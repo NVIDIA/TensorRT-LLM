@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
@@ -162,8 +163,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_property_readonly("lookahead_config", &GenLlmReq::getLookaheadConfig)
-        .def_property_readonly(
-            "context_current_position", py::overload_cast<>(&GenLlmReq::getContextCurrentPosition, py::const_))
         .def_property("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_property("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
         .def_readwrite("request_id", &GenLlmReq::mRequestId)
@@ -187,6 +186,8 @@ void initBindings(pybind11::module_& m)
         .def("set_priority", py::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
         .def_property_readonly("cum_log_probs", &GenLlmReq::getCumLogProbs)
         .def("set_cum_log_prob", &GenLlmReq::setCumLogProb, py::arg("cum_log_prob"), py::arg("beam"))
+        .def("update_num_tokens_per_iteration", &GenLlmReq::updateNumTokensPerIteration,
+            py::arg("num_tokens_per_iteration"), py::arg("model_config"))
         .def_property_readonly("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
         .def("move_to_next_context_chunk", &GenLlmReq::moveToNextContextChunk)
@@ -195,6 +196,7 @@ void initBindings(pybind11::module_& m)
         .def("is_first_context_chunk", py::overload_cast<>(&GenLlmReq::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+        .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
@@ -205,8 +207,10 @@ void initBindings(pybind11::module_& m)
             "is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
         .def_property_readonly(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_property_readonly("is_context_init_state", &GenLlmReq::isContextInitState)
         .def_property_readonly("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
         .def_property_readonly("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
+        .def_property_readonly("llm_request_type", &GenLlmReq::getLlmRequestType)
         .def_property_readonly("position_ids",
             [](GenLlmReq& self)
             {
@@ -283,19 +287,23 @@ void initBindings(pybind11::module_& m)
                      std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                      std::optional<executor::ContextPhaseParams> context_phase_params)
                  {
-                     auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
+                     auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                      {
                          std::optional<tb::LlmRequest::TensorPtr> tensorPtr = std::nullopt;
                          if (atTensor)
                          {
                              tensorPtr = tr::TorchView::of(atTensor.value());
+                             if (unsqueeze)
+                             {
+                                 (*tensorPtr)->unsqueeze(0);
+                             }
                          }
                          return tensorPtr;
                      };
 
-                     auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias);
-                     auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list);
-                     auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list);
+                     auto embedding_bias_tensor_ptr = makeOptionalTensor(embedding_bias, true);
+                     auto bad_words_list_tensor_ptr = makeOptionalTensor(bad_words_list, true);
+                     auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list, true);
                      auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                      auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                      auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
@@ -397,21 +405,24 @@ void initBindings(pybind11::module_& m)
 
     py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::SizeType32, runtime::TllmRuntime const&, runtime::ModelConfig const&,
+                 runtime::SizeType32, runtime::BufferManager const&, runtime::ModelConfig const&,
                  runtime::WorldConfig const&>(),
             py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("runtime"), py::arg("model_config"),
+            py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
         .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
         .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_readwrite("sequence_lengths", &tb::DecoderBuffers::sequenceLengths)
+        .def_property_readonly(
+            "sequence_lengths", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengths); })
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
         .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_readwrite("new_output_tokens", &tb::DecoderBuffers::newOutputTokens)
-        .def_readwrite("new_output_tokens_host", &tb::DecoderBuffers::newOutputTokensHost)
+        .def_property_readonly(
+            "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
+        .def_property_readonly("new_output_tokens_host",
+            [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
         .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
         .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
@@ -420,8 +431,8 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::TllmRuntime const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("runtime"))
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
+            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"))
         .def_readwrite("output_ids", &tb::SlotDecoderBuffers::outputIds)
         .def_readwrite("output_ids_host", &tb::SlotDecoderBuffers::outputIdsHost)
         .def_readwrite("sequence_lengths_host", &tb::SlotDecoderBuffers::sequenceLengthsHost)
@@ -430,6 +441,13 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
+
+    py::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
+                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
+                 runtime::TllmRuntime const&>(),
+            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
+            py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

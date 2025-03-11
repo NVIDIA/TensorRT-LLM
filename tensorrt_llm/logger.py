@@ -63,6 +63,7 @@ class Logger(metaclass=Singleton):
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
         self._logger = logging.getLogger(self.PREFIX)
+        self._logger.propagate = False
         handler = logging.StreamHandler(stream=sys.stdout)
         handler.setFormatter(
             logging.Formatter(fmt='[%(asctime)s] %(message)s',

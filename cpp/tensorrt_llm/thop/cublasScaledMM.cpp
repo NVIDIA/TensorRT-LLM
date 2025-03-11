@@ -53,7 +53,13 @@ using AlgoListType = std::unordered_map<std::tuple<int32_t, int32_t, int32_t>, s
 AlgoListType bf16_algo_list = {
     // Deepseek v3/R1 fused_a
     // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom5 -m_mma0 -m_cga2 -m_scheduling1]
-    {{8, 7168, 2112}, {10, 35, 1, 0, 0, 5, 2}}};
+    {{8, 7168, 2112}, {10, 35, 1, 0, 0, 5, 2}},
+    // Deepseek v3/R1 router gemm
+    // [-algo66 -m_tile10 -m_stages35 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom3 -m_mma0 -m_cga2 -m_scheduling1]
+    {{8, 7168, 256}, {10, 35, 1, 0, 0, 3, 2}},
+    {{512, 7168, 256}, {48, 35, 1, 0, 0, 0, 2}},
+    {{1024, 7168, 256}, {13, 35, 1, 0, 0, 1, 3}},
+};
 
 // fp8*fp8->fp32->fp16
 AlgoListType fp8_algo_list = {
@@ -91,7 +97,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
 {
     int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
     AlgoListType algo_list;
-    if (((aType == CUDA_R_16BF && outType == CUDA_R_16BF) || (aType == CUDA_R_16F && outType == CUDA_R_16F))
+    if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
         algo_list = bf16_algo_list;
@@ -118,6 +124,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         TLLM_LOG_DEBUG("No special cublasLt algo found for m=%d, k=%d, n=%d\n", m, k, n);
         return false;
     }
+    TLLM_LOG_DEBUG("Found special cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
     return true;
 }
 
@@ -245,7 +252,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 } // namespace
 
 Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, Tensor& out)
+    std::optional<at::Tensor> const& bias, Tensor& out)
 {
     // Check device
     CHECK_TH_CUDA(mat_a);
@@ -270,7 +277,6 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 
     TORCH_CHECK(mat_a.dtype() == torch::kFloat8_e4m3fn);
     TORCH_CHECK(mat_b.dtype() == torch::kFloat8_e4m3fn);
-    TORCH_CHECK(!out_dtype || *out_dtype == out.scalar_type(), "out_dtype must match output matrix type");
 
     cublas_gemm_caller(out, mat_a, mat_b, scale_a, scale_b, true);
     return out;
@@ -298,7 +304,7 @@ Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& 
         out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
     }
 
-    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out_dtype, out);
+    return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out);
 }
 
 Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias, Tensor& out)
@@ -314,9 +320,8 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
         && mat_b.sizes()[1] == out.sizes()[1]);
 
     // Check for strides and alignment
-    TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1);           // Row-major
-    TORCH_CHECK(mat_b.strides()[0] == 1);                                    // Column-major
-    TORCH_CHECK(out.strides()[0] % 16 == 0 && mat_b.strides()[1] % 16 == 0); // 16 Byte Alignment
+    TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
+    TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
 
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
 
@@ -324,10 +329,11 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
     return out;
 }
 
-Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias)
+Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias,
+    std::optional<c10::ScalarType> out_dtype)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
-    auto const out_dtype_ = mat_a.scalar_type();
+    auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     Tensor out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
     return cublas_mm_out(mat_a, mat_b, bias, out);
@@ -340,7 +346,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
         " ScalarType? out_dtype, int userbuffers_id) -> (Tensor out)");
-    m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias) -> (Tensor out)");
+    m.def(
+        "cublas_scaled_mm_out(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
+        " int userbuffers_id, Tensor! out) -> (Tensor out)");
+    m.def("cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
+    m.def("cublas_mm_out(Tensor mat_a, Tensor mat_b, Tensor? bias, Tensor! out) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

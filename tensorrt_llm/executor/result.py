@@ -25,7 +25,7 @@ __all__ = [
     "GenerationResultBase",
     "DetokenizedGenerationResultBase",
     "GenerationResult",
-    "IterationStatsResult",
+    "IterationResult",
 ]
 
 
@@ -453,9 +453,9 @@ class GenerationResult(GenerationResultBase):
         return hash(self.request_id)
 
 
-class IterationStatsResult:
+class IterationResult:
     """
-    Runtime statistics for all available iterations.
+    Runtime results for all available iterations.
     """
 
     def __init__(self):
@@ -478,13 +478,13 @@ class IterationStatsResult:
 
     def get_results(self) -> List[dict]:
         """
-        Return all runtime stats in the queue.
+        Return all runtime results in the queue.
         """
         results = []
         while not self._done:
             try:
-                stats = self.queue.get(timeout=self._timeout)
-                results.append(json.loads(stats))
+                data = self.queue.get(timeout=self._timeout)
+                results.append(json.loads(data))
             except Empty:
                 self._done = True
         return results
@@ -499,8 +499,8 @@ class IterationStatsResult:
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
 
         try:
-            stats = await self.aqueue.get(timeout=self._timeout)
-            return json.loads(stats)
+            data = await self.aqueue.get(timeout=self._timeout)
+            return json.loads(data)
         except asyncio.TimeoutError:
             self._done = True
             raise StopAsyncIteration

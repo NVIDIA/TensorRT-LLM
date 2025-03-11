@@ -8,11 +8,12 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
+from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import nvtx_range, print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import ExecutorResponse
+from .utils import _create_rsp
 
 if TYPE_CHECKING:
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
@@ -53,8 +54,9 @@ class PostprocWorker:
     The worker to postprocess the responses from the executor's await_response.
     '''
 
-    class Input(NamedTuple):
-        rsp: "ExecutorResponse"
+    @dataclass
+    class Input:
+        rsp: "tllm.Response"
 
         # The information necessary for creating a GenerationResult in the first Input for each request
         sampling_params: Optional[SamplingParams] = None
@@ -161,9 +163,10 @@ class PostprocWorker:
         async def handle_single_input(inp: PostprocWorker.Input,
                                       batch: List[PostprocWorker.Output]):
             assert isinstance(inp, PostprocWorker.Input)
-            rsp = inp.rsp
-            client_id = rsp.client_id
-            is_final = bool(rsp.is_final)
+            if isinstance(inp.rsp, tllm.Response):
+                inp.rsp = _create_rsp(inp.rsp)
+            client_id = inp.rsp.client_id
+            is_final = bool(inp.rsp.is_final)
             res = await self._handle_input(inp)
             batch.append(Output(client_id, res, is_final))
             if is_final:
@@ -175,20 +178,15 @@ class PostprocWorker:
                              | PostprocWorker.
                              Input] = await self._pull_pipe.get_async()
 
-            if inputs is None:
-                self._to_stop.set()
-                yield None  # notify the batched_put corountine to quit
-                break
+            if not isinstance(inputs, list):
+                inputs = [inputs]
 
-            if isinstance(inputs, list):  # batched
-                for inp in inputs:
-                    if inp is None:
-                        self._to_stop.set()
-                        yield None
-                        break
-                    await handle_single_input(inp, batch)
-            else:
-                await handle_single_input(inputs, batch)
+            for inp in inputs:
+                if inp is None:
+                    self._to_stop.set()
+                    yield None
+                    break
+                await handle_single_input(inp, batch)
 
             yield batch
 

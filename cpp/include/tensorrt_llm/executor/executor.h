@@ -955,9 +955,12 @@ public:
         std::optional<size_t> const& hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
-        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
+        std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt,
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
+    [[nodiscard]] bool getEnablePartialReuse() const;
+    [[nodiscard]] bool getCopyOnPartialReuse() const;
     [[nodiscard]] std::optional<SizeType32> getMaxTokens() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getMaxAttentionWindowVec() const;
     [[nodiscard]] std::optional<SizeType32> getSinkTokenLength() const;
@@ -969,6 +972,8 @@ public:
     [[nodiscard]] size_t getEventBufferMaxSize() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
+    void setEnablePartialReuse(bool enablePartialReuse);
+    void setCopyOnPartialReuse(bool copyOnPartialReuse);
     void setMaxTokens(SizeType32 maxTokens);
     void setMaxAttentionWindowVec(std::vector<SizeType32> maxAttentionWindowVec);
     void setSinkTokenLength(SizeType32 sinkTokenLength);
@@ -1023,6 +1028,12 @@ private:
 
     /// @brief Max size of the KV cache event buffer
     size_t mEventBufferMaxSize;
+
+    /// @brief Whether blocks that are only partially matched can be reused
+    bool mEnablePartialReuse;
+
+    /// @brief Whether partially matched blocks that are in use can be reused after copying them
+    bool mCopyOnPartialReuse;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1527,7 +1538,7 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        tensorrt_llm::runtime::LoraTaskIdType loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
@@ -1541,7 +1552,7 @@ struct KVCacheStoredBlockData
     /// @brief The unique tokens of the block
     tensorrt_llm::runtime::VecUniqueTokens tokens;
     /// @brief The Lora task id of the block
-    tensorrt_llm::runtime::LoraTaskIdType loraId;
+    std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId;
     /// @brief The cache level of the block
     SizeType32 cacheLevel;
     /// @brief The priority of the block

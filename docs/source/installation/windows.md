@@ -56,7 +56,7 @@ TensorRT-LLM on Windows only supports single-GPU execution.
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm --extra-index-url https://download.pytorch.org/whl/ --extra-index-url https://pypi.nvidia.com
+  pip install tensorrt_llm --extra-index-url https://download.pytorch.org/whl/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.

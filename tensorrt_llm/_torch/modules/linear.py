@@ -341,8 +341,10 @@ class Linear(nn.Module):
         else:
             # TODO: remove custom cublas_mm when default heuristics is good enough
             if self.use_custom_cublas_mm:
-                output = torch.ops.trtllm.cublas_mm(input, self.weight.t(),
-                                                    bias)
+                output = torch.ops.trtllm.cublas_mm(input,
+                                                    self.weight.t(),
+                                                    bias,
+                                                    out_dtype=None)
             else:
                 output = F.linear(input, self.weight, bias)
         return output

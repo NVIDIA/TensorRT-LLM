@@ -518,6 +518,12 @@ class Tensor(object):
         '''
         return unbind(self, dim)
 
+    def repeat(self, sizes):
+        '''
+        See functional.repeat
+        '''
+        return repeat(self, sizes)
+
     def is_dynamic(self, dim=None):
         '''
         If the argument 'dim' is None, that function returns a boolean that
@@ -584,6 +590,15 @@ class Tensor(object):
 
     def __repr__(self):
         return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+
+    def __xor__(self, b):
+        '''
+        Maps to functional.gt or functional.eq.
+        '''
+        print(f"self.shape: {self.shape}, b.shape: {b.shape}")
+        a, b = broadcast_helper(self, b)
+        print(f"a.shape: {a.shape}, b.shape: {b.shape}")
+        return op_xor(a, b)
 
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
@@ -3009,6 +3024,7 @@ eq = partial(elementwise_binary, op=trt.ElementWiseOperation.EQUAL)
 minimum = partial(elementwise_binary, op=trt.ElementWiseOperation.MIN)
 maximum = partial(elementwise_binary, op=trt.ElementWiseOperation.MAX)
 pow = partial(elementwise_binary, op=trt.ElementWiseOperation.POW)
+op_xor = partial(elementwise_binary, op=trt.ElementWiseOperation.XOR)
 
 
 def modulo(x: Tensor, y: Union[Tensor, int]) -> Tensor:
@@ -3622,6 +3638,59 @@ def conv2d(input: Tensor,
                     output.size(2),
                     output.size(3)]))
 
+    return output
+
+
+def conv3d(input: Tensor,
+           weight: Tensor,
+           bias: Optional[Tensor] = None,
+           stride: Union[int, Tuple[int, int]] = (1, 1, 1),
+           padding: Union[int, Tuple[int, int]] = (0, 0, 0),
+           dilation: Union[int, Tuple[int, int]] = (1, 1, 1),
+           groups: int = 1) -> Tensor:
+    ##
+    ## TODO: Document this function!
+    ##
+
+    ndim = input.ndim()
+    # TRT requires the input of Conv3D layer to be 5-dimentional tensor.
+    if ndim == 4:
+        input = expand_dims(input, 0)
+    assert input.ndim() == 5
+
+    if isinstance(stride, int):
+        stride = tuple([stride] * 3)
+    if isinstance(padding, int):
+        padding = tuple([padding] * 3)
+    if isinstance(dilation, int):
+        dilation = tuple([dilation] * 3)
+
+    noutput = weight.size()[0]
+    kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+
+    if bias is not None:
+        is_bias_constant = (bias.producer is not None
+                            and bias.producer.type == trt.LayerType.CONSTANT)
+        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+
+    layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
+                                                kernel_size, weight, bias)
+    layer.stride_nd = stride
+    layer.padding_nd = padding
+    layer.dilation_nd = dilation
+    layer.num_groups = groups
+    layer.dilation_nd = dilation
+
+    if not is_weight_constant:
+        layer.set_input(1, weight.trt_tensor)
+    if bias is not None and not is_bias_constant:
+        layer.set_input(2, bias.trt_tensor)
+
+    output = _create_tensor(layer.get_output(0), layer)
     return output
 
 
@@ -5959,6 +6028,152 @@ def rms_norm(input: Tensor,
     return y
 
 
+def rearrange(inputs: Union[Tensor, Sequence[Tensor]], expression: str,
+              **kwargs) -> Tensor:
+    '''
+    Add a rearrange operation on a tensor.
+
+    This operation is a reader-friendly smart element reordering for multidimensional tensors,
+    including functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
+    stack, concatenate and other operations. Please see: https://einops.rocks/api/rearrange/
+
+    For example, if the shape of input tensor is [32, 30, 40, 3], and run:
+        `rearrange(x, 'b (h h1) (w w1) c -> b h w 1 (c h1 w1) 1', h1=2, w1=2)`
+    it would produce a tensor with shape as [32, 15, 20, 1, 12, 1].
+
+    Parameters:
+        input: Union[Tensor, Sequence[Tensor]]
+            If it is a tensor, it will directly operate on it.
+            Otherwise, if it is a sequence, it will concat it to a tensor and then
+            operates on it.
+
+        expression : str
+            The expression about how to reorder the tensor in a reader-friendly way.
+
+        kwargs:
+            Keyword arguments to set some identifiers with specific values.
+
+    Returns:
+        The output tensor of this operation.
+    '''
+    import re
+
+    def _init_expression(expr):
+        expr_items = expr.split(" ")
+        tmp_name_index = 0
+        for idx, item in enumerate(expr_items):
+            values = re.findall(r'\b\d+\b', item)
+            if len(values) > 0:
+                prefix = "(" if "(" in item else ""
+                subfix = ")" if ")" in item else ""
+                expr_items[
+                    idx] = f"{prefix}NumericId{tmp_name_index}Val{values[0]}{subfix}"
+                tmp_name_index += 1
+        return " ".join(expr_items)
+
+    def _get_all_identifier(expr):
+        return re.findall(r'\b[a-zA-Z_]+\d*\b', expr)
+
+    def _get_all_symbols(expr):
+        return re.findall(r'\b\w+\b', expr)
+
+    def _get_dim_expr(expr):
+        return [
+            _get_all_symbols(match.group())
+            for match in re.finditer(r'\b\w+\b|\(.*?\)', expr)
+        ]
+
+    src_shape_expr, _, dst_shape_expr = expression.partition("->")
+    unknown_identifiers = re.findall(r'[^a-zA-Z0-9_\(\)]',
+                                     src_shape_expr + dst_shape_expr)
+    assert len(
+        unknown_identifiers) > 0, f"Unknown identifiers: {unknown_identifiers}"
+    src_identifiers = _get_all_identifier(src_shape_expr)
+    dst_identifiers = _get_all_identifier(dst_shape_expr)
+    assert (len(src_identifiers) == len(set(src_identifiers))
+            and len(dst_identifiers) == len(set(dst_identifiers))
+            ), "Indexing expression contains duplicate dimension."
+    assert (set(src_identifiers) == set(dst_identifiers)
+            ), "Identifiers only on one side of expression (should be on both)."
+
+    new_expression = _init_expression(expression)
+    src_shape_expr, _, dst_shape_expr = new_expression.partition("->")
+
+    # concat if inputs are sequence of tensors
+    if isinstance(inputs, Sequence):
+        inputs = concat([unsqueeze(t, 0) for t in inputs], dim=0)
+    assert (
+        inputs.ndim() == len(_get_dim_expr(src_shape_expr))
+    ), f"inputs.ndim() is {inputs.ndim()} while indexing expression has {len(_get_dim_expr(src_shape_expr))}"
+
+    src_symbols = _get_all_symbols(src_shape_expr)
+    dst_symbols = _get_all_symbols(dst_shape_expr)
+
+    # find all the symbols-values mapping and store them in symbol_map
+    symbol_map = {
+        symbol: {
+            "updated": False,
+            "value": None
+        }
+        for symbol in set(src_symbols + dst_symbols)
+    }
+    for symbol in symbol_map:
+        if "NumericId" in symbol:
+            symbol_map[symbol]["value"] = int(symbol.partition("Val")[-1])
+            symbol_map[symbol]["updated"] = True
+    for symbol, value in kwargs.items():
+        symbol_map[symbol]["value"] = value
+        symbol_map[symbol]["updated"] = True
+
+    for idx, dim_expr in enumerate(_get_dim_expr(src_shape_expr)):
+        if len(dim_expr) == 1:
+            symbol = dim_expr[0]
+            if not symbol_map[symbol]["updated"]:
+                symbol_map[symbol]["value"] = shape(inputs, idx)
+                symbol_map[symbol]["updated"] = True
+        else:
+            divisors = []
+            unknown_symbol = None
+            for symbol in dim_expr:
+                if not symbol_map[symbol]["updated"]:
+                    unknown_symbol = symbol
+                else:
+                    divisors.append(symbol_map[symbol]["value"])
+            if unknown_symbol is not None:
+                assert len(divisors) > 0
+                divisor = prod(cast(concat(divisors), "int64"), dim=-1)
+                symbol_map[unknown_symbol]["value"] = shape(inputs,
+                                                            idx) / divisor
+                symbol_map[unknown_symbol]["updated"] = True
+
+    for symbol, item in symbol_map.items():
+        assert (item["updated"]
+                ), f"{symbol} cannot be inferred, please set it manually"
+
+    dst_dims = []
+    for dim_expr in _get_dim_expr(dst_shape_expr):
+        if len(dim_expr) == 1:
+            dst_dims.append(symbol_map[dim_expr[0]]["value"])
+        else:
+            accumulator = prod(cast(
+                concat([symbol_map[symbol]["value"] for symbol in dim_expr]),
+                "int64"),
+                               dim=-1)
+            dst_dims.append(accumulator)
+    dst_dims = cast(concat(dst_dims, dim=-1), "int64")
+
+    src_indices = {symbol: idx for idx, symbol in enumerate(src_identifiers)}
+    permute_dims = [src_indices[symbol] for symbol in dst_identifiers]
+
+    symbol_shape = cast(
+        concat([symbol_map[symbol]["value"] for symbol in src_identifiers],
+               dim=-1), "int64")
+    tensor = inputs.view(symbol_shape)
+    tensor = permute(tensor, permute_dims)
+    tensor = tensor.view(dst_dims)
+    return tensor
+
+
 def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
     '''
     Repeats the tensor along the specified dimensions.
@@ -5973,6 +6188,8 @@ def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
         A tensor except for repeated input tensors along specified dim.
 
     '''
+    assert input.ndim() <= len(sizes), \
+        "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor"
     repeated_tensor = input
     for k in range(-1, -len(sizes) - 1, -1):
         repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)

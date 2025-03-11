@@ -424,9 +424,9 @@ __global__ void topk_with_k2_kernel(T* output, T* input, int64_t const num_token
     }
 }
 
-template <typename T>
-__global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, T* scores_with_bias,
-    int64_t const num_tokens, int64_t const n_group, int64_t const topk_group, int64_t const topk,
+template <typename T, typename IdxT>
+__global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, T* topk_values, IdxT* topk_indices,
+    T* scores_with_bias, int64_t const num_tokens, int64_t const n_group, int64_t const topk_group, int64_t const topk,
     int64_t const num_experts, int64_t const num_experts_per_group, double routed_scaling_factor)
 {
     int32_t warp_id = threadIdx.x / WARP_SIZE;
@@ -435,6 +435,9 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     scores_with_bias += case_id * num_experts;
     scores += case_id * num_experts;
     group_scores += case_id * n_group;
+    topk_values += case_id * topk;
+    topk_indices += case_id * topk;
+
     int32_t align_num_experts_per_group = warp_topk::round_up_to_multiple_of<WARP_SIZE>(num_experts_per_group);
 
     cg::thread_block block = cg::this_thread_block();
@@ -534,26 +537,19 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     {
         if (if_proceed_next_topk)
         {
-            if (case_id < num_tokens)
-            {
-                for (int i = lane_id; i < num_experts; i += WARP_SIZE)
-                {
-                    scores[i] = 0;
-                }
-            }
-            __threadfence();
-            __syncthreads();
             for (int i = lane_id; i < topk; i += WARP_SIZE)
             {
                 float value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
-                scores[s_topk_idx[i]] = cuda_cast<T, float>(value);
+                topk_indices[i] = s_topk_idx[i];
+                topk_values[i] = cuda_cast<T, float>(value);
             }
         }
         else
         {
-            for (int i = lane_id; i < num_experts; i += WARP_SIZE)
+            for (int i = lane_id; i < topk; i += WARP_SIZE)
             {
-                scores[i] = i < topk ? cuda_cast<T, float>(1.0f / topk) : cuda_cast<T, float>(0.0f);
+                topk_indices[i] = i;
+                topk_values[i] = cuda_cast<T, float>(1.0f / topk);
             }
         }
         // Note: when if_proceed_next_topk==false, choose the first 8 experts as the default result.
@@ -561,33 +557,33 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     }
 }
 
-template <typename T>
-void invokeNoAuxTc(T* scores, T* group_scores, T* scores_with_bias, int64_t const num_tokens, int64_t const num_experts,
-    int64_t const n_group, int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
-    cudaStream_t const stream)
+template <typename T, typename IdxT>
+void invokeNoAuxTc(T* scores, T* group_scores, T* topk_values, IdxT* topk_indices, T* scores_with_bias,
+    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group, int64_t const topk_group,
+    int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream)
 {
     int64_t num_cases = num_tokens * n_group;
     int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
     topk_with_k2_kernel<T><<<topk_with_k2_num_blocks, BLOCK_SIZE, 0, stream>>>(
         group_scores, scores_with_bias, num_tokens, num_cases, n_group, num_experts / n_group);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
     size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
 
-    group_idx_and_topk_idx_kernel<T><<<topk_with_k_group_num_blocks, BLOCK_SIZE, dynamic_smem_in_bytes, stream>>>(
-        scores, group_scores, scores_with_bias, num_tokens, n_group, topk_group, topk, num_experts,
-        num_experts / n_group, routed_scaling_factor);
-    sync_check_cuda_error();
+    group_idx_and_topk_idx_kernel<T, IdxT><<<topk_with_k_group_num_blocks, BLOCK_SIZE, dynamic_smem_in_bytes, stream>>>(
+        scores, group_scores, topk_values, topk_indices, scores_with_bias, num_tokens, n_group, topk_group, topk,
+        num_experts, num_experts / n_group, routed_scaling_factor);
+    sync_check_cuda_error(stream);
 }
 
-#define INSTANTIATE_NOAUX_TC(T)                                                                                        \
-    template void invokeNoAuxTc<T>(T * scores, T * group_scores, T * scores_with_bias, int64_t const num_tokens,       \
-        int64_t const num_experts, int64_t const n_group, int64_t const topk_group, int64_t const topk,                \
-        double const routed_scaling_factor, cudaStream_t const stream);
+#define INSTANTIATE_NOAUX_TC(T, IdxT)                                                                                  \
+    template void invokeNoAuxTc<T, IdxT>(T * scores, T * group_scores, T * topk_values, IdxT * topk_indices,           \
+        T * scores_with_bias, int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,              \
+        int64_t const topk_group, int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream);
 
-INSTANTIATE_NOAUX_TC(float);
-INSTANTIATE_NOAUX_TC(half);
+INSTANTIATE_NOAUX_TC(float, int32_t);
+INSTANTIATE_NOAUX_TC(half, int32_t);
 #ifdef ENABLE_BF16
-INSTANTIATE_NOAUX_TC(__nv_bfloat16);
+INSTANTIATE_NOAUX_TC(__nv_bfloat16, int32_t);
 #endif
 } // namespace tensorrt_llm::kernels

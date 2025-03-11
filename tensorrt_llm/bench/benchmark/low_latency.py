@@ -202,12 +202,12 @@ def latency_command(
             warmup_dataset = generate_warmup_dataset(requests, warmup)
             logger.info("Running warmup.")
             asyncio.run(
-                async_benchmark(llm, sampling_params, warmup_dataset,
+                async_benchmark(llm, sampling_params, warmup_dataset, False,
                                 concurrency))
             logger.info("Warmup done.")
 
         statistics = asyncio.run(
-            async_benchmark(llm, sampling_params, requests, concurrency))
+            async_benchmark(llm, sampling_params, requests, True, concurrency))
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, params, True)
         if report_json:

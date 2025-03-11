@@ -48,7 +48,7 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                              ///< Unknown state
     kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
     kCONTEXT_INIT = 2,                         ///< Context phase starts
-    KDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
+    kDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
     kGENERATION_IN_PROGRESS = 4,               ///< Generation phase is in progress
     kGENERATION_TO_COMPLETE = 5,               ///< Generation phase is to be completed
     kGENERATION_COMPLETE = 6,                  ///< Generation phase completed
@@ -1449,7 +1449,7 @@ public:
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
         return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE
-            || mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+            || mState == LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationToCompleteState() const noexcept
@@ -1469,7 +1469,7 @@ public:
 
     [[nodiscard]] bool isDisaggGenerationTransmissionComplete() const noexcept
     {
-        return mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+        return mState == LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE;
     }
 
     [[nodiscard]] bool isDisaggGenerationTransmissionInProgress() const noexcept
@@ -1496,7 +1496,7 @@ public:
         case batch_manager::LlmRequestState::kCONTEXT_INIT: return executor::RequestStage::kCONTEXT_IN_PROGRESS; break;
         case batch_manager::LlmRequestState::kGENERATION_IN_PROGRESS:
         case batch_manager::LlmRequestState::kGENERATION_TO_COMPLETE:
-        case batch_manager::LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE:
+        case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_INIT:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS:
             return executor::RequestStage::kGENERATION_IN_PROGRESS;
@@ -1571,7 +1571,7 @@ public:
     /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        return getContextCurrentPosition() == 0;
+        return mContextCurrentPosition == 0;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
@@ -1693,16 +1693,13 @@ public:
         return mLanguageAdapterUid;
     }
 
-    std::valarray<float> getLanguageAdapterRouting(SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
+    std::vector<SizeType32> getLanguageAdapterRouting(
+        SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
     {
         auto const reqLanguageAdapterUid = getLanguageAdapterUid().value();
         TLLM_CHECK_WITH_INFO(reqLanguageAdapterUid < reqNumLanguages, "Language adapter uid is out of range.\n");
-        // Copy the same routing info for all the tokens in a request
-        // Construct the routing probabilities across all languages, put 1.0 for the selected language.
-        // Will be removed after TopK logic is removed from MOE kernel.
-        std::valarray<float> languageAdapterRouting(0.0f, inputLength * reqNumLanguages);
-        languageAdapterRouting[std::slice(reqLanguageAdapterUid, inputLength, reqNumLanguages)] = 1.0f;
-        return languageAdapterRouting;
+        // Copy the same routing info for all the tokens in this request
+        return std::vector<SizeType32>(inputLength, reqLanguageAdapterUid);
     }
 
     /// @brief mark all beams as finished by the given reason. Marks only unfinished beams.

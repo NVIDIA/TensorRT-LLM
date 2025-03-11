@@ -42,18 +42,20 @@ add_library(
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
+  deepseekAllreduceFusionOp.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp4Op.cpp
-  fp4Bmm.cpp
   fp4Gemm.cpp
   fp4Quantize.cpp
+  fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
   gatherTreeOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  fp8BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp

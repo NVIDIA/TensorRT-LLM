@@ -95,6 +95,7 @@ class OpenAIServer:
 
         self.register_routes()
 
+
     @property
     def postproc_worker_enabled(self) -> bool:
         return True if self.llm.args._num_postprocess_workers > 0 else False
@@ -114,6 +115,8 @@ class OpenAIServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
+        self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -131,6 +134,12 @@ class OpenAIServer:
     async def get_model(self) -> JSONResponse:
         model_list = ModelList(data=[ModelCard(id=self.model)])
         return JSONResponse(content=model_list.model_dump())
+
+    async def get_iteration_stats(self) -> JSONResponse:
+        stats = []
+        async for stat in self.llm.get_stats_async(2):
+            stats.append(stat)
+        return JSONResponse(content=stats)
 
     async def openai_chat(self, request: ChatCompletionRequest) -> Response:
 

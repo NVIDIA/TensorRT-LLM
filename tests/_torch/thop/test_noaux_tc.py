@@ -24,7 +24,7 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
-    weight = torch.randn((num_experts, HIDDEN_SIZE), dtype=torch.float32).cuda()
+    weight = torch.randn((num_experts, HIDDEN_SIZE), dtype=dtype).cuda()
     e_score_correction_bias = torch.randn((num_experts),
                                           dtype=torch.float32).cuda()
 
@@ -41,11 +41,13 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
                           n_group=n_group,
                           topk_group=topk_group,
                           routed_scaling_factor=ROUTED_SCALING_FACTOR,
+                          dtype=dtype,
                           is_thop=True)
     gate.load_weights([weights])
     gate.cuda()
     with torch.inference_mode():
-        output = gate.forward(logits)
+        selected_indices, selected_values = gate.routing_method.apply(
+            gate.forward(logits))
 
     # Run the original version
     ref_gate = Deepseekv3Gate(hidden_size=HIDDEN_SIZE,
@@ -54,12 +56,22 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
                               n_group=n_group,
                               topk_group=topk_group,
                               routed_scaling_factor=ROUTED_SCALING_FACTOR,
+                              dtype=dtype,
                               is_thop=False)
     ref_gate.load_weights([weights])
     ref_gate.cuda()
     with torch.inference_mode():
-        ref_output = ref_gate.forward(logits)
+        ref_selected_indices, ref_selected_values = ref_gate.routing_method.apply(
+            ref_gate.forward(logits))
+
+    # sort before compare
+    sorted_selected_values, _ = torch.sort(selected_values)
+    ref_sorted_selected_values, _ = torch.sort(ref_selected_values)
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=0.01, atol=0.01)
+
+    torch.testing.assert_close(sorted_selected_values,
+                               ref_sorted_selected_values,
+                               rtol=0.01,
+                               atol=0.01)

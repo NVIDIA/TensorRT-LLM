@@ -70,16 +70,14 @@ using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
 struct BlockKey
 {
-    bool hasLora = false;
     bool usesExtraIds = false;
-    LoraTaskIdType loraTaskId = 0;
+    std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
     VecUniqueTokens uniqueTokens;
 
     BlockKey() = default;
 
-    explicit BlockKey(bool hasLora, bool usesExtraIds, LoraTaskIdType loraTaskId, VecUniqueTokens uniqueTokens)
-        : hasLora{hasLora}
-        , usesExtraIds(usesExtraIds)
+    explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens)
+        : usesExtraIds(usesExtraIds)
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
     {
@@ -87,8 +85,20 @@ struct BlockKey
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (hasLora == other.hasLora && usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens);
+        return (
+            usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+    }
+
+    int partialMatch(BlockKey const& other) const noexcept
+    {
+        SizeType32 numMatched{0};
+        if (loraTaskId == other.loraTaskId)
+        {
+            auto [matchEnd, otherMatchEnd]
+                = std::mismatch(uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin());
+            numMatched = std::distance(uniqueTokens.begin(), matchEnd);
+        }
+        return numMatched;
     }
 };
 
@@ -118,17 +128,14 @@ struct BlockKeyHasher
             }
         }
 
-        uint64_t c = blockKey.loraTaskId;
-        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-        c = c ^ (c >> 31);
-        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-
-        uint32_t d = static_cast<uint32_t>(blockKey.hasLora);
-        d = ((d >> 16) ^ d) * 0x45d9f3b;
-        d = ((d >> 16) ^ d) * 0x45d9f3b;
-        d = (d >> 16) ^ d;
-        seed ^= d + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        if (blockKey.loraTaskId)
+        {
+            uint64_t c = blockKey.loraTaskId.value();
+            c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+            c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+            c = c ^ (c >> 31);
+            seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
 
         return seed;
     }
@@ -210,7 +217,12 @@ public:
 
     void removeNextBlock(BlockKey const& blockKey);
 
-    [[nodiscard]] BlockPtr findMatchingBlock(BlockKey const& blockKey) const;
+    //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
+    //! blockKey.
+    //! @return tuple of [partialMatch, numMatched, block], partialMatch is true if not all the tokens of the block were
+    //! matched.
+    [[nodiscard]] std::tuple<bool, SizeType32, BlockPtr> findMatchingBlock(
+        BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const;
 
     //! \brief Free block from previous block if present.
     void freeLeafBlock();
@@ -218,6 +230,8 @@ public:
     [[nodiscard]] bool isFull() const;
 
     [[nodiscard]] bool isShared() const;
+
+    [[nodiscard]] bool isLeaf() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -413,8 +427,11 @@ private:
 class KVCacheBlockPool
 {
 public:
-    SizeType32 numKvHeads;
     SizeType32 numLayers;
+    SizeType32 numKvHeads;
+    SizeType32 sizePerHead;
+    SizeType32 tokensPerBlock;
+    SizeType32 quantSize;
     SizeType32 blockSize;
 
     // Memory pools. Primary is fast memory, secondary is slower memory used for offloading.
@@ -424,12 +441,15 @@ public:
     // FP4 KV caches have extra pools that contain second level scales for dequantization.
     bool containsBlockScales;
 
-    KVCacheBlockPool(SizeType32 numKvHeads, SizeType32 numLayers, SizeType32 blockSize,
-        runtime::ITensor::SharedPtr primaryPtr = nullptr, runtime::ITensor::SharedPtr secondaryPtr = nullptr,
-        bool containsBlockScales = false)
-        : numKvHeads(numKvHeads)
-        , numLayers(numLayers)
-        , blockSize(blockSize)
+    KVCacheBlockPool(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
+        SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
+        runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false)
+        : numLayers(numLayers)
+        , numKvHeads(numKvHeads)
+        , sizePerHead(sizePerHead)
+        , tokensPerBlock(tokensPerBlock)
+        , quantSize(quantSize)
+        , blockSize((numKvHeads * sizePerHead * tokensPerBlock) / quantSize)
         , primaryPtr(std::move(primaryPtr))
         , secondaryPtr(std::move(secondaryPtr))
         , containsBlockScales(containsBlockScales)
@@ -468,7 +488,8 @@ public:
         SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
     ~BlockManager();
 
@@ -636,7 +657,11 @@ public:
 
     //! \brief Bring offloaded block from secondary to primary memory.
     //! \details Does nothing of block is already in primary memory.
-    void onboardBlock(BlockPtr offloadBlock);
+    void onboardBlock(BlockPtr const& offloadBlock);
+
+    //! \brief Bring block from primary to secondary memory.
+    //! \details Does nothing of block is already in secondary memory.
+    void offloadBlock(BlockPtr const& block);
 
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
     //! \details Only full blocks are considered.
@@ -660,6 +685,11 @@ public:
     }
 
     [[nodiscard]] static bool blockInRadixTree(BlockPtr const& block);
+
+    [[nodiscard]] bool verifyQueueIntegrity();
+
+    //! \brief Store context blocks
+    void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     [[nodiscard]] bool isEnableHashKey() const
     {
@@ -760,9 +790,19 @@ private:
     // max_num_tokens(For DeepSeek). Controlled by mCacheType
     SizeType32 mKVFactor;
     std::set<KVCacheBlock::IdType> reusedBlockIds;
+    // Number of reused tokens
+    double mReusedTokens;
+    // Total number of input tokens
+    double mTotalInputTokens;
 
     // Whether or not to maintain a hashmap of blocks.
     bool mEnableHashKey;
+
+    // Whether blocks that are partially matched should be reused.
+    bool mEnablePartialReuse;
+
+    // Whether partially matched blocks that are already in use should be copied and reused.
+    bool mCopyOnPartialReuse;
 
 private:
     friend class KVCacheManager;
@@ -936,13 +976,17 @@ public:
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF);
+        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
+        std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
+        bool copyOnpartialReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -950,13 +994,15 @@ public:
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF);
+        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
+        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     ~KVCacheManager() override = default;
 

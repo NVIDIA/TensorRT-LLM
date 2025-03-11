@@ -81,7 +81,7 @@ void Fp8RowwiseGemmPluginProfiler::runTactic(int m, int n, int k, Fp8RowwiseGemm
     // Run profiling
     mRunner->gemm(dTmp, aTmp, bTmp, nullptr, mQuantMode, m, n, k, scaleD0Tmp, scaleD1Tmp, tactic, workspaceTmp,
         wsSizeRunner, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 int Fp8RowwiseGemmPluginProfiler::getMaxProfileM() const
@@ -275,7 +275,7 @@ int Fp8RowwiseGemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     mGemmRunner->gemm(outputs[0], inputs[0], inputs[1], nullptr, mQuantMode, m, n, k,
         reinterpret_cast<float const*>(inputs[2]), reinterpret_cast<float const*>(inputs[3]), *bestTactic,
         reinterpret_cast<char*>(workspace), wsSize, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return 0;
 }

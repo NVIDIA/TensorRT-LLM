@@ -27,11 +27,6 @@
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::runtime
-{
-class TllmRuntime;
-} // namespace tensorrt_llm::runtime
-
 namespace tensorrt_llm::batch_manager
 {
 
@@ -141,7 +136,7 @@ public:
         std::vector<std::vector<runtime::ITensor::SharedPtr>>
             predictedDraftLogits;               // [mMaxNumRequests][mMaxNumHeads][maxDraftTokens + 1, vocabSize]
 
-        void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::TllmRuntime const& runtime,
+        void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
             runtime::ModelConfig const& modelConfig);
     };
 
@@ -151,7 +146,7 @@ public:
     std::optional<runtime::LookaheadDecodingBuffers> lookaheadBuffers;
 
     DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::TllmRuntime const& runtime,
+        SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
     std::unique_ptr<DecoderStepAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
@@ -182,7 +177,7 @@ public:
     TensorPtr logProbsHost;        // [beamWidth, maxSeqLen]
     TensorPtr finishReasonsHost;   // [beamWidth]
 
-    SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, runtime::TllmRuntime const& runtime);
+    SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, runtime::BufferManager const& manager);
 
     static std::unique_ptr<DecoderSlotAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
         TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,

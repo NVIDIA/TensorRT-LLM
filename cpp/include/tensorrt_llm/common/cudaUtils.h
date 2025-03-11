@@ -146,42 +146,43 @@ void checkEx(
 
 inline std::optional<bool> isCudaLaunchBlocking()
 {
-    static bool firstCall = true;
-    static std::optional<bool> ptr = std::nullopt;
-
-    if (firstCall)
+    thread_local bool firstCall = true;
+    thread_local std::optional<bool> result = std::nullopt;
+    if (!firstCall)
     {
         char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
         if (env != nullptr && std::string(env) == "1")
         {
-            ptr = true;
+            result = true;
         }
-        else if (env != nullptr && std::string(env) == "0")
+        else
         {
-            ptr = false;
+            result = false;
         }
         firstCall = false;
     }
-
-    return ptr;
+    return result;
 }
 
-inline bool isCapturing()
+inline bool isCapturing(cudaStream_t stream)
 {
     cudaStreamCaptureStatus status;
-    check_cuda_error(cudaStreamIsCapturing(cudaStreamPerThread, &status));
+    check_cuda_error(cudaStreamIsCapturing(stream, &status));
     return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
 }
 
-inline bool doCheckError()
+inline bool doCheckError(cudaStream_t stream)
 {
     auto const cudaLaunchBlocking = isCudaLaunchBlocking();
     if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
     {
-        return !isCapturing();
+        return !isCapturing(stream);
     }
+
 #ifndef NDEBUG
-    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing());
+    // Debug builds will sync when we're not capturing unless explicitly
+    // disabled.
+    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
 #else
     bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif
@@ -189,16 +190,16 @@ inline bool doCheckError()
     return checkError;
 }
 
-inline void syncAndCheck(char const* const file, int const line)
+inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
 {
-    if (doCheckError())
+    if (doCheckError(stream))
     {
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(stream);
         check(cudaGetLastError(), "cudaGetLastError", file, line);
     }
 }
 
-#define sync_check_cuda_error() tensorrt_llm::common::syncAndCheck(__FILE__, __LINE__)
+#define sync_check_cuda_error(stream) tensorrt_llm::common::syncAndCheck(stream, __FILE__, __LINE__)
 
 #define PRINT_FUNC_NAME_()                                                                                             \
     do                                                                                                                 \

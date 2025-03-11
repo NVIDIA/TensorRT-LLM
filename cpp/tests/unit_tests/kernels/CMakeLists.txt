@@ -23,6 +23,7 @@ add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
+  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
   add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
   # gemmAllReduceTest uses internal CUTLASS.
   target_include_directories(

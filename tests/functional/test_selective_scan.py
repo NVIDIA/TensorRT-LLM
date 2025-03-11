@@ -519,7 +519,6 @@ class TestFunctional(unittest.TestCase):
             inputs['host_context_lengths'] = host_context_lengths
         if has_z:
             inputs['z'] = zxBCdt
-        inputs
         outputs = {'output': output, 'present_state': state}
         stream = torch.cuda.current_stream()
         builder_config = builder.create_builder_config(precision=dtype, )

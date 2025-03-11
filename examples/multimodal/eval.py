@@ -89,16 +89,26 @@ def parse_arguments(args=None):
 
 def load_dataset(args) -> datasets.Dataset:
     split_name = 'validation' if 'VQAv2' in args.eval_task else 'test'
-    dataset = datasets.load_dataset(
-        args.dataset_dir or args.eval_task,
-        cache_dir=args.dataset_cache_dir,
-        split=split_name,
-        storage_options={
-            'client_kwargs': {
-                'timeout': aiohttp.ClientTimeout(total=3600)
-            }
-        },
-    )
+
+    if args.dataset_dir is not None and os.path.exists(
+            os.path.join(args.dataset_dir, "dataset_info.json")):
+        logger.info(f"load dataset by load_from_disk from {args.dataset_dir}")
+        dataset = datasets.load_from_disk(args.dataset_dir)
+
+    else:
+        logger.info(
+            f"load dataset by load_dataset from {args.dataset_dir or args.eval_task}"
+        )
+        dataset = datasets.load_dataset(
+            args.dataset_dir or args.eval_task,
+            cache_dir=args.dataset_cache_dir,
+            split=split_name,
+            storage_options={
+                'client_kwargs': {
+                    'timeout': aiohttp.ClientTimeout(total=3600)
+                }
+            },
+        )
     return dataset
 
 
@@ -229,11 +239,14 @@ if args.model_type == 'mllama':
     from tensorrt_llm.runtime.processor_wrapper import MllamaProcessorWrapper
     hf_processor = MllamaProcessorWrapper(hf_processor, logger)
 
+torch.random.manual_seed(0)
 profiler.start('evaluation')
 if args.test_trtllm or args.test_hf:
     for i in range(args.max_ite):
         logger.debug(f"Ite: {i:3d}")
         data = dataset[i]
+        if i > len(dataset):
+            break
         prompts = prepare_prompts(args.eval_task, data, args.model_type,
                                   hf_processor)
         image = data['image']

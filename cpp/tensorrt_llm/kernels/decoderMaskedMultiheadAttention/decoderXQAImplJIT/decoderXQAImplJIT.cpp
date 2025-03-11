@@ -244,7 +244,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, stream);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // The preprocessing kernel that applies RoPE and updates kv cache.
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
@@ -296,7 +296,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         preprocessingParams.rotary_vision_length = xqaParams.rotary_vision_length;
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // Use mTileSize = 16 kernels when qSeqLen <= 16.
@@ -353,7 +353,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     dim3 gridDim(multi_block, xqaParams.num_kv_heads, xqaParams.batch_size);
     dim3 blockDim(128, 1, isGMMAKernel ? 3 : 2);
     cubinObj->launch(gridDim, blockDim, stream, kernelParams);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     if (needOutputCvt)
     {
@@ -361,7 +361,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             static_cast<T const*>(launchParams.output),
             xqaParams.head_size * xqaParams.num_q_heads * xqaParams.total_num_input_tokens, xqaParams.fp8_out_scale,
             stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 }
 

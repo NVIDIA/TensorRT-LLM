@@ -19,23 +19,23 @@ def check_quantized(gm):
 
 
 @pytest.mark.parametrize(
-    "quantization,atol,rtol",
+    "quant_config,atol,rtol",
     [
         pytest.param(
-            "FP8",
+            {"quant_algo": "FP8"},
             0.05,
             0.01,
             marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
         ),
         pytest.param(
-            "NVFP4",
+            {"quant_algo": "NVFP4"},
             0.16,
             0.016,
             marks=pytest.mark.skipif(not fp4_compatible(), reason="Requires fp4 support"),
         ),
     ],
 )
-def test_quantization(quantization, atol, rtol):
+def test_quantization(quant_config, atol, rtol):
     model = MLP(32, 64, 32).to(torch.float16).to("cuda")
     x = torch.randn(3, 32, dtype=torch.float16).to("cuda")
 
@@ -49,7 +49,7 @@ def test_quantization(quantization, atol, rtol):
         rtol,
         True,  # test_load_hook
         False,  # strict_loading
-        quantization,
+        quant_config,
     )
 
     # check there's quantization error during transformation

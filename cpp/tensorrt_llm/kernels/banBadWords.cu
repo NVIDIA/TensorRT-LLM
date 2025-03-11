@@ -111,7 +111,7 @@ void invokeBanBadWords(T* logits, TokenIdType const** output_ids_ptr, SizeType32
 
     ban_bad_words<<<grid, block, 0, stream>>>(logits, output_ids_ptr, parent_ids_ptr, batch_slot, beam_width, bad_words,
         bad_words_lens, vocab_size_padded, sequence_lengths, max_seq_len);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeBanBadWords(half* logits, TokenIdType const** output_ids_ptr, SizeType32 const** parent_ids_ptr,

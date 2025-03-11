@@ -3,11 +3,12 @@ from ..executor import CompletionOutput, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
+from .llm_args import (EagleDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig)
 from .llm_utils import (BuildConfig, CalibConfig, CapacitySchedulerPolicy,
-                        EagleDecodingConfig, KvCacheConfig,
-                        KvCacheRetentionConfig, LookaheadDecodingConfig,
-                        MedusaDecodingConfig, MTPDecodingConfig, QuantAlgo,
-                        QuantConfig, SchedulerConfig)
+                        KvCacheConfig, KvCacheRetentionConfig,
+                        LookaheadDecodingConfig, QuantAlgo, QuantConfig,
+                        SchedulerConfig)
 from .mpi_session import MpiCommSession
 
 __all__ = [

@@ -17,9 +17,10 @@ SchedulerOutput = namedtuple("SchedulerOutput", [
 
 class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
-    context_requests: RequestList
-    generation_requests: RequestList
-    paused_requests: RequestList
+    def __init__(self):
+        self.context_requests: RequestList = []
+        self.generation_requests: RequestList = []
+        self.paused_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
@@ -171,6 +172,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+        for request in active_requests:
+            if request.py_draft_tokens is not None:
+                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 

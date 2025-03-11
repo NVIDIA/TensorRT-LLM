@@ -56,6 +56,8 @@ def test_llama(model_name, quant, tp_size, torch_compile):
     # 16GB weight + 8GB KV cache + 8GB cache_indirection (TRT engine only) = 32GB
     if not is_fp8 and get_total_gpu_memory(0) < 32 * 1024**3:
         pytest.skip("Not enough GPU memory to run BF16 model")
+    if torch_compile:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5147283")
 
     prompts = [
         "The president of the United States is",
@@ -103,30 +105,3 @@ def test_llama(model_name, quant, tp_size, torch_compile):
         assert similar(
             output_text,
             expected), f"Expected '{expected}' but get '{output_text}'"
-
-
-if __name__ == '__main__':
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "bf16",
-               1,
-               torch_compile=False)
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "bf16",
-               4,
-               torch_compile=False)
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "fp8",
-               1,
-               torch_compile=False)
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "fp8",
-               4,
-               torch_compile=False)
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "fp8_kv_cache",
-               1,
-               torch_compile=False)
-    test_model("llama-3.1-model/Meta-Llama-3.1-8B",
-               "fp8_kv_cache",
-               4,
-               torch_compile=False)

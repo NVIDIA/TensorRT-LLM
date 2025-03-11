@@ -25,10 +25,11 @@ from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
-from .result import GenerationResult, IterationStatsResult
-from .utils import ProcessPoolExecutorSession, RequestError, has_event_loop
+from .result import GenerationResult, IterationResult
+from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
     from .proxy import ExecutorBindingsProxy
@@ -55,6 +56,13 @@ class CppExecutorError(RuntimeError):
         return f"{self.message}\nStack trace:\n{self.stack_trace}"
 
 
+class IterationResultQueue:
+    is_initialized: bool = False
+    # FusedIpcQueue or IntraProcessQueue is used to communicate results from workers to proxy
+    queue: Optional[Union[Queue, FusedIpcQueue, IntraProcessQueue]] = None
+    aqueue: Optional[AsyncQueue] = None
+
+
 class GenerationExecutor(ABC):
 
     def __init__(self,
@@ -65,8 +73,8 @@ class GenerationExecutor(ABC):
             num_postprocess_workers=num_postprocess_workers,
             postprocess_tokenizer_dir=postprocess_tokenizer_dir)
 
-        self._stats = None
-        self.stats_queue = None
+        self.kv_events_queues = IterationResultQueue()
+        self.stats_queues = IterationResultQueue()
 
         atexit.register(self.shutdown)
 
@@ -78,10 +86,10 @@ class GenerationExecutor(ABC):
 
         self._last_client_id: int = 1
 
-        self._iter_stats_result = None
-
         # whether it's the executor instance of LLM API
         self._is_llm_executor = is_llm_executor
+        self._iter_kv_events_result: IterationResult | None = None
+        self._iter_stats_result: IterationResult | None = None
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -111,13 +119,7 @@ class GenerationExecutor(ABC):
         assert isinstance(prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
-        if self._is_llm_executor:
-            if self._iter_stats_result is None:
-                # singleton to store cpp runtime stats
-                self._iter_stats_result = IterationStatsResult()
-            else:
-                # expect more engine stats whenever new prompts are submitted
-                self._iter_stats_result.mark_undone()
+        self._maybe_initialize_iteration_results()
 
         if postproc_params:
             postproc_params.postproc_args.num_prompt_tokens = len(
@@ -193,6 +195,20 @@ class GenerationExecutor(ABC):
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
 
+    def _maybe_initialize_iteration_results(self):
+        if self._is_llm_executor:
+            if self._iter_stats_result is None:
+                # singleton to store cpp runtime stats
+                self._iter_stats_result = IterationResult()
+            else:
+                # expect more engine stats whenever new prompts are submitted
+                self._iter_stats_result.mark_undone()
+
+            if self._iter_kv_events_result is None:
+                self._iter_kv_events_result = IterationResult()
+            else:
+                self._iter_kv_events_result.mark_undone()
+
     def _handle_background_error(self, error: Optional[Exception | str] = None):
         """ Process the errors from the threads or processes.
         NOTE: This should be called in the main thread.
@@ -232,18 +248,6 @@ class GenerationExecutor(ABC):
     def enable_postprocess_parallel(self) -> bool:
         return self.postproc_config.enabled
 
-    def create_stats_queue(self):
-        # Stats queue is created during first submission to ensure event loop exists if it is needed.
-        if not self._stats:
-            if has_event_loop():
-                self._stats = AsyncQueue()
-                self.stats_queue = self._stats.sync_q
-                self.stats_aqueue = self._stats
-            else:
-                self._stats = Queue()
-                self.stats_queue = self._stats
-                self.stats_aqueue = None
-
     def get_stats(self, timeout: float) -> List[dict]:
         """
         Get iteration statistics from the runtime.
@@ -252,21 +256,47 @@ class GenerationExecutor(ABC):
         Returns:
             List[dict]: A list of runtime stats as dict.
         """
-        assert self._iter_stats_result is not None, "IterationStatsResult is not properly instantiated."
+        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result.get_results()
 
-    def aget_stats(self, timeout: float) -> IterationStatsResult:
+    def aget_stats(self, timeout: float) -> IterationResult:
         """
         Get iteration statistics from the runtime.
         Returns:
-            IterationStatsResult: An async iterable object containing runtime stats.
+            IterationResult: An async iterable object containing runtime stats.
         """
-        assert self._iter_stats_result is not None, "IterationStatsResult is not properly instantiated."
+        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
+
+    def get_kv_events(self, timeout: float) -> List[dict]:
+        """
+        Get iteration kv events from the runtime.
+        Args:
+            timeout (float): Max wait time in seconds when retrieving stats from queue.
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        """
+        assert self._iter_kv_events_result is not None, "KV Event IterationResult is not properly instantiated."
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result.get_results()
+
+    def aget_kv_events(self, timeout=None) -> IterationResult:
+        """
+        Get iteration kv events from the runtime.
+        Args:
+            timeout (float): Max wait time in seconds when retrieving stats from queue.
+        Returns:
+            IterationResult: An async iterable object containing runtime events.
+        """
+        assert self._iter_kv_events_result is not None, "KV Event IterationResult is not properly instantiated."
+
+        self._iter_kv_events_result.set_timeout(timeout)
+        return self._iter_kv_events_result
 
     @staticmethod
     def create(

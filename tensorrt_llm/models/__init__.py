@@ -57,6 +57,7 @@ from .phi.model import PhiForCausalLM, PhiModel
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForCausalLM
+from .stdit.model import STDiT3Model
 
 __all__ = [
     'BertModel',
@@ -69,6 +70,7 @@ __all__ = [
     'BloomForCausalLM',
     'DiT',
     'SD3Transformer2DModel',
+    'STDiT3',
     'DeepseekForCausalLM',
     'FalconConfig',
     'DeepseekV2ForCausalLM',
@@ -189,6 +191,7 @@ MODEL_MAP = {
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
     'SD3Transformer2DModel': SD3Transformer2DModel,
+    'STDiT3': STDiT3Model,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,

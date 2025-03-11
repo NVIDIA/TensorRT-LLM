@@ -27,20 +27,29 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
+#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
+
+#include <ATen/core/TensorBody.h>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <torch/extension.h>
+
+#include <optional>
 
 namespace py = pybind11;
 
+namespace tr = tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
 
 void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::module_& m)
@@ -90,30 +99,65 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
 
     py::class_<HandleContextLogits>(m, HandleContextLogits::name)
         .def(py::init())
-        .def("__call__", &HandleContextLogits::operator(), py::arg("context_requests"),
-            py::arg("context_runtime_buffers"), py::arg("decoder_buffers"), py::arg("model_config"), py::arg("runtime"))
+        .def(
+            "__call__",
+            [](HandleContextLogits const& self, RequestVector const& contextRequests,
+                std::vector<tr::SizeType32> const& numContextLogitsVec, at::Tensor const& logits,
+                DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
+                tensorrt_llm::runtime::CudaStream const& stream,
+                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
+            {
+                return self(contextRequests, numContextLogitsVec, tr::TorchView::of(logits), decoderBuffers,
+                    modelConfig, manager, stream, medusaBuffers);
+            },
+            py::arg("context_requests"), py::arg("num_context_logits"), py::arg("logits"), py::arg("decoder_buffers"),
+            py::arg("model_config"), py::arg("buffer_manager"), py::arg("stream"),
+            py::arg("medusa_buffers") = std::nullopt)
         .def("name", [](HandleContextLogits const&) { return HandleContextLogits::name; });
 
     py::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
         .def(py::init())
-        .def("__call__", &HandleGenerationLogits::operator(), py::arg("logits_index"), py::arg("generation_requests"),
-            py::arg("gen_runtime_buffers"), py::arg("decoder_buffers"), py::arg("model_config"), py::arg("runtime"))
+        .def(
+            "__call__",
+            [](HandleGenerationLogits const& self, tr::SizeType32 logitsIndex, RequestVector const& generationRequests,
+                DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
+                at::Tensor const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers = std::nullopt)
+            {
+                self(logitsIndex, generationRequests, decoderBuffers, modelConfig, manager, tr::TorchView::of(logits),
+                    genRuntimeBuffers);
+            },
+            py::arg("logits_index"), py::arg("generation_requests"), py::arg("decoder_buffers"),
+            py::arg("model_config"), py::arg("buffer_manager"), py::arg("logits"),
+            py::arg("gen_runtime_buffers") = std::nullopt)
         .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
 
     py::class_<GenerateRequestOptions>(m, GenerateRequestOptions::name)
         .def(py::init<bool, bool, bool>(), py::arg("speculative_decoding_fast_logits"),
             py::arg("is_leader_in_orch_mode"), py::arg("is_normalize_log_probs"))
-        .def("__call__", &GenerateRequestOptions::operator(), py::arg("model_config"), py::arg("world_config"),
-            py::arg("decoding_config"), py::arg("runtime"), py::arg("context_requests"), py::arg("buffer"),
-            py::arg("decoder_input_buffers"))
+        .def(
+            "__call__",
+            [](GenerateRequestOptions& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
+                executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
+                tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
+                DecoderInputBuffers const& inputBuffers, OptionalRef<RuntimeBuffers const> buffers = std::nullopt)
+            {
+                auto [batchSlots, decoderRequests, samplingConfigs] = self(modelConfig, worldConfig, decodingConfig,
+                    contextRequests, bufferManager, logitsType, inputBuffers, buffers);
+
+                return std::tuple{
+                    runtime::Torch::tensor(batchSlots), std::move(decoderRequests), std::move(samplingConfigs)};
+            },
+            py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
+            py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"),
+            py::arg("buffers") = std::nullopt)
         .def("name", [](GenerateRequestOptions const&) { return GenerateRequestOptions::name; });
 
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(py::init())
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("fused_runtime_buffers"),
-            py::arg("decoder_input_buffers"), py::arg("model_config"), py::arg("max_num_sequences"),
-            py::arg("beam_width"), py::arg("buffer_manager"), py::arg("stream"))
+            py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("decoder_input_buffers"),
+            py::arg("model_config"), py::arg("max_num_sequences"), py::arg("beam_width"), py::arg("buffer_manager"),
+            py::arg("stream"), py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
@@ -125,8 +169,18 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
 
     py::class_<CreateNewDecoderRequests>(m, CreateNewDecoderRequests::name)
         .def(py::init())
-        .def("__call__", &CreateNewDecoderRequests::operator(), py::arg("seq_slots"), py::arg("requests"),
-            py::arg("sampling_configs"), py::arg("model_config"), py::arg("decoder"), py::arg("runtime_stream"),
-            py::arg("max_sequence_length"))
+        .def(
+            "__call__",
+            [](CreateNewDecoderRequests& self, at::Tensor const& batchSlots,
+                std::vector<runtime::decoder_batch::Request> const& requests,
+                std::vector<runtime::SamplingConfig> const& samplingConfigs, runtime::ModelConfig const& modelConfig,
+                runtime::GptDecoderBatched& decoder, tensorrt_llm::runtime::CudaStream const& runtimeStream,
+                SizeType32 maxSequenceLength)
+            {
+                self(tr::TorchView::of(batchSlots), requests, samplingConfigs, modelConfig, decoder, runtimeStream,
+                    maxSequenceLength);
+            },
+            py::arg("batch_slots"), py::arg("requests"), py::arg("sampling_configs"), py::arg("model_config"),
+            py::arg("decoder"), py::arg("runtime_stream"), py::arg("max_sequence_length"))
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 }

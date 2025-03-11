@@ -621,7 +621,7 @@ void updateOutputIds(ITensor::SharedPtr const& outputIds, ITensor::SharedPtr con
     auto outputIdsView = ITensor::view(
         outputIds, ITensor::makeShape({outputIdsShape.d[0] * outputIdsShape.d[1], outputIdsShape.d[2]}));
     kernels::invokeTransposeWithOutputOffset(*outputIdsView, *newTokensView, decoderStep, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream.get());
 }
 } // namespace
 
@@ -961,13 +961,13 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
             mRuntime->setOutputTensors(contextId, outputBuffer);
 
             TLLM_CHECK_WITH_INFO(mRuntime->executeContext(contextId), "Executing TRT engine in context step failed!");
-            sync_check_cuda_error();
+            sync_check_cuda_error(mRuntime->getStream().get());
             buffers.clearTensorMaps(); // inputBuffer and outputBuffer are not needed anymore, we explicitly clear them
                                        // to release memory
         }
 
         generationBuffers.postContextStep(contextBuffers, manager, mModelConfig, mWorldConfig);
-        sync_check_cuda_error();
+        sync_check_cuda_error(mRuntime->getStream().get());
 
         // Save the last token logits of context into generation logits
         if (mWorldConfig.isLastPipelineParallelRank() && getGatherGenerationLogits())
@@ -1075,14 +1075,14 @@ SizeType32 GptSession::executeGenerationStep(SizeType32 step, std::vector<Genera
             TLLM_CHECK_WITH_INFO(
                 mRuntime->executeContext(contextId), tc::fmtstr("Executing TRT engine in step %d failed!", step));
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(mRuntime->getStream().get());
 
         if (mWorldConfig.isLastPipelineParallelRank() && getGatherGenerationLogits())
         {
             auto& buffers = *mBuffers.at(generationBatchId);
             buffers.generationLogitsFragments->push_back(buffers.logits);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(mRuntime->getStream().get());
 
         std::swap(buffers.cacheIndirectionDecoderInput, buffers.cacheIndirectionDecoderOutput);
 
@@ -1173,7 +1173,7 @@ void GptSession::decoderStepAsync(SizeType32 decoderStep, SizeType32 microBatchI
         stream.record(mReceivedEvents.at(microBatchId).get());
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream.get());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -1200,7 +1200,7 @@ bool GptSession::shouldStopSync(SizeType32 batchSize, SizeType32 beamWidth, Size
         mReceivedEvents.at(microBatchId).synchronize();
         nbFinished = *bufferCast<SizeType32>(*mBuffers.at(microBatchId)->nbFinished);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(mRuntime->getStream().get());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return nbFinished == batchSize * beamWidth;
 }
@@ -1278,7 +1278,7 @@ void GptSession::finalize(SizeType32 microBatchId, SamplingConfig const& samplin
         // sequenceLengths are already updated by decoder
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(mRuntime->getStream().get());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

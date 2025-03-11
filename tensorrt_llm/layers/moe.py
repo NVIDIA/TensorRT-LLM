@@ -25,14 +25,16 @@ from tensorrt_llm._utils import (get_init_params, str_dtype_to_torch,
 from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
-from .._utils import QuantModeWrapper, int32_array
+from .._utils import QuantModeWrapper, get_sm_version, int32_array
 from ..functional import (AllReduceParams, SideStreamIDType, Tensor,
-                          _add_plugin_info, _create_tensor, allreduce, cast,
-                          concat, constant, cuda_stream_sync, div, expand,
-                          gather_nd, is_gated_activation, non_gated_version,
-                          nonzero, reduce_scatter, repeat_interleave, scatter,
-                          scatter_nd, shape, sigmoid, softmax, split, sum, topk,
-                          unsqueeze)
+                          _add_plugin_info, _create_tensor, abs, allreduce,
+                          cast, concat, constant, cuda_stream_sync, div, expand,
+                          gather_nd, gt, is_gated_activation)
+from ..functional import max as trt_max
+from ..functional import (maximum, non_gated_version, nonzero, reduce_scatter,
+                          repeat_interleave, scatter, scatter_nd, shape,
+                          sigmoid, softmax, split, sub, sum, topk, unsqueeze,
+                          where)
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
@@ -139,8 +141,8 @@ class MoeConfig:
 def _moe_plugin(moe_config,
                 hidden_states,
                 hidden_states_raw,
-                routing,
-                finished,
+                token_selected_experts,
+                token_final_scales,
                 expert_weights_1,
                 expert_weights_2,
                 expert_bias_1,
@@ -201,9 +203,9 @@ def _moe_plugin(moe_config,
     p_num_experts = trt.PluginField("number_of_experts",
                                     np.array(num_experts, dtype=np.int32),
                                     trt.PluginFieldType.INT32)
-    p_top_k = trt.PluginField("top_k", np.array(moe_config.top_k,
-                                                dtype=np.int32),
-                              trt.PluginFieldType.INT32)
+    p_experts_per_token = trt.PluginField(
+        "experts_per_token", np.array(moe_config.top_k, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     p_expert_hidden_size = trt.PluginField(
         "expert_hidden_size", np.array(hidden_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -238,8 +240,9 @@ def _moe_plugin(moe_config,
     p_quant_mode = trt.PluginField("quant_mode",
                                    np.array([int(quant_mode)], dtype=np.int32),
                                    trt.PluginFieldType.INT32)
-    p_use_finished = trt.PluginField(
-        "use_finished", np.array([int(finished is not None)], dtype=np.int32),
+    p_use_final_scales = trt.PluginField(
+        "use_final_scales",
+        np.array([int(token_final_scales is not None)], dtype=np.int32),
         trt.PluginFieldType.INT32)
     p_use_bias = trt.PluginField(
         "use_bias", np.array([int(expert_bias_1 is not None)], dtype=np.int32),
@@ -252,15 +255,6 @@ def _moe_plugin(moe_config,
                                 trt.PluginFieldType.INT32)
     p_ep_rank = trt.PluginField("ep_rank", np.array(ep_rank, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
-    p_normalization_mode = trt.PluginField(
-        "normalization_mode",
-        np.array(moe_config.normalization_mode, dtype=np.int32),
-        trt.PluginFieldType.INT32)
-
-    p_sparse_mixer_epsilon = trt.PluginField(
-        "sparse_mixer_epsilon",
-        np.array(moe_config.sparse_mixer_epsilon, dtype=np.float32),
-        trt.PluginFieldType.FLOAT32)
 
     p_force_determinism = trt.PluginField(
         "force_determinism", np.array([int(False)], dtype=np.int32),
@@ -285,12 +279,12 @@ def _moe_plugin(moe_config,
             trt.PluginFieldType.INT32)
 
     pfc_inputs = [
-        p_remove_input_padding, p_num_experts, p_top_k, p_expert_hidden_size,
-        p_expert_inter_size, p_groupwise_quant_algo, p_group_size,
-        p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
-        p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
-        p_ep_size, p_ep_rank, p_normalization_mode, p_sparse_mixer_epsilon,
-        p_force_determinism, p_side_stream_id, p_use_lora
+        p_remove_input_padding, p_num_experts, p_experts_per_token,
+        p_expert_hidden_size, p_expert_inter_size, p_groupwise_quant_algo,
+        p_group_size, p_activation_type, p_type_id, p_weight_type_id,
+        p_output_type_id, p_quant_mode, p_use_bias, p_use_final_scales,
+        p_tp_size, p_tp_rank, p_ep_size, p_ep_rank, p_force_determinism,
+        p_side_stream_id, p_use_lora
     ]
 
     if use_lora:
@@ -305,14 +299,19 @@ def _moe_plugin(moe_config,
     moe_plugin = plugin_creator.create_plugin("mixture_of_experts", pfc)
 
     # Instantiate the plugin with our specific inputs
-    plugin_inputs = [hidden_states, routing, expert_weights_1, expert_weights_2]
+    plugin_inputs = [hidden_states, expert_weights_1, expert_weights_2]
+    plugin_inputs += [token_selected_experts]
 
+    # Add conditional inputs
+
+    # Final scales do a final rescale of the output of the experts
+    if token_final_scales is not None:
+        plugin_inputs += [token_final_scales]
+
+    # Expert biases
     if expert_bias_1:
         assert expert_bias_2
         plugin_inputs += [expert_bias_1, expert_bias_2]
-
-    if finished is not None:
-        plugin_inputs += [finished]
 
     # Add conditional inputs
     if (quant_mode.is_weight_only() and not quant_mode.has_per_group_scaling()):
@@ -352,6 +351,7 @@ def _moe_plugin(moe_config,
             expert_scale_5, expert_scale_6
         ]
 
+    # Lora parameters
     if use_lora:
         # Check if lora_params is not None
         moe_h_4h_params = lora_params.get_runtime_params(0, "moe_h_to_4h")
@@ -379,9 +379,11 @@ def _moe_plugin(moe_config,
         if default_net().plugin_config.remove_input_padding:
             plugin_inputs += [lora_params.host_context_lengths]
 
+    # A control flow tensor required to synchronize the side stream
     if side_stream_id != SideStreamIDType.disable:
         plugin_inputs += [hidden_states_raw]
 
+    # Pass the inputs to the plugin
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
     _add_plugin_info(layer, plugin_creator, "mixture_of_experts", pfc)
@@ -389,7 +391,11 @@ def _moe_plugin(moe_config,
         for ii in range(layer.num_inputs):
             if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):
                 layer.get_input(ii).set_dynamic_range(-127, 127)
+
+    # Fetch the output tensor
     output = _create_tensor(layer.get_output(0), layer)
+
+    # If the side stream is enabled, also return the synchronization tensor for the side stream
     if side_stream_id != SideStreamIDType.disable:
         output = (output, _create_tensor(layer.get_output(1), layer))
     return output
@@ -873,9 +879,24 @@ class MixtureOfExperts(Module):
                                      self.wrapper_tllm_to_externel_key_dict,
                                      self.mapping.moe_tp_size, 1)
 
+    def default_routing(self, logits):
+        topk_values, topk_indices = topk(softmax(cast(logits, trt.float32),
+                                                 dim=-1),
+                                         k=self.moe_config.top_k,
+                                         dim=-1)
+        return topk_indices, topk_values
+
+    def renormalize(self, logits):
+        # Get top-k experts and renormalize their scores
+        token_scores, token_selected_experts = topk(cast(logits, trt.float32),
+                                                    k=self.moe_config.top_k,
+                                                    dim=-1)
+        token_final_scales = softmax(token_scores, dim=-1)
+        return token_selected_experts, token_final_scales
+
     def group_limited_greedy(self, logits):
         n_group = self.moe_config.device_limited_n_group
-        scores = softmax(logits, -1)
+        scores = softmax(cast(logits, trt.float32), -1)
         scores_shape = [shape(scores, i) for i in range(scores.ndim())]
         group_scores = scores.view(
             concat(scores_shape[:-1] +
@@ -884,7 +905,7 @@ class MixtureOfExperts(Module):
                             k=self.moe_config.device_limited_topk_group,
                             dim=-1)
         group_mask = scatter(group_scores * 0, -1, group_idx,
-                             group_idx.cast(group_scores.dtype) * 0 + 1)
+                             cast(group_idx, group_scores.dtype) * 0 + 1)
         score_mask = expand(
             unsqueeze(group_mask, -1),
             concat(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group]),
@@ -893,9 +914,52 @@ class MixtureOfExperts(Module):
             self.moe_config.device_limited_routed_scaling_factor
         return scores
 
+    def sparse_mixer(self, logits):
+        router_logits = cast(logits, trt.float32)
+
+        topk_values = []
+        topk_indices = []
+
+        assert self.top_k == 2, "Sparse mixer only supports top_k = 2"
+
+        def mask_and_softmax(router_logits):
+            # Get max of remaining values
+            max_values = trt_max(router_logits, dim=-1, keepdim=True)
+
+            # Calculate mask for epsilon condition
+            abs_values = abs(router_logits)
+            max_abs = maximum(abs_values, max_values)
+            diff = sub(max_values, router_logits)
+            ratio = div(diff, max_abs)
+
+            # Apply epsilon mask
+            eps_mask = gt(ratio, 2 * self.moe_config.sparse_mixer_epsilon)
+            router_logits = where(eps_mask, -float('inf'), router_logits)
+            curr_values, curr_indices = topk(softmax(router_logits),
+                                             k=1,
+                                             dim=-1)
+            return curr_indices, curr_values
+
+        curr_indices, curr_values = mask_and_softmax(router_logits)
+        topk_values.append(curr_values)
+        topk_indices.append(curr_indices)
+
+        # Mask the last selected expert to -inf
+        router_logits = scatter(router_logits, -1, curr_indices,
+                                curr_values * 0 - float('inf'))
+
+        curr_indices, curr_values = mask_and_softmax(router_logits)
+        topk_values.append(curr_values)
+        topk_indices.append(curr_indices)
+
+        # Concatenate results
+        values = concat(topk_values, dim=1)
+        indices = concat(topk_indices, dim=1)
+
+        return indices, values
+
     def forward(self,
                 hidden_states,
-                finished=None,
                 lora_layer_params=None,
                 all_reduce_params: Optional[AllReduceParams] = None,
                 last_local_layer_residual=None,
@@ -906,18 +970,44 @@ class MixtureOfExperts(Module):
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
                 0, "moe_router")
+
         if not self.static_routing:
             routing_input = cast(hidden_states, trt.float32)
             routing = self.router(routing_input, moe_router_lora_params)
-            if self.moe_config.normalization_mode in [
-                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
-                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
-            ]:
-                routing = self.group_limited_greedy(routing)  # bs x seq_len
         else:
-            routing = static_routing_input  # bs
-        output = self.forward_experts(hidden_states, routing, finished,
-                                      lora_layer_params, side_stream_id)
+            routing = None
+
+        # token_selected_experts is shape (num_tokens, experts_per_token).
+        #     It is a list of selected expert indices for each token
+        # token_final_scales is shape (num_tokens, experts_per_token). May be None
+        #     It contains a final scaling/weighting factor applied to the output of each selected expert before summing the results
+        if self.static_routing:
+            token_selected_experts = static_routing_input
+            token_final_scales = None
+        elif self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED:
+            token_final_scales, token_selected_experts = topk(
+                self.group_limited_greedy(routing),
+                k=self.moe_config.top_k,
+                dim=-1)
+        elif self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM:
+            token_final_scales, token_selected_experts = topk(
+                self.group_limited_greedy(routing),
+                k=self.moe_config.top_k,
+                dim=-1)
+            token_final_scales /= sum(token_final_scales, dim=-1, keepdim=True)
+        elif self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
+            token_selected_experts, token_final_scales = self.renormalize(
+                routing)
+        elif self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.SPARSE_MIXER:
+            token_selected_experts, token_final_scales = self.sparse_mixer(
+                routing)
+        else:
+            token_selected_experts, token_final_scales = self.default_routing(
+                routing)
+
+        output = self.forward_experts(hidden_states, token_selected_experts,
+                                      token_final_scales, lora_layer_params,
+                                      side_stream_id)
         if side_stream_id != SideStreamIDType.disable:
             output, hidden_states = output
         if self.use_all_reduce:
@@ -927,8 +1017,8 @@ class MixtureOfExperts(Module):
             output = (output, hidden_states)
         return output
 
-    def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params, side_stream_id):
+    def forward_experts(self, hidden_states, token_selected_experts,
+                        token_final_scales, lora_layer_params, side_stream_id):
 
         groupwise_quant_params = MoeGroupwiseQuantParams()
         if self.quant_mode.has_fp8_qdq():
@@ -1025,7 +1115,8 @@ class MixtureOfExperts(Module):
         output = _moe_plugin(self.moe_config,
                              hidden_states_quant,
                              hidden_states,
-                             routing,
+                             token_selected_experts,
+                             token_final_scales,
                              expert_weights_1=self.fc.weight.value,
                              expert_weights_2=self.proj.weight.value,
                              expert_bias_1=self.fc.bias,
@@ -1037,7 +1128,6 @@ class MixtureOfExperts(Module):
                              expert_scale_5=scale_5,
                              expert_scale_6=scale_6,
                              groupwise_quant_params=groupwise_quant_params,
-                             finished=finished,
                              hidden_size=self.hidden_size,
                              ffn_hidden_size=self.expert_inter_size,
                              act_fn=self.hidden_act,
@@ -1122,6 +1212,12 @@ class MoeOOTB(MOE):
             raise ValueError(
                 f"OOTB MOE does not support weight only quantization now, current quant mode: {self.quant_mode}"
             )
+
+        if get_sm_version() >= 100:
+            raise RuntimeError(
+                "MoeOOTB does not support SM version >= 100, please use SM version < 100"
+            )
+
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
 
         tp_size = 1
@@ -1173,8 +1269,8 @@ class MoeOOTB(MOE):
             weight_index=expert_idx,
         )
 
-    def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params, side_stream_id):
+    def forward_experts(self, hidden_states, token_selected_experts,
+                        token_final_scales, lora_layer_params, side_stream_id):
         assert side_stream_id == SideStreamIDType.disable, "MoeOOTB does not support using side stream"
         # TODO: https://nvbugspro.nvidia.com/bug/4781396 after this nvbug is fixed, we will remove this check.
         if lora_layer_params is not None:
@@ -1184,12 +1280,8 @@ class MoeOOTB(MOE):
                         f"MoE  OOTB does not support {module} LoRA module, please enable MoE plugin"
                     )
 
-        if self.moe_config.normalization_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
-            topk_values, topk_indices = topk(routing, self.top_k, dim=-1)
-            topk_values = softmax(topk_values, -1)
-        else:
-            router_probs = softmax(routing, -1)
-            topk_values, topk_indices = topk(router_probs, self.top_k, dim=-1)
+        topk_indices = token_selected_experts
+        topk_values = token_final_scales
 
         hidden_size = shape(hidden_states, -1)
         # [B*sq, hidden]

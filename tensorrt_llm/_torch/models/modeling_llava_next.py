@@ -21,7 +21,8 @@ class LlavaNextInputProcessor(InputProcessor):
 
     def __init__(self, model_path, model_config, tokenizer):
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path)
+        self.processor = AutoProcessor.from_pretrained(model_path,
+                                                       use_fast=True)
         self.model_config = model_config
 
         model = LlavaNextForConditionalGeneration.from_pretrained(
@@ -33,8 +34,11 @@ class LlavaNextInputProcessor(InputProcessor):
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, images):
         return [
-            self.processor(text="dummy", images=image,
-                           return_tensors="pt")['pixel_values'][0].to(
+            self.processor(text="dummy",
+                           images=image,
+                           do_rescale=not isinstance(image, torch.Tensor),
+                           return_tensors="pt",
+                           device=self.device)['pixel_values'][0].to(
                                self.device) for image in images
         ]
 

@@ -1433,7 +1433,7 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
 
         // Encoder tokens (i.e. KV tokens).
         if (head_idx == (kv_head_idx * params.qheads_per_kv_head) && token_idx < encoder_seq_len
-            && store_encoder_kv_cache)
+            && store_encoder_kv_cache && params.kv_cache_buffer.data != nullptr)
         {
             // The global token idx in all sequences.
             int global_token_idx = token_idx + encoder_seq_offset;
@@ -1545,6 +1545,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         {
         case 32: invokeUpdateKvCacheForCrossAttention<1024, 32, T, TCache, KVCacheBuffer>(params, stream); break;
         case 64: invokeUpdateKvCacheForCrossAttention<1024, 64, T, TCache, KVCacheBuffer>(params, stream); break;
+        case 72: invokeUpdateKvCacheForCrossAttention<1008, 72, T, TCache, KVCacheBuffer>(params, stream); break;
         case 128: invokeUpdateKvCacheForCrossAttention<1024, 128, T, TCache, KVCacheBuffer>(params, stream); break;
         case 256: invokeUpdateKvCacheForCrossAttention<1024, 256, T, TCache, KVCacheBuffer>(params, stream); break;
         default: TLLM_CHECK_WITH_INFO(false, "Not supported."); break;

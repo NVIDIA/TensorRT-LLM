@@ -269,7 +269,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, params.stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(params.stream);
         }
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
@@ -338,7 +338,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         preprocessingParms.rotary_vision_length = params.rotary_vision_length;
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, params.stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
 
         // Build runner parameters.
         TllmGenFmhaRunnerParams tllmRunnerParams;

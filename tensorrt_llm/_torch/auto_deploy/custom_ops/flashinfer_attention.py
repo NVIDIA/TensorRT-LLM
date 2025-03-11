@@ -1,21 +1,11 @@
 from dataclasses import dataclass, fields
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Union
 
 import flashinfer
 import torch
 
 from ..utils.cuda_graph import cuda_graph_state
-from .attention_interface import (
-    AttentionDescriptor,
-    AttentionInfo,
-    AttentionRegistry,
-    BufferInitializerDict,
-    CacheInitializerDict,
-    Constant,
-    MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
-)
+from .attention_interface import AttentionDescriptor, AttentionRegistry, SequenceInfo
 
 
 @dataclass
@@ -35,6 +25,13 @@ class PlanParams:
     rope_theta: Optional[float] = None
     rope_scale: Optional[float] = None
     causal: bool = True
+
+    def __post_init__(self):
+        self.pos_embd_mode = {
+            None: "NONE",
+            "rope": "ROPE_LLAMA",
+            "alibi": "ALIBI",
+        }[self.pos_embd_mode]
 
     def __hash__(self):
         """Convert all fields to a string representation and concatenate them."""
@@ -221,7 +218,9 @@ def flashinfer_mha_with_cache(
     workspace_buffer: torch.Tensor,
     # CONSTANTS
     fuse_rope: bool,
-    rope_theta: Optional[float],
+    rope_mode: Optional[str],
+    rope_theta: float,
+    rope_scale: float,
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
@@ -244,13 +243,19 @@ def flashinfer_mha_with_cache(
         page_size=k_cache.shape[1],
         q_dtype=q.dtype,
         kv_dtype=k_cache.dtype,
-        pos_embd_mode="ROPE_LLAMA" if fuse_rope else "NONE",
+        pos_embd_mode=rope_mode if fuse_rope else None,
         rope_theta=rope_theta,
+        rope_scale=rope_scale,
     )
 
     # TODO: Get flashinfer fuse_rope working with fp8 kv cache (https://github.com/flashinfer-ai/flashinfer/issues/661)
-    if rope_theta is not None:
-        q, k = flashinfer.apply_rope(q, k, qo_indptr, offsets, rope_theta=rope_theta)
+    if not fuse_rope:
+        if rope_mode == "rope":
+            q, k = flashinfer.apply_rope(
+                q, k, qo_indptr, offsets, rope_scale=rope_scale, rope_theta=rope_theta
+            )
+        elif rope_mode is not None:
+            raise ValueError(f"Unknown positional embedding mode: {rope_mode}.")
 
     # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
     k_scale, v_scale = 1.0, 1.0
@@ -308,7 +313,9 @@ def flashinfer_mha_with_cache_fake(
     workspace_buffer: torch.Tensor,
     # CONSTANTS
     fuse_rope: bool,
-    rope_theta: Optional[float],
+    rope_mode: Optional[str],
+    rope_theta: float,
+    rope_scale: float,
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
@@ -318,34 +325,35 @@ def flashinfer_mha_with_cache_fake(
 @AttentionRegistry.register("FlashInfer")
 class FlashInferAttention(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
+    def is_paged(cls):
         """Return if the attention op is paged or not."""
         return True
 
     @classmethod
-    def get_attention_op(cls) -> MHACallable:
+    def get_attention_op(cls):
         return torch.ops.attention.flashinfer_mha_with_cache
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
+    def get_prepare_metadata_op(cls):
         return torch.ops.attention.prepare_flashinfer_metadata, 5
 
     @classmethod
-    def get_cache_initializers(cls, attention_info: AttentionInfo) -> CacheInitializerDict:
+    def get_cache_initializers(cls, get_info):
         def _get_cache(si: SequenceInfo):
+            attention_info = get_info()
             return torch.empty(
                 si.num_pages,
                 si.page_size,
                 attention_info.num_kv_heads,
                 attention_info.head_dim,
                 device=si.device,
-                dtype=attention_info.cache_dtype or attention_info.dtype,
+                dtype=attention_info.cache_config.dtype or attention_info.dtype,
             )
 
         return {"k_cache": _get_cache, "v_cache": _get_cache}
 
     @classmethod
-    def get_global_buffer_initializers(cls, attention_info) -> BufferInitializerDict:
+    def get_global_buffer_initializers(cls, get_info):
         def _init_workspace(si: SequenceInfo) -> torch.Tensor:
             buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=si.device)
             _GlobalFlashInferPlanner.init_workspace(buffer)
@@ -354,10 +362,13 @@ class FlashInferAttention(AttentionDescriptor):
         return {"workspace_buffer": _init_workspace}
 
     @classmethod
-    def get_constants(cls, attention_info) -> List[Constant]:
+    def get_constants(cls, attention_info):
+        pos_embd_config = attention_info.pos_embd_config
         return [
             False,  # fuse_rope
-            attention_info.rope_theta,  # rope_theta
+            pos_embd_config.mode,  # pos_embd_mode
+            pos_embd_config.rope_theta,  # rope_theta
+            pos_embd_config.rope_scale,  # rope_scale
             1.0,  # k_scale
             1.0,  # v_scale
         ]

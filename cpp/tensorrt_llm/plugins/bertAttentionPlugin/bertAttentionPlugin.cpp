@@ -362,7 +362,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         params.fmhaBmm2Scale = scale_bmm2_ptr;
     }
     invokeBuildDecoderInfo(params, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     auto const gemm_data_type = tc::CudaDataType<T>::value;
     int const attention_seq_len_1 = request_seq_len; // q length
@@ -402,7 +402,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         if (mSageAttn && mHeadSize == 80 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
             && mSageAttnVBlockSize == 256)
@@ -424,7 +424,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         if (mSageAttn && mHeadSize == 128 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
             && mSageAttnVBlockSize == 256)
@@ -446,7 +446,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         if (mSageAttn && mHeadSize == 128 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
             && mSageAttnVBlockSize == 32)
@@ -468,7 +468,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         if (mSageAttn && mHeadSize == 80 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
             && mSageAttnVBlockSize == 32)
@@ -490,7 +490,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         if (mSageAttn && mHeadSize == 72 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
             && mSageAttnVBlockSize == 32)
@@ -512,7 +512,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         // Construct the fmha params for running kernels.
@@ -545,7 +545,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 
         // Run the fmha kernel.
         mFMHARunner->run(fmhaParams);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         if (mSageAttn)
         {
             if (paddedHeadSize != mHeadSize && mHeadSize == 72)
@@ -667,7 +667,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 request_seq_len, mNumHeads, mHeadSize, padding_offset, (float*) nullptr, 0, stream);
         }
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

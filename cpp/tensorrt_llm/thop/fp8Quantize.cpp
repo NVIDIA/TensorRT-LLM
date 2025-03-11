@@ -50,10 +50,12 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
     // row major, add padding required by the sm90 fp8_block_scaling gemm kernel
     at::Tensor valueE4M3 = at::detail::empty_cuda(
         {m_padded, n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
-    int64_t scaleSize = mGemmRunner.getActScaleSize(m, n);
+    int64_t scaleSizeInBytes = mGemmRunner.getActScaleSize(m, n); // 128-byte aligned
+    int64_t elementSize = scaleSizeInBytes / torch::elementSize(FP8_BLOCK_SCALING_SF_DTYPE);
+
     // col major
     at::Tensor scaleFP8SF = at::detail::empty_cuda(
-        {scaleSize}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+        {elementSize}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
 
     __nv_fp8_e4m3* act_buffer = reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr());
     float* act_scale_buffer = reinterpret_cast<float*>(scaleFP8SF.data_ptr());
@@ -100,9 +102,10 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
     at::Tensor valueE4M3 = at::detail::empty_cuda(
         {b * m_padded * n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
 
-    int64_t act_scale_size = mGemmRunner.getActScaleSize(m, b * n);
+    int64_t scaleSizeInBytes = mGemmRunner.getActScaleSize(m, b * n);
+    int64_t elementSize = scaleSizeInBytes / torch::elementSize(FP8_BLOCK_SCALING_SF_DTYPE);
     at::Tensor scaleFP8SF = at::detail::empty_cuda(
-        {act_scale_size}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+        {elementSize}, FP8_BLOCK_SCALING_SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
 
     __nv_fp8_e4m3* act_buffer = reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr());
     float* act_scale_buffer = reinterpret_cast<float*>(scaleFP8SF.data_ptr());

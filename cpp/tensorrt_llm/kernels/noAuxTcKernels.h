@@ -25,9 +25,9 @@
 namespace tensorrt_llm::kernels
 {
 
-template <typename T>
-void invokeNoAuxTc(T* scores, T* group_scores, T* scores_with_bias, int64_t const num_tokens, int64_t const num_experts,
-    int64_t const n_group, int64_t const topk_group, int64_t const topk, double const routed_scaling_factor,
-    cudaStream_t const stream = 0);
+template <typename T, typename IdxT>
+void invokeNoAuxTc(T* scores, T* group_scores, T* topk_values, IdxT* topk_indices, T* scores_with_bias,
+    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group, int64_t const topk_group,
+    int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream = 0);
 
 } // namespace tensorrt_llm::kernels

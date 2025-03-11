@@ -27,31 +27,37 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
             topk_node = node
 
-            # Step 2: Trace backwards within the region to find the gate linear node.
+            # Identify routing_weights and selected_experts from the output of topk node
+            topk_output_mapping = {n.args[1]: n for n in topk_node.users}
+            routing_weights, selected_experts = topk_output_mapping[0], topk_output_mapping[1]
+
+            # Step 2: Identify normalized_routing_weights
+            normalized_routing_weights = _find_normalized_routing_weights(
+                routing_weights, boundary=end_boundary
+            )
+
+            # Step 3: Trace backwards within the region to find the gate linear node and extract hidden_states
             gate_linear_node = _find_gate_linear_node(topk_node, boundary=start_boundary)
             if gate_linear_node is None:
                 continue
-
-            # Extract hidden_states (input to gate) and router_logits (output of gate linear)
             hidden_states = gate_linear_node.args[0]
-            router_logits = gate_linear_node  # gate linear output
-            top_k = topk_node.args[1]
 
-            # Step 3: Extract expert branch weights from the topk node (restricted by region).
+            # Step 4: Extract expert branch weights from the topk node (restricted by region).
             expert_weights = _extract_expert_weights_from_topk(topk_node, boundary=end_boundary)
             if not expert_weights:
                 continue
 
-            # Step 4: Identify the final GEMM output before the residual boundary.
+            # Step 5: Identify the final GEMM output before the residual boundary.
             final_hidden_state_node = _find_final_hidden_state_node(end_boundary)
             if final_hidden_state_node is None:
                 continue
 
-            # Step 5: Insert the moe op into the graph.
+            # Step 6: Insert the moe op into the graph.
             ad_logger.debug(
                 f"""Found MoE Pattern: between boundary {start_boundary} and {end_boundary}.\n
                 Capturing gate node: {gate_linear_node}, input hidden states node: {hidden_states},
-                router_logits node: {router_logits}, top_k : {top_k}, expert weights : {expert_weights} """
+                selected_experts node: {selected_experts}, routing_weights node: {normalized_routing_weights},
+                expert weights : {expert_weights} """
             )
             with graph.inserting_before(final_hidden_state_node):
                 w1_list = expert_weights["w1"]
@@ -60,7 +66,14 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
                 fused_moe_node = graph.call_function(
                     torch.ops.moe.torch_moe,
-                    args=(hidden_states, router_logits, w1_list, w2_list, w3_list, top_k),
+                    args=(
+                        hidden_states,
+                        selected_experts,
+                        normalized_routing_weights,
+                        w1_list,
+                        w2_list,
+                        w3_list,
+                    ),
                 )
 
             final_hidden_state_node.replace_all_uses_with(fused_moe_node)
@@ -88,12 +101,7 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
             continue
 
         ad_logger.debug(f"Found MoE op to fuse: {node} with args: {node.args}")
-        hidden_states = node.args[0]
-        router_logits = node.args[1]
-        w1_list = node.args[2]
-        w2_list = node.args[3]
-        w3_list = node.args[4]
-        top_k = node.args[5]
+        hidden_states, selected_experts, routing_weights, w1_list, w2_list, w3_list = node.args
 
         fused_w3_w1_experts = torch.stack(
             [
@@ -120,10 +128,10 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
                 torch.ops.moe.trtllm_fused_moe,
                 args=(
                     hidden_states,
-                    router_logits,
+                    selected_experts,
+                    routing_weights,
                     graph.get_attr(new_key_w3_w1),
                     graph.get_attr(new_key_w2),
-                    top_k,
                 ),
             )
 
@@ -173,6 +181,31 @@ def _bfs(
                 visited.add(next_node)
                 queue.append(next_node)
     raise RuntimeError(f"Could not find node with target condition {target}.")
+
+
+def _find_normalized_routing_weights(
+    routing_weights_node: Node, boundary: Optional[Node] = None
+) -> Optional[Node]:
+    """
+    Starting from the routing_weights node, use BFS to locate a node that:
+      1. Is a torch.ops.aten.to op,
+      2. And its first argument is produced by a torch.ops.aten.div_ op.
+
+    Returns:
+        The node producing the normalized routing weights, or None if not found.
+    """
+    try:
+        norm_node = _bfs(
+            routing_weights_node,
+            lambda n: is_op(n, torch.ops.aten.to)
+            and len(n.args) > 0
+            and is_op(n.args[0], torch.ops.aten.div_),
+            attr_next="users",
+            boundary=boundary,
+        )
+        return norm_node
+    except RuntimeError:
+        return None
 
 
 def _get_linear_weight_from_branch(branch_node: Node):
@@ -275,13 +308,13 @@ def _remove_dead_inplace_nodes_in_region(
     end_boundary: torch.fx.Node,
 ) -> bool:
     """
-    Searches (via BFS) for a dead in-place node (index_add_ or div_) in the region
+    Searches (via BFS) for a dead in-place node (index_add_) in the region
     between start_boundary and end_boundary. If one is found, it is removed from the graph.
     Returns True if a node was removed, False otherwise.
     """
 
     def target(n: torch.fx.Node) -> bool:
-        return is_op(n, {torch.ops.aten.index_add_, torch.ops.aten.div_}) and len(n.users) == 0
+        return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
         node_to_remove = _bfs(start_boundary, target, attr_next="users", boundary=end_boundary)

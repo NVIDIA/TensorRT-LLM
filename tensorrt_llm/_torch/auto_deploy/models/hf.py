@@ -14,6 +14,7 @@ from torch._prims_common import DeviceLikeType
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
 
+from ..custom_ops.attention_interface import CacheConfig, PositionalEmbeddingConfig
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
 
@@ -45,7 +46,8 @@ class HFFactory(ModelFactory):
         self.model_kwargs = model_kwargs or {}
         self.model_kwargs["use_cache"] = False
         self.tokenizer_kwargs = tokenizer_kwargs or {}
-        self.quantization = None
+        self._quant_config = None
+        self._pos_embd_config = None
 
         if self.ckpt_path:
             # prefetch if needed
@@ -56,7 +58,7 @@ class HFFactory(ModelFactory):
     def build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
-        if self.quantization and self.quantization.get("quant_algo", None) == "NVFP4":
+        if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
             self.model_kwargs["torch_dtype"] = torch.half
 
         model_config = AutoConfig.from_pretrained(
@@ -75,17 +77,40 @@ class HFFactory(ModelFactory):
         if hasattr(model, "post_init"):
             model.post_init()
 
+        # Store positional embedding config
+        hf_config: Dict[str, Any] = getattr(model, "config", object())
+
+        # TODO: let's see how we can support more Rope variants in the future
+        self._pos_embd_config = PositionalEmbeddingConfig(
+            mode="rope" if hasattr(hf_config, "rope_theta") else None,
+            rope_theta=getattr(hf_config, "rope_theta", 0.0),
+            rope_scale=1.0,
+        )
+
         model.eval()
         return model
 
-    def get_quantization(self) -> Optional[Dict]:
-        return self.quantization
+    def get_quant_config(self) -> Dict:
+        return self._quant_config or {}
 
-    def get_positional_encoding_config(self, model: nn.Module) -> Optional[Dict[str, Any]]:
+    def get_positional_embedding_config(self):
         """Return the positional encoding configuration for the model."""
-        return {
-            "rope_theta": getattr(getattr(model, "config", {}), "rope_theta", None),
-        }
+        assert self._pos_embd_config is not None, "Please call build_model first."
+
+        return self._pos_embd_config
+
+    def get_cache_config(self):
+        """Setup cache information based on quantization information."""
+        if self._quant_config is not None and "kv_cache_quant_algo" in self._quant_config.keys():
+            kv_cache_format = self._quant_config.get("kv_cache_quant_algo", None)
+            if kv_cache_format is not None:
+                assert kv_cache_format == "FP8", (
+                    f"KV cache quantization format {kv_cache_format} is not supported."
+                )
+            kv_cache_dtype = torch.float8_e4m3fn if kv_cache_format is not None else None
+        else:
+            kv_cache_dtype = None
+        return CacheConfig(dtype=kv_cache_dtype)
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model."""
@@ -164,8 +189,8 @@ class HFFactory(ModelFactory):
                 assert quantization_config.get("producer", {}).get("name", None) == "modelopt", (
                     "Only support modelopt quantized checkpoint"
                 )
-                self.quantization = quantization_config.get("quantization", {})
+                self._quant_config = quantization_config.get("quantization", {})
 
                 # We do not quantize lm_head.
-                if "exclude_modules" not in self.quantization:
-                    self.quantization["exclude_modules"] = ["lm_head"]
+                if "exclude_modules" not in self._quant_config:
+                    self._quant_config["exclude_modules"] = ["lm_head"]

@@ -222,7 +222,7 @@ void DynamicDecodeLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
 
     mCyclicStep += 1;
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

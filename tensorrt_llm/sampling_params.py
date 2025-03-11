@@ -352,7 +352,7 @@ class SamplingParams:
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []
-        if self.bad_token_ids is not None:
+        if self.bad_token_ids:
             words = [[i] for i in self.bad_token_ids]
 
         if self.bad is None:
@@ -366,7 +366,7 @@ class SamplingParams:
 
     def _get_stop_words(self) -> List[List[int]]:
         words = []
-        if self.stop_token_ids is not None:
+        if self.stop_token_ids:
             words = [[i] for i in self.stop_token_ids]
 
         if self.stop is None:
@@ -379,7 +379,7 @@ class SamplingParams:
             return words + self._stop_word_ids
 
     def _get_stop_reasons_and_words(
-            self) -> List[Tuple[Union[str, int], List[int]]]:
+            self) -> List[Tuple[Union[str, int], List[List[int]]]]:
         stop_reasons = []
         if self.stop_token_ids is not None:
             stop_reasons.extend(self.stop_token_ids)
@@ -389,11 +389,6 @@ class SamplingParams:
             else:
                 stop_reasons.extend(self.stop)
         stop_words = self._get_stop_words()
-        if len(stop_reasons) != len(stop_words):
-            raise RuntimeError(
-                f"The number of {self.__class__.__name__}.stop_token_ids ({self.stop_token_ids}) "
-                f"and {self.__class__.__name__}.stop ({self.stop}) are inconsistent with the "
-                f"processed stop_words ({stop_words}).")
         return list(zip(stop_reasons, stop_words))
 
     def _get_sampling_config(self) -> tllme.SamplingConfig:

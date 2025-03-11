@@ -48,6 +48,7 @@ struct TrtllmGenBlockScaleGemmInfo
     Data_type dtypeC;
     Data_type dtypeAcc;
     bool transposeMmaOutput;
+    bool sliceK;
 };
 
 // clang-format off
@@ -55,9 +56,9 @@ const std::vector<TrtllmGenBlockScaleGemmInfo> trtllmGenBlockScaleGemmInfo {
     {
         GemmKernel_E4m3_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin_data,
         GemmKernel_E4m3_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin_len,
-        152576,
+        155648,
         "gemmKernel_E4m3_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a",
-        320,
+        352,
         128,
         128,
         128,
@@ -71,14 +72,15 @@ const std::vector<TrtllmGenBlockScaleGemmInfo> trtllmGenBlockScaleGemmInfo {
         Data_type::DATA_TYPE_E4M3,
         Data_type::DATA_TYPE_E4M3,
         Data_type::DATA_TYPE_FP32,
+        false,
         false
     },
     {
         GemmKernel_Fp32_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin_data,
         GemmKernel_Fp32_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin_len,
-        201728,
+        204800,
         "gemmKernel_Fp32_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a",
-        320,
+        352,
         128,
         128,
         128,
@@ -92,14 +94,15 @@ const std::vector<TrtllmGenBlockScaleGemmInfo> trtllmGenBlockScaleGemmInfo {
         Data_type::DATA_TYPE_E4M3,
         Data_type::DATA_TYPE_FP32,
         Data_type::DATA_TYPE_FP32,
+        false,
         false
     },
     {
         GemmKernel_Bfloat16_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a_cubin_data,
         GemmKernel_Bfloat16_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a_cubin_len,
-        168960,
+        172032,
         "gemmKernel_Bfloat16_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a",
-        320,
+        352,
         128,
         128,
         128,
@@ -113,6 +116,7 @@ const std::vector<TrtllmGenBlockScaleGemmInfo> trtllmGenBlockScaleGemmInfo {
         Data_type::DATA_TYPE_E4M3,
         Data_type::DATA_TYPE_BF16,
         Data_type::DATA_TYPE_FP32,
+        false,
         false
     }
 };

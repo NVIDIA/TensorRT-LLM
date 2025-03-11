@@ -84,9 +84,9 @@ python3 ../run.py --engine_dir $ENGINE_DIR --tokenizer_type "language_adapter" -
 ### Python runtime
 Currently Python runtime does not support beam_width > 1.
 
-For Python runtime, full routing information of length [num_tokens, num_languages] is required for both encoder and decoder, which stacks routing information for each token in a batch of requests.
+For Python runtime, full routing information of length [num_tokens, 1] is required for both encoder and decoder, which stacks routing information for each token in a batch of requests.
 ```
-# language_adapter_routing = get_language_adapter_routings(language_task_uid, input_ids, num_languages)
+# language_adapter_routing = get_language_adapter_routings(language_task_uid, input_ids)
 
 TEXT="Where is the nearest restaurant? Wikipedia is a free online encyclopedia written and maintained by a community of volunteers (called Wikis) through open collaboration and the use of MediaWiki, a wiki-based editing system."
 

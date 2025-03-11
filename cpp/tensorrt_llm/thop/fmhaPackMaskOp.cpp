@@ -133,7 +133,7 @@ Tensor pack_fmha_mask_by_input_helper(
     // Launch the pack mask kernel.
     auto stream = at::cuda::getCurrentCUDAStream(mask_input.get_device());
     invokeBuildPackedMask(maskParams, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return packed_mask;
 }

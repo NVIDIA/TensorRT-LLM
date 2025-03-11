@@ -73,9 +73,6 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
         reinterpret_cast<void*>(scanReduceTempMemoryStorage.data_ptr<int8_t>()), scanReduceTempMemoryBytes,
         scanedSpecDecodingGenerationLengths.data_ptr<int>(), maxSpecDecodingGenerationLengths.data_ptr<int>(), stream);
 
-    int hostMaxSpecDecodingGenerationLengths;
-    cudaMemcpyAsync(&hostMaxSpecDecodingGenerationLengths, maxSpecDecodingGenerationLengths.data_ptr<int>(),
-        sizeof(int), cudaMemcpyDeviceToHost, stream);
     tensorrt_llm::kernels::speculative_decoding::invokeConvertMaskToPackedMask(batchSize,
         scanedSpecDecodingGenerationLengths.data_ptr<int>(), maxSpecDecodingGenerationLengths.data_ptr<int>(),
         specDecodingMaskTensor.data_ptr<bool>(), nullptr, maxSpecDecodingTokens, maxSpecDecodingTokens + 1,

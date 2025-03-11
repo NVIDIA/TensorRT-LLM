@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
@@ -12,6 +13,7 @@ from tensorrt_llm.logger import logger
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.mpi_session import MpiSession
+from ..llmapi.utils import print_colored_debug
 
 BATCH_RESP_IN_AWAIT = os.getenv("TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT") == "1"
 
@@ -120,6 +122,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_error_queue_addr: str
     result_queue_addr: str
     stats_queue_addr: str
+    kv_cache_events_queue_addr: str
 
 
 class WorkerCommQueues(NamedTuple):
@@ -129,3 +132,53 @@ class WorkerCommQueues(NamedTuple):
     # result_queue could be an IPC address when postproc worker is enabled.
     result_queue: IntraProcessQueue | str
     stats_queue: IntraProcessQueue
+    kv_cache_events_queue: IntraProcessQueue
+
+
+def _create_rsp(response) -> ExecutorResponse:
+    client_id = response.client_id
+    if response.has_error():
+        # This error will be dispatched to the user's generate_async for the corresponding request. It won't
+        # stop the whole service.
+        rsp = ExecutorResponse(
+            client_id,
+            tensors=None,
+            # Note: error Response only has one finish reason.
+            # Since the error will be raised in the main thread, so the finish reason is not actually used.
+            finish_reasons=[tllm.FinishReason.NOT_FINISHED],
+            is_final=True,
+            sequence_index=None,
+            error=response.error_msg,
+            timestamp=time.perf_counter())
+
+    else:
+        response_result = response.result
+        tensors = ExecutorResponseTensors(
+            output_token_ids=response_result.output_token_ids,
+            context_logits=response_result.context_logits,
+            generation_logits=response_result.generation_logits,
+            log_probs=response_result.log_probs,
+            cum_log_probs=response_result.cum_log_probs,
+        )
+
+        disaggregated_params = None
+        context_phase_params = response_result.context_phase_params
+        if context_phase_params is not None:
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_only",
+                first_gen_tokens=context_phase_params.first_gen_tokens,
+                ctx_request_id=context_phase_params.req_id,
+                opaque_state=context_phase_params.opaque_state)
+
+        rsp = ExecutorResponse(client_id,
+                               tensors,
+                               finish_reasons=response_result.finish_reasons,
+                               is_final=response_result.is_final,
+                               sequence_index=response_result.sequence_index,
+                               error=None,
+                               timestamp=time.perf_counter(),
+                               disaggregated_params=disaggregated_params)
+
+        print_colored_debug(f"rsp: {rsp}\n", color="yellow")
+
+    return rsp

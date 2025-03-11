@@ -622,6 +622,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     "When FP8 KV cache is being used, paged context FMHA cannot be used without "
                     "FP8 attention.")
 
+        assert metadata.kv_lens[:metadata.num_seqs].max(
+        ) <= metadata.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {metadata.kv_lens[:metadata.num_seqs].max()} for kv cache manager."
+
         num_seqs = metadata.num_seqs
         self.wrapper.plan(
             tokens_per_block=metadata.kv_cache_manager.tokens_per_block,

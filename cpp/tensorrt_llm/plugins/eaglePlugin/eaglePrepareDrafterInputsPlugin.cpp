@@ -319,7 +319,7 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
         chunkedContextNextTokens, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens,
         prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens, mMaxNonLeavesPerLayer, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -425,7 +425,7 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
 
     invokePrepareGenEagleNetInputs(params);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

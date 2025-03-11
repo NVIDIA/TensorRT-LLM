@@ -239,7 +239,7 @@ void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cu
     // Calculate the cuMaskRows.
     buildCuMaskRows<256><<<params.batchSize, 256, 0, stream>>>(
         params.batchSize, params.actualQSeqLens, params.cuQSeqLens, params.cuMaskRows);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     // The number of mmas in the N dimension (MMA_N = 64).
     size_t mmasN
         = (divUp(params.maxKvSeqLen, size_t(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)
@@ -269,7 +269,7 @@ void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cu
     {
         TLLM_CHECK_WITH_INFO(false, "The attention mask type is not supported.");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

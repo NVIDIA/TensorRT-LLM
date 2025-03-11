@@ -197,7 +197,7 @@ public:
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, stream);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
@@ -252,7 +252,7 @@ public:
         preprocessingParms.rotary_vision_length = xqaParams.rotary_vision_length;
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
@@ -288,7 +288,7 @@ public:
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
                 check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
                     sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error();
+                sync_check_cuda_error(stream);
             }
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
                 xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
@@ -336,7 +336,7 @@ public:
                 1, isGmmaKernel ? 3 : 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         if (needOutputCvt)
         {
@@ -344,7 +344,7 @@ public:
                 static_cast<T const*>(launchParams.output),
                 xqaParams.head_size * xqaParams.num_q_heads * xqaParams.total_num_input_tokens, xqaParams.fp8_out_scale,
                 stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
     }
 

@@ -63,7 +63,7 @@ namespace
 // Abstract class for routing config
 struct RoutingConfig
 {
-    virtual void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) = 0;
+    virtual void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) = 0;
     virtual std::string getName() = 0;
     virtual bool isDeterministic() const = 0;
     virtual bool supportsConfig(int64_t num_experts, int64_t k, int64_t num_tokens) const = 0;
@@ -84,10 +84,20 @@ struct LoadBalancedRoutingConfig : public RoutingConfig
         return true;
     }
 
-    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) override
     {
-        nvinfer1::DataType type = nvinfer1::DataType::kFLOAT;
-        makeLoadBalancedRoutingConfiguration(routing_output, num_experts, num_tokens, k, type, streamPtr->get());
+        std::vector<int> h_selected_experts(k * num_tokens, 0);
+        int stride = tensorrt_llm::common::ceilDiv(num_experts, k);
+        for (int token = 0; token < num_tokens; token++)
+        {
+            for (int i = 0; i < k; i++)
+            {
+                h_selected_experts[token * k + i] = (token + i * stride) % num_experts;
+            }
+        }
+
+        check_cuda_error(cudaMemcpyAsync(selected_experts, h_selected_experts.data(),
+            h_selected_experts.size() * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
@@ -102,18 +112,21 @@ struct LoadBalancedRoutingConfig : public RoutingConfig
  */
 struct RandomDistributionRoutingConfig : public RoutingConfig
 {
+    using ElementType = float;
     std::mt19937_64 twister{0xD5};
     std::vector<float> probabilities;
-    std::pair<int64_t, int64_t> shape;
+    int64_t num_experts;
+    int64_t k;
     std::string name;
 
-    RandomDistributionRoutingConfig(std::vector<float> const& in_probabilities, std::pair<int64_t, int64_t> shape,
+    RandomDistributionRoutingConfig(std::vector<ElementType> const& in_probabilities, int64_t num_experts, int64_t k,
         std::string name = "random_distribution")
         : probabilities(std::move(in_probabilities))
-        , shape(std::move(shape))
+        , num_experts(num_experts)
+        , k(k)
         , name(std::move(name))
     {
-        TLLM_CHECK_WITH_INFO(shape.second == probabilities.size(),
+        TLLM_CHECK_WITH_INFO(num_experts == probabilities.size(),
             "Cannot create random routing distribution. Number of experts does not match the number of weights");
     }
 
@@ -147,10 +160,10 @@ struct RandomDistributionRoutingConfig : public RoutingConfig
         }
     }
 
-    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) override
     {
         TLLM_CHECK(num_experts == probabilities.size());
-        std::vector<float> input(num_experts * num_tokens, 0);
+        std::vector<int> h_selected_experts(k * num_tokens, 0);
         std::vector<int> selected;
         float max = std::accumulate(probabilities.begin(), probabilities.end(), 0.0f);
         // TODO Put this on the GPU
@@ -162,19 +175,16 @@ struct RandomDistributionRoutingConfig : public RoutingConfig
             {
                 doSample(curr_max, selected);
             }
-            for (auto selection : selected)
-            {
-                input[token * num_experts + selection] = 1.f;
-            }
+            std::copy(selected.begin(), selected.end(), h_selected_experts.begin() + token * k);
         }
-        check_cuda_error(cudaMemcpyAsync(
-            routing_output, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice, streamPtr->get()));
+        check_cuda_error(cudaMemcpyAsync(selected_experts, h_selected_experts.data(),
+            h_selected_experts.size() * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
-    bool supportsConfig(int64_t num_experts, int64_t, int64_t) const override
+    bool supportsConfig(int64_t num_experts_, int64_t, int64_t) const override
     {
-        return num_experts == shape.second;
+        return num_experts == num_experts_;
     }
 };
 
@@ -195,13 +205,13 @@ struct UniformRoutingConfig : public RoutingConfig
         return false;
     }
 
-    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) override
     {
-        std::uniform_real_distribution<float> dist(-1, 1);
-        std::vector<float> input(num_experts * num_tokens);
+        std::uniform_int_distribution<int> dist(0, num_experts - 1);
+        std::vector<int> input(k * num_tokens);
         std::generate(input.begin(), input.end(), [&] { return dist(twister); });
         check_cuda_error(cudaMemcpyAsync(
-            routing_output, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice, streamPtr->get()));
+            selected_experts, input.data(), input.size() * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
@@ -216,13 +226,17 @@ struct UniformRoutingConfig : public RoutingConfig
  */
 struct VectoredRoutingConfig : public RoutingConfig
 {
-    std::vector<float> config;
-    std::pair<int64_t, int64_t> shape;
+    using ElementType = int;
+    std::vector<int> config;
+    int64_t num_experts;
+    int64_t k;
     std::string name;
 
-    VectoredRoutingConfig(std::vector<float> config, std::pair<int64_t, int64_t> shape, std::string name = "vectored")
+    VectoredRoutingConfig(
+        std::vector<ElementType> config, int64_t num_experts, int64_t k, std::string name = "vectored")
         : config(config)
-        , shape(shape)
+        , num_experts(num_experts)
+        , k(k)
         , name(name)
     {
     }
@@ -237,21 +251,21 @@ struct VectoredRoutingConfig : public RoutingConfig
         return true;
     }
 
-    void setRouting(float* routing_output, int64_t num_experts, int64_t k, int64_t num_tokens) override
+    void setRouting(int* selected_experts, int64_t num_experts, int64_t k, int64_t num_tokens) override
     {
-        assert(shape.second == num_experts);
-        for (int64_t i = 0; i < num_tokens; i += shape.first)
+        for (int64_t i = 0; i < num_tokens; i += config.size())
         {
-            int num_to_copy = std::min(num_tokens - i, shape.first);
-            check_cuda_error(cudaMemcpyAsync(routing_output + i * num_experts, config.data(),
-                num_to_copy * num_experts * sizeof(float), cudaMemcpyHostToDevice, streamPtr->get()));
+            int64_t num_to_copy = std::min(num_tokens - i, (int64_t) config.size());
+            check_cuda_error(cudaMemcpyAsync(
+                selected_experts, config.data(), num_to_copy * sizeof(int), cudaMemcpyHostToDevice, streamPtr->get()));
+            selected_experts += num_to_copy;
         }
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
-    bool supportsConfig(int64_t num_experts, int64_t, int64_t) const override
+    bool supportsConfig(int64_t num_experts_, int64_t k_, int64_t) const override
     {
-        return shape.second == num_experts;
+        return num_experts_ == num_experts && k_ == k;
     }
 };
 
@@ -292,7 +306,7 @@ public:
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
-    float* mInputProbabilities{};
+    int* mSelectedExperts{};
     DataType* mInputTensor{};
 
     int64_t mHiddenSize{};
@@ -390,7 +404,7 @@ public:
         assert(bufferManager);
         if (shouldSkip())
         {
-            s.SkipWithMessage("GPU does not support FP8");
+            s.SkipWithMessage("GPU does not support dtype");
         }
 
         // Makes sure nothing from a previous iteration hangs around
@@ -433,19 +447,17 @@ public:
 
     OutputType* mFinalOutput{};
     int* mSourceToExpandedMap;
-    int* mSelectedExpert;
     int64_t mInterSize{};
     int64_t mTotalTokens{};
 
     int mRoutingConfigIndex = 0;
 
     bool mUseBias = true;
-
+    bool mUseFinalScale = true;
     bool mIsGated = false;
     int mGatedMultiplier = 1;
 
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
-    MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
 
     QuantParams mQuantParams{};
     bool mUseLora = false;
@@ -458,11 +470,12 @@ public:
     template <class T>
     T* allocBuffer(size_t size)
     {
-        auto i_buffer = bufferManager->gpu(size * sizeof(T));
+        size_t size_padded = ceilDiv(size * sizeof(T), 128) * 128;
+        auto i_buffer = bufferManager->gpu(size_padded);
         check_cuda_error(cudaGetLastError());
         managed_buffers.emplace_back(std::move(i_buffer));
         T* ptr = static_cast<T*>(managed_buffers.back()->data());
-        check_cuda_error(cudaMemsetAsync(ptr, 0x0, size * sizeof(T), streamPtr->get()));
+        populateRandomBuffer(ptr, size_padded, streamPtr->get());
         return ptr;
     }
 
@@ -483,7 +496,7 @@ public:
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, mNormMode, {}, mUseLora, /*use_fp8_block_scaling=*/false, mUsePrequantScale);
+            mActType, {}, mUseLora, /*use_fp8_block_scaling=*/false, mUsePrequantScale);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -530,17 +543,16 @@ public:
                 mExpertFP4ActScale2, mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
         }
 
-        mInputProbabilities = allocBuffer<float>(mTotalTokens * mNumExperts);
+        mSelectedExperts = allocBuffer<int>(mTotalTokens * mK);
         mScaleProbs = allocBuffer<float>(mTotalTokens * mK);
         mInputTensor = allocBuffer<DataType>(mTotalTokens * mHiddenSize);
         mFinalOutput = allocBuffer<OutputType>(mTotalTokens * mHiddenSize);
 
         mSourceToExpandedMap = allocBuffer<int>(mTotalTokens * mK);
-        mSelectedExpert = allocBuffer<int>(mTotalTokens * mK);
 
         mRoutingConfigIndex = routing_config;
         auto tactic = routingConfigCache.at(routing_config);
-        tactic->setRouting(mInputProbabilities, mNumExperts, mK, mTotalTokens);
+        tactic->setRouting(mSelectedExperts, mNumExperts, mK, mTotalTokens);
 
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
@@ -578,7 +590,7 @@ public:
         auto tactic = routingConfigCache.at(mRoutingConfigIndex);
         if (!tactic->isDeterministic())
         {
-            tactic->setRouting(mInputProbabilities, mNumExperts, mK, mTotalTokens);
+            tactic->setRouting(mSelectedExperts, mNumExperts, mK, mTotalTokens);
         }
 
         {
@@ -716,10 +728,10 @@ public:
     void runMoEPermute(MOEParallelismConfig parallelism_config)
     {
         auto stream = streamPtr->get();
-        mMoERunner.runMoe(mInputTensor, mInputProbabilities, mExpertWeight1, mExpertBias1, mActType, mExpertWeight2,
-            mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace,
-            mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, 0.01,
-            parallelism_config, mNormMode, mUseLora, mLoraParams, /*use_fp8_block_scaling=*/false, stream);
+        mMoERunner.runMoe(mInputTensor, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr, mExpertWeight1,
+            mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize,
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, mLoraParams,
+            /*use_fp8_block_scaling=*/false, stream);
     }
 
     void runBenchmark(benchmark::State& state);
@@ -738,8 +750,8 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     int const world_rank = state.range(6);
     int const num_tokens = state.range(7);
     mUseBias = state.range(8);
-    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(9));
-    mNormMode = static_cast<MOEExpertScaleNormalizationMode>(state.range(10));
+    mUseFinalScale = state.range(9);
+    mActType = static_cast<tensorrt_llm::ActivationType>(state.range(10));
     int tactic_idx1 = state.range(11);
     int tactic_idx2 = state.range(12);
     int const routing_config = state.range(13);
@@ -753,15 +765,15 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["world_rank"] = world_rank;
     state.counters["num_tokens"] = num_tokens;
     state.counters["use_bias"] = (int) mUseBias;
+    state.counters["use_final_scale"] = (int) mUseFinalScale;
     state.counters["act_fn"] = (int) mActType;
-    state.counters["norm_mode"] = (int) mNormMode;
     state.counters["routing_config"] = (int) routing_config;
     state.counters["dtype"] = (int) toDTypeID();
 
     std::stringstream ss;
-    ss << "Experts,K,Hidden,Inter,TP,EP,Rank,Tokens,Bias,Actfn,Norm Mode,Tactic,Routing=";
+    ss << "Experts,K,Hidden,Inter,TP,EP,Rank,Tokens,Bias,Scale,Actfn,Tactic,Routing=";
     for (auto v : {num_experts, top_k, hidden_size, inter_size, tp_size, ep_size, world_rank, num_tokens,
-             (int) mUseBias, (int) mActType, (int) mNormMode, tactic_idx1, tactic_idx2})
+             (int) mUseBias, (int) mUseFinalScale, (int) mActType, tactic_idx1, tactic_idx2})
     {
         ss << v << ",";
     }

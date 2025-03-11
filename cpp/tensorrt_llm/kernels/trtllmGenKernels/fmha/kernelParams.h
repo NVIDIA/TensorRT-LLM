@@ -474,7 +474,7 @@ struct KernelParams
 
     // Build tma descriptors.
     template <class FmhaOptions>
-    static CUtensorMap buildNdTmaDescriptor(FmhaOptions const& options, Data_type dtypeElt, int32_t headDim,
+    static CUtensorMap buildNdTmaDescriptor(FmhaOptions const& options, Data_type dtypeElt,
         std::vector<uint64_t> const& shapes, std::vector<uint64_t> const& strides,
         std::vector<uint32_t> const& tileShapes, void* gmemAddr, bool swizzled = true)
     {
@@ -500,26 +500,26 @@ struct KernelParams
 
         // The swizzle type.
         CUtensorMapSwizzle swizzleType;
-        int32_t headSizeInBytes = headDim * get_size_in_bits(dtypeElt) / 8 /*bits*/;
+        int32_t numBytesInLeadingDim = tileShapes[0] * get_size_in_bits(dtypeElt) / 8 /*bits*/;
         if (!swizzled)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
         }
-        else if ((headSizeInBytes % 128) == 0)
+        else if ((numBytesInLeadingDim % 128) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
         }
-        else if ((headSizeInBytes % 64) == 0)
+        else if ((numBytesInLeadingDim % 64) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
         }
-        else if ((headSizeInBytes % 32) == 0)
+        else if ((numBytesInLeadingDim % 32) == 0)
         {
             swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(false, "Unexpected headSizeInBytes %d", headSizeInBytes);
+            TLLM_CHECK_WITH_INFO(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
         }
 
         // Check gmem address must be 16B-aligned
@@ -561,7 +561,9 @@ struct KernelParams
 
         if (result != CUDA_SUCCESS)
         {
-            std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+            char const* err_str;
+            cuGetErrorString(result, &err_str);
+            std::cerr << "Error: Failed to initialize the TMA descriptor due to " << err_str << std::endl;
             std::cerr << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr
                       << std::endl;
             std::cerr << "Shape: " << shapes[0] << " " << shapes[1] << " " << shapes[2] << " " << shapes[3] << " "
@@ -612,7 +614,7 @@ struct KernelParams
             = makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
         // Build tma descriptor for Q.
         params.tmaQ_ = buildNdTmaDescriptor(
-            options, kernelMeta.mDataTypeQ, options.mHeadDimQk, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
+            options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qPtr));
 
         // The number of keys per tile.
         int32_t numKeysPerTile = isPagedKv(options.mQkvLayout)
@@ -636,11 +638,11 @@ struct KernelParams
         tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor;
         tileShapeKv[1] = numKeysPerTile;
         // Build tma descriptor for K.
-        params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, maxHeadDimKv, shapeK, strideK, tileShapeKv,
+        params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
             /*swizzled = */ !transformsKv);
         // Build tma descriptor for V.
-        params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, maxHeadDimKv, shapeV, strideV, tileShapeKv,
+        params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
             /*swizzled = */ !transformsKv);
 
@@ -661,13 +663,13 @@ struct KernelParams
             // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into (16, tileSizeKv *
             // headDim / NumEltsPerSf / 16). See makeTmaShapeStrideKvSf for details. Build tma descriptor
             // for K SF.
-            params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, maxHeadDimKv, shapeKvSf, strideKvSf,
-                tileShapeKvSf, const_cast<void*>(options.kSfBasePtr),
+            params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
+                const_cast<void*>(options.kSfBasePtr),
                 /*swizzled = */ false);
 
             // Build tma descriptor for V SF.
-            params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, maxHeadDimKv, shapeKvSf, strideKvSf,
-                tileShapeKvSf, const_cast<void*>(options.vSfBasePtr),
+            params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf, tileShapeKvSf,
+                const_cast<void*>(options.vSfBasePtr),
                 /*swizzled = */ false);
         }
 
@@ -678,8 +680,8 @@ struct KernelParams
         tileShapeO[0] = numEltsInClampedHeadDimQ;
         tileShapeO[1] = kernelMeta.mTileSizeQ;
         // Build tma descriptor for O.
-        params.tmaO_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, options.mHeadDimV, shapeO, strideO,
-            tileShapeO, const_cast<void*>(options.oPtr));
+        params.tmaO_ = buildNdTmaDescriptor(
+            options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
 
         // Set the other kernel parameters.
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;

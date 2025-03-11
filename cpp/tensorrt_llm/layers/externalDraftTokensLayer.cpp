@@ -395,7 +395,7 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
         invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
 
     tksd::invokeAcceptDraftTokens(batchSize, bufferCast<T>(*inputs->draftProbs), bufferCast<T>(*inputs->targetProbs),
         bufferCast<SizeType32>(*inputs->numDraftTokens), bufferCast<bool>(*inputs->useDraftLogits),
@@ -404,7 +404,7 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
         inputs->useRandomAcceptanceThreshold, inputs->constantThreshold, inputs->step,
         bufferCast<bool>(*mBatchIsAccepted), bufferCast<SizeType32>(*mTargetOutputIds), getStream());
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -603,7 +603,7 @@ void ExternalDraftTokensLayer<T>::forwardAcceptedTokens(std::shared_ptr<BaseDeco
         bufferCast<TokenIdType>(*inputs->draftTokenIds), bufferCastOrNull<TokenIdType*>(outputs->outputIdsPtr),
         inputs->step, maxTokensPerStep, bufferCastOrNull<TokenIdType>(inputs->endIds), finishedOutput, getStream());
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

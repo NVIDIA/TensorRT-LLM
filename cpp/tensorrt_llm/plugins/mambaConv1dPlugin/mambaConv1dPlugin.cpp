@@ -197,7 +197,7 @@ int MambaConv1dPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     {
         invokeMambaConv1dGeneration<T>(mambaConv1dParams, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

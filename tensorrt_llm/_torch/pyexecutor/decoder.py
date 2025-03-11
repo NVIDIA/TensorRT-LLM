@@ -1,15 +1,23 @@
+import itertools
 from abc import ABC, abstractmethod
 from typing import Dict
 
 import torch
 
-from tensorrt_llm.bindings import executor as tllm_executor
+import tensorrt_llm.bindings as tllm
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.mapping import Mapping
 
 from .llm_request import *
 from .scheduler import ScheduledRequests
 
 
 class Decoder(ABC):
+
+    @abstractmethod
+    def setup_decoder(self, scheduled_requests: ScheduledRequests,
+                      model_outputs):
+        raise NotImplementedError
 
     @abstractmethod
     def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
@@ -29,6 +37,10 @@ class Decoder(ABC):
 
 class DummyDecoder(Decoder):
 
+    def setup_decoder(self, scheduled_requests: ScheduledRequests,
+                      model_outputs):
+        pass
+
     def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
         for request in scheduled_requests.context_requests:
             request.add_new_token(500, 0)
@@ -44,6 +56,10 @@ class BertDecoder(Decoder):
     """
     Use Decoder class for Bert model request so it will early stop
     """
+
+    def setup_decoder(self, scheduled_requests: ScheduledRequests,
+                      model_outputs):
+        pass
 
     def decode_async(self, model_outputs):
         pass
@@ -161,6 +177,10 @@ class TorchDecoder(Decoder):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
 
+    def setup_decoder(self, scheduled_requests: ScheduledRequests,
+                      model_outputs):
+        pass
+
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
 
@@ -169,19 +189,20 @@ class TorchDecoder(Decoder):
                                                   >= self.max_seq_len)
 
     def _meet_stop_token_criteria(self, request: LlmRequest):
-        if not hasattr(request, 'py_stop_words_list'):
-            return False
         assert isinstance(request.py_stop_words_list,
                           list), "request.py_stop_words_list should be a list"
-        stop_words_list = request.py_stop_words_list
-        tokens = request.get_tokens(0)
-        for stop_word in stop_words_list:
-            if isinstance(stop_word, int):
-                stop_word = [stop_word]
-            if len(stop_word) > len(tokens):
-                continue
-            if tokens[-len(stop_word):] == stop_word:
-                return True
+        if request.py_stop_words_list:
+            stop_words_list, prefix_sum = request.py_stop_words_list
+            tokens = request.get_tokens(0)
+            offset = 0
+            for i, offset_end in enumerate(prefix_sum):
+                if i > 0:
+                    offset = prefix_sum[i - 1]
+                stop_word = stop_words_list[offset:offset_end]
+                if len(stop_word) > len(tokens):
+                    continue
+                if tokens[-len(stop_word):] == stop_word:
+                    return True
         return False
 
     def _handle_stop_criteria(self, request: LlmRequest, new_token: int,
@@ -190,19 +211,19 @@ class TorchDecoder(Decoder):
         Returns True if generation should stop."""
         if new_token == request.py_end_id:
             request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(tllm_executor.FinishReason.END_ID,
+            request.set_finished_reason(tllm.executor.FinishReason.END_ID,
                                         beam_idx)
             return True
 
         if self._meet_max_token_stop_criteria(request, num_tokens):
             request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(tllm_executor.FinishReason.LENGTH,
+            request.set_finished_reason(tllm.executor.FinishReason.LENGTH,
                                         beam_idx)
             return True
 
         if self._meet_stop_token_criteria(request):
             request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(tllm_executor.FinishReason.STOP_WORDS,
+            request.set_finished_reason(tllm.executor.FinishReason.STOP_WORDS,
                                         beam_idx)
             return True
 
@@ -235,7 +256,9 @@ class TorchDecoder(Decoder):
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if request.py_draft_tokens is not None:
+            if hasattr(
+                    request,
+                    'py_draft_tokens') and request.py_draft_tokens is not None:
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
@@ -344,3 +367,228 @@ class TorchStarAttentionDecoder(TorchDecoder):
             new_token = new_tokens_list[request.output_token_idx]
             num_tokens = request.add_new_token(new_token, beam_idx)
             self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
+
+
+class Algorithms():
+
+    def defined_algorithms(self):
+        return [attr for attr in dir(self) if not attr.startswith("__")]
+
+    def __repr__(self):
+        algs = self.defined_algorithms()
+        return f"Algs({', '.join(algs)})"
+
+
+class TRTLLMDecoder(Decoder):
+
+    def __init__(
+        self,
+        executor_config: tllm.executor.ExecutorConfig,
+        model,
+        model_dtype,
+        mapping: Mapping,
+        decoding_mode: tllm.executor.DecodingMode,
+    ):
+
+        vocab_size = model.config.vocab_size
+        num_hidden_layers = model.config.num_hidden_layers
+        hidden_size = model.config.hidden_size
+        num_heads = model.config.num_attention_heads
+
+        self.model_datatype = torch_dtype_to_binding(model_dtype)
+        self.logits_datatype = tllm.DataType.FLOAT
+        self.decoding_mode = decoding_mode
+        self.executor_config = executor_config
+        self.decoding_config = self.executor_config.decoding_config if self.executor_config.decoding_config else tllm.executor.DecodingConfig(
+            decoding_mode)
+        max_attn_window = self.executor_config.kv_cache_config.max_attention_window
+        self.max_attention_window = max_attn_window if max_attn_window is not None else executor_config.max_seq_len
+        self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
+        self.max_seq_idle_microseconds = 180 * 1000 * 1000
+        self.max_decoding_tokens = 1  # It must be 1 when not in speculative decoding
+
+        self.world_config = tllm.WorldConfig.mpi(mapping.gpus_per_node,
+                                                 mapping.tp_size,
+                                                 mapping.pp_size)
+        self.model_config = tllm.ModelConfig(vocab_size, num_hidden_layers,
+                                             num_hidden_layers, 0, num_heads,
+                                             hidden_size, self.model_datatype)
+
+        self._initialize_store()
+        self._instantiate_algorithms()
+
+    def _initialize_store(self):
+        self.store = {}
+        self.store["torch_stream"] = torch.cuda.Stream()
+        self.store["cuda_stream"] = tllm.internal.runtime.CudaStream(
+            self.store["torch_stream"].cuda_stream)
+        self.store["buffer_manager"] = tllm.internal.runtime.BufferManager(
+            stream=self.store["cuda_stream"])
+        self.store[
+            "seq_slot_manager"] = tllm.internal.batch_manager.SequenceSlotManager(
+                self.max_num_sequences, self.max_seq_idle_microseconds)
+        self.store[
+            "decoder_buffers"] = tllm.internal.batch_manager.DecoderBuffers(
+                self.max_num_sequences, self.executor_config.max_beam_width,
+                self.max_attention_window, self.executor_config.max_seq_len,
+                self.max_decoding_tokens, self.store["buffer_manager"],
+                self.model_config, self.world_config)
+        self.store[
+            "decoder_input_buffers"] = tllm.internal.batch_manager.DecoderInputBuffers(
+                self.executor_config.max_batch_size, self.max_decoding_tokens,
+                self.store["buffer_manager"])
+
+    def _instantiate_algorithms(self):
+        self.algs = Algorithms()
+        self.algs.decoder = tllm.internal.runtime.GptDecoderBatched(
+            stream=self.store["cuda_stream"],
+            speculative_decoding_mode=tllm.internal.runtime.
+            SpeculativeDecodingMode.NoneType(),
+            dtype=self.logits_datatype)
+        self.algs.decoder.setup(
+            mode=self.decoding_mode,
+            max_batch_size=self.executor_config.max_batch_size,
+            max_beam_width=self.executor_config.max_beam_width,
+            max_attention_window=self.max_attention_window,
+            sink_token_length=0,
+            max_sequence_length=self.executor_config.max_seq_len,
+            max_tokens_per_step=self.max_decoding_tokens,
+            dtype=self.logits_datatype,
+            model_config=self.model_config,
+            world_config=self.world_config)
+        self.algs.assign_req_seq_slots = tllm.internal.algorithms.AssignReqSeqSlots(
+        )
+        self.algs.generate_request_options = tllm.internal.algorithms.GenerateRequestOptions(
+            speculative_decoding_fast_logits=False,
+            is_leader_in_orch_mode=False,
+            is_normalize_log_probs=False)
+        self.algs.create_new_decoder_requests = tllm.internal.algorithms.CreateNewDecoderRequests(
+        )
+        self.algs.handle_context_logits = tllm.internal.algorithms.HandleContextLogits(
+        )
+        self.algs.handle_generation_logits = tllm.internal.algorithms.HandleGenerationLogits(
+        )
+        self.algs.make_decoding_batch_input_output = tllm.internal.algorithms.MakeDecodingBatchInputOutput(
+        )
+
+    def setup_decoder(self, scheduled_requests: ScheduledRequests,
+                      model_outputs):
+        self.batch_size = scheduled_requests.batch_size
+
+        for req in itertools.chain(scheduled_requests.context_requests,
+                                   scheduled_requests.generation_requests):
+            self.beam_width = req.sampling_config.beam_width
+            break
+
+        logits = model_outputs["logits"].reshape(
+            (self.batch_size, self.beam_width, -1))
+
+        with torch.inference_mode():
+            self.algs.assign_req_seq_slots(
+                self.store["seq_slot_manager"],
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests)
+
+            batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
+                self.model_config, self.world_config, self.decoding_config,
+                scheduled_requests.context_requests,
+                self.store["buffer_manager"], self.logits_datatype,
+                self.store["decoder_input_buffers"])
+
+            if len(decoder_requests):
+                self.algs.create_new_decoder_requests(
+                    batch_slots, decoder_requests, sampling_configs,
+                    self.model_config, self.algs.decoder,
+                    self.store["cuda_stream"], self.executor_config.max_seq_len)
+
+                local_batch_size = len(batch_slots)
+                sampling_config = tllm.make_sampling_config(sampling_configs)
+                self.algs.decoder.underlying_decoder().setup(
+                    sampling_config, local_batch_size, batch_slots,
+                    self.algs.decoder.joint_decoding_output, decoder_requests)
+
+            # Note: In runtimeBuffers.cpp, num_context_logits is set to:
+            #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
+            # Revisit this when we support chunked context.
+            num_context_logits = [1] * self.batch_size
+            logits_index = self.algs.handle_context_logits(
+                scheduled_requests.context_requests, num_context_logits, logits,
+                self.store["decoder_buffers"], self.model_config,
+                self.store["buffer_manager"], self.store["cuda_stream"])
+            self.algs.handle_generation_logits(
+                logits_index, scheduled_requests.generation_requests,
+                self.store["decoder_buffers"], self.model_config,
+                self.store["buffer_manager"], logits)
+            decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests,
+                self.store["decoder_buffers"],
+                self.store["decoder_input_buffers"], self.model_config,
+                self.max_num_sequences, self.beam_width,
+                self.store["buffer_manager"], self.store["cuda_stream"])
+            self.algs.decoder.forward_async(self.decoding_output,
+                                            decoding_input)
+
+            self.decoder_event = torch.cuda.Event()
+            self.decoder_event.record()
+
+    def update_requests(self, scheduled_requests: ScheduledRequests):
+        self.decoder_event.synchronize()
+
+        # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
+        new_tokens_host = self.algs.decoder.all_new_tokens.to('cpu',
+                                                              non_blocking=True)
+        finished_sum_host = self.algs.decoder.finished_sum.to('cpu',
+                                                              non_blocking=True)
+        finish_reasons_host = self.algs.decoder.finish_reasons.to(
+            'cpu', non_blocking=True)
+        sequence_lengths_host_data = self.store[
+            "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
+
+        self.decoder_event.record()
+        self.decoder_event.synchronize()
+
+        for request in itertools.chain(scheduled_requests.context_requests,
+                                       scheduled_requests.generation_requests):
+            if request.is_context_init_state:
+                continue
+
+            seq_slot = request.seq_slot
+            num_generated_tokens = request.num_draft_tokens + 1
+            current_num_of_tokens = request.max_beam_num_tokens
+
+            num_new_tokens = [0] * self.beam_width
+            num_dropped_tokens = [0] * self.beam_width
+
+            for beam in range(self.beam_width):
+                seq_len = sequence_lengths_host_data[seq_slot * self.beam_width
+                                                     + beam].item()
+                num_new_tokens[beam] = min(
+                    num_generated_tokens,
+                    seq_len - request.get_num_tokens(beam))
+                num_dropped_tokens[
+                    beam] = num_generated_tokens - num_new_tokens[beam]
+
+                for step in range(num_new_tokens[beam]):
+                    new_token = new_tokens_host[step][seq_slot][beam]
+                    request.add_new_token(new_token, beam)
+
+                finish_reason = finish_reasons_host[seq_slot * self.beam_width +
+                                                    beam].item()
+                request.set_finished_reason(
+                    tllm.executor.FinishReason(finish_reason), beam)
+
+            # Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
+            request.update_num_tokens_per_iteration(
+                request.max_beam_num_tokens - current_num_of_tokens,
+                self.model_config)
+
+            if finished_sum_host[seq_slot] == self.beam_width:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
+        pass
+
+    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
+        self.update_requests(scheduled_requests)

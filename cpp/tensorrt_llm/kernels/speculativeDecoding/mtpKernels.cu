@@ -190,7 +190,7 @@ void invokeMTPPrepareDrafterInputs(MTPPrepareDrafterInputsParam& params, cudaStr
         reinterpret_cast<T*>(params.previousLayerHiddenStates), params.previousLayerDraftTokens, params.returnInputIds,
         reinterpret_cast<T*>(params.returnHiddenStates));
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPPrepareDrafterInputs<float>(MTPPrepareDrafterInputsParam& params, cudaStream_t stream);
@@ -341,12 +341,12 @@ void invokeMTPSampleAndAcceptDraftTokens(MTPSampleAndAcceptDraftTokensParam& par
 
     mtpGreedySampling<T, BLOCK_SIZE><<<numLogits, greedyBlockSize, 0, stream>>>(params.numMTPModules, params.batchSize,
         params.numContextRequest, params.vocabSize, reinterpret_cast<T*>(params.logits), params.targetTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     mtpAcceptDraftToken<<<divUp(params.batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(params.numMTPModules,
         params.batchSize, params.numContextRequest, params.draftTokens, reinterpret_cast<int*>(params.targetTokens),
         params.acceptedTokens, params.numAcceptedTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPSampleAndAcceptDraftTokens<float>(
@@ -464,7 +464,7 @@ void invokeMTPUpdateHiddenStates(MTPUpdateHiddenStatesParam& params, cudaStream_
         params.numContextRequest, params.hiddenSize, params.inputIds, params.seqLens,
         reinterpret_cast<T*>(params.targetModelHiddenStates), reinterpret_cast<T**>(params.mtpPastHiddenStatesPtrs),
         params.mtpPastTokensPtrs, params.numAcceptedTokens, params.acceptedTokens);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeMTPUpdateHiddenStates<float>(MTPUpdateHiddenStatesParam& params, cudaStream_t stream);

@@ -4,6 +4,8 @@ import sys
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from helpers import reference_moe_torch
 
@@ -68,6 +70,8 @@ def test_moe_op_run(dtype):
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
+    routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+    selected_experts, final_scales = routing_method.apply(router_logits)
 
     w3_w1_stacked_weight = torch.empty(
         (NUM_EXPERTS, INTERMEDIATE_SIZE * 2, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -88,11 +92,11 @@ def test_moe_op_run(dtype):
     with torch.inference_mode():
         output_no_profile = torch.ops.trtllm.fused_moe(
             x,
-            router_logits.float(),
+            selected_experts,
+            final_scales,
             w3_w1_stacked_weight,
             w2_weight,
             dtype,
-            TOP_K,
             quant_scales=None,
             tp_size=TP_SIZE,
             tp_rank=TP_RANK,
@@ -120,11 +124,11 @@ def test_moe_op_run(dtype):
     with torch.inference_mode():
         output_with_profile = torch.ops.trtllm.fused_moe(
             x,
-            router_logits.float(),
+            selected_experts,
+            final_scales,
             w3_w1_stacked_weight,
             w2_weight,
             dtype,
-            TOP_K,
             quant_scales=None,
             tp_size=TP_SIZE,
             tp_rank=TP_RANK,
@@ -135,7 +139,8 @@ def test_moe_op_run(dtype):
 
     # torch run
     with torch.inference_mode():
-        ref_output = reference_moe_torch(x, router_logits, TOP_K, weights)
+        ref_output = reference_moe_torch(x, selected_experts, final_scales,
+                                         NUM_EXPERTS, weights)
 
     # compare
     torch.cuda.synchronize()

@@ -4,6 +4,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
 IS_FLASHINFER_AVAIABLE = False
 
 if platform.system() != "Windows":
@@ -135,6 +137,31 @@ def _register_fake():
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
+
+    @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
+    def _(
+        input: torch.Tensor,
+        workspace: torch.Tensor,
+        reduce_fusion_inputs: torch.Tensor,
+        rank: int,
+        nranks: int,
+        eps: float,
+        fusion_op: int,
+    ):
+        from tensorrt_llm.functional import AllReduceFusionOp
+        residual = reduce_fusion_inputs[0]
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            sf_vec_size = 16
+            sf_use_ue8m0 = False
+            quant_shape, scale_shape = fp4_utils.get_fp4_shape(
+                input.shape, sf_vec_size, sf_use_ue8m0)
+            return torch.empty_like(
+                quant_shape, dtype=torch.uint8), torch.empty_like(
+                    scale_shape, dtype=torch.uint8), torch.empty_like(residual)
+        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return torch.empty_like(input), torch.empty_like(residual)
+        else:
+            raise ValueError(f"Unsupported fusion op: {fusion_op}")
 
 
 @torch.library.custom_op("trtllm::ub_scaled_mm_allreduce_quant_scaled_mm_op",

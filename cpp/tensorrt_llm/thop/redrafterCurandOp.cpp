@@ -71,7 +71,7 @@ void initializeDeviceCurandStates(
         tk::invokeCurandInitialize(
             curandStatePtr, batchSlotsPtr, batchSize, tensorrt_llm::layers::DefaultDecodingParams::getSeed(), stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 } // namespace
 
@@ -158,7 +158,7 @@ void prepareRandomTensors(th::Tensor& curandState, // [maxBatchSize, 48], uint8_
 #endif // ENABLE_BF16
     default: throw std::runtime_error("Unsupported tensor type.");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace torch_ext

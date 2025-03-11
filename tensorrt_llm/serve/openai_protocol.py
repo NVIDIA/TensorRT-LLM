@@ -196,28 +196,36 @@ class CompletionRequest(OpenAIBaseModel):
 
     def to_sampling_params(self) -> SamplingParams:
         sampling_params = SamplingParams(
-            top_k=self.top_k,
-            top_p=self.top_p,
-            seed=self.seed,
-            temperature=self.temperature,
-            presence_penalty=self.presence_penalty,
+            best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
+            return_log_probs=self.logprobs,
+            max_tokens=self.max_tokens,
+            n=self.n,
+            presence_penalty=self.presence_penalty,
+            seed=self.seed,
+            stop=self.stop,
+            temperature=self.temperature,
+            top_p=self.top_p,
+
+            # completion-sampling-params
+            use_beam_search=self.use_beam_search,
+            top_k=self.top_k,
+            top_p_min=self.top_p_min if self.top_p_min > 0 else None,
+            min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_tokens=self.max_tokens,
+            early_stopping=self.early_stopping,
             stop_token_ids=self.stop_token_ids,
-            stop=self.stop,
-            # NOTE: our early_stopping type definition is different from vLLM's
-            # early_stopping=self.early_stopping,
-            beam_width=self.best_of if self.best_of else self.n,
-            min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
-            add_special_tokens=self.add_special_tokens,
-            min_p=self.min_p,
             ignore_eos=self.ignore_eos,
+            min_tokens=self.min_tokens,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+
+            # completion-extra-params
+            add_special_tokens=self.add_special_tokens,
         )
-        if self.top_p_min > 0:
-            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def to_llm_disaggregated_params(self) -> LlmDisaggregatedParams:
@@ -516,27 +524,36 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_sampling_params(self) -> SamplingParams:
 
         sampling_params = SamplingParams(
-            top_p=self.top_p,
-            top_k=self.top_k,
-            seed=self.seed,
-            temperature=self.temperature,
-            beam_width=self.best_of,
-            presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
+            return_log_probs=self.logprobs,
+            max_tokens=self.max_tokens,
+            n=self.n,
+            presence_penalty=self.presence_penalty,
+            seed=self.seed,
+            stop=self.stop,
+            temperature=self.temperature,
+
+            # chat-completion-sampling-params
+            best_of=self.best_of,
+            use_beam_search=self.use_beam_search,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            top_p_min=self.top_p_min if self.top_p_min > 0 else None,
+            min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_tokens=self.max_tokens,
-            min_tokens=self.min_tokens,
+            early_stopping=self.early_stopping,
             stop_token_ids=self.stop_token_ids,
-            stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
-            return_log_probs=self.logprobs,
-            add_special_tokens=self.add_special_tokens,
-            min_p=self.min_p,
             ignore_eos=self.ignore_eos,
+            min_tokens=self.min_tokens,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+
+            # chat-completion-extra-params
+            add_special_tokens=self.add_special_tokens,
         )
-        if self.top_p_min > 0:
-            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def model_post_init(self, __context: Any) -> None:

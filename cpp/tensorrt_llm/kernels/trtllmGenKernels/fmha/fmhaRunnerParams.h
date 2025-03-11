@@ -241,10 +241,10 @@ struct TllmGenFmhaRunnerParams
 // Parameters that might be updated when selecting kernels.
 struct TllmGenSelectKernelParams
 {
+    // The FMHA kernel type.
+    FmhaKernelType mKernelType;
     // The headDimV per CTA, which is only used by MLA generation kernels currently.
     int mHeadDimPerCtaV;
-    // The maximum number of headsQPerCta that will be processed in one CTA.
-    int mMaxNumHeadsQPerKvInCta;
     // Enable the multiCtasKvMode or not.
     bool mMultiCtasKvMode;
     // Reuse smemK for V or not (only work with MLA generation kernels).
@@ -256,8 +256,8 @@ struct TllmGenSelectKernelParams
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
-        : mHeadDimPerCtaV(params.mHeadDimV)
-        , mMaxNumHeadsQPerKvInCta(1)
+        : mKernelType(params.mKernelType)
+        , mHeadDimPerCtaV(params.mHeadDimV)
         , mMultiCtasKvMode(params.mMultiCtasKvMode)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)

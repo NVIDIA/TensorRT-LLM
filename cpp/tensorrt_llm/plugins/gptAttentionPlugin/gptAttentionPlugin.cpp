@@ -668,7 +668,7 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
             outputDesc, inputs, outputs, workspace, stream);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     TLLM_LOG_TRACE("Attention plugin stop at layer %d", mLayerIdx);
 
     return 0;
