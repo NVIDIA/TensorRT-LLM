@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
@@ -38,29 +39,30 @@ void CreateNewDecoderRequests::operator()(TensorPtr const& batchSlots,
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    auto const& decoderStream = decoder.getDecoderStream();
+    auto& decoderState = decoder.getDecoderState();
+
     auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
     auto const localBatchSize = batchSlots->getSize();
     for (size_t bi = 0; bi < localBatchSize; ++bi)
     {
-        newRequest(batchSlotsRange[bi], requests[bi], samplingConfigs[bi], modelConfig, decoder, runtimeStream,
-            maxSequenceLength);
+        newRequest(batchSlotsRange[bi], requests[bi], samplingConfigs[bi], modelConfig, decoderState, runtimeStream,
+            *decoderStream, maxSequenceLength);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
-    SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig, GptDecoderBatched& decoder,
-    CudaStream const& runtimeStream, SizeType32 maxSequenceLength) const
+    SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
+    runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
+    SizeType32 maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK(batchSlot >= 0);
 
-    auto const& decoderStream = decoder.getDecoderStream();
-    BufferManager const manager{decoderStream};
-
-    auto& decoderState = decoder.getDecoderState();
+    BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
 
     auto const& jointOutputIdsShape = decoderState.getJointDecodingOutput().ids->getShape();
     auto const batchSize = jointOutputIdsShape.d[0];
@@ -91,7 +93,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
     TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
-    runtime::kernels::invokeFill(*endIdTensorPtr, endId, *decoderStream);
+    runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
 
     TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
     if (request.embeddingBias)
@@ -137,12 +139,11 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     setupWords(dJointInput.badWordsLists, request.badWordsList, dJointInput.badWordsPtrs, dJointInput.badWordsLens,
         dJointInput.maxBadWordsLen, batchSlot);
 
-    TensorPtr const sequenceLimitLength{
-        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
-    runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, *decoderStream);
+    TensorPtr const sequenceLimitLength{ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
+    runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, decoderStream);
 
     TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
-    runtime::kernels::invokeFill(*inputLengths, inputLength, *decoderStream);
+    runtime::kernels::invokeFill(*inputLengths, inputLength, decoderStream);
 
     // output
     auto& dJointOutput = decoderState.getJointDecodingOutput();
@@ -172,7 +173,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         else
         {
             runtime::kernels::invokeFill(
-                *finishedSteps, tk::FinishedState::skipDecoding().toUnderlying(), *decoderStream);
+                *finishedSteps, tk::FinishedState::skipDecoding().toUnderlying(), decoderStream);
         }
     }
 
@@ -193,7 +194,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     {
         TensorPtr const cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
         runtime::kernels::invokeFill(
-            *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, *decoderStream);
+            *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, decoderStream);
 
         auto parentIds = ITensor::slice(dJointOutput.parentIds, batchSlot, 1);
         parentIds->reshape(outputIdsShape);
@@ -208,14 +209,14 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     {
         TLLM_CHECK(beamWidth == 1);
         newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig,
-            decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream, *decoderStream,
+            decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream, decoderStream,
             decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
     }
 
     // fill outputIds with endIds
     TensorPtr const outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
     auto outputIdsTileView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, maxSequenceLength}));
-    runtime::kernels::invokeFill(*outputIdsTileView, endId, *decoderStream);
+    runtime::kernels::invokeFill(*outputIdsTileView, endId, decoderStream);
 
     // copy the request ids into outputIds
     auto const requestIdsShape = requestIds->getShape();
@@ -229,7 +230,7 @@ void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx
     runtime::decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
     runtime::ModelConfig const& modelConfig, DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput,
     CudaStream const& runtimeStream, CudaStream const& decoderStream,
-    SpeculativeDecodingMode const& speculativeDecodingMode, SizeType32 maxDecodingEngineTokens) const
+    SpeculativeDecodingMode const& speculativeDecodingMode, SizeType32 maxDecodingEngineTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -277,7 +278,7 @@ void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx
 
 void CreateNewDecoderRequests::newRequestDraftTokensExternal(SizeType32 batchIdx,
     runtime::decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
-    DecodingInput& jointDecodingInput, CudaStream const& decoderStream) const
+    DecodingInput& jointDecodingInput, CudaStream const& decoderStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -330,7 +331,7 @@ void CreateNewDecoderRequests::newRequestDraftTokensExternal(SizeType32 batchIdx
 }
 
 void CreateNewDecoderRequests::newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens) const
+    DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -361,7 +362,7 @@ void CreateNewDecoderRequests::newRequestMedusa(SizeType32 batchIdx, runtime::de
 }
 
 void CreateNewDecoderRequests::newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream) const
+    DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -377,7 +378,7 @@ void CreateNewDecoderRequests::newRequestLookahead(SizeType32 batchIdx, runtime:
 
 void CreateNewDecoderRequests::newRequestExplicitDraftTokens(SizeType32 batchIdx,
     runtime::decoder_batch::Request const& request, DecodingOutput& jointDecodingOutput,
-    CudaStream const& runtimeStream) const
+    CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -391,7 +392,7 @@ void CreateNewDecoderRequests::newRequestExplicitDraftTokens(SizeType32 batchIdx
 }
 
 void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream) const
+    runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 

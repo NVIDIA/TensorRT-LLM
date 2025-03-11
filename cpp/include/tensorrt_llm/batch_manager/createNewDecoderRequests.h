@@ -30,6 +30,12 @@ class DecodingOutput;
 class GptDecoderBatched;
 class SamplingConfig;
 class SpeculativeDecodingMode;
+
+namespace decoder
+{
+class DecoderState;
+} // namespace decoder
+
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
@@ -58,38 +64,38 @@ public:
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
     //! GptDecoderBatched::newBatch()
-    void newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig, GptDecoderBatched& decoder,
-        CudaStream const& runtimeStream, SizeType32 maxSequenceLength) const;
+    static void newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
+        SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
+        runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
+        SizeType32 maxSequenceLength);
 
 private:
     //! @brief Setups decoder internal tensors for new speculative decoding request
-    void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+    static void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
         SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
         DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream,
         CudaStream const& decoderStream, SpeculativeDecodingMode const& speculativeDecodingMode,
-        SizeType32 maxDecodingEngineTokens) const;
+        SizeType32 maxDecodingEngineTokens);
 
     //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
-    void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, DecodingInput& jointDecodingInput, CudaStream const& decoderStream) const;
+    static void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        SamplingConfig const& samplingConfig, DecodingInput& jointDecodingInput, CudaStream const& decoderStream);
 
     //! @brief Setups decoder internal tensors for new Medusa request
-    void newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens) const;
+    static void newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens);
 
     //! @brief Setups decoder internal tensors for new Lookahead request
-    void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream) const;
+    static void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
 
     //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-    void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream) const;
+    static void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
 
     //! @brief Setups decoder internal tensors for new Eagle request
-    void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput,
-        CudaStream const& runtimeStream) const;
+    static void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
 };
 
 } // namespace tensorrt_llm::batch_manager
