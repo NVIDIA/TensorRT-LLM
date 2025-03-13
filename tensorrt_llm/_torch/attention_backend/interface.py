@@ -530,3 +530,36 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
+
+    
+@torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
+def dummy_forward(q: torch.Tensor, k: torch.Tensor,
+                  v: torch.Tensor) -> torch.Tensor:
+    """
+    Dummy attention forward function to estimate memory usage.
+    Args:
+        q (torch.Tensor): Query tensor with shape (1, num_q_tokens, num_heads, head_dim),.
+        k (torch.Tensor): Key tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
+        v (torch.Tensor): Value tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
+    Returns:
+        torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
+    """
+    head_dim = q.shape[3]
+    assert q.dim() == 4 and q.size()[0] == 1
+    assert k.dim() == 4 and k.size()[0] == 1 and k.size()[3] == head_dim
+    assert v.dim() == 4 and v.size()[0] == 1 and v.size()[3] == head_dim
+    # This is only for memory estimation for now.
+    # NOTE: this method is not accurate while it works for most scenario.
+    o = _flash_attention_forward(q,
+                                 k,
+                                 v,
+                                 attention_mask=None,
+                                 query_length=q.size(1),
+                                 is_causal=True)
+    return o.reshape(o.size(1), -1)
+
+
+@dummy_forward.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    num_q_tokens = q.size()[1]
+    return torch.empty_like(q).reshape(num_q_tokens, -1)
