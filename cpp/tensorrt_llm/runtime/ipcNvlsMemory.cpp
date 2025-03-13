@@ -16,6 +16,7 @@
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "ipcSocket.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <unistd.h>
 
@@ -199,12 +200,18 @@ IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> group)
     IpcNvlsHandle handle;
     handle.size = mcprop.size;
 
+    // Get time
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // High res time down to nanosec
+    unsigned long seed = ts.tv_sec * 1000000000L + ts.tv_nsec;
+    // Initialize with rand seed.
+    srand(seed);
     int root = 0;
-    srand(time(NULL));
     uint64_t unique_op_id = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
     MPI_group_bcast(group, &unique_op_id, sizeof(unique_op_id), MpiType::kBYTE, root);
 
-    volatile uint32_t abort_flag = 0;
+    uint32_t volatile abort_flag = 0;
     std::shared_ptr<NcclIpcSocket> socket = ncclIpcSocketInit(rank, unique_op_id, &abort_flag);
     MPI_group_barrier(group);
 
@@ -230,7 +237,6 @@ IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> group)
     }
 
     MPI_group_barrier(group);
-    ncclIpcSocketClose(socket);
     close(fd);
 
     // Add device to multicast object
@@ -264,7 +270,60 @@ IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> group)
     printf("Rank %d nvlsAllocated %zu bytes successfully %p %p\n", rank, size, (void*) handle.uc_ptr,
         (void*) handle.mc_ptr);
 
+    // Export to unicast VA to shareable handle
+    int fd_uc;
+    CUCHECK(cuMemExportToShareableHandle(
+        (void*) &fd_uc, handle.uc_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
+
+    handle.ipc_uc_ptrs.resize(ranks.size());
+    handle.ipc_uc_vas.resize(ranks.size());
+    handle.ipc_uc_handles.resize(ranks.size());
+
+    // Allgather unicast shareable handles
+    std::vector<int> peer_fds_uc(ranks.size());
+    peer_fds_uc[group_rank] = fd_uc;
+    for (size_t i = 1; i < ranks.size(); ++i)
+    {
+        MPI_group_barrier(group);
+        int send_rank = (group_rank + i) % ranks.size();
+        int recv_rank = (group_rank + ranks.size() - i) % ranks.size();
+        ncclIpcSocketSendFd(socket, fd_uc, ranks[send_rank], unique_op_id);
+        peer_fds_uc[recv_rank] = ncclIpcSocketRecvFd(socket);
+    }
+    ncclIpcSocketClose(socket);
+
+    // Import unicast shareable handles
+    for (size_t i = 0; i < ranks.size(); ++i)
+    {
+        if (ranks[i] == rank)
+        {
+            handle.ipc_uc_ptrs[i] = handle.uc_ptr;
+            handle.ipc_uc_vas[i] = handle.uc_va;
+            handle.ipc_uc_handles[i] = handle.uc_handle;
+        }
+        else
+        {
+            CUCHECK(cuMemImportFromShareableHandle(&handle.ipc_uc_handles[i], (void*) (uintptr_t) peer_fds_uc[i],
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+            CUCHECK(cuMemAddressReserve(&handle.ipc_uc_vas[i], size, uc_align, 0U, 0));
+            CUCHECK(cuMemMap(handle.ipc_uc_vas[i], size, 0, handle.ipc_uc_handles[i], 0));
+            // set access on UC address, for all GPUs so that UVA works
+            for (int gpu_id : group)
+            {
+                uc_mc_access.location.id = gpu_id;
+                CUCHECK(cuMemSetAccess(handle.ipc_uc_vas[i], size, &uc_mc_access, 1 /* count */));
+            }
+
+            handle.ipc_uc_ptrs[i] = reinterpret_cast<uintptr_t>((void*) handle.ipc_uc_vas[i]);
+        }
+        // close FD UC
+        close(peer_fds_uc[i]);
+    }
+
     MPI_group_barrier(group);
+
+    printf("Rank %d imported IPC handles successfully\n", rank);
+
     return handle;
 #else
     TLLM_THROW("ipcNvlsAllocate needs to be compiled with ENABLE_MULTI_DEVICE");
@@ -279,9 +338,12 @@ void ipcNvlsFree(IpcNvlsHandle handle)
     CUCHECK(cuMemRelease(handle.mc_handle));
     CUCHECK(cuMemAddressFree(handle.mc_va, handle.size));
     // Unmap and release UC VA
-    CUCHECK(cuMemUnmap(handle.uc_va, handle.size));
-    CUCHECK(cuMemRelease(handle.uc_handle));
-    CUCHECK(cuMemAddressFree(handle.uc_va, handle.size));
+    for (size_t i = 0; i < handle.ipc_uc_vas.size(); ++i)
+    {
+        CUCHECK(cuMemUnmap(handle.ipc_uc_vas[i], handle.size));
+        CUCHECK(cuMemRelease(handle.ipc_uc_handles[i]));
+        CUCHECK(cuMemAddressFree(handle.ipc_uc_vas[i], handle.size));
+    }
 #else
     TLLM_THROW("ipcNvlsFree needs to be compiled with ENABLE_MULTI_DEVICE");
 #endif

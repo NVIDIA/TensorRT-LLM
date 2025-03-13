@@ -27,6 +27,8 @@ namespace torch_ext
 class IFtDynamicDecode
 {
 public:
+    virtual ~IFtDynamicDecode() = default;
+
     virtual void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
@@ -64,6 +66,8 @@ class FtDynamicDecode : public IFtDynamicDecode
 public:
     FtDynamicDecode(size_t const max_batch_size, size_t const max_beam_width, size_t const vocab_size,
         size_t const vocab_size_padded, int const tensor_para_size, int const pipeline_para_size);
+
+    ~FtDynamicDecode() override = default;
 
     void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,

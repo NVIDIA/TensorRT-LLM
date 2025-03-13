@@ -37,7 +37,8 @@ public:
     //! Setup the decoder before calling `forward()`
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
     void newBatch(GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig,

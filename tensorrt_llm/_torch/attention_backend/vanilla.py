@@ -1,6 +1,8 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -149,6 +151,112 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         attn_output = attn_output.squeeze(0)
         return attn_output
 
+    @staticmethod
+    def no_kv_cache_forward(
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        num_heads: int,
+        num_kv_heads: int,
+        metadata: AttentionMetadata,
+        *,
+        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        This function is used to perform attention without kv cache.
+        Args:
+            q (torch.Tensor): Query tensor with shape (seq_len, num_heads * head_dim) or (seq_len, (num_heads + 2 * num_kv_heads) * head_dim),
+            k (Optional[torch.Tensor]): Key tensor with shape (seq_len, num_heads * head_dim) or None,
+            v (Optional[torch.Tensor]): Value tensor with shape (seq_len, num_heads * head_dim) or None,
+        """
+        # lazy loading
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+        head_dim = q.shape[-1]
+        is_fused_qkv = False
+        if (k is None) or (v is None):
+            assert (k is None) or (
+                v is None), "Both k and v has to be None if any of them is None"
+            is_fused_qkv = True
+
+        if is_fused_qkv:
+            q_size = int(head_dim * num_heads / (num_heads + 2 * num_kv_heads))
+            kv_size = int(head_dim * num_kv_heads /
+                          (num_heads + 2 * num_kv_heads))
+            q, k, v = q.split([q_size, kv_size, kv_size], dim=-1)
+        else:
+            q_size = head_dim
+        head_dim = int(q_size / num_heads)
+        q = q.reshape(-1, num_heads, head_dim).contiguous()
+        k = k.reshape(-1, num_kv_heads, head_dim).contiguous()
+        v = v.reshape(-1, num_kv_heads, head_dim).contiguous()
+        assert q.dim() == 3
+        assert k.dim() == 3
+        assert v.dim() == 3
+        seqlens_in_batch = metadata.seq_lens
+        assert seqlens_in_batch is not None, "seq_len can not be None for remove padding inputs attention!"
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+        cu_seqlens = F.pad(
+            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32),
+            (1, 0)).to(q.device)
+
+        max_seqlen_q = max_seqlen_k = max_seqlen_in_batch
+        cu_seqlens_q = cu_seqlens_k = cu_seqlens
+
+        attn_output_unpad = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=False,
+            # window_size=(-1, -1),  # -1 means infinite context window
+            alibi_slopes=None,
+            deterministic=False,
+            return_attn_probs=False,
+        )
+
+        return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
+
+    @torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
+    @staticmethod
+    def dummy_forward(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Dummy attention forward function to estimate memory usage.
+        Args:
+            q (torch.Tensor): Query tensor with shape (1, num_q_tokens, num_heads, head_dim),.
+            k (torch.Tensor): Key tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
+            v (torch.Tensor): Value tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
+        Returns:
+            torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
+        """
+        head_dim = q.shape[3]
+        assert q.dim() == 4 and q.size()[0] == 1
+        assert k.dim() == 4 and k.size()[0] == 1 and k.size()[3] == head_dim
+        assert v.dim() == 4 and v.size()[0] == 1 and v.size()[3] == head_dim
+        # This is only for memory estimation for now.
+        # NOTE: this method is not accurate while it works for most scenario.
+        o = _flash_attention_forward(q,
+                                     k,
+                                     v,
+                                     attention_mask=None,
+                                     query_length=q.size(1),
+                                     is_causal=True)
+        return o.reshape(o.size(1), -1)
+
+    @dummy_forward.register_fake
+    def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        num_q_tokens = q.size()[1]
+        return torch.empty_like(q).reshape(num_q_tokens, -1)
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
@@ -157,10 +265,24 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
                 **kwargs) -> torch.Tensor:
+        # NOTE: WAR for no kv cache attn e.g. BERT,
+        # try to separate the kv cache estimation path from no kv cache attn.
+        if metadata is not None and metadata.kv_cache_manager is None:
+            num_heads = self.num_heads
+            num_kv_heads = self.num_kv_heads
+            return VanillaAttention.no_kv_cache_forward(
+                q=q,
+                k=k,
+                v=v,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                metadata=metadata,
+                attention_mask=attention_mask)
+
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return AttentionBackend.dummy_forward(q.unsqueeze(0),
+            return VanillaAttention.dummy_forward(q.unsqueeze(0),
                                                   k.unsqueeze(0),
                                                   v.unsqueeze(0))
 

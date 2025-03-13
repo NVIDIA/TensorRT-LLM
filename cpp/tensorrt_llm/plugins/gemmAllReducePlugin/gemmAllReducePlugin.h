@@ -18,9 +18,9 @@
 
 #include "gemmAllReducePluginProfiler.h"
 #include "gemmAllReducePluginResource.h"
-#include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/allreduce_gemm/allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
@@ -45,6 +45,9 @@ struct GemmAllReducePluginOptions
     // Set in configurePlugin during build phase
     GemmDims maxProblemShape;
     bool deserialize; // used for profiler instantiation
+    int8_t hasSFA = 0;
+    int8_t hasSFB = 0;
+    int8_t alphaIsPtr = 0;
 };
 
 class GemmAllReducePlugin : public BasePlugin
@@ -120,6 +123,23 @@ private:
     using ValueType = std::function<GemmAllReduceImplInterface*()>;
     GemmAllReducePluginOptions mOptions;
     int mRank = 0;
+
+    enum TensorArg
+    {
+        IN_ACTIVATION,
+        IN_ACTIVATION_SF,
+        IN_WEIGHT,
+        IN_WEIGHT_SF,
+        IN_ALPHA,
+        OUT_D_UC,
+        OUT_D_MC,
+        OUT_D_IPC
+    };
+
+    std::unordered_map<int, TensorArg> mArgMap;
+    std::unordered_map<TensorArg, int> mArgInvMap;
+    int mNbInputs = 0;
+    int mNbOutputs = 0;
 
     std::map<KeyType, ValueType> mTypedInstantiators;
     char const* mWorkspaceKey = "gemm_allreduce_workspace";

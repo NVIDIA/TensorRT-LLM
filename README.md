@@ -5,10 +5,10 @@ TensorRT-LLM
 <h4> A TensorRT Toolbox for Optimized Large Language Model Inference</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
-[![python](https://img.shields.io/badge/python-3.12.3-green)](https://www.python.org/downloads/release/python-3123/)
-[![python](https://img.shields.io/badge/python-3.10.12-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-12.6.3-green)](https://developer.nvidia.com/cuda-downloads)
-[![trt](https://img.shields.io/badge/TRT-10.7.0-green)](https://developer.nvidia.com/tensorrt)
+[![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
+[![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
+[![cuda](https://img.shields.io/badge/cuda-12.8.0-green)](https://developer.nvidia.com/cuda-downloads)
+[![trt](https://img.shields.io/badge/TRT-10.8.0-green)](https://developer.nvidia.com/tensorrt)
 [![version](https://img.shields.io/badge/release-0.18.0.dev-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
@@ -18,14 +18,18 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+<div align="center">
+<img src="docs/source/media/r1-perf.jpeg" width="75%">
+
+  <sub><sup>HGX B200 (8 GPUs) vs HGX H200 (8 GPUs) vs 2 x HGX H100 (normalized to 8 GPUs for comparison). Input tokens not included in TPS calculations. TensorRT-LLM Version:  0.18.0.dev2025021800 (pre-release) used for Feb measurements, SGLang used for Jan measurements. Hopper numbers in FP8. B200 numbers in FP4. Max concurrency use case. ISL/OSL: 1K/1K.</sub></sup>
+<div align="left">
+
 * [2025/01/07] 🌟 Getting Started with TensorRT-LLM
 [➡️ link](https://www.youtube.com/watch?v=TwWqPnuNHV8)
 
 * [2025/01/04] ⚡Boost Llama 3.3 70B Inference Throughput 3x with NVIDIA TensorRT-LLM Speculative Decoding
 [➡️ link](https://developer.nvidia.com/blog/boost-llama-3-3-70b-inference-throughput-3x-with-nvidia-tensorrt-llm-speculative-decoding/)
-<div align="center">
-<img src="https://developer-blogs.nvidia.com/wp-content/uploads/2024/12/three-llamas-wearing-goggles.png" width="50%">
-<div align="left">
 
 * [2024/12/10] ⚡ Llama 3.3 70B from AI at Meta is accelerated by TensorRT-LLM. 🌟 State-of-the-art model on par with Llama 3.1 405B for reasoning, math, instruction following and tool use. Explore the preview
 [➡️ link](https://build.nvidia.com/meta/llama-3_3-70b-instruct)

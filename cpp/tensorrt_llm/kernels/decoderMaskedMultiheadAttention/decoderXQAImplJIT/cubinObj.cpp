@@ -168,7 +168,6 @@ void CubinObj::initialize()
                 mFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, mSharedMemBytes));
         }
 
-        sync_check_cuda_error();
         mInitialized = true;
     }
 }

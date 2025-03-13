@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 #include "allgatherPlugin.h"
-#include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <nccl.h>
 
@@ -174,8 +174,8 @@ AllgatherPluginCreator::AllgatherPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

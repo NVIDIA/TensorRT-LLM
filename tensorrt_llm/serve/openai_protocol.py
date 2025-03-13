@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
+import base64
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -11,6 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import SamplingParams
 
 
@@ -47,6 +49,13 @@ class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json_object"]
 
 
+class DisaggregatedParams(OpenAIBaseModel):
+    request_type: str
+    first_gen_tokens: Optional[List[int]] = None
+    ctx_request_id: Optional[int] = None
+    encoded_opaque_state: Optional[str] = None
+
+
 class ErrorResponse(OpenAIBaseModel):
     object: str = "error"
     message: str
@@ -74,6 +83,22 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+
+    @staticmethod
+    def to_disaggregated_params(
+            tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+        if tllm_disagg_params is None:
+            return None
+        else:
+            encoded_opaque_state = base64.b64encode(
+                tllm_disagg_params.opaque_state).decode(
+                    "utf-8") if tllm_disagg_params is not None else None
+            return DisaggregatedParams(
+                request_type=tllm_disagg_params.request_type,
+                first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+                ctx_request_id=tllm_disagg_params.ctx_request_id,
+                encoded_opaque_state=encoded_opaque_state)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -162,32 +187,60 @@ class CompletionRequest(OpenAIBaseModel):
             "supported."),
     )
 
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+
     # doc: end-completion-extra-params
 
     def to_sampling_params(self) -> SamplingParams:
         sampling_params = SamplingParams(
-            top_k=self.top_k,
-            top_p=self.top_p,
-            seed=self.seed,
-            temperature=self.temperature,
-            presence_penalty=self.presence_penalty,
+            best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
+            return_log_probs=self.logprobs,
+            max_tokens=self.max_tokens,
+            n=self.n,
+            presence_penalty=self.presence_penalty,
+            seed=self.seed,
+            stop=self.stop,
+            temperature=self.temperature,
+            top_p=self.top_p,
+
+            # completion-sampling-params
+            use_beam_search=self.use_beam_search,
+            top_k=self.top_k,
+            top_p_min=self.top_p_min if self.top_p_min > 0 else None,
+            min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_tokens=self.max_tokens,
+            early_stopping=self.early_stopping,
             stop_token_ids=self.stop_token_ids,
-            stop=self.stop,
-            # NOTE: our early_stopping type definition is different from vLLM's
-            # early_stopping=self.early_stopping,
-            beam_width=self.best_of if self.best_of else self.n,
-            min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            ignore_eos=self.ignore_eos,
+            min_tokens=self.min_tokens,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+
+            # completion-extra-params
             add_special_tokens=self.add_special_tokens,
-            min_p=self.min_p,
         )
-        if self.top_p_min > 0:
-            sampling_params.top_p_min = self.top_p_min
         return sampling_params
+
+    def to_llm_disaggregated_params(self) -> LlmDisaggregatedParams:
+        if self.disaggregated_params is None:
+            return None
+        else:
+            opaque_state = base64.b64decode(
+                self.disaggregated_params.encoded_opaque_state
+            ) if self.disaggregated_params.encoded_opaque_state is not None else None
+
+            return LlmDisaggregatedParams(
+                request_type=self.disaggregated_params.request_type,
+                first_gen_tokens=self.disaggregated_params.first_gen_tokens,
+                ctx_request_id=self.disaggregated_params.ctx_request_id,
+                opaque_state=opaque_state)
 
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
@@ -471,26 +524,36 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_sampling_params(self) -> SamplingParams:
 
         sampling_params = SamplingParams(
-            top_p=self.top_p,
-            top_k=self.top_k,
-            seed=self.seed,
-            temperature=self.temperature,
-            beam_width=self.best_of,
-            presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
+            return_log_probs=self.logprobs,
+            max_tokens=self.max_tokens,
+            n=self.n,
+            presence_penalty=self.presence_penalty,
+            seed=self.seed,
+            stop=self.stop,
+            temperature=self.temperature,
+
+            # chat-completion-sampling-params
+            best_of=self.best_of,
+            use_beam_search=self.use_beam_search,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            top_p_min=self.top_p_min if self.top_p_min > 0 else None,
+            min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            max_tokens=self.max_tokens,
-            min_tokens=self.min_tokens,
+            early_stopping=self.early_stopping,
             stop_token_ids=self.stop_token_ids,
-            stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
-            return_log_probs=self.logprobs,
+            ignore_eos=self.ignore_eos,
+            min_tokens=self.min_tokens,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+
+            # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
-            min_p=self.min_p,
         )
-        if self.top_p_min > 0:
-            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def model_post_init(self, __context: Any) -> None:

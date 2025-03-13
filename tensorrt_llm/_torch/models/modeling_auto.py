@@ -16,4 +16,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             raise ValueError(
                 f"Unknown architecture for AutoModelForCausalLM: {config.pretrained_config.architectures[0]}"
             )
+        if issubclass(cls, DecoderModelForCausalLM):
+            config.skip_create_weights = True
         return cls(config)

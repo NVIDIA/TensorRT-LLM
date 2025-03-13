@@ -29,6 +29,7 @@ enum class CacheType
 {
     kSELF = 0,
     kCROSS = 1,
+    kSELFKONLY = 2,
 };
 
 //! @brief Encapsulates parameters to configure paged KV cache.
@@ -43,7 +44,8 @@ public:
         std::optional<float> freeGpuMemoryFraction = std::nullopt, bool enableBlockReuse = true, bool useUvm = false,
         std::optional<size_t> hostCacheSize = std::nullopt, bool onboardBlocks = true,
         std::optional<float> crossKvCacheFraction = std::nullopt,
-        std::optional<SizeType32> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0)
+        std::optional<SizeType32> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
+        bool enablePartialReuse = true, bool copyOnPartialReuse = true)
         : maxTokens{maxTokens}
         , maxAttentionWindowVec{std::move(maxAttentionWindowVec)}
         , sinkTokenLength{sinkTokenLength}
@@ -55,6 +57,8 @@ public:
         , crossKvCacheFraction{crossKvCacheFraction}
         , secondaryOffloadMinPriority(secondaryOffloadMinPriority)
         , eventBufferMaxSize(eventBufferMaxSize)
+        , enablePartialReuse(enablePartialReuse)
+        , copyOnPartialReuse(copyOnPartialReuse)
     {
     }
 
@@ -63,7 +67,8 @@ public:
             kvCacheConfig.getSinkTokenLength(), kvCacheConfig.getFreeGpuMemoryFraction(),
             kvCacheConfig.getEnableBlockReuse(), false, kvCacheConfig.getHostCacheSize(),
             kvCacheConfig.getOnboardBlocks(), kvCacheConfig.getCrossKvCacheFraction(),
-            kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig.getEventBufferMaxSize())
+            kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig.getEventBufferMaxSize(),
+            kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse())
     {
     }
 
@@ -75,7 +80,8 @@ public:
             && hostCacheSize == other.hostCacheSize && onboardBlocks == other.onboardBlocks
             && crossKvCacheFraction == other.crossKvCacheFraction
             && secondaryOffloadMinPriority == other.secondaryOffloadMinPriority
-            && eventBufferMaxSize == other.eventBufferMaxSize;
+            && eventBufferMaxSize == other.eventBufferMaxSize && enablePartialReuse == other.enablePartialReuse
+            && copyOnPartialReuse == other.copyOnPartialReuse;
     }
 
     friend std::ostream& operator<<(std::ostream& os, KvCacheConfig const& self);
@@ -95,5 +101,7 @@ public:
     std::optional<SizeType32> secondaryOffloadMinPriority;
     // Maximum size of the KV Cache event buffer
     size_t eventBufferMaxSize;
+    bool enablePartialReuse;
+    bool copyOnPartialReuse;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

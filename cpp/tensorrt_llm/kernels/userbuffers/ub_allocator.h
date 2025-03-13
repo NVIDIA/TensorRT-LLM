@@ -14,14 +14,10 @@
  * limitations under the License.
  */
 #pragma once
-#include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/tllmBuffers.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #if ENABLE_MULTI_DEVICE
 #include "userbuffers.h"
 #endif
-#include <unordered_map>
-#include <vector>
 
 namespace tensorrt_llm::runtime::ub
 {
@@ -40,7 +36,7 @@ struct UBBuffer
     {
     }
 
-    bool invalid()
+    [[nodiscard]] bool invalid() const
     {
         return (addr == nullptr) || (handle == -1) || (size == 0);
     }
@@ -51,9 +47,9 @@ class UserBufferAllocator
 public:
     static UserBufferAllocator& Instance();
 
-    UserBufferAllocator() {}
+    UserBufferAllocator() = default;
 
-    void initialize(int tp);
+    void initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
     bool is_initialized();
     UBBuffer register_ub_buffer(size_t bytes);
     void* allocate(int idx, size_t bytes);
@@ -65,7 +61,7 @@ private:
     communicator* ub_comm_;
     std::array<UBBuffer, 3> buffers_;
     bool is_initialized_;
-    int tp_;
+    tensorrt_llm::runtime::WorldConfig world_config_;
 };
 #else
 using communicator = void;

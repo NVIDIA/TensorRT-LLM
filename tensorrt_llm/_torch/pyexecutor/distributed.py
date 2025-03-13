@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import torch
 import torch.distributed as dist
 
-from ..._utils import mpi_broadcast
+from ..._utils import mpi_allgather, mpi_barrier, mpi_broadcast
 from ...mapping import Mapping
 
 
@@ -16,6 +16,10 @@ class Distributed(ABC):
     @property
     def rank(self):
         return self.mapping.rank
+
+    @property
+    def world_size(self):
+        return self.mapping.world_size
 
     @property
     def has_tp(self):
@@ -49,11 +53,21 @@ class Distributed(ABC):
     def broadcast(self, obj, root=0):
         pass
 
+    @abstractmethod
+    def allgather(self, obj, root=0):
+        pass
+
 
 class MPIDist(Distributed):
 
     def broadcast(self, obj, root=0):
         return mpi_broadcast(obj, root)
+
+    def allgather(self, obj):
+        return mpi_allgather(obj)
+
+    def barrier(self):
+        mpi_barrier()
 
 
 class TorchDist(Distributed):

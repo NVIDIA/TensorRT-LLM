@@ -18,11 +18,11 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
+
+#include <cstddef>
 #include <memory>
 #include <tuple>
 
@@ -33,21 +33,20 @@ using namespace tensorrt_llm::runtime;
 
 LookaheadAlgorithm::LookaheadAlgorithm(
     runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id)
-    : mMaxW(maxW)
+    : mPoolManager(maxG)
+    , mPrefillsMax(runtime::BufferManager::cpu(
+          runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
+    , mPastTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
+    , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
+    , mGoldenTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
+    , mGuessTokensMax(
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), nvinfer1::DataType::kINT32))
+    , mMaxW(maxW)
     , mMaxN(maxN)
     , mMaxG(maxG)
     , mFilling(0)
-    , mPoolManager(maxG)
-    , mId(id)
-    , mGoldenTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
-    , mPrefillsMax(runtime::BufferManager::cpu(
-          runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
-    , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
-    , mPastTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
-    , mGuessTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), nvinfer1::DataType::kINT32))
 {
     runtime::SizeType32 maxGeneratedLen, maxDraftLen;
     std::tie(maxGeneratedLen, std::ignore, maxDraftLen, std::ignore)
@@ -285,7 +284,6 @@ SizeType32 LookaheadAlgorithm::treeEncode(
         {
             if (maskLocation.at(i, j))
             {
-                auto pos = posIdsRange[j];
                 auto tok = tokensRange[j];
                 auto found = nexts->find(tok);
                 if (found != nexts->end())
@@ -526,7 +524,7 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     mSampledTokens = ITensor::slice(mSampledTokensMax, 0, mEncodeMap->getShape().d[0] + 1);
 
     unzipRange[0] = zippedTokensRange[0];
-    for (SizeType32 i = 0; i < mapRange.size(); i++)
+    for (size_t i = 0; i < mapRange.size(); i++)
     {
         unzipRange[i + 1] = zippedTokensRange[mapRange[i] + 1];
     }
@@ -569,8 +567,6 @@ void LookaheadAlgorithm::update(TensorPtr const& acceptedTokens, TensorPtr const
     TLLM_CHECK(guessSize + lookSize == outputSize);
 
     TensorConstPtr goldenTokens = ITensor::slice(mSampledTokens, lookSize, guessSize);
-
-    auto& acptLen = *BufferRange<SizeType32>(*acceptedLength).begin();
 
     verify(acceptedTokens, acceptedOffsets, acceptedLength, newLastToken, ITensor::slice(sampledTokens, 1), endToken);
 

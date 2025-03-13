@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -45,18 +46,18 @@ struct GemmIDMoe
     int64_t hidden_size;
     int64_t inter_size;
     int num_experts;
-    int top_k;
+    int experts_per_token;
 
     bool operator==(GemmIDMoe const& id) const
     {
         return id.gemm_idx == gemm_idx && id.hidden_size == hidden_size && id.inter_size == inter_size
-            && id.num_experts == num_experts && id.top_k == top_k;
+            && id.num_experts == num_experts && id.experts_per_token == experts_per_token;
     }
 
     friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
-        out << "gemm_idx, hidden_size, inter_size, num_experts, top_k=" << static_cast<int>(id.gemm_idx) << ","
-            << id.hidden_size << "," << id.inter_size << "," << id.num_experts << "," << id.top_k;
+        out << "gemm_idx, hidden_size, inter_size, num_experts, experts_per_token=" << static_cast<int>(id.gemm_idx)
+            << "," << id.hidden_size << "," << id.inter_size << "," << id.num_experts << "," << id.experts_per_token;
         return out;
     }
 };
@@ -69,7 +70,7 @@ struct GemmIDMoeHash
         hash ^= std::hash<int64_t>{}(id.hidden_size);
         hash ^= std::hash<int64_t>{}(id.inter_size);
         hash ^= std::hash<int>{}(id.num_experts);
-        hash ^= std::hash<int>{}(id.top_k);
+        hash ^= std::hash<int>{}(id.experts_per_token);
         return hash;
     }
 };
@@ -130,8 +131,8 @@ struct RunnerTypeKeyHash
 class FusedMoeRunner : public torch::CustomClassHolder
 {
 public:
-    static c10::intrusive_ptr<FusedMoeRunner> getInstance(
-        c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype)
+    static c10::intrusive_ptr<FusedMoeRunner> getInstance(c10::ScalarType activation_dtype,
+        c10::ScalarType weight_dtype, c10::ScalarType output_dtype, bool use_fp8_block_scaling)
     {
         static std::mutex instance_map_mutex;
         std::lock_guard<std::mutex> lock(instance_map_mutex);
@@ -142,18 +143,21 @@ public:
         auto const iter = instance_map.find(key);
         if (iter == instance_map.end())
         {
-            auto instance = c10::make_intrusive<FusedMoeRunner>(activation_dtype, weight_dtype, output_dtype);
+            auto instance = c10::make_intrusive<FusedMoeRunner>(
+                activation_dtype, weight_dtype, output_dtype, use_fp8_block_scaling);
             instance_map[key] = instance;
             return instance;
         }
         return iter->second;
     }
 
-    FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype)
+    FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
+        bool use_fp8_block_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
+        mUseFp8BlockScaling = use_fp8_block_scaling;
         mInnerDimMultiplier = 1;
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -166,6 +170,12 @@ public:
         {
             mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
         }
+#ifdef ENABLE_FP8
+        else if (mActivationDtype == c10::ScalarType::BFloat16 && mWeightDtype == c10::ScalarType::Float8_e4m3fn)
+        {
+            mKernelRunner = std::make_unique<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3>>();
+        }
+#endif
 #endif
 
         // Templated lambda for picking the right output type for fp8/fp4
@@ -230,16 +240,21 @@ public:
     void operator=(FusedMoeRunner const&) = delete;
 
     void runProfile(torch::Tensor const& fc2_expert_weights, int64_t const top_k, int64_t const tp_size,
-        int64_t const tp_rank, std::vector<int64_t> num_token_buckets)
+        int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, std::vector<int64_t> num_token_buckets)
     {
         std::lock_guard<std::mutex> lock(mMutex);
+
+        if (mUseFp8BlockScaling)
+        {
+            return; // TODO
+        }
 
         CHECK_INPUT(fc2_expert_weights, mWeightDtype)
         TORCH_CHECK(fc2_expert_weights.dim() == 3, "fc2_expert_weights must be 3D.");
 
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        int num_experts = static_cast<int>(fc2_expert_weights.sizes()[0]);
+        int num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         std::sort(num_token_buckets.begin(), num_token_buckets.end());
         mMinDimM = num_token_buckets.front();
@@ -254,14 +269,15 @@ public:
         for (auto const& gemm_idx : gemm_idxes)
         {
             runProfileGemmIdx(hidden_size, inter_size, num_experts, static_cast<int>(top_k), static_cast<int>(tp_size),
-                static_cast<int>(tp_rank), num_token_buckets, gemm_idx, stream);
+                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank), num_token_buckets,
+                gemm_idx, stream);
         }
 
         common::check_cuda_error(cudaStreamDestroy(stream));
     }
 
-    c10::optional<std::vector<int64_t>> getProfileIds(
-        int64_t const num_tokens, torch::Tensor const& fc2_expert_weights, int64_t const top_k)
+    c10::optional<std::vector<int64_t>> getProfileIds(int64_t const num_tokens, torch::Tensor const& fc2_expert_weights,
+        int64_t const top_k, int64_t const num_experts)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -270,11 +286,10 @@ public:
 
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        int num_experts = static_cast<int>(fc2_expert_weights.sizes()[0]);
-        auto gemm_id_moe1 = GemmIDMoe{
-            profiler_backend::GemmToProfile::GEMM_1, hidden_size, inter_size, num_experts, static_cast<int>(top_k)};
-        auto gemm_id_moe2 = GemmIDMoe{
-            profiler_backend::GemmToProfile::GEMM_2, hidden_size, inter_size, num_experts, static_cast<int>(top_k)};
+        auto gemm_id_moe1 = GemmIDMoe{profiler_backend::GemmToProfile::GEMM_1, hidden_size, inter_size,
+            static_cast<int>(num_experts), static_cast<int>(top_k)};
+        auto gemm_id_moe2 = GemmIDMoe{profiler_backend::GemmToProfile::GEMM_2, hidden_size, inter_size,
+            static_cast<int>(num_experts), static_cast<int>(top_k)};
 
         if (!mMNKProfileMap->existsMProfileMap(gemm_id_moe1) || !mMNKProfileMap->existsMProfileMap(gemm_id_moe2))
         {
@@ -297,39 +312,51 @@ public:
         return profile_ids;
     }
 
-    torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& gating_output,
-        torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
-        torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, int64_t const tp_size, int64_t const tp_rank,
+    torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
+        torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
+        torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
+        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
         torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
         CHECK_INPUT(input, mActivationDtype)
-        CHECK_INPUT(gating_output, at::ScalarType::Float)
+        CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
+        if (token_final_scales)
+        {
+            CHECK_INPUT(token_final_scales.value(), at::ScalarType::Float)
+        }
         CHECK_INPUT(fc1_expert_weights, mWeightDtype)
         CHECK_INPUT(fc2_expert_weights, mWeightDtype)
 
         TORCH_CHECK(input.dim() == 2, "input must be 2D.");
-        TORCH_CHECK(gating_output.dim() == 2, "gating_output must be 2D.");
+        TORCH_CHECK(token_selected_experts.dim() == 2, "token_selected_experts must be 2D.");
+
         TORCH_CHECK(fc1_expert_weights.dim() == 3, "fc1_expert_weights must be 3D.");
         TORCH_CHECK(fc2_expert_weights.dim() == 3, "fc2_expert_weights must be 3D.");
-        TORCH_CHECK(
-            input.sizes()[0] == gating_output.sizes()[0], "input and gating_output must have the same batch size.");
-        TORCH_CHECK(gating_output.sizes()[1] == fc1_expert_weights.sizes()[0],
-            "gating_output and fc1_expert_weights must have the same number of experts.");
+        TORCH_CHECK(input.sizes()[0] == token_selected_experts.sizes()[0],
+            "input and token_selected_experts must have the same num tokens.");
+        if (token_final_scales)
+        {
+            TORCH_CHECK(token_final_scales.value().dim() == 2, "token_selected_experts_probs must be 2D.");
+            TORCH_CHECK(input.sizes()[0] == token_final_scales.value().sizes()[0],
+                "input and token_selected_experts_probs must have the same num tokens.");
+            TORCH_CHECK(token_selected_experts.sizes()[1] == token_final_scales.value().sizes()[1],
+                "token_selected_experts and token_final_scales must have the same number of experts per token.");
+        }
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
         TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
             "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
 
+        int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0]);
-        int const moe_top_k = static_cast<int>(top_k);
-        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, /* ep_size */ 1, /* ep_rank */ 0);
+        int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
+        auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
+        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
         auto activation_type = tensorrt_llm::ActivationType::Swiglu;
-        auto norm_mode = kernels::MOEExpertScaleNormalizationMode::RENORMALIZE;
 
         setRunnerProfiles(profile_ids);
 
@@ -338,20 +365,23 @@ public:
         std::vector<int64_t> output_shape = {num_rows, hidden_size};
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
-        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts,
-            static_cast<int>(top_k), activation_type, norm_mode, parallelism_config);
+        WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
+            static_cast<int>(experts_per_token), activation_type, parallelism_config);
 
-        auto const quant_params = getQuantParams(num_experts, hidden_size, inter_size, quant_scales);
+        auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+
         // TODO: support lora in the future
         kernels::LoraParams lora_params{};
 
-        mKernelRunner->runMoe(input.const_data_ptr(), gating_output.const_data_ptr<float>(),
+        mKernelRunner->runMoe(input.const_data_ptr(),
+            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
+                                           : nullptr,
             fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
-            quant_params, num_rows, hidden_size, inter_size, num_experts, static_cast<int>(top_k),
-            static_cast<char*>(workspace_info.workspace), output.data_ptr(), nullptr, output.sizes()[0],
-            workspace_info.scale_probs, static_cast<int*>(workspace_info.src_to_dest_map),
-            static_cast<int*>(workspace_info.selected_experts), 0, parallelism_config, norm_mode, false, lora_params,
-            stream);
+            quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            mUseFp8BlockScaling, stream);
 
         return output;
     }
@@ -360,9 +390,7 @@ private:
     struct WorkspaceInfo
     {
         void* workspace{};
-        void* scale_probs{};
         void* src_to_dest_map{};
-        void* selected_experts{};
     };
 
     std::mutex mMutex;
@@ -378,14 +406,17 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
 
+    bool mUseFp8BlockScaling = false;
+
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
 
-    void runProfileGemmIdx(int64_t const hidden_size, int64_t const inter_size, int const num_experts, int const top_k,
-        int const tp_size, int const tp_rank, std::vector<int64_t> const& num_token_buckets,
-        profiler_backend::GemmToProfile const gemm_idx, cudaStream_t stream)
+    void runProfileGemmIdx(int64_t const hidden_size, int64_t const inter_size, int const num_experts,
+        int const experts_per_token, int const tp_size, int const tp_rank, int const ep_size, int const ep_rank,
+        std::vector<int64_t> const& num_token_buckets, profiler_backend::GemmToProfile const gemm_idx,
+        cudaStream_t stream)
     {
-        auto gemm_id_moe = GemmIDMoe{gemm_idx, hidden_size, inter_size, num_experts, top_k};
+        auto gemm_id_moe = GemmIDMoe{gemm_idx, hidden_size, inter_size, num_experts, experts_per_token};
 
         if (mMNKProfileMap->existsMProfileMap(gemm_id_moe))
         {
@@ -396,12 +427,12 @@ private:
 
         mProfiler->mGemmToProfile = gemm_idx;
         // TODO: support more dtypes and expert parallelism
-        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, /* ep_size */ 1, /* ep_rank */ 0);
+        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
         mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
             tensorrt_llm::runtime::TorchUtils::dataType(mActivationDtype),
             tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
-            tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, top_k, hidden_size, inter_size,
-            tensorrt_llm::ActivationType::Swiglu,
+            tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, experts_per_token, hidden_size,
+            inter_size, /* group_size */ -1, tensorrt_llm::ActivationType::Swiglu,
             /* bias */ false, /* use_lora */ false, parallelism_config);
 
         char* profile_workspace = nullptr;
@@ -423,7 +454,7 @@ private:
     {
         mProfiler->prepare(m, profile_workspace, stream);
         float best_time = std::numeric_limits<float>::max();
-        ProfileId best_profile_id;
+        ProfileId best_profile_id{0};
         for (int i = 0; i < static_cast<int>(mAllProfiles.size()); ++i)
         {
             auto const& profile = mAllProfiles[i];
@@ -488,6 +519,17 @@ private:
 
     void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
+        if (mUseFp8BlockScaling)
+        {
+            auto config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
+                tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape128x16x128B,
+                tensorrt_llm::cutlass_extensions::MainloopScheduleType::AUTO,
+                tensorrt_llm::cutlass_extensions::EpilogueScheduleType::AUTO,
+                tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+            mKernelRunner->setTactic(config, config);
+            return;
+        }
+
         auto best_gemm1_profile = mAllProfiles.front();
         auto best_gemm2_profile = mAllProfiles.front();
         if (profile_ids.has_value())
@@ -500,15 +542,15 @@ private:
     }
 
     WorkspaceInfo getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int num_experts, int top_k, tensorrt_llm::ActivationType activation_type,
-        kernels::MOEExpertScaleNormalizationMode norm_mode, kernels::MOEParallelismConfig const& parallelismConfig)
+        int num_experts, int experts_per_token, tensorrt_llm::ActivationType activation_type,
+        kernels::MOEParallelismConfig const& parallelismConfig)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
-            top_k, activation_type, norm_mode, parallelismConfig, /* use_lora */ false);
-        size_t scale_prob_size = num_rows * num_experts * sizeof(float);
-        size_t src_to_dest_map_size = top_k * num_rows * sizeof(int);
-        size_t selected_expert_size = top_k * num_rows * sizeof(int);
-        std::vector<size_t> workspaces{moe_workspace_size, scale_prob_size, src_to_dest_map_size, selected_expert_size};
+            experts_per_token, activation_type, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling,
+            /* hasExpertPrequantScales */ false);
+        size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
+
+        std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
         size_t total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
         auto workspace = torch::empty({static_cast<long>(total_workspace_size)},
@@ -516,16 +558,13 @@ private:
 
         WorkspaceInfo info{};
         info.workspace = workspace.data_ptr();
-        info.scale_probs = common::nextWorkspacePtr(static_cast<int8_t*>(workspace.data_ptr()), moe_workspace_size);
-        info.src_to_dest_map = common::nextWorkspacePtr(static_cast<int8_t*>(info.scale_probs), scale_prob_size);
-        info.selected_experts
-            = common::nextWorkspacePtr(static_cast<int8_t*>(info.src_to_dest_map), src_to_dest_map_size);
+        info.src_to_dest_map = common::nextWorkspacePtr(static_cast<int8_t*>(workspace.data_ptr()), moe_workspace_size);
 
         return info;
     }
 
-    kernels::QuantParams getQuantParams(int64_t const num_experts, int64_t const hidden_size, int64_t const inter_size,
-        torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
+    kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
+        int64_t const inter_size, torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales) const
     {
         if (isFp8Quant())
         {
@@ -545,8 +584,10 @@ private:
             TORCH_CHECK(fc2_quant.dim() == 0, "fc2 quant must be a scalar tensor");
             TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 quant must be 1D");
             TORCH_CHECK(fc1_input_dequant.dim() == 0, "fc1 input dequant must be a scalar tensor");
-            TORCH_CHECK(fc1_dequant.sizes()[0] == num_experts, "fc1 dequant size must be (num_experts,)");
-            TORCH_CHECK(fc2_dequant.sizes()[0] == num_experts, "fc2 dequant size must be (num_experts,)");
+            TORCH_CHECK(
+                fc1_dequant.sizes()[0] == num_experts_on_rank, "fc1 dequant size must be (num_experts_on_rank,)");
+            TORCH_CHECK(
+                fc2_dequant.sizes()[0] == num_experts_on_rank, "fc2 dequant size must be (num_experts_on_rank,)");
 
             return kernels::QuantParams::FP8(static_cast<float const*>(fc1_dequant.data_ptr()),
                 static_cast<float const*>(fc2_quant.data_ptr()), static_cast<float const*>(fc2_dequant.data_ptr()),
@@ -578,25 +619,34 @@ private:
             TORCH_CHECK(fc2_act_global.dim() == 0, "fc2 act global must be a scalar tensor");
             TORCH_CHECK(fc2_weight_block.dim() == 3, "fc2 weight block must be 3D");
             TORCH_CHECK(fc2_global.dim() == 1, "fc2 global must be 1D");
-            TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts && fc1_weight_block.sizes()[1] == inter_size * 2
+            TORCH_CHECK(fc1_weight_block.sizes()[0] == num_experts_on_rank
+                    && fc1_weight_block.sizes()[1] == inter_size * 2
                     && fc1_weight_block.sizes()[2] * FP8_PER_INT32
                             * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize
                         == hidden_size,
-                "fc1 weight block size must be (num_experts, inter_size * 2, hidden_size // 4 // "
+                "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 // "
                 "block_scale_vector_size)");
-            TORCH_CHECK(fc1_global.sizes()[0] == num_experts, "fc1 global size must be (num_experts,)");
-            TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts && fc2_weight_block.sizes()[1] == hidden_size
+            TORCH_CHECK(fc1_global.sizes()[0] == num_experts_on_rank, "fc1 global size must be (num_experts_on_rank,)");
+            TORCH_CHECK(fc2_weight_block.sizes()[0] == num_experts_on_rank && fc2_weight_block.sizes()[1] == hidden_size
                     && fc2_weight_block.sizes()[2] * FP8_PER_INT32
                             * tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize
                         == inter_size,
-                "fc2 weight block size must be (num_experts, hidden_size, inter_size // 4 // block_scale_vector_size)");
-            TORCH_CHECK(fc2_global.sizes()[0] == num_experts, "fc2 global size must be (num_experts,)");
+                "fc2 weight block size must be (num_experts_on_rank, hidden_size, inter_size // 4 // "
+                "block_scale_vector_size)");
+            TORCH_CHECK(fc2_global.sizes()[0] == num_experts_on_rank, "fc2 global size must be (num_experts_on_rank,)");
 
             return kernels::QuantParams::FP4(static_cast<float const*>(fc1_act_global.data_ptr()),
                 static_cast<tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
                 static_cast<float const*>(fc1_global.data_ptr()), static_cast<float const*>(fc2_act_global.data_ptr()),
                 static_cast<tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
                 static_cast<float const*>(fc2_global.data_ptr()));
+        }
+        else if (mUseFp8BlockScaling)
+        {
+            auto& fc1_scales = quant_scales.value()[0];
+            auto& fc2_scales = quant_scales.value()[1];
+            return kernels::QuantParams::FP8BlockScaling(
+                static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
         }
         else
         {
@@ -606,7 +656,8 @@ private:
 
     bool isFp8Quant() const
     {
-        return mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
+        return !mUseFp8BlockScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
+            && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }
 
     bool isNvfp4Quant() const
@@ -615,15 +666,17 @@ private:
     }
 };
 
-torch::Tensor fused_moe(torch::Tensor const& input, torch::Tensor const& gating_output,
-    torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
-    c10::ScalarType const& output_dtype, int64_t const top_k,
+torch::Tensor fused_moe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
+    torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
+    torch::Tensor const& fc2_expert_weights, c10::ScalarType const& output_dtype,
     torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, int64_t const tp_size, int64_t const tp_rank,
-    torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    int64_t const ep_size, int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids,
+    bool use_fp8_block_scaling)
 {
-    return FusedMoeRunner::getInstance(input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype)
-        ->runMoe(input, gating_output, fc1_expert_weights, fc2_expert_weights, top_k, quant_scales, tp_size, tp_rank,
-            profile_ids);
+    return FusedMoeRunner::getInstance(
+        input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling)
+        ->runMoe(input, token_selected_experts, token_final_scales, fc1_expert_weights, fc2_expert_weights,
+            quant_scales, tp_size, tp_rank, ep_size, ep_rank, profile_ids);
 }
 
 } // namespace torch_ext
@@ -639,11 +692,12 @@ TORCH_LIBRARY(trtllm, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_moe(Tensor input, Tensor gating_output, "
-        "Tensor fc1_expert_weights, Tensor fc2_expert_weights, "
-        "ScalarType output_dtype, int top_k, "
+        "fused_moe(Tensor input, Tensor token_selected_experts, "
+        "Tensor? token_final_scales, Tensor fc1_expert_weights, Tensor fc2_expert_weights, "
+        "ScalarType output_dtype, "
         "Tensor[]? quant_scales=None, "
-        "int tp_size=1, int tp_rank=0, int[]? profile_ids=None) -> Tensor");
+        "int tp_size=1, int tp_rank=0, int ep_size=1, int ep_rank=0, int[]? profile_ids=None, "
+        "bool use_fp8_block_scaling=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

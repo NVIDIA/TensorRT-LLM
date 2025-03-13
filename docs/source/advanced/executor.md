@@ -106,7 +106,7 @@ The latter three types should be used with the schema/regex/grammar provided to 
 The executor API gives the user the possibility to read the arbitrary outputs from the model. For example, it is possible to obtain hidden states or logits.
 
 #### Mark Tensors As Output
-For a tensor to be obtainable using this feature, it needs to be marked as an output in your TensorRT engine, as part of the engine building process.
+For a tensor to be obtainable using this feature, it needs to be marked as an output in the model definition (e.g. add `topk_logits.mark_output("TopKLogits")`) before building the TRT engine.
 
 #### Configure The Executor
 Assuming the TensorRT engine you are planning to use has a tensor named `TopKLogits` marked as output, you should then configure the `Executor` to read from this output tensor by passing its name to the `ExecutorConfig` configuration object:
@@ -131,6 +131,10 @@ executor.enqueueRequest(request);
 ```
 
 The output can be found at the `additionalOutputs` property of each response.
+
+#### Note on context outputs
+
+Note that context outputs require to build the engine with `--gather_context_logits`. If KV cache reuse is enabled, context outputs will not contain outputs for the part of the context that has been reused. This part of the outputs can only be obtained from the prior request with the same prefix that generated this part of the KV cache.
 
 ## C++ Executor API Example
 

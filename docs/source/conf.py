@@ -22,7 +22,7 @@ html_show_sphinx = False
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 templates_path = ['_templates']
-exclude_patterns = []
+exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
 
 extensions = [
     'sphinx.ext.duration',

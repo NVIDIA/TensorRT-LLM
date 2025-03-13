@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
+#include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include <string>
 #include <vector>
@@ -52,8 +53,12 @@ namespace jit
 CubinObj CompileEngine::compile() const
 {
     tllmXqaJitProgram program;
-    bool useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
+    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
+    bool const applyRoPEInXqaKernel = useQGMMAKernel
+        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
+                                              PositionEmbeddingType::kROPE_GPTJ},
+            mXqaParams.position_embedding_type);
     if (useQGMMAKernel)
     {
         switch (mXqaParams.position_embedding_type)
@@ -61,8 +66,24 @@ CubinObj CompileEngine::compile() const
         case PositionEmbeddingType::kROPE_GPTJ: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_GPTJ; break;
         case PositionEmbeddingType::kROPE_GPT_NEOX:
         case PositionEmbeddingType::kLONG_ROPE: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NEOX; break;
-        default: CHECK_TLLM_XQA_JIT_ERROR(("Bad RoPE type", TLLM_XQA_JIT_INVALID_INPUT));
+        // For kROPE_M, set ropeStyle to TLLM_XQA_JIT_ROPE_NONE to let XQA kernel not apply RoPE.
+        // At runtime, a separate kernel (see invokeQKVPreprocessing) will be launched to apply RoPE.
+        case PositionEmbeddingType::kROPE_M: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE; break;
+        default: TLLM_THROW("TllmXqaJit: Bad RoPE type");
         }
+    }
+    else
+    {
+        // Make it explicit that Ampere-style kernel doesn't apply RoPE in the kernel.
+        ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
+    }
+    if (applyRoPEInXqaKernel)
+    {
+        TLLM_CHECK(ropeStyle != tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
+    }
+    else
+    {
+        TLLM_CHECK(ropeStyle == tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE);
     }
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
@@ -76,7 +97,9 @@ CubinObj CompileEngine::compile() const
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
         /*kernel_type=*/useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA,
         /*fp8_output=*/mXqaParams.is_fp8_output,
-        /*use_input_kv=*/useQGMMAKernel,
+        // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
+        // scratch in this case.
+        /*use_input_kv=*/applyRoPEInXqaKernel,
         /*rope_style=*/ropeStyle};
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));

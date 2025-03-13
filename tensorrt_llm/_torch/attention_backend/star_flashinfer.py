@@ -4,6 +4,7 @@ import torch
 from ..distributed import allgather
 from ..modules.linear import ParallelConfig
 from .flashinfer import *
+from .vanilla import VanillaAttention
 
 
 # Please sync with flashinfer's DISPATCH_GQA_GROUP_SIZE in include/flashinfer/utils.cuh
@@ -320,7 +321,7 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return AttentionBackend.dummy_forward(q.unsqueeze(0),
+            return VanillaAttention.dummy_forward(q.unsqueeze(0),
                                                   k.unsqueeze(0),
                                                   v.unsqueeze(0))
 

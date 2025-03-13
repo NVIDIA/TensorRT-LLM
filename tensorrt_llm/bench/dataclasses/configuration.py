@@ -5,18 +5,14 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
-import yaml
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm_utils import BuildCacheConfig, CalibConfig
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import (QuantConfig,
-                                                SpeculativeDecodingMode)
+from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 SPECULATIVE_MAP = {
     SpeculativeDecodingMode.NONE: lambda *args: None,
@@ -31,41 +27,10 @@ class RuntimeConfig(BaseModel):
     sw_version: str
     settings_config: ExecutorSettingsConfig
     world_config: ExecutorWorldConfig
-    decoding_config: DecodingConfig
+    decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
     backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
-
-    def _update_with_extra_options(self, llm_args: Dict) -> Dict:
-        if self.extra_llm_api_options is not None:
-            with open(self.extra_llm_api_options, 'r') as f:
-                llm_args_dict = yaml.safe_load(f)
-
-            field_mapping = {
-                "quant_config": QuantConfig,
-                "calib_config": CalibConfig,
-                "build_config": BuildConfig,
-                "kv_cache_config": trtllm.KvCacheConfig,
-                "decoding_config": trtllm.DecodingConfig,
-                "enable_build_cache": BuildCacheConfig,
-                "peft_cache_config": trtllm.PeftCacheConfig,
-                "scheduler_config": trtllm.SchedulerConfig,
-                "speculative_config": trtllm.LookaheadDecodingConfig,
-                "batching_type": trtllm.BatchingType,
-                "extended_runtime_perf_knob_config":
-                trtllm.ExtendedRuntimePerfKnobConfig,
-                "pytorch_backend_config": PyTorchConfig,
-            }
-            for field, field_type in field_mapping.items():
-                if field in llm_args_dict:
-                    llm_args_dict[field] = field_type(**llm_args_dict[field])
-                    logger.warning(
-                        f"Overriding {field} because it's specified in {self.extra_llm_api_options}."
-                    )
-
-            llm_args = llm_args | llm_args_dict
-
-        return llm_args
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
@@ -81,6 +46,10 @@ class RuntimeConfig(BaseModel):
             self.world_config.pp_size,
             "tensor_parallel_size":
             self.world_config.tp_size,
+            "gpus_per_node":
+            self.world_config.gpus_per_node,
+            "moe_expert_parallel_size":
+            self.world_config.ep_size,
             "trust_remote_code":
             True,
             "kv_cache_config":
@@ -103,7 +72,8 @@ class RuntimeConfig(BaseModel):
             llm_args["pytorch_backend_config"] = \
                 self.performance_options.get_pytorch_perf_config()
 
-        return self._update_with_extra_options(llm_args)
+        return update_llm_args_with_extra_options(llm_args,
+                                                  self.extra_llm_api_options)
 
     @model_validator(mode="after")
     def validate_full_config(self) -> RuntimeConfig:
@@ -166,6 +136,7 @@ class ExecutorWorldConfig(BaseModel):
     world_size: int = 1
     gpus_per_node: int = 8
     leader_mode: bool = False
+    ep_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:
@@ -180,6 +151,10 @@ class ExecutorWorldConfig(BaseModel):
                 f"({num_gpus}).")
 
         return self
+
+    @property
+    def world_size(self) -> int:
+        return self.pp_size * self.tp_size
 
     def _get_tensorrt_llm_executor_worker_path(self) -> Path:
         module_path = find_spec("tensorrt_llm").loader.get_filename()
