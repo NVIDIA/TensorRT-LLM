@@ -1,6 +1,7 @@
 # Multi-stage Dockerfile
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=25.01-py3
+# NOTE: DLFW 25.03 has not been released yet, so we're using the internal DLFW version
+ARG BASE_IMAGE=gitlab-master.nvidia.com:5005/dl/dgx/pytorch
+ARG BASE_TAG=25.03-py3-devel
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base

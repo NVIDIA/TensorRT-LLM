@@ -12,7 +12,7 @@ except ImportError:
     AttentionMaskConverter = None
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        PredefinedAttentionMask, dummy_forward)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
