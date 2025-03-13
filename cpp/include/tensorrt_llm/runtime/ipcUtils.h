@@ -73,5 +73,6 @@ public:
 };
 
 void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
+bool canAccessPeer(WorldConfig const& worldConfig);
 
 } // namespace tensorrt_llm::runtime

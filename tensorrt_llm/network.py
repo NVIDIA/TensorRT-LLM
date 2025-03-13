@@ -553,7 +553,7 @@ class Network(object):
 
         def layer_type_to_class(layer: trt.ILayer = None) -> trt.ILayer:
             '''
-            Convert trt.ILayer into a exect TensorRT layer
+            Convert trt.ILayer into a exact TensorRT layer
             '''
             layer_type_name = str(layer.type)[10:]
             # Some special cases

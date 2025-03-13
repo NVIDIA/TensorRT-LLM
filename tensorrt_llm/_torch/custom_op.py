@@ -1,8 +1,10 @@
 import platform
 import traceback
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
+
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 IS_FLASHINFER_AVAIABLE = False
 
@@ -35,10 +37,23 @@ def _register_fake():
         bias,
         scale,
     ):
-        final_output = torch.empty_like(
-            input, dtype=torch.float8_e4m3fn if scale else input.dtype)
-        inter_output = torch.empty_like(input)
-        return final_output, inter_output
+        from tensorrt_llm.functional import AllReduceFusionOp
+        if op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            final_output = input.new_empty(fp4_shape, dtype=torch.uint8)
+            inter_output = torch.empty_like(input)
+            scale_output = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [final_output, scale_output, inter_output]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+            final_output = input.new_empty(fp4_shape, dtype=torch.float8_e4m3fn)
+            inter_output = torch.empty_like(input)
+            return [final_output, inter_output]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
+            final_output = torch.empty_like(input)
+            inter_output = torch.empty_like(input)
+            return [final_output, inter_output]
+        else:
+            return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::allgather")
     def _(input, group):
@@ -53,6 +68,7 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias,
         out_dtype,
+        userbuffers_id,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -81,6 +97,8 @@ def _register_fake():
         out_scale,
         rotary_inv_freq,
         rotary_cos_sin,
+        latent_cache,
+        q_pe,
         is_fused_qkv,
         update_kv_cache,
         layer_idx,
@@ -95,6 +113,7 @@ def _register_fake():
         beam_width,
         mask_type,
         quant_mode,
+        q_scaling,
         position_embedding_type,
         rotary_embedding_dim,
         rotary_embedding_base,
@@ -105,18 +124,134 @@ def _register_fake():
         rotary_embedding_max_positions,
         rotary_embedding_original_max_positions,
         use_paged_context_fmha,
+        attention_input_type,
+        is_mla_enable,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
     ):
-        output_shape = (q.shape[0], num_heads * head_size)
+        output_shape = (q.shape[0], num_heads *
+                        v_head_dim if is_mla_enable else num_heads * head_size)
         return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
 
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input):
         return torch.empty_like(input)
 
+    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm")
+    def _(a, b, a_scale, b_scale):
+        m = a.shape[0]
+        n = b.shape[0]
+        return a.new_empty((m, n))
+
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input).to(torch.float8_e4m3fn), scale
+
+    @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
+    def _(
+        input: torch.Tensor,
+        workspace: torch.Tensor,
+        reduce_fusion_inputs: torch.Tensor,
+        rank: int,
+        nranks: int,
+        eps: float,
+        fusion_op: int,
+    ):
+        from tensorrt_llm.functional import AllReduceFusionOp
+        residual = reduce_fusion_inputs[0]
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            sf_vec_size = 16
+            sf_use_ue8m0 = False
+            quant_shape, scale_shape = fp4_utils.get_fp4_shape(
+                input.shape, sf_vec_size, sf_use_ue8m0)
+            return torch.empty_like(
+                quant_shape, dtype=torch.uint8), torch.empty_like(
+                    scale_shape, dtype=torch.uint8), torch.empty_like(residual)
+        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return torch.empty_like(input), torch.empty_like(residual)
+        else:
+            raise ValueError(f"Unsupported fusion op: {fusion_op}")
+
+
+@torch.library.custom_op("trtllm::ub_scaled_mm_allreduce_quant_scaled_mm_op",
+                         mutates_args=())
+def ub_scaled_mm_allreduce_quant_scaled_mm_op(
+    mm0_a: torch.Tensor,
+    mm0_b: torch.Tensor,
+    mm0_a_scale: torch.Tensor,
+    mm0_b_scale: torch.Tensor,
+    mm0_bias: Optional[torch.Tensor],
+    mm_dtype: torch.dtype,
+    residual_in: torch.Tensor,
+    gamma: torch.Tensor,
+    groups: List[int],
+    eps: float,
+    scale: torch.Tensor,
+    mm1_b: torch.Tensor,
+    mm1_b_scale: torch.Tensor,
+    mm1_bias: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mm0_res = torch.ops.trtllm.cublas_scaled_mm(
+        mm0_a,
+        mm0_b,
+        mm0_a_scale,
+        mm0_b_scale,
+        bias=mm0_bias,
+        out_dtype=mm_dtype,
+        userbuffers_id=0,
+    )
+    from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
+    hidden, residual = torch.ops.trtllm.allreduce(
+        mm0_res,
+        None,
+        [residual_in, gamma, scale],
+        groups,
+        int(AllReduceStrategy.UB),
+        0,  # UB ar does not care about AllReduceConfig
+        int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
+        eps,
+        True,
+        False,
+        True,
+    )
+    mm1_res = torch.ops.trtllm.cublas_scaled_mm(
+        hidden,
+        mm1_b.t(),
+        scale,
+        mm1_b_scale,
+        bias=mm1_bias,
+        out_dtype=mm_dtype,
+        userbuffers_id=-1,
+    )
+    return mm1_res, residual
+
+
+@ub_scaled_mm_allreduce_quant_scaled_mm_op.register_fake
+def _(
+    mm0_a: torch.Tensor,
+    mm0_b: torch.Tensor,
+    mm0_a_scale: torch.Tensor,
+    mm0_b_scale: torch.Tensor,
+    mm0_bias: Optional[torch.Tensor],
+    mm_dtype: torch.dtype,
+    residual_in: torch.Tensor,
+    gamma: torch.Tensor,
+    groups: List[int],
+    eps: float,
+    scale: torch.Tensor,
+    mm1_b: torch.Tensor,
+    mm1_b_scale: torch.Tensor,
+    mm1_bias: Optional[torch.Tensor],
+):
+    shape = [i for i in mm0_a.shape]
+    shape[-1] = mm1_b.shape[-1]
+    ret = mm0_a.new_empty(shape, dtype=mm_dtype)
+    residual = torch.empty_like(residual_in)
+    return ret, residual
 
 
 if IS_FLASHINFER_AVAIABLE:

@@ -108,6 +108,10 @@ def add_common_args(parser):
         default=None,
         nargs="+",
         help="The list of LoRA task uids; use -1 to disable the LoRA module")
+    parser.add_argument('--debug_mode',
+                        default=False,
+                        action='store_true',
+                        help="Whether or not to turn on the debug mode")
     return parser
 
 

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
 #include "tensorrt_llm/plugins/doraPlugin/doraPlugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
+#include "tensorrt_llm/plugins/fusedLayernormPlugin/fusedLayernormPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
@@ -207,6 +208,7 @@ extern "C"
     {
         static tensorrt_llm::plugins::IdentityPluginCreator identityPluginCreator;
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
+        static tensorrt_llm::plugins::FusedLayernormPluginCreator fusedLayernormPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
         static tensorrt_llm::plugins::GemmSwigluPluginCreator gemmSwigluPluginCreator;
@@ -261,6 +263,7 @@ extern "C"
                   creatorPtr(reduceScatterPluginCreator),
                   creatorPtr(gemmAllReducePluginCreator),
 #endif // ENABLE_MULTI_DEVICE
+                  creatorPtr(fusedLayernormPluginCreator),
                   creatorPtr(smoothQuantGemmPluginCreator),
                   creatorPtr(qserveGemmPluginCreator),
                   creatorPtr(layernormQuantizationPluginCreator),

@@ -409,7 +409,7 @@ def load_weights_from_hf_model(hf_model,
     else:
         plugin_weight_only_quant_type = None
 
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     per_channel = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token = use_smooth_quant and 'PER_TOKEN' in quant_algo
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8
@@ -869,7 +869,7 @@ def quantize(hf_model_dir: str,
     assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
-    use_smooth_quant = quant_config.use_plugin_sq
+    use_smooth_quant = quant_config._use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"

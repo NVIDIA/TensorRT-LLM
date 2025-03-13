@@ -517,68 +517,69 @@ void beamSearchKernelLauncher(
     T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
 {
     // clang-format off
-    //
-    // V1 Workflow (reference: https://github.com/NVIDIA/online-softmax):
-    // logProbs.shape = [nBS, nBM, nV]
-    //          nV               |<- nVChunk ->|<- nVChunk ->| <- ... ->|          |<- nBM*4 ->|<- nBM*4 ->|<- ... ->|*
-    //     ┏━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    //     ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
-    //     ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-    // nBS ┃nBM       ┃ ---> nBS ┃nBM                                   ┃ ---> nBS ┃nBM                              ┃
-    //     ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-    //     ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
-    //     ┗━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-    //       logProbs            divide `nV` elements into `nVPart` parts          pStage3 with `nVPart` tiles per row
-    //
-    //          |<- nBm*2 ->|  |<- nBm*2 ->|
-    //          ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓
-    //          ┃nBM        ┃  ┃nBM        ┃
-    //  B       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  C
-    // ---> nBS ┃nBM        ┃  ┃nBM        ┃ --->
-    //          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫
-    //          ┃nBM        ┃  ┃nBM        ┃
-    //          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛
-    //            pStage2Ids  pStage2LogProbs
-    //
-    // *: Each "tile" in pStage3 with shape [`nBM*4`] contains `nBM*2` top ids and corresponding `nBM*2` log probs.
-    //     |<- nBm*2 ->|<- nBm*2 ->|
-    //     ┏━━━━━━━━━━━━━━━━━━━━━━━┓
-    //   1 ┃  top ids  | log probs ┃
-    //     ┗━━━━━━━━━━━━━━━━━━━━━━━┛
 
-    // A: beamStage1Kernel: gridDim(BS,BM,nVPart), blockDim(nThreadStage1,1,1)
-    //                      Each Block takes `nVChunk` contiguous elements from `logProbs`, does TopK and writes output to `pStage3`
-    // B: beamStage2Kernel: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
-    //                      Each Block takes `nVPart` contiguous tiles from pStage3, add `cumLogProbs`, does TopK` and writes output to `pStage2Ids` and `pStage2LogProbs`
-    // C: beamStage3Kernel: gridDim(BS,1,1), blockDim(128,1,1)
-    //                      Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
-    //                          + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
-    //                          + selects BM elements for the next generation step if not.
-    //                          + maintains related score array, min_normed_score / batchDones / finished, etc..
-    //
-    // ===================================================================================================================================
-    //
-    // V2 Workflow (use Air-TopK for better performance, https://dl.acm.org/doi/pdf/10.1145/3581784.3607062)
-    // logProbs.shape = [nBS, nBM, nV]
-    //     |<- nV ->|          |<- nBM*2 ->|  |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|
-    //     ┏━━━━━━━━┓          ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓  D       ┏━━━━━━━━━━━┓
-    //     ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ ---> nBS ┃           ┃ ---\
-    //     ┣━━━━━━━━┫  A       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  B       ┣━━━━━━━━━━━┫  C       ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛    | E
-    // nBS ┃nBM     ┃ ---> nBS ┃nBM        ┃  ┃nBM        ┃ ---> nBS ┃nBM        ┃ --->       pStage2Id              pStage2Id      |--->
-    //     ┣━━━━━━━━┫          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫          ┣━━━━━━━━━━━┫          ┏━━━━━━━━━━━┓                           |
-    //     ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ --------------------------/
-    //     ┗━━━━━━━━┛          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛
-    //      logProbs             pStage1Id     pStage1Probs           pStage1Probs           pStage2Probs
-    //
-    // A: TopK            : Get top `nBM*2` elements in `nBS*nBM` groups (`nV` elements per group)
-    // B: addCumLogProbs  : Add `cumLogProbs` to the elements in each beam
-    // C: TopK            : Get top `nBM*2` elements in `nBS` group (`nBM*nBM*2` elements per group)
-    // D: gatherIds       : Combine stage1Id and stage2Id to get ids of the top `nBM*2` elements in input logProbs
-    // E: beamStage3Kernel: Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
-    //                          + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
-    //                          + selects BM elements for the next generation step if not.
-    //                          + maintains related score array, min_normed_score / batchDones / finished, etc..
-    //
+    /* V1 Workflow (reference: https://github.com/NVIDIA/online-softmax):
+    logProbs.shape = [nBS, nBM, nV]
+             nV               |<- nVChunk ->|<- nVChunk ->| <- ... ->|          |<- nBM*4 ->|<- nBM*4 ->|<- ... ->|*
+        ┏━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
+        ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+    nBS ┃nBM       ┃ ---> nBS ┃nBM                                   ┃ ---> nBS ┃nBM                              ┃
+        ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+        ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
+        ┗━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+          logProbs            divide `nV` elements into `nVPart` parts          pStage3 with `nVPart` tiles per row
+
+             |<- nBm*2 ->|  |<- nBm*2 ->|
+             ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓
+             ┃nBM        ┃  ┃nBM        ┃
+     B       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  C
+    ---> nBS ┃nBM        ┃  ┃nBM        ┃ --->
+             ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫
+             ┃nBM        ┃  ┃nBM        ┃
+             ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛
+               pStage2Ids  pStage2LogProbs
+
+    *: Each "tile" in pStage3 with shape [`nBM*4`] contains `nBM*2` top ids and corresponding `nBM*2` log probs.
+        |<- nBm*2 ->|<- nBm*2 ->|
+        ┏━━━━━━━━━━━━━━━━━━━━━━━┓
+      1 ┃  top ids  | log probs ┃
+        ┗━━━━━━━━━━━━━━━━━━━━━━━┛
+
+    A: beamStage1Kernel: gridDim(BS,BM,nVPart), blockDim(nThreadStage1,1,1)
+                         Each Block takes `nVChunk` contiguous elements from `logProbs`, does TopK and writes output to `pStage3`
+    B: beamStage2Kernel: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
+                         Each Block takes `nVPart` contiguous tiles from pStage3, add `cumLogProbs`, does TopK` and writes output to `pStage2Ids` and `pStage2LogProbs`
+    C: beamStage3Kernel: gridDim(BS,1,1), blockDim(128,1,1)
+                         Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
+                             + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
+                             + selects BM elements for the next generation step if not.
+                             + maintains related score array, min_normed_score / batchDones / finished, etc..
+
+    ===================================================================================================================================
+
+    V2 Workflow (use Air-TopK for better performance, https://dl.acm.org/doi/pdf/10.1145/3581784.3607062)
+    logProbs.shape = [nBS, nBM, nV]
+        |<- nV ->|          |<- nBM*2 ->|  |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|
+        ┏━━━━━━━━┓          ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓  D       ┏━━━━━━━━━━━┓
+        ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ ---> nBS ┃           ┃ ---\
+        ┣━━━━━━━━┫  A       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  B       ┣━━━━━━━━━━━┫  C       ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛    | E
+    nBS ┃nBM     ┃ ---> nBS ┃nBM        ┃  ┃nBM        ┃ ---> nBS ┃nBM        ┃ --->       pStage2Id              pStage2Id      |--->
+        ┣━━━━━━━━┫          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫          ┣━━━━━━━━━━━┫          ┏━━━━━━━━━━━┓                           |
+        ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ --------------------------/
+        ┗━━━━━━━━┛          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛
+         logProbs             pStage1Id     pStage1Probs           pStage1Probs           pStage2Probs
+
+    A: TopK            : Get top `nBM*2` elements in `nBS*nBM` groups (`nV` elements per group)
+    B: addCumLogProbs  : Add `cumLogProbs` to the elements in each beam
+    C: TopK            : Get top `nBM*2` elements in `nBS` group (`nBM*nBM*2` elements per group)
+    D: gatherIds       : Combine stage1Id and stage2Id to get ids of the top `nBM*2` elements in input logProbs
+    E: beamStage3Kernel: Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
+                             + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
+                             + selects BM elements for the next generation step if not.
+                             + maintains related score array, min_normed_score / batchDones / finished, etc..
+    */
+
     // clang-format on
 
     size_t const nBS{bh.nBatchSize};
@@ -609,21 +610,21 @@ void beamSearchKernelLauncher(
 
         // Stage 1
         invokeTopkLastDim<T>(nBS * nBM, nV, nBM * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         int nThread = min(roundUp(nBM * nBM * 2, 32), 1024);
         addCumLogProbs<<<nBS, nThread, 0, stream>>>(
             pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds, bh.diversityRates, bh.batchSlots, nBS, nBM);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Stage 2
         invokeTopkLastDim<T>(
             nBS, nBM * nBM * 2, nBM * 2, true, pStage1LogProbs, pStage2LogProbs, pStage2Ids, pTopK, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         nThread = min(roundUp(nBM * 2, 32), 1024);
         gatherId<<<nBS, nThread, 0, stream>>>(pStage1Ids, pStage2Ids, nBS, nBM, nV);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else // V1
     {
@@ -638,7 +639,7 @@ void beamSearchKernelLauncher(
         dim3 grid(nBS, nBM, bh.nVPart);
         beamStage1Kernel<T, PBM, nThreadStage1><<<grid, nThreadStage1, bh.nByteSharedMemoryStage1, stream>>>(
             logProbs, bias, pStage3, bh.endIds, bh.finished, nV, bh.batchSlots);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Stage 2
         // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
@@ -662,7 +663,7 @@ void beamSearchKernelLauncher(
             TLLM_LOG_TRACE("Use slow Beam Search stage 2 kernel due to large beam_width or vocab_size");
             BEAM_STAGE2_KERNEL(128, false)
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // Stage 3 in common
@@ -690,7 +691,7 @@ void beamSearchKernelLauncher(
         beamStage3Kernel<T, PBM, nThreadStage3, false, IS_V2>
             <<<nBS, nThreadStage3, 0, stream>>>(pStage2Ids, pStage2LogProbs, pStage3, bh);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 #undef BEAM_STAGE2_KERNEL

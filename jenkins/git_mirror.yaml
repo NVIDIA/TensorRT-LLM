@@ -1,0 +1,3 @@
+check: \.gitlab-master.*\.nvidia\.com
+mapping:
+  "https://gitlab-master.nvidia.com/ftp/GitHubSync/dynamic-kernel-generator.git": " "

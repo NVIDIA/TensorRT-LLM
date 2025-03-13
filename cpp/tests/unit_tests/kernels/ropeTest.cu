@@ -664,7 +664,7 @@ protected:
 
         TLLM_LOG_DEBUG(decoderParams.toString());
         invokeBuildDecoderInfo(decoderParams, this->mStream->get());
-        sync_check_cuda_error();
+        sync_check_cuda_error(this->mStream->get());
     }
 
     void buildPreprocessingParams()
@@ -765,7 +765,6 @@ protected:
             = (this->batch_size * 2 * (this->mCrossAttention ? this->cross_qkv_length : this->max_attention_window)
                   * this->mNumKVHeads * this->mHeadSize * elemSizeBits)
             / 8;
-        bool constexpr canUseOneMoreBlock{true};
         keyValueCacheBuffer = BufferManager::pinned(totalSize);
         void* key_value_cache = static_cast<void*>(keyValueCacheBuffer->data());
 
@@ -861,7 +860,7 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     this->allocateBuffers();
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->mStream->get());
 
     this->buildDecoderParams();
     this->buildKVCaches();
@@ -934,8 +933,6 @@ TYPED_TEST(RopeTest, RopeTestLLamaLinearCache)
 
     auto kernelBlockScales = reinterpret_cast<__nv_fp8_e4m3*>(this->blockScalesCache.data);
     auto referenceBlockScales = reinterpret_cast<__nv_fp8_e4m3*>(this->blockScalesCacheReference.data);
-
-    bool kvCacheEqual{true};
 
 #ifdef ENABLE_FP4
     constexpr auto isFP4 = std::is_same_v<KVCacheType, __nv_fp4_e2m1>;

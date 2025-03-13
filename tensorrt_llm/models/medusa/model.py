@@ -253,7 +253,7 @@ class MedusaForCausalLm(PretrainedModel):
                 model_config = json.load(fp)
 
             num_medusa_heads = kwargs[
-                'medusa_num_heads'] if 'medusa_num_heads' in kwargs else model_config.get(
+                'speculative_config'].num_medusa_heads if 'speculative_config' in kwargs else model_config.get(
                     'medusa_num_heads', None)
             num_medusa_layers = model_config.get('medusa_num_layers', None)
         medusa_weights = load_medusa_hf(medusa_path=speculative_model_dir,

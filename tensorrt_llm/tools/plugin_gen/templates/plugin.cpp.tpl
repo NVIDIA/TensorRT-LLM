@@ -223,7 +223,7 @@ const char* [[ plugin_name ]]::getPluginNamespace() const noexcept
     mPluginAttributes.clear();
 
     {% for arg in params %}
-    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]], 0));
+    mPluginAttributes.emplace_back(PluginField("[[arg.name]]", nullptr, PluginFieldType::[[arg.dtype.dtype.to('trt_plugin')]]));
     {% endfor %}
 
     mFC.nbFields = mPluginAttributes.size();

@@ -258,7 +258,7 @@ void invokeMaskTargetLogits(SizeType32 batchSize, T* targetLogits, SizeType32 co
         maskTargetLogitsKernel<<<grid, block, 0, stream>>>(targetLogits, batchSlots, beamWidth, vocabSizePadded,
             finishedInput, maxBatchSize, outputIdsAfterSampling, runtimeTopKDevicePtr, maskBuffer);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -278,7 +278,7 @@ void invokeAcceptDraftTokens(SizeType32 batchSize, T* draftProbs, T* targetProbs
             batchUseDraftLogits, draftIds, finishedInput, finishedOutput, curandState, batchSlots, maxDraftTokens,
             beamWidth, vocabSizePadded, randomThreshold, constantThreshold, step, batchIsAccepted, targetOutputIds);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -311,7 +311,7 @@ void invokeForwardAcceptedTokens(SizeType32 batchSize, SizeType32 const* batchSl
     dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
     forwardAcceptedTokensKernel<<<grid, block, 0, stream>>>(batchSize, batchSlots, batchIsAccepted,
         outputSequenceLengths, draftIds, idsPtrs, step, maxDraftTokens, endIds, finishedOutput);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 } // namespace tensorrt_llm::kernels::speculative_decoding

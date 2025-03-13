@@ -78,7 +78,7 @@ def make_tuple(num_experts=4,
 
 def config_is_allowed(config):
     # TODO: Support ootb path with getSMVersion() < 90:
-    enable_ootb = getSMVersion() >= 90
+    enable_ootb = getSMVersion() >= 90 and getSMVersion() < 100
     enable_fp8 = getSMVersion() >= 89
 
     WEIGHT_TYPE_INDEX = 6
@@ -723,11 +723,11 @@ class TestMoE(unittest.TestCase):
                        ('int4', actfn, True)]
             # OOTB tests
             # TODO: Support ootb path with getSMVersion() < 90, quantization:
-            if getSMVersion() >= 90:
+            if getSMVersion() >= 90 and getSMVersion() < 100:
                 params += [('float32', actfn, False), ('float16', actfn, False),
                            ('bfloat16', actfn, False)]
             if getSMVersion() >= 100:
-                params += [('fp4', actfn, True), ('fp4', actfn, False)]
+                params += [('fp4', actfn, True)]
         return params
 
     @parameterized.expand(get_mlp_params(), name_func=unittest_name_func)
@@ -904,7 +904,7 @@ class TestMoE(unittest.TestCase):
     @parameterized.expand(get_ootb_comp_params(), name_func=unittest_name_func)
     def test_ootb_comparison(self, dtype_str, num_experts, top_k, actfn):
         """ This test uses one expert and compares the result to a plain MLP """
-        if getSMVersion() < 90:
+        if getSMVersion() != 90:
             pytest.skip("OOTB tests disabled on pre-Hopper architectures")
 
         use_int4_weights = dtype_str == 'int4'

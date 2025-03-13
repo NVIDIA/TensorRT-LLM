@@ -32,11 +32,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../examples'))
 import os
 import sys
 
-from examples.gptneox.convert_checkpoint import convert_hf_gptneox
+from gptneox.convert_checkpoint import convert_hf_gptneox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import unittest_name_func

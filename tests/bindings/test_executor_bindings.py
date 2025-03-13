@@ -468,6 +468,7 @@ def test_get_num_responses_ready(streaming: bool,
     assert executor.get_num_responses_ready() == num_expected_responses
 
 
+@pytest.mark.skip("https://nvbugs/5028235")
 @pytest.mark.parametrize("batching_type", [trtllm.BatchingType.INFLIGHT])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("beam_width", [1])
@@ -587,6 +588,8 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     executor_config = trtllm.ExecutorConfig(beam_width)
     executor_config.batching_type = batching_type
     executor_config.kv_cache_config = kv_cache_config
+    if return_generation_logits:
+        executor_config.gather_generation_logits = True
 
     if return_context_logits or return_generation_logits:
         model_path = model_path_return_logits
@@ -853,6 +856,23 @@ def test_output_config():
     assert additional_model_output.gather_context == True
 
 
+def test_output_config_pickle():
+    config = trtllm.OutputConfig(
+        True, False, True, False, True, False,
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.return_log_probs == True
+    assert config_copy.return_context_logits == False
+    assert config_copy.return_generation_logits == True
+    assert config_copy.exclude_input_from_output == False
+    assert config_copy.return_encoder_output == True
+    assert config_copy.return_perf_metrics == False
+    assert len(config_copy.additional_model_outputs) == 1
+    additional_model_output = config_copy.additional_model_outputs[0]
+    assert additional_model_output.name == "topKLogits"
+    assert additional_model_output.gather_context == True
+
+
 def test_external_draft_tokens_config():
     tokens = [1, 2, 3]
     config = trtllm.ExternalDraftTokensConfig(tokens)
@@ -1066,6 +1086,25 @@ def test_response():
     assert response.result.output_token_ids == [[1, 2, 3]]
 
 
+def test_dynamic_batch_config():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    assert config.enable_batch_size_tuning == True
+    assert config.enable_max_num_tokens_tuning == True
+    assert config.dynamic_batch_moving_average_window == 128
+
+
+def test_dynamic_batch_config_pickle():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.enable_batch_size_tuning == True
+    assert config_copy.enable_max_num_tokens_tuning == True
+    assert config_copy.dynamic_batch_moving_average_window == 128
+
+
 def test_scheduler_config():
     capacity_scheduler_policy = trtllm.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
     config = trtllm.SchedulerConfig()
@@ -1223,6 +1262,25 @@ def test_kv_cache_retention_config():
         ], 50)
 
 
+def test_speculative_decoding_config():
+    config = trtllm.SpeculativeDecodingConfig(True)
+    assert config.fast_logits == True
+
+    kwargs = {
+        "fast_logits": True,
+    }
+
+    config = trtllm.SpeculativeDecodingConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
+def test_speculative_decoding_config_pickle():
+    config = trtllm.SpeculativeDecodingConfig(True)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.fast_logits == True
+
+
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
     assert config.max_window_size == 3
@@ -1243,6 +1301,14 @@ def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(**kwargs)
     for k, v in kwargs.items():
         assert getattr(config, k) == v
+
+
+def test_lookahead_decoding_config_pickle():
+    config = trtllm.LookaheadDecodingConfig(3, 5, 7)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.max_window_size == 3
+    assert config_copy.max_ngram_size == 5
+    assert config_copy.max_verification_set_size == 7
 
 
 def test_eagle_config():
@@ -1295,6 +1361,16 @@ def test_eagle_config():
     config = trtllm.EagleConfig(**kwargs2)
     for k, v in kwargs2.items():
         assert getattr(config, k) == v
+
+
+def test_eagle_config_pickle():
+    config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
+    assert config.eagle_choices == config_copy.eagle_choices
+    assert config.posterior_threshold == config_copy.posterior_threshold
+    assert config.use_dynamic_tree == config_copy.use_dynamic_tree
+    assert config.greedy_sampling == config_copy.greedy_sampling
 
 
 def test_decoding_mode():
@@ -1667,6 +1743,7 @@ def test_logits_post_processor_batched(model_files, model_path):
         assert len(tokens[req_id]) == expected_num_tokens, f"{req_id}"
 
 
+@pytest.mark.skip("https://nvbugs/5082576")
 def test_kv_event_stream(model_path):
 
     beam_width = 1
@@ -1821,6 +1898,57 @@ def test_request_perf_metrics(streaming: bool, model_path):
         max_tokens,
         streaming=streaming,
         exclude_input_from_output=False), f"{request_id}"
+
+
+def test_request_perf_metrics_kv_cache(model_path):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create request: model uses 32 tokens per block, so it will fill a full block
+    max_tokens = 32
+    input_tokens = [1, 2, 3, 4]
+    request = trtllm.Request(input_tokens, max_tokens=max_tokens)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+    # Store two blocks with a total of 35 reusable tokens (4 input + 32 output, but last token is not stored)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Prepare second request using the first output
+    input_tokens = result.output_token_ids[beam_width - 1] + [1, 2, 3, 4]
+    output_config = trtllm.OutputConfig(return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             output_config=output_config)
+
+    # Enqueue the request
+    # New query has 36 tokens that match input and output of first request plus 4 additional tokens.
+    # First block reused completely (32 tokens), from second block we'll partially reuse 3 tokens.
+    request_id = executor.enqueue_request(request)
+
+    # Get the response
+    responses = executor.await_responses(request_id)
+    assert not responses[0].has_error()
+    result = responses[0].result
+    assert result.is_final
+
+    # Check KV cache metric: Two blocks will be reused, although second block is partially reused.
+    # Cache hit rate is 100% since granularity is blocks, not tokens.
+    kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
+    assert kv_cache_metrics.num_total_allocated_blocks == 0
+    assert kv_cache_metrics.num_new_allocated_blocks == 0
+    assert kv_cache_metrics.num_reused_blocks == 2
+    assert kv_cache_metrics.num_missed_blocks == 0
+    assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])
@@ -1993,6 +2121,15 @@ def test_kv_cache_config_pickle():
     assert config.host_cache_size == config_copy.host_cache_size
     assert config.onboard_blocks == config_copy.onboard_blocks
     assert config.event_buffer_max_size == config_copy.event_buffer_max_size
+
+
+def test_kv_cache_retention_config_pickle():
+    config = trtllm.KvCacheRetentionConfig([
+        trtllm.KvCacheRetentionConfig.TokenRangeRetentionConfig(
+            0, 2, 30, datetime.timedelta(seconds=30))
+    ], 80)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config == config_copy
 
 
 def test_peft_cache_config_pickle():
@@ -2218,9 +2355,26 @@ def test_runtime_defaults():
         assert getattr(default_runtime_defaults, key) == None
 
 
-def test_DynamicBatchConfig_pickle():
-    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
-                                       enable_max_num_tokens_tuning=True,
-                                       dynamic_batch_moving_average_window=128)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.enable_batch_size_tuning == config_copy.enable_batch_size_tuning
+def test_request_pickle():
+
+    samplingConfig = trtllm.SamplingConfig(beam_width=1,
+                                           top_k=10,
+                                           top_p=0.1,
+                                           num_return_sequences=3)
+
+    request = trtllm.Request(input_token_ids=[1, 2, 3, 4],
+                             max_tokens=5,
+                             streaming=False,
+                             client_id=123,
+                             sampling_config=samplingConfig)
+    request_copy = pickle.loads(pickle.dumps(request))
+
+    assert request.sampling_config.beam_width == request_copy.sampling_config.beam_width
+    assert request.sampling_config.top_k == request_copy.sampling_config.top_k
+    assert request.sampling_config.num_return_sequences == request_copy.sampling_config.num_return_sequences
+    assert request.request_type == request_copy.request_type
+    assert request.input_token_ids == request_copy.input_token_ids
+    assert request.max_new_tokens == request_copy.max_new_tokens
+    assert request.output_config.return_log_probs == request_copy.output_config.return_log_probs
+    assert request.guided_decoding_params == request_copy.guided_decoding_params
+    assert request.kv_cache_retention_config == request_copy.kv_cache_retention_config

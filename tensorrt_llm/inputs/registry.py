@@ -22,8 +22,9 @@ class InputProcessor(Protocol):
         - Register the inherited class to the model class using @register_input_processor(...)
     """
 
-    tokenizer: any
+    model_path: any
     model_config: any
+    tokenizer: any
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -34,9 +35,10 @@ class InputProcessor(Protocol):
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
-    def __init__(self, model_config, tokenizer) -> None:
+    def __init__(self, model_path, model_config, tokenizer) -> None:
         self.tokenizer = tokenizer
         self.model_config = model_config
+        self.model_path = model_path
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -104,6 +106,7 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
         except RuntimeError:  # unregistered model
             input_processor_cls = None
         if input_processor_cls is not None:
-            return input_processor_cls(model_config, tokenizer)
+            return input_processor_cls(model_path_or_dir, model_config,
+                                       tokenizer)
 
-    return DefaultInputProcessor(None, tokenizer)
+    return DefaultInputProcessor(None, None, tokenizer)

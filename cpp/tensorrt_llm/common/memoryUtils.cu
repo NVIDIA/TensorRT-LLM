@@ -23,10 +23,68 @@
 #include <sys/stat.h>
 #include <unordered_map>
 
+#include <sanitizer/asan_interface.h>
+
 namespace tensorrt_llm
 {
 namespace common
 {
+
+#ifdef __has_feature
+#if __has_feature(address_sanitizer)
+#define TLLM_HAS_ASAN
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define TLLM_HAS_ASAN
+#endif
+
+cudaError_t cudaMemcpyAsyncSanitized(
+    void* dst, void const* src, size_t count, enum cudaMemcpyKind kind, cudaStream_t stream)
+{
+#if defined(TLLM_HAS_ASAN)
+    bool needASAN = false;
+    if (kind == cudaMemcpyDeviceToHost)
+    {
+        needASAN = true;
+    }
+    else if (kind == cudaMemcpyDefault)
+    {
+        auto const srcType = getPtrCudaMemoryType(src);
+        auto const dstType = getPtrCudaMemoryType(dst);
+        needASAN = srcType == cudaMemoryTypeDevice && dstType != cudaMemoryTypeDevice;
+    }
+
+    // Poison the memory area during async copy
+    if (needASAN)
+    {
+        ASAN_POISON_MEMORY_REGION(dst, count);
+    }
+
+    auto const result = cudaMemcpyAsync(dst, src, count, kind, stream);
+
+    if (result == cudaSuccess && needASAN)
+    {
+        struct ctxType
+        {
+            void* ptr;
+            size_t count;
+        };
+
+        auto const ctx = new ctxType{dst, count};
+        auto cb = [](cudaStream_t, cudaError_t, void* data)
+        {
+            auto const ctx = static_cast<ctxType*>(data);
+            ASAN_UNPOISON_MEMORY_REGION(ctx->ptr, ctx->count);
+            delete ctx;
+        };
+        TLLM_CUDA_CHECK(cudaStreamAddCallback(stream, cb, ctx, 0));
+    }
+
+    return result;
+#else
+    return cudaMemcpyAsync(dst, src, count, kind, stream);
+#endif
+}
 
 template <typename T>
 void deviceMalloc(T** ptr, size_t size, bool is_random_initialize)
@@ -208,7 +266,7 @@ void cudaAutoCpy(T* tgt, T const* src, const size_t size, cudaStream_t stream)
 {
     if (stream != NULL)
     {
-        check_cuda_error(cudaMemcpyAsync(tgt, src, sizeof(T) * size, cudaMemcpyDefault, stream));
+        check_cuda_error(cudaMemcpyAsyncSanitized(tgt, src, sizeof(T) * size, cudaMemcpyDefault, stream));
     }
     else
     {

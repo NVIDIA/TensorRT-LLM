@@ -12,7 +12,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_vila import VilaConfig, VilaModel
+from tensorrt_llm._torch.models.modeling_vila import (VilaConfig, VilaModel,
+                                                      fuse_input_embeds)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -476,7 +477,7 @@ class TestVila(unittest.TestCase):
                                  device=device,
                                  dtype=torch.int)
         images = [torch.rand(193, 2560, dtype=dtype, device=device)]
-        input_ids, input_embeds = vila._fuse_input_embeds(input_ids, images)
+        input_ids, input_embeds = fuse_input_embeds(vila, input_ids, images)
         self.assertIsNone(input_ids)
         self.assertEqual(list(input_embeds.shape), [233, 2560])
 

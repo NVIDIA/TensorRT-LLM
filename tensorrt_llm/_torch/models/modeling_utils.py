@@ -1,7 +1,9 @@
 import contextlib
+import fnmatch
 import math
 import time
 from abc import ABC
+from dataclasses import dataclass
 from typing import Dict, Generic, Optional, Tuple, Type, TypeVar
 
 import torch
@@ -25,6 +27,14 @@ def timing(message: str):
     yield
     end = time.time()
     print(f"{message} -- {(end-start):.2f}s")
+
+
+@dataclass
+class EagerFusionConfig:
+    PRE_MOE_FUSION: bool = False
+    PRE_MLP_FUSION: bool = False
+    POST_MLP_FUSION: bool = False
+    POST_MOE_FUSION: bool = False
 
 
 class MetaInitException(RuntimeError):
@@ -139,10 +149,20 @@ class DecoderModel(nn.Module, ABC):
         return hidden_states
 
 
+class PostInitCaller(type):
+
+    def __call__(cls, *args, **kwargs):
+        obj = type.__call__(cls, *args, **kwargs)
+        obj.__post_init__()
+        return obj
+
+
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
-class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
+class DecoderModelForCausalLM(nn.Module,
+                              Generic[TModel, TConfig],
+                              metaclass=PostInitCaller):
 
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
@@ -151,17 +171,32 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
         self.model = model
         # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
         # will considering per layer QuantConfig in the future.
-        self.lm_head = LMHead(
-            vocab_size,
-            hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=config.mapping.tp_rank,
-                tensor_parallel_size=config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-            ),
-        )
+        if config.mapping.enable_attention_dp:
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                parallel_config=ParallelConfig(
+                    tensor_parallel_rank=0,
+                    tensor_parallel_size=1,
+                    tensor_parallel_mode=None,
+                    gather_output=False,
+                ),
+            )
+        else:
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                parallel_config=ParallelConfig(
+                    tensor_parallel_rank=config.mapping.tp_rank,
+                    tensor_parallel_size=config.mapping.tp_size,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
+                    gpus_per_node=config.mapping.gpus_per_node,
+                ),
+            )
+
         # use embedding weights in lm_head if tie word embedding is enabled
         if config.pretrained_config.tie_word_embeddings:
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
@@ -169,7 +204,28 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+
         self.logits_processor = LogitsProcessor()
+
+    def __post_init__(self):
+        quant_config = self.model_config.quant_config
+        if quant_config is not None:
+            # skip quant for modules in QuantConfig.exclude_modules
+            if quant_config.exclude_modules is not None:
+                exclude_modules = quant_config.exclude_modules
+                for name, module in self.named_modules():
+                    is_excluded = False
+                    for exclude_module in exclude_modules:
+                        if fnmatch.fnmatchcase(name, exclude_module):
+                            is_excluded = True
+                            break
+                    if is_excluded and getattr(module, "quant_config",
+                                               None) is not None:
+                        module.quant_config = None
+
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
 
     @property
     def config(self):
@@ -256,7 +312,7 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
         rope_factor = 1
         if rope_scaling is not None:
             rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
-            if rope_type not in ("su", "longrope", "llama3"):
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
                 rope_factor = rope_scaling.get('factor', 1.0)
 
         # Step 1: Find the upper bound of max_seq_len

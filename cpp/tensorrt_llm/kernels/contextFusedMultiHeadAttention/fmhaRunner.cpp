@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,12 +82,13 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
-    TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_120),
+    TLLM_CHECK_WITH_INFO(
+        (mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90 || mSM == kSM_100 || mSM == kSM_120),
         "Unsupported architecture");
     TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
                              || mFixedParams.dataType == DATA_TYPE_E4M3),
         "Unsupported data type");
-    xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mSM);
+    xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
     if (mFixedParams.headSizeV == 0)
     {
@@ -107,8 +108,8 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
 // Shared setup function.
 void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
 {
-    // Memset kernel params.
-    memset(&mKernelParams, 0, sizeof(mKernelParams));
+    // Reinit kernel params.
+    mKernelParams = {};
 
     // Set the batch size, and sequence length.
     mKernelParams.b = runnerParams.b;
@@ -149,7 +150,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     }
     // Set the output buffer stride in bytes.
     mKernelParams.o_stride_in_bytes
-        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataType);
+        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataTypeOut);
     // Set the packed_mask_stride_in_bytes.
     if (mFixedParams.attentionMaskType == ContextAttentionMaskType::CUSTOM_MASK)
     {
@@ -233,6 +234,14 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     {
         mKernelParams.paged_kv_cache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
     }
+
+    // for sage attention
+    mKernelParams.sage.q.scales = runnerParams.qScalePtr;
+    mKernelParams.sage.k.scales = runnerParams.kScalePtr;
+    mKernelParams.sage.v.scales = runnerParams.vScalePtr;
+    mKernelParams.sage.q.max_nblock = runnerParams.qMaxNBlock;
+    mKernelParams.sage.k.max_nblock = runnerParams.kMaxNBlock;
+    mKernelParams.sage.v.max_nblock = runnerParams.vMaxNBlock;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -281,6 +290,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm8x = (mSM == kSM_86 || mSM == kSM_89);
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
+    bool const isSm100 = (mSM == kSM_100);
     bool const isSm120 = (mSM == kSM_120);
 
     // Sliding_window_causal mask.
@@ -343,7 +353,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
             mLaunchParams.granular_tiling = false;
         }
-        else if (isSm80 || isSm8x || isSm120)
+        else if (isSm80 || isSm8x || isSm100 || isSm120)
         {
             // otherwise, choose tiled kernel for Ampere/Ada/Gb20x
             mLaunchParams.granular_tiling = true;
@@ -387,6 +397,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.use_tma = false;
         mLaunchParams.dynamic_scheduler = false;
     }
+
+    mLaunchParams.sage_block_size_q = mFixedParams.sageBlockSizeQ;
+    mLaunchParams.sage_block_size_k = mFixedParams.sageBlockSizeK;
+    mLaunchParams.sage_block_size_v = mFixedParams.sageBlockSizeV;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -437,9 +451,9 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];                    // d*h*3
 
     uint64_t tensor_stride_o[3];
-    tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataType); // d
-    tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];                      // d*h
-    tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];                      // d*h*1
+    tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
+    tensor_stride_o[1] = tensor_size_o[1] * tensor_stride_o[0];                         // d*h
+    tensor_stride_o[2] = tensor_size_o[2] * tensor_stride_o[1];                         // d*h*1
 
     // traversal stride
     uint32_t traversal_stride_qkv[4] = {1, 1, 1, 1};
@@ -486,7 +500,7 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     // O: 16
     // Note: sliding window causal kernel currently has reg spill when TMA store is enabled
     box_size[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataType) == 1)
+    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
         && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
     {
         qkv_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
@@ -567,7 +581,7 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
 
     // O: 16. Reuse
     box_size_qo[3] = 16;
-    if ((get_size_in_bytes(mFixedParams.dataType) == 1)
+    if ((get_size_in_bytes(mFixedParams.dataTypeOut) == 1)
         && mLaunchParams.attention_mask_type != ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
     {
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,

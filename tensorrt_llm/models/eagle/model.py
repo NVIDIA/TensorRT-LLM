@@ -14,13 +14,16 @@
 # limitations under the License.
 
 from collections import OrderedDict
+from typing import Optional, Union
 
 import numpy as np
 import tensorrt as trt
+from tqdm import tqdm
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM, LLaMAModel
+from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 
 from ..._common import default_net, default_trtnet
 from ..._utils import pad_vocab_size
@@ -30,6 +33,7 @@ from ...functional import (Tensor, _create_tensor, cast, concat,
 from ...layers import AttentionParams, ColumnLinear, SpecDecodingParams
 from ...module import Module, ModuleList
 from ...plugin import TRT_LLM_PLUGIN_NAMESPACE
+from ..modeling_utils import QuantConfig
 from .config import EagleConfig
 
 
@@ -577,6 +581,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
     def __init__(self, config: EagleConfig):
 
         super().__init__(config)
+
         self.num_eagle_layers = config.num_eagle_layers
         self.max_non_leaves_per_layer = config.max_non_leaves_per_layer
         self.hidden_size = config.hidden_size
@@ -1213,3 +1218,110 @@ class EagleForCausalLM(LLaMAForCausalLM):
             'all_layers_draft_token_ids_predecessor'] = all_layers_draft_token_ids_predecessor
 
         return inputs
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        assert hf_model_or_dir is not None
+        speculative_model_dir = kwargs.get('speculative_model', None)
+        tllm_config = EagleConfig.from_hugging_face(hf_model_or_dir,
+                                                    dtype=dtype,
+                                                    mapping=mapping,
+                                                    quant_config=quant_config,
+                                                    **kwargs)
+
+        # for rank in range(mapping.world_size):
+        tllm_config.mapping = Mapping(world_size=mapping.world_size,
+                                      rank=mapping.rank,
+                                      cp_size=1,
+                                      tp_size=mapping.tp_size,
+                                      pp_size=mapping.pp_size)
+
+        model = EagleForCausalLM(tllm_config)
+
+        def check_and_update(module, dict):
+            if hasattr(module, 'tllm_to_externel_key_dict'):
+                module.tllm_to_externel_key_dict.update(dict)
+            else:
+                module.tllm_to_externel_key_dict = dict
+
+        def copy(tensors):
+            if isinstance(tensors, list):
+                if None in tensors:
+                    return tensors
+                else:
+                    return [tensor.clone() for tensor in tensors]
+            elif tensors is None:
+                return tensors
+            else:
+                return tensors.clone()
+
+        shared_weight_prefixs = []
+        tllm_weights = {}
+        customized_dict = {"drafter": ""}
+        if speculative_model_dir is None:
+            # Single checkpoint for ModelOpt
+            for idx, eagle_net in enumerate(model.eagle_nets):
+                check_and_update(eagle_net.drafter.fc, {"fc": "fc"})
+                check_and_update(eagle_net.drafter.vocab_embedding,
+                                 {f"eagle_nets.{idx}": "model"})
+                check_and_update(eagle_net.lm_head, {f"eagle_nets.{idx}": ""})
+                shared_weight_prefixs.append(f"eagle_nets.{idx}")
+                customized_dict[f'eagle_nets.{idx}'] = 'eagle_module'
+            loader = ModelWeightsLoader(speculative_model_dir, customized_dict)
+            loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.named_parameters()):
+                if any([
+                        tllm_key.startswith(prefix)
+                        for prefix in shared_weight_prefixs
+                ]):
+                    tllm_weights.update(loader.load(tllm_key, preprocess=copy))
+                else:
+                    tllm_weights.update(loader.load(tllm_key))
+            loader.fill(tllm_weights)
+        else:
+            # Double checkpoint for HF
+            for idx, eagle_net in enumerate(model.eagle_nets):
+                check_and_update(eagle_net.drafter.fc, {"fc": "fc"})
+                check_and_update(eagle_net.drafter.vocab_embedding,
+                                 {f"eagle_nets.{idx}": ""})
+                check_and_update(eagle_net.lm_head, {f"eagle_nets.{idx}": ""})
+                shared_weight_prefixs.append(f"eagle_nets.{idx}")
+                customized_dict[f'eagle_nets.{idx}'] = ''
+
+            # Load base model
+            base_loader = ModelWeightsLoader(hf_model_or_dir)
+            base_loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.transformer.named_parameters()):
+                tllm_weights.update(base_loader.load("transformer." + tllm_key))
+            tllm_weights.update(base_loader.load("lm_head.weight"))
+            # for idx in range(args.num_eagle_layers):
+            for idx in range(4):
+                tllm_weights.update(
+                    base_loader.load(f"eagle_nets.{idx}.lm_head.weight",
+                                     preprocess=copy))
+
+            # Load eagle model
+            eagle_loader = ModelWeightsLoader(str(speculative_model_dir),
+                                              customized_dict)
+            eagle_loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.eagle_nets.named_parameters()):
+                if not tllm_key.endswith("lm_head.weight"):
+                    if any([
+                            tllm_key.startswith(prefix)
+                            for prefix in shared_weight_prefixs
+                    ]):
+                        tllm_weights.update(
+                            eagle_loader.load("eagle_nets." + tllm_key,
+                                              preprocess=copy))
+                    else:
+                        tllm_weights.update(
+                            eagle_loader.load("eagle_nets." + tllm_key))
+            base_loader.fill(tllm_weights)
+
+        return model

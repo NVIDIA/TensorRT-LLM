@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -41,15 +42,15 @@ struct FillBuffers
     using BufferConstPtr = runtime::IBuffer::SharedConstPtr;
 
     template <typename T>
-    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, BufferPtr hostBuffer,
-        BufferPtr deviceBuffer, BufferConstPtr batchSlots, std::pair<float, float> const& limits,
+    void operator()(std::optional<std::vector<T>> const& optParam, T const defaultValue, BufferPtr const& hostBuffer,
+        BufferPtr const& deviceBuffer, BufferConstPtr const& batchSlots, std::pair<float, float> const& limits,
         std::string const& name) const
     {
         auto hostBufferRange = runtime::BufferRange<T>(*hostBuffer);
-        for (size_t bi = 0; bi < batchSize; ++bi)
+        auto batchSlotsRange = runtime::BufferRange<runtime::SizeType32 const>(*batchSlots);
+        for (runtime::SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto value = defaultValue;
-            auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
             if (optParam)
             {
                 if (optParam->size() == 1)
@@ -58,13 +59,15 @@ struct FillBuffers
                 }
                 else
                 {
-                    TLLM_CHECK_WITH_INFO(optParam->size() == batchSize, "Argument vector size mismatch.");
-                    value = optParam.value()[bi];
+                    TLLM_CHECK_WITH_INFO(
+                        optParam->size() == static_cast<size_t>(batchSize), "Argument vector size mismatch.");
+                    value = optParam->at(bi);
                 }
             }
             TLLM_CHECK_WITH_INFO(limits.first < static_cast<float>(value) && static_cast<float>(value) <= limits.second,
                 "%s param (%f) is out of limits (%f, %f]", name.c_str(), static_cast<float>(value), limits.first,
                 limits.second);
+            auto const batchSlot = batchSlotsRange[bi];
             hostBufferRange[batchSlot] = value;
         }
 
@@ -128,7 +131,7 @@ inline DecoderDomain getLocalDecoderDomain(
 }
 
 template <typename... T>
-runtime::SizeType32 expandMatchElements(runtime::SizeType32 expandSize, std::vector<T>&... vector)
+size_t expandMatchElements(size_t expandSize, std::vector<T>&... vector)
 {
     std::array vectorSizes{vector.size()...};
 

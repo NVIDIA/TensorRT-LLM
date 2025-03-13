@@ -189,7 +189,7 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
         biasSoftmaxParams.minPs = bufferCastOrNull<float>(minPs);
         biasSoftmaxParams.checkParams();
         invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
-        sync_check_cuda_error();
+        sync_check_cuda_error(getStream());
     }
 
     for (auto&& layer : mSamplingLayers)

@@ -15,25 +15,28 @@
  */
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/runtime/worldConfig.h"
-
-#include <algorithm>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <set>
+#include <vector>
 
 namespace tensorrt_llm::runtime
 {
 struct IpcNvlsHandle
 {
     size_t size = 0;
+    // Device pointers used by kernels
     uintptr_t uc_ptr = 0;
     uintptr_t mc_ptr = 0;
+    std::vector<uintptr_t> ipc_uc_ptrs;
+    // Device pointers
     CUdeviceptr uc_va;
     CUdeviceptr mc_va;
+    std::vector<CUdeviceptr> ipc_uc_vas;
+    // Device allocation handles
     CUmemGenericAllocationHandle uc_handle;
     CUmemGenericAllocationHandle mc_handle;
+    std::vector<CUmemGenericAllocationHandle> ipc_uc_handles;
 };
 
 void MPI_group_barrier(std::set<int> ranks);
@@ -62,17 +65,25 @@ public:
         _capacity = size;
     }
 
-    T* getMulticastPointer() const
+    // Return device pointer to multicast memory
+    [[nodiscard]] T* getMulticastPointer() const
     {
         return reinterpret_cast<T*>(_handle.mc_ptr);
     }
 
-    T* getUnicastPointer() const
+    // Return device pointer for current rank
+    [[nodiscard]] T* getUnicastPointer() const
     {
         return reinterpret_cast<T*>(_handle.uc_ptr);
     }
 
-    size_t getCapacity() const
+    // Return host list of device pointers to memory on each rank
+    [[nodiscard]] T** getIpcUnicastPointers()
+    {
+        return reinterpret_cast<T**>(_handle.ipc_uc_ptrs.data());
+    }
+
+    [[nodiscard]] size_t getCapacity() const
     {
         return _capacity;
     }

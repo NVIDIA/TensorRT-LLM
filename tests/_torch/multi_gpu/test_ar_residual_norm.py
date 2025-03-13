@@ -14,8 +14,10 @@
 # limitations under the License.
 import os
 import pickle
+import random
 import sys
 import traceback
+from time import sleep
 
 import cloudpickle
 import pytest
@@ -108,34 +110,43 @@ def row_linear_residual_norm_fusion_forward(
     assert backend.match_count[0] == 1, "Pattern matching failed"
 
     # torch run
-    l0 = nn.Linear(in_features=hidden_size,
-                   out_features=hidden_size,
-                   bias=False,
-                   dtype=dtype)
-    l0.weight.data.copy_(weights[0])
-    l0.cuda()
+    l0_torch = nn.Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype)
+    l0_torch.weight.data.copy_(weights[0])
+    l0_torch.cuda()
 
-    torch_output = l0.forward(x)
-    torch_inter_output = torch_output + residual
-    torch_final_output = rms_norm(torch_inter_output, norm_weight, eps)
+    def ref_func(input, residual):
+        torch_output = l0_torch.forward(input)
+        torch_inter_output = torch_output + residual
+        torch_final_output = rms_norm(torch_inter_output, norm_weight, eps)
+        return torch_final_output, torch_inter_output + 1
 
-    torch.testing.assert_close(
-        torch_final_output,
-        final_output,
-        rtol=0.05,
-        atol=0.15,
-    )
-    torch.testing.assert_close(
-        torch_inter_output + 1,
-        inter_output,
-        rtol=0.05,
-        atol=0.15,
-    )
+    seq_len = x.shape[0]
+
+    for i in range(1, seq_len + 1):
+        sleep(random.randint(0, 10) / 10 * tensor_parallel_rank)
+        final_output, inter_output = func(x[:i], residual[:i])
+        torch_final_output, torch_inter_output = ref_func(x[:i], residual[:i])
+
+        torch.testing.assert_close(
+            torch_final_output,
+            final_output,
+            rtol=0.05,
+            atol=0.15,
+        )
+        torch.testing.assert_close(
+            torch_inter_output,
+            inter_output,
+            rtol=0.05,
+            atol=0.15,
+        )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("seq_len", [2, 32], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("seq_len", [8, 32], ids=lambda x: f"seqlen:{x}")
 @pytest.mark.parametrize("hidden_size", [16, 256], ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("fused_add_norm", [True, False],
                          ids=["fused_add_norm", "unfused_add_norm"])
@@ -158,4 +169,4 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fused_add_norm):
 
 
 if __name__ == "__main__":
-    test_row_linear_residual_norm_fusion(2, 256, True)
+    test_row_linear_residual_norm_fusion(256, True)

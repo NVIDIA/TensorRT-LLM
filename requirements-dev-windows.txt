@@ -8,7 +8,9 @@ parameterized
 pre-commit
 pybind11
 pybind11-stubgen
+pytest
 pytest-cov
+pytest-env
 pytest-forked
 pytest-timeout
 pytest-xdist
@@ -19,3 +21,4 @@ typing-extensions==4.8.0
 jsonlines==4.0.0
 jieba==0.42.1
 rouge==1.0.1
+ruff==0.9.4

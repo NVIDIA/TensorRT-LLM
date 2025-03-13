@@ -35,8 +35,8 @@ public:
     GPTAttentionPluginCommon() = delete;
 
     GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-        float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+        int head_size, int unidirectional, float q_scaling, float attn_logit_softcapping_scale,
+        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,

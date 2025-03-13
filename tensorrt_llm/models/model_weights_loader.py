@@ -311,7 +311,7 @@ class ModelWeightsLoader:
                 weight_dict = {tllm_key: v}
 
         for k, v in weight_dict.items():
-            if not v.is_contiguous():
+            if v is not None and not v.is_contiguous():
                 weight_dict[k] = v.contiguous()
 
         return weight_dict

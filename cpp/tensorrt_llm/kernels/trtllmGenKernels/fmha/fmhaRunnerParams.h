@@ -174,6 +174,8 @@ struct TllmGenFmhaRunnerParams
     int32_t const* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
+    // The sequence length buffer for K/V.
+    int const* seqLensKvPtr;
     // The cumulative sequence length buffer for Q and K/V
     int const* cumSeqLensQPtr;
     int const* cumSeqLensKvPtr;
@@ -195,8 +197,10 @@ struct TllmGenFmhaRunnerParams
     // The output scaling factor buffer.
     void* oSfPtr;
 
-    // Head dimension.
-    int mHeadDim;
+    // Head dimension for Q and K.
+    int mHeadDimQk;
+    // Head dimension for V.
+    int mHeadDimV;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.
@@ -218,8 +222,8 @@ struct TllmGenFmhaRunnerParams
     int mNumTokensPerPage;
     // The number of pages in memory pool.
     int mNumPagesInMemPool;
-    // The maximum Ctas in the multiCtasKv mode.
-    int mMaxNumCtas;
+    // The number of multiProcessor for the GPU.
+    int mMultiProcessorCount;
     // Scaling factor for Q.
     float mScaleQ;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
@@ -230,6 +234,40 @@ struct TllmGenFmhaRunnerParams
     float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Parameters that might be updated when selecting kernels.
+struct TllmGenSelectKernelParams
+{
+    // The FMHA kernel type.
+    FmhaKernelType mKernelType;
+    // The headDimV per CTA, which is only used by MLA generation kernels currently.
+    int mHeadDimPerCtaV;
+    // Enable the multiCtasKvMode or not.
+    bool mMultiCtasKvMode;
+    // Reuse smemK for V or not (only work with MLA generation kernels).
+    bool mReuseSmemKForV;
+    // Do we need to select a new kernel as the parameters have been updated.
+    bool mSelectNewKernel;
+    // The tile scheduler.
+    TileScheduler mTileScheduler;
+    // The tile size for Kv.
+    int mTileSizeKv;
+    // Use 2 CTA MMA or not.
+    bool mUses2CtaMma;
+
+    // The constructor.
+    TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
+        : mKernelType(params.mKernelType)
+        , mHeadDimPerCtaV(params.mHeadDimV)
+        , mMultiCtasKvMode(params.mMultiCtasKvMode)
+        , mReuseSmemKForV(false)
+        , mSelectNewKernel(false)
+        , mTileScheduler(params.mTileScheduler)
+        , mTileSizeKv(128)
+        , mUses2CtaMma(false){};
 };
 
 } // namespace kernels

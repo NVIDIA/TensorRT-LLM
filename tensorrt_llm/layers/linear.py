@@ -209,11 +209,6 @@ class LinearBase(Module, metaclass=ABCMeta):
     def tp_split_dim(cls) -> int:
         pass
 
-    def weight_is_kn(self):  # WAR for bug 4641821
-        return (default_net().plugin_config.manage_weights
-                and self.prefer_managed_weight
-                and self.weight.dtype == trt.DataType.HALF)
-
     def get_weight(self) -> Tensor:
         if default_net(
         ).plugin_config.manage_weights and self.prefer_managed_weight:
@@ -224,11 +219,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             ).plugin_config.low_latency_gemm_plugin == 'fp8'
             use_gemm_allreduce_plugin = default_net(
             ).plugin_config.gemm_allreduce_plugin is not None
-            return self.weight.get_managed_tensor(
-                network=default_net(),
-                need_transpose=self.weight_is_kn() and not use_gemm_plugin
-                and not use_low_latency_gemm_plugin
-                and not use_gemm_allreduce_plugin)
+            return self.weight.get_managed_tensor(network=default_net())
         else:
             return self.weight.get_constant_tensor(network=default_net())
 
@@ -263,7 +254,7 @@ class LinearBase(Module, metaclass=ABCMeta):
                              alpha=alpha,
                              strict_dtype=strict_dtype)
         else:
-            x = matmul(x, weight, transb=not self.weight_is_kn())
+            x = matmul(x, weight, transb=True)
 
         if default_net(
         ).plugin_config.lora_plugin and lora_runtime_params is not None:

@@ -30,3 +30,8 @@ class ProcessorWrapper():
         raise NotImplementedError(
             f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
         )
+
+    def decode(self, **kwargs):
+        raise NotImplementedError(
+            f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
+        )

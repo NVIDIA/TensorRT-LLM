@@ -119,6 +119,20 @@ struct QKVPreprocessingParams
     KVCacheBuffer kv_cache_block_scales_buffer{};
     T const* qkv_bias{nullptr};
 
+    // Fuse the computation of FMHA quantization scales into the preprocessing kernels.
+    // This can also be done in gptKernels.h if there is no preprocessing kernels.
+    // The scale to dequant Q/Kv input.
+    float const* q_scale_quant_orig{nullptr};
+    float const* kv_scale_quant_orig{nullptr};
+    // The scale to quant O output.
+    float const* o_scale_orig_quant{nullptr};
+    // The scale after fmha bmm1.
+    float* fmha_bmm1_scale{nullptr};
+    // The scale after fmha bmm2.
+    float* fmha_bmm2_scale{nullptr};
+    // The fmha tile counter (used by hopper fmha kernels).
+    float* fmha_tile_counter{nullptr};
+
     // Logn scaling pointer, of shape {max_position_embedding_length}
     float const* logn_scaling{nullptr};
     // The (batch_idx, token_idx_in_seq) int2 buffer of shape {num_tokens}.
@@ -162,6 +176,8 @@ struct QKVPreprocessingParams
     int kv_head_num{0};
     int qheads_per_kv_head{0};
     int size_per_head{0};
+    // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
+    float fmha_host_bmm1_scale{1.f};
     int rotary_embedding_dim{0};
     float rotary_embedding_base{0.};
     RotaryScalingType rotary_scale_type{};
