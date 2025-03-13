@@ -70,8 +70,12 @@ class QWenDecoderLayer(Module):
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
+            tp_rank=config.mapping.tp_rank,
             tp_group=self.tp_group,
             tp_size=self.tp_size,
+            cp_rank=config.mapping.cp_rank,
+            cp_size=config.mapping.cp_size,
+            cp_group=config.mapping.cp_group,
             quant_mode=config.quant_mode,
             use_logn_scaling=config.use_logn_attn,
             dense_bias=False)
@@ -344,9 +348,13 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
+            elif config.qwen_type == "qwen2_audio":
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head",
+                }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
-
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
 
                 def reshape_qkv(weights):
@@ -443,7 +451,6 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             logger.debug(f"HuggingFace model: {hf_model}")
 
             model = QWenForCausalLM(config)
-
             logger.debug(f"TensorRT-LLM model: {model}")
 
             if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
@@ -476,7 +483,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length=2048,
         **kwargs,
     ):
-        if quant_config.requires_modelopt_quantization:
+        if quant_config._requires_modelopt_quantization:
             # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
@@ -489,7 +496,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        elif quant_config.requires_calibration:
+        elif quant_config._requires_calibration:
             # non-modelopt quantization flow
             from . import convert
 

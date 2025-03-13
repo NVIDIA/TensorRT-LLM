@@ -69,7 +69,7 @@ struct PackedMaskParams
     // The sliding window size.
     int slidingWindowSize;
     // The value to identify that the position is valid.
-    MaskInputDataType validPosVal = MaskInputDataType(1.0f);
+    MaskInputDataType validPosVal = {};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

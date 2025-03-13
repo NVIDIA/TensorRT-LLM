@@ -1,0 +1,63 @@
+version: 0.0.1
+l0_a100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+  tests:
+  - test_unittests.py::test_unittests[llmapi-quant]
+  - test_unittests.py::test_unittests[others]
+  - test_unittests.py::test_unittests[llmapi-models-part2]
+  - test_unittests.py::test_unittests[llmapi-models-part3]
+  - test_unittests.py::test_unittests[llmapi-single-gpu-part0]
+  - test_unittests.py::test_unittests[llmapi-single-gpu-part1]
+  - test_unittests.py::test_unittests[llmapi-executor]
+  - examples/test_qwen.py::test_llm_qwen_int4_single_gpu_summary[qwen2_7b_awq-nb:1]
+  - examples/test_llama.py::test_llm_llama_int8_kv_awq_1gpu_summary[llama-7b-nb:4]
+  - test_accuracy.py::test_accuracy_gpt[gpt-smooth-quant]
+  - test_accuracy.py::test_accuracy_gpt[gpt-smooth-quant-per-token-per-channel]
+  - examples/test_gpt.py::test_llm_starcoder2_sqootb_single_gpu[starcoder2]
+  - examples/test_llama.py::test_llm_llama_int8_sq_ootb_1gpu_summary[llama-7b-nb:1]
+  - examples/test_llama.py::test_llm_llama_smooth_quant_1gpu_summary[float16-llama-7b-enable_ptpc-nb:4]
+  - examples/test_llama.py::test_llm_llama_v3_2_smoothquant_1node_single_gpu[llama-3.2-1b]
+  - test_accuracy.py::test_accuracy_gpt[gpt-use-int8-kv-cache] # 1 min
+  - test_accuracy.py::test_accuracy_gpt[gpt-use-int4-weight-only-quant] # 3 mins
+  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
+  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
+  - examples/test_llama.py::test_llm_llama_int8_kv_1gpu_summary[llama-7b-enable_weight_only-nb:4] # skip
+  - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int4-nb:1] # 7 mins
+  - examples/test_llama.py::test_llm_llama_wo_1gpu_summary[llama-7b-int8-nb:1] # 7 mins
+  - examples/test_llama.py::test_llm_llama_v3_int8_gptq_1gpu_summary[llama-v3-8b-instruct-hf-float16-nb:1] # 7 mins
+  - examples/test_llama.py::test_llm_llama_v3_1_quantization_1gpu_manage_weights[llama-3.1-8b-int4_wo] # 5 mins
+  - examples/test_llama.py::test_llm_llama_v3_1_quantization_1gpu_manage_weights[llama-3.1-8b-int8_sq] # 8 mins
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+  tests:
+  - test_accuracy.py::test_accuracy_gpt_next[gpt-next] # 2 mins
+  - test_accuracy.py::test_accuracy_santacoder[santacoder-context-fmha-enabled] # 3 mins
+  - test_unittests.py::test_unittests[model_api-part1]
+  - test_unittests.py::test_unittests[model_api-part2]
+  - test_unittests.py::test_unittests[model_api-part3]
+  - test_unittests.py::test_unittests[model-gpt-e2e]
+  - test_unittests.py::test_unittests[model-eagle]
+  - examples/test_chatglm.py::test_llm_glm_10b_single_gpu_run[disable_weight_only] # 8 mins
+  - examples/test_baichuan.py::test_llm_baichuan_single_gpu_summary[v1_7b-int8-enable_gemm_plugin-enable_attention_plugin] # 7 mins
+  - examples/test_qwen.py::test_llm_qwen_int4_single_gpu_summary[qwen_7b_chat_int4-nb:4]
+  - examples/test_chatglm.py::test_llm_chatglm3_6b_quantization_summary[chatglm3-6b-int4_awq]
+  - examples/test_baichuan.py::test_llm_baichuan_smoothquant_summary[v2_7b-enable_ptpc]
+  - test_unittests.py::test_unittests[llmapi-models-part1]
+  - test_accuracy.py::test_accuracy_gpt[gpt-use-int8-weight-only-quant] # 2 mins

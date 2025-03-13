@@ -70,3 +70,7 @@ class MllamaProcessorWrapper(ProcessorWrapper):
                     text = f"<|image|><|begin_of_text|>{text}"
 
         return text
+
+    def decode(self, tensor, skip_special_tokens=True):
+        return self.processor.decode(tensor,
+                                     skip_special_tokens=skip_special_tokens)

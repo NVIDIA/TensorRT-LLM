@@ -343,7 +343,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        if quant_config.requires_modelopt_quantization:
+        if quant_config._requires_modelopt_quantization:
             # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
@@ -357,7 +357,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        elif quant_config.requires_calibration:
+        elif quant_config._requires_calibration:
             # non-modelopt quantization flow
             from . import convert
 

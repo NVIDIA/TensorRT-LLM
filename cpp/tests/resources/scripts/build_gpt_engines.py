@@ -254,22 +254,6 @@ def build_engines(model_cache: Optional[str] = None,
                  *get_ifb_args(_tb.KVCacheType.PAGED),
                  max_input_len=max_input_len)
 
-    # Build the target model with return accepted token logits
-    # Build with '--max_draft_len', '--speculative_decoding_mode'
-    model_spec_current = model_spec_obj.__copy__()
-    max_draft_len = 5
-    model_spec_current.use_draft_tokens_external_decoding()
-    model_spec_current.set_draft_tokens(max_draft_len)
-    model_spec_current.gather_logits()
-    model_spec_current.return_accepted_tokens_logits()
-
-    build_engine(
-        str(fp16_ckpt_dir),
-        str(engine_dir / model_spec_current.get_model_path() / tp_pp_cp_dir),
-        f'--max_draft_len={max_draft_len}',
-        '--speculative_decoding_mode=draft_tokens_external',
-        *get_ifb_args(_tb.KVCacheType.PAGED))
-
     # We build almost the same engine twice. But this engine has gather_context_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.

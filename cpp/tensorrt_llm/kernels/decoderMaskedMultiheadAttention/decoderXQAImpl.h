@@ -58,6 +58,8 @@ public:
     // Needs runner pointer for accessing resources in DecoderXQARunner class.
     static std::unique_ptr<DecoderXQAImpl> create(DecoderXQARunner* runner, ImplType implType);
 
+    virtual ~DecoderXQAImpl() = default;
+
 protected:
     DecoderXQAImpl(DecoderXQARunner* runner)
         : mRunner(runner)

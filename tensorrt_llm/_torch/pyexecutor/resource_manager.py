@@ -26,6 +26,8 @@ KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
+KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
+RequestList = list[LlmRequest]
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -82,27 +84,34 @@ class DummyKvCacheManager(BaseResourceManager):
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
-            self,
-            kv_cache_config: KvCacheConfigCpp,
-            kv_cache_type: CacheTypeCpp,
-            num_layers: int,
-            num_heads: int,
-            num_kv_heads: Union[int, List[Optional[int]]],
-            head_dim: int,
-            tokens_per_block: int,
-            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-            # It's derived from the model's BuildConfig for consistency with the C++ backend.
-            max_seq_len: int,
-            max_batch_size: int,
-            mapping: Mapping,
-            dtype: DataType = DataType.HALF) -> None:
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_type: CacheTypeCpp,
+        num_layers: int,
+        num_heads: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+        # It's derived from the model's BuildConfig for consistency with the C++ backend.
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        # Some speculative decoding methods need to use different kv lengths for the
+        # draft/target layers. Add extra tokens to haddle this issue.
+        num_extra_kv_tokens: int = 0,
+    ) -> None:
         assert not mapping.has_pp(), "TODO: enable pipeline parallelism"
 
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
+        self.dtype = dtype
 
         tp_size = mapping.tp_size
+        if mapping.enable_attention_dp:
+            tp_size = 1
 
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
@@ -122,6 +131,7 @@ class KVCacheManager(BaseResourceManager):
                     self.num_kv_heads_per_layer.append(0)
 
         assert len(self.num_kv_heads_per_layer) > 0
+
         self.is_homongenous = all(val == self.num_kv_heads_per_layer[0]
                                   for val in self.num_kv_heads_per_layer[1:])
 
@@ -130,6 +140,9 @@ class KVCacheManager(BaseResourceManager):
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        self.num_extra_kv_tokens = num_extra_kv_tokens
+        self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         if kv_cache_config.max_attention_window is None:
             max_attention_window = max_seq_len
@@ -183,7 +196,13 @@ class KVCacheManager(BaseResourceManager):
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
+            'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
+            'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
+        if self.event_buffer_max_size > 0:
+            kwargs['event_manager'] = KVCacheEventManagerCpp(
+                max_kv_event_entries=self.event_buffer_max_size)
+
         self.impl = KVCacheManagerCpp(**kwargs)
 
         self.impl.allocate_pools(dtype, False)
@@ -258,28 +277,39 @@ class KVCacheManager(BaseResourceManager):
                 if req.is_first_context_chunk():
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req)
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req.py_request_id)
+                    if req.py_draft_tokens is not None:
+                        for _ in range(len(req.py_draft_tokens)):
+                            self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
+            if req.py_draft_tokens is not None:
+                for _ in range(len(req.py_draft_tokens)):
+                    self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        max_num_draft_tokens: int = 0,
     ):
         beam_width = 1
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[i] if token_nums is not None else 1
+            token_num = token_nums[
+                i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
-                0
+                1
             ] * token_num if self.impl.cross_kv else None
+            # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
-                input_tokens=[0] * token_num,
+                input_tokens=[1] * token_num,
                 sampling_config=tensorrt_llm.bindings.SamplingConfig(
                     sampling_params._get_sampling_config()),
                 is_streaming=False,
@@ -288,31 +318,36 @@ class KVCacheManager(BaseResourceManager):
             self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
                 req.state = tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
+                req.prompt_len = token_num - 1 + max_num_draft_tokens
                 req.py_prompt_len = req.prompt_len
+                if max_num_draft_tokens > 0:
+                    req.py_draft_tokens = [0] * max_num_draft_tokens
             requests.append(req)
         return requests
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        # store context blocks
-        pass
+        # rewind kv cache
+        for request in scheduled_batch.generation_requests:
+            if request.state != tensorrt_llm.bindings.LlmRequestState.GENERATION_COMPLETE:
+                if request.py_rewind_len > 0:
+                    self.rewind_kv_cache(request, request.py_rewind_len)
 
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
-    def calculate_max_num_blocks(
-        self,
-        kv_cache_config: KvCacheConfigCpp,
-        head_dim: int,
-        tokens_per_block: int,
-        mapping: Mapping,
-        dtype: DataType,
-    ):
+    def calculate_max_num_blocks(self,
+                                 kv_cache_config: KvCacheConfigCpp,
+                                 head_dim: int,
+                                 tokens_per_block: int,
+                                 mapping: Mapping,
+                                 dtype: DataType,
+                                 kv_factor: int = 2):
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
 
-        cache_size_per_token = 2 * sum(self.num_kv_heads_per_layer) * head_dim
+        cache_size_per_token = kv_factor * sum(
+            self.num_kv_heads_per_layer) * head_dim
 
         if dtype == DataType.FP8:
             kv_cache_dtype_bytes = 1
@@ -325,9 +360,6 @@ class KVCacheManager(BaseResourceManager):
 
         cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
         free_mem, total_mem = torch.cuda.mem_get_info()
-        logger.info(
-            f'Memory usage when calculating max tokens in paged kv cache: total: {(total_mem / (1<<30)):.2f} GiB, available: {(free_mem / (1<<30)):.2f} GiB'
-        )
 
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
         max_tokens = free_mem_fraction * free_mem / cache_size_bytes_per_token
@@ -396,9 +428,79 @@ class KVCacheManager(BaseResourceManager):
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)
-        return result.reshape(result.shape[0], 2, self.tokens_per_block,
+        return result.reshape(result.shape[0], self.kv_factor,
+                              self.tokens_per_block,
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim)
+
+    def flush_iteration_events(self):
+        self.impl.flush_iteration_events()
+
+    def get_latest_events(self, timeout_ms: Optional[float] = 0):
+        return self.impl.get_latest_events(timeout_ms)
+
+    def get_kv_cache_stats(self):
+        return self.impl.get_kv_cache_stats()
+
+    def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
+        self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
+
+
+class MLAKVCacheManager(KVCacheManager):
+
+    def __init__(
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_type: CacheTypeCpp,
+        num_layers: int,
+        num_heads: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+        # It's derived from the model's BuildConfig for consistency with the C++ backend.
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        kv_lora_rank: int = None,
+        qk_rope_head_dim: int = None,
+        # Some speculative decoding methods need to use different kv lengths for the
+        # draft/target layers. Add extra tokens to haddle this issue.
+        num_extra_kv_tokens: int = 0,
+    ) -> None:
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None, "both of kv_lora_rank and qk_rope_head_dim shall be set together"
+        head_dim = kv_lora_rank + qk_rope_head_dim
+
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = 1
+        else:
+            assert len(num_kv_heads) == self.num_layers
+            num_kv_heads = [1 for _ in range(self.num_layers)]
+
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+
+        super().__init__(kv_cache_config, kv_cache_type, num_layers, num_heads,
+                         num_kv_heads, head_dim, tokens_per_block, max_seq_len,
+                         max_batch_size, mapping, dtype, num_extra_kv_tokens)
+
+    def calculate_max_num_blocks(
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        head_dim: int,
+        tokens_per_block: int,
+        mapping: Mapping,
+        dtype: DataType,
+    ):
+        # dim is
+        kv_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        return super().calculate_max_num_blocks(kv_cache_config,
+                                                kv_head_dim,
+                                                tokens_per_block,
+                                                mapping,
+                                                dtype,
+                                                kv_factor=1)
 
 
 class BaseDraftTokenManager(BaseResourceManager):
@@ -426,7 +528,7 @@ class BaseDraftTokenManager(BaseResourceManager):
         results = self.get_draft_tokens(input_tokens)
         for request, output in zip(scheduled_batch.generation_requests,
                                    results):
-            request.draft_tokens = output
+            request.py_draft_tokens = output
 
     def get_max_resource_count(self) -> int:
         return 0
@@ -448,21 +550,24 @@ class ResourceManager(object):
         self.resource_managers[name] = resource_manager
 
     def get_resource_manager(self, name: str) -> BaseResourceManager:
-        return self.resource_managers[name]
+        return self.resource_managers.get(name)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
-            resource_manager.prepare_resources(scheduled_batch)
+            if hasattr(resource_manager, "prepare_resources"):
+                resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
-            resource_manager.update_resources(scheduled_batch)
+            if hasattr(resource_manager, "update_resources"):
+                resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
         for _, resource_manager in reversed(self.resource_managers.items()):
-            resource_manager.free_resources(request)
+            if hasattr(resource_manager, "free_resources"):
+                resource_manager.free_resources(request)
 
     def reorder_pipeline(self, resource_manager_list: list[str]):
         assert set(resource_manager_list) == set(self.resource_managers.keys())

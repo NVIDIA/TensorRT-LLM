@@ -216,13 +216,6 @@ class DeciLMDecoderLayer(Module):
                          self.config.mapping.tp_size -
                          1) // self.config.mapping.tp_size
 
-            # local layers with the same number of kv heads share the same cache pool
-            # we count how many such layers there are before us to determine our index inside that pool
-            layer_idx_in_cache_pool = num_kv_heads_per_local_layer[:
-                                                                   local_attn_layer_idx].count(
-                                                                       nheads_tp
-                                                                   )
-
             self.input_layernorm = RmsNorm(
                 normalized_shape=self.config.hidden_size,
                 eps=self.config.norm_epsilon,
@@ -245,8 +238,7 @@ class DeciLMDecoderLayer(Module):
                 tp_group=self.config.mapping.tp_group,
                 tp_size=self.config.mapping.tp_size,
                 tp_rank=self.config.mapping.tp_rank,
-                quant_mode=self.config.quant_mode,
-                layer_idx_in_cache_pool=layer_idx_in_cache_pool)
+                quant_mode=self.config.quant_mode)
 
         elif self.layer_config.is_noop_attention_layer:
             self.input_layernorm = NoOpLayerNorm()

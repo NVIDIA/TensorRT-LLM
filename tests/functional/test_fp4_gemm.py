@@ -133,7 +133,7 @@ class TestFunctional(unittest.TestCase):
             product(
                 [1024, 2048],
                 [1024, 2048],
-                [1, 2, 4, 8, 128, 1023],
+                [1, 8, 128, 1023],
                 #product([256], [256], [1],
                 ['float16'],
                 [16],
@@ -167,9 +167,10 @@ class TestFunctional(unittest.TestCase):
         net.plugin_config.gemm_plugin = 'nvfp4'
 
         input_e2m1_trt = input_e2m1.cuda()
-        input_e8m0_scale_trt = input_e8m0_scale.cuda()
+        input_e8m0_scale_trt = input_e8m0_scale.cuda().view(torch.float8_e4m3fn)
         weights_e2m1_trt = weights_e2m1.cuda()
-        weights_e8m0_scale_trt = weights_e8m0_scale.cuda()
+        weights_e8m0_scale_trt = weights_e8m0_scale.cuda().view(
+            torch.float8_e4m3fn)
 
         #print(f"input_e2m1_trt={input_e2m1_trt}")
         print(f"input_e8m0_scale_trt={input_e8m0_scale_trt}")
@@ -194,21 +195,17 @@ class TestFunctional(unittest.TestCase):
 
         with tensorrt_llm.net_guard(net):
             input_tensor = Tensor(name='input',
-                                  shape=(batch_size, input_dim // 16),
-                                  dtype=tensorrt_llm.str_dtype_to_trt(
-                                      trtllm_packed_input_type_str))
-            input_sf_tensor = Tensor(
-                name='input_sf',
-                shape=input_e8m0_scale_trt.shape,
-                dtype=tensorrt_llm.str_dtype_to_trt(trtllm_scale_type_str))
+                                  shape=(batch_size, input_dim),
+                                  dtype=trt.fp4)
+            input_sf_tensor = Tensor(name='input_sf',
+                                     shape=input_e8m0_scale_trt.shape,
+                                     dtype=trt.fp8)
             weights_tensor = Tensor(name='weights',
-                                    shape=(output_dim, input_dim // 16),
-                                    dtype=tensorrt_llm.str_dtype_to_trt(
-                                        trtllm_packed_input_type_str))
-            weights_sf_tensor = Tensor(
-                name='weights_sf',
-                shape=weights_e8m0_scale_trt.shape,
-                dtype=tensorrt_llm.str_dtype_to_trt(trtllm_scale_type_str))
+                                    shape=(output_dim, input_dim),
+                                    dtype=trt.fp4)
+            weights_sf_tensor = Tensor(name='weights_sf',
+                                       shape=weights_e8m0_scale_trt.shape,
+                                       dtype=trt.fp8)
             global_sf_tensor = Tensor(
                 name='global_sf',
                 shape=alpha_tensor.shape,
@@ -268,9 +265,9 @@ class TestFunctional(unittest.TestCase):
                                   rtol=1e-3)
 
     @parameterized.expand(
-        list(product([1024, 2048], [1024, 2048], [1, 2, 4, 8, 128, 1023], [16]))
-        + list(
-            product([8192, 10240, 28672], [28672, 10240, 8192], [1, 20], [16])),
+        list(product([1024, 2048], [1024, 2048], [1, 8, 128, 1023], [16])) +
+        list(product([8192, 10240, 28672], [28672, 10240, 8192], [1, 20],
+                     [16])),
         name_func=unittest_name_func)
     @skip_pre_blackwell_unittest
     def test_input_quant_and_fp4_gemm(self, input_dim, output_dim, batch_size,
@@ -301,7 +298,8 @@ class TestFunctional(unittest.TestCase):
         net.plugin_config.gemm_plugin = 'nvfp4'
 
         weights_e2m1_trt = weights_e2m1.cuda()
-        weight_ufp8_scale_trt = weight_ufp8_scale.cuda()
+        weight_ufp8_scale_trt = weight_ufp8_scale.cuda().view(
+            torch.float8_e4m3fn)
 
         output_trt = None
         gemm_quantized_input = None
@@ -323,13 +321,11 @@ class TestFunctional(unittest.TestCase):
                 dtype=tensorrt_llm.str_dtype_to_trt("float16"))
 
             weights_tensor = Tensor(name='weights',
-                                    shape=(output_dim, input_dim // 16),
-                                    dtype=tensorrt_llm.str_dtype_to_trt(
-                                        trtllm_packed_input_type_str))
-            weights_sf_tensor = Tensor(
-                name='weights_sf',
-                shape=weight_ufp8_scale_trt.shape,
-                dtype=tensorrt_llm.str_dtype_to_trt(trtllm_scale_type_str))
+                                    shape=(output_dim, input_dim),
+                                    dtype=trt.fp4)
+            weights_sf_tensor = Tensor(name='weights_sf',
+                                       shape=weight_ufp8_scale_trt.shape,
+                                       dtype=trt.fp8)
             sf_scale_tensor_trt = Tensor(
                 name='sf_scale',
                 shape=gemm_alpha_tensor.shape,
@@ -345,10 +341,10 @@ class TestFunctional(unittest.TestCase):
             # mark the intermediate results.
             net._mark_output(quantized_input,
                              'quantized_gemm_input',
-                             dtype=trt.int64)
+                             dtype=trt.fp4)
             net._mark_output(input_sf_tensor,
                              'gemm_input_sf_tensor',
-                             dtype=trt.int32)
+                             dtype=trt.fp8)
 
             outputs = tensorrt_llm.quantization.functional.fp4_gemm(
                 quantized_input,

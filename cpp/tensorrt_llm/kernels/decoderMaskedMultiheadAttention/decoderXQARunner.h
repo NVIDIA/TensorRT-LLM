@@ -91,7 +91,7 @@ public:
     template <typename KVCacheBuffer>
     void dispatch(XQAParams const& xqa_params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t const& stream)
     {
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         this->run(xqa_params, kv_cache_buffer, stream);
     }
 

@@ -83,7 +83,7 @@ void invokeAssembleTargetLogitsOffsets(T const** logitsPtrs, SizeType32* decodin
     assembleTargetLogitsOffsets<T, BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(
         logitsPtrs, decodingTokens, logits, draftDecodingTokens, batchSize, maxDecodingTokens, vocabSizePadded);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeAssembleTargetLogitsOffsets(float const** logitsPtrs, SizeType32* decodingTokens,
@@ -776,7 +776,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
         buildLeafMask<<<grid, BLOCK_SIZE, 0, params.stream>>>(
             params.isLeafMask, params.nextPaths, params.maxDecodingTokens, params.maxPathLen);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     // Select all no-leaf ending paths for given level idx.
@@ -794,7 +794,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.parentNonLeafInLevelOffset, params.nonLeavesInLevelOffsets, params.isLeafMask, params.nextPaths,
             params.levelIdx, params.maxDecodingTokens, params.maxPathLen);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     // Use selected tokens and prepare data for gen iteration of EagleNet.
@@ -809,7 +809,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.parentNonLeafInLevelOffset, params.levelIdx, params.batchSize, params.maxPathLen,
             params.maxDecodingTokens, params.maxNonLeavesPerLayer);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 
     {
@@ -820,7 +820,7 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
             params.maxGenerationLength, params.selectedMasks, params.maxDecodingTokens - 1,
             params.specDecodingPackedMasks);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(params.stream);
     }
 }
 
@@ -864,7 +864,7 @@ void invokeAssembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits, run
     assembleDraftLogitsOffsets<T><<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(logitsPtrs, logits,
         outputIdsPtrs, outputIds, skipDecode, numValidLogits, batchSize, maxDecodingDraftTokens, vocabSizePadded);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template void invokeAssembleDraftLogitsOffsets(float const** logitsPtrs, float const* logits,
@@ -1018,7 +1018,7 @@ void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeT
     extractNumSuccessorsFromPath<<<batchSize, BLOCK_SIZE, dynamicSmemSize, stream>>>(
         paths, numSuccessorsForEachNode, layerId, batchSize, maxDecodingTokens, maxPathLen);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_CHECK_WITH_INFO(
         batchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", BLOCK_SIZE);
@@ -1327,7 +1327,7 @@ void invokeUnpackEagleData(UnpackEagleDataParams const& params, cudaStream_t str
     SizeType32 constexpr BLOCK_SIZE = 128;
     unpackEagleData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1353,7 +1353,7 @@ void invokeFillContextEagleData(FillContextEagleParams const& params, cudaStream
     SizeType32 constexpr BLOCK_SIZE = 128;
     fillContextEagleData<<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 const* batchSlots,
@@ -1366,7 +1366,7 @@ void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 co
     getPackedMaskFromPath<<<grid, block, shmSize, stream>>>(
         specDecodingPackedMasks, batchSlots, nextDraftPaths, maxDecodingTokens, maxPathLen);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1465,7 +1465,7 @@ void invokeSetTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchS
     setTopKsFromDyanmicTreeMaxTopK<<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
         layerIdx, numInputLogits, batchSize, topKs, topKOffset, dynamicTreeMaxTopK, numValidLogits);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1570,7 +1570,7 @@ void invokeCopyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleL
         pluginOutputAllLayersScores, pluginOutputAllLayersDraftTokenIds, pluginOutputAllLayersDraftTokenIdsPredecessor,
         firstTopKOutputLogProbs, firstTopKOutputIds);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1621,7 +1621,7 @@ void invokeUpdateScores(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTop
     updateScores<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
         batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, curLogProbs, prevLayerScores);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1654,7 +1654,7 @@ void invokeAssembleSecondTopKSamplingInputs(SizeType32 batchSize, SizeType32 con
         dynamicTreeMaxTopK, maxDecodingDraftTokens, firstTopKOutputLogProbs, secondTopKInputScoresPtrs,
         secondTopKOutputIdsFlatten, secondTopKOutputIdsPtrs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 // The outputIds are almost ascending
@@ -1892,7 +1892,7 @@ void invokeUpdatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 dyna
     updatePath<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, batchSize, dynamicTreeMaxTopK,
         maxDecodingTokens, maxPathLen, prevPaths, newPaths, secondTopKOutputIdsPtrs, pluginOutputNextExpandIndices);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -1967,7 +1967,7 @@ void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 
         dynamicTreeMaxTopK, maxDecodingDraftTokens, curDraftIds, pluginInputDraftIds, pluginInputDraftLens,
         pluginOutputDraftIds, pluginOutputDraftLens, curLayerScores, pluginOutputCurrentScores);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -2015,7 +2015,7 @@ void invokeExtractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 d
         dynamicTreeMaxTopK, maxDecodingDraftTokens, secondTopKInputScoresPtrs, secondTopKOutputIdsPtrs,
         firstTopKOutputIds, secondTopKOutputLogProbs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -2053,7 +2053,7 @@ void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 cons
         dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs,
         pluginOutputAllLayersScores, thirdTopKInputScoresPtrs, thirdTopKOutputIds, thirdTopKOutputIdsPtrs);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -2288,7 +2288,7 @@ void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTr
         maxDecodingDraftTokens, maxDecodingTokens, maxPathLen, mNumEagleLayers, maxNodesOnFinalTree,
         thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIdsPredecessor, newPaths);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 namespace
@@ -2336,7 +2336,7 @@ void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTr
         maxDecodingDraftTokens, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKOutputIdsPtrs,
         pluginOutputAllLayersDraftTokenIds, pluginOutputDraftTokenIds, pluginOutputDraftLens);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

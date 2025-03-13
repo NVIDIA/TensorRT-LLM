@@ -116,7 +116,7 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::initTmpD
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
 void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTactics(RunnerPtr const& runner,
-    nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId, bool hasCudaKernel)
+    nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId, bool hasWeightOnlyCudaKernel)
 {
     writer_lock lock(mMNKProfileMap->mutex);
 
@@ -158,23 +158,6 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
             initTmpData(m, n, k, mWorkspaceTmp, mTmpWorkspaceSizeInBytes, mStream);
             auto tactics = this->getTactics(m, n, k);
 
-            // stop to profile Cuda kernel if m > 16 or CUTLASS kernel performs better for m - 1
-            if constexpr (std::is_same_v<Config, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>)
-            {
-                // check if the best tactic for m-1 is CUTLASS kernel
-                bool lastTacticEnableCudaKernel = true;
-                if (mProfileMap->count(m - 1) > 0)
-                {
-                    lastTacticEnableCudaKernel = mProfileMap->at(m - 1).value().enableCudaKernel;
-                }
-                if (m > 16 || !lastTacticEnableCudaKernel)
-                {
-                    if (!tactics.empty())
-                    {
-                        tactics.pop_back();
-                    }
-                }
-            }
             // Profile different tactics for particular m and insert best config to the map
             mProfileMap->insert({m, this->profileTacticsForProblem(m, n, k, tactics)});
         }
@@ -184,9 +167,10 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
 
     int const startMinMRounded = nextPowerOfTwo(dims.minM);
 
-    if (hasCudaKernel)
+    if (hasWeightOnlyCudaKernel)
     {
-        // Profile tactics for finer granularity of M if CUDA kernel is enabled
+        // Profile tactics for finer granularity of M,
+        // if CUDA kernel is enabled for weight-only plugins
         int minM = dims.minM;
         for (int m = std::max(1, minM); m < std::min(16, maxM); m += 1)
         {

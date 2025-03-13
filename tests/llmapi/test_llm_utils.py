@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
@@ -170,7 +171,7 @@ def test_ConfigArbitor_perf_fallback():
 def test_ModelLoader():
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
     args = LlmArgs(llama_model_path, kv_cache_config=kv_cache_config)
-    args.setup()
+    args._setup()
 
     # Test with HF model
     temp_dir = tempfile.TemporaryDirectory()
@@ -183,7 +184,7 @@ def test_ModelLoader():
 
     # Test with engine
     args.model = build_engine()
-    args.setup()
+    args._setup()
     assert args.model_format is _ModelFormatKind.TLLM_ENGINE
     print(f'engine_dir: {args.model}')
     model_loader = ModelLoader(args)
@@ -196,7 +197,7 @@ def test_CachedModelLoader():
     args = LlmArgs(llama_model_path,
                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
     args.enable_build_cache = True
-    args.setup()
+    args._setup()
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir, _ = model_loader()
@@ -204,6 +205,16 @@ def test_CachedModelLoader():
     assert engine_dir.exists() and engine_dir.is_dir()
     model_format = ModelLoader.get_model_format(engine_dir)
     assert model_format is _ModelFormatKind.TLLM_ENGINE
+
+
+def test_LlmArgs_default_gpus_per_node():
+    # default
+    llm_args = LlmArgs(llama_model_path)
+    assert llm_args.gpus_per_node == torch.cuda.device_count()
+
+    # set explicitly
+    llm_args = LlmArgs(llama_model_path, gpus_per_node=6)
+    assert llm_args.gpus_per_node == 6
 
 
 if __name__ == '__main__':

@@ -17,7 +17,6 @@
 #pragma once
 
 #include "pluginUtils.h"
-#include "tensorrt_llm/common/logger.h"
 
 #include <cuda_runtime.h>
 
@@ -217,13 +216,15 @@ public:
 
     GemmPluginProfiler();
 
+    virtual ~GemmPluginProfiler() = default;
+
     void serialize(char*& buffer, GemmIdType const& gemmId) const;
 
     void deserialize(char const*& data, GemmDims& dims, GemmIdType const& gemmId);
     size_t getSerializationSize(GemmIdType const& gemmId) const;
 
     void profileTactics(RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims,
-        GemmIdType const& gemmId, bool hasCudaKernel = false);
+        GemmIdType const& gemmId, bool hasWeightOnlyCudaKernel = false);
 
     void setSelectionTactics(MNKProfileMapPtr const& map)
     {

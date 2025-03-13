@@ -16,9 +16,11 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/kernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -31,7 +33,9 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -147,6 +151,41 @@ public:
     }
 };
 
+class PyIGptDecoder : public tr::IGptDecoder
+{
+public:
+    using tr::IGptDecoder::IGptDecoder; // Inherit constructors
+
+    void setup(tr::SamplingConfig const& samplingConfig, size_t batchSize,
+        tr::DecodingInput::TensorConstPtr const& batchSlots,
+        std::optional<tr::DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, setup, samplingConfig, batchSize, batchSlots, output, requests);
+    }
+
+    void forwardAsync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, forwardAsync, output, input);
+    }
+
+    void forwardSync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, forwardSync, output, input);
+    }
+
+    tr::SamplingConfig const& getSamplingConfig() override
+    {
+        PYBIND11_OVERRIDE_PURE(tr::SamplingConfig const&, IGptDecoder, getSamplingConfig);
+    }
+
+    void disableLookahead(std::optional<tr::SamplingConfig> const& samplingConfig, tr::SizeType32 batchSize,
+        tr::DecodingInput::TensorConstPtr batchSlots) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, disableLookahead, samplingConfig, batchSize, batchSlots);
+    }
+};
+
 namespace tensorrt_llm::pybind::runtime
 {
 
@@ -171,7 +210,7 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
-        .def_static("None", &tr::SpeculativeDecodingMode::None)
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
         .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
         .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
         .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
@@ -182,7 +221,9 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
         .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
         .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
+        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
+        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
 
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
@@ -240,14 +281,14 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("active", &tr::decoder_batch::Input::active)
-        .def_readwrite("cacheIndirection", &tr::decoder_batch::Input::cacheIndirection)
-        .def_readwrite("predictedDraftLogits", &tr::decoder_batch::Input::predictedDraftLogits)
-        .def_readwrite("seqSlots", &tr::decoder_batch::Input::seqSlots);
+        .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
+        .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
+        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
-        .def_readwrite("cacheIndirection", &tr::decoder::Output::cacheIndirection)
-        .def_readwrite("sequenceLengths", &tr::decoder::Output::sequenceLengths);
+        .def_readwrite("cache_indirection", &tr::decoder::Output::cacheIndirection)
+        .def_readwrite("sequence_lengths", &tr::decoder::Output::sequenceLengths);
 
     py::class_<tr::decoder::Input>(m, "Input")
         .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
@@ -291,34 +332,54 @@ void initBindings(pybind11::module_& m)
             }))
         .def("synchronize", [](tr::decoder_batch::DecoderFinishedEvent& self) { self.event.synchronize(); });
 
+    py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
+        .def(
+            "setup",
+            [](tr::IGptDecoder& self, tr::SamplingConfig const& samplingConfig, size_t batchSize,
+                at::Tensor const& batchSlots, std::optional<tr::DecodingOutput> const& output = std::nullopt,
+                std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt)
+            {
+                auto tensorPtrBatchSlots = tr::TorchView::of(batchSlots);
+                return self.setup(samplingConfig, batchSize, std::move(tensorPtrBatchSlots), output, requests);
+            },
+            py::arg("sampling_config"), py::arg("batch_size"), py::arg("batch_slots"), py::arg("output") = std::nullopt,
+            py::arg("requests") = std::nullopt);
+
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<std::size_t, std::size_t, tr::GptDecoderBatched::CudaStreamPtr,
-                 tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
-            py::arg("vocab_size"), py::arg("vocab_size_padded"), py::arg("stream"),
-            py::arg("speculative_decoding_mode"), py::arg("dtype"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
+            py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
-            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"))
+            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("world_config"))
         .def("forward_async",
             py::overload_cast<tr::decoder_batch::Output&, tr::decoder_batch::Input const&>(
                 &tr::GptDecoderBatched::forwardAsync),
             py::arg("output"), py::arg("input"))
-        .def("forward_sync",
-            py::overload_cast<tr::decoder_batch::DecoderFinishedEvent const&>(&tr::GptDecoderBatched::forwardSync),
-            py::arg("token"))
         .def("setup_explicit_draft_tokens", &tr::GptDecoderBatched::setupExplicitDraftTokens,
             py::arg("explicit_draft_tokens_buffers"))
         .def("setup_lookahead", py::overload_cast<tr::LookaheadDecodingBuffers>(&tr::GptDecoderBatched::setupLookahead),
             py::arg("lookahead_decoding_buffers"))
+        .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
+        .def(
+            "new_tokens",
+            [](tr::GptDecoderBatched& self, int iter = 0)
+            {
+                auto allNewTokens = self.getAllNewTokens();
+                auto newTokensView = std::shared_ptr<tr::ITensor>(tr::ITensor::slice(allNewTokens, iter, 1));
+                newTokensView->squeeze(0);
+                return tr::Torch::tensor(tr::ITensor::slice(newTokensView, 0, self.getActualBatchSize()));
+            },
+            py::arg("iter") = 0)
         .def_property_readonly("decoding_mode", &tr::GptDecoderBatched::getDecodingMode)
-        .def_property_readonly("finished", &tr::GptDecoderBatched::getFinished)
         .def_property_readonly("joint_decoding_input", &tr::GptDecoderBatched::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::GptDecoderBatched::getJointDecodingOutput)
-        .def_property_readonly("batch_slots_setup", &tr::GptDecoderBatched::getBatchSlotsSetup)
         .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
         .def_property_readonly("max_decoding_engine_tokens", &tr::GptDecoderBatched::getMaxDecodingEngineTokens)
         .def_property_readonly(
             "all_new_tokens", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
+        .def_property_readonly(
+            "finished_sum", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishedSum()); })
         .def_property_readonly(
             "finish_reasons", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishReasons()); });
 
@@ -330,6 +391,11 @@ void initBindings(pybind11::module_& m)
                 reinterpret_cast<void*>(buffer_2), size);
         },
         "Lamport initialize all buffers");
+    m.def(
+        "lamport_initialize",
+        [](intptr_t buffer, size_t size)
+        { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
+        "Lmaport initialize buffer");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

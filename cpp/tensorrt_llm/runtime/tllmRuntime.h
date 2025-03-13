@@ -134,8 +134,9 @@ public:
     std::string getLayerProfileInfo() const;
     void reportToProfiler(SizeType32 contextId);
     void loadManagedWeights(RawEngine const& rawEngine, int localRank);
-    void initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-        SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens);
+    void initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const& world_config, SizeType32 maxBatchSize,
+        SizeType32 maxBeamWidth, SizeType32 maxSequenceLength, SizeType32 hiddenSize,
+        std::optional<SizeType32> maxNumTokens);
 
     bool isUserBufferEnabled() const
     {

@@ -217,7 +217,7 @@ int32_t CpSplitPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     int32_t* hOutputJoinIdx = new int[inputDesc[IdxEntry::INPUT_IDS].dims.d[0]];
     cudaMemcpyAsync(
         hInputs, inputIds, sizeof(int32_t) * inputDesc[IdxEntry::INPUT_IDS].dims.d[0], cudaMemcpyDeviceToHost, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     int32_t inputIdx = 0;
     int32_t outputIdx = 0;
@@ -282,7 +282,7 @@ int32_t CpSplitPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     cudaMemcpyAsync(outputIds, hOutputs, sizeof(int32_t) * hOutputLength, cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(outputLength, &hOutputLength, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(outputJoinIdx, hOutputJoinIdx, sizeof(int32_t) * tokenNum, cudaMemcpyHostToDevice, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -300,8 +300,8 @@ CpSplitPluginCreator::CpSplitPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

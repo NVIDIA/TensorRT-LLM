@@ -74,6 +74,8 @@ protected:
 
     std::vector<Config> getTactics(int m, int n, int k) const override;
 
+    bool checkTactic(int m, int n, int k, Config const& tactic) const override;
+
 private:
     int mQuantAlgo;
     int mGroupSize;

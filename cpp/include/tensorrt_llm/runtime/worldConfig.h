@@ -35,7 +35,7 @@ public:
 
     explicit WorldConfig(SizeType32 tensorParallelism = 1, SizeType32 pipelineParallelism = 1,
         SizeType32 contextParallelism = 1, SizeType32 rank = 0, SizeType32 gpusPerNode = kDefaultGpusPerNode,
-        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt);
+        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt, bool enableAttentionDP = false);
 
     [[nodiscard]] SizeType32 constexpr getSize() const noexcept
     {
@@ -153,6 +153,11 @@ public:
         return getSize() - 1;
     }
 
+    [[nodiscard]] bool constexpr enableAttentionDP() const noexcept
+    {
+        return mEnableAttenionDP;
+    }
+
     [[nodiscard]] std::vector<SizeType32> getPipelineParallelGroup() const;
     [[nodiscard]] std::vector<SizeType32> getTensorParallelGroup() const;
     [[nodiscard]] std::vector<SizeType32> getContextParallelGroup() const;
@@ -161,7 +166,7 @@ public:
         std::optional<SizeType32> tensorParallelism = std::nullopt,
         std::optional<SizeType32> pipelineParallelism = std::nullopt,
         std::optional<SizeType32> contextParallelism = std::nullopt,
-        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt);
+        std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt, bool enableAttentionDP = false);
 
     [[nodiscard]] bool validMpiConfig() const;
 
@@ -171,6 +176,7 @@ private:
     SizeType32 mContextParallelism;
     SizeType32 mRank;
     SizeType32 mGpusPerNode;
+    bool mEnableAttenionDP;
     std::vector<SizeType32> mDeviceIds;
 };
 

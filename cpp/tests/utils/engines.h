@@ -78,9 +78,9 @@ struct EngineBuildState
     // copy of those, so if you create them as temporaries and pass them to the TRT APIs, you will get UB. So we need
     // some place where we can keep those things.
     std::unique_ptr<nvinfer1::IBuilderConfig> builderConfig;
-    std::vector<std::unique_ptr<EngineBuildResource>> resources{};
-    std::vector<nvinfer1::ITensor*> tensors{};
-    std::vector<nvinfer1::ILayer*> layers{};
+    std::vector<std::unique_ptr<EngineBuildResource>> resources;
+    std::vector<nvinfer1::ITensor*> tensors;
+    std::vector<nvinfer1::ILayer*> layers;
 
     ~EngineBuildState()
     {
@@ -96,10 +96,10 @@ common::OptionalRef<nvinfer1::ITensor> getTensorByName(EngineBuildState& buildSt
 nvinfer1::ITensor& addSingleOutputLayer(EngineBuildState& buildState, nvinfer1::ILayer* layer);
 
 template <typename TResource>
-TResource& addResource(EngineBuildState& buildState, TResource&& resource)
+TResource& addResource(EngineBuildState& buildState, TResource resource)
 {
     return *dynamic_cast<TResource*>(
-        buildState.resources.emplace_back(std::make_unique<TResource>(std::forward<TResource>(resource))).get());
+        buildState.resources.emplace_back(std::make_unique<TResource>(std::move(resource))).get());
 }
 
 template <typename TValue>

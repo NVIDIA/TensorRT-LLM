@@ -172,6 +172,22 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
              --workers 2
 ```
 
+### AWQ Quantization
+
+Mixtral supports AWQ quantization using [AutoAWQ](https://github.com/casper-hansen/AutoAWQ).
+
+```bash
+# Convert AutoAWQ HF checkpoints into TRT-LLM checkpoint
+python ../llama/convert_checkpoint.py --model_dir ./tmp/mixtral-8x7b-v0.1-AWQ/ \
+                                      --output_dir ./tllm_checkpoint_mixtral_awq_1gpu
+
+# Build trtllm engines from the trtllm checkpoint
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_awq_1gpu \
+             --output_dir ./engine_outputs
+```
+
+You may found `quant_algo = W4A16_GPTQ` in the configuration file of the converted checkpoints, and that's because AutoAWQ is using exactly the same components as GPTQ.
+
 ### NVFP4 Post-Training Quantization
 
 Mixtral supports NVFP4 quantization.

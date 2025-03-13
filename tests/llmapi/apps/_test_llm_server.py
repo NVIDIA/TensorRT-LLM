@@ -1,8 +1,12 @@
+import concurrent.futures
 import os
 import sys
+import time
 
 import pytest
 from fastapi.testclient import TestClient
+
+import tensorrt_llm.profiler as profiler
 
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples",
@@ -77,3 +81,71 @@ def test_generate_streaming(client):
 
         whole_text = "".join(chunks)
         assert "D E F" in whole_text
+
+
+def make_concurrent_requests(client, num_requests):
+    """make concurrent requests"""
+
+    def single_request():
+        try:
+            response = client.post("/generate",
+                                   json={
+                                       "prompt": "In this example,",
+                                       "max_tokens": 2048,
+                                       "beam_width": 5,
+                                       "temperature": 0,
+                                       "repetition_penalty": 1.15,
+                                       "presence_penalty": 2,
+                                       "frequency_penalty": 2
+                                   })
+            assert response.status_code == 200
+            return response.json()
+        except Exception as e:
+            print(f"Request failed: {str(e)}")
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_requests) as executor:
+        responses = [None] * num_requests
+        future_to_request = {
+            executor.submit(single_request): i
+            for i in range(num_requests)
+        }
+        for future in concurrent.futures.as_completed(future_to_request):
+            i = future_to_request[future]
+            try:
+                responses[i] = future.result()
+            except Exception as e:
+                print(f"Request {i} failed: {str(e)}")
+                responses[i] = None
+        print(responses)
+    return responses
+
+
+def test_concurrent_requests_memory_leak(client):
+    """test memory leak under concurrent requests"""
+    num_requests = 10
+    num_iterations = 2
+    memory_threshold = 1  # GB
+    memory_usages = []
+    try:
+        # multiple rounds of concurrent requests test
+        for i in range(num_iterations):
+            print(f"\nIteration {i+1}:")
+            profiler.print_memory_usage(f'make concurrent requests {i} started')
+            current_memory, _, _ = profiler.host_memory_info()
+            responses = make_concurrent_requests(client, num_requests)
+            assert len(responses) == num_requests
+            time.sleep(2)
+            profiler.print_memory_usage(f'make concurrent requests {i} ended')
+            current_memory, _, _ = profiler.host_memory_info()
+            memory_usages.append(current_memory)
+
+        first_round_memory = memory_usages[0] / (1024**3)
+        final_memory = memory_usages[-1] / (1024**3)
+        memory_diff = final_memory - first_round_memory
+        assert memory_diff < memory_threshold, f"Memory leak detected: {memory_diff:.2f} GB increase between first and last round"
+
+    finally:
+        import gc
+        gc.collect()

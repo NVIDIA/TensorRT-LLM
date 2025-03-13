@@ -206,7 +206,7 @@ int LookupPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1:
                 output, input, weight, tokenNum, offset, localVocabSize, hidden, nullptr, stream);
         }
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return 0;
 }
@@ -268,8 +268,8 @@ LookupPluginCreator::LookupPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("rank", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("rank", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

@@ -19,12 +19,12 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
-#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
 #include <nccl.h>
+
 #include <unordered_set>
 
 using namespace nvinfer1;
@@ -841,16 +841,16 @@ AllreducePluginCreator::AllreducePluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("strategy", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("config", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("fusion_op", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("counter", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1));
-    mPluginAttributes.emplace_back(PluginField("affine", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("bias", nullptr, PluginFieldType::kINT8, 1));
-    mPluginAttributes.emplace_back(PluginField("scale", nullptr, PluginFieldType::kINT8, 1));
+    mPluginAttributes.emplace_back(PluginField("group", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("strategy", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("config", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("fusion_op", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("counter", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("affine", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("bias", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("scale", nullptr, PluginFieldType::kINT8));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

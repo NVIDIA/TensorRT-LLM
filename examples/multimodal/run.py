@@ -106,7 +106,8 @@ if __name__ == '__main__':
     if args.run_profiling:
         num_warmup_iters = 3  # Multiple iterations to load both vision and LLM engines into memory
         for _ in range(num_warmup_iters):
-            input_text, output_text = model.run(args.input_text, raw_image,
+            input_text, output_text = model.run(args.input_text,
+                                                input_multimodal_data,
                                                 args.max_new_tokens)
         profiler.reset()
 

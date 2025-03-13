@@ -1,3 +1,4 @@
+import math
 import typing
 from typing import Union
 
@@ -73,7 +74,7 @@ def get_qkv_module_name(model_type):
         q = "q"
         k = "k"
         v = "v"
-    elif model_type == "bart" or model_type == "nmt":
+    elif model_type == "bart" or model_type == "nmt" or model_type == "language_adapter":
         q = "q_proj"
         k = "k_proj"
         v = "v_proj"
@@ -91,3 +92,30 @@ def convert_weight_to_dtype(params: typing.Dict[str, torch.Tensor],
                           str), f"dtype must be str, but get type {type(dtype)}"
         for name in params.keys():
             params[name] = params[name].to(str_dtype_to_torch(dtype))
+
+
+def fairseq_sin_pos_embedding(num_embeddings: int, embedding_dim: int):
+    '''
+    generate fairseq specific sinusoidal position embedding [sin, sin, ... cos, cos...]
+    https://github.com/facebookresearch/fairseq/blob/main/fairseq/modules/sinusoidal_positional_embedding.py
+    '''
+    padding_offset = 2
+    half_dim = embedding_dim // 2.0
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float16) * -emb)
+    emb = torch.arange(num_embeddings + padding_offset,
+                       dtype=torch.float16).unsqueeze(1) * emb.unsqueeze(0)
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)],
+                    dim=1).view(num_embeddings + padding_offset, -1)
+    if embedding_dim % 2 == 1:
+        # zero pad
+        emb = torch.cat(
+            [emb, torch.zeros(num_embeddings + padding_offset, 1)],
+            dim=1,
+            dtype=torch.float16)
+    '''
+    remove first 2 column to match position_id setup difference between fairseq & trt
+    fairseq position_id starts with 2, ex: [2, 3, 4 ..]
+    trt position_id starts with 0 [0, 1, 2]
+    '''
+    return emb[padding_offset:, :]

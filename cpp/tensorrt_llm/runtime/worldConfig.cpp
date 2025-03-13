@@ -19,8 +19,8 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <algorithm>
 #include <numeric>
@@ -30,12 +30,14 @@ using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
 WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-    SizeType32 rank, SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds)
+    SizeType32 rank, SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds,
+    bool enableAttentionDP)
     : mTensorParallelism{tensorParallelism}
     , mPipelineParallelism{pipelineParallelism}
     , mContextParallelism{contextParallelism}
     , mRank{rank}
     , mGpusPerNode{gpusPerNode}
+    , mEnableAttenionDP{enableAttentionDP}
     , mDeviceIds{deviceIds.value_or(std::vector<SizeType32>(mGpusPerNode))}
 {
 #if ENABLE_MULTI_DEVICE
@@ -89,7 +91,7 @@ bool WorldConfig::validMpiConfig() const
 
 WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> tensorParallelism,
     std::optional<SizeType32> pipelineParallelism, std::optional<SizeType32> contextParallelism,
-    std::optional<std::vector<SizeType32>> const& deviceIds)
+    std::optional<std::vector<SizeType32>> const& deviceIds, bool enableAttentionDP)
 {
 #if ENABLE_MULTI_DEVICE
     auto& comm = COMM_SESSION;
@@ -132,7 +134,7 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
         }
     }
 
-    return WorldConfig{tp, pp, cp, mpiRank, gpusPerNode, deviceIds};
+    return WorldConfig{tp, pp, cp, mpiRank, gpusPerNode, deviceIds, enableAttentionDP};
 #else
     return WorldConfig();
 #endif

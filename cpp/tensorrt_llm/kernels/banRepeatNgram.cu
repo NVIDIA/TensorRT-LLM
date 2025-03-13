@@ -159,7 +159,7 @@ void invokeBanRepeatNgram(T* logits, TokenIdType const** output_ids_buf, Finishe
     ban_repeat_ngram<<<grid, block, (block.x + 2 * (max_no_repeat_ngram_size - 1)) * sizeof(int), stream>>>(logits,
         output_ids_buf, finished_buf, parent_ids_buf, batch_slot, batch_size, beam_width, max_seq_len,
         no_repeat_ngram_size_buf, vocab_size_padded, sequence_lengths);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 #define INVOKE_BAN_REPEAT_NGRAM(T)                                                                                     \
