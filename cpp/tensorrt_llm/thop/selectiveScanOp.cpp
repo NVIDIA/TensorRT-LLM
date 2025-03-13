@@ -67,7 +67,7 @@ std::tuple<th::Tensor, th::Tensor> run_selective_scan(th::Tensor const& input, t
     auto req_type = host_request_types[0].item<int>();
 
     std::vector<int64_t> out_shape;
-    if (remove_padding && req_type == 0)
+    if (remove_padding)
     {
         out_shape = {input_sizes[0], dim};
     }
@@ -204,7 +204,7 @@ std::tuple<th::Tensor, th::Tensor> run_selective_scan(th::Tensor const& input, t
         tk::invokeSelectiveScanUpdate<T, float>(params, stream);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     return std::make_tuple(out, state);
 }

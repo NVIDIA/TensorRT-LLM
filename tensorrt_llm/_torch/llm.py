@@ -20,12 +20,10 @@ class LLM(BaseLLM):
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
-                 speculative_model: Optional[str] = None,
                  **kwargs: Any):
 
         kwargs_dict = dict(kwargs)
         kwargs_dict['backend'] = 'pytorch'
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, speculative_model,
-                         **kwargs_dict)
+                         revision, tokenizer_revision, **kwargs_dict)

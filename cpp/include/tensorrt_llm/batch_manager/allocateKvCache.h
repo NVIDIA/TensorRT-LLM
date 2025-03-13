@@ -26,8 +26,6 @@
 namespace tensorrt_llm::batch_manager
 {
 
-namespace tle = tensorrt_llm::executor;
-
 class AllocateKvCache : Algorithm
 {
     using BaseKVCacheManager = tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager;

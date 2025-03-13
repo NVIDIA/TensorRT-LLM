@@ -231,7 +231,7 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
 {
     TLLM_CHECK_WITH_INFO(
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
-    memset(&launchParams, 0, sizeof(XQALaunchParam<KVCacheBuffer>));
+    launchParams = {};
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.slidingWindowSize = params.cyclic_attention_window_size;
     launchParams.qScale = params.q_scaling;

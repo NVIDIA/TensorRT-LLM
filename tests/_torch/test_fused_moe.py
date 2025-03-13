@@ -1,5 +1,6 @@
 import os
 import sys
+from itertools import product
 from typing import Dict, List, Optional
 
 import pytest
@@ -7,7 +8,10 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import FusedMoE
+from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
+                                                   DefaultMoeRoutingMethod,
+                                                   FusedMoE,
+                                                   RenormalizeMoeRoutingMethod)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -15,13 +19,17 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe(dtype):
+@pytest.mark.parametrize(
+    "dtype, experts, RoutingMethodCls",
+    product([torch.float16, torch.bfloat16], [3, 8, 512],
+            [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod]))
+def test_fused_moe(dtype, experts, RoutingMethodCls):
     SEQ_LEN = 8
     HIDDEN_SIZE = 64
     INTERMEDIATE_SIZE = 32
-    NUM_EXPERTS = 3
+    NUM_EXPERTS = experts
     TOP_K = 2
+    routing_method = RoutingMethodCls(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -39,7 +47,7 @@ def test_fused_moe(dtype):
         weights[f"{expert_id}.w2.weight"] = w2_weight
         weights[f"{expert_id}.w3.weight"] = w3_weight
     fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         top_k=TOP_K,
+                         routing_method=routing_method,
                          hidden_size=HIDDEN_SIZE,
                          intermediate_size=INTERMEDIATE_SIZE,
                          dtype=dtype,
@@ -56,7 +64,7 @@ def test_fused_moe(dtype):
     # torch run
 
     ref_fused_moe = RefGatedMLPFusedMoE(num_experts=NUM_EXPERTS,
-                                        top_k=TOP_K,
+                                        routing_method=routing_method,
                                         hidden_size=HIDDEN_SIZE,
                                         intermediate_size=INTERMEDIATE_SIZE,
                                         dtype=dtype,
@@ -82,6 +90,7 @@ def test_fused_moe_fp8(dtype):
     INTERMEDIATE_SIZE = 32
     NUM_EXPERTS = 3
     TOP_K = 2
+    routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -126,7 +135,7 @@ def test_fused_moe_fp8(dtype):
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         top_k=TOP_K,
+                         routing_method=routing_method,
                          hidden_size=HIDDEN_SIZE,
                          intermediate_size=INTERMEDIATE_SIZE,
                          dtype=dtype,
@@ -142,7 +151,7 @@ def test_fused_moe_fp8(dtype):
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
-        top_k=TOP_K,
+        routing_method=routing_method,
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
@@ -167,6 +176,7 @@ def test_fused_moe_nvfp4(dtype):
     INTERMEDIATE_SIZE = 128
     NUM_EXPERTS = 3
     TOP_K = 2
+    routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -228,7 +238,7 @@ def test_fused_moe_nvfp4(dtype):
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
     fused_moe = FusedMoE(num_experts=NUM_EXPERTS,
-                         top_k=TOP_K,
+                         routing_method=routing_method,
                          hidden_size=HIDDEN_SIZE,
                          intermediate_size=INTERMEDIATE_SIZE,
                          dtype=dtype,
@@ -244,7 +254,7 @@ def test_fused_moe_nvfp4(dtype):
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
-        top_k=TOP_K,
+        routing_method=routing_method,
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
@@ -263,14 +273,14 @@ class RefGatedMLPFusedMoE(nn.Module):
 
     def __init__(self,
                  num_experts: int,
-                 top_k: int,
+                 routing_method: BaseMoeRoutingMethod,
                  hidden_size: int,
                  intermediate_size: int,
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig()):
         super().__init__()
         self.num_experts = num_experts
-        self.top_k = top_k
+        self.routing_method = routing_method
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
 
@@ -292,28 +302,22 @@ class RefGatedMLPFusedMoE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_size
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        routing_weights = nn.functional.softmax(router_logits,
-                                                dim=1,
-                                                dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights,
-                                                       self.top_k,
-                                                       dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        selected_experts, routing_weights = self.routing_method.apply(
+            router_logits)
 
         final_hidden_states = torch.zeros(hidden_states.shape,
                                           dtype=hidden_states.dtype,
                                           device=hidden_states.device)
 
         for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
             batch_idx, nth_expert = torch.where(selected_experts == expert_id)
             expert_inputs = hidden_states[batch_idx]
 
             output = self.experts[expert_id](expert_inputs)
-            final_hidden_states[batch_idx] += routing_weights[batch_idx,
-                                                              nth_expert,
-                                                              None] * output
+            final_hidden_states[batch_idx] += routing_weights[
+                batch_idx, nth_expert, None] * output.float()
 
         final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
         return final_hidden_states

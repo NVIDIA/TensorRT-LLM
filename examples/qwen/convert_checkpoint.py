@@ -26,6 +26,10 @@ def parse_arguments():
                         type=int,
                         default=1,
                         help='N-way pipeline parallelism size')
+    parser.add_argument('--cp_size',
+                        type=int,
+                        default=1,
+                        help='N-way context parallelism size')
     parser.add_argument(
         '--dtype',
         type=str,
@@ -249,13 +253,12 @@ def convert_and_save_hf(args):
         logger.warning("AutoConfig cannot load the huggingface config.")
 
     if args.smoothquant is not None or args.int8_kv_cache:
-        mapping = Mapping(
-            world_size=world_size,
-            tp_size=args.tp_size,
-            pp_size=args.pp_size,
-            moe_tp_size=args.moe_tp_size,
-            moe_ep_size=args.moe_ep_size,
-        )
+        mapping = Mapping(world_size=world_size,
+                          tp_size=args.tp_size,
+                          pp_size=args.pp_size,
+                          moe_tp_size=args.moe_tp_size,
+                          moe_ep_size=args.moe_ep_size,
+                          cp_size=args.cp_size)
         QWenForCausalLM.quantize(args.model_dir,
                                  args.output_dir,
                                  dtype=args.dtype,
@@ -277,6 +280,8 @@ def convert_and_save_hf(args):
                                                      mapping=mapping,
                                                      quant_config=quant_config,
                                                      **override_fields)
+            qwen.config.mapping.cp_size = args.cp_size
+            qwen.config.mapping.world_size *= args.cp_size
             qwen.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del qwen
 

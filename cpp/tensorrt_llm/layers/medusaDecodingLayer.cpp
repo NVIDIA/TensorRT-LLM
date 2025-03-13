@@ -142,7 +142,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
     auto prepareRuntimeTopK = [this, workspace](std::vector<SizeType32> const& runtimeTopK, SizeType32 batchSize,
                                   BufferConstPtr const& batchSlots, BufferPtr const& runtimeTopKDevice)
     {
-        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == 1 || runtimeTopK.size() == batchSize,
+        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == 1 || runtimeTopK.size() == static_cast<size_t>(batchSize),
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
         SizeType32* topKSetupPtr = nullptr;
         if (runtimeTopK.size() > 1)

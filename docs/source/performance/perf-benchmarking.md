@@ -202,7 +202,7 @@ trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_
 - [Experimental] Build engine with target ISL/OSL for optimization:
 In this experimental mode, you can provide hints to `trtllm-bench`'s tuning heuristic to optimize the engine on specific ISL and OSL targets.
 Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
-The following command builds an FP8 quantized engine and optmizes for ISL:OSL targets of 128:128.
+The following command builds an FP8 quantized engine and optimizes for ISL:OSL targets of 128:128.
 
 ```shell
 trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128

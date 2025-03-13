@@ -40,6 +40,7 @@ from tensorrt_llm.runtime.redrafter_utils import *
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
+from ..layers import LanguageAdapterConfig
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -219,8 +220,6 @@ class _Runtime(object):
         self.address = None
         self.device_memory_size = 0
         self.__prepare(mapping, engine_buffer)
-        if logger.level == "verbose":
-            self.__print_engine_info()
 
     def _serialize_engine(self) -> trt.IHostMemory:
         return self.engine.serialize()
@@ -280,6 +279,11 @@ class _Runtime(object):
         if not self.engine.streamable_weights_size:
             # engine does not have weight streaming enabled
             self.__prepare_execution_contexts()
+        else:
+            self.engine.weight_streaming_budget_v2 = 0  # avoid OOM when print engine info
+
+        if logger.level == "verbose":
+            self.__print_engine_info()
 
     def __prepare_execution_contexts(self):
         self.context_0 = None
@@ -643,6 +647,8 @@ class ModelConfig:
     num_kv_heads_per_layer: Optional[List[int]] = None
     num_kv_heads_per_cross_attn_layer: Optional[List[int]] = None
     skip_cross_attn_blocks: bool = False
+    # language adapter
+    language_adapter_config: Optional[LanguageAdapterConfig] = None
 
 
 @dataclass
@@ -668,6 +674,7 @@ class SamplingConfig:
     top_p_decay: Optional[torch.Tensor] = field(default=None)  # float
     top_p_min: Optional[torch.Tensor] = field(default=None)  # float
     top_p_reset_ids: Optional[torch.Tensor] = field(default=None)  # int
+    random_seed: Union[int, torch.Tensor] = field(default=None)
 
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
     early_stopping: Union[int, torch.Tensor] = field(default=1)
@@ -681,7 +688,6 @@ class SamplingConfig:
     # The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
                                                                    default=0.0)
-    random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
     no_repeat_ngram_size: Union[int, torch.Tensor] = field(init=False,
@@ -930,17 +936,6 @@ class GenerationSession(object):
                 CustomAllReduceHelper.max_workspace_size_auto(
                     self.mapping.tp_size))
 
-            if self.use_gemm_allreduce_plugin:
-                # XXX (xsimmons): this is a bit hacky as it assumes
-                # 2x RowLinear layers per attention block.
-                # This will be fixed soon when I remove coupling between model
-                # and runtime.
-                for i in range(self.num_attn_layers * 2):
-                    expected_tensor_names += [
-                        f'gemm_allreduce_uc_out_{i}',
-                        f'gemm_allreduce_mc_out_{i}'
-                    ]
-
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
         if self.mapping.is_first_pp_rank():
@@ -1085,12 +1080,17 @@ class GenerationSession(object):
         if self.is_redrafter_mode:
             expected_tensor_names += get_redrafter_tensor_names()
 
+        # language adapter
+        if model_config.language_adapter_config:
+            expected_tensor_names += ['language_adapter_routings']
+
         found_tensor_names = [
             self.runtime.engine.get_tensor_name(i)
             for i in range(self.runtime.engine.num_io_tensors)
         ]
         for name in found_tensor_names:
-            if name.startswith("allreduce_ub_"):
+            if name.startswith("allreduce_ub_") or name.startswith(
+                    "gemm_allreduce"):
                 expected_tensor_names += [name]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
@@ -2136,6 +2136,7 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ) -> Dict[str, RuntimeTensor]:
         tensors = {}
 
@@ -2193,6 +2194,9 @@ class GenerationSession(object):
                 add_tensor(self.cross_kv_reuse, 'cross_kv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -2411,25 +2415,29 @@ class GenerationSession(object):
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
             if self.use_gemm_allreduce_plugin:
-                # bind pointers to symbolic tensors
-                idx = 0
-                for i in range(self.num_attn_layers):
-                    # XXX (xsimmons): this is a bit hacky as it assumes
-                    # 2x RowLinear layers per attention block.
-                    # This will be fixed soon when I remove coupling between model
-                    # and runtime.
-                    for _ in range(2):
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.uc_ptr,
-                            f'gemm_allreduce_uc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.mc_ptr,
-                            f'gemm_allreduce_mc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
-                        idx += 1
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
@@ -2481,6 +2489,7 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
@@ -2579,6 +2588,9 @@ class GenerationSession(object):
             add_tensor_with_shape(encoder_output, 'encoder_output',
                                   encoder_output_shape)
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -2777,26 +2789,29 @@ class GenerationSession(object):
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
             if self.use_gemm_allreduce_plugin:
-                # bind pointers to symbolic tensors
-                idx = 0
-                for i in range(self.num_attn_layers):
-                    # XXX (xsimmons): this is very hacky as it makes
-                    # an assumption about having 2x RowLinear layers
-                    # per attention block. The design doesn't provide
-                    # an way to determine which layers use RowLinear
-                    # without a lot of surgery
-                    for _ in range(2):
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.uc_ptr,
-                            f'gemm_allreduce_uc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.mc_ptr,
-                            f'gemm_allreduce_mc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
-                        idx += 1
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
         # it is only necessary to set the lora weight for the first two steps.
@@ -3470,6 +3485,8 @@ class GenerationSession(object):
 
         position_ids_raw = kwargs.get('position_ids', None)
         skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
+        language_adapter_routings = kwargs.get('language_adapter_routings',
+                                               None)
         if step == 0:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
@@ -3531,6 +3548,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=context_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
+                language_adapter_routings=language_adapter_routings,
             )
 
             context = self.runtime.ctx_context
@@ -3748,7 +3766,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=gen_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
-            )
+                language_adapter_routings=language_adapter_routings)
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
             # needs to pro-long the life time of the tensors inside the next_step_tensors array

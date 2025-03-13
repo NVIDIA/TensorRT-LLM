@@ -44,6 +44,9 @@ uint32_t getElemBytes(CUtensorMapDataType_enum dataType)
     case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ: return 4;
     case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32: return 4;
     case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
+    case CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B: return 8;
+    case CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B: return 16;
+    case CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B: return 16;
     }
     throw std::runtime_error("unsupported data type");
 }

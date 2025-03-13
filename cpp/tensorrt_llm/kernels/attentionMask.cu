@@ -177,7 +177,7 @@ void invokeBuildAttentionMask(AttentionMaskParams<MaskDataType> const& params, c
     {
         buildCuQSeqLens<256>
             <<<params.batchSize, 256, 0, stream>>>(params.batchSize, params.actualQSeqLens, params.cuQSeqLens);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // Set the attention mask.
@@ -211,7 +211,7 @@ void invokeBuildAttentionMask(AttentionMaskParams<MaskDataType> const& params, c
     {
         TLLM_CHECK_WITH_INFO(false, "The attention mask type is not supported.");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

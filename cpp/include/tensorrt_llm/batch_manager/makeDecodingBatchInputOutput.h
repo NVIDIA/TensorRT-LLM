@@ -19,39 +19,39 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
 class DecoderBuffers;
 class RuntimeBuffers;
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager
 {
-
-namespace tr = tensorrt_llm::runtime;
-
 class MakeDecodingBatchInputOutput : Algorithm
 {
 public:
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
     constexpr static auto name{"MakeDecodingBatchInputOutput"};
 
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using TensorPtr = runtime::decoder_batch::Input::TensorPtr;
 
     MakeDecodingBatchInputOutput() = default;
 
-    std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>> operator()(
-        RequestVector const& contextRequests, RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
-        RuntimeBuffers const& genRuntimeBuffers, executor::DecodingMode const& decodingMode,
-        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences) const;
-
-private:
-    std::vector<bool> computeActiveVec(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        SizeType32 maxNumSequences) const;
+    std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
+    operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
+        DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences, SizeType32 beamWidth,
+        runtime::BufferManager const& manager, runtime::CudaStream const& stream,
+        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

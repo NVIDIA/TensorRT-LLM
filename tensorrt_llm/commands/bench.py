@@ -6,6 +6,7 @@ from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.build.build import build_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.logger import logger, severity_map
 
 
 @click.group(name="trtllm-bench", context_settings={'show_default': True})
@@ -32,13 +33,19 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
     default="/tmp",  # nosec B108
     help="The directory to store benchmarking intermediate files.",
 )
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
 @click.pass_context
 def main(
     ctx,
     model: str,
     model_path: Path,
     workspace: Path,
+    log_level: str,
 ) -> None:
+    logger.set_level(log_level)
     ctx.obj = BenchmarkEnvironment(model=model,
                                    checkpoint_path=model_path,
                                    workspace=workspace)

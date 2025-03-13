@@ -33,7 +33,7 @@ Or you can try the following commands to get a quantized model by yourself:
 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-cd TensorRT-Model-Optimizer/llm_ptq
+cd TensorRT-Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --export_fmt hf
 ```
 
@@ -47,3 +47,7 @@ scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --ex
 - [Attention](./torch/attention.md)
 - [KV Cache Manager](./torch/kv_cache_manager.md)
 - [Scheduler](./torch/scheduler.md)
+
+## Known Issues
+
+- The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
