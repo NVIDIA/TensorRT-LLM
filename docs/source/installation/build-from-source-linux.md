@@ -107,7 +107,7 @@ The following command compiles the C++ code and packages the compiled libraries 
 
 ```bash
 # To build the TensorRT-LLM code.
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py
 ```
 
 Once the wheel is built, install it by:
@@ -126,7 +126,7 @@ By default, `build_wheel.py` enables incremental builds. To clean the build
 directory, add the `--clean` option:
 
 ```bash
-python3 ./scripts/build_wheel.py --clean  --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py --clean
 ```
 
 It is possible to restrict the compilation of TensorRT-LLM to specific CUDA
@@ -136,13 +136,13 @@ example:
 
 ```bash
 # Build TensorRT-LLM for Ampere.
-python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
 ```
 
 To use the C++ benchmark scripts under [benchmark/cpp](/benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
 
 ```bash
-python3 ./scripts/build_wheel.py --benchmarks --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py --benchmarks
 ```
 
 Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
@@ -152,7 +152,7 @@ Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 The C++ Runtime, in particular, `GptSession` can be exposed to Python via bindings. This feature can be turned on through the default build options.
 
 ```bash
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
+python3 ./scripts/build_wheel.py
 ```
 
 After installing, the resulting wheel as described above, the C++ Runtime bindings will be available in

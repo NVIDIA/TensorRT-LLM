@@ -10,6 +10,7 @@ import math
 BYTES_PER_ELEM = {
     QuantAlgo.NO_QUANT: 2.0,
     QuantAlgo.FP8: 1.0,
+    QuantAlgo.FP8_BLOCK_SCALES: 1.0,
     QuantAlgo.NVFP4: .5,
 }
 
@@ -52,8 +53,6 @@ def calc_engine_setting(
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
-    # Model specific calculation
-    param_count = model_config.param_count / (1000**3)
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
     byte_per_token = 2 * model_config.num_hidden_layers * adjusted_num_kv_heads \
@@ -62,10 +61,11 @@ def calc_engine_setting(
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
     # Total engine size.
-    engine_size = param_count * byte_per_elem
+    engine_size = model_config.param_count * byte_per_elem / (1024**3)
     total_gpu_memory = get_device_memory() * n_gpus
     # Available memory to allocate KV cache.
     available_memory = total_gpu_memory - engine_size
+    logger.info(f"Estimated engine size: {engine_size:.2f} GB")
     logger.info("Estimated total available memory for KV cache: "
                 f"{available_memory:.2f} GB")
 
@@ -88,7 +88,22 @@ def calc_engine_setting(
     if total_gpu_memory < engine_size:
         raise RuntimeError(
             f"The model requires at least: {engine_size:.2f} GB, "
-            f"the total GPU memory of {total_gpu_memory:.2f} is insufficient.")
+            f"the total GPU memory of {total_gpu_memory:.2f} is insufficient.\n"
+            "----------------------------------------------------------\n"
+            f"Estimation based on the following:\n"
+            "----------------------------------------------------------\n"
+            f"Bytes per Element: {byte_per_elem}\n"
+            f"Bytes per KV Element: {byte_per_kv_elem}\n"
+            f"Number of GPUs: {n_gpus}\n"
+            f"Model Number of KV Heads: {model_config.num_key_value_heads}\n"
+            f"Adjusted Number of KV Heads: {adjusted_num_kv_heads}\n"
+            f"Head Size: {model_config.head_size}\n"
+            f"Number of Hidden Layers: {model_config.num_hidden_layers}\n"
+            f"Number of Pipeline Stages: {pp_size}\n"
+            f"Number of Tensor Parallel Shards: {tp_size}\n"
+            f"Number of Pipeline Parallel Stages: {pp_size}\n"
+            f"KV Cache GPU Memory Fraction: {kv_cache_gpu_mem_fraction}\n"
+            "----------------------------------------------------------\n")
     if kv_cache_max_requests < 1:
         raise RuntimeError("The amount of KV cache memory is insufficient to "
                            "run this model. Please try with more GPUs.")

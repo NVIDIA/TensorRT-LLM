@@ -75,7 +75,6 @@ void StopCriteriaLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
 
     auto const localDecoderDomain = getLocalDecoderDomain(inputs, mDecoderDomain);
     auto const maxSeqLen = outputs->outputIds->getDimension<-1>();
-    auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
 
     TLLM_CHECK_WITH_INFO(inputs->stopCriteriaInputs, "stopCriteriaInputs for forward is not set");
 

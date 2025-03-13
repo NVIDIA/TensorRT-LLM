@@ -100,7 +100,7 @@ public:
     TensorPtr runtimePerfKnobsHost;      // can hold max 16 perf knobs
     TensorPtr contextProgressHost;
 
-    std::shared_ptr<IpcNvlsTensor> gemmAllReduceOutput; // stores output for gemmAllReduce plugin layer
+    std::shared_ptr<MulticastTensor> gemmAllReduceOutput; // stores output for gemmAllReduce plugin layer
 };
 
 } // namespace tensorrt_llm::runtime

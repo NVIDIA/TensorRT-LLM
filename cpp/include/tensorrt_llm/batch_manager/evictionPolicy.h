@@ -52,11 +52,13 @@ public:
         = 0;
     /// @brief Perform any per-iteration bookkeeping
     virtual void refresh() = 0;
+
+    virtual bool verifyQueueIntegrity() = 0;
 };
 
 struct ExpiringBlockComparator
 {
-    inline bool operator()(BlockPtr const& a, BlockPtr const& b) const
+    bool operator()(BlockPtr const& a, BlockPtr const& b) const
     {
         // If two blocks expire in the same millisecond, their expiration times will be equal. As a fallback, check the
         // raw pointer values.
@@ -86,6 +88,8 @@ public:
 
     // Making this public and virtual makes it possible to test.
     [[nodiscard]] virtual std::chrono::steady_clock::time_point::duration getTime() const;
+
+    bool verifyQueueIntegrity() override;
 
 private:
     // Check if the block should be added to mFreeQueues.

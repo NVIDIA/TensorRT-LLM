@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include "cuda.h"
 #include <cstdint>
@@ -30,8 +30,9 @@
 
 std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
 {
-    static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap = {{nvinfer1::DataType::kFLOAT, ncclFloat32},
-        {nvinfer1::DataType::kHALF, ncclFloat16}, {nvinfer1::DataType::kBF16, ncclBfloat16}};
+    static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap
+        = {{nvinfer1::DataType::kFLOAT, ncclFloat32}, {nvinfer1::DataType::kHALF, ncclFloat16},
+            {nvinfer1::DataType::kBF16, ncclBfloat16}, {nvinfer1::DataType::kFP8, ncclInt8}};
     return &dtypeMap;
 }
 
@@ -129,6 +130,7 @@ void const* tensorrt_llm::common::op::getCommSessionHandle()
 
 namespace
 {
+using tensorrt_llm::common::op::hash;
 
 // Get current cuda context, a default context will be created if there is no context.
 inline CUcontext getCurrentCudaCtx()
@@ -219,7 +221,7 @@ private:
     mutable std::mutex mMutex;
     // CUDA resources are per-context and per-thread.
     using CacheKey = std::tuple<CUcontext, std::thread::id>;
-    std::unordered_map<CacheKey, std::weak_ptr<T>, tensorrt_llm::common::op::TupleHash<CacheKey>> mObservers;
+    std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>> mObservers;
 };
 
 } // namespace

@@ -48,8 +48,8 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
         case 2:
         case 4: CASE_K(4)
         case 8: CASE_K(8)
-#ifndef FAST_BUILD
         case 16: CASE_K(16)
+#ifndef FAST_BUILD // Skip beam_width larger than 16
         case 32: CASE_K(32)
         case 64: CASE_K(64)
         case 128: CASE_K(128)
@@ -91,19 +91,20 @@ __global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restri
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM)
 {
     int const bid = blockIdx.x;
-    float const diversityRate{diversityRates[batchSlots[bid]]};
+    runtime::SizeType32 const slot = batchSlots[bid];
+    float const diversityRate{diversityRates[slot]};
     T* pLocalProbs = pStage1Probs + bid * nBM * nBM * 2;
 
     for (int index = threadIdx.x; index < nBM * nBM * 2; index += blockDim.x)
     {
         int const indexBM = index / (nBM * 2);
-        if (finished[bid * nBM + indexBM].isFinished())
+        if (finished[slot * nBM + indexBM].isFinished())
         {
-            pLocalProbs[index] += (index == endIds[bid]) ? 1.0f : 0.0f;
+            pLocalProbs[index] += (index == endIds[slot]) ? 1.0f : 0.0f;
         }
         else
         {
-            pLocalProbs[index] += cumLogProbs[bid * nBM + indexBM] + diversityRate * indexBM;
+            pLocalProbs[index] += cumLogProbs[slot * nBM + indexBM] + diversityRate * indexBM;
         }
     }
     return;

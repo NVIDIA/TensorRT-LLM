@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <valarray>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -47,7 +48,7 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                              ///< Unknown state
     kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
     kCONTEXT_INIT = 2,                         ///< Context phase starts
-    KDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
+    kDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
     kGENERATION_IN_PROGRESS = 4,               ///< Generation phase is in progress
     kGENERATION_TO_COMPLETE = 5,               ///< Generation phase is to be completed
     kGENERATION_COMPLETE = 6,                  ///< Generation phase completed
@@ -123,7 +124,9 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -170,6 +173,7 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
         , mLlmRequestType(llmRequestType)
+        , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
         , mEagleConfig(std::move(eagleConfig))
@@ -177,6 +181,7 @@ public:
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
+        , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
@@ -202,7 +207,9 @@ public:
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1)
+        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -241,8 +248,10 @@ public:
         , mDecodingIter(0)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.beamWidth)
+        , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mSequenceIndex(0)
+        , mLanguageAdapterUid(languageAdapterUid)
     {
         if (draftTokens)
         {
@@ -317,6 +326,7 @@ public:
         , mSequenceIndex(0)
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
+        , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -429,11 +439,8 @@ public:
 
         if (req.getOutputConfig().additionalModelOutputs.has_value())
         {
-            auto const additionalModelOutputs
-                = req.getOutputConfig()
-                      .additionalModelOutputs.value(); // Explicit copy is needed. Something shady is going on,
-                                                       // somewhere, which makes it behave unpredictably without it.
-                                                       // Separate investigation needed.
+            auto const& outputConfig = req.getOutputConfig();
+            auto const& additionalModelOutputs = outputConfig.additionalModelOutputs.value();
             for (auto const& modelOutput : additionalModelOutputs)
             {
                 if (modelOutput.gatherContext)
@@ -1050,6 +1057,8 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
+
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
@@ -1408,7 +1417,7 @@ public:
 
     void setState(LlmRequestState state)
     {
-        TLLM_LOG_DEBUG("Set request %ld from state %d to %d", mRequestId, mState, state);
+        TLLM_LOG_DEBUG("Set request %lu from state %d to %d", mRequestId, mState, state);
         mState = state;
     }
 
@@ -1440,7 +1449,7 @@ public:
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
         return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE
-            || mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+            || mState == LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationToCompleteState() const noexcept
@@ -1460,7 +1469,7 @@ public:
 
     [[nodiscard]] bool isDisaggGenerationTransmissionComplete() const noexcept
     {
-        return mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+        return mState == LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE;
     }
 
     [[nodiscard]] bool isDisaggGenerationTransmissionInProgress() const noexcept
@@ -1487,7 +1496,7 @@ public:
         case batch_manager::LlmRequestState::kCONTEXT_INIT: return executor::RequestStage::kCONTEXT_IN_PROGRESS; break;
         case batch_manager::LlmRequestState::kGENERATION_IN_PROGRESS:
         case batch_manager::LlmRequestState::kGENERATION_TO_COMPLETE:
-        case batch_manager::LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE:
+        case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_INIT:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS:
             return executor::RequestStage::kGENERATION_IN_PROGRESS;
@@ -1536,7 +1545,7 @@ public:
     {
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
-            "getContextChunkSize is only possible during the context phase.");
+            "getContextChunkSize is only possible during the context phase or generation init phase.");
         return mContextChunkSize;
     }
 
@@ -1545,7 +1554,9 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_CHECK_WITH_INFO(isContextInitState(), "setContextChunkSize is only possible during the context phase.");
+        TLLM_CHECK_WITH_INFO(
+            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+            "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
     }
@@ -1560,7 +1571,7 @@ public:
     /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        return getContextCurrentPosition() == 0;
+        return mContextCurrentPosition == 0;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
@@ -1677,6 +1688,20 @@ public:
         return mPerfMetrics.kvCacheMetrics.numReusedBlocks;
     }
 
+    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const
+    {
+        return mLanguageAdapterUid;
+    }
+
+    std::vector<SizeType32> getLanguageAdapterRouting(
+        SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
+    {
+        auto const reqLanguageAdapterUid = getLanguageAdapterUid().value();
+        TLLM_CHECK_WITH_INFO(reqLanguageAdapterUid < reqNumLanguages, "Language adapter uid is out of range.\n");
+        // Copy the same routing info for all the tokens in this request
+        return std::vector<SizeType32>(inputLength, reqLanguageAdapterUid);
+    }
+
     /// @brief mark all beams as finished by the given reason. Marks only unfinished beams.
     void finishByReason(executor::FinishReason finishReason)
     {
@@ -1721,10 +1746,12 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
+        auto const currentTokenTime = std::chrono::steady_clock::now();
+
         if (!mPerfMetrics.firstIter)
         {
             mPerfMetrics.firstIter = iter;
-            mPerfMetrics.timingMetrics.firstTokenTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstTokenTime = currentTokenTime;
         }
 
         mPerfMetrics.iter = iter;
@@ -1732,8 +1759,18 @@ public:
         if (isFinished())
         {
             mPerfMetrics.lastIter = iter;
-            mPerfMetrics.timingMetrics.lastTokenTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
+    }
+
+    void setRequestedBlockHashes(std::vector<size_t> hashes)
+    {
+        mRequestedBlockHashes = std::move(hashes);
+    }
+
+    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
+    {
+        return mRequestedBlockHashes;
     }
 
     RequestIdType mRequestId;
@@ -1749,10 +1786,9 @@ public:
     std::optional<RequestIdType> mClientId;
     // Position of mask token in GLM model inputs
     SizeType32 mMaskPosition{0};
-
-protected:
     LlmRequestState mState;
 
+protected:
     bool mIsStreaming;
 
     // A list of tokens generated at the current step.
@@ -1856,6 +1892,8 @@ protected:
     // Guided decoding params
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams;
 
+    std::optional<SizeType32> mLanguageAdapterUid;
+
     // the timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
@@ -1864,9 +1902,17 @@ protected:
     TensorMap mAdditionalContextOutputTensors;    // Tensors containing the additional context output.
     TensorMap mAdditionalGenerationOutputTensors; // Tensors containing the additional generation output.
 
+    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
+    std::vector<size_t> mRequestedBlockHashes;
+
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
+        }
+
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
         mLastTokens = VecTokens(mSamplingConfig.beamWidth);
@@ -2032,7 +2078,9 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
@@ -2042,7 +2090,8 @@ public:
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
             llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
-            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs)
+            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid,
+            allottedTimeMs, contextPhaseParams)
     {
     }
 
@@ -2073,7 +2122,9 @@ public:
         std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2093,7 +2144,7 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), allottedTimeMs)
+            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams)
     {
     }
 
@@ -2112,14 +2163,16 @@ public:
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1)
+        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
             lookaheadConfig, returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            numReturnSequences)
+            numReturnSequences, languageAdapterUid, contextPhaseParams)
     {
     }
 
@@ -2139,8 +2192,9 @@ public:
     /// @return An optional Response
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
+    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
+        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false,
+        bool gatherContextOutputs = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 

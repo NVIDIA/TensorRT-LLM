@@ -61,7 +61,6 @@ struct XQAParams
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
     int32_t generation_input_length;
-    int32_t layer_idx = 0;
     int32_t num_q_heads = 0;
     int32_t num_kv_heads = 0;
     int32_t head_size = 0;
@@ -138,7 +137,6 @@ struct XQAParams
            << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
            << "mrope_position_deltas: " << mrope_position_deltas << std::endl
            << "generation_input_length: " << generation_input_length << std::endl
-           << "layer_idx: " << layer_idx << std::endl
            << "num_q_heads: " << num_q_heads << std::endl
            << "num_kv_heads: " << num_kv_heads << std::endl
            << "head_size: " << head_size << std::endl

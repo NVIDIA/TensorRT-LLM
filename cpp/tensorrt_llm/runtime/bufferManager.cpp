@@ -17,6 +17,7 @@
 #include "cudaMemPool.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/memoryUtils.h"
 #include "tllmBuffers.h"
 
 #include <cstring>
@@ -108,7 +109,7 @@ BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::
 
 BufferManager::ITensorPtr BufferManager::ipcNvls(std::set<int> ranks, nvinfer1::Dims dims, nvinfer1::DataType type)
 {
-    return std::make_unique<IpcNvlsTensor>(dims, type, ranks);
+    return std::make_unique<MulticastTensor>(dims, type, ranks);
 }
 
 void BufferManager::setZero(IBuffer& buffer) const
@@ -138,7 +139,8 @@ void BufferManager::copy(void const* src, IBuffer& dst, MemoryType srcType) cons
         }
         else
         {
-            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+            TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
+                dst.data(), src, dst.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
         }
     }
 }
@@ -153,7 +155,8 @@ void BufferManager::copy(IBuffer const& src, void* dst, MemoryType dstType) cons
         }
         else
         {
-            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
+            TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(
+                dst, src.data(), src.getSizeInBytes(), cudaMemcpyDefault, mStream->get()));
         }
     }
 }

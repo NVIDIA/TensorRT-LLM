@@ -8,6 +8,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -133,6 +134,13 @@ class LlamaModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            parallel_config=ParallelConfig(
+                tensor_parallel_rank=model_config.mapping.tp_rank,
+                tensor_parallel_size=model_config.mapping.tp_size,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                gpus_per_node=model_config.mapping.gpus_per_node,
+            ),
         )
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
@@ -174,6 +182,19 @@ class LlamaModel(DecoderModel):
 
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[LlamaConfig],
+    ):
+        super().__init__(LlamaModel(model_config),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=model_config.pretrained_config.vocab_size)
+
+
+@register_auto_model("MistralForCausalLM")
+class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
 
     def __init__(
         self,

@@ -48,8 +48,6 @@ struct XqaFixedParams
     int numTokensPerBlock;
     // The head size.
     int headSize;
-    // The context parallel size
-    int cpSize;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // Whether to enable multi block mode.

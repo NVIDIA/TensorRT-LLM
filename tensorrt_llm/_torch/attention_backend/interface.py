@@ -6,7 +6,6 @@ from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from typing_extensions import Self
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -100,6 +99,8 @@ class AttentionMetadata:
     # are enabled.
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
+
+    all_rank_num_tokens: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -203,7 +204,8 @@ class AttentionMetadata:
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
-                                   sub_cross_metadata: bool = False) -> Self:
+                                   sub_cross_metadata: bool = False,
+                                   max_draft_tokens: int = 0) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -219,14 +221,15 @@ class AttentionMetadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
         if not sub_cross_metadata:
-            cuda_graph_metadata.seq_lens = torch.ones((max_batch_size, ),
-                                                      dtype=torch.int)
+            cuda_graph_metadata.seq_lens = torch.ones(
+                (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.max_num_requests = max_batch_size
-        cuda_graph_metadata.max_num_tokens = max_batch_size
+        cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
+                                                               max_draft_tokens)
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -253,6 +256,10 @@ class RopeParams:
     long_m_scale: float = 1.0
     max_positions: int = 1024
     original_max_positions: int = 1024
+    beta_fast: int = 32
+    beta_slow: int = 1
+    mscale: float = 1.0
+    mscale_all_dim: float = 0.0
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -288,6 +295,10 @@ class RopeParams:
                 "high_freq_factor", 4.0)
             rope_params.original_max_positions = rope_scaling.get(
                 "original_max_position_embeddings", 1024)
+            rope_params.beta_fast = rope_scaling.get("beta_fast", 32)
+            rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
+            rope_params.mscale = rope_scaling.get("mscale", 1.0)
+            rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
 
         return rope_params
 
@@ -412,34 +423,11 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
-    @torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
-    @staticmethod
-    def dummy_forward(q: torch.Tensor, k: torch.Tensor,
-                      v: torch.Tensor) -> torch.Tensor:
-        """
-        Dummy attention forward function to estimate memory usage.
-        Args:
-            q (torch.Tensor): Query tensor with shape (1, num_q_tokens, num_heads, head_dim),.
-            k (torch.Tensor): Key tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
-            v (torch.Tensor): Value tensor with shape (1, num_new_kv_tokens, num_kv_heads, head_dim)
-        Returns:
-            torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
-        """
-        head_dim = q.shape[3]
-        assert q.dim() == 4 and q.size()[0] == 1
-        assert k.dim() == 4 and k.size()[0] == 1 and k.size()[3] == head_dim
-        assert v.dim() == 4 and v.size()[0] == 1 and v.size()[3] == head_dim
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        o = _flash_attention_forward(q,
-                                     k,
-                                     v,
-                                     attention_mask=None,
-                                     query_length=q.size(1),
-                                     is_causal=True)
-        return o.reshape(o.size(1), -1)
 
-    @dummy_forward.register_fake
-    def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        num_q_tokens = q.size()[1]
-        return torch.empty_like(q).reshape(num_q_tokens, -1)
+@dataclass(kw_only=True, unsafe_hash=True)
+class MLAParams:
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+    qk_nope_head_dim: int = 0
+    v_head_dim: int = 0

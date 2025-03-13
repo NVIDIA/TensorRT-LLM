@@ -294,7 +294,7 @@ public:
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-/// Specialization for row-major output (OperatorClass TensorOp), fp16 activation & int4 weight
+/// Specialization for row-major output (OperatorClass TensorOp), bf16 activation & int4 weight
 template <
     /// Layout type for A matrix operand
     typename LayoutA,

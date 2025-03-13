@@ -34,6 +34,7 @@
 
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
 #include "cutlass_extensions/tile_interleaved_layout.h"
+#include "cutlass_extensions/weight_only_quant_op.h"
 
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_tma_warp_specialized_traits.h"
 
@@ -55,12 +56,20 @@ using void_t = void;
 template <typename Mma, typename = void>
 struct use_dq_gemm : platform::false_type
 {
+    using LayoutScaleZero = void;
 };
 
 template <typename Mma>
 struct use_dq_gemm<Mma, void_t<typename Mma::IteratorScale>> : platform::true_type
 {
+    using LayoutScaleZero = typename Mma::IteratorScale::Layout;
 };
+
+template <typename Element>
+CUTLASS_HOST_DEVICE bool tensor_aligned(Element const* ref, int stride, int alignment)
+{
+    return (reinterpret_cast<uintptr_t>(ref) % alignment == 0) && (stride % alignment == 0);
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -142,6 +151,7 @@ public:
         ElementA* ptr_A;
         ElementB* ptr_B;
         ElementScale* weight_scales;
+        ElementScale* weight_zeros;
         ElementC* ptr_C;
         ElementC* ptr_D;
         bool C_is_broadcast;
@@ -152,6 +162,14 @@ public:
 
         // Only used by device-level operator
         GemmCoord* host_problem_sizes;
+
+        // For gather+scatter operations, default nullptr
+        int const* gather_A_indices{};
+        int const* gather_B_indices{};
+        int const* scatter_D_indices{};
+
+        // Included so we can use Gemm Universal
+        int batch_stride_D = 0;
 
         //
         // Methods
@@ -165,6 +183,7 @@ public:
             , ptr_A(nullptr)
             , ptr_B(nullptr)
             , weight_scales(nullptr)
+            , weight_zeros(nullptr)
             , ptr_C(nullptr)
             , ptr_D(nullptr)
             , total_tokens_including_expert(nullptr)
@@ -172,15 +191,20 @@ public:
             , gemm_k(0)
             , host_problem_sizes(nullptr)
             , C_is_broadcast{true}
+            , gather_A_indices(nullptr)
+            , gather_B_indices(nullptr)
+            , scatter_D_indices(nullptr)
+            , batch_stride_D(0)
         {
         }
 
         /// Ctor
         CUTLASS_HOST_DEVICE
         Arguments(int problem_count, int threadblock_count, int group_size, typename EpilogueOutputOp::Params output_op,
-            ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales, ElementC const* ptr_C,
-            bool C_is_broadcast, ElementC* ptr_D, int64_t const* total_tokens_including_expert, int64_t gemm_n,
-            int64_t gemm_k, GemmCoord* host_problem_sizes = nullptr)
+            ElementA const* ptr_A, ElementB const* ptr_B, ElementScale const* weight_scales,
+            ElementScale const* weight_zeros, ElementC const* ptr_C, bool C_is_broadcast, ElementC* ptr_D,
+            int64_t const* total_tokens_including_expert, int64_t gemm_n, int64_t gemm_k,
+            GemmCoord* host_problem_sizes = nullptr)
             : problem_count(problem_count)
             , threadblock_count(threadblock_count)
             , group_size(group_size)
@@ -188,6 +212,7 @@ public:
             , ptr_A(const_cast<ElementA*>(ptr_A))
             , ptr_B(const_cast<ElementB*>(ptr_B))
             , weight_scales(const_cast<ElementScale*>(weight_scales))
+            , weight_zeros(const_cast<ElementScale*>(weight_zeros))
             , ptr_C(const_cast<ElementC*>(ptr_C))
             , C_is_broadcast{C_is_broadcast}
             , ptr_D(ptr_D)
@@ -200,6 +225,10 @@ public:
             {
                 assert(weight_scales);
             }
+            this->gather_A_indices = nullptr;
+            this->gather_B_indices = nullptr;
+            this->scatter_D_indices = nullptr;
+            this->batch_stride_D = 0;
         }
     };
 
@@ -221,8 +250,14 @@ public:
         ElementA* ptr_A;
         ElementB* ptr_B;
         ElementScale* weight_scales;
+        ElementScale* weight_zeros;
         ElementC* ptr_C;
         ElementC* ptr_D;
+
+        // For gather+scatter operations, default nullptr.
+        int const* gather_A_indices;
+        int const* gather_B_indices;
+        int const* scatter_D_indices;
 
         //
         // Methods
@@ -233,9 +268,13 @@ public:
             : ptr_A(nullptr)
             , ptr_B(nullptr)
             , weight_scales(nullptr)
+            , weight_zeros(nullptr)
             , ptr_C(nullptr)
             , ptr_D(nullptr)
             , C_is_broadcast(true)
+            , gather_A_indices(nullptr)
+            , gather_B_indices(nullptr)
+            , scatter_D_indices(nullptr)
         {
         }
 
@@ -249,9 +288,13 @@ public:
             , ptr_A(args.ptr_A)
             , ptr_B(args.ptr_B)
             , weight_scales(args.weight_scales)
+            , weight_zeros(args.weight_zeros)
             , ptr_C(args.ptr_C)
             , ptr_D(args.ptr_D)
             , C_is_broadcast(args.C_is_broadcast)
+            , gather_A_indices(args.gather_A_indices)
+            , gather_B_indices(args.gather_B_indices)
+            , scatter_D_indices(args.scatter_D_indices)
         {
         }
 
@@ -266,9 +309,13 @@ public:
             ptr_A = args.ptr_A;
             ptr_B = args.ptr_B;
             weight_scales = args.weight_scales;
+            weight_zeros = args.weight_zeros;
             ptr_C = args.ptr_C;
             ptr_D = args.ptr_D;
             C_is_broadcast = args.C_is_broadcast;
+            gather_A_indices = args.gather_A_indices;
+            gather_B_indices = args.gather_B_indices;
+            scatter_D_indices = args.scatter_D_indices;
         }
     };
 
@@ -296,12 +343,90 @@ public:
 
     static Status can_implement(Arguments const& args)
     {
-        if (platform::is_same<uint8_t, ElementB>::value || platform::is_same<uint4b_t, ElementB>::value)
+        if constexpr (platform::is_same<uint8_t, ElementB>::value || platform::is_same<uint4b_t, ElementB>::value)
         {
             if (args.weight_scales == nullptr)
             {
                 CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - weight scales are required for uint8_t and uint4b_t");
                 return Status::kInvalid;
+            }
+            static int const kAlignmentA
+                = (platform::is_same<typename Mma::IteratorA::Layout, layout::ColumnMajorInterleaved<32>>::value) ? 32
+                : (platform::is_same<typename Mma::IteratorA::Layout, layout::ColumnMajorInterleaved<64>>::value)
+                ? 64
+                : Mma::IteratorA::AccessType::kElements;
+            static int const kAlignmentB
+                = (platform::is_same<typename Mma::IteratorB::Layout, layout::RowMajorInterleaved<32>>::value) ? 32
+                : (platform::is_same<typename Mma::IteratorB::Layout, layout::RowMajorInterleaved<64>>::value)
+                ? 64
+                : Mma::IteratorB::AccessType::kElements;
+
+            static int const kAlignmentScale = Mma::IteratorScale::AccessType::kElements;
+
+            static int const kAlignmentC = (platform::is_same<typename Epilogue::OutputTileIterator::Layout,
+                                               layout::ColumnMajorInterleaved<32>>::value)
+                ? 32
+                : (platform::is_same<typename Epilogue::OutputTileIterator::Layout,
+                      layout::ColumnMajorInterleaved<64>>::value)
+                ? 64
+                : Epilogue::OutputTileIterator::kElementsPerAccess;
+
+            if (!tensor_aligned(args.ptr_A, args.gemm_k, kAlignmentA))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+            // TODO: stride is gemm_n or gemm_n / 2 ?
+            if (!tensor_aligned(args.ptr_B, args.gemm_n, kAlignmentB))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+
+            if (!tensor_aligned(args.weight_scales, args.gemm_n, kAlignmentScale))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+
+            if (!tensor_aligned(args.weight_zeros, args.gemm_n, kAlignmentScale))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+
+            if (!tensor_aligned(args.ptr_C, args.gemm_n, kAlignmentC))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+
+            if (!tensor_aligned(args.ptr_D, args.gemm_n, kAlignmentC))
+            {
+                return Status::kErrorMisalignedOperand;
+            }
+
+            if (args.weight_scales == nullptr)
+            {
+                return Status::kErrorNotSupported;
+            }
+
+            if constexpr (hasZero(Mma::QuantOp))
+            {
+                if (args.weight_zeros == nullptr)
+                {
+                    return Status::kErrorNotSupported;
+                }
+            }
+            else
+            {
+                if (args.weight_zeros != nullptr)
+                {
+                    return Status::kErrorNotSupported;
+                }
+            }
+
+            if constexpr (isFinegrained(Mma::QuantOp))
+            {
+                if (args.group_size != 128 && args.group_size != args.gemm_k)
+                {
+                    return Status::kErrorNotSupported;
+                }
             }
         }
         else if (args.weight_scales != nullptr)
@@ -321,6 +446,7 @@ public:
             CUTLASS_TRACE_HOST("MoeFCGemm::can_implement() - gemm_n is smaller than the input alignment");
             return Status::kInvalid;
         }
+
         return Status::kSuccess;
     }
 
@@ -328,6 +454,28 @@ public:
     {
 
         return 0;
+    }
+
+    // Initializes the fine grained scale+bias iterator. Needed since the fine grained iterator
+    // has a different constructor signature than a regular cutlass iterator
+    template <typename IteratorScale, WeightOnlyQuantOp op, std::enable_if_t<isFinegrained(op), bool> = true>
+    CUTLASS_DEVICE static IteratorScale initialize_scale(typename IteratorScale::Params const& params,
+        typename IteratorScale::Pointer pointer_scale, typename IteratorScale::Pointer pointer_zero,
+        typename IteratorScale::TensorCoord extent, int thread_id,
+        typename IteratorScale::TensorCoord const& threadblock_offset, int group_size)
+    {
+
+        return IteratorScale(params, pointer_scale, pointer_zero, extent, thread_id, threadblock_offset, group_size);
+    }
+
+    template <typename IteratorScale, WeightOnlyQuantOp op, std::enable_if_t<!isFinegrained(op), bool> = true>
+    CUTLASS_DEVICE static IteratorScale initialize_scale(typename IteratorScale::Params const& params,
+        typename IteratorScale::Pointer pointer_scale, typename IteratorScale::Pointer pointer_zero,
+        typename IteratorScale::TensorCoord extent, int thread_id,
+        typename IteratorScale::TensorCoord const& threadblock_offset, int group_size)
+    {
+
+        return IteratorScale(params, pointer_scale, extent, thread_id, threadblock_offset);
     }
 
     CUTLASS_DEVICE
@@ -343,6 +491,7 @@ public:
         using LayoutB = typename Mma::IteratorB::Layout;
         using ElementC = typename Epilogue::OutputTileIterator::Element;
         using LayoutC = typename Epilogue::OutputTileIterator::Layout;
+        using LayoutScaleZero = typename use_dq_gemm<Mma>::LayoutScaleZero;
         static constexpr int kInterleave = Mma::IteratorB::Shape::kRow / Mma::Shape::kK;
         static_assert(platform::is_same<LayoutB, layout::RowMajor>::value && kInterleave == 1
                 || platform::is_same<LayoutB, layout::ColumnMajor>::value && kInterleave >= 1,
@@ -382,7 +531,13 @@ public:
             ElementB* ptr_B = reinterpret_cast<ElementB*>(byte_ptr_B);
             typename LayoutB::LongIndex ldm_B
                 = platform::is_same<layout::RowMajor, LayoutB>::value ? gemm_n : gemm_k * kInterleave;
-
+            ElementScale* ptr_Scale = use_dq_gemm<Mma>::value
+                ? params.weight_scales + problem_idx * gemm_k / params.group_size * gemm_n
+                : nullptr;
+            ElementScale* ptr_Zero = (params.weight_zeros == nullptr)
+                ? nullptr
+                : params.weight_zeros + problem_idx * gemm_k / params.group_size * gemm_n;
+            long ldm_Scale = gemm_n;
             // Compute initial location in logical coordinates
             cutlass::MatrixCoord tb_offset_A{
                 threadblock_offset.m(),
@@ -433,14 +588,14 @@ public:
             // Wait for all threads to finish their epilogue phases from the previous tile.
             __syncthreads();
 
-            // Compute threadblock-scoped matrix multiply-add
-            ElementScale* weight_scale_ptr = params.weight_scales + problem_idx * problem_size.n();
-
             if constexpr (use_dq_gemm<Mma>::value)
             {
-                const MatrixCoord scale_extent = {1, problem_size.n()};
-                typename Mma::IteratorScale iterator_scale(Mma::IteratorScale::Layout(scale_extent.column()),
-                    weight_scale_ptr, scale_extent, thread_idx, tb_offset_scale);
+                typename MatrixCoord::Index scale_row_extent = isFinegrained(Mma::QuantOp) ? gemm_k / 64 : 1;
+                typename Mma::IteratorScale iterator_scale
+                    = initialize_scale<typename Mma::IteratorScale, Mma::QuantOp>(LayoutScaleZero(ldm_Scale),
+                        reinterpret_cast<typename Mma::IteratorScale::Pointer>(ptr_Scale),
+                        reinterpret_cast<typename Mma::IteratorScale::Pointer>(ptr_Zero),
+                        {scale_row_extent, problem_size.n()}, thread_idx, tb_offset_scale, params.group_size);
 
                 mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale, accumulators);
             }
@@ -453,8 +608,9 @@ public:
             // Epilogue
             //
 
-            ElementC* ptr_C = reinterpret_cast<ElementC*>(params.ptr_C)
-                + (params.C_is_broadcast ? problem_idx : rows_to_jump) * gemm_n;
+            ElementC* ptr_C = (params.ptr_C == nullptr) ? nullptr
+                                                        : reinterpret_cast<ElementC*>(params.ptr_C)
+                    + (params.C_is_broadcast ? problem_idx : rows_to_jump) * gemm_n;
             ElementC* ptr_D = reinterpret_cast<ElementC*>(params.ptr_D) + rows_to_jump * gemm_n;
 
             // lora need to set as layout_C(gemm_n)
@@ -466,11 +622,11 @@ public:
 
             // Tile iterator loading from source tensor.
             typename Epilogue::OutputTileIterator iterator_C(
-                params_C, ptr_C, problem_size.mn(), thread_idx, threadblock_offset.mn());
+                params_C, ptr_C, problem_size.mn(), thread_idx, threadblock_offset.mn(), params.scatter_D_indices);
 
             // Tile iterator writing to destination tensor.
             typename Epilogue::OutputTileIterator iterator_D(
-                params_D, ptr_D, problem_size.mn(), thread_idx, threadblock_offset.mn());
+                params_D, ptr_D, problem_size.mn(), thread_idx, threadblock_offset.mn(), params.scatter_D_indices);
 
             Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
 
@@ -531,7 +687,16 @@ public:
             run_kernel<arch::Sm80>(params, shared_storage);
         }
 #elif (__CUDA_ARCH__ >= 900)
-        run_kernel<arch::Sm80>(params, shared_storage);
+        constexpr bool isFp8 = platform::is_same<ElementA, cutlass::float_e4m3_t>::value
+            || platform::is_same<ElementA, cutlass::float_e5m2_t>::value;
+        if constexpr (isFp8)
+        {
+            run_kernel<arch::Sm89>(params, shared_storage);
+        }
+        else
+        { // reuse sm80 kernel for other types, align with dispatchToArch
+            run_kernel<arch::Sm80>(params, shared_storage);
+        }
 #else
         static_assert(
             false, "Invalid architecture being compiled. Only Ampere+ supported in weight-only quantization kernels.");

@@ -201,7 +201,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                  pad_token="<pad>",
                  unk_token="<unk>",
                  num_image_tokens=20000,
-                 **kwargs) -> None:  # wili, fix for new tranformers
+                 **kwargs) -> None:  # wili, fix for new transformers
 
         self.do_lower_case = do_lower_case
         self.remove_space = remove_space
@@ -217,7 +217,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                                         num_image_tokens=num_image_tokens)
 
         super().__init__(
-            do_lower_case=do_lower_case,  # wili, fix for new tranformers
+            do_lower_case=do_lower_case,  # wili, fix for new transformers
             remove_space=remove_space,
             padding_side=padding_side,
             bos_token=bos_token,

@@ -390,7 +390,7 @@ void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const& params, cudaS
 
         invokeAddBiasSoftMax(biasSoftmaxParams, stream);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // correct logits based on the probs and entropy
@@ -400,7 +400,7 @@ void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const& params, cudaS
             params.posteriorAlphas, params.temperatures, params.batchSlots, params.batchSize, params.maxDecodingTokens,
             params.vocabSize, stream);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // compute probs of the corrected logits
@@ -423,7 +423,7 @@ void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const& params, cudaS
 
         invokeAddBiasSoftMax(biasSoftmaxParams, stream);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // do multinomial sampling
@@ -451,7 +451,7 @@ void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const& params, cudaS
 
         tensorrt_llm::kernels::invokeBatchAirTopPSampling<T>(samplingParams, stream);
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 }
 
