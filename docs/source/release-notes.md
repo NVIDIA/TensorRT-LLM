@@ -8,6 +8,8 @@ All published functionality in the Release Notes has been fully tested and verif
 ## TensorRT-LLM Release 0.18.0
 
 ### Key Features and Enhancements
+  - **Features that were previously available in the 0.18.0.dev pre-releases are not included in this release**.
+  - [BREAKING CHANGE] Windows platform support is discontinued in this release. All Windows-related code and functionality will be completely removed in future releases.
 
 ### API Changes
 
@@ -16,6 +18,11 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Fixed Issues
 
 ### Infrastructure Changes
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.03-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.03-py3`.
+  - The dependent TensorRT version is updated to 10.9.
+  - The dependent CUDA version is updated to 12.8.1.
+  - The dependent NVIDIA ModelOpt version is updated to 0.25 for Linux platform.
 
 
 ## TensorRT-LLM Release 0.17.0
