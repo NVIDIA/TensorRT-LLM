@@ -36,6 +36,8 @@ public:
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin) override;
     void prepare(XQAParams const& xqaParams) override;
 
+    ~DecoderXQAImplJIT() override = default;
+
 protected:
     void runWithKVLinearBuffer(
         XQAParams const& xqaParams, KVLinearBuffer const& kv_linear_buffer, cudaStream_t const& stream) override;

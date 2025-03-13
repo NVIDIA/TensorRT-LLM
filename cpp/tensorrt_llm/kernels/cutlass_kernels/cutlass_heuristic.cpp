@@ -302,13 +302,16 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
             candidate_configs.push_back(config);
         }
     }
-    // add cuda kernel profiler to tactics
-    if (tiles.size() > 0)
+    // add cuda kernel profiler to tactics for weight-only plugins
+    if (config & CutlassGemmConfig::WEIGHT_ONLY)
     {
-        CutlassGemmConfig CudaKernelConfig(
-            tiles[0], MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
-        CudaKernelConfig.enableCudaKernel = true;
-        candidate_configs.push_back(CudaKernelConfig);
+        if (tiles.size() > 0)
+        {
+            CutlassGemmConfig CudaKernelConfig(
+                tiles[0], MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
+            CudaKernelConfig.enableCudaKernel = true;
+            candidate_configs.push_back(CudaKernelConfig);
+        }
     }
     return candidate_configs;
 }
@@ -361,6 +364,15 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
                     if (cluster_n == 1)
                     {
                         base.push_back(CutlassTileConfigSM100::CtaShape128x32x128B);
+                        if ((config & CutlassGemmConfig::FP8_ONLY) != 0)
+                        {
+                            base.push_back(CutlassTileConfigSM100::CtaShape128x16x128B);
+                        }
+                    }
+
+                    if (cluster_n == 1 && cluster_m == 1 && ((config & CutlassGemmConfig::FP8_ONLY) != 0))
+                    {
+                        base.push_back(CutlassTileConfigSM100::CtaShape128x8x256B);
                     }
 
                     std::vector onesm{CutlassTileConfigSM100::CtaShape64x64x128B,
@@ -430,12 +442,15 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
             }
         }
     }
-    // add cuda kernel profiler to tactics
-    if (tiles.size() > 0)
+    // add cuda kernel profiler to tactics for weight-only plugins
+    if (config_type_param & CutlassGemmConfig::WEIGHT_ONLY)
     {
-        CutlassGemmConfig CudaKernelConfig(tiles[0], SplitKStyle::NO_SPLIT_K, 1, min_stages);
-        CudaKernelConfig.enableCudaKernel = true;
-        candidate_configs.push_back(CudaKernelConfig);
+        if (tiles.size() > 0)
+        {
+            CutlassGemmConfig CudaKernelConfig(tiles[0], SplitKStyle::NO_SPLIT_K, 1, min_stages);
+            CudaKernelConfig.enableCudaKernel = true;
+            candidate_configs.push_back(CudaKernelConfig);
+        }
     }
     return candidate_configs;
 }

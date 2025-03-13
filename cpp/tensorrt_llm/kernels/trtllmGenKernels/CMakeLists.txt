@@ -16,3 +16,5 @@
 #
 
 add_subdirectory(fmha)
+add_subdirectory(blockscaleGemm)
+add_subdirectory(fp8BlockScaleMoe)

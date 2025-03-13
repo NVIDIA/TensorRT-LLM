@@ -492,19 +492,19 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
 
     int const slot_idx = params.slot_mapping_ptr == nullptr ? sample : params.slot_mapping_ptr[sample];
     int const dt_d_idx = MAMBA_V1 ? channel : head;
-    int const bc_dim = MAMBA_V1 ? 2 * DSTATE : 2 * ngroups * DSTATE;
+    int const bc_dim = MAMBA_V1 ? 2 * DSTATE : 2 * ngroups * params.dstate;
     int const x_dim = MAMBA_V1 ? num_channels : num_channels + bc_dim;
     int const z_dim = MAMBA_V1 ? num_channels : 2 * num_channels + bc_dim + (nheads + 7) / 8 * 8;
     int const dt_dim = MAMBA_V1 ? num_channels : (z ? z_dim : z_dim - num_channels);
     int const dt_offset = MAMBA_V1 ? sample * dt_dim : sample * dt_dim + dt_dim - (nheads + 7) / 8 * 8;
     int const bc_offset = MAMBA_V1 ? sample * (bc_dim + params.dt_rank) : sample * (num_channels + bc_dim);
-    int const b_offset = MAMBA_V1 ? params.dt_rank : num_channels + DSTATE * group;
-    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : num_channels + DSTATE * (ngroups + group);
+    int const b_offset = MAMBA_V1 ? params.dt_rank : num_channels + params.dstate * group;
+    int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : num_channels + params.dstate * (ngroups + group);
 
-    input_t* my_state = &state[slot_idx * num_channels * DSTATE];
+    input_t* my_state = &state[slot_idx * num_channels * (MAMBA_V1 ? DSTATE : params.dstate)];
     input_t* my_output = &output[sample * num_channels];
 
-    int const state_loops = (DSTATE + STATE_UNROLL - 1) / STATE_UNROLL;
+    int const state_loops = ((MAMBA_V1 ? DSTATE : params.dstate) + STATE_UNROLL - 1) / STATE_UNROLL;
 
     float my_x, my_dt, my_z, my_dt_bias, out;
     my_x = toFloat(x[sample * x_dim + channel]);
@@ -561,7 +561,8 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
             {
                 rB[i] = toFloat(B[bc_offset + b_offset + i_offset + i]);
                 rC[i] = toFloat(C[bc_offset + c_offset + i_offset + i]);
-                rState[i] = toFloat(my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl]);
+                rState[i] = toFloat(
+                    my_state[(head * (MAMBA_V1 ? DSTATE : params.dstate) + i_offset + i) * head_dim + head_chl]);
             }
 #pragma unroll
             for (int i = 0; i < STATE_UNROLL; i++)
@@ -572,7 +573,9 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
                 float dBx = dB * my_x;
                 float newState = sdA + dBx;
                 // Write the new state back out to the cache
-                convertAndStore(&my_state[(head * DSTATE + i_offset + i) * head_dim + head_chl], newState);
+                convertAndStore(
+                    &my_state[(head * (MAMBA_V1 ? DSTATE : params.dstate) + i_offset + i) * head_dim + head_chl],
+                    newState);
                 out += newState * rC[i];
             }
         }
@@ -604,7 +607,7 @@ void invokeSelectiveScanUpdate(SSMParamsBase& params, cudaStream_t stream)
     TLLM_CHECK_WITH_INFO(nheads % ngroups == 0, "nheads must be divisible by ngroups");
     if (params.is_mamba2)
     {
-        TLLM_CHECK(params.dstate == 128);
+        TLLM_CHECK(params.dstate % 16 == 0);
         selective_scan_update_kernel<input_t, weight_t, 128, 128, false><<<grid, block, 0, stream>>>(params);
     }
     else

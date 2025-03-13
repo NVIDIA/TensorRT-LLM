@@ -25,6 +25,10 @@ init_ubuntu() {
     ccache \
     gdb \
     git-lfs \
+    clang \
+    lld \
+    llvm \
+    libclang-rt-dev \
     libffi-dev \
     python3-dev \
     python3-pip \
@@ -36,7 +40,7 @@ init_ubuntu() {
   fi
   apt-get clean
   rm -rf /var/lib/apt/lists/*
-  echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
+  echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
     apt-get remove --purge -y libnvinfer*
@@ -55,21 +59,24 @@ install_python_rockylinux() {
   dnf makecache --refresh
   dnf install \
     epel-release \
-	  curl \
-	  make \
-	  gcc \
-	  openssl-devel \
-	  bzip2-devel \
-	  libffi-devel \
-	  zlib-devel \
-	  xz-devel \
-	  -y
+    compiler-rt \
+    curl \
+    make \
+    gcc \
+    openssl-devel \
+    bzip2-devel \
+    llvm-toolset \
+    lld \
+    libffi-devel \
+    zlib-devel \
+    xz-devel \
+    -y
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
     LDFLAGS=-Wl,-rpath=/opt/python/${PYTHON_VERSION}/lib,--disable-new-dtags && make -j$(nproc) && make install"
   ln -s /opt/python/${PYTHON_VERSION}/bin/python3 /usr/local/bin/python
-  echo "export PATH=\$PATH:/opt/python/${PYTHON_VERSION}/bin" >> "${PYTHON_ENV_FILE}"
+  echo "export PATH=/opt/python/${PYTHON_VERSION}/bin:\$PATH" >> "${PYTHON_ENV_FILE}"
   echo "source ${PYTHON_ENV_FILE}" >> "${ENV}"
   dnf clean all
   cd .. && rm -rf /tmp/Python-${PYTHON_VERSION}
@@ -84,7 +91,7 @@ install_gcctoolset_rockylinux() {
   dnf clean all
   DEVTOOLSET_ENV_FILE="/tmp/gcctoolset_env"
   # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
-  echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
+  echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
   dnf install \
 	  vim \
 	  wget \
@@ -99,7 +106,7 @@ install_gcctoolset_rockylinux() {
 	  -y
   echo "source scl_source enable gcc-toolset-13" >> "${DEVTOOLSET_ENV_FILE}"
   echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
-  echo 'export PATH=$PATH:/usr/lib64/openmpi/bin' >> "${ENV}"
+  echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
   dnf clean all
 }
 

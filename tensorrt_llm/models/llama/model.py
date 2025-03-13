@@ -20,14 +20,15 @@ import transformers
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
-                           allgather, concat, constant, non_gated_version, recv,
-                           send, unsqueeze)
+                           allgather, concat, constant, div, non_gated_version,
+                           recv, send, unsqueeze)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
+from ...quantization.functional import fused_layernorm
 from ..convert_utils import has_safetensors
 from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -146,8 +147,15 @@ class LLaMADecoderLayer(Module):
             and default_net().plugin_config.user_buffer
             and default_net().plugin_config.pp_reduce_scatter
         ), "User buffer reduce fusion enabled with PP reduce scatter is not supported now."
+        assert not (
+            default_net().plugin_config.reduce_fusion
+            and default_net().plugin_config.norm_quant_fusion
+        ), "Reduce fusion and quant fusion can't be enabled at the same time."
         if default_net(
         ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
+            hidden_states, residual = hidden_states
+        elif default_net(
+        ).plugin_config.norm_quant_fusion and self.local_layer_idx > 0:
             hidden_states, residual = hidden_states
         else:
             residual = hidden_states
@@ -165,7 +173,7 @@ class LLaMADecoderLayer(Module):
                     ).plugin_config.gemm_plugin == "nvfp4", "UB with nvfp4 model must use nvfp4 gemm plugin"
                     reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
                 else:
-                    assert false, "UB must enabled with fp8 or nvfp4 model"
+                    assert False, "UB must enabled with fp8 or nvfp4 model"
             else:
                 reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
 
@@ -203,7 +211,6 @@ class LLaMADecoderLayer(Module):
                 norm_weight=self.post_layernorm.weight.value,
                 scale=reduce_fusion_scale,
                 eps=self.post_layernorm.eps))
-
         if use_cache:
             attention_output, presents = attention_output
 
@@ -226,20 +233,51 @@ class LLaMADecoderLayer(Module):
         else:
             if default_net().plugin_config.reduce_fusion:
                 hidden_states, residual = attention_output
+            elif default_net().plugin_config.norm_quant_fusion:
+                hidden_states, residual_attn, act_per_block_scale = fused_layernorm(
+                    input=attention_output,
+                    normalized_shape=self.config.hidden_size,
+                    residual=residual,
+                    weight=self.post_layernorm.weight.value,
+                    scale=div(
+                        1, self.mlp.fc.activation_global_scaling_factor.value)
+                    if self.mlp.fc.activation_global_scaling_factor.value else
+                    None,
+                    eps=self.post_layernorm.eps,
+                    p_dtype=self.config.dtype)
+
+                hidden_states, residual_attn = (
+                    hidden_states, act_per_block_scale), residual_attn
+                assert isinstance(hidden_states, tuple)
             else:
                 hidden_states = residual + attention_output * self.config.residual_multiplier
                 residual = hidden_states
                 hidden_states = self.post_layernorm(hidden_states)
             if next_layer_input_layernorm_args is not None:
+                #this is middle layer
                 hidden_states = self.mlp(
                     hidden_states,
                     lora_layer_params=lora_layer_params,
                     all_reduce_params=AllReduceParams(
                         fusion_op=reduce_fusion_op,
-                        residual=residual,
+                        residual=residual_attn
+                        if default_net().plugin_config.norm_quant_fusion else
+                        residual,
                         norm_weight=next_layer_input_layernorm_args[0],
                         scale=next_layer_input_layernorm_args[2],
                         eps=next_layer_input_layernorm_args[1]))
+                if default_net().plugin_config.norm_quant_fusion:
+                    hidden_states, residual, act_per_block_scale = fused_layernorm(
+                        input=hidden_states,
+                        normalized_shape=self.config.hidden_size,
+                        residual=residual_attn,
+                        weight=next_layer_input_layernorm_args[0],
+                        scale=div(1, next_layer_input_layernorm_args[2])
+                        if next_layer_input_layernorm_args[2] else None,
+                        eps=next_layer_input_layernorm_args[1],
+                        p_dtype=self.config.dtype)
+                    hidden_states = (hidden_states,
+                                     act_per_block_scale), residual
             else:
                 if default_net(
                 ).plugin_config.pp_reduce_scatter and self.is_last_local_layer and not self.mapping.is_last_pp_rank(
@@ -533,7 +571,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        if quant_config.requires_modelopt_quantization:
+        if quant_config._requires_modelopt_quantization:
             # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
@@ -547,7 +585,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        elif quant_config.requires_calibration:
+        elif quant_config._requires_calibration:
             # non-modelopt quantization flow
             from . import convert
 

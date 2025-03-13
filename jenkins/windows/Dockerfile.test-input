@@ -1,0 +1,169 @@
+ARG BASE_IMAGE=mcr.microsoft.com/windows/servercore:ltsc2022
+
+FROM ${BASE_IMAGE} AS build-input-base
+
+# Restore the default Windows shell for correct batch processing.
+# (Used for VS Build Tools installation)
+SHELL ["cmd", "/S", "/C"]
+
+# Install Visual Studio
+RUN \
+    curl -L -O https://aka.ms/vs/17/release/vs_buildtools.exe &&\
+    start /wait vs_buildtools.exe \
+        --installPath "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools" \
+        --nocache \
+        --norestart \
+        --quiet \
+        --wait \
+        --includeRecommended \
+        --add Microsoft.VisualStudio.Component.VC.CMake.Project \
+        --add Microsoft.VisualStudio.Workload.MSBuildTools \
+        --add Microsoft.VisualStudio.Workload.VCTools \
+        --remove Microsoft.VisualStudio.Component.Windows10SDK.10240 \
+        --remove Microsoft.VisualStudio.Component.Windows10SDK.10586 \
+        --remove Microsoft.VisualStudio.Component.Windows10SDK.14393 \
+        --remove Microsoft.VisualStudio.Component.Windows81SDK \
+        &&\
+    del vs_buildtools.exe &&\
+    rmdir /s /q "C:\Program Files (x86)\Common Files\Designer" &&\
+    rmdir /s /q "C:\Program Files (x86)\Common Files\Microsoft" &&\
+    rmdir /s /q "C:\Program Files (x86)\Common Files\Microsoft Shared" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft.NET" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft SDKs\ClickOnce Bootstrapper" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft SDKs\Portable" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft SDKs\Windows Kits" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\1033" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Automation" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\en" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Extensions" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\ItemTemplates" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\NewFileItems" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\NewScriptItems" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\PrivateAssemblies" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Profiles" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\ProjectTemplates" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\PublicAssemblies" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\ReferenceAssemblies" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Remote Debugger" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Script Diagnostics" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\ShellExtensions" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\SolutionTemplates" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\TestTools" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\TextTransform" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\ToolboxCaches" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\UnifiedSettings" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VS SCC" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\VSFinalizerDependencies" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\WebViewHost" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\x64" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Xml" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Packages" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\ServiceHub" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\DIA SDK" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Licenses" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Team Tools" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VB" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC#" &&\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft Visual Studio\Shared" &&\
+    rmdir /s /q "C:\ProgramData\Package Cache" &&\
+    \
+    \
+    # Moved here to remove a 6-8MB layer.
+    # RUN mkdir \workspace
+    mkdir \workspace &&\
+    \
+    \
+    # Remove and (try to) block Microsoft Edge (Browser, Update, WebView)
+    #
+    # Note: Intentionally using & instead of && so some substeps can fail.
+    rmdir /s /q "C:\Program Files (x86)\Microsoft\EdgeCore" &\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft\EdgeUpdate" &\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft\EdgeWebView" &\
+    rmdir /s /q "C:\Program Files (x86)\Microsoft\Temp" &\
+    rmdir /s /q "C:\ProgramData\Microsoft\EdgeUpdate" &\
+    \
+    mkdir "C:\ProgramData\Microsoft" &\
+    copy nul "C:\ProgramData\Microsoft\EdgeUpdate" &\
+    \
+    rmdir /s /q "C:\Program Files (x86)\Microsoft" &\
+    copy nul "C:\Program Files (x86)\Microsoft"
+
+WORKDIR /workspace
+
+ARG PYTHON_VERSION_3=3.10.11
+
+# Install Python
+RUN \
+    curl -L -O https://www.python.org/ftp/python/%PYTHON_VERSION_3%/python-%PYTHON_VERSION_3%-amd64.exe &&\
+    start /wait python-%PYTHON_VERSION_3%-amd64.exe \
+        /quiet \
+        CompileAll=0 \
+        Include_doc=0 \
+        Include_launcher=0 \
+        Include_tcltk=0 \
+        Include_test=0 \
+        InstallAllUsers=1 \
+        InstallLauncherAllUsers=0 \
+        PrependPath=1 \
+        &&\
+    mklink "C:\Program Files\Python310\python3.exe" "C:\Program Files\Python310\python.exe" &&\
+    del python-%PYTHON_VERSION_3%-amd64.exe
+
+# Install Git
+RUN \
+    curl -L -O https://github.com/git-for-windows/git/releases/download/v2.43.0.windows.1/Git-2.43.0-64-bit.exe &&\
+    start /wait Git-2.43.0-64-bit.exe /norestart /silent &&\
+    del Git-2.43.0-64-bit.exe
+
+# Install CUDA Toolkit
+#
+# This is needed by test_unittests[attention-gpt-no-cache]
+# by getCUDAVersion() in tests/utils/util.py.
+ARG CUDA_TOOLKIT_DRV_VERSION_2=571.96
+ARG CUDA_TOOLKIT_VERSION_2=12.8
+ARG CUDA_TOOLKIT_VERSION_3=12.8.0
+RUN \
+    curl -L -O https://developer.download.nvidia.com/compute/cuda/%CUDA_TOOLKIT_VERSION_3%/local_installers/cuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows.exe &&\
+    curl -L -O https://7-zip.org/a/7zr.exe &&\
+    7zr.exe x cuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows.exe -ocuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows &&\
+    start /wait cuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows\setup.exe -s \
+        nvcc_%CUDA_TOOLKIT_VERSION_2% \
+        &&\
+    setx PATH "%PATH%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v%CUDA_TOOLKIT_VERSION_2%\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v%CUDA_TOOLKIT_VERSION_2%\lib;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v%CUDA_TOOLKIT_VERSION_2%\libnvvp;" &&\
+    rmdir /s /q cuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows &&\
+    del 7zr.exe &&\
+    del cuda_%CUDA_TOOLKIT_VERSION_3%_%CUDA_TOOLKIT_DRV_VERSION_2%_windows.exe
+
+# Install TensorRT-LLM requirements
+#
+# Note that the build command does this automatically but if the build fails
+# it's useful to have the last docker "cached" result already have the
+# requirements downloaded and installed.
+RUN \
+    echo Installing requirements &&\
+    \
+    curl -L -O https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/requirements-windows.txt &&\
+    curl -L -O https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/requirements-dev-windows.txt &&\
+    pip install -r requirements-dev-windows.txt &&\
+    del requirements-dev-windows.txt &&\
+    del requirements-windows.txt &&\
+    \
+    pip cache purge
+
+# Install TensorRT
+# Install after requirements from main branch above to get this version pinned in the container
+ARG TRT_CT_VERSION_2=12.8
+ARG TRT_VERSION_3=10.8.0
+ARG TRT_VERSION_4=10.8.0.43
+RUN \
+    echo https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/%TRT_VERSION_3%/zip/TensorRT-%TRT_VERSION_4%.Windows.win10.cuda-%TRT_CT_VERSION_2%.zip &&\
+    curl -L -O https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/%TRT_VERSION_3%/zip/TensorRT-%TRT_VERSION_4%.Windows.win10.cuda-%TRT_CT_VERSION_2%.zip &&\
+    powershell Expand-Archive TensorRT-%TRT_VERSION_4%.Windows.win10.cuda-%TRT_CT_VERSION_2%.zip . &&\
+    pip install --upgrade --no-deps --force-reinstall TensorRT-%TRT_VERSION_4%\python\tensorrt-%TRT_VERSION_4%-cp310-none-win_amd64.whl &&\
+    pip cache purge &&\
+    setx PATH "%PATH%;C:\workspace\TensorRT-%TRT_VERSION_4%\lib" &&\
+    del TensorRT-%TRT_VERSION_4%.Windows.win10.cuda-%TRT_CT_VERSION_2%.zip
+
+# Clone turtle repo
+RUN \
+    git clone -b main https://gitlab-master.nvidia.com/TensorRT/Infrastructure/turtle.git turtleSingleDevice

@@ -128,24 +128,7 @@ function(process_target target_name enable_hopper enable_blackwell)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-  # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
-  # specified). This is because sm_90a has arch conditional instructions that
-  # are not forward compatible. As a result, it does not make sense to embed PTX
-  # into the binary anyway.
-  if(${enable_hopper}
-     AND ("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE))
-
-    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
-    target_compile_options(
-      ${target_name}
-      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
-
-    # Hopper kernels require cuda lib for TMA APIs
-    target_link_libraries(${target_name} PRIVATE CUDA::cuda_driver
-                                                 ${MPI_C_LIBRARIES})
-
+  if(${enable_hopper} AND "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
     target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
@@ -153,35 +136,20 @@ function(process_target target_name enable_hopper enable_blackwell)
                                PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
-  if(${enable_blackwell}
-     AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "100-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "100-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE))
-
-    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_100a.")
+  if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+                              OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
     target_compile_options(
-      ${target_name}
-      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_100a,code=sm_100a
-              -Xcicc --uumn -Xptxas -uumn>)
+      ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcicc --uumn -Xptxas
+                             -uumn>)
 
-    # No kernels should be parsed, unless blackwell is specified. This is a
-    # build time improvement
-    target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_BLACKWELL_TMA_GEMMS)
-    target_compile_definitions(${target_name}
-                               PRIVATE COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
-  endif()
-
-  if(${enable_blackwell}
-     AND ("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "120-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-          OR "120-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE))
-
-    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_120a.")
-    target_compile_options(
-      ${target_name}
-      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a
-              -Xcicc --uumn -Xptxas -uumn>)
+    if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      # No kernels should be parsed, unless blackwell is specified. This is a
+      # build time improvement
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_TMA_GEMMS)
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
   endif()
 
   # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has

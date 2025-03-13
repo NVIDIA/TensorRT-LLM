@@ -3,7 +3,6 @@ import os
 import shutil
 import sys
 import tarfile
-from pathlib import Path
 from time import time
 
 import yaml
@@ -40,7 +39,7 @@ def add_multimodal_arguments(parser):
                             'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
                             'fuyu', 'pix2struct', 'neva', 'kosmos-2',
                             'video-neva', 'phi-3-vision', 'mllama', 'internvl',
-                            'qwen2_vl', 'internlm-xcomposer2'
+                            'qwen2_vl', 'internlm-xcomposer2', 'qwen2_audio'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -76,10 +75,21 @@ def add_multimodal_arguments(parser):
         help=
         "Minimum multiply of h and w after patching for input images for qwen2_vl"
     )
+    parser.add_argument(
+        '--num_mul_bins',
+        type=int,
+        default=128,
+        help="Number of Mel frequency bins of input audios for qwen2_audio")
+    parser.add_argument(
+        '--max_mel_seq_len',
+        type=int,
+        default=3000,
+        help=
+        "Maximum Mel frequency feature lengths of input audios for qwen2_audio")
     return parser
 
 
-class VisionEngineBuilder:
+class MultimodalEngineBuilder:
 
     def __init__(self, args):
         args.device = torch.device(
@@ -87,7 +97,7 @@ class VisionEngineBuilder:
         if args.output_dir is None:
             # default path to save the engines
             model_name = args.model_path.split('/')[-1]
-            args.output_dir = f'tmp/trt_engines/{model_name}/vision_encoder'
+            args.output_dir = f'tmp/trt_engines/{model_name}/multimodal_encoder'
 
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -126,6 +136,8 @@ class VisionEngineBuilder:
             build_internvl_engine(args)
         elif args.model_type == 'qwen2_vl':
             build_qwen2_vl_engine(args)
+        elif args.model_type == 'qwen2_audio':
+            build_qwen2_audio_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -158,14 +170,21 @@ def build_trt_engine(model_type,
                      engine_dir,
                      max_batch_size,
                      dtype=torch.float16,
-                     qwen2_vl_dim=0,
-                     min_hw_dims=0,
-                     max_hw_dims=0,
-                     num_frames=None,
+                     model_params=None,
                      onnx_name='model.onnx',
                      engine_name='model.engine',
                      delete_onnx=True,
                      logger=trt.Logger(trt.Logger.INFO)):
+    """Build TensorRT engine from ONNX model.
+
+    Args:
+        model_params (dict): Optional model specific parameters, e.g.:
+            - qwen2_vl_dim (int): Dimension for Qwen2-VL model
+            - min_hw_dims (int): Minimum HW dimensions
+            - max_hw_dims (int): Maximum HW dimensions
+            - num_frames (int): Number of frames for video models
+    """
+    model_params = model_params or {}
     onnx_file = f'{onnx_dir}/{onnx_name}'
     engine_file = f'{engine_dir}/{engine_name}'
     config_file = f'{engine_dir}/config.json'
@@ -183,8 +202,9 @@ def build_trt_engine(model_type,
         "max_batch_size": max_batch_size,
         "model_name": "multiModal"
     }
-    if num_frames is not None:
-        config_args["num_frames"] = num_frames
+
+    if "num_frames" in model_params:
+        config_args["num_frames"] = model_params["num_frames"]
 
     config_wrapper = Builder().create_builder_config(**config_args)
     config = config_wrapper.trt_builder_config
@@ -197,6 +217,7 @@ def build_trt_engine(model_type,
             for error in range(parser.num_errors):
                 logger.log(trt.Logger.ERROR, parser.get_error(error))
         logger.log(trt.Logger.INFO, "Succeeded parsing %s" % onnx_file)
+
     nBS = -1
     nMinBS = 1
     nOptBS = max(nMinBS, int(max_batch_size / 2))
@@ -212,8 +233,14 @@ def build_trt_engine(model_type,
         input_images = network.get_input(0)
         inputT = network.get_input(1)
         attenstion_mask = network.get_input(2)
-        assert min_hw_dims > 0
-        assert max_hw_dims > 0
+
+        qwen2_vl_dim = model_params.get('qwen2_vl_dim', 0)
+        min_hw_dims = model_params.get('min_hw_dims', 0)
+        max_hw_dims = model_params.get('max_hw_dims', 0)
+
+        assert min_hw_dims > 0, "min_hw_dims must be positive for qwen2_vl"
+        assert max_hw_dims > 0, "max_hw_dims must be positive for qwen2_vl"
+
         multi_size_min = min_hw_dims
         multi_size_max = max_hw_dims * max_batch_size
         multi_size_opt = max(multi_size_min, int(multi_size_max / 2))
@@ -233,7 +260,32 @@ def build_trt_engine(model_type,
                           [1, multi_size_min, multi_size_min],
                           [1, multi_size_opt, multi_size_opt],
                           [1, multi_size_max, multi_size_max])
+    elif model_type == "qwen2_audio":
+        inputT = network.get_input(0)
+        mask = network.get_input(1)
 
+        num_mul_bins = model_params.get('num_mul_bins', 0)
+        max_mel_seq_len = model_params.get('max_mel_seq_len', 0)
+
+        assert num_mul_bins > 0, "num_mul_bins must be positive for qwen2_audio"
+        assert max_mel_seq_len > 0, "max_mel_seq_len must be positive for qwen2_audio"
+
+        inputT.shape = [nBS, num_mul_bins, max_mel_seq_len]
+        max_seq_len = (max_mel_seq_len - 2) // 2 + 1
+        mask.shape = [nBS, 1, max_seq_len, max_seq_len]
+
+        profile.set_shape(
+            inputT.name,
+            [nMinBS, num_mul_bins, max_mel_seq_len],
+            [nOptBS, num_mul_bins, max_mel_seq_len],
+            [nMaxBS, num_mul_bins, max_mel_seq_len],
+        )
+        profile.set_shape(
+            mask.name,
+            [nMinBS, 1, max_seq_len, max_seq_len],
+            [nOptBS, 1, max_seq_len, max_seq_len],
+            [nMaxBS, 1, max_seq_len, max_seq_len],
+        )
     else:
         if isinstance(input_sizes[0], int):
             logger.log(trt.Logger.INFO, f"Processed input sizes {input_sizes}")
@@ -865,7 +917,7 @@ def build_video_neva_engine(args):
         args.output_dir,
         args.max_batch_size,
         dtype=dtype,
-        num_frames=num_frames)
+        model_params={'num_frames': num_frames})
 
 
 def build_kosmos_engine(args):
@@ -991,17 +1043,13 @@ def build_mllama_engine(args):
     inputs = processor(images=image,
                        return_tensors="pt").to(model_dtype).to(model.device)
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    part_name = 'visual_encoder'
-    onnx_dir = f"{args.output_dir}/{part_name}/onnx"
-
     # inputs["pixel_values"]: torch.Size([1, 1, 4, 3, 448, 448])
     # inputs["aspect_ratio_ids"]: torch.Size([1, 1])
     # inputs["aspect_ratio_mask"]: torch.Size([1, 1, 4])
     export_onnx(
         wrapper,
         input=tuple([value for key, value in inputs.items()]),
-        onnx_dir=onnx_dir,
+        onnx_dir=f'{args.output_dir}/onnx',
         input_names=[key for key in inputs],
         output_names=['encoder_output'],
         dynamic_axes={key: {
@@ -1013,11 +1061,10 @@ def build_mllama_engine(args):
     build_trt_engine(
         args.model_type,
         [[list(inputs[key].shape[1:]) for _ in range(3)] for key in inputs],
-        onnx_dir,
+        f'{args.output_dir}/onnx',
         args.output_dir,
         args.max_batch_size,
         model_dtype,
-        engine_name=f"{part_name}.engine",
     )
 
 
@@ -1294,6 +1341,70 @@ def build_qwen2_vl_engine(args):
                      f'{args.output_dir}/onnx',
                      args.output_dir,
                      args.max_batch_size,
-                     qwen2_vl_dim=qwen2_vl_dim,
-                     min_hw_dims=args.min_hw_dims,
-                     max_hw_dims=args.max_hw_dims)
+                     model_params={
+                         'qwen2_vl_dim': qwen2_vl_dim,
+                         'min_hw_dims': args.min_hw_dims,
+                         'max_hw_dims': args.max_hw_dims
+                     })
+
+
+def build_qwen2_audio_engine(args):
+    from transformers import Qwen2AudioForConditionalGeneration
+
+    model = Qwen2AudioForConditionalGeneration.from_pretrained(
+        args.model_path, torch_dtype=torch.float16)
+
+    # dummy audio features, dtype is float32
+    audio = torch.randn(1,
+                        args.num_mul_bins,
+                        args.max_mel_seq_len,
+                        device=args.device)
+
+    max_seq_len = (args.max_mel_seq_len - 2) // 2 + 1
+    mask = torch.zeros((audio.size(0), 1, max_seq_len, max_seq_len),
+                       device=args.device,
+                       dtype=torch.float16)
+
+    class AudioEncoderWrapper(torch.nn.Module):
+
+        def __init__(self, audio_tower, multi_modal_projector):
+            super(AudioEncoderWrapper, self).__init__()
+            self.audio_tower = audio_tower
+            self.multi_modal_projector = multi_modal_projector
+
+        def forward(self, x, mask):
+            audio_outputs = self.audio_tower(x, attention_mask=mask)
+            selected_audio_feature = audio_outputs.last_hidden_state
+            audio_features = self.multi_modal_projector(selected_audio_feature)
+            return audio_features
+
+    wrapper = AudioEncoderWrapper(model.audio_tower,
+                                  model.multi_modal_projector)
+    wrapper.eval().to(args.device)
+    del model  # To save memory
+
+    dynamic_axes = {
+        "input": {
+            0: "batch"
+        },
+        "mask": {
+            0: "batch"
+        },
+        "output": {
+            0: "batch"
+        },
+    }
+    export_onnx(wrapper, (audio, mask),
+                f'{args.output_dir}/onnx',
+                input_names=["input", "mask"],
+                output_names=["output"],
+                dynamic_axes=dynamic_axes)
+
+    build_trt_engine(args.model_type, [],
+                     f'{args.output_dir}/onnx',
+                     args.output_dir,
+                     args.max_batch_size,
+                     model_params={
+                         'num_mul_bins': args.num_mul_bins,
+                         'max_mel_seq_len': args.max_mel_seq_len
+                     })

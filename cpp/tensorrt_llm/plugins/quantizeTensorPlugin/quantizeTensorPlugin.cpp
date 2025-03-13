@@ -134,7 +134,7 @@ int QuantizeTensorPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             stream, mProp.maxGridSize[0]);
     }
 #endif
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

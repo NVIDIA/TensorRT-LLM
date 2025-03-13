@@ -36,9 +36,8 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 from tensorrt_llm.runtime import ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.generation import _prepare_attention_mask
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from examples.bloom.convert_checkpoint import convert_hf_bloom
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../examples'))
+from bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import unittest_name_func
@@ -412,6 +411,7 @@ class TestBloom(unittest.TestCase):
         temperature = 1
         top_k = 0
         top_p = 0.0
+        random_seed = 0
         length_penalty = 1
         repetition_penalty = 1
 
@@ -459,6 +459,7 @@ class TestBloom(unittest.TestCase):
                                          temperature=temperature,
                                          top_k=top_k,
                                          top_p=top_p,
+                                         random_seed=random_seed,
                                          length_penalty=length_penalty,
                                          repetition_penalty=repetition_penalty)
         input_ids = torch.randint(100, (batch_size, seq_len)).int().cuda()

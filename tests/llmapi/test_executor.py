@@ -285,9 +285,9 @@ def test_GenerationResultBase():
         id=2,
         sampling_params=sampling_params,
     )
-    result.handle_response(create_rsp(2, finished=False))
-    result.handle_response(create_rsp(3, finished=False))
-    result.handle_response(create_rsp(4, finished=True))
+    result._handle_response(create_rsp(2, finished=False))
+    result._handle_response(create_rsp(3, finished=False))
+    result._handle_response(create_rsp(4, finished=True))
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
     assert result._done
@@ -299,8 +299,8 @@ def test_GenerationResult():
     result = GenerationResult(request)
 
     for i in range(11):
-        result.handle_response(create_rsp(i + 33, finished=False))
-    result.handle_response(create_rsp(44, finished=True))
+        result._handle_response(create_rsp(i + 33, finished=False))
+    result._handle_response(create_rsp(44, finished=True))
     assert len(result.outputs[0].token_ids) == 12
     assert result._done
 
@@ -314,9 +314,9 @@ def test_DetokenizedGenerationResultBase():
         sampling_params=sampling_params,
         tokenizer=tokenizer,
     )
-    result.handle_response(create_rsp(20, finished=False))
-    result.handle_response(create_rsp(30, finished=False))
-    result.handle_response(create_rsp(40, finished=True))
+    result._handle_response(create_rsp(20, finished=False))
+    result._handle_response(create_rsp(30, finished=False))
+    result._handle_response(create_rsp(40, finished=True))
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
     assert result._done

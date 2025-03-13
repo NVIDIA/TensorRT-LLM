@@ -555,6 +555,7 @@ class TestFalcon(unittest.TestCase):
                                          temperature=1.0,
                                          top_k=1,
                                          top_p=0.0,
+                                         random_seed=0,
                                          length_penalty=1.0,
                                          repetition_penalty=1.0)
 
