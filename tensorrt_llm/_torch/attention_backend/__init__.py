@@ -1,11 +1,12 @@
 from ..custom_op import IS_FLASHINFER_AVAIABLE
 from .interface import AttentionBackend, AttentionMetadata
-from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
 from .vanilla import VanillaAttention, VanillaAttentionMetadata
 
 __all__ = [
     "AttentionMetadata",
     "AttentionBackend",
+    "AttentionInputType",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "VanillaAttention",

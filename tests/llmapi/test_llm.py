@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import gc
 import json
 import os
@@ -18,18 +19,20 @@ from utils.util import skip_single_gpu
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, GuidedDecodingParams,
-                                 KvCacheConfig, LookaheadDecodingConfig,
-                                 MedusaDecodingConfig, NoStatsAvailable,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
+                                 GuidedDecodingParams, KvCacheConfig,
+                                 KvCacheRetentionConfig,
+                                 LookaheadDecodingConfig, MedusaDecodingConfig)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
-from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
-                                           _ParallelConfig)
+from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
+                                           QuantConfig, _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
+from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
+                                          LogitsProcessor, SamplingParams)
 
 # isort: off
 from utils.llm_data import llm_models_root
@@ -159,7 +162,8 @@ def test_llm_build_config():
 
     llm = LLM(model=llama_model_path,
               build_config=build_config,
-              kv_cache_config=global_kvcache_config)
+              kv_cache_config=global_kvcache_config,
+              fast_build=True)
     tmpdir = tempfile.TemporaryDirectory()
     llm.save(tmpdir.name)
 
@@ -176,6 +180,27 @@ def test_llm_build_config():
         assert build_config1.max_num_tokens == build_config.max_num_tokens
         assert build_config1.strongly_typed == build_config.strongly_typed
         assert build_config1.max_seq_len == build_config.max_seq_len
+
+
+def test_llm_args_invalid_usage():
+    runtime_max_batch_size = 3
+    runtime_max_num_tokens = 2
+
+    # Update build_config with warning msg if runtime arguments are passed.
+    llm_args = LlmArgs.from_kwargs(model='test-model',
+                                   max_batch_size=runtime_max_batch_size,
+                                   max_num_tokens=runtime_max_num_tokens)
+    assert llm_args.build_config.max_batch_size == runtime_max_batch_size
+    assert llm_args.build_config.max_num_tokens == runtime_max_num_tokens
+
+    # Conflict between build_config and runtime_params
+    build_config = BuildConfig(max_batch_size=5, max_num_tokens=7)
+    llm_args = LlmArgs.from_kwargs(model='test-model',
+                                   build_config=build_config,
+                                   max_batch_size=runtime_max_batch_size,
+                                   max_num_tokens=runtime_max_num_tokens)
+    assert llm_args.build_config.max_batch_size == build_config.max_batch_size
+    assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
 
 
 def test_llm_loading_from_hf():
@@ -263,16 +288,21 @@ def test_llm_with_customized_tokenizer():
         model=llama_model_path,
         # a customized tokenizer is passed to override the default one
         tokenizer=MyTokenizer.from_pretrained(llama_model_path),
-        kv_cache_config=global_kvcache_config)
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
 
     for output in llm.generate(prompts):
         print(output)
 
 
 def test_llm_without_tokenizer():
-    llm = LLM(model=llama_model_path,
-              skip_tokenizer_init=True,
-              kv_cache_config=global_kvcache_config)
+    llm = LLM(
+        model=llama_model_path,
+        skip_tokenizer_init=True,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
 
     sampling_params = SamplingParams(end_id=2, pad_id=2, max_tokens=8)
 
@@ -284,17 +314,28 @@ def test_llm_without_tokenizer():
         print(output)
 
 
+def test_llm_with_kv_cache_retention_config():
+    kv_cache_retention_config = KvCacheRetentionConfig([
+        KvCacheRetentionConfig.TokenRangeRetentionConfig(
+            0, 2, 30, datetime.timedelta(seconds=30))
+    ], 80)
+
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              fast_build=True)
+
+    for output in llm.generate(
+            prompts, kv_cache_retention_config=kv_cache_retention_config):
+        print(output)
+
+
 @pytest.mark.parametrize(
     'tokenizer_dir, threshold',
     [
         (get_model_path('gpt2'), 0.95),  # BPE
         (get_model_path('bert/bert-base-uncased'), 0.95),  # WordPiece
         (get_model_path('t5-small'), 0.95),  # SentencePiece
-        (get_model_path('opt-125m'), 0.95),
         (get_model_path('starcoder2-3b'), 0.95),
-        (get_model_path('gpt-j-6b'), 0.95),
-        (get_model_path('bloom-560m'), 0.95),
-        (get_model_path('mpt-7b'), 0.95),
         (get_model_path('falcon-7b-instruct'), 0.95),
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), 0.95),
@@ -376,6 +417,7 @@ def _test_llm_generate_async(model_name=default_model_name,
         tensor_parallel_size=tp_size,
         auto_parallel=use_auto_parallel,
         auto_parallel_world_size=world_size,
+        fast_build=True,
     )
 
     sampling_params = SamplingParams(max_tokens=6)
@@ -454,9 +496,12 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.fixture(scope="module")
 def llm_for_sampling_params() -> LLM:
+    build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
+        build_config=build_config,
         kv_cache_config=global_kvcache_config,
+        fast_build=True,
     )
     return llm
 
@@ -467,7 +512,8 @@ def test_user_specify_workspace():
     os.mkdir(user_specified_ws_path)
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
-              workspace=user_specified_ws_path)
+              workspace=user_specified_ws_path,
+              fast_build=True)
     pre_built_engine_cfg = llm.args.model / 'config.json'
     assert pre_built_engine_cfg.exists()
     del llm
@@ -492,7 +538,6 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
 
 
 @force_ampere
-@pytest.fixture(scope="module")
 @pytest.mark.parametrize(
     "sampling_params",
     [
@@ -524,6 +569,29 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert len(output.outputs) == sampling_params.n
+
+
+@force_ampere
+def test_generate_with_seed(llm_for_sampling_params: LLM):
+    prompts = ["The capital of France is"] * 10
+    # Use a high temperature and large max_tokens to increase the diversity
+    sampling_params = [
+        SamplingParams(temperature=100, top_k=100, max_tokens=100)
+        for _ in range(10)
+    ]
+    # Fix the seed for the first 5 prompts
+    for i in range(5):
+        sampling_params[i].seed = 515
+
+    llm = llm_for_sampling_params
+    generated_texts = []
+    for output in llm.generate(prompts, sampling_params):
+        generated_texts.append(output.outputs[0].text)
+    for output in llm.generate(prompts, sampling_params):
+        generated_texts.append(output.outputs[0].text)
+
+    assert len(generated_texts) == 20
+    assert len(set(generated_texts)) == 11
 
 
 @force_ampere
@@ -592,6 +660,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
         kv_cache_config=global_kvcache_config,
         build_config=build_config,
         gather_generation_logits=gather_generation_logits,
+        fast_build=True,
     )
     sampling_params = SamplingParams(
         max_tokens=8,
@@ -619,6 +688,7 @@ def test_generate_with_stop_words():
     llm = LLM(
         model=llama_model_path,
         kv_cache_config=global_kvcache_config,
+        fast_build=True,
     )
     stop_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
 
@@ -680,6 +750,7 @@ def test_generate_with_bad_words():
     llm = LLM(
         model=llama_model_path,
         kv_cache_config=global_kvcache_config,
+        fast_build=True,
     )
 
     bad_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
@@ -705,6 +776,7 @@ def test_generate_with_sampling_params_misc():
         model=llama_model_path,
         tokenizer_mode='slow',
         kv_cache_config=global_kvcache_config,
+        fast_build=True,
     )
 
     fake_end_id = llm.tokenizer.encode("N", add_special_tokens=False)[-1]
@@ -790,7 +862,7 @@ def test_invalid_embedding_bias():
     embedding_bias = torch.zeros(vocab_size_padded, dtype=torch.float16)
     embedding_bias[biased_word_id] = torch.finfo(torch.float16).max
 
-    llm = LLM(llama_model_path)
+    llm = LLM(llama_model_path, fast_build=True)
     sampling_params = SamplingParams(max_tokens=6,
                                      embedding_bias=embedding_bias)
 
@@ -812,7 +884,7 @@ def test_generate_with_embedding_bias_fp8():
                                kv_cache_quant_algo=QuantAlgo.FP8)
     assert quant_config.quant_mode.has_any_quant()
 
-    llm = LLM(llama_model_path, quant_config=quant_config)
+    llm = LLM(llama_model_path, quant_config=quant_config, fast_build=True)
 
     # FP32 embedding bias input (will be converted to FP16)
     embedding_bias = torch.zeros(vocab_size_padded)
@@ -846,7 +918,7 @@ def test_invalid_embedding_bias_fp8():
                                kv_cache_quant_algo=QuantAlgo.FP8)
     assert quant_config.quant_mode.has_any_quant()
 
-    llm = LLM(llama_model_path, quant_config=quant_config)
+    llm = LLM(llama_model_path, quant_config=quant_config, fast_build=True)
 
     # Should raise "Embedding bias tensor needs to be in CPU memory for casting"
     embedding_bias = torch.zeros(vocab_size_padded, device='cuda')
@@ -862,7 +934,7 @@ def test_invalid_embedding_bias_fp8():
     assert (0)
 
 
-class MyLogitsPostProcessor:
+class MyLogitsProcessor(LogitsProcessor):
 
     def __init__(self, biased_word_id):
         self.biased_word_id = biased_word_id
@@ -877,23 +949,55 @@ class MyLogitsPostProcessor:
 def tinyllama_logits_processor_test_harness(**llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    sampling_params = SamplingParams(max_tokens=6,
-                                     logits_post_processor_name="my_logits_pp")
+    sampling_params = SamplingParams(
+        max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
 
     llm_test_harness(
         llama_model_path,
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        logits_post_processor_map={
-            "my_logits_pp": MyLogitsPostProcessor(biased_word_id)
-        },
         **llm_kwargs)
 
 
 @force_ampere
 def test_tinyllama_logits_processor():
     tinyllama_logits_processor_test_harness()
+
+
+class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
+
+    def __init__(self, biased_word_id):
+        self.biased_word_id = biased_word_id
+
+    def __call__(self, req_ids_batch: List[int],
+                 logits_batch: List[torch.Tensor],
+                 token_ids_batch: List[List[List[int]]], stream_ptr: int,
+                 client_ids_batch: List[Optional[int]]):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for logits in logits_batch:
+                logits[:] = float("-inf")
+                logits[..., self.biased_word_id] = 0
+
+
+def tinyllama_logits_processor_batched_test_harness(**llm_kwargs):
+    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    sampling_params = SamplingParams(max_tokens=6,
+                                     apply_batched_logits_processor=True)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts, ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        batched_logits_processor=MyBatchedLogitsProcessor(biased_word_id),
+        **llm_kwargs)
+
+
+@force_ampere
+def test_tinyllama_logits_processor_batched():
+    tinyllama_logits_processor_batched_test_harness()
 
 
 def tinyllama_guided_decoding_test_harness(**llm_kwargs):
@@ -962,13 +1066,14 @@ def test_llm_api_medusa():
     build_config = BuildConfig(
         max_batch_size=1,
         max_seq_len=1024,
-        max_draft_len=63,
-        speculative_decoding_mode=SpeculativeDecodingMode.MEDUSA)
+    )
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
-                            medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+            max_draft_len=63,
+            speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
+            medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
                                             [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
@@ -976,10 +1081,10 @@ def test_llm_api_medusa():
                                              [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
       )
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
               build_config=build_config,
               kv_cache_config=kv_cache_config,
-              speculative_config=speculative_config)
+              speculative_config=speculative_config,
+              fast_build=True)
 
     outputs = llm.generate(prompts, sampling_params)
 
@@ -999,15 +1104,13 @@ def test_llm_api_medusa_tp2():
         "The future of AI is",
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-    build_config = BuildConfig(
-        max_batch_size=1,
-        max_seq_len=1024,
-        max_draft_len=63,
-        speculative_decoding_mode=SpeculativeDecodingMode.MEDUSA)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     speculative_config = MedusaDecodingConfig(num_medusa_heads=4,
+            max_draft_len=63,
+              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
                             medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
                                             [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
                                             [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
@@ -1016,13 +1119,94 @@ def test_llm_api_medusa_tp2():
                                              [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
       )
     llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
-              speculative_model=get_model_path("medusa-vicuna-7b-v1.3"),
               build_config=build_config,
               kv_cache_config=kv_cache_config,
               speculative_config=speculative_config,
-              tensor_parallel_size=2)
+              tensor_parallel_size=2,
+              fast_build=True)
 
     outputs = llm.generate(prompts, sampling_params, tensor_parallel_size=2)
+
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+def test_llm_api_eagle():
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    speculative_config = EagleDecodingConfig(
+        max_draft_len=63,
+        speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
+                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
+                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
+                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
+                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
+    )
+    llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
+              build_config=build_config,
+              kv_cache_config=kv_cache_config,
+              speculative_config=speculative_config,
+              fast_build=True)
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+@skip_single_gpu
+def test_llm_api_eagle_tp2():
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    speculative_config = EagleDecodingConfig(
+        max_draft_len=63,
+                      speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
+                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
+                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
+                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
+                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
+    )
+    llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
+              build_config=build_config,
+              kv_cache_config=kv_cache_config,
+              speculative_config=speculative_config,
+              tensor_parallel_size=2,
+              fast_build=True)
+
+    outputs = llm.generate(prompts, sampling_params)
 
     # Print the outputs.
     for output in outputs:
@@ -1093,6 +1277,7 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
               enable_lora=True,
               max_lora_rank=64,
               build_config=build_config,
+              fast_build=True,
               **llm_kwargs)
 
     prompts = [
@@ -1126,6 +1311,7 @@ def llama_7b_multi_lora_test_harness(**llm_kwargs):
               enable_lora=True,
               max_lora_rank=8,
               build_config=build_config,
+              fast_build=True,
               **llm_kwargs)
 
     prompts = [
@@ -1171,6 +1357,7 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
     llm = LLM(hf_model_dir,
               enable_prompt_adapter=True,
               max_prompt_adapter_token=8,
+              fast_build=True,
               **llm_kwargs)
 
     prompts = [
@@ -1213,7 +1400,8 @@ def test_generate_block_reuse():
     llm = LLM(model=llama_model_path,
               kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
                                             enable_block_reuse=True),
-              build_config=build_config)
+              build_config=build_config,
+              fast_build=True)
 
     sampling_params = SamplingParams(max_tokens=6)
 
@@ -1223,7 +1411,9 @@ def test_generate_block_reuse():
 
 
 def test_executor_results_cleanup():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              fast_build=True)
     sampling_params = SamplingParams(max_tokens=6)
     for i in range(20):
         llm.generate(prompts, sampling_params=sampling_params)
@@ -1244,7 +1434,8 @@ def _test_llm_trust_remote_code(trust_remote_code: bool):
                   trust_remote_code=trust_remote_code,
                   tokenizer=TransformersTokenizer.from_pretrained(
                       internlm_model_path, trust_remote_code=trust_remote_code),
-                  kv_cache_config=global_kvcache_config)
+                  kv_cache_config=global_kvcache_config,
+                  fast_build=True)
         sampling_params = SamplingParams(max_tokens=6,
                                          temperature=0.8,
                                          top_p=0.95)
@@ -1259,7 +1450,8 @@ def _test_llm_trust_remote_code(trust_remote_code: bool):
             llm = LLM(model="internlm/internlm-chat-7b",
                       trust_remote_code=trust_remote_code,
                       tokenizer="internlm/internlm-chat-7b",
-                      kv_cache_config=global_kvcache_config)
+                      kv_cache_config=global_kvcache_config,
+                      fast_build=True)
 
 
 def test_llm_build_cache():
@@ -1270,7 +1462,8 @@ def test_llm_build_cache():
     def first_run():
         llm = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config,
-                  enable_build_cache=cache_config)
+                  enable_build_cache=cache_config,
+                  fast_build=True)
         llm_check_output(llm,
                          prompts, ["D E F G H I J K"],
                          sampling_params=sampling_params)
@@ -1278,7 +1471,8 @@ def test_llm_build_cache():
     def second_run():
         llm = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config,
-                  enable_build_cache=cache_config)
+                  enable_build_cache=cache_config,
+                  fast_build=True)
         llm_check_output(llm,
                          prompts, ["D E F G H I J K"],
                          sampling_params=sampling_params)
@@ -1307,21 +1501,16 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-def test_llm_apidocs():
-    doc = LLM.__doc__
-    assert doc
-    assert doc.find('pipeline_parallel_size') != -1
-    assert doc.find('tensor_parallel_size') != -1
-    assert doc.find('auto_parallel') != -1
-
-
 def check_llm_return_context_logits(tp_size=1):
     build_config = BuildConfig(gather_context_logits=True)
 
-    llm = LLM(llama_model_path,
-              tensor_parallel_size=tp_size,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-              build_config=build_config)
+    llm = LLM(
+        llama_model_path,
+        tensor_parallel_size=tp_size,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        build_config=build_config,
+        fast_build=True,
+    )
 
     sampling_params = SamplingParams(max_tokens=8, return_context_logits=True)
 
@@ -1343,6 +1532,7 @@ def check_llm_return_generation_logits(tp_size=1):
         tensor_parallel_size=tp_size,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         gather_generation_logits=True,
+        fast_build=True,
     )
 
     sampling_params = SamplingParams(max_tokens=8,
@@ -1398,9 +1588,12 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
 def test_llm_handling_per_requeust_error():
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor3,
-              kv_cache_config=global_kvcache_config)
+    llm = LLM(
+        model=llama_model_path,
+        executor_cls=DummyExecutor3,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
     # The dummy executor will delay the responses
     sampling_params = SamplingParams(max_tokens=6)
 
@@ -1419,9 +1612,12 @@ def test_llm_handling_per_requeust_error():
 
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5063025")
 def test_llm_handling_per_requeust_error_async():
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor3,
-              kv_cache_config=global_kvcache_config)
+    llm = LLM(
+        model=llama_model_path,
+        executor_cls=DummyExecutor3,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
     # The dummy executor will delay the responses
     sampling_params = SamplingParams(max_tokens=6)
 
@@ -1444,37 +1640,119 @@ def test_llm_handling_per_requeust_error_async():
     asyncio.run(task())
 
 
-def llm_get_stats_test_harness(tp_size: int = 1):
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              fast_build=True)
-    sampling_params = SamplingParams(max_tokens=100)
+def validate_stats(pytorch_backend, results, max_tokens):
+    assert results
+    assert len(results) == max_tokens if pytorch_backend else max_tokens + 1
+    for iter, result in enumerate(results):
+        ifbStats = result["inflightBatchingStats"]
+        expected_num_scheduled = 1 if (iter < max_tokens) else 0
+        assert ifbStats["numScheduledRequests"] == expected_num_scheduled
+        if iter == 0:
+            assert ifbStats["numContextRequests"] == 1
+            assert ifbStats["numGenRequests"] == 0
+            assert result["numActiveRequests"] == 1
+        elif iter == max_tokens:
+            assert ifbStats["numContextRequests"] == 0
+            assert ifbStats["numGenRequests"] == 0
+            assert result["numActiveRequests"] == 0
+        else:
+            assert ifbStats["numContextRequests"] == 0
+            assert ifbStats["numGenRequests"] == 1
+            assert result["numActiveRequests"] == 1
+
+        #TODO: For some reason, w/o pytorch backend, numCompleted is always 0
+        # need to revisit this
+        expected_num_completed = 1 if iter == len(results) - 1 else 0
+        assert result["numCompletedRequests"] == expected_num_completed
+
+
+def llm_get_stats_test_harness(tp_size: int = 1,
+                               return_context_logits: bool = False,
+                               pytorch_backend: bool = False,
+                               use_overlap: bool = False):
+    llm_args_extra = {}
+    sampling_args_extra = {}
+    if return_context_logits:
+        llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
+        sampling_args_extra["return_context_logits"] = True
+
+    if pytorch_backend:
+        print("Use PyTorch path...")
+        from tensorrt_llm._torch import LLM as LLM_torch
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
+            enable_iter_perf_stats=True, enable_overlap_scheduler=use_overlap)
+        LLM_CLASS = LLM_torch
+    else:
+        LLM_CLASS = LLM
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    fast_build=True,
+                    **llm_args_extra)
+
+    max_tokens = 5
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **sampling_args_extra)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
 
-    while True:
-        try:
-            stats = llm._get_stats(2)
-            print(stats)
-        except NoStatsAvailable:
-            break
+    results = llm.get_stats(2)
+
+    validate_stats(pytorch_backend, results, max_tokens)
+
+    assert not llm.get_stats(2)
+
+    # test that IterationResult()._done is properly set
+    _ = llm.generate(prompts, sampling_params=sampling_params)
+    assert llm.get_stats(2)
 
 
-# The LLM._get_stats/_async is temporary APIs, and we don't plan to have a public one in the short run.
-# TODO Introduce some dedicated DS similar to executor.GenerationResult, that should be more stable
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
-def test_llm_get_stats():
-    llm_get_stats_test_harness(tp_size=1)
+@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
+                         [
+                             (True, False, False),
+                             (False, False, False),
+                             (False, True, False),
+                             (False, True, True),
+                         ])
+def test_llm_get_stats(return_context_logits, pytorch_backend, use_overlap):
+    llm_get_stats_test_harness(tp_size=1,
+                               return_context_logits=return_context_logits,
+                               pytorch_backend=pytorch_backend,
+                               use_overlap=use_overlap)
 
 
-def llm_get_stats_async_test_harness(tp_size: int = 1):
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              fast_build=True)
-    sampling_params = SamplingParams(max_tokens=6)
+def llm_get_stats_async_test_harness(tp_size: int = 1,
+                                     return_context_logits: bool = False,
+                                     pytorch_backend: bool = False,
+                                     use_overlap: bool = False):
+    llm_args_extra = {}
+    sampling_args_extra = {}
+    if return_context_logits:
+        llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
+        sampling_args_extra["return_context_logits"] = True
+
+    if pytorch_backend:
+        print("Use PyTorch path...")
+        from tensorrt_llm._torch import LLM as LLM_torch
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+        llm_args_extra["pytorch_backend_config"] = PyTorchConfig(
+            enable_iter_perf_stats=True, enable_overlap_scheduler=use_overlap)
+        LLM_CLASS = LLM_torch
+    else:
+        LLM_CLASS = LLM
+
+    llm = LLM_CLASS(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config,
+                    tensor_parallel_size=tp_size,
+                    fast_build=True,
+                    **llm_args_extra)
+
+    max_tokens = 6
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **sampling_args_extra)
 
     async def task0():
         async for output in llm.generate_async(prompts[0],
@@ -1483,22 +1761,34 @@ def llm_get_stats_async_test_harness(tp_size: int = 1):
             print(output)
 
     async def task1():
-        while True:
-            try:
-                stats = await llm._get_stats_async(2)
-                print(stats)
-            except NoStatsAvailable:
-                break
+        results = []
+        async for stats in llm.get_stats_async(timeout=2):
+            print(stats)
+            results.append(stats)
+
+        assert results
 
     async def main():
-        await asyncio.gather(task0(), task1())
+        for i in range(2):  # test recurrent usage
+            await asyncio.gather(task0(), task1())
 
     asyncio.run(main())
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
-def test_llm_get_stats_async():
-    llm_get_stats_async_test_harness(tp_size=1)
+@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
+                         [
+                             (True, False, False),
+                             (False, False, False),
+                             (False, True, False),
+                             (False, True, True),
+                         ])
+def test_llm_get_stats_async(return_context_logits, pytorch_backend,
+                             use_overlap):
+    llm_get_stats_async_test_harness(
+        tp_size=1,
+        return_context_logits=return_context_logits,
+        pytorch_backend=pytorch_backend,
+        use_overlap=use_overlap)
 
 
 def test_llm_chunked_prefill():
@@ -1514,7 +1804,8 @@ def test_llm_chunked_prefill():
         llm = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   build_config=build_config,
-                  enable_chunked_prefill=False)
+                  enable_chunked_prefill=False,
+                  fast_build=True)
 
         with pytest.raises(ValueError):
             output = llm.generate_async(
@@ -1523,10 +1814,13 @@ def test_llm_chunked_prefill():
             ).result()
 
     def success_path():
-        llm = LLM(model=llama_model_path,
-                  kv_cache_config=global_kvcache_config,
-                  build_config=build_config,
-                  enable_chunked_prefill=True)
+        llm = LLM(
+            model=llama_model_path,
+            kv_cache_config=global_kvcache_config,
+            build_config=build_config,
+            enable_chunked_prefill=True,
+            fast_build=True,
+        )
 
         output = llm.generate_async(
             "A " * build_config.max_num_tokens,
@@ -1544,6 +1838,7 @@ def _test_llm_capture_request_error(tp_size: int = 1):
     llm = LLM(
         model=llama_model_path,
         build_config=build_config,
+        fast_build=True,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
@@ -1561,6 +1856,7 @@ def test_llm_api_jupyter_scenario():
     with LLM(
             model=llama_model_path,
             kv_cache_config=global_kvcache_config,
+            fast_build=True,
     ) as llm:
 
         sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
@@ -1603,21 +1899,28 @@ def test_llm_with_postprocess_parallel():
     run_llm_with_postprocess_parallel(tp_size=1)
 
 
-def run_llm_with_postprocess_parallel_and_result_handler(tp_size: int = 1):
+def run_llm_with_postprocess_parallel_and_result_handler(
+        streaming, backend, tp_size: int = 1):
+    sampling_params = SamplingParams(max_tokens=6)
+    from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
+                                                       PostprocParams)
+    post_proc_args = PostprocArgs(tokenizer=llama_model_path)
+    post_proc_params = PostprocParams(
+        post_processor=perform_faked_oai_postprocess,
+        postproc_args=post_proc_args)
     llm = LLM(model=llama_model_path,
+              backend=backend,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               _num_postprocess_workers=2,
               _postprocess_tokenizer_dir=llama_model_path,
-              _postprocess_result_handler=perform_faked_oai_postprocess)
-    sampling_params = SamplingParams(max_tokens=6)
-
+              fast_build=True)
     golden_result = "DEFGHI"
     for i, output in enumerate(
             llm.generate_async(prompts[0],
                                sampling_params=sampling_params,
-                               streaming=True)):
-
+                               _postproc_params=post_proc_params,
+                               streaming=streaming)):
         if i < len(golden_result) - 1:
             assert golden_result[i] in output.outputs[0]._postprocess_result[-1]
         else:
@@ -1625,9 +1928,117 @@ def run_llm_with_postprocess_parallel_and_result_handler(tp_size: int = 1):
                 -2]  # EOS
 
 
-def test_llm_with_postprocess_parallel_and_result_handler():
-    run_llm_with_postprocess_parallel_and_result_handler(tp_size=1)
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("backend", [None, "pytorch"])
+def test_llm_with_postprocess_parallel_and_result_handler(streaming, backend):
+    run_llm_with_postprocess_parallel_and_result_handler(streaming,
+                                                         backend,
+                                                         tp_size=1)
+
+
+def run_llm_abort_request(llm: LLM, sampling_params: SamplingParams):
+    # to make sure LLM run slower for canceling the request to be actually performed
+    sampling_params.max_tokens = 100
+    sampling_params.end_id = -1  # let it run for a while
+
+    async def task():
+        result = llm.generate_async(prompts[0],
+                                    sampling_params=sampling_params,
+                                    streaming=True)
+        print(f"to abort")
+        result.abort()
+
+        print(f"waiting for the result")
+        # Before it actually abort, we should see some outputs
+        outputs = []
+        async for output in result:
+            print(f"get output: {output}")
+            outputs.append(output)
+        print(f"get {len(outputs)} remaining outputs")
+        print(f"outputs: {outputs}")
+        print(f"finish_reason: {outputs[-1].outputs[0].finish_reason}")
+        assert 1 <= len(
+            outputs) < 1000  # It should be aborted before the completion
+        # NOTE: known issue: only the last output is finished and got the finish_reason
+        assert outputs[-1].outputs[-1].finish_reason == "cancelled"
+
+    asyncio.run(task())
+
+
+sampling_params_for_aborting_request = [
+    SamplingParams(),
+    # n-returns
+    SamplingParams(n=2, top_k=2),
+    SamplingParams(n=2, top_k=2, best_of=3),
+    SamplingParams(n=3, use_beam_search=True),
+    SamplingParams(n=2, best_of=3, use_beam_search=True),
+]
+
+
+@force_ampere
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
+def test_llm_abort_request(llm_for_sampling_params,
+                           sampling_params: SamplingParams):
+    run_llm_abort_request(llm=llm_for_sampling_params,
+                          sampling_params=sampling_params)
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        SamplingParams()  # pytorch only supports n=1
+    ])
+def test_llm_abort_request_pytorch(sampling_params):
+    from tensorrt_llm._torch import LLM as LLM_torch
+    llm = LLM_torch(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config)
+    run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+
+
+def test_llm_sampling_params_n_lt_max_batch_size():
+    sampling_params = SamplingParams(n=2, best_of=1)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              build_config=build_config,
+              fast_build=True)
+
+    with pytest.raises(ValueError):
+        llm.generate_async(prompts[0], sampling_params=sampling_params)
+
+
+def test_llm_api_draft_target():
+    sampling_params = SamplingParams(max_tokens=4)
+
+    build_config = BuildConfig(
+        speculative_decoding_mode=SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+        max_draft_len=4,
+        max_batch_size=2,
+        max_beam_width=1,
+        max_seq_len=128,
+        max_num_tokens=64)
+
+    llm = LLM(llama_model_path,
+              build_config=build_config,
+              kv_cache_config=global_kvcache_config,
+              fast_build=True)
+
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == '__main__':
-    test_llm_capture_request_error()
+    test_llm_with_postprocess_parallel_and_result_handler(True, "pytorch")

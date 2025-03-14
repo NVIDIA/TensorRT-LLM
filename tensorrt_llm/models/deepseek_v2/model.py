@@ -113,6 +113,7 @@ class DeepseekV2DecoderLayer(Module):
                           bias=False,
                           tp_group=config.mapping.tp_group,
                           tp_size=config.mapping.tp_size,
+                          quant_mode=config.quant_mode,
                           **mlp_kwargs)
 
         # Pose layernorm in Deepseek v2 is same as Llama

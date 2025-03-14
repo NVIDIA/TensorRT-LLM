@@ -97,11 +97,6 @@ void Buffers::initBindings(pybind11::module_& m)
         .def_readwrite(
             "cache_indir_decoder_io_batched_copy_sizes", &tb::RuntimeBuffers::cacheIndirDecoderIOBatchedCopySizes)
         .def_readwrite("logits", &tb::RuntimeBuffers::logits)
-        .def_readwrite("cache_transposed_generation_logits", &tb::RuntimeBuffers::cacheTransposedGenerationLogits)
-        .def_readwrite(
-            "cache_generation_fragment_pointer_device", &tb::RuntimeBuffers::cacheGenerationFragmentPointerDevice)
-        .def_readwrite(
-            "cache_generation_fragment_pointer_host", &tb::RuntimeBuffers::cacheGenerationFragmentPointerHost)
         .def_readwrite("seq_slots", &tb::RuntimeBuffers::seqSlots)
         .def_readwrite("seq_slots_device", &tb::RuntimeBuffers::seqSlotsDevice)
         .def_readwrite("sorted_seq_slots", &tb::RuntimeBuffers::sortedSeqSlots)

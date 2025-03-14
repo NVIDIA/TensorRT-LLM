@@ -243,7 +243,7 @@ void setNameCacheIdx(std::string const& name, int id)
 }
 
 template <class ConfigType>
-std::optional<int> loadRoutingValues(nlohmann::json entry, int64_t num_experts, std::string config_name)
+std::optional<int> loadRoutingValues(nlohmann::json entry, int64_t num_experts, int64_t k, std::string config_name)
 {
     std::optional<int> routing_config;
     if (entry.is_string())
@@ -260,18 +260,17 @@ std::optional<int> loadRoutingValues(nlohmann::json entry, int64_t num_experts, 
         {
             throw std::invalid_argument("Explicit routing configurations must specify a name");
         }
-        std::vector<float> routing_values;
-        entry.get_to(routing_values);
 
-        int64_t shape = routing_values.size() / num_experts;
-        routingConfigCache.push_back(std::make_shared<ConfigType>(
-            std::move(routing_values), std::pair<int64_t, int64_t>{shape, num_experts}, config_name));
+        std::vector<typename ConfigType::ElementType> values;
+        entry.get_to(values);
+
+        routingConfigCache.push_back(std::make_shared<ConfigType>(std::move(values), num_experts, k, config_name));
         routing_config = routingConfigCache.size() - 1;
     }
 
     auto conf = routingConfigCache[*routing_config];
 
-    bool const is_supported = conf->supportsConfig(num_experts, {}, {});
+    bool const is_supported = conf->supportsConfig(num_experts, k, {});
     auto conf_derived = std::dynamic_pointer_cast<ConfigType>(conf);
     auto conf_default = std::dynamic_pointer_cast<std::conditional_t<std::is_same_v<ConfigType, VectoredRoutingConfig>,
         LoadBalancedRoutingConfig, UniformRoutingConfig>>(conf);
@@ -280,8 +279,9 @@ std::optional<int> loadRoutingValues(nlohmann::json entry, int64_t num_experts, 
     if (!is_supported || !is_valid_type)
     {
         throw std::invalid_argument("Incompatible config selected. "
-            + ((conf_derived) ? "Expected " + std::to_string(num_experts)
-                        + " experts in routing configuration. Found: " + std::to_string(conf_derived->shape.second)
+            + ((conf_derived) ? "Expected experts: " + std::to_string(num_experts) + " and k: " + std::to_string(k)
+                        + " in routing configuration. Found: " + std::to_string(conf_derived->num_experts) + " and "
+                        + std::to_string(conf_derived->k)
                               : "Found incompatible routing config type"));
     }
 
@@ -313,13 +313,20 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
 
         // WARNING: Process the routing configuration immediately, so we can guarantee all configs get processed for all
         // data types. We should not skip any test cases as a later test config may depend on this config
-        if (run_config.contains("routing_values_name"))
+        if (run_config.contains("routing_name"))
         {
-            run_config["routing_values_name"].get_to(config_name);
-            if (!run_config.contains("routing_values") && !run_config.contains("routing_distribution"))
+            run_config["routing_name"].get_to(config_name);
+            if (!run_config.contains("selected_experts") && !run_config.contains("expert_distribution"))
             {
                 throw std::invalid_argument("Setting routing value configuration name but missing routing values");
             }
+        }
+
+        if (run_config.contains("routing_values") || run_config.contains("routing_distribution"))
+        {
+            throw std::invalid_argument(
+                "Using deprecated routing_values or routing_distribution. Please use selected_experts or "
+                "expert_distribution instead.");
         }
 
         std::optional<int> routing_config;
@@ -327,7 +334,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         // We must check i is not equal since this function gets called for each data type
         if (!res.second && res.first->second.first != i)
         {
-            throw std::invalid_argument("Redefinition of routing_values_name " + config_name + " at config "
+            throw std::invalid_argument("Redefinition of routing_name " + config_name + " at config "
                 + std::to_string(i) + ". First declared at " + std::to_string(res.first->second.first));
         }
         else if (!res.second)
@@ -338,18 +345,19 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         i++;
 
         int num_experts = run_config.at("num_experts").get<int>();
+        int k = run_config.at("k").get<int>();
 
         if (!routing_config)
         {
-            if (run_config.contains("routing_values"))
+            if (run_config.contains("selected_experts"))
             {
-                routing_config
-                    = loadRoutingValues<VectoredRoutingConfig>(run_config["routing_values"], num_experts, config_name);
+                routing_config = loadRoutingValues<VectoredRoutingConfig>(
+                    run_config["selected_experts"], num_experts, k, config_name);
             }
-            else if (run_config.contains("routing_distribution"))
+            else if (run_config.contains("expert_distribution"))
             {
                 routing_config = loadRoutingValues<RandomDistributionRoutingConfig>(
-                    run_config["routing_distribution"], num_experts, config_name);
+                    run_config["expert_distribution"], num_experts, k, config_name);
             }
         }
         // Use the selected config or fall back to balanced
@@ -439,6 +447,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int ep_size = get_or("ep_size", 1);
         int world_rank = get_or("world_rank", 0);
         int bias = get_or("bias", 0);
+        int do_final_scale = get_or("do_final_scale", 1); // Default to scales on
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
 
         auto get_range = [&](std::string name, int min = 1, int max = INT32_MAX)
@@ -459,17 +468,16 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
                 if (!has_tactic_ids2)
                     t2 = t1;
 
-                benchmark->Args({num_experts,                                                      //
-                    get_range("k"),                                                                //
-                    get_range("hidden_size"),                                                      //
-                    get_range("inter_size"),                                                       //
-                    tp_size, ep_size, world_rank,                                                  //
-                    get_range("num_tokens"),                                                       //
-                    bias,                                                                          //
-                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity),          //
-                    get_range("norm_mode", 0, (int) MOEExpertScaleNormalizationMode::RENORMALIZE), //
-                    t1,                                                                            //
-                    t2,                                                                            //
+                benchmark->Args({num_experts,                                             //
+                    get_range("k"),                                                       //
+                    get_range("hidden_size"),                                             //
+                    get_range("inter_size"),                                              //
+                    tp_size, ep_size, world_rank,                                         //
+                    get_range("num_tokens"),                                              //
+                    bias, do_final_scale,                                                 //
+                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity), //
+                    t1,                                                                   //
+                    t2,                                                                   //
                     *routing_config});
             }
         }
@@ -489,7 +497,6 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     // {tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Gelu,
     // tensorrt_llm::ActivationType::Silu, tensorrt_llm::ActivationType::Geglu,
     // tensorrt_llm::ActivationType::Swiglu};
-    auto norm_mode = {MOEExpertScaleNormalizationMode::NONE};
     auto cutlass_tactic = {-1};                           // {0,..., listAllTactics<BenchClass>().size()};
     auto routing_config = {LOAD_BALANCED_ROUTING_CONFIG}; // {0, 1, 2};
 
@@ -503,12 +510,11 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
                         for (auto tokens : num_tokens)
                             for (auto bias : use_bias)
                                 for (auto act : activation_type)
-                                    for (auto norm : norm_mode)
-                                        for (auto tactic1 : cutlass_tactic)
-                                            for (auto tactic2 : cutlass_tactic)
-                                                for (auto routing : routing_config)
-                                                    benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens,
-                                                        bias, (int) act, (int) norm, tactic1, tactic2, routing});
+                                    for (auto tactic1 : cutlass_tactic)
+                                        for (auto tactic2 : cutlass_tactic)
+                                            for (auto routing : routing_config)
+                                                benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens, bias,
+                                                    (int) act, tactic1, tactic2, routing});
                     }
 }
 
@@ -531,7 +537,7 @@ void argGen(benchmark::internal::Benchmark* benchmark)
     // Generic setup
     benchmark->UseManualTime();
     benchmark->ArgNames({"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank",
-        "Num Tokens", "Use Bias", "Activation Function", "Norm Mode", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
+        "Num Tokens", "Use Bias", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
 
     if (workloadFile)
         argGenLoadFile<BenchClass>(benchmark);
@@ -601,16 +607,16 @@ void help()
            "    \"ep_size\": int, (optional)\n"
            "    \"world_rank\": int, (optional)\n"
            "    \"num_tokens\": int,\n"
-           "    \"bias\": int,\n"
+           "    \"bias\": int, (optional)\n"
+           "    \"do_final_scale\": int, (optional)\n"
            "    \"act_fn\": int,\n"
-           "    \"norm_mode\": int,\n"
            "    \"tactic_id\": tactic, (see below)\n"
            "    \"tactic_id1\": tactic, (see below)\n"
            "    \"tactic_id2\": tactic, (see below)\n"
            "    \"dtypes\": [string, ...], (optional)\n"
-           "    \"routing_values_name\": string, (optional)\n"
-           "    \"routing_values\": [float, ...], or string, (optional, length is a multiple of num_experts)\n"
-           "    \"routing_distribution\": [float, ...], or string, (optional, length is num_experts)\n"
+           "    \"routing_name\": string, (optional)\n"
+           "    \"selected_experts\": [int, ...], or string, (optional, length is a multiple of k)\n"
+           "    \"expert_distribtuion\": [float, ...], or string, (optional, length is num_experts)\n"
            "  },\n"
            "  ...\n"
            "]\n"
@@ -624,11 +630,9 @@ void help()
            "- \"world_rank\" - The world rank = tp_rank * ep_size + ep_rank\n"
            "- \"num_tokens\" - The total number of tokens to benchmark\n"
            "- \"bias\" - If bias should be used, 0 = no bias, 1 = bias\n"
-           "- \"act_fn\" - The enum value of the activation function. See\n"
-           "\"cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h\"\n"
-           "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM, 2 = SPARSE_MIXER, 3 = DEVICE_LIMITED, 4 = "
-           "DEVICE_LIMITED_RENORM. See\n"
-           "\"cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h\"\n"
+           "- \"do_final_scale\" - If final scales should be applied, 0 = no scale, 1 = scale\n"
+           "- \"act_fn\" - The activation function to use, 0 = identity, 1 = relu, 2 = gelu, 3 = silu, 4 = geglu, 5 = "
+           "swiglu\n"
            "- \"tactic_id, tactic_id1, tactic_id2\"\n"
            "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "
            "auto mode)\n"
@@ -657,18 +661,17 @@ void help()
            "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all "
            "dtypes,\n"
            "unsupported tactics will be skipped with a warning.\n"
-           "- \"routing_values_name\" - a name to help identify the routing pattern. This can be used by later "
+           "- \"routing_name\" - a name to help identify the routing pattern. This can be used by later "
            "benchmarks to reuse the config\n"
-           "- \"routing_values\" - a flat array of routing values to define a new config, or a string referencing "
-           "the name of a\n"
-           "previous config. Defaults to pre-defined config \"balanced\", which is short-hand for a perfectly balanced "
-           "expert distribution\n"
+           "- \"selected_experts\" - a flat array of selected experts to define a new config,\n or a string "
+           "referencing the name of a previous config. Defaults to pre-defined config \"balanced\",\n"
+           "which is short-hand for a perfectly balanced expert distribution\n"
            "These define the routing values used as input to the moe backend, and is intended to allow comparing "
            "different routing behaviours.\n"
-           "When defining an array, it must have `T*num_experts` floating point values. Each set of\n"
-           "`num_experts` values defines the input for a single token. If `num_tokens` is greater than `T` it will "
+           "When defining an array, it must have `T*k` floating point values. Each set of\n"
+           "`k` values defines the input for a single token. If `num_tokens` is greater than `T` it will "
            "repeat from the beginning\n"
-           "- \"routing_distribution\" - instead of explicitly setting routing_values, define a random distribution "
+           "- \"expert_distribution\" - instead of explicitly setting selected_experts, define a random distribution "
            "that experts will be randomly sampled from."
            "There is also pre-defined config \"uniform\", which is short-hand for a random uniform distribution\n"
            "\n";

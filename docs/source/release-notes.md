@@ -36,6 +36,11 @@ All published functionality in the Release Notes has been fully tested and verif
   - [BREAKING CHANGE] KV cache reuse is enabled automatically when `paged_context_fmha` is enabled.
   - Added `--concurrency` support for the `throughput` subcommand of `trtllm-bench`.
 
+### Known Issues
+  - Need `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm` due to new third-party dependencies.
+  - The PYPI SBSA wheel is incompatible with PyTorch 2.5.1 due to a break in the PyTorch ABI/API, as detailed in the related [GitHub issue](https://github.com/pytorch/pytorch/issues/144966).
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
 ### Fixed Issues
   - Fixed incorrect LoRA output dimension. Thanks for the contribution from @akhoroshev in #2484.
   - Added NVIDIA H200 GPU into the `cluster_key` for auto parallelism feature. (#2552)

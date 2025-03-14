@@ -23,14 +23,14 @@
 #include <torch/extension.h>
 #include <vector>
 
-#include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
 #include "tensorrt_llm/pybind/batch_manager/buffers.h"
+#include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
@@ -42,6 +42,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
@@ -58,6 +59,14 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_PYBIND_MODULE)
 #error "TRTLLM_PYBIND_MODULE must be defined"
 #endif
+
+namespace
+{
+tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
+{
+    return tr::SamplingConfig(configs);
+}
+} // namespace
 
 PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 {
@@ -84,6 +93,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 return session.tensorrt_llm::mpi::MpiComm::getSize();
             })
         .def_static("local_init", []() { tensorrt_llm::mpi::MpiComm::localSession(); })
+        .def_static("set_raw_mpi_session_by_fortran_handle",
+            [](int64_t fortran_handle) { tensorrt_llm::mpi::MpiComm::setRawSessionByFortran(fortran_handle); })
         .def_static("split",
             [](size_t color, size_t rank)
             {
@@ -93,7 +104,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
-    tensorrt_llm::pybind::executor::InitBindings(executor_submodule);
+    tensorrt_llm::pybind::executor::initBindings(executor_submodule);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -101,27 +112,61 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto kvCacheConfigGetState = [](tbk::KvCacheConfig const& config)
     {
         return py::make_tuple(config.maxTokens, config.maxAttentionWindowVec, config.sinkTokenLength,
-            config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm);
+            config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm, config.hostCacheSize,
+            config.onboardBlocks, config.crossKvCacheFraction, config.secondaryOffloadMinPriority,
+            config.eventBufferMaxSize, config.enablePartialReuse, config.copyOnPartialReuse);
     };
     auto kvCacheConfigSetState = [](py::tuple t)
     {
         return tbk::KvCacheConfig(t[0].cast<std::optional<SizeType32>>(),
             t[1].cast<std::optional<std::vector<SizeType32>>>(), t[2].cast<std::optional<SizeType32>>(),
-            t[3].cast<std::optional<float>>(), t[4].cast<bool>(), t[5].cast<bool>());
+            t[3].cast<std::optional<float>>(), t[4].cast<bool>(), t[5].cast<bool>(), t[6].cast<std::optional<size_t>>(),
+            t[7].cast<bool>(), t[8].cast<std::optional<float>>(), t[9].cast<std::optional<SizeType32>>(),
+            t[10].cast<size_t>(), t[11].cast<bool>(), t[12].cast<bool>());
     };
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<std::optional<SizeType32>, std::optional<std::vector<SizeType32>>, std::optional<SizeType32>,
-                 std::optional<float>, bool>(),
+                 std::optional<float>, bool, bool, std::optional<size_t>, bool, std::optional<float>,
+                 std::optional<SizeType32>, size_t, bool, bool>(),
             py::arg("max_tokens") = py::none(), py::arg("max_attention_window") = py::none(),
             py::arg("sink_token_length") = py::none(), py::arg("free_gpu_memory_fraction") = py::none(),
-            py::arg("enable_block_reuse") = false)
+            py::arg("enable_block_reuse") = false, py::arg("use_uvm") = false, py::arg("host_cache_size") = py::none(),
+            py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
+            py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0,
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true)
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindowVec)
         .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
         .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse)
+        .def_readwrite("use_uvm", &tbk::KvCacheConfig::useUvm)
+        .def_readwrite("host_cache_size", &tbk::KvCacheConfig::hostCacheSize)
+        .def_readwrite("onboard_blocks", &tbk::KvCacheConfig::onboardBlocks)
+        .def_readwrite("cross_kv_cache_fraction", &tbk::KvCacheConfig::crossKvCacheFraction)
+        .def_readwrite("secondary_offload_min_priority", &tbk::KvCacheConfig::secondaryOffloadMinPriority)
+        .def_readwrite("event_buffer_max_size", &tbk::KvCacheConfig::eventBufferMaxSize)
+        .def_readwrite("enable_partial_reuse", &tbk::KvCacheConfig::enablePartialReuse)
+        .def_readwrite("copy_on_partial_reuse", &tbk::KvCacheConfig::copyOnPartialReuse)
         .def(py::pickle(kvCacheConfigGetState, kvCacheConfigSetState))
         .def("__eq__", &tbk::KvCacheConfig::operator==);
+
+    std::optional<SizeType32> maxTokens;
+    std::optional<std::vector<SizeType32>> maxAttentionWindowVec;
+    std::optional<SizeType32> sinkTokenLength;
+    std::optional<float> freeGpuMemoryFraction;
+    bool enableBlockReuse;
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
+    bool useUvm;
+    std::optional<size_t> hostCacheSize;
+    bool onboardBlocks;
+    // Cross will use crossKvCacheFraction of KV Cache and self attention will use the rest.
+    std::optional<float> crossKvCacheFraction;
+    // The minimum priority level to allow blocks to be offloaded to secondary memory.
+    std::optional<SizeType32> secondaryOffloadMinPriority;
+    // Maximum size of the KV Cache event buffer
+    size_t eventBufferMaxSize;
+    bool enablePartialReuse;
+    bool copyOnPartialReuse;
 
     py::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -203,7 +248,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
             py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
             py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
-            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false)
+            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false, py::arg("use_fp8_block_scales") = false)
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -270,10 +315,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 std::optional<std::vector<SizeType32>> const&>(),
+                 std::optional<std::vector<SizeType32>> const&, bool>(),
             py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("context_parallelism") = 1,
             py::arg("rank") = 0, py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode,
-            py::arg("device_ids") = py::none())
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false)
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
@@ -290,12 +335,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
         .def_property_readonly("context_parallel_rank", &tr::WorldConfig::getContextParallelRank)
+        .def_property_readonly("enable_attention_dp", &tr::WorldConfig::enableAttentionDP)
         .def_static("mpi",
             py::overload_cast<SizeType32, std::optional<SizeType32>, std::optional<SizeType32>,
-                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&>(&tr::WorldConfig::mpi),
+                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&, bool>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none(), py::arg("context_parallelism") = py::none(),
-            py::arg("device_ids") = py::none());
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false);
 
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
     {
@@ -356,6 +402,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
 
+    m.def("make_sampling_config", &makeSamplingConfig, py::arg("configs"));
+
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
                  tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
@@ -389,7 +437,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CONTEXT_INIT", tb::LlmRequestState::kCONTEXT_INIT)
         .value("GENERATION_IN_PROGRESS", tb::LlmRequestState::kGENERATION_IN_PROGRESS)
         .value("GENERATION_TO_COMPLETE", tb::LlmRequestState::kGENERATION_TO_COMPLETE)
-        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE);
+        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE)
+        .value("DISAGG_GENERATION_INIT", tb::LlmRequestState::kDISAGG_GENERATION_INIT)
+        .value("DISAGG_CONTEXT_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS)
+        .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
+        .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
+        .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
+        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
     py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
         .value("V1", tb::TrtGptModelType::V1)
@@ -418,6 +472,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("enable_trt_overlap") = false, py::arg("device_ids") = std::nullopt,
             py::arg("normalize_log_probs") = true, py::arg("enable_chunked_context") = false,
             py::arg_v("peft_cache_manager_config", tb::PeftCacheManagerConfig{}, "PeftCacheManagerConfig()"))
+        .def(py::init<tensorrt_llm::executor::ExecutorConfig const&, bool>(), py::arg("executor_config"),
+            py::arg("is_leader_in_orch_mode") = false)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)
@@ -446,6 +502,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
+    tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
     tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
@@ -459,7 +516,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::init<>())
         .def_readwrite("uc_ptr", &tr::IpcNvlsHandle::uc_ptr)
         .def_readwrite("mc_ptr", &tr::IpcNvlsHandle::mc_ptr)
-        .def_readwrite("size", &tr::IpcNvlsHandle::size);
+        .def_readwrite("size", &tr::IpcNvlsHandle::size)
+        .def("get_ipc_ptrs",
+            [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);

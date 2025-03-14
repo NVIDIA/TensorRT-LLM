@@ -10,7 +10,7 @@ template = '''{{
   "world_rank": {world_rank},
   "num_tokens": {num_tokens},
   "act_fn": {act_fn},
-  "norm_mode": {norm_mode},
+  "do_final_scale": 1,
   {dtype_string}
   {routing_string}
   {tactic_string}
@@ -30,13 +30,13 @@ def make_dtype_string(dtypes=None):
 def make_routing_string(name=None, values=None, is_distribution=False):
     if values is None and name is None:
         return ""
-    values_field = "routing_distribution" if is_distribution else "routing_values"
+    values_field = "expert_distribution" if is_distribution else "selected_experts"
     if values is None:
         return f'"{values_field}": "{name}",'
 
     values = f'"{values_field}": [{",".join(map(str, values))}],'
     if name is not None:
-        values += f' "routing_values_name": "{name}",'
+        values += f' "routing_name": "{name}",'
 
     return values
 
@@ -62,7 +62,6 @@ tp_size = 4
 ep_size = 1
 world_rank = 0
 act_fn = 3
-norm_mode = 1
 dtype_string = make_dtype_string()  # All dtypes
 routing_string = make_routing_string(
     name="uniform",
@@ -83,7 +82,6 @@ for num_tokens in [1, 8, 64, 2048, 65536]:
             world_rank=world_rank,
             num_tokens=num_tokens,
             act_fn=act_fn,
-            norm_mode=norm_mode,
             dtype_string=dtype_string,
             routing_string=routing_string,
             tactic_string=make_tactic_string(tactic_id1=tactic_id1,

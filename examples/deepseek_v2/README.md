@@ -91,7 +91,7 @@ trtllm-build --checkpoint_dir ./trtllm_checkpoint_deepseek_v2_8gpu_bf16 \
 Test the engine with [run.py](../run.py) script:
 
 ```bash
-mpirun --allow-run-as-root -np 8 python ../run.py --engine_dir ./trtllm_engines/deepseek_v2/bf16/tp8-sel4096-isl2048-bs4 \
+mpirun --allow-run-as-root -n 8 python ../run.py --engine_dir ./trtllm_engines/deepseek_v2/bf16/tp8-sel4096-isl2048-bs4 \
                 --tokenizer_dir ./DeepSeek-V2 \
                 --max_output_len 40 \
                 --input_text "The president of the United States is person who"
@@ -123,7 +123,7 @@ Output [Text 0 Beam 0]: " is elected by the people of the United States to lead 
 If we want to evaluate the model summarization ability, we can use [summarize.py](../summarize.py) script:
 
 ```bash
-mpirun --allow-run-as-root -np 8 python ../summarize.py --engine_dir ./trtllm_engines/deepseek_v2/bf16/tp8-sel4096-isl2048-bs4 \
+mpirun --allow-run-as-root -n 8 python ../summarize.py --engine_dir ./trtllm_engines/deepseek_v2/bf16/tp8-sel4096-isl2048-bs4 \
                        --hf_model_dir ./DeepSeek-V2 \
                        --data_type bfloat16 \
                        --batch_size 1 \

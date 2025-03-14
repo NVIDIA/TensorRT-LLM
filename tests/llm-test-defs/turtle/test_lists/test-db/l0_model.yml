@@ -1,0 +1,152 @@
+version: 0.0.1
+l0_model:
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*a10*'
+          - '*a30*'
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+      terms:
+        stage: post_merge
+    tests:
+      - examples/test_llama.py::test_llm_llama_1gpu[llama-v2-7b-hf-disable_fp8-float16-inference-nb:1] # 5 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[blip2-opt-2.7b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 8 mins
+      - examples/test_baichuan.py::test_llm_baichuan_single_gpu_summary[v1_7b-int8-enable_gemm_plugin-enable_attention_plugin] # 6 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 10 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[blip2-opt-2.7b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:8-cpp_e2e:True-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1] # 7 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1] # 10 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[blip2-flan-t5-xl-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] # 12 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[nougat-base-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] # 6 mins
+      - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-mbart-large-50-many-to-one-mmt-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 2 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-disable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 3 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-disable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 2 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8] # 1 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8] # 1 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 2 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 2 mins
+      - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 2 mins
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          gte: 40000
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*a10*'
+          - '*a30*'
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+      - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+      - examples/test_exaone.py::test_llm_exaone_1gpu[enable_weight_only-exaone-float16-nb:1] # ? mins
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          gte: 40000
+      wildcards:
+        gpu:
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - test_unittests.py::test_unittests[model-deepseek-v2] # 1 mins
+      - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] # 4 mins
+      - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-2b-instruct]
+      - examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder2]
+      - examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
+      - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          gte: 30000
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*a10*'
+          - '*a30*'
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - examples/test_llama.py::test_llm_llama_1gpu[llama-v2-7b-hf-disable_fp8-bfloat16-summarization-nb:2]
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          lt: 30000
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*a10*'
+          - '*a30*'
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - examples/test_llama.py::test_llm_llama_1gpu[llama-v2-7b-hf-disable_fp8-bfloat16-summarization-nb:1] # 2.5 mins
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          gte: 30000
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*h100*'
+          - '*h200*'
+          - '*l40s*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - examples/test_falcon.py::test_llm_falcon_11b_1node_1gpus[enable_block_reuse-enabled-float16-nb:1] # 15 mins
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+        gpu_memory:
+          gte: 30000
+      wildcards:
+        gpu:
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins

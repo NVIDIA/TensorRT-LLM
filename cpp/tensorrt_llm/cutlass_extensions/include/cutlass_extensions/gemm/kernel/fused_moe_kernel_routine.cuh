@@ -43,18 +43,19 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const K1 = params.gemm_k;
         bool const bias_is_broadcast = params.bias_is_broadcast;
 
-        int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
+        size_t const problem_jump = problem_index;
+        size_t const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
         typename KT::ElementWeight const* ptr_fc1_gate_
-            = params.ptr_fc1 + (2 * problem_index + 1) * N1 * K1; // TODO: we only focus on gated activation..
+            = params.ptr_fc1 + (2 * problem_jump + 1) * N1 * K1; // TODO: we only focus on gated activation..
         typename KT::ElementWeight const* ptr_fc1_
-            = params.ptr_fc1 + 2 * problem_index * N1 * K1;       // TODO: we only focus on gated activation..
+            = params.ptr_fc1 + 2 * problem_jump * N1 * K1;       // TODO: we only focus on gated activation..
         typename KT::ElementInput const* ptr_bias_ = (params.ptr_bias == nullptr)
             ? nullptr
-            : (bias_is_broadcast ? params.ptr_bias + 2 * problem_index * N1 : params.ptr_bias + 2 * row_jump * N1);
+            : (bias_is_broadcast ? params.ptr_bias + 2 * problem_jump * N1 : params.ptr_bias + 2 * row_jump * N1);
         typename KT::ElementInput const* ptr_bias_gate_ = (params.ptr_bias == nullptr)
             ? nullptr
-            : (bias_is_broadcast ? params.ptr_bias + (2 * problem_index + 1) * N1
+            : (bias_is_broadcast ? params.ptr_bias + (2 * problem_jump + 1) * N1
                                  : params.ptr_bias + (2 * row_jump + 1) * N1);
         typename KT::ElementOutput* ptr_output_ = params.ptr_output + row_jump * N1;
 
@@ -464,12 +465,13 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
         int const K1 = params.gemm_k;
         bool const bias_is_broadcast = params.bias_is_broadcast;
 
-        int const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
+        size_t const problem_jump = problem_index;
+        size_t const row_jump = ((problem_index == 0) ? 0 : params.total_tokens_including_expert[problem_index - 1]);
         typename KT::ElementInput const* ptr_input_ = params.ptr_input + row_jump * K1;
-        typename KT::ElementWeight const* ptr_fc1_ = params.ptr_fc1 + problem_index * N1 * K1;
+        typename KT::ElementWeight const* ptr_fc1_ = params.ptr_fc1 + problem_jump * N1 * K1;
         typename KT::ElementInput const* ptr_bias_ = (params.ptr_bias == nullptr)
             ? nullptr
-            : (bias_is_broadcast ? params.ptr_bias + problem_index * N1 : params.ptr_bias + row_jump * N1);
+            : (bias_is_broadcast ? params.ptr_bias + problem_jump * N1 : params.ptr_bias + row_jump * N1);
         typename KT::ElementOutput* ptr_output_ = params.ptr_output + row_jump * N1;
 
         cute::Tensor mInput_mk

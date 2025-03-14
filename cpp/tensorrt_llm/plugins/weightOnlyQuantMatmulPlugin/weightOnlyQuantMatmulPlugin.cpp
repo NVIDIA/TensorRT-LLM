@@ -48,14 +48,26 @@ void WeightOnlyQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 
     int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
 
-    if (mWeightTypeId == WeightTypeId::INT8)
+    if (tactic.enableCudaKernel)
     {
-        mRunner->gemm(actPtr, weightPtr, scalesPtr, outputPtr, m, originalN, k, tactic, workspacePtr, wsSize, stream);
+        // run CUDA kernel
+        tensorrt_llm::kernels::weight_only::Params params{actPtr, nullptr, weightPtr, scalesPtr, nullptr, nullptr,
+            outputPtr, 1.f, m, originalN, k, 0, mCudaKernelType};
+        tensorrt_llm::kernels::weight_only::kernel_launcher(mArch, params, stream);
     }
     else
     {
-        mRunner->gemm(actPtr, reinterpret_cast<cutlass::uint4b_t*>(weightPtr), scalesPtr, outputPtr, m, originalN, k,
-            tactic, workspacePtr, wsSize, stream);
+        // run CUTLASS kernel
+        if (mWeightTypeId == WeightTypeId::INT8)
+        {
+            mRunner->gemm(
+                actPtr, weightPtr, scalesPtr, outputPtr, m, originalN, k, tactic, workspacePtr, wsSize, stream);
+        }
+        else
+        {
+            mRunner->gemm(actPtr, reinterpret_cast<cutlass::uint4b_t*>(weightPtr), scalesPtr, outputPtr, m, originalN,
+                k, tactic, workspacePtr, wsSize, stream);
+        }
     }
 }
 
@@ -77,6 +89,16 @@ std::vector<WeightOnlyQuantGemmPluginProfiler::Config> WeightOnlyQuantGemmPlugin
     int m, int n, int k) const
 {
     return mRunner->getConfigs();
+}
+
+bool WeightOnlyQuantGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& tactic) const
+{
+    // stop to profile Cuda kernel for m >= 16
+    if (tactic.enableCudaKernel)
+    {
+        return m < 16;
+    }
+    return true;
 }
 
 WeightOnlyQuantMatmulPlugin::WeightOnlyQuantMatmulPlugin(nvinfer1::DataType type, WeightTypeId weightTypeId,
@@ -171,7 +193,10 @@ void WeightOnlyQuantMatmulPlugin::init(nvinfer1::DataType type, WeightTypeId wei
     }
 
     mPluginProfiler->setWeightTypeId(mWeightTypeId);
-
+    if (mCudaKernelEnabled)
+    {
+        mPluginProfiler->setCudaKernelType(mCudaKernelType, mArch);
+    }
     mGemmId = GemmIdCore(mDims.n, mDims.k, mType);
 }
 
@@ -184,7 +209,7 @@ nvinfer1::IPluginV2DynamicExt* WeightOnlyQuantMatmulPlugin::clone() const noexce
 
 void WeightOnlyQuantMatmulPlugin::configGemm()
 {
-    mPluginProfiler->profileTactics(m_weightOnlyGemmRunner, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(m_weightOnlyGemmRunner, mType, mDims, mGemmId, mCudaKernelEnabled);
 }
 
 nvinfer1::DimsExprs WeightOnlyQuantMatmulPlugin::getOutputDimensions(
@@ -303,7 +328,6 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     if (m == 0)
         return 0;
 
-    bool const use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
 #if defined(ENABLE_BF16)
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16,
         "No valid weightOnlyQuantMatmul configuration");
@@ -311,6 +335,15 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     TLLM_CHECK_WITH_INFO(mType == nvinfer1::DataType::kHALF, "No valid weightOnlyQuantMatmul configuration");
 #endif
     int real_n = mWeightTypeId == WeightTypeId::INT4 ? n * INT8_INT4_RATIO : n;
+
+    // get best tactic and check if CUDA kernel should be used
+    bool use_cuda_kernel = false;
+    auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+    TLLM_CHECK_WITH_INFO(bestTactic,
+        "No valid weight only per-channel GEMM tactic(It is usually caused by the failure to execute all candidate "
+        "configurations of the CUTLASS kernel, please pay attention to the warning information when building the "
+        "engine.)");
+    use_cuda_kernel = bestTactic->enableCudaKernel;
     if (use_cuda_kernel)
     {
         void const* cuda_kernel_act_ptr = inputs[0];
@@ -324,12 +357,6 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     else
     {
         int const ws_size = m_weightOnlyGemmRunner->getWorkspaceSize(m, real_n, k);
-
-        auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-        TLLM_CHECK_WITH_INFO(bestTactic,
-            "No valid weight only per-channel GEMM tactic(It is usually caused by the failure to execute all candidate "
-            "configurations of the CUTLASS kernel, please pay attention to the warning information when building the "
-            "engine.)");
 
         m_weightOnlyGemmRunner->gemm(inputs[0], inputs[1], inputs[2], outputs[0], m, real_n, k, *bestTactic,
             reinterpret_cast<char*>(workspace), ws_size, stream);
@@ -402,8 +429,8 @@ WeightOnlyQuantMatmulPluginCreator::WeightOnlyQuantMatmulPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("weight_type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("weight_type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

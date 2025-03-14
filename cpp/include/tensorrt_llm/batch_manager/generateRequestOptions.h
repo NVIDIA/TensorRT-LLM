@@ -18,21 +18,21 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
-#include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::batch_manager
 {
+class RuntimeBuffers;
+class DecoderInputBuffers;
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
 
 class GenerateRequestOptions : Algorithm
 {
@@ -42,6 +42,9 @@ public:
     using SizeType32 = tr::SizeType32;
     using ITensor = tr::ITensor;
     using TensorPtr = tr::ITensor::SharedPtr;
+    using BufferManager = tr::BufferManager;
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
     GenerateRequestOptions(bool speculativeDecodingFastLogits, bool isLeaderInOrchMode, bool isNormalizeLogProbs)
         : mSpeculativeDecodingFastLogits(speculativeDecodingFastLogits)
@@ -50,22 +53,20 @@ public:
     {
     }
 
-    std::tuple<std::vector<SizeType32>, std::vector<tr::decoder_batch::Request>, std::vector<tr::SamplingConfig>>
-    operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
-        executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime,
-        RequestVector const& contextRequests, RuntimeBuffers& buffers, TensorPtr& decoderInputsIds) const;
+    std::tuple<ITensor::SharedPtr, std::vector<tr::decoder_batch::Request>, std::vector<tr::SamplingConfig>> operator()(
+        tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
+        executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
+        BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
+        OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
 
 private:
-    std::shared_ptr<runtime::ITensor> retrieveDraftLogits(tr::ModelConfig const& modelConfig,
-        tr::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> tensor,
-        runtime::TllmRuntime const& runtime) const;
+    [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(tr::ModelConfig const& modelConfig,
+        tr::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
+        BufferManager const& bufferManager) const;
 
     /// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
     /// to the appropriate type if the input tensor does not match it.
-    TensorPtr getEmbeddingBias(runtime::TllmRuntime const& runtime, TensorPtr const& tensor) const;
-
-    std::optional<TensorPtr> targetModelReceiveLogits(
-        executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::TllmRuntime const& runtime) const;
+    [[nodiscard]] TensorPtr getEmbeddingBias(nvinfer1::DataType logitsType, TensorPtr const& tensor) const;
 
     bool mSpeculativeDecodingFastLogits;
     bool mIsLeaderInOrchMode;

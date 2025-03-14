@@ -33,12 +33,6 @@ parameters: {
 
 If you are writing your own application using Executor API, you can enable kv cache reuse by including `enableBlockReuse=true` when you create the `KvCacheConfig` object. Note that this is the default, if you wish to disable kv cache reuse, pass `enableBlockReuse=false` instead.
 
-GptManager API has been deprecated, but if you have an old application that is using GptManager API, you can enable or disable kv cache reuse with an optional parameter:
-
-* `TrtGptModelOptionalParams` class encapsulates the following fields:
-  - `kvCacheConfig`
-    - `enableBlockReuse` (default: `true`) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.
-
 GptSession is scheduled to be obsoleted and does not support kv cache reuse.
 
 ### Enable kv cache reuse for p-tuning
@@ -46,7 +40,7 @@ GptSession is scheduled to be obsoleted and does not support kv cache reuse.
 When using p-tuning, different requests may use same fake input ids (i.e. prompt ids whose values are larger than vocabulary size). That may lead to incorrect kv cache reuse, since TRT-LLM could not distinguish these requests only by input ids. To enable kv cache reuse for p-tuning correctly, users should provide an extra id (uint64) for each input id. Extra ids for normal input ids (i.e. text token ids) should always be 0, while fake input ids should have extra ids which are larger than 0. Requests using same prompt embeddings should use same extra ids, while requests using different prompt embeddings should use different extra ids.
 
 Example:
-Assume vocaburlay size is 100, which means normal text token ids are in range [0, 99] and prompt ids start from 100.
+Assume vocabulary size is 100, which means normal text token ids are in range [0, 99] and prompt ids start from 100.
 
 ```python
 # Request 1 uses prompt embedding table 1
@@ -100,11 +94,5 @@ parameters: {
 ```
 
 If you are writing your own application using Executor API, you can enable offloading to host by including `hostCacheSize=45000000000` when you create the `KvCacheConfig` object. This will create a 45 GiB offloading buffer in host memory.
-
-GptManager API has been deprecated, but if you have an existing application that is using GptManager API, you can enable offloading with an optional parameter:
-
-* `TrtGptModelOptionalParams` class encapsulates the following fields:
-  - `kvCacheConfig`
-    - `hostCacheSize` (default: `0`) size in bytes of host buffer used to offload kv cache pages upon eviction from gpu memory.
 
 GptSession is scheduled to be obsoleted and does not support kv cache block offloading.

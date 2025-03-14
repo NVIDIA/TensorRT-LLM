@@ -1,0 +1,12 @@
+diff --git a/__init__.py b/__init__.py
+index d1d4333..ec6c158 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -1104,6 +1104,8 @@ class StreamHandler(Handler):
+             self.flush()
+         except RecursionError:  # See issue 36272
+             raise
++        except ValueError:
++            pass
+         except Exception:
+             self.handleError(record)

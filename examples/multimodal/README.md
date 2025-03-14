@@ -139,12 +139,12 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
 3. Build TensorRT engines for vision encoders
 
     ```bash
-    python build_visual_engine.py --model_type blip2 --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/vision --max_batch_size 8
+    python build_multimodal_engine.py --model_type blip2 --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/vision --max_batch_size 8
     ```
 
     The built engines are located in `tmp/trt_engines/${MODEL_NAME}/bfloat16/vision` for BLIP2-T5, similarly for BLIP-OPT.
 
-    To run the BLIP2 pipeline with batch size > 1, change `--max_batch_size` argument to `build_visual_engine.py` accordingly.
+    To run the BLIP2 pipeline with batch size > 1, change `--max_batch_size` argument to `build_multimodal_engine.py` accordingly.
 
 4. Assemble everything into BLIP2 pipeline
 
@@ -235,7 +235,7 @@ Currently, CogVLM only support bfloat16 precision.
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
 
     ```bash
-    python build_visual_engine.py --model_type cogvlm --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 48 --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/vision
+    python build_multimodal_engine.py --model_type cogvlm --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 48 --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/vision
 
     python run.py \
     --max_new_tokens 1000 \
@@ -293,12 +293,12 @@ Currently, CogVLM only support bfloat16 precision.
 3. Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_type pix2struct --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8 --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/vision
+    python build_multimodal_engine.py --model_type pix2struct --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8 --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/vision
     ```
 
     The built visual engines are located in `tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/vision`.
 
-    To run the deplot pipeline with batch size > 1, change `--max_batch_size` argument to `build_visual_engine.py` accordingly.
+    To run the deplot pipeline with batch size > 1, change `--max_batch_size` argument to `build_multimodal_engine.py` accordingly.
 
 4. Assemble everything into deplot pipeline
 
@@ -342,7 +342,7 @@ Currently, CogVLM only support bfloat16 precision.
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
 
     ```bash
-    python build_visual_engine.py --model_type fuyu --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    python build_multimodal_engine.py --model_type fuyu --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
 
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -384,7 +384,7 @@ Firstly, please install transformers with 4.45.2
         --max_batch_size 48 \
         --max_multimodal_len 58800 # 58800 = 1225(visual token/img) * 48 (max_batch_size), as each image corresponds to 1225 visual tokens in the ViT here
 
-    python build_visual_engine.py \
+    python build_multimodal_engine.py \
         --model_type internlm-xcomposer2 \
         --model_path tmp/hf_models/${MODEL_NAME} \
         --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu/vision \
@@ -450,7 +450,7 @@ Firstly, please install transformers with 4.37.2
 
 4. Generate TensorRT engines for visual components and combine everything into final pipeline.
     ```bash
-    python build_visual_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    python build_multimodal_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
@@ -476,7 +476,7 @@ Firstly, please install transformers with 4.37.2
         --qformat int8_sq
    ```
 
-   Then follow the same `trtllm-build`, `build_visual_engine.py` and `run.py` steps as before.
+   Then follow the same `trtllm-build`, `build_multimodal_engine.py` and `run.py` steps as before.
 
 
 ## Kosmos-2
@@ -510,7 +510,7 @@ Firstly, please install transformers with 4.37.2
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
 
     ```bash
-    python build_visual_engine.py --model_type kosmos-2 --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    python build_multimodal_engine.py --model_type kosmos-2 --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
 
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -622,13 +622,13 @@ Firstly, please install transformers with 4.37.2
 3. Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava # for LLaVA
+    python build_multimodal_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava # for LLaVA
 
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava_next --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+    python build_multimodal_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava_next --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
 
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava_onevision --max_batch_size 32 # max_batch_size * patch for image or frame for video # for LLaVA-OneVision
+    python build_multimodal_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type llava_onevision --max_batch_size 32 # max_batch_size * patch for image or frame for video # for LLaVA-OneVision
 
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type vila --vila_path ${VILA_PATH} # for VILA
+    python build_multimodal_engine.py --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
 
     ```bash
@@ -737,7 +737,7 @@ For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llam
 * build engine of vision encoder model
 
 ```bash
-python examples/multimodal/build_visual_engine.py --model_type mllama \
+python examples/multimodal/build_multimodal_engine.py --model_type mllama \
                                                   --model_path Llama-3.2-11B-Vision/ \
                                                   --output_dir /tmp/mllama/trt_engines/vision/
 ```
@@ -766,7 +766,6 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 ```bash
 python3 examples/multimodal/run.py --engine_dir /tmp/mllama/trt_engines/ \
-                                   --visual_engine_name visual_encoder.engine \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
                                    --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
@@ -776,7 +775,6 @@ python3 examples/multimodal/run.py --engine_dir /tmp/mllama/trt_engines/ \
 Use model_runner_cpp by default. To switch to model_runner, set `--session python` in the command mentioned above.
 
 python3 examples/multimodal/eval.py \
-                                   --visual_engine_name visual_encoder.engine \
                                    --engine_dir /tmp/mllama/trt_engines/ \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --test_trtllm \
@@ -813,7 +811,6 @@ trtllm-build --checkpoint_dir /tmp/llama-3.2-11B-Vision/fp8/ \
 # copy visiual engine directory `/tmp/mllama/trt_engines/vision/` to fp8 engine directory `/tmp/trt_engines/llama-3.2-11B-Vision/fp8/vision`
 
 python3 examples/multimodal/run.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
-                                   --visual_engine_name visual_encoder.engine \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
                                    --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
@@ -821,7 +818,6 @@ python3 examples/multimodal/run.py --engine_dir /tmp/trt_engines/llama-3.2-11B-V
                                    --batch_size 2
 
 python3 examples/multimodal/eval.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
-                                   --visual_engine_name visual_encoder.engine \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --test_trtllm \
                                    --accuracy_threshold 65 \
@@ -867,7 +863,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 2. Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_path ./${MODEL_NAME}.nemo --model_type neva --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/vision
+    python build_multimodal_engine.py --model_path ./${MODEL_NAME}.nemo --model_type neva --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/vision
     ```
 
     ```bash
@@ -922,7 +918,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
 
     ```bash
-    python build_visual_engine.py --model_type nougat --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/vision
+    python build_multimodal_engine.py --model_type nougat --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/vision
 
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -962,7 +958,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
 
     ```bash
-    python build_visual_engine.py --model_type phi-3-vision --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    python build_multimodal_engine.py --model_type phi-3-vision --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
 
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
@@ -976,15 +972,20 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 Firstly, please install transformers and qwen-vl-utils
 ```bash
-    pip install -r requirements-qwen2vl.txt
+pip install -r requirements-qwen2vl.txt
 ```
-1. Download Huggingface weights
+### Support data types <!-- omit from toc -->
+  * FP16
+  * FP8
+
+### Build and run vision model <!-- omit from toc -->
+* Download Huggingface weights
     ```bash
     export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-2B-Instruct
     git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
+* Build engine of decoder model
 
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/qwen`.
     ```bash
     python3 ../qwen/convert_checkpoint.py \
         --model_dir=tmp/hf_models/${MODEL_NAME} \
@@ -996,19 +997,49 @@ Firstly, please install transformers and qwen-vl-utils
         --gemm_plugin=float16 \
         --gpt_attention_plugin=float16 \
         --max_batch_size=4 \
-        --max_input_len=2048 --max_seq_len=3072 \
+        --max_input_len=2048 \
+        --max_seq_len=3072 \
         --max_multimodal_len=1296 #(max_batch_size) * 324 (num_visual_features), this's for image_shape=[504,504]
     ```
 
-3. Generate TensorRT engines for visual components and combine everything into final pipeline.
+* Build engine of vision encoder model
     ```bash
-    python build_visual_engine.py --model_type qwen2_vl --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    python build_multimodal_engine.py --model_type qwen2_vl --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
+    ```
 
+* Run test on multimodal/run.py with C++ runtime (LLM part only)
+    ```bash
     python3 run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/
     ```
+### Run Qwen2-VL decoder part by FP8 <!-- omit from toc -->
+* Build engine
+    ```bash
+    python ./examples/quantization/quantize.py \
+    --model_dir tmp/hf_models/${MODEL_NAME} \
+    --dtype float16 \
+    --qformat fp8 \
+    --kv_cache_dtype fp8 \
+    --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
+    --calib_size 512
 
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
+    --output_dir tmp/trt_engines/${MODEL_NAME}/fp8/1-gpu/llm \
+    --max_input_len=2048 \
+    --max_seq_len 3072 \
+    --gemm_plugin auto \
+    --max_batch_size 4 \
+    --max_multimodal_len=1296
+
+    # copy visiual engine directory `tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision/` to fp8 engine directory `tmp/trt_engines/${MODEL_NAME}/fp8/1-gpu/vision`
+    ```
+* Run test on multimodal/run.py with C++ runtime (LLM part only)
+    ```bash
+    python3 run.py \
+    --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+    --engine_dir tmp/trt_engines/${MODEL_NAME}/fp8/1-gpu/
+    ```
 ## Video NeVA
 
 [Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
@@ -1040,7 +1071,7 @@ Firstly, please install transformers and qwen-vl-utils
 2. Build TensorRT engines for visual components
 
     ```bash
-    python build_visual_engine.py --model_path /path/to/video/neva/projector.nemo --model_type video-neva --output_dir tmp/trt_engines/nemotron-3/visual_encoder --output_dir tmp/trt_engines/nemotron-3/bf16/1-gpu/vision
+    python build_multimodal_engine.py --model_path /path/to/video/neva/projector.nemo --model_type video-neva --output_dir tmp/trt_engines/nemotron-3/visual_encoder --output_dir tmp/trt_engines/nemotron-3/bf16/1-gpu/vision
     ```
 
     ```bash
@@ -1137,7 +1168,7 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
         --max_seq_len 2560 \
         --max_multimodal_len 576
 
-    python build_visual_engine.py --model_type llava --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/2-gpu/vision
+    python build_multimodal_engine.py --model_type llava --model_path tmp/hf_models/${MODEL_NAME} --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/2-gpu/vision
 
     mpirun -n 2 --allow-run-as-root \
         python run.py \

@@ -41,6 +41,45 @@ constexpr auto transpose_stride(T const& t)
     return cute::prepend(cute::prepend(cute::take<2, cute::rank_v<T>>(t), cute::get<0>(t)), cute::get<1>(t));
 }
 
+// Note update moe.py to match
+enum class ActivationType
+{
+    Gelu = 0,
+    Relu,
+    Silu,
+    Swiglu,
+    Geglu,
+    Identity,
+    InvalidType
+};
+
+template <typename AType, typename BType, typename BScaleType, typename OType>
+struct GroupedGemmInput
+{
+    AType const* A = nullptr;
+    int64_t const* total_tokens_including_expert = nullptr;
+    BType const* B = nullptr;
+    BScaleType const* scales = nullptr;
+    BScaleType const* zeros = nullptr;
+    OType const* biases = nullptr;
+    OType* C = nullptr;
+    float const** alpha_scales = nullptr;
+    int* occupancy = nullptr;
+
+    ActivationType activation_type = ActivationType::InvalidType;
+    int64_t num_rows = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int num_experts = 0;
+    int const groupwise_quant_group_size = 0;
+
+    bool bias_is_broadcast = true;
+    bool use_fused_moe = false;
+
+    cudaStream_t stream = 0;
+    cutlass_extensions::CutlassGemmConfig gemm_config;
+};
+
 struct TmaWarpSpecializedGroupedGemmInput
 {
     template <class T>
@@ -193,18 +232,6 @@ struct TmaWarpSpecializedGroupedGemmInput
     std::string toString() const;
 };
 
-// Note update moe.py to match
-enum class ActivationType
-{
-    Gelu = 0,
-    Relu,
-    Silu,
-    Swiglu,
-    Geglu,
-    Identity,
-    InvalidType
-};
-
 constexpr bool isGatedActivation(ActivationType activation_type)
 {
     return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu;
@@ -232,16 +259,11 @@ public:
     static constexpr bool use_fp4 = false;
 #endif
 
-    void moeGemmBiasAct(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
-        ScaleBiasType const* biases, bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
-        TmaWarpSpecializedGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
-        int num_experts, ActivationType activation_type, bool use_fused_moe, float const** alpha_scale_ptr_array,
-        cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+        TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-    void moeGemm(T const* A, WeightType const* B, ScaleBiasType const* weight_scales, void* C,
-        int64_t const* total_tokens_including_expert, TmaWarpSpecializedGroupedGemmInput layout_info,
-        int64_t total_rows, int64_t gemm_n, int64_t gemm_k, int num_experts, bool use_fused_moe,
-        float const** alpha_scale_ptr_array, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void moeGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+        TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
     std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs() const;
     static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm);
@@ -262,18 +284,12 @@ public:
 
 private:
     template <typename EpilogueTag>
-    void dispatchToArch(T const* A, WeightType const* B, ScaleBiasType const* weight_scales,
-        ScaleBiasType const* biases, bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
-        TmaWarpSpecializedGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
-        int num_experts, cutlass_extensions::CutlassGemmConfig gemm_config, bool use_fused_moe,
-        float const** alpha_scale_ptr_array, cudaStream_t stream, int* occupancy = nullptr);
+    void dispatchToArch(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+        TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
     template <typename EpilogueTag>
-    void runGemm(T const* A, WeightType const* B, ScaleBiasType const* weight_scales, ScaleBiasType const* biases,
-        bool bias_is_broadcast, void* C, int64_t const* total_tokens_including_expert,
-        TmaWarpSpecializedGroupedGemmInput layout_info, int64_t total_rows, int64_t gemm_n, int64_t gemm_k,
-        int num_experts, bool use_fused_moe, float const** alpha_scale_ptr_array, cudaStream_t stream,
-        cutlass_extensions::CutlassGemmConfig chosen_conf);
+    void runGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+        TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
 private:
     int sm_{};
