@@ -30,11 +30,9 @@ namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 namespace tensorrt_llm::runtime
 {
 
-void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const& runtime,
+void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, BufferManager const& manager,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
-    auto const& manager = runtime.getBufferManager();
-
     auto const& speculativeDecodingModule = modelConfig.getSpeculativeDecodingModule();
     auto const maxNumPaths = speculativeDecodingModule.getMaxNumPaths();
     auto const maxPathLen = speculativeDecodingModule.getMaxPathLen();
@@ -93,7 +91,7 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
 
 EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime)
+    executor::DecodingConfig const& decodingConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "EAGLE does not support beam search");
@@ -185,12 +183,10 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
     // helper tensors
-    auto const& stream = manager.getStream();
-    scanTempStorageBytes
-        = tksd::invokeScanGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    reduceTempStorageBytes
-        = tksd::invokeReduceMaxGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    scanReduceTempStorage = manager.gpu(std::max(reduceTempStorageBytes, scanTempStorageBytes));
+    scanReduceTempStorageBytes = tksd::invokeScanReduceGenerationLengths(
+        maxNumSequences, nullptr, nullptr, 0, nullptr, nullptr, manager.getStream().get());
+    scanReduceTempStorage = manager.gpu(scanReduceTempStorageBytes);
+
     cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     maxGenerationLength = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
@@ -364,9 +360,9 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         // Compute inclusive sum and max
         tksd::invokeScanReduceGenerationLengths(numGenSequences,
             bufferCast<SizeType32>(*engineInputs.specDecodingGenerationLengths),
-            bufferCast<uint8_t>(*scanReduceTempStorage), scanTempStorageBytes,
-            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<uint8_t>(*scanReduceTempStorage),
-            reduceTempStorageBytes, bufferCast<SizeType32>(*maxGenerationLength), manager.getStream().get());
+            bufferCast<uint8_t>(*scanReduceTempStorage), scanReduceTempStorageBytes,
+            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<SizeType32>(*maxGenerationLength),
+            manager.getStream().get());
     }
 
     // Pack tensors from batch slot position to continuous array
@@ -502,12 +498,10 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
 
 void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
     ITensor const& requestTypes, ITensor const& seqSlots, EagleBuffers::Inputs const& draftBuffers,
-    runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+    BufferManager const& manager, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const& manager = runtime.getBufferManager();
 
     auto const eagleModule
         = std::dynamic_pointer_cast<runtime::EagleModule const>(modelConfig.getSpeculativeDecodingModulePtr());

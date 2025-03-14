@@ -369,17 +369,17 @@ class LlamaAttentionExtend(LlamaAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.head_dim = self.config.head_size
-        self.q_proj = nn.Linear(self.hidden_size,
-                                self.num_heads * self.head_dim,
+        self.q_proj = nn.Linear(self.config.hidden_size,
+                                self.config.num_attention_heads * self.head_dim,
                                 bias=False)
-        self.k_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+        self.k_proj = nn.Linear(self.config.hidden_size,
+                                self.config.num_key_value_heads * self.head_dim,
                                 bias=False)
-        self.v_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+        self.v_proj = nn.Linear(self.config.hidden_size,
+                                self.config.num_key_value_heads * self.head_dim,
                                 bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim,
-                                self.hidden_size,
+        self.o_proj = nn.Linear(self.config.num_attention_heads * self.head_dim,
+                                self.config.hidden_size,
                                 bias=False)
         self.config.head_dim = self.head_dim
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -399,10 +399,11 @@ class LlamaAttentionExtend(LlamaAttention):
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads *
+            key_value_slicing = (self.config.num_key_value_heads *
                                  self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp,
+                (self.config.num_attention_heads * self.head_dim) //
+                self.config.pretraining_tp,
                 dim=0)
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
@@ -430,11 +431,14 @@ class LlamaAttentionExtend(LlamaAttention):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads,
+        query_states = query_states.view(bsz, q_len,
+                                         self.config.num_attention_heads,
                                          self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+        key_states = key_states.view(bsz, q_len,
+                                     self.config.num_key_value_heads,
                                      self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+        value_states = value_states.view(bsz, q_len,
+                                         self.config.num_key_value_heads,
                                          self.head_dim).transpose(1, 2)
 
         past_key_value = getattr(self, "past_key_value", past_key_value)
@@ -474,16 +478,17 @@ class LlamaAttentionExtend(LlamaAttention):
                                              training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, self.config.num_attention_heads, q_len,
+                                  self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, self.config.num_attention_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}")
 
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         # Here is what we extend.
-        attn_output = attn_output.reshape(bsz, q_len,
-                                          self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.config.num_attention_heads * self.head_dim)
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size //
@@ -502,7 +507,7 @@ class LlamaAttentionExtend(LlamaAttention):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights
 
 
 def create_model_from_config(trt_llm_config, weights):

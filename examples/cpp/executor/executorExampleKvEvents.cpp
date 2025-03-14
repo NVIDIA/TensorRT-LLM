@@ -49,14 +49,14 @@ struct RuntimeOptions
 
 struct KVCacheBlock
 {
-    KVCacheBlock(size_t hash, int cacheLevel, int priority, size_t loraId = 0,
+    KVCacheBlock(size_t hash, int cacheLevel, int priority, std::optional<size_t> loraId = std::nullopt,
         std::shared_ptr<KVCacheBlock> prevBlock = nullptr);
 
     size_t hash;
     int cacheLevel;
     int priority;
 
-    size_t loraId;
+    std::optional<size_t> loraId;
 
     std::shared_ptr<KVCacheBlock> prevBlock;
     std::unordered_map<size_t, std::shared_ptr<KVCacheBlock>> nextBlocks;
@@ -197,7 +197,7 @@ RuntimeOptions parseArgs(int argc, char* argv[])
 }
 
 KVCacheBlock::KVCacheBlock(
-    size_t hash, int cacheLevel, int priority, size_t loraId, std::shared_ptr<KVCacheBlock> prevBlock)
+    size_t hash, int cacheLevel, int priority, std::optional<size_t> loraId, std::shared_ptr<KVCacheBlock> prevBlock)
     : hash{hash}
     , cacheLevel{cacheLevel}
     , priority{priority}

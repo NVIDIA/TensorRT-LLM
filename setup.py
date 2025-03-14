@@ -37,6 +37,11 @@ def parse_requirements(filename: os.PathLike):
             # handle -i and --extra-index-url options
             if "-i " in line or "--extra-index-url" in line:
                 extra_URLs.append(extract_url(line))
+            # handle URLs such as git+https://github.com/flashinfer-ai/flashinfer.git@e3853dd#egg=flashinfer-python
+            elif line.startswith("git+https"):
+                idx = line.find("egg=")
+                dep = line[idx + 4:]
+                deps.append(dep)
             else:
                 deps.append(line)
     return deps, extra_URLs
@@ -175,6 +180,8 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
+            if file.filename.endswith(".py"):
+                continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
                                        f"tensorrt_llm/{filename_pattern}"):

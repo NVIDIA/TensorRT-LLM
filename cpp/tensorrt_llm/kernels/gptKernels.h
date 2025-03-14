@@ -73,10 +73,15 @@ enum class RotaryScalingType : int8_t
 
 struct BlockSparseParams
 {
-    int block_size;
-    int homo_head_pattern;
-    int num_local_blocks; // Sliding window blocks
-    int vertical_stride;
+    int block_size = 1;
+    int homo_head_pattern = 0;
+    int num_local_blocks = 0; // Sliding window blocks
+    int vertical_stride = 0;
+
+    auto data() const
+    {
+        return std::make_tuple(block_size, homo_head_pattern, num_local_blocks, vertical_stride);
+    }
 
     __device__ bool computeMask(
         int row_idx, int col_idx, int q_seq_length, int kv_seq_length, int num_heads, int head_idx) const
@@ -201,6 +206,10 @@ struct BuildDecoderInfoParams
             return true;
         }
         if (attentionMask != nullptr)
+        {
+            return true;
+        }
+        if (fmhaTileCounter != nullptr || fmhaBmm1Scale != nullptr || fmhaBmm2Scale != nullptr)
         {
             return true;
         }

@@ -26,7 +26,7 @@ import safetensors
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, str_dtype_to_torch
@@ -918,14 +918,18 @@ def quantize(hf_model_dir: str,
     assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
-    use_smooth_quant = quant_config.use_plugin_sq
+    use_smooth_quant = quant_config._use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == "INT8"
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
-    hf_model = AutoModelForCausalLM.from_pretrained(
+    if hf_config.architectures == ['Qwen2VLForConditionalGeneration']:
+        from transformers import Qwen2VLForConditionalGeneration as model_cls
+    else:
+        from transformers import AutoModelForCausalLM as model_cls
+    hf_model = model_cls.from_pretrained(
         hf_model_dir,
         device_map='auto',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
@@ -993,7 +997,7 @@ def load_weights_from_hf_model(hf_model,
     moe_config = config.moe
 
     use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     per_channel = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token = use_smooth_quant and 'PER_TOKEN' in quant_algo
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8

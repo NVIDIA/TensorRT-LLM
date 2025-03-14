@@ -19,14 +19,15 @@ from argparse import ArgumentParser
 import torch
 # isort: on
 from cuda import cuda, cudart
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST, mpi_comm
 from tensorrt_llm.functional import (AllReduceParams, AllReduceStrategy,
                                      allreduce)
-from tensorrt_llm.plugin.plugin import current_all_reduce_helper
+from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
+                                        init_all_reduce_helper)
+from tensorrt_llm.runtime import Session
 
 
 def allreduce_benchmark(dtype: str,
@@ -68,11 +69,13 @@ def allreduce_benchmark(dtype: str,
         ]:
             builder = tllm.Builder()
             net = builder.create_network()
+            net.plugin_config.set_nccl_plugin(dtype)
+            init_all_reduce_helper()
             _buffers, workspace = current_all_reduce_helper(
             ).allocate_workspace(mapping, size * dtype_size)
 
             with tllm.net_guard(net):
-                network = tllm.default_trtnet()
+                tllm.default_trtnet()
 
                 x = Tensor(name='x',
                            shape=input.shape,
@@ -86,32 +89,20 @@ def allreduce_benchmark(dtype: str,
                         current,
                         mapping.tp_group,
                         all_reduce_params=AllReduceParams(strategy=strategy))
-                output = current.trt_tensor
-
-                network.mark_output(output)
-                output.name = 'output'
-                output.dtype = tllm.str_dtype_to_trt(dtype)
-
-            build_engine = EngineFromNetwork(
-                (builder.trt_builder, net.trt_network),
-                config=CreateConfig(
-                    fp16=(dtype == 'float16'),
-                    bf16=(dtype == 'bfloat16'),
-                    precision_constraints='obey',
-                ))
-
-            output = torch.zeros_like(input)
-
-            stream = torch.cuda.current_stream()
+                current.mark_output('output', dtype)
             feed_dict = {'x': input, 'all_reduce_workspace': workspace}
+            builder_config = builder.create_builder_config(precision=dtype)
+            engine = builder.build_engine(net, builder_config)
+            assert engine is not None, "Failed to build engine"
+            session = Session.from_serialized_engine(engine)
 
-            session = tllm.runtime.Session.from_engine(build_engine())
             _, start = cuda.cuEventCreate(0)
             _, stop = cuda.cuEventCreate(0)
             runtimes = []
 
             tllm.mpi_barrier()
-
+            output = torch.empty(input.shape, dtype=torch_dtype, device='cuda')
+            stream = torch.cuda.current_stream()
             for _ in range(10):
                 cuda.cuEventRecord(start, stream.cuda_stream)
                 session.run(inputs=feed_dict,
@@ -123,7 +114,9 @@ def allreduce_benchmark(dtype: str,
                 runtimes.append(ms)
 
             median_ms = sorted(runtimes)[len(runtimes) // 2]
-            assert torch.allclose(output, (input * world_size)**inner_loop)
+
+            allreduce_ref = (input * world_size)**inner_loop
+            assert torch.allclose(output, allreduce_ref)
 
             if mapping.rank == 0:
                 print(

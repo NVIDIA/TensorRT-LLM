@@ -128,6 +128,7 @@ private:
     int mPadLda;
     int mPadLdb;
     int mPadLdc;
+    int mArch;
     nvinfer1::DataType mType;
     nvinfer1::DataType mOutputType;
 

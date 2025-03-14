@@ -42,7 +42,7 @@ def run_command(command: _tp.Sequence[str],
 def wincopy(source: str, dest: str, isdir: bool, cwd=None) -> None:
     if not isdir:  # Single-file copy
         run_command(["cmd", "/c", "copy",
-                     str(_pl.Path(source)), f".\{dest}"],
+                     str(_pl.Path(source)), f".\\{dest}"],
                     cwd=cwd)
     else:  # Directory sync
         copy_cmd = ["robocopy", source, f"./{dest}", "/mir", "/e"]

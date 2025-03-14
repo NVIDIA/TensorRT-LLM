@@ -5,8 +5,7 @@ set -ex
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01
-# PyTorch v2.5.1 has a fix for https://github.com/pytorch/pytorch/issues/138324.
-TORCH_VERSION="2.5.1"
+TORCH_VERSION="2.6.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {
@@ -28,6 +27,14 @@ install_from_source() {
         echo "Installation from PyTorch source codes cannot be supported..."
         exit 1
       fi
+    fi
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
+    if [ "$ARCH" = "sbsa" ] && [ "$TORCH_VERSION" = "2.6.0" ]; then
+      echo "Due to a known issue https://github.com/pytorch/pytorch/issues/141083, PyTorch v2.6.0 installation from source codes cannot be supported..."
+      exit 1
     fi
     prepare_environment $1
 
@@ -60,8 +67,16 @@ install_from_source() {
 }
 
 install_from_pypi() {
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
+    if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+
     pip3 uninstall -y torch torchvision
-    pip3 install torch==${TORCH_VERSION} torchvision
+    if [ "$ARCH" = "sbsa" ]; then
+      pip3 install torch==${TORCH_VERSION} torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    else
+      pip3 install torch==${TORCH_VERSION} torchvision
+    fi
 }
 
 case "$1" in

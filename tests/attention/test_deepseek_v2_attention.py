@@ -1036,7 +1036,7 @@ class TestFunctional(unittest.TestCase):
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                     host_kv_cache_pool_mapping_tensor = Tensor(
                         name='host_kv_cache_pool_mapping',
-                        shape=(1, ),
+                        shape=(1, 1),
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 else:
                     past_key_value_tensor = Tensor(
@@ -1135,7 +1135,7 @@ class TestFunctional(unittest.TestCase):
                     # position_ids=position_ids_tensor,
                     # q_a_proj=q_a_proj_tensor,
                     # q_a_layernorm=q_a_layernorm_tensor,
-                    fused_q_proj=kv_a_proj_with_mqa_tensor,
+                    k_b_proj_trans=kv_a_proj_with_mqa_tensor,
                     q_b_proj=q_b_proj_tensor,
                     # kv_a_proj_with_mqa=kv_a_proj_with_mqa_tensor,
                     # kv_a_layernorm=kv_a_layernorm_tensor,

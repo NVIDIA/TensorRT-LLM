@@ -1,0 +1,8 @@
+Databases:
+    MySQL:
+        credentials:
+            hostname: gpu-tensorrt-llm-perf-db-pr-rw.db.nvidia.com
+            username: tensorrt_llm_perf_db_usr
+            password: wEv0yIvzy#Lufakj
+            database: tensorrt_llm_perf_db
+            port: 3306

@@ -1,0 +1,190 @@
+ARG BASE_IMAGE=must_be_specified
+ARG BUILD_IMAGE=must_be_specified
+
+FROM ${BUILD_IMAGE} AS build-output-base
+
+RUN \
+    echo. &&\
+    echo Git history for base &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. git -C TensorRT-LLM --no-pager log --oneline -n500)
+
+RUN \
+    (if exist TensorRT-LLM.new\. rmdir /s /q TensorRT-LLM.new)
+
+# Copy TensorRT-LLM clone from build context
+COPY ./ TensorRT-LLM.new/
+
+# Mitigation for logging spam that includes:
+#   File "C:\Program Files\Python310\lib\logging\__init__.py", line 1103, in emit
+#   stream.write(msg + self.terminator)
+#   ValueError: underlying buffer has been detached
+RUN \
+    pushd "C:\Program Files\Python310\Lib\logging" &&\
+    (type C:\workspace\TensorRT-LLM.new\jenkins\windows\python3.10.11_logging.patch && echo. ) | git apply --no-index - &&\
+    popd
+
+RUN \
+    echo. &&\
+    echo Git history for changes &&\
+    echo. &&\
+    (if exist TensorRT-LLM.new\. git -C TensorRT-LLM.new --no-pager log --oneline -n500)
+
+# Steps:
+# 1. Query last N commits for TensorRT-LLM ("old") and save in 'commits'.
+# 2. Query last N commits for TensorRT-LLM.new and save in 'commits.new'.
+# 3. Look for the first-in-descending-list (i.e. newest) commit.
+# 4. Save in 'merge-base'.
+RUN \
+    echo. &&\
+    echo Find cross-clone merge-base &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. git -C TensorRT-LLM --no-pager log --format=%H -n500 > commits) &&\
+    (if exist TensorRT-LLM\. git -C TensorRT-LLM.new --no-pager log --format=%H -n500 > commits.new) &&\
+    (if exist TensorRT-LLM\. powershell "((Get-Content commits) | Where-Object { (Get-Content commits.new) -contains $_})[0] | Out-File merge-base") &&\
+    (if exist TensorRT-LLM\. type merge-base)
+
+# Steps (the powershell invocations):
+# 1. Query paths of changes since the commit in 'merge-base'.
+# 2. For files that exist in TensorRT-LLM, save as 'TensorRT-LLM.new.changed' with full TensorRT-LLM.new paths.
+# 3. For files that don't, save as 'TensorRT-LLM.new.deleted' with full TensorRT-LLM paths.
+RUN \
+    echo. &&\
+    echo Query git for changes &&\
+    echo. &&\
+    pushd TensorRT-LLM.new &&\
+    copy nul ..\TensorRT-LLM.new.changed &&\
+    copy nul ..\TensorRT-LLM.new.deleted &&\
+    (if exist ..\TensorRT-LLM\. powershell "git --no-pager diff --name-only (Get-Content ..\merge-base) | Where-Object { Test-Path -Path $_ } | ForEach-Object { 'C:\workspace\TensorRT-LLM.new\' + $_.Replace('/', '\') } | Out-File ..\TensorRT-LLM.new.changed") &&\
+    (if exist ..\TensorRT-LLM\. powershell "git diff --name-status --diff-filter=DR (Get-Content ..\merge-base) | ForEach-Object { $_.split()[1] } | ForEach-Object { 'C:\workspace\TensorRT-LLM\' + $_.Replace('/', '\') } | Out-File ..\TensorRT-LLM.new.deleted") &&\
+    popd &&\
+    echo - Changed: &&\
+    type TensorRT-LLM.new.changed &&\
+    echo - Deleted: &&\
+    type TensorRT-LLM.new.deleted
+
+# Steps:
+# 1. Enumerate TensorRT-LLM files (including hidden).
+# 2. Remove any files present in 'TensorRT-LLM.new.deleted'.
+# 3. For submodules, remove the entire submodule directory.
+RUN \
+    echo. &&\
+    echo Trim TensorRT-LLM for deletes &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. powershell "@(Get-ChildItem -File -Force -Recurse TensorRT-LLM) | Where-Object { @(Get-Content TensorRT-LLM.new.deleted).Contains($_.FullName) } | Remove-Item -Force -Recurse")
+
+# Steps:
+# 1. Enumerate changed paths.
+# 2. If a submodule is changed (identified under "3rdparty\"), remove the submodule.
+# 3. In a future step running build_wheel.py, it will init missing submodules automatically.
+RUN \
+    echo. &&\
+    echo Trim TensorRT-LLM for updated submodules &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. powershell "Get-Content TensorRT-LLM.new.changed | Where-Object { $_ -like 'C:\workspace\TensorRT-LLM.new\3rdparty\*' } | ForEach-Object { $newPath = $_.Replace('TensorRT-LLM.new', 'TensorRT-LLM'); if (Test-Path $newPath) { Remove-Item $newPath -Recurse -Force } }")
+
+
+# Steps:
+# 1. Remove .git directory from TensorRT-LLM
+# 2. Copy .git directory from TensorRT-LLM.new to TensorRT-LLM
+RUN \
+    echo. &&\
+    echo Transfer .git from TensorRT-LLM.new &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. powershell "Remove-Item TensorRT-LLM\.git -Force -Recurse") &&\
+    (if exist TensorRT-LLM\. xcopy /h /i /v /e /y /q TensorRT-LLM.new\.git TensorRT-LLM\.git)
+
+# Steps:
+# 1. Enumerate TensorRT-LLM.new files (including hidden).
+# 2. Remove any files not present in 'TensorRT-LLM.new.changed'.
+# 3. Enumerate directories (including hidden).
+# 4. Reverse the directory list (so that we can process deepest first).
+# 5. Remove empty directories.
+RUN \
+    echo. &&\
+    echo Trim TensorRT-LLM.new to changes &&\
+    echo. &&\
+    (if exist TensorRT-LLM\. powershell "@(Get-ChildItem -File -Force -Recurse TensorRT-LLM.new) | Where-Object { -Not @(Get-Content TensorRT-LLM.new.changed).Contains($_.FullName) } | Remove-Item -Force") &&\
+    (if exist TensorRT-LLM\. powershell "$d = @(Get-ChildItem -Directory -Recurse TensorRT-LLM.new); [array]::Reverse($d); $d | Where-Object { (Get-ChildItem -Force $_.FullName).count -eq 0 } | Remove-Item")
+
+# REVIEW: Coalescing the layers from COPY above to here would
+# trim down the image size significantly but would need to be
+# done with tooling outside of Docker.
+
+RUN \
+    echo. &&\
+    echo Copy TensorRT-LLM.new to TensorRT-LLM &&\
+    echo. &&\
+    (if not exist TensorRT-LLM\. mkdir TensorRT-LLM) &&\
+    xcopy /h /i /v /e /y TensorRT-LLM.new TensorRT-LLM
+
+ARG ARCHS=86-real
+ARG BUILD_TYPE=Release
+ARG CMAKEVARS="ENABLE_MULTI_DEVICE=0"
+ARG JOB_COUNT=8
+ARG TRT_VERSION_4=10.8.0.43
+RUN \
+    echo. &&\
+    echo Building %BUILD_TYPE% Whl for %ARCHS% &&\
+    echo. &&\
+    \
+    pushd TensorRT-LLM &&\
+    (if exist build\*.whl del /q build\*.whl) &&\
+    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\Tools\\VsDevCmd.bat" -arch=amd64 &&\
+    powershell "\
+        $changedCount = ((Get-Content ..\\TensorRT-LLM.new.changed) | Select-String 'C:\\workspace\\TensorRT-LLM\.new\\cpp\\tensorrt_llm\\kernels\\.+').Length; \
+        $deletedCount = ((Get-Content ..\\TensorRT-LLM.new.deleted) | Select-String 'C:\\workspace\\TensorRT-LLM\\cpp\\tensorrt_llm\\kernels\\.+').Length; \
+        ${env:maybe_configure_cmake_arg} = ''; \
+        if ($changedCount + $deletedCount -ge 1) { ${env:maybe_configure_cmake_arg} = '--configure_cmake' }; \
+        $process = Start-Process -FilePath 'python' -ArgumentList \" \
+            .\scripts\build_wheel.py \
+            -a %ARCHS% \
+            --build_type %BUILD_TYPE% \
+            --clean_wheel \
+            ${env:maybe_configure_cmake_arg} \
+            --extra-cmake-vars %CMAKEVARS% \
+            --job_count %JOB_COUNT% \
+            --python_bindings \
+            --trt_root C:\workspace\TensorRT-%TRT_VERSION_4% \
+        \" -NoNewWindow -PassThru -Wait; \
+        exit $process.ExitCode; \
+    " &&\
+    popd
+
+# TODO: The additions to PATH for google-tests should be unnecessary.
+# In a future MR, this should be confirmed and simplified.
+RUN \
+    echo. &&\
+    echo Building %BUILD_TYPE% UTs &&\
+    echo. &&\
+    \
+    pushd TensorRT-LLM\cpp\build &&\
+    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\Tools\\VsDevCmd.bat" -arch=amd64 &&\
+    for /f "tokens=2 delims==" %A in ('cmd /c set Path ^| find "Path="') do @(set PATH=%A;%CD%\tensorrt_llm) &&\
+    for /f "tokens=2 delims==" %A in ('cmd /c set Path ^| find "Path="') do @(set PATH=%A;%CD%\tensorrt_llm\plugins) &&\
+    cmake \
+        --build . \
+        --config %BUILD_TYPE% \
+        --target google-tests \
+        -j %JOB_COUNT% \
+        &&\
+    popd
+
+RUN \
+    echo. &&\
+    echo Building %BUILD_TYPE% Benchmarks &&\
+    echo. &&\
+    \
+    pushd TensorRT-LLM\cpp\build &&\
+    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\Tools\\VsDevCmd.bat" -arch=amd64 &&\
+    cmake \
+        --build . \
+        --config %BUILD_TYPE% \
+        --target benchmarks \
+        -j %JOB_COUNT% \
+        &&\
+    popd
+
+FROM ${BASE_IMAGE} AS build-output
+
+COPY --from=build-output-base /workspace/ /workspace/
