@@ -151,6 +151,7 @@ def parse_input(tokenizer,
             for row in inputs:
                 input_ids = row[row != pad_id]
                 batch_input_ids.append(input_ids[-max_input_length:])
+
         elif input_file.endswith('.txt'):
             with open(input_file, 'r', encoding='utf-8',
                       errors='replace') as txt_file:
@@ -232,7 +233,7 @@ def print_output(tokenizer,
     batch_size = len(input_lengths)
     num_return_sequences = num_output_sents // batch_size
 
-    if output_csv is None and output_npy is None:
+    if output_csv is None and output_npy is None and tokenizer is not None:
         for i in range(batch_size * num_return_sequences):
             batch_idx = i // num_return_sequences
             seq_idx = i % num_return_sequences
@@ -539,7 +540,8 @@ def main(args):
                 medusa_choices=args.medusa_choices,
                 eagle_choices=args.eagle_choices,
                 return_all_generated_tokens=args.return_all_generated_tokens,
-                input_token_extra_ids=input_token_extra_ids)
+                input_token_extra_ids=input_token_extra_ids,
+                language_adapter_uids=args.language_task_uids)
             torch.cuda.synchronize()
 
     # Receive output, print to screen or save to file

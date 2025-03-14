@@ -162,6 +162,7 @@ class MllamaForCausalLM(nn.Module):
                 tensor_parallel_size=config.mapping.tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                gpus_per_node=config.mapping.gpus_per_node,
             ),
         )
         # use embedding weights in lm_head if tie word embedding is enabled

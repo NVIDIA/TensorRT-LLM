@@ -101,8 +101,8 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-        float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+        int head_size, int unidirectional, float q_scaling, float attn_logit_softcapping_scale,
+        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
@@ -172,11 +172,6 @@ public:
     void serialize(void* buffer) const noexcept override;
 
 private:
-    template <typename T, typename AttentionOutT>
-    kernels::mlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
-        nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream);
-
     template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -227,9 +222,9 @@ private:
         MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
         HOST_CONTEXT_PROGRESS,
-        MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
+        MLA_K_B_PROJ_TRANS_TENSOR,
         SKIP_ATTN,
         LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last

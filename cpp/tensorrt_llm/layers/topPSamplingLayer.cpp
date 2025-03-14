@@ -285,7 +285,7 @@ void TopPSamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
         invokeBatchAirTopPSampling<T>(params, getStream());
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
     auto* runtimeTopPDevicePtr = bufferCastOrNull<float>(mRuntimeTopPDevice);
     auto* initialTopPDevicePtr = bufferCastOrNull<float>(mInitialTopPDevice);
     auto* topPDecayDevicePtr = bufferCastOrNull<float>(mTopPDecayDevice);

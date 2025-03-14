@@ -97,19 +97,24 @@ public:
         return QuantMode(BaseType(1u) << 3 | BaseType(1u) << 4 | BaseType(1u) << 9);
     }
 
-    static constexpr QuantMode w4a8QServe() noexcept
+    static constexpr QuantMode fp8BlockScales() noexcept
     {
         return QuantMode(BaseType(1u) << 10);
     }
 
-    static constexpr QuantMode nvfp4() noexcept
+    static constexpr QuantMode w4a8QServe() noexcept
     {
         return QuantMode(BaseType(1u) << 11);
     }
 
-    static constexpr QuantMode fp4KvCache() noexcept
+    static constexpr QuantMode nvfp4() noexcept
     {
         return QuantMode(BaseType(1u) << 12);
+    }
+
+    static constexpr QuantMode fp4KvCache() noexcept
+    {
+        return QuantMode(BaseType(1u) << 13);
     }
 
     constexpr BaseType value() const noexcept
@@ -195,7 +200,7 @@ public:
     static constexpr QuantMode fromDescription(bool quantizeWeights = false, bool quantizeActivations = false,
         bool perToken = false, bool perChannel = false, bool perGroup = false, bool useInt4Weights = false,
         bool useInt8KvCache = false, bool useFp8KvCache = false, bool useFp8Qdq = false, bool useFp8RowWise = false,
-        bool useW4a8QServe = false, bool useFp4Quant = false)
+        bool useW4a8QServe = false, bool useFp4Quant = false, bool useFp8BlockScales = false)
     {
         QuantMode quantMode{};
         if (quantizeWeights)
@@ -242,6 +247,11 @@ public:
         if (useFp8RowWise)
         {
             quantMode += fp8RowWise();
+        }
+
+        if (useFp8BlockScales)
+        {
+            quantMode += fp8BlockScales();
         }
 
         if (useW4a8QServe)
@@ -337,6 +347,11 @@ public:
             quantMode
                 = fromDescription(false, false, false, false, false, false, false, false, false, false, false, true);
         }
+        else if (quantAlgo == "FP8_BLOCK_SCALES")
+        {
+            quantMode = fromDescription(
+                false, false, false, false, false, false, false, false, false, false, false, false, true);
+        }
 
         if (kvCacheQuantAlgo == "INT8")
         {
@@ -386,6 +401,17 @@ public:
 
 private:
     BaseType mValue{0};
+};
+
+class GroupwiseQuantAlgo
+{
+    // Keep align with tensorrt_llm/quantization/mode.py
+public:
+    static constexpr int BIAS = int(1) << 0;
+    static constexpr int ZERO = int(1) << 1;
+    static constexpr int PRE_QUANT_SCALE = int(1) << 2;
+    static constexpr int FP8_ALPHA = int(1) << 3;
+    static constexpr int INT8_WEIGHT = int(1) << 4;
 };
 
 } // namespace common

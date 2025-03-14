@@ -63,7 +63,7 @@ void buildRelativeAttentionBias(
     default: throw std::runtime_error("Unimplemented scalar type");
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace torch_ext

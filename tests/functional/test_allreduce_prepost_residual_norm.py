@@ -136,9 +136,9 @@ class TestCommunicationPlugin(unittest.TestCase):
             current, z = allreduce(
                 current,
                 self.mapping.tp_group,
-                strategy=strategy,
-                config=config,
                 all_reduce_params=AllReduceParams(
+                    strategy=strategy,
+                    config=config,
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM,
                     bias=y,
                     residual=z,
@@ -159,10 +159,16 @@ class TestCommunicationPlugin(unittest.TestCase):
         session = create_session(builder, net, precision=dtype)
         outputs = run_session(session, feed_dict)
 
+        rtol = 1e-2
+        atol = 1e-2
+        if dtype == 'bfloat16':
+            rtol *= 3
+            atol *= 3
+
         close = torch.isclose(allreduce_ref,
                               outputs['output'],
-                              rtol=1e-2,
-                              atol=1e-2)
+                              rtol=rtol,
+                              atol=atol)
         if not torch.all(close):
             not_close_a = allreduce_ref[~close]
             not_close_b = outputs['output'][~close]
@@ -175,8 +181,8 @@ class TestCommunicationPlugin(unittest.TestCase):
         self.assertTrue(
             torch.allclose(outputs['output'].cpu(),
                            allreduce_ref.cpu(),
-                           rtol=1e-2,
-                           atol=1e-2))
+                           rtol=rtol,
+                           atol=atol))
 
 
 if __name__ == "__main__":

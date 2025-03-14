@@ -145,13 +145,13 @@ TYPED_TEST(CopyToWorkspaceFixture, DataFitsExactly_Succeeds)
     auto const workspaceSizeInBytes = numElements * sizeof(dataType);
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
     DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     // Copy back and check data integrity.
     auto dataCopy = std::pmr::vector<dataType>(numElements);
     auto const dataSizeInBytes = numElements * sizeof(dataType);
     this->bufferManager->copy(*IBuffer::slice(workspace, 0, dataSizeInBytes), dataCopy.data(), MemoryType::kCPU);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     for (auto i = 0; i < numElements; i++)
     {
@@ -168,13 +168,13 @@ TYPED_TEST(CopyToWorkspaceFixture, DataSmallerThanWorkspace_Succeeds)
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) * 4;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
     DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     // Copy back and check data integrity.
     auto dataCopy = std::pmr::vector<dataType>(numElements);
     auto const dataSizeInBytes = numElements * sizeof(dataType);
     this->bufferManager->copy(*IBuffer::slice(workspace, 0, dataSizeInBytes), dataCopy.data(), MemoryType::kCPU);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     for (auto i = 0; i < numElements; i++)
     {
@@ -191,13 +191,13 @@ TYPED_TEST(CopyToWorkspaceFixture, DataMuchSmallerThanWorkspace_Succeeds)
     auto const workspaceSizeInBytes = numElements * sizeof(dataType) * 1000;
     IBuffer::SharedPtr workspace = this->bufferManager->gpu(workspaceSizeInBytes);
     DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     // Copy back and check data integrity.
     auto dataCopy = std::pmr::vector<dataType>(numElements);
     auto const dataSizeInBytes = numElements * sizeof(dataType);
     this->bufferManager->copy(*IBuffer::slice(workspace, 0, dataSizeInBytes), dataCopy.data(), MemoryType::kCPU);
-    sync_check_cuda_error();
+    sync_check_cuda_error(this->bufferManager->getStream().get());
 
     for (auto i = 0; i < numElements; i++)
     {
@@ -219,12 +219,12 @@ TYPED_TEST(CopyToWorkspaceFixture, TypedWorkspaceBuffer_Succeeds)
         this->fillData(data);
         IBuffer::SharedPtr workspace = this->bufferManager->gpu(numElements, TRTDataType<dataType>::value);
         DecodingLayerWorkspace::copyToWorkspace(*this->bufferManager, data, workspace);
-        sync_check_cuda_error();
+        sync_check_cuda_error(this->bufferManager->getStream().get());
 
         // Copy back and check data integrity.
         auto dataCopy = std::pmr::vector<dataType>(numElements);
         this->bufferManager->copy(*IBuffer::slice(workspace, 0, numElements), dataCopy.data(), MemoryType::kCPU);
-        sync_check_cuda_error();
+        sync_check_cuda_error(this->bufferManager->getStream().get());
 
         for (auto i = 0; i < numElements; i++)
         {

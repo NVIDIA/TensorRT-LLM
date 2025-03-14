@@ -11,6 +11,8 @@ import tensorrt_llm
 
 from .patterns.ar_residual_norm import register_ar_residual_norm
 from .patterns.residual_add_norm import register_add_norm
+from .patterns.ub_allreduce import (register_ub_allreduce,
+                                    register_ub_allreduce_finalize)
 from .recover_pass import recover_pass
 
 
@@ -18,13 +20,13 @@ class Backend:
 
     _custom_pass_instance: Optional[PatternMatcherPass] = None
 
-    def __init__(self, enable_inductor=True) -> None:
+    def __init__(self, enable_inductor=True, enable_userbuffers=False) -> None:
         super().__init__()
         self.elapsed_time = 0
         self.module_inference_event = []
         self.module_inference_time = 0
         self.call_count = 0
-        self.custom_pass = Backend.get_custom_pass()
+        self.custom_pass = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
 
@@ -37,7 +39,7 @@ class Backend:
             self.inductor_config["joint_custom_post_pass"] = self.optimize
 
     @classmethod
-    def get_custom_pass(cls):
+    def get_custom_pass(cls, enable_userbuffers):
         world_size = tensorrt_llm.mpi_world_size()
         if cls._custom_pass_instance == None:
             # Really naive pass manager here
@@ -47,6 +49,10 @@ class Backend:
                 # TO-DO: Fix this issue
                 os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
                 register_ar_residual_norm(cls._custom_pass_instance)
+                if enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
+                ):
+                    register_ub_allreduce(cls._custom_pass_instance)
+                    register_ub_allreduce_finalize(cls._custom_pass_instance)
             else:
                 register_add_norm(cls._custom_pass_instance)
         return cls._custom_pass_instance
@@ -58,6 +64,8 @@ class Backend:
     ):
         graph = gm.graph if isinstance(gm, GraphModule) else gm
         self.match_count.append(self.custom_pass.apply(graph))
+        while self.match_count[-1]:
+            self.match_count.append(self.custom_pass.apply(graph))
         graph.eliminate_dead_code()
         if isinstance(gm, GraphModule):
             gm.recompile()

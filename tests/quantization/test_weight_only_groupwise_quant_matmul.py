@@ -27,6 +27,7 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm.parameter import Parameter
+from tensorrt_llm.quantization import GroupwiseQuantAlgo
 from tensorrt_llm.quantization.functional import \
     weight_only_groupwise_quant_matmul
 
@@ -209,16 +210,11 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                      quantized_weight_dtype,
                                      activation_type).view(activation_dtype)
 
-        # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        BIAS = 1
-        ZERO = 2
-        PRE_QUANT_SCALE = 4
-        W4A8_AWQ = 8
-        INT8_WEIGHT = 16
-
-        quant_algo = (use_int8_weight * INT8_WEIGHT + use_w4a8_awq * W4A8_AWQ +
-                      has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO +
-                      has_bias * BIAS)
+        quant_algo = (use_int8_weight * GroupwiseQuantAlgo.INT8_WEIGHT +
+                      use_w4a8_awq * GroupwiseQuantAlgo.W4A8_ALPHA +
+                      has_pre_quant * GroupwiseQuantAlgo.PRE_QUANT_SCALE +
+                      has_zero * GroupwiseQuantAlgo.ZERO +
+                      has_bias * GroupwiseQuantAlgo.BIAS)
 
         scale_ref = scale.repeat_interleave(group_size, dim=0)[:k, :]
         ref_th_weight = ref_q_weight.cuda().to(activation_dtype) * scale_ref

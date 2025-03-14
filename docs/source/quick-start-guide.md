@@ -98,5 +98,5 @@ For more examples, refer to:
 
 ## Related Information
 
-- [Best Practices Guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-best-practices.md)
+- [Best Practices Guide](https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/index.html)
 - [Support Matrix](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)

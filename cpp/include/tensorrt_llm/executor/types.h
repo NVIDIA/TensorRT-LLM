@@ -395,7 +395,7 @@ struct RequestStats
     /// @brief Number of missed blocks per request
     SizeType32 missedBlocksPerRequest;
     /// @brief KV Cache Hit Rate per request, defined as reusedBlocks / (reusedBlocks + missedBlocks)
-    SizeType32 kvCacheHitRatePerRequest;
+    FloatType kvCacheHitRatePerRequest;
 };
 
 /// @brief Struct that holds the stats of all requests in an iteration
@@ -439,7 +439,7 @@ struct RequestPerfMetrics
         /// @brief Number of missed blocks
         SizeType32 numMissedBlocks{0};
         /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
-        SizeType32 kvCacheHitRate{0};
+        FloatType kvCacheHitRate{0.f};
     };
 
     struct SpeculativeDecodingMetrics
