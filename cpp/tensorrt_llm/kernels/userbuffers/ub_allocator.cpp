@@ -23,15 +23,15 @@ UserBufferAllocator& UserBufferAllocator::Instance()
     return _;
 }
 
-void UserBufferAllocator::initialize(int tp)
+void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
 {
     if (!is_initialized())
     {
         ub_comm_ = nullptr;
-        create_communicator_grouped2(&ub_comm_, 1, 1, tp, 1);
+        world_config_ = world_config;
+        create_communicator_grouped2(&ub_comm_, world_config_);
         TLLM_CHECK(ub_comm_ != nullptr);
         is_initialized_ = true;
-        tp_ = tp;
     }
 }
 
@@ -45,7 +45,7 @@ UBBuffer UserBufferAllocator::register_ub_buffer(size_t bytes)
     TLLM_CHECK(is_initialized());
     void* addr = nullptr;
     int handle = -1;
-    handle = register_user_buffer_collective((void**) &addr, bytes, ub_comm_, true);
+    handle = register_user_buffer_collective((void**) &addr, bytes, ub_comm_);
     return {addr, handle, bytes};
 }
 

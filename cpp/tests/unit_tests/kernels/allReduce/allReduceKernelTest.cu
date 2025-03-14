@@ -32,11 +32,11 @@
 #include <type_traits>
 #include <vector>
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace mpi = tensorrt_llm::mpi;

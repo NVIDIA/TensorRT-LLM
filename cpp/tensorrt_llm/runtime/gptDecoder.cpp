@@ -250,7 +250,6 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     }
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
-    mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
     mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

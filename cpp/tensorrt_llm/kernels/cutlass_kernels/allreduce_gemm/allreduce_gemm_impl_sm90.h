@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,27 +16,19 @@
  */
 #pragma once
 
-#include "allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/allreduce_gemm_runner.h"
 
-#include "cutlass/conv/convolution.h"
-// Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass_extensions/gemm_configs.h"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
-#include "cutlass/tensor_ref.h"
 #include "cutlass_extensions/communication/collective/sm90_allreduce_nvls_warpspecialized.hpp"
 #include "cutlass_extensions/epilogue/fusion/sm90_visitor_allreduce_tma_warpspecialized.hpp"
-#include "cutlass_extensions/gemm/kernel/sm90_gemm_allreduce_tma_warpspecialized.hpp"
-#include "cutlass_extensions/gemm/kernel/sm90_gemm_allreduce_tma_warpspecialized_cooperative.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_allreduce_tma_warpspecialized_pingpong.hpp"
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -45,20 +38,20 @@ using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
-constexpr int kGemmAllReduceOneShotMaxSizeBytes = 128 * 1024; // 128KiB
-
 //////////////////////////////////////////////
 // Sm90 Two-shot fusion
 //////////////////////////////////////////////
-template <typename ElementA_, typename ElementB_, typename ElementC_, typename ElementD_, typename LayoutA_,
-    typename LayoutB_, typename LayoutC_, typename LayoutD_, typename TileShape_MNK_, typename ClusterShape_MNK_,
-    typename MainLoopScheduleType_, typename EpilogueScheduleType_>
-struct CutlassGemmTypes
+template <typename ElementA_, typename ElementB_, typename ElementC_, typename ElementD_, typename ElementSFA_,
+    typename ElementSFB_, typename LayoutA_, typename LayoutB_, typename LayoutC_, typename LayoutD_,
+    typename TileShape_MNK_, typename ClusterShape_MNK_, typename MainLoopScheduleType_, typename EpilogueScheduleType_>
+struct Sm90GemmTypes
 {
     using ElementA = ElementA_;
     using ElementB = ElementB_;
     using ElementC = ElementC_;
     using ElementD = ElementD_;
+    using ElementSFA = ElementSFA_;
+    using ElementSFB = ElementSFB_;
     using LayoutA = LayoutA_;
     using LayoutB = LayoutB_;
     using LayoutC = LayoutC_;
@@ -85,6 +78,12 @@ public:
     using LayoutB = typename GemmTraits::LayoutB;
     using LayoutC = typename GemmTraits::LayoutC;
     using LayoutD = typename GemmTraits::LayoutD;
+
+    using StrideA = cutlass::gemm::TagToStrideA_t<LayoutA>;
+    using StrideB = cutlass::gemm::TagToStrideB_t<LayoutB>;
+    using StrideC = cutlass::gemm::TagToStrideC_t<LayoutC>;
+    using StrideD = cutlass::gemm::TagToStrideC_t<LayoutD>;
+
     using TileShape_MNK = typename GemmTraits::TileShape_MNK;
     using ClusterShape_MNK = typename GemmTraits::ClusterShape_MNK;
 
@@ -95,6 +94,8 @@ public:
     using RasterOrderOptions =
         typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
 
+    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */>;
+
     // 16B alignment for TMA
     static constexpr int AlignmentA = 16 / sizeof(ElementA);
     static constexpr int AlignmentB = 16 / sizeof(ElementB);
@@ -102,35 +103,15 @@ public:
     static constexpr int AlignmentD = 16 / sizeof(ElementD);
 
     ////////////////
-    // AuxStore EVT
-    ////////////////
-    static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
-    using EVT_D = cutlass::epilogue::fusion::Sm90LinearCombination<ElementD, ElementCompute, ElementC, ElementScalar,
-        RoundStyle>; // beta * C + (alpha * acc)
-
-    using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-    using EpilogueDescriptor = cutlass::epilogue::collective::detail::EpilogueDescriptor<TileShape_MNK,
-        EpilogueTileType, ElementC, ElementD, EpilogueScheduleType>;
-
-    using AuxStoreDescriptor
-        = cutlass::epilogue::collective::detail::AuxStoreDescriptor<EpilogueDescriptor, LayoutD, ElementD>;
-
-    using TileBarrierType = cutlass::MulticastSystemBarrier<cutlass::detail::SyncNoOp, true /* Safe across phases */>;
-
-    using AuxStore = cutlass::epilogue::fusion::Sm90AuxStoreReduceWarpSpecialized<AuxStoreDescriptor::Stages,
-        typename EpilogueDescriptor::EpilogueTile, typename AuxStoreDescriptor::Element,
-        typename AuxStoreDescriptor::Stride, typename AuxStoreDescriptor::SmemLayoutAtom, RoundStyle,
-        typename AuxStoreDescriptor::CopyOpR2S, TileShape_MNK, TileBarrierType, OneShot>;
-
-    using FusionCallbacks = cutlass::epilogue::fusion::Sm90EVT<AuxStore, EVT_D>;
-
-    ////////////////
     // Epilogue
     ////////////////
+    using FusionOp = cutlass::epilogue::fusion::Sm90LinCombAuxAllReduce<OneShot, TileBarrierType, LayoutD, ElementD,
+        ElementCompute, ElementC>;
+
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<cutlass::arch::Sm90,
-        cutlass::arch::OpClassTensorOp, TileShape_MNK, ClusterShape_MNK, EpilogueTileType, ElementAccumulator,
-        ElementCompute, ElementC, LayoutC, AlignmentC, void, LayoutD, AlignmentD, // set to void because using EVT
-        EpilogueScheduleType, FusionCallbacks>::CollectiveOp;
+        cutlass::arch::OpClassTensorOp, TileShape_MNK, ClusterShape_MNK,
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute, ElementC, LayoutC,
+        AlignmentC, void, LayoutD, AlignmentD, EpilogueScheduleType, FusionOp>::CollectiveOp;
 
     ////////////////
     // AllReduce
@@ -138,9 +119,9 @@ public:
     static constexpr int CollectiveThreads
         = cute::is_base_of_v<cutlass::gemm::KernelTmaWarpSpecializedCooperative, MainLoopScheduleType> ? 256 : 128;
 
-    using CollectiveAllReduce = cutlass::communication::collective::CollectiveAllReduceMulticastWarpSpecialized<
-        typename AuxStoreDescriptor::Element, CollectiveThreads, TileShape_MNK, typename AuxStoreDescriptor::Stride,
-        TileBarrierType, LayoutD, OneShot>;
+    using CollectiveAllReduce
+        = cutlass::communication::collective::CollectiveAllReduceMulticastWarpSpecialized<ElementD, CollectiveThreads,
+            4 /* Unroll */, TileShape_MNK, StrideD, TileBarrierType, LayoutD, OneShot>;
 
     ////////////////
     // Mainloop
@@ -158,10 +139,6 @@ public:
     using GemmKernel = cutlass::gemm::kernel::GemmARUniversal<cute::Shape<int, int, int>, CollectiveMainloop,
         CollectiveEpilogue, CollectiveAllReduce, TileSchedulerType>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-    using StrideA = typename Gemm::GemmKernel::StrideA;
-    using StrideB = typename Gemm::GemmKernel::StrideB;
-    using StrideC = typename Gemm::GemmKernel::StrideC;
-    using StrideD = typename Gemm::GemmKernel::StrideD;
     using ProblemShapeType = typename Gemm::GemmKernel::ProblemShape;
 
     class PersistentWorkspace : public PersistentWorkspaceInterface
@@ -242,14 +219,14 @@ public:
         _hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(_hw_info.device_id);
     }
 
-    std::shared_ptr<PersistentWorkspaceInterface> getPersistentWorkspace(ProblemArgs const& max_problem)
+    std::shared_ptr<PersistentWorkspaceInterface> getPersistentWorkspace(ProblemArgs const& max_problem) override
     {
         auto [M, N, K, L] = max_problem.problem_size;
         assert(L == 1 && "batched GEMM not supported yet.");
         return std::make_shared<PersistentWorkspace>(M, N, max_problem.ranks);
     }
 
-    int run(ProblemArgs const& problem, cudaStream_t stream)
+    int run(ProblemArgs const& problem, cudaStream_t stream) override
     {
         Gemm gemm;
         auto arguments = getArgs(problem);
@@ -273,9 +250,9 @@ public:
     }
 
 private:
-    auto getArgs(ProblemArgs const& problem)
+    auto getArgs(ProblemArgs const& problem) const
     {
-        bool skip_AR = problem.ranks.size() == 1; // single-GPU doesn't need AR
+        bool const skip_AR = problem.ranks.size() == 1; // single-GPU doesn't need AR
 
         auto [M, N, K, L] = problem.problem_size;
         auto workspace = static_cast<PersistentWorkspace*>(problem.workspace);
@@ -287,58 +264,25 @@ private:
         auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, L));
         auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, L));
 
-        auto arguments = typename Gemm::Arguments{};
-
-        auto get_aux_store_args = [&](/* int output_stage */)
-        {
-            return typename AuxStore::Arguments{(ElementD*) problem.D_mc, (ElementD*) problem.D, stride_D,
-                skip_AR ? typename TileBarrierType::Params{} : workspace->getTileBarrierParams(), problem.rank,
-                int(problem.ranks.size())};
-        };
-
-        auto get_epilogue_args = [&](/* int output_stage */)
-        {
-            typename GemmKernel::EpilogueArguments epilogue{{}, (ElementD*) problem.C, stride_C, nullptr, stride_D};
-
-            epilogue.thread = {// unary op: aux store D
-                {
-                    // ternary op : beta * C + (alpha * acc)
-                    {{problem.beta}}, // leaf op+args : beta
-                    {},               // leaf op+args : C
-                    {
-                        // binary op : alpha * acc
-                        {{problem.alpha}}, // leaf op+args : alpha
-                        {},                // leaf op+args : acc
-                        {}                 // binary args : multiplies
-                    },                     // end binary op
-                    {}                     // ternary args : multiply_add
-                },
-                // aux store D
-                get_aux_store_args()};
-
-            return epilogue;
-        };
-
-        auto get_collective_allreduce_args = [&](/* int output_stage */)
-        {
-            return typename CollectiveAllReduce::Arguments{(ElementD*) problem.D_mc, (ElementD*) problem.D, stride_D,
+        return typename Gemm::Arguments{cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K},
+            {// Mainloop arguments
+                reinterpret_cast<ElementA const*>(problem.A), stride_A, reinterpret_cast<ElementB const*>(problem.B),
+                stride_B},
+            {// Epilogue arguments
+                {problem.alpha, problem.beta, problem.alpha_ptr, nullptr, reinterpret_cast<ElementD*>(problem.D_mc),
+                    reinterpret_cast<ElementD*>(problem.D), stride_D,
+                    skip_AR ? typename TileBarrierType::Params{} : workspace->getTileBarrierParams(), problem.rank,
+                    static_cast<int>(problem.ranks.size())},
+                reinterpret_cast<ElementC const*>(problem.C), stride_C, (ElementD*) nullptr, stride_D},
+            {// AllReduce arguments
+                reinterpret_cast<ElementD*>(problem.D_mc), reinterpret_cast<ElementD**>(problem.D_ipc), stride_D,
                 skip_AR ? typename TileBarrierType::Params{} : workspace->getTileBarrierParams(),
                 skip_AR ? typename TileBarrierType::Params{} : workspace->getCompletionBarrierParams(), problem.rank,
-                int(problem.ranks.size())};
-        };
-
-        arguments.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-        arguments.problem_shape = ProblemShapeType{M, N, K};
-        arguments.mainloop = {(ElementA*) problem.A, stride_A, (ElementB*) problem.B, stride_B};
-        arguments.epilogue = get_epilogue_args();
-        arguments.hw_info = _hw_info;
-        arguments.all_reduce = get_collective_allreduce_args();
-        arguments.scheduler = {};
-        arguments.scheduler.raster_order = RasterOrderOptions::AlongN;
-        // The tile scheduler will swizzle up to 8 and with the nearest multiple of 2 (i.e., 1, 2, 4, and 8)
-        arguments.scheduler.max_swizzle_size = 1;
-
-        return arguments;
+                static_cast<int>(problem.ranks.size()),
+                problem.launch_config.reduce_location == ReduceLocationType::kSWITCH},
+            _hw_info,
+            {// TileScheduler arguments
+                1, RasterOrderOptions::AlongN}};
     }
 
     // Holds the number of SMs on the GPU.

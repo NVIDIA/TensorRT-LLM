@@ -51,12 +51,8 @@ void ExplicitDraftTokensLayer<T>::allocateBuffer()
     mTemperature
         = mBufferManager->pinnedPool(ITensor::makeShape({mDecoderDomain.getBatchSize()}), TRTDataType<float>::value);
 
-    mScanWorkspaceSizeInBytes = invokeScanGenerationLengths(
-        nullptr, mScanWorkspaceSizeInBytes, nullptr, nullptr, mDecoderDomain.getBatchSize(), getStream());
-    mReduceWorkspaceSizeInBytes = invokeReduceMaxGenerationLengths(
-        nullptr, mReduceWorkspaceSizeInBytes, nullptr, nullptr, mDecoderDomain.getBatchSize(), getStream());
-
-    mWorkspaceSize = std::max(mScanWorkspaceSizeInBytes, mReduceWorkspaceSizeInBytes);
+    mWorkspaceSize = invokeScanReduceGenerationLengths(
+        mDecoderDomain.getBatchSize(), nullptr, nullptr, 0, nullptr, nullptr, getStream());
 
     mCurandStatesDevice = mBufferManager->gpu(
         ITensor::makeShape({mDecoderDomain.getBatchSize(), sizeof(curandState_t)}), TRTDataType<int8_t>::value);
@@ -261,9 +257,8 @@ void ExplicitDraftTokensLayer<T>::convertPackedMask(ExplicitDraftTokensOutputs c
     auto generationLengthInclusiveSumPtr = bufferCastOrNull<SizeType32>(mGenerationLengthInclusiveSum);
     auto workSpaceDevicePtr = workspace->getRawWorkspaceDevicePtr();
     auto maxGenerationLengthPtr = bufferCastOrNull<SizeType32>(mMaxGenerationLength);
-    invokeScanReduceGenerationLengths(batchSize, generationLengths, workSpaceDevicePtr, mScanWorkspaceSizeInBytes,
-        generationLengthInclusiveSumPtr, workSpaceDevicePtr, mReduceWorkspaceSizeInBytes, maxGenerationLengthPtr,
-        getStream());
+    invokeScanReduceGenerationLengths(batchSize, generationLengths, workSpaceDevicePtr, mWorkspaceSize,
+        generationLengthInclusiveSumPtr, maxGenerationLengthPtr, getStream());
 
     invokeConvertMaskToPackedMask(batchSize, generationLengthInclusiveSumPtr, maxGenerationLengthPtr, masksDevice,
         batchSlots, mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingDraftTokens(),

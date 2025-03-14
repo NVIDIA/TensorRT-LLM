@@ -9,7 +9,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from functional.torch_ref import mamba_conv1d_ref
 from utils.util import unittest_name_func
 
@@ -66,16 +66,16 @@ class TestFunctional(unittest.TestCase):
             last_token_ids_input = last_token_ids
 
         if req_type == "context":
-            past_conv_state = torch.zeros([batch_size, dim, dconv - 1],
-                                          dtype=torch_dtype,
-                                          device=device)
+            conv_state = torch.zeros([batch_size, dim, dconv - 1],
+                                     dtype=torch_dtype,
+                                     device=device)
         else:
-            past_conv_state = torch.randn(batch_size,
-                                          dim,
-                                          dconv - 1,
-                                          dtype=torch_dtype,
-                                          device=device)
-            past_conv_state.normal_(mean, std_dev)
+            conv_state = torch.randn(batch_size,
+                                     dim,
+                                     dconv - 1,
+                                     dtype=torch_dtype,
+                                     device=device)
+            conv_state.normal_(mean, std_dev)
 
         conv_weight = torch.randn([dim, 1, dconv],
                                   dtype=torch_dtype,
@@ -115,19 +115,22 @@ class TestFunctional(unittest.TestCase):
             x_input = torch.cat([pad_pre, x_input, pad_post],
                                 dim=-1).contiguous()
 
-        past_conv_state_input = past_conv_state.permute(0, 2, 1).contiguous()
+        conv_state_input = conv_state.permute(0, 2, 1).contiguous()
         conv_weight_input = conv_weight.permute(1, 2, 0).contiguous()
 
         is_paged_state = False
         slot_mapping = None
 
+        if remove_padding and req_type == "generation":
+            x_input = x_input.squeeze(1)
+
         outputs = torch.ops.trtllm.mamba_conv1d(
             x_input,
             conv_weight_input,
             conv_bias,
+            conv_state_input,
             host_request_types,
             last_token_ids_input,
-            past_conv_state_input,
             host_context_lengths,
             slot_mapping,
             dim,
@@ -140,22 +143,21 @@ class TestFunctional(unittest.TestCase):
         )
 
         out_ref = torch.zeros_like(x)
-        present_conv_state_ref = torch.zeros_like(past_conv_state)
+        conv_state_ref = torch.zeros_like(conv_state)
 
         for b in range(batch_size):
             (
                 out_ref[b:b + 1, :, :host_context_lengths[b].item()],
-                present_conv_state_ref[b:b + 1, :, :],
+                conv_state_ref[b:b + 1, :, :],
             ) = mamba_conv1d_ref(
                 x[b:b + 1, :, :host_context_lengths[b].item()],
-                past_conv_state[b:b + 1, :, :],
+                conv_state[b:b + 1, :, :],
                 conv_weight,
                 conv_bias,
                 apply_silu,
             )
 
-        present_conv_state_ref = present_conv_state_ref.permute(0, 2,
-                                                                1).contiguous()
+        conv_state_ref = conv_state_ref.permute(0, 2, 1).contiguous()
         out_ref = out_ref.permute(0, 2, 1).contiguous()
 
         if remove_padding and req_type == "context":
@@ -164,6 +166,9 @@ class TestFunctional(unittest.TestCase):
                 out_ref_batches.append(out_ref[b, :host_context_lengths[b], :])
             out_ref = torch.cat(out_ref_batches, dim=0)
 
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
+
         atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 1e-1}
 
         torch.testing.assert_close(outputs[0],
@@ -171,6 +176,6 @@ class TestFunctional(unittest.TestCase):
                                    rtol=1e-2,
                                    atol=atol[dtype])
         torch.testing.assert_close(outputs[1],
-                                   present_conv_state_ref,
+                                   conv_state_ref,
                                    rtol=1e-2,
                                    atol=atol[dtype])

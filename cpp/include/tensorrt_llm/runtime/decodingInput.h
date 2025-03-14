@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <optional>
+#include <utility>
 
 namespace tensorrt_llm::runtime
 {
@@ -52,23 +53,27 @@ public:
 
     // mandatory parameters
 
-    SizeType32 step;               //!< The index of the decoding step we are on. Only used in Python runtime.
+    SizeType32 step;                    //!< The index of the decoding step we are on. Only used in Python runtime.
 
-    SizeType32 maxLength;          //!< The maximum number of tokens to decode.
+    SizeType32 maxLength;               //!< The maximum number of tokens to decode.
 
-    SizeType32 maxAttentionWindow; //!< The maximum length of the attention window to consider while decoding.
+    SizeType32 maxAttentionWindow;      //!< The maximum length of the attention window to consider while decoding.
 
-    SizeType32 sinkTokenLength;    //!< the number of tokens to use as attention sinks, as described there: @link
-                                   //!< https://arxiv.org/html/2309.17453v3
+    SizeType32 sinkTokenLength;         //!< the number of tokens to use as attention sinks, as described there: @link
+                                        //!< https://arxiv.org/html/2309.17453v3
 
-    SizeType32 batchSize;          //!< The number of samples in the batch.
+    SizeType32 batchSize;               //!< The number of requests in the batch.
 
-    SizeType32 maxStopWordsLen;    //!<  The maximum value in the `stopWordsLens` tensor.
+    std::vector<SizeType32> beamWidths; //!<  [batchSize], the beam widths of each request.
 
-    SizeType32 maxBadWordsLen;     //!<  The maximum value in the `badWordsLens` tensor.
+    std::vector<SizeType32> numDecodingEngineTokens; //!<  [batchSize], the num tokens of each request.
 
-    TensorConstPtr logits;         //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
-                                   //!<  distribution over the vocabulary, the output of the model.
+    SizeType32 maxStopWordsLen;                      //!<  The maximum value in the `stopWordsLens` tensor.
+
+    SizeType32 maxBadWordsLen;                       //!<  The maximum value in the `badWordsLens` tensor.
+
+    TensorConstPtr logits; //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
+                           //!<  distribution over the vocabulary, the output of the model.
     std::optional<std::vector<TensorConstPtr>>
         logitsVec; //!< Vector of size [batchSize] contains logits of size [beamWidth, vocabSizePadded], on gpu. This is
                    //!< another view on the @property logits
@@ -156,17 +161,17 @@ public:
             TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
             TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
             TensorConstPtr chunkedContextNextTokens, TensorConstPtr seqSlots)
-            : nextDraftTokens(nextDraftTokens)
-            , nextDraftLens(nextDraftLens)
-            , nextDraftPaths(nextDraftPaths)
-            , lastDraftTokens(lastDraftTokens)
-            , lastDraftLens(lastDraftLens)
-            , lastDraftPaths(lastDraftPaths)
-            , acceptedTokens(acceptedTokens)
-            , acceptedLens(acceptedLens)
-            , acceptedPathIds(acceptedPathIds)
-            , chunkedContextNextTokens(chunkedContextNextTokens)
-            , seqSlots(seqSlots)
+            : nextDraftTokens(std::move(nextDraftTokens))
+            , nextDraftLens(std::move(nextDraftLens))
+            , nextDraftPaths(std::move(nextDraftPaths))
+            , lastDraftTokens(std::move(lastDraftTokens))
+            , lastDraftLens(std::move(lastDraftLens))
+            , lastDraftPaths(std::move(lastDraftPaths))
+            , acceptedTokens(std::move(acceptedTokens))
+            , acceptedLens(std::move(acceptedLens))
+            , acceptedPathIds(std::move(acceptedPathIds))
+            , chunkedContextNextTokens(std::move(chunkedContextNextTokens))
+            , seqSlots(std::move(seqSlots))
         {
         }
 

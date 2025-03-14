@@ -91,7 +91,7 @@ int IdentityPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer
 
     cudaMemcpyAsync(outputs[0], inputs[0], count, cudaMemcpyDeviceToDevice, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

@@ -54,7 +54,7 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
         auto batchSlots = getDefaultBatchSlots(batchSize);
         auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
         tk::invokeCurandInitialize(curandStates, batchSlotsPtr, batchSize, seed, this->mStream->get());
-        sync_check_cuda_error();
+        sync_check_cuda_error(this->mStream->get());
 
         // Generate random numbers using initialized curand states.MemoryType
         auto randValsDevice = this->mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
@@ -117,7 +117,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     // Initialize curand states.
     tk::invokeCurandBatchInitialize(curandStates, batchSlotsPtr, batchSize,
         reinterpret_cast<uint64_t*>(bufferCast<int64_t>(*randomSeedsDevice)), mStream->get());
-    sync_check_cuda_error();
+    sync_check_cuda_error(mStream->get());
 
     // Generate random numbers using initialized curand states.
     auto randValsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
@@ -139,7 +139,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     }
 
     cudaFree(curandStates);
-    sync_check_cuda_error();
+    sync_check_cuda_error(mStream->get());
 }
 
 template <typename T>

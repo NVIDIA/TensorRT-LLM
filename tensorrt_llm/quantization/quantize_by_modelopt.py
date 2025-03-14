@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
+from modelopt.torch.utils import print_rank_0
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
@@ -139,6 +140,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Qwen2VLForConditionalGeneration": "qwen2_vl",
     "RecurrentGemma": "recurrentgemma",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
@@ -211,6 +213,13 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         if model_type and model_type == "qwen":
             # qwen use token id 151643 as pad and eos tokens
             tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
+            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
+        elif model_type and model_type == "qwen2_vl":
+            # qwen use token id 151643 as pad and 151643 and 151645 as eos tokens
+            tokenizer.eos_token = [
+                tokenizer.convert_ids_to_tokens(151643),
+                tokenizer.convert_ids_to_tokens(151645)
+            ]
             tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         else:
             tokenizer.pad_token = tokenizer.eos_token
@@ -300,6 +309,9 @@ def get_model(ckpt_path: str,
     elif hf_config.model_type == 'mllama':
         from transformers import MllamaForConditionalGeneration
         model_cls = MllamaForConditionalGeneration
+    elif hf_config.model_type == 'qwen2_vl':
+        from transformers import Qwen2VLForConditionalGeneration
+        model_cls = Qwen2VLForConditionalGeneration
 
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
@@ -326,6 +338,11 @@ def get_model(ckpt_path: str,
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
+        elif hf_config.model_type == "qwen2_vl":
+            #WAR for Qwen2-VL because its lm_head is outside of LLM
+            lm_head = model.lm_head
+            model = model.model
+            model.lm_head = lm_head
 
     model.eval()
 
@@ -638,7 +655,8 @@ def quantize_and_export(*,
                         medusa_model_dir=None,
                         quant_medusa_head=None,
                         auto_quantize_bits=None,
-                        device_map="auto"):
+                        device_map="auto",
+                        quantize_lm_head=False):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -734,6 +752,10 @@ def quantize_and_export(*,
             if model_type == "gemma" and "int8_sq" in qformat:
                 quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
+            if qformat == 'fp8' and quantize_lm_head:
+                print_rank_0("Quantizing lm_head layer")
+                del quant_cfg["quant_cfg"]["*lm_head*"]
+
         calib_dataloader = get_calib_dataloader(
             dataset_name_or_dir=calib_dataset,
             tokenizer=tokenizer,
@@ -772,6 +794,7 @@ def quantize_and_export(*,
 
         if model_type == 'mllama':
             model = model.language_model
+
         export_tensorrt_llm_checkpoint(
             model.hf_model if is_enc_dec else model,
             model_type,
@@ -831,7 +854,7 @@ def quantize_and_export(*,
                     json.dump(tensorrt_llm_config, f, indent=4)
 
             # Workaround for qwen version
-            if model_type == 'qwen':
+            if model_type == 'qwen' or model_type == 'qwen2_vl':
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 qwen_config = AutoConfig.from_pretrained(model_dir,
@@ -914,6 +937,18 @@ def quantize_and_export(*,
                     if key not in tensorrt_llm_config:
                         tensorrt_llm_config[key] = value
 
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
+
+            # Workaround for lm_head quantization
+            # Can be removed after modelopt version is > 0.23
+            if quantize_lm_head:
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                if 'lm_head' in tensorrt_llm_config['quantization'][
+                        'exclude_modules']:
+                    tensorrt_llm_config['quantization'][
+                        'exclude_modules'].remove('lm_head')
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -1005,7 +1040,6 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
     from megatron.core import parallel_state
     from megatron.core.transformer.module import Float16Module
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
-    from modelopt.torch.utils import print_rank_0
     from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import \
         MegatronGPTModel
     from nemo.collections.nlp.modules.common.text_generation_strategy import \

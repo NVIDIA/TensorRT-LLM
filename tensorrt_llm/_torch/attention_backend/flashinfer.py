@@ -9,6 +9,7 @@ from flashinfer.jit.core import check_cuda_arch
 
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, AttentionMask, AttentionMetadata, PredefinedAttentionMask)
+from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -447,7 +448,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             q = q.view(1, -1, num_heads, head_dim)
             k = k.view(1, -1, num_kv_heads, head_dim)
             v = v.view(1, -1, num_kv_heads, head_dim)
-            return AttentionBackend.dummy_forward(q, k, v)
+            return VanillaAttention.dummy_forward(q, k, v)
 
         assert isinstance(
             metadata,

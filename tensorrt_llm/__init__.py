@@ -40,10 +40,11 @@ from ._common import _init, default_net, default_trtnet, precision
 # but may be called in dependencies (such as examples)
 from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
-from ._utils import (mpi_rank, mpi_world_size, str_dtype_to_trt,
+from ._utils import (mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
                      torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
+from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
 from .llmapi.llm import LLM, LlmArgs
 from .logger import logger
@@ -65,6 +66,7 @@ __all__ = [
     'str_dtype_to_torch'
     'mpi_barrier',
     'mpi_rank',
+    'set_mpi_comm',
     'mpi_world_size',
     'constant',
     'default_net',
@@ -91,6 +93,7 @@ __all__ = [
     'LLM',
     'LlmArgs',
     'SamplingParams',
+    'DisaggregatedParams',
     'KvCacheConfig',
     '__version__',
 ]

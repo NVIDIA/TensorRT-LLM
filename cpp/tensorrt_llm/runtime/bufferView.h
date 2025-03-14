@@ -44,6 +44,8 @@ public:
         }
     }
 
+    using IBuffer::data;
+
     void* data() override
     {
         if (getSize() == 0)

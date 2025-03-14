@@ -416,7 +416,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     auto beginOffsetBuf = static_cast<SizeType32*>(alignedPointers[5]);
 
     invokeTopPInitialize(idVals, offsetBuf, beginOffsetBuf, params.batchSize, params.vocabSizePadded, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     SizeType32 constexpr BLOCK_SIZE = 256;
     // Performs Top K=1 search.
@@ -424,7 +424,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     topPBeamTopKKernel<T, BLOCK_SIZE><<<params.batchSize, BLOCK_SIZE, 0, stream>>>(params.probs, sortedIdVals,
         sortedProbs, params.finishedInput, params.vocabSizePadded, offsetBuf, beginOffsetBuf, params.topPs,
         params.skipDecode, params.batchSlots);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     // Sort tokens by probability in descending order
     auto cubWorkspaceSize = workspaceSizes[0];
@@ -444,7 +444,7 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
         params.curandState, params.randomVals, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode,
         params.batchSlots, params.returnAllSelectedTokens, params.returnAllSelectedTokensPerSlot, params.maxSeqLen,
         params.outputIdCurrentStep, params.skipOutputIdCurrentStep);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
