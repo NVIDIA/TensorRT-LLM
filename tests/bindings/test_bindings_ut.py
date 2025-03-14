@@ -3,6 +3,7 @@ import os
 import pickle
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -527,3 +528,53 @@ def test_SamplingConfig_pickle():
     config1 = pickle.loads(pickle.dumps(config))
 
     assert config1 == config
+
+
+def test_KvCache_events_binding():
+    stream = torch.cuda.Stream()
+    kwargs = {
+        'num_kv_heads_per_layer': [1, 1],
+        'size_per_head':
+        128,
+        'tokens_per_block':
+        64,
+        'blocks_in_primary_pool':
+        1000,
+        'blocks_in_secondary_pool':
+        10000,
+        'max_num_sequences':
+        1,
+        'max_beam_width':
+        1,
+        'max_attention_window':
+        10,
+        'temporary_attention_window':
+        0,
+        'sink_token_length':
+        0,
+        'stream':
+        stream.cuda_stream,
+        'max_sequence_length':
+        10,
+        'enable_block_reuse':
+        True,
+        'onboard_blocks':
+        False,
+        'cache_type':
+        _tb.internal.batch_manager.CacheType.SELF,
+        'event_manager':
+        _tb.internal.batch_manager.KVCacheEventManager(
+            max_kv_event_entries=1024)
+    }
+
+    kv_cache_manager = _tb.internal.batch_manager.KVCacheManager(**kwargs)
+    kv_cache_manager.flush_iteration_events()
+    time.sleep(0.0001)
+    events = kv_cache_manager.get_latest_events()
+    assert len(events) == 1
+    assert isinstance(events[0], _tb.executor.kv_cache.KVCacheEvent)
+    assert events[0].event_id == 0 and isinstance(
+        events[0].data, _tb.executor.kv_cache.KVCacheCreatedData)
+
+    del stream
+    torch.cuda.empty_cache()

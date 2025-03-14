@@ -45,8 +45,8 @@ from tensorrt_llm.runtime.kv_cache_manager import GenerationSequence
 from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
     PoolsKVCacheManager
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from examples.gpt.convert_checkpoint import convert_and_save_hf
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../examples'))
+from gpt.convert_checkpoint import convert_and_save_hf
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -935,6 +935,7 @@ class TestGPT(unittest.TestCase):
         temperature = 1
         top_k = 0
         top_p = 0.0
+        random_seed = 0
         length_penalty = 1
         repetition_penalty = 1
 
@@ -965,6 +966,7 @@ class TestGPT(unittest.TestCase):
                                          temperature=temperature,
                                          top_k=top_k,
                                          top_p=top_p,
+                                         random_seed=random_seed,
                                          length_penalty=length_penalty,
                                          repetition_penalty=repetition_penalty)
         input_ids = torch.randint(100, (batch_size, seq_len)).int().cuda()

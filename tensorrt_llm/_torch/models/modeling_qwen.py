@@ -8,6 +8,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -128,23 +129,30 @@ class QwenModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[Qwen2Config]):
         super().__init__(model_config)
-        config = self.model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
+        config = self.model_config
+        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            dtype=config.torch_dtype,
+            config.pretrained_config.vocab_size,
+            config.pretrained_config.hidden_size,
+            dtype=config.pretrained_config.torch_dtype,
+            parallel_config=ParallelConfig(
+                tensor_parallel_rank=config.mapping.tp_rank,
+                tensor_parallel_size=config.mapping.tp_size,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+                gpus_per_node=config.mapping.gpus_per_node,
+            ),
         )
         self.layers = nn.ModuleList([
             QwenDecoderLayer(
                 model_config,
                 layer_idx,
-            ) for layer_idx in range(config.num_hidden_layers)
+            ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size=config.hidden_size,
-                            eps=config.rms_norm_eps,
-                            dtype=config.torch_dtype)
+        self.norm = RMSNorm(hidden_size=config.pretrained_config.hidden_size,
+                            eps=config.pretrained_config.rms_norm_eps,
+                            dtype=config.pretrained_config.torch_dtype)
 
     def forward(
         self,

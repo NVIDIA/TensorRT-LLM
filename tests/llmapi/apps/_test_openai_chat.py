@@ -2,34 +2,79 @@
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
 import os
 import sys
+import tempfile
 from typing import List
 
 import numpy as np
 import openai
 import pytest
+import yaml
 from openai_server import RemoteOpenAIServer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import get_model_path
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
 def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module",
+                params=[None, 'pytorch'],
+                ids=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
+@pytest.fixture(scope="module",
+                params=[True, False],
+                ids=["extra_options", "no_extra_options"])
+def extra_llm_api_options(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
+def temp_extra_llm_api_options_file(request):
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+    try:
+        extra_llm_api_options_dict = {
+            "enable_chunked_prefill": False,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "max_tokens": 40000
+            }
+        }
+
+        with open(temp_file_path, 'w') as f:
+            yaml.dump(extra_llm_api_options_dict, f)
+
+        yield temp_file_path
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, backend: str, extra_llm_api_options: bool,
+           temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     if backend == "pytorch":
         args = ["--backend", f"{backend}"]
     else:
         args = ["--max_beam_width", "4"]
+    if extra_llm_api_options:
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -56,7 +101,8 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
+        temperature=0.0,
         logprobs=False,
     )
     assert chat_completion.id is not None
@@ -65,13 +111,25 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
     assert message.content is not None
     assert message.role == "assistant"
     # test finish_reason
+    finish_reason = chat_completion.choices[0].finish_reason
     completion_tokens = chat_completion.usage.completion_tokens
-    if chat_completion.choices[0].finish_reason == "length":
+    if finish_reason == "length":
         assert completion_tokens == 10
-    elif chat_completion.choices[0].finish_reason == "stop":
+    elif finish_reason == "stop":
         assert completion_tokens <= 10
     else:
-        raise RuntimeError("finish_reason not in [length, stop]")
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
+    # test max_tokens
+    legacy = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=10,
+        temperature=0.0,
+        logprobs=False,
+    )
+    assert legacy.choices[0].message.content \
+        == chat_completion.choices[0].message.content
 
 
 def test_single_chat_session_with_logprobs(client: openai.OpenAI,
@@ -90,7 +148,7 @@ def test_single_chat_session_with_logprobs(client: openai.OpenAI,
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         logprobs=True,
     )
     assert chat_completion.id is not None
@@ -100,17 +158,19 @@ def test_single_chat_session_with_logprobs(client: openai.OpenAI,
     assert message.role == "assistant"
     # test logprobs
     logprobs = chat_completion.choices[0].logprobs.content
-    if chat_completion.choices[0].finish_reason == "length":
+    finish_reason = chat_completion.choices[0].finish_reason
+    if finish_reason == "length":
         assert len(logprobs) == 10
-    elif chat_completion.choices[0].finish_reason == "stop":
+    elif finish_reason == "stop":
         assert len(logprobs) <= 10
     else:
-        raise RuntimeError("finish_reason not in [length, stop]")
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
     for logprob in logprobs:
         assert logprob.token is not None
         assert logprob.logprob is not None
         assert logprob.bytes is not None
-        assert len(logprob.top_logprobs) == 0
+        assert logprob.top_logprobs is None
 
 
 def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
@@ -127,7 +187,7 @@ def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
     )
     message = chat_completion.choices[0].message
     assert message.content is not None and len(message.content) >= 0
@@ -147,7 +207,7 @@ def test_beam_search(client: openai.OpenAI, model_name: str, backend: str):
     chat_completion = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         n=2,
         temperature=0.0,
         extra_body=dict(use_beam_search=True),
@@ -172,7 +232,7 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
     chat_completion = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         logprobs=False,
     )
@@ -183,7 +243,7 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
     stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         logprobs=False,
         stream=True,
@@ -213,7 +273,8 @@ async def test_chat_streaming(async_client: openai.AsyncOpenAI,
     elif finish_reason == "stop":
         assert num_tokens <= 10
     else:
-        raise RuntimeError("finish_reason not in [length, stop]")
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
     # test generated tokens
     assert "".join(str_chunks) == output
 
@@ -235,7 +296,7 @@ async def test_chat_streaming_with_logprobs(async_client: openai.AsyncOpenAI,
     chat_completion = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         logprobs=True,
     )
@@ -251,7 +312,7 @@ async def test_chat_streaming_with_logprobs(async_client: openai.AsyncOpenAI,
     stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         logprobs=True,
         stream=True,
@@ -290,7 +351,8 @@ async def test_chat_streaming_with_logprobs(async_client: openai.AsyncOpenAI,
     elif finish_reason == "stop":
         assert num_tokens <= 10
     else:
-        raise RuntimeError("finish_reason not in [length, stop]")
+        raise RuntimeError(
+            f"finish_reason {finish_reason} not in [length, stop]")
     # test generated tokens
     assert "".join(str_chunks) == output
     # test logprobs
@@ -314,7 +376,7 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
     stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         stream=True,
         stream_options={"include_usage": False})
@@ -326,7 +388,7 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
     stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         stream=True,
         stream_options={
@@ -350,7 +412,7 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
         await async_client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=10,
+            max_completion_tokens=10,
             temperature=0.0,
             stream=False,
             stream_options={"include_usage": None})
@@ -360,7 +422,7 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
         await async_client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=10,
+            max_completion_tokens=10,
             temperature=0.0,
             stream=False,
             stream_options={"include_usage": True})
@@ -370,7 +432,7 @@ async def test_chat_completion_stream_options(async_client: openai.AsyncOpenAI,
     stream = await async_client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         stream=True,
         stream_options={
@@ -430,7 +492,7 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     resp = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        max_tokens=10,
+        max_completion_tokens=10,
         temperature=0.0,
         stop="two",
     )

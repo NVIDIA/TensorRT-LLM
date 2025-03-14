@@ -123,11 +123,19 @@ class Mapping(object):
             pp_size=1,
             moe_tp_size=-1,  # -1 means no moe
             moe_ep_size=-1,  # -1 means no moe
-            auto_parallel=False):
+            auto_parallel=False,
+            enable_attention_dp=False):
         # set default values for non-moe cases
-        if moe_tp_size == -1:
+        # or where only one MOE parallelism size is specified
+        if moe_tp_size == -1 and moe_ep_size == -1:
             moe_tp_size = tp_size
             moe_ep_size = 1
+
+        elif moe_tp_size == -1:
+            moe_tp_size = tp_size // moe_ep_size
+
+        elif moe_ep_size == -1:
+            moe_ep_size = tp_size // moe_tp_size
 
         if auto_parallel:
             if tp_size != 1 or pp_size != 1 or tp_size != 1:
@@ -159,7 +167,7 @@ class Mapping(object):
         self.world_size = world_size
         self.rank = rank
         self.gpus_per_node = gpus_per_node
-
+        self.enable_attention_dp = enable_attention_dp
         self.pp_groups = []
         self.cp_groups = []
         self.tp_groups = []

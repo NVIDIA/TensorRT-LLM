@@ -26,7 +26,7 @@
 namespace tensorrt_llm::runtime
 {
 class TllmRuntime;
-class IpcNvlsTensor;
+class MulticastTensor;
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
@@ -105,7 +105,7 @@ public:
     TensorPtr seqSlotsAltDevice;
     TensorPtr skipCrossAttnBlocks;
 
-    std::shared_ptr<tensorrt_llm::runtime::IpcNvlsTensor> gemmAllReduceOutput;
+    std::shared_ptr<tensorrt_llm::runtime::MulticastTensor> gemmAllReduceOutput;
 
     TransformerBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,

@@ -267,7 +267,7 @@ def save_config(args):
         config['quantization'] = {
             'quant_algo': "FP8",
             # TODO: add support for exclude modules.
-            # 'exclude_modules': "*final_layer*",
+            # 'exclude_modules': ["*final_layer*"],
         }
 
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:

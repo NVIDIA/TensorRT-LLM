@@ -8,7 +8,7 @@ import pytest
 from parameterized import parameterized
 
 from tensorrt_llm.executor import ExecutorBindingsProxy
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -25,10 +25,21 @@ from test_llm import (
     llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
-    run_llm_with_postprocess_parallel_and_result_handler)
+    run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
+    sampling_params_for_aborting_request)
+from test_llm_kv_cache_events import create_llm
 from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
-                        skip_single_gpu, unittest_name_func)
+                        skip_single_gpu, unittest_name_func, force_ampere)
 # isort: on
+
+# shrink the kv_cache_config to avoid OOM in CI
+global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+# python api does not seem to support extra tokens needed for prompt tuning + reuse.
+# disable block reuse for those tests.
+# TODO: Add extra tokens to prompt tuning unit tests.
+global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                                enable_block_reuse=False)
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +58,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
         llm = LLM(
             ckpt_dir,
             tokenizer=tokenizer,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+            kv_cache_config=global_kv_cache_config,
         )
         assert llm.args.parallel_config.tp_size == tp_size
 
@@ -55,16 +66,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     llm.save(tmpdir.name)
 
     return tmpdir
-
-
-# shrink the kv_cache_config to avoid OOM in CI
-global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-
-# python api does not seem to support extra tokens needed for prompt tuning + reuse.
-# disable block reuse for those tests.
-# TODO: Add extra tokens to prompt tuning unit tests.
-global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                                enable_block_reuse=False)
 
 
 @skip_single_gpu
@@ -246,15 +247,48 @@ def test_llama_v2_7b_prompt_adapter_tp2():
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
+def run_command(command: str):
+    try:
+        result = subprocess.run(command,
+                                shell=True,
+                                check=True,
+                                env=os.environ,
+                                capture_output=True,
+                                text=True)  # nosec B603
+        print("Command output:")
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("Command failed with exit code:", e.returncode)
+        print("Error output:")
+        print(e.stderr)
+        print("Standard output:")
+        print(e.stdout)
+        raise e
+
+
 @skip_single_gpu
-def _test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
+def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
-    subprocess.run(command, shell=True, check=True,
-                   env=os.environ)  # nosec B603
+    print(f"Command: {command}")
+
+    run_command(command)
+
+
+@skip_single_gpu
+def test_llm_multi_node_with_postproc():
+    # TODO[chunweiy]: reactivate this later
+    nworkers = 2
+    test_case_file = os.path.join(os.path.dirname(__file__),
+                                  "run_llm_with_postproc.py")
+    os.path.join(os.path.dirname(__file__), "launch.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers}"
+    print(f"Command: {command}")
+
+    run_command(command)
 
 
 @skip_single_gpu
@@ -364,16 +398,22 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    proxy_class=DummyExecutorProxy3)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
 @skip_single_gpu
-def test_llm_get_stats_tp2():
-    llm_get_stats_test_harness(tp_size=2)
+@pytest.mark.parametrize("pytorch_backend", [False, True])
+def test_llm_get_stats_tp2(pytorch_backend):
+    if pytorch_backend:
+        pytest.skip("https://nvbugs/5150466: Flaky hang")
+        return
+    llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
 @skip_single_gpu
-def test_llm_get_stats_async_tp2():
-    llm_get_stats_async_test_harness(tp_size=2)
+@pytest.mark.parametrize("pytorch_backend", [False, True])
+def test_llm_get_stats_async_tp2(pytorch_backend):
+    if pytorch_backend:
+        pytest.skip("https://nvbugs/5150466: Flaky hang")
+        return
+    llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 def test_llm_capture_request_error():
@@ -384,8 +424,55 @@ def test_llm_with_postprocess_parallel_tp2():
     run_llm_with_postprocess_parallel(tp_size=2)
 
 
-def test_llm_with_postprocess_parallel_and_result_handler_tp2():
-    run_llm_with_postprocess_parallel_and_result_handler(tp_size=2)
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("backend", [None, "pytorch"])
+def test_llm_with_postprocess_parallel_and_result_handler_tp2(
+        streaming: bool, backend: str):
+    run_llm_with_postprocess_parallel_and_result_handler(streaming,
+                                                         backend,
+                                                         tp_size=2)
+
+
+@force_ampere
+@skip_single_gpu
+def test_llm_get_kv_cache_events_tp2():
+    llm = create_llm(tensor_parallel_size=2)
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+
+    _ = llm.generate(prompt, sampling_params=sampling_params)
+
+    events = llm.get_kv_cache_events(5)
+
+    # created + stored events
+    assert events and len(events) >= 2
+    for event in events:
+        if event:
+            if event[0]["event_id"] == 0:
+                assert event[0]["data"]["type"] == "created"
+            elif event[0]["event_id"] == 1:
+                assert event[0]["data"]["type"] == "stored"
+
+
+@pytest.fixture(scope="module")
+def llm_for_sampling_params_tp2() -> LLM:
+    build_config = BuildConfig(max_beam_width=3)
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+        fast_build=True,
+        kv_cache_config=global_kv_cache_config,
+        tensor_parallel_size=2,
+    )
+    return llm
+
+
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
+def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
+                               sampling_params: SamplingParams):
+    run_llm_abort_request(llm=llm_for_sampling_params_tp2,
+                          sampling_params=sampling_params)
 
 
 if __name__ == '__main__':

@@ -242,11 +242,11 @@ def get_default_trtllm_modules_to_hf_modules():
         "mlp_h_to_4h": "gate_proj",
         "mlp_4h_to_h": "down_proj",
         "mlp_gate": "up_proj",
+        "mlp_gate_up": "gate_up_proj",
         "moe_h_to_4h": "w1",
         "moe_4h_to_h": "w2",
         "moe_gate": "w3",
         "moe_router": "gate",
-        "mlp_gate_up": "gate_up_proj",
     }
 
 

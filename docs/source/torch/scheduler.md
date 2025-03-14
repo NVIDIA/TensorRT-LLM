@@ -26,7 +26,7 @@ The inputs to `SimpleScheduler` include `active_requests` and `inflight_request_
 To customize the scheduler or batching mechanism, implement your own `CapacityScheduler` and `MicroBatchScheduler` by inheriting their respective classes.
 If two-step scheduling is unnecessary, inherit `RequestScheduler` and implement `schedule_request` directly.
 
-An example of a `CapacityScheduler` implementation is the `GuaranteedNoEvictScheduler` class, found in [scheduler.py](../../../tensorrt_llm/_torch/pyexecutor/scheduler.py).
+An example of a `CapacityScheduler` implementation is the `GuaranteedNoEvictScheduler` class, found in [scheduler.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/scheduler.py).
 This class was used before the C++ binding of `CapacityScheduler` and initially employed a Python-based scheduler.
 It inherits `CapacityScheduler` and implements its own `schedule_request` method.
 This method processes all `active_requests` and tries to schedule more requests that can fit in the KV cache.
@@ -90,7 +90,7 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
 ```
 
 After implementing your own scheduler, integrate it into the PyExecutor.
-For the PyTorch backend, the code is in [pytorch_model_registry.py](../../../tensorrt_llm/_torch/pyexecutor/backend_registries/pytorch_model_registry.py).
+For the PyTorch backend, the code is in [py_executor_creator.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py).
 In the `create_pytorch_model_based_executor` function, there are two lines creating `CapacityScheduler`:
 
 ```python

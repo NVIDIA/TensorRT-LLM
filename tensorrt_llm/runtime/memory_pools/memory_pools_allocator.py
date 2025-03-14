@@ -1,4 +1,4 @@
-from collections import Counter
+from itertools import chain
 from typing import List
 
 import torch
@@ -19,16 +19,19 @@ class MemoryPoolsAllocator(object):
         self._head_size = head_size
 
     def allocate(self, dtype, num_kv_heads_per_layer: List[int], device="cuda"):
-        self._num_kv_heads_per_layer = num_kv_heads_per_layer
-
         if isinstance(dtype, str):
             dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
-        kv_heads_unique_counter = Counter(self._num_kv_heads_per_layer)
-        keys_to_indices = {}
 
-        for idx, (kv_head,
-                  num_layers) in enumerate(kv_heads_unique_counter.items()):
-            keys_to_indices[kv_head] = idx
+        # LayerCachePoolLocator{.indexOfPool, .layerIdxInCachePool}"
+        layers_mapping = [[-1, -1]] * len(num_kv_heads_per_layer)
+        unique_nkvh = sorted(set(num_kv_heads_per_layer))
+        for index_of_pool, kv_head in enumerate(unique_nkvh):
+            layers = [
+                layer for layer, nkvh in enumerate(num_kv_heads_per_layer)
+                if nkvh == kv_head
+            ]
+
+            num_layers = len(layers)
             cache_shape = (
                 self._num_blocks,
                 num_layers,
@@ -42,17 +45,14 @@ class MemoryPoolsAllocator(object):
             self._pools_metadata.append(
                 Pool(num_kv_heads=kv_head, num_layers=num_layers))
 
-        self._set_layers_mapping(keys_to_indices)
+            for layer_idx_in_cache_pool, layer in enumerate(layers):
+                layers_mapping[layer] = [index_of_pool, layer_idx_in_cache_pool]
+
+        assert -1 not in set(chain(*layers_mapping))
+        self._pool_mapping = torch.tensor(layers_mapping, dtype=torch.int32)
 
     def get_kv_cache_pool_pointers(self):
         return self._get_primarmy_secondary_pool_pointers()
-
-    def _set_layers_mapping(self, keys_to_indices):
-        layers_mapping = []
-        for kv_size in self._num_kv_heads_per_layer:
-            layers_mapping.append(keys_to_indices[kv_size])
-
-        self._pool_mapping = torch.tensor(layers_mapping, dtype=torch.int32)
 
     def _get_primarmy_secondary_pool_pointers(self):
         assert len(self._pool_pointers

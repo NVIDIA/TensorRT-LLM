@@ -1,5 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
+import os
 import subprocess
 import sys
 import time
@@ -13,18 +14,23 @@ from tensorrt_llm.llmapi.mpi_session import find_free_port
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
-    MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 60 seconds
+    MAX_SERVER_START_WAIT_S = 600  # wait for server to start for 600 seconds
 
-    def __init__(
-        self,
-        model: str,
-        cli_args: List[str],
-    ) -> None:
+    def __init__(self,
+                 model: str,
+                 cli_args: List[str],
+                 llmapi_launch: bool = False,
+                 port: int = None) -> None:
         self.host = "localhost"
-        self.port = find_free_port()
+        self.port = port if port is not None else find_free_port()
+        self.rank = os.environ.get("SLURM_PROCID", 0)
 
         cli_args += ["--host", f"{self.host}", "--port", f"{self.port}"]
-        self.proc = subprocess.Popen(["trtllm-serve"] + [model] + cli_args,
+        launch_cmd = ["trtllm-serve"] + [model] + cli_args
+        if llmapi_launch:
+            # start server with llmapi-launch on multi nodes
+            launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
+        self.proc = subprocess.Popen(launch_cmd,
                                      stdout=sys.stdout,
                                      stderr=sys.stderr)
         self._wait_for_server(url=self.url_for("health"),
@@ -42,11 +48,15 @@ class RemoteOpenAIServer:
             self.proc.wait(timeout=30)
 
     def _wait_for_server(self, *, url: str, timeout: float):
-        # run health check
+        # run health check on the first rank only.
         start = time.time()
         while True:
             try:
-                if requests.get(url).status_code == 200:
+                if self.rank == 0:
+                    if requests.get(url).status_code == 200:
+                        break
+                else:
+                    time.sleep(timeout)
                     break
             except Exception as err:
                 result = self.proc.poll()

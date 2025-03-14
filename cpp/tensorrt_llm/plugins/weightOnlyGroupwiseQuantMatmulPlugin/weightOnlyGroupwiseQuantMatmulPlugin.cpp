@@ -25,16 +25,6 @@ using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantMatmulPluginCreator;
 using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantMatmulPlugin;
 using tensorrt_llm::plugins::WeightOnlyGroupwiseQuantGemmPluginProfiler;
 using tensorrt_llm::plugins::WeightOnlyGemmRunnerPtr;
-
-// Flags for indicating whether the corresponding inputs are applied in mQuantAlgo
-// mQuantAlgo = int8_weight * INT8_WEIGHT + use_w4a8_awq * FP8_ALPHA + pre_quant_scale * PRE_QUANT_SCALE
-//              + zero * ZERO + bias * BIAS
-// Here int8_weight, use_w4a8_awq, pre_quant_scale, zero and bias are boolean type
-static constexpr int BIAS = int(1) << 0;
-static constexpr int ZERO = int(1) << 1;
-static constexpr int PRE_QUANT_SCALE = int(1) << 2;
-static constexpr int FP8_ALPHA = int(1) << 3;
-static constexpr int INT8_WEIGHT = int(1) << 4;
 using tensorrt_llm::plugins::read;
 using tensorrt_llm::plugins::write;
 
@@ -47,7 +37,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     WeightOnlyGroupwiseQuantGemmPluginProfiler::Config const& tactic, char* workspace, cudaStream_t const& stream)
 {
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
-    int const originalN = mQuantAlgo & INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
+    int const originalN = mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
     half* actPtr = reinterpret_cast<half*>(workspace);
     void* weightPtr = nextWorkspacePtr(reinterpret_cast<int8_t*>(actPtr), m * k * sizeof(half));
     half* inputScalesPtr
@@ -59,11 +49,11 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     half* outputPtr = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(biasesPtr), m * sizeof(half)));
     char* workspacePtr
         = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(outputPtr), m * originalN * sizeof(half)));
-    if ((mQuantAlgo & ZERO) == 0)
+    if ((mQuantAlgo & GroupwiseQuantAlgo::ZERO) == 0)
     {
         zerosPtr = nullptr;
     }
-    if ((mQuantAlgo & BIAS) == 0)
+    if ((mQuantAlgo & GroupwiseQuantAlgo::BIAS) == 0)
     {
         biasesPtr = nullptr;
     }
@@ -83,7 +73,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     {
         // run CUTLASS kernel
         int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
-        if (mQuantAlgo & INT8_WEIGHT)
+        if (mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT)
         {
             mRunner->gemm(actPtr, reinterpret_cast<int8_t*>(weightPtr), inputScalesPtr, zerosPtr, biasesPtr, outputPtr,
                 m, originalN, k, mGroupSize, tactic, workspacePtr, wsSize, stream);
@@ -99,7 +89,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
 void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
-    int const originalN = mQuantAlgo & INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
+    int const originalN = mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
     std::vector<size_t> workspaces = {
         maxM * k * sizeof(half),                      // A
         k * n * sizeof(float),                        // B
@@ -117,6 +107,16 @@ std::vector<WeightOnlyGroupwiseQuantGemmPluginProfiler::Config> WeightOnlyGroupw
     int m, int n, int k) const
 {
     return mRunner->getConfigs();
+}
+
+bool WeightOnlyGroupwiseQuantGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& tactic) const
+{
+    // stop to profile Cuda kernel for m >= 16
+    if (tactic.enableCudaKernel)
+    {
+        return m < 16;
+    }
+    return true;
 }
 
 WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(nvinfer1::DataType type, int quant_algo,
@@ -161,7 +161,7 @@ using GemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRun
 template <typename ActivationType, typename WeightType, typename OutputType, typename ScaleZeroType = OutputType>
 WeightOnlyGemmRunnerPtr selectGemmRunnerForZERO(int quant_algo)
 {
-    if (quant_algo & ZERO)
+    if (quant_algo & GroupwiseQuantAlgo::ZERO)
     {
         return std::make_shared<GemmRunner<ActivationType, WeightType, OutputType, ScaleZeroType,
             cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
@@ -176,7 +176,7 @@ WeightOnlyGemmRunnerPtr selectGemmRunnerForZERO(int quant_algo)
 template <typename ActivationType>
 WeightOnlyGemmRunnerPtr selectGemmRunnerForWeightType(int quant_algo)
 {
-    if (quant_algo & INT8_WEIGHT)
+    if (quant_algo & GroupwiseQuantAlgo::INT8_WEIGHT)
     {
         return selectGemmRunnerForZERO<ActivationType, uint8_t, ActivationType>(quant_algo);
     }
@@ -194,16 +194,16 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     mGroupSize = group_size;
 
     // quant_algo = int8_weight * 16 + fp8_alpha * 8 + pre_quant_scale * 4 + zero * 2 + bias
-    mPreQuantScaleInputIdx = (quant_algo & PRE_QUANT_SCALE) ? 1 : 0;
+    mPreQuantScaleInputIdx = (quant_algo & GroupwiseQuantAlgo::PRE_QUANT_SCALE) ? 1 : 0;
     mWeightInputIdx = mPreQuantScaleInputIdx + 1;
     mScalesInputIdx = mWeightInputIdx + 1;
-    mZerosInputIdx = (quant_algo & ZERO) ? mScalesInputIdx + 1 : mScalesInputIdx;
-    mBiasesInputIdx = (quant_algo & BIAS) ? mZerosInputIdx + 1 : mZerosInputIdx;
+    mZerosInputIdx = (quant_algo & GroupwiseQuantAlgo::ZERO) ? mScalesInputIdx + 1 : mScalesInputIdx;
+    mBiasesInputIdx = (quant_algo & GroupwiseQuantAlgo::BIAS) ? mZerosInputIdx + 1 : mZerosInputIdx;
 
     if (mType == nvinfer1::DataType::kHALF)
     {
         // CUTLASS kernel selection
-        if (quant_algo & FP8_ALPHA)
+        if (quant_algo & GroupwiseQuantAlgo::FP8_ALPHA)
         {
             mAlpha = alpha;
 
@@ -212,7 +212,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             {
                 TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
-            assert(!(quant_algo & INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
+            assert(!(quant_algo & GroupwiseQuantAlgo::INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
             m_weightOnlyGroupwiseGemmRunner
                 = selectGemmRunnerForZERO<__nv_fp8_e4m3, cutlass::uint4b_t, half>(quant_algo);
         }
@@ -221,7 +221,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             m_weightOnlyGroupwiseGemmRunner = selectGemmRunnerForWeightType<half>(quant_algo);
         }
         // CUDA kernel selection
-        if (quant_algo & INT8_WEIGHT)
+        if (quant_algo & GroupwiseQuantAlgo::INT8_WEIGHT)
         {
             // INT8 weight
             mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
@@ -240,7 +240,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     else if (mType == nvinfer1::DataType::kBF16)
     {
         // CUTLASS kernel selection
-        if (quant_algo & FP8_ALPHA)
+        if (quant_algo & GroupwiseQuantAlgo::FP8_ALPHA)
         {
             mAlpha = alpha;
 
@@ -249,7 +249,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             {
                 TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
-            assert(!(quant_algo & INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
+            assert(!(quant_algo & GroupwiseQuantAlgo::INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
             m_weightOnlyGroupwiseGemmRunner
                 = selectGemmRunnerForZERO<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, half>(quant_algo);
         }
@@ -258,7 +258,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             m_weightOnlyGroupwiseGemmRunner = selectGemmRunnerForWeightType<__nv_bfloat16>(quant_algo);
         }
         // CUDA kernel selection
-        if (quant_algo & INT8_WEIGHT)
+        if (quant_algo & GroupwiseQuantAlgo::INT8_WEIGHT)
         {
             // INT8 weight
             mCudaKernelEnabled = tensorrt_llm::kernels::weight_only::is_supported(
@@ -327,7 +327,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
         }
 
         // int4/int8 weight only quant (INT4*4 -> FP16, INT8*2 -> FP16)
-        int const weight_multiplier = mQuantAlgo & INT8_WEIGHT ? FP16_INT8_RATIO : FP16_INT4_RATIO;
+        int const weight_multiplier = mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT ? FP16_INT8_RATIO : FP16_INT4_RATIO;
         ret.d[nbDimsA - 1] = exprBuilder.constant(inputs[mWeightInputIdx].d[1]->getConstantValue() * weight_multiplier);
 
         return ret;
@@ -362,7 +362,7 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(nvinfer1::DynamicPlug
     int const maxK = in[0].max.d[in[0].max.nbDims - 1];
 
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
-    int const weight_multiplier = mQuantAlgo & INT8_WEIGHT ? FP16_INT8_RATIO : FP16_INT4_RATIO;
+    int const weight_multiplier = mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT ? FP16_INT8_RATIO : FP16_INT4_RATIO;
     int const maxN = in[mWeightInputIdx].max.d[1] * weight_multiplier;
 
     auto const K = maxK;
@@ -390,7 +390,7 @@ void pre_quant_scale_for_act(int const m, int const k, int const mQuantAlgo, int
     void const* const* inputs, void* workspace, cudaStream_t stream)
 {
     // Apply pre-quant per channel scale on activations
-    if (mQuantAlgo & FP8_ALPHA)
+    if (mQuantAlgo & GroupwiseQuantAlgo::FP8_ALPHA)
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, __nv_fp8_e4m3>(
             reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
@@ -436,9 +436,11 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
         "when building the engine.)");
     use_cuda_kernel = bestTactic->enableCudaKernel;
 
-    bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
-    half const* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<half const*>(inputs[mZerosInputIdx]) : nullptr;
-    half const* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<half const*>(inputs[mBiasesInputIdx]) : nullptr;
+    bool use_pre_quant_scale = mQuantAlgo & GroupwiseQuantAlgo::PRE_QUANT_SCALE;
+    half const* zeros_ptr
+        = (mQuantAlgo & GroupwiseQuantAlgo::ZERO) ? reinterpret_cast<half const*>(inputs[mZerosInputIdx]) : nullptr;
+    half const* biases_ptr
+        = (mQuantAlgo & GroupwiseQuantAlgo::BIAS) ? reinterpret_cast<half const*>(inputs[mBiasesInputIdx]) : nullptr;
     half const* act_ptr = reinterpret_cast<half const*>(inputs[0]);
 
     if (use_pre_quant_scale && !use_cuda_kernel)
@@ -465,7 +467,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
 #endif
 
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
-    int real_n = mQuantAlgo & INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
+    int real_n = mQuantAlgo & GroupwiseQuantAlgo::INT8_WEIGHT ? n * FP16_INT8_RATIO : n * FP16_INT4_RATIO;
 
     if (use_cuda_kernel)
     {
@@ -479,7 +481,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
         void* cuda_kernel_out_ptr = outputs[0];
         tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, pre_quant_scale_ptr,
             cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, zeros_ptr, biases_ptr, cuda_kernel_out_ptr, mAlpha, m,
-            real_n, k, mGroupSize, mCudaKernelType, static_cast<bool>(mQuantAlgo & FP8_ALPHA)};
+            real_n, k, mGroupSize, mCudaKernelType, static_cast<bool>(mQuantAlgo & GroupwiseQuantAlgo::FP8_ALPHA)};
         tensorrt_llm::kernels::weight_only::kernel_launcher(mArch, params, stream);
     }
     else
@@ -562,10 +564,10 @@ WeightOnlyGroupwiseQuantMatmulPluginCreator::WeightOnlyGroupwiseQuantMatmulPlugi
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("quant_algo", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("alpha", nullptr, PluginFieldType::kFLOAT32, 1));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("quant_algo", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("group_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("alpha", nullptr, PluginFieldType::kFLOAT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,10 +55,11 @@ public:
         return hashID(kernelMeta.mS, kernelMeta.mD);
     }
 
-    TFusedMultiHeadAttentionXMMAKernel(
-        TKernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type type, unsigned int sm)
+    TFusedMultiHeadAttentionXMMAKernel(TKernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type inputType,
+        Data_type outputType, unsigned int sm)
         : mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
-        , mDataType(type)
+        , mInputDataType(inputType)
+        , mOutputDataType(outputType)
         , mKernelMeta(pMetaStart)
         , mKernelMetaCount(nMetaCount)
         , mSM(sm)
@@ -75,7 +76,7 @@ public:
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
-            if (kernelMeta.mSM == mSM && kernelMeta.mDataType == mDataType)
+            if (kernelMeta.mSM == mSM && kernelMeta.mDataTypeOut == mOutputDataType)
             {
                 CUmodule hmod{0};
                 auto findModuleIter = mModules.find(kernelMeta.mCubin);
@@ -152,7 +153,8 @@ protected:
 protected:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
 
-    Data_type mDataType;
+    Data_type mInputDataType;
+    Data_type mOutputDataType;
     TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
@@ -173,16 +175,16 @@ class TFusedMHAKernelFactory
 {
 public:
     TFusedMHAKernelList const* getXMMAKernels(const typename TFusedMHAKernelList::KernelMeta* pKernelList,
-        unsigned int nbKernels, Data_type type, unsigned int sm)
+        unsigned int nbKernels, Data_type inputType, Data_type outputType, unsigned int sm)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        auto const id = hashID(type, sm);
+        auto const id = hashID(outputType, sm);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
-            TFusedMHAKernelList* newKernel = new TFusedMHAKernelList{pKernelList, nbKernels, type, sm};
+            TFusedMHAKernelList* newKernel = new TFusedMHAKernelList{pKernelList, nbKernels, inputType, outputType, sm};
             newKernel->loadXMMAKernels();
             mKernels.insert(std::make_pair(id, std::unique_ptr<TFusedMHAKernelList>(newKernel)));
             return newKernel;
@@ -224,19 +226,30 @@ class FusedMultiHeadAttentionXMMAKernelV2
 {
 public:
     FusedMultiHeadAttentionXMMAKernelV2(FusedMultiHeadAttentionKernelMetaInfoV2 const* pMetaStart,
-        unsigned int nMetaCount, Data_type type, unsigned int sm)
+        unsigned int nMetaCount, Data_type inputType, Data_type outputType, unsigned int sm)
         : TFusedMultiHeadAttentionXMMAKernel<FusedMultiHeadAttentionKernelMetaInfoV2,
-            Fused_multihead_attention_params_v2>(pMetaStart, nMetaCount, type, sm)
+            Fused_multihead_attention_params_v2>(pMetaStart, nMetaCount, inputType, outputType, sm)
     {
     }
 
     inline uint64_t hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved, bool unroll,
         bool force_fp32_acc, bool flash_attention, bool warp_specialization, bool is_alibi_supported,
-        int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping) const
+        int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping,
+        unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v) const
     {
-        s = flash_attention ? 0 : s;
-        // D <= 1024
-        return (uint64_t(s) << 36) | (uint64_t(d) << 26) | (dv << 16) | (attention_mask_type << 10)
+        unsigned int log_block_size_q = (unsigned int) std::log2(sage_block_size_q);
+        unsigned int log_block_size_k = (unsigned int) std::log2(sage_block_size_k);
+        unsigned int log_block_size_v = (unsigned int) std::log2(sage_block_size_v);
+        unsigned int hash = 0;
+        if (flash_attention)
+        {
+            hash = (uint64_t(log_block_size_q) << 12) | (uint64_t(log_block_size_k) << 6) | uint64_t(log_block_size_v);
+        }
+        else
+        {
+            hash = s;
+        }
+        return (uint64_t(hash) << 36) | (uint64_t(d) << 26) | (dv << 16) | (attention_mask_type << 10)
             | (input_layout << 8) | (enable_attn_logit_softcapping ? 128ull : 0ull)
             | (is_alibi_supported ? 64ull : 0ull) | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull)
             | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
@@ -249,7 +262,8 @@ public:
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mDV, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
             kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout,
-            kernelMeta.mTiled, kernelMeta.mEnableAttnLogitSoftcapping);
+            kernelMeta.mTiled, kernelMeta.mEnableAttnLogitSoftcapping, kernelMeta.mSageBlockSizeQ,
+            kernelMeta.mSageBlockSizeK, kernelMeta.mSageBlockSizeV);
     }
 
     // FMHA runner.
@@ -292,8 +306,8 @@ public:
 
                 block_size.y = std::min(static_cast<int>(params.num_tiles), launch_params.multi_processor_count);
                 // 2 * bytes_per_elt stands for kv cache and bytes_per_elt bytes per element.
-                auto const size_in_bytes = 2 * static_cast<int64_t>(get_size_in_bytes(mDataType)) * params.b * params.h
-                    * params.s * params.d;
+                auto const size_in_bytes = 2 * static_cast<int64_t>(get_size_in_bytes(mInputDataType)) * params.b
+                    * params.h * params.s * params.d;
                 params.use_balanced_scheduling = launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
                     && size_in_bytes <= launch_params.device_l2_cache_size;
 
@@ -314,7 +328,7 @@ public:
 
                 // 2 * size_per_element stands for kv cache.
                 auto const size_in_bytes
-                    = 2 * static_cast<int64_t>(get_size_in_bytes(mDataType)) * block_size.y * params.s * params.d;
+                    = 2 * static_cast<int64_t>(get_size_in_bytes(mInputDataType)) * block_size.y * params.s * params.d;
                 if (size_in_bytes <= launch_params.device_l2_cache_size)
                 {
                     // strategy 1: limit to only 1 wave
@@ -366,7 +380,8 @@ public:
     {
         uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
             static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
-            params.attnLogitSoftcappingScale != 0.f);
+            params.attnLogitSoftcappingScale != 0.f, params.sageBlockSizeQ, params.sageBlockSizeK,
+            params.sageBlockSizeV);
         auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
         return findIter != mFunctions.end();
     }
@@ -417,7 +432,8 @@ private:
             };
             for (unsigned int i = 0u; i < sizeof(unrollList) / sizeof(unrollList[0]); ++i)
             {
-                if (mSM == unrollList[i].mSM && mDataType == unrollList[i].mDataType
+                // should use inputDataType or outputDataType?
+                if (mSM == unrollList[i].mSM && mOutputDataType == unrollList[i].mDataType
                     && launch_params.kernel_s == unrollList[i].mS && params.d == unrollList[i].mD
                     && params.b * params.h <= unrollList[i].mMaxBatchHead)
                 {
@@ -437,16 +453,18 @@ private:
             launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
-            launch_params.enableAttnLogitSoftcapping);
+            launch_params.enableAttnLogitSoftcapping, launch_params.sage_block_size_q, launch_params.sage_block_size_k,
+            launch_params.sage_block_size_v);
     }
 };
 
 using FusedMHAKernelFactoryV2 = TFusedMHAKernelFactory<FusedMultiHeadAttentionXMMAKernelV2>;
 
-inline FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type type, unsigned int sm)
+inline FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(
+    Data_type inputType, Data_type outputType, unsigned int sm)
 {
-    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(
-        sMhaKernelMetaInfosV2, sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), type, sm);
+    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(sMhaKernelMetaInfosV2,
+        sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), inputType, outputType, sm);
 }
 
 } // namespace tensorrt_llm::kernels
