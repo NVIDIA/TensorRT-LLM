@@ -52,6 +52,9 @@ class TransformersTokenizer(TokenizerBase):
                                                   **kwargs)
         return cls(tokenizer)
 
+    def save_pretrained(self, pretrained_model_dir: str, **kwargs):
+        self.tokenizer.save_pretrained(pretrained_model_dir, **kwargs)
+
     def clean_up_tokenization(self, out_string: str) -> str:
         return self.tokenizer.clean_up_tokenization(out_string)
 

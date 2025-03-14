@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <gtest/gtest.h>
 

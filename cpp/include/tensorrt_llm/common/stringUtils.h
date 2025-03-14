@@ -43,6 +43,54 @@ static inline std::basic_ostream<char>& operator<<(std::basic_ostream<char>& str
     return stream;
 }
 
+// Add forward declaration before printElement functions
+template <typename... Args>
+std::ostream& operator<<(std::ostream& os, std::tuple<Args...> const& t);
+
+namespace
+{
+
+// Print element - default case for non-tuple types
+template <typename T>
+void printElement(std::ostream& os, T const& t)
+{
+    os << t;
+}
+
+// Print tuple implementation
+template <typename Tuple, std::size_t... Is>
+void printTupleImpl(std::ostream& os, Tuple const& t, std::index_sequence<Is...>)
+{
+    os << "(";
+    ((Is == 0 ? os : (os << ", "), printElement(os, std::get<Is>(t))), ...);
+    os << ")";
+}
+
+// Print element - specialized for tuples
+template <typename... Args>
+void printElement(std::ostream& os, std::tuple<Args...> const& t)
+{
+    printTupleImpl(os, t, std::index_sequence_for<Args...>{});
+}
+
+} // namespace
+
+// Override operator<< for any tuple
+template <typename... Args>
+std::ostream& operator<<(std::ostream& os, std::tuple<Args...> const& t)
+{
+    printElement(os, t);
+    return os;
+}
+
+template <typename... Args>
+std::string to_string(std::tuple<Args...> const& t)
+{
+    std::stringstream ss;
+    ss << t;
+    return ss.str();
+}
+
 inline std::string fmtstr(std::string const& s)
 {
     return s;

@@ -22,6 +22,7 @@ namespace cutlass
 // FP4 and FP6 types
 struct float_e2m1_t;
 struct float_e3m2_t;
+struct float_ue4m3_t;
 } // namespace cutlass
 
 namespace tensorrt_llm
@@ -43,6 +44,14 @@ template <>
 struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t>
 {
     using type = __nv_fp4_e2m1;
+};
+#endif
+
+#if defined(ENABLE_FP4)
+template <>
+struct CutlassType<nvinfer1::DataType::kFP4>
+{
+    using type = cutlass::float_e2m1_t;
 };
 #endif
 

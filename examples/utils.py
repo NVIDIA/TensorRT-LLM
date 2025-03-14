@@ -18,7 +18,6 @@ import subprocess
 import sys
 from argparse import BooleanOptionalAction
 from functools import partial
-from os.path import abspath, dirname
 from pathlib import Path
 from typing import List, Optional
 
@@ -121,6 +120,8 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
                                                       language='english',
                                                       task='transcribe',
                                                       predict_timestamps=False)
+        elif tokenizer_type == 'language_adapter':
+            tokenizer = None
         else:
             use_fast = True
             if tokenizer_type is not None and tokenizer_type == "llama":
@@ -162,6 +163,9 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif 'GLM' in model_name and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
+    elif tokenizer_type == 'language_adapter':
+        pad_id = 0
+        end_id = 2
     else:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -193,11 +197,9 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_features = None
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
-        tllm_path = dirname(dirname(abspath(__file__)))
-        sys.path.insert(0, tllm_path)
-
-        from examples.whisper.whisper_utils import \
-            log_mel_spectrogram  # cannot directly import whisper due to name collision
+        # cannot directly import whisper due to name collision
+        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')
         with open(config_path, 'r') as f:
@@ -506,6 +508,15 @@ def add_common_args(parser):
         "If specified, return the full beams/outputs at each step. "
         "It is automatically enabled for num_beams>1 (only available with cpp session). "
         "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+    )
+
+    parser.add_argument(
+        '--language_task_uids',
+        type=int,
+        nargs='+',
+        default=None,
+        help=
+        "language task id indicating which adapter to use in language adapter. Please include 1 locale per input text"
     )
     parser.add_argument('--backend', type=str, default=None)
 

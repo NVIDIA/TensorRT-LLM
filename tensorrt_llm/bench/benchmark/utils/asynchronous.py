@@ -8,8 +8,7 @@ from typing import List, Optional, Set, Tuple
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
-from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
-                                                      StatsKeeper)
+from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 
@@ -19,7 +18,7 @@ class LlmManager:
 
     def __init__(self,
                  llm: LLM,
-                 outbox: asyncio.Queue[NewRequestPerfItemTuple],
+                 outbox: asyncio.Queue[PerfItemTuple],
                  streaming: bool,
                  concurrency: int = -1) -> None:
         self.llm = llm
@@ -61,7 +60,7 @@ class LlmManager:
 
         # Mark that the response returned. Construct a record to send to statistics.
         tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
-        request_perf_item = NewRequestPerfItemTuple(
+        request_perf_item = PerfItemTuple(
             start_timestamp=request_start_timestamp,
             end_timestamp=response_end_timestamp,
             request_id=response.request_id,
@@ -158,8 +157,8 @@ async def async_benchmark(
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
-                item: NewRequestPerfItemTuple = await asyncio.wait_for(
-                    outbox.get(), timeout=1.0)
+                item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
+                                                             timeout=1.0)
                 statistics.register_request_perf_item(item)
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")

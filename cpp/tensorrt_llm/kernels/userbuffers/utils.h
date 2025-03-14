@@ -656,4 +656,7 @@ __inline__ __device__ T blockReduceSumV2(T* val)
     warpReduceSumV2<T, NUM>(val);
     return (T) 0.0f;
 }
+
+static bool const kDISABLE_FP32_ACCUMULATION = getenv("TRTLLM_UB_AR_DISABLE_FP32_ACCUMULATION") != nullptr;
+
 } // namespace tensorrt_llm::runtime::ub

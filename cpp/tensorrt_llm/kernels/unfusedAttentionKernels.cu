@@ -143,7 +143,7 @@ void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, T const* b
             QKVIA3Transpose<T><<<grid, block, 0, stream>>>(q_buf, k_buf, v_buf, Q, K, V, ia3_tasks, ia3_key_weights,
                 ia3_value_weights, batch_size, seq_len, head_num, size_per_head);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else
     {
@@ -162,7 +162,7 @@ void invokeAddQKVBiasIA3Transpose(T* q_buf, T* k_buf, T* v_buf, T* Q, T const* b
                 (const T2*) K, (const T2*) V, ia3_tasks, (const T2*) ia3_key_weights, (const T2*) ia3_value_weights,
                 batch_size, seq_len, head_num, size_per_head / 2);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 }
 

@@ -25,34 +25,34 @@ typename PoolAllocator<TAllocator>::PoolType& PoolAllocator<TAllocator>::getPool
     return pool;
 }
 
-IpcNvlsTensorView::IpcNvlsTensorView(std::weak_ptr<IpcNvlsTensor> const& tensor, bool unicastView)
+MulticastTensorView::MulticastTensorView(std::weak_ptr<MulticastTensor> const& tensor, ViewType viewType)
     : mTensor(tensor)
-    , mUnicastView(unicastView)
+    , mViewType(viewType)
     , mDims(mTensor.lock()->getShape())
 {
 }
 
-IpcNvlsTensorView::IpcNvlsTensorView(IpcNvlsTensorView&& other) noexcept
+MulticastTensorView::MulticastTensorView(MulticastTensorView&& other) noexcept
     : mTensor(std::move(other.mTensor))
-    , mUnicastView(other.mUnicastView)
+    , mViewType(other.mViewType)
     , mDims(mTensor.lock()->getShape())
 {
 }
 
-IpcNvlsTensorView& IpcNvlsTensorView::operator=(IpcNvlsTensorView&& other) noexcept
+MulticastTensorView& MulticastTensorView::operator=(MulticastTensorView&& other) noexcept
 {
     if (this != &other)
     {
         // Reset tensor.
         mTensor.reset();
         mTensor.swap(other.mTensor);
-        mUnicastView = other.mUnicastView;
+        mViewType = other.mViewType;
         mDims = mTensor.lock()->getShape();
     }
     return *this;
 }
 
-std::shared_ptr<IpcNvlsBuffer> IpcNvlsTensorView::lock() const
+std::shared_ptr<MulticastBuffer> MulticastTensorView::lock() const
 {
     auto sp = mTensor.lock();
     TLLM_CHECK(sp != nullptr);
@@ -60,54 +60,54 @@ std::shared_ptr<IpcNvlsBuffer> IpcNvlsTensorView::lock() const
 }
 
 ///////////////////////////////////////
-// IpcNvlsTensorView ITensor methods
+// MulticastTensorView ITensor methods
 ///////////////////////////////////////
-nvinfer1::Dims const& IpcNvlsTensorView::getShape() const
+nvinfer1::Dims const& MulticastTensorView::getShape() const
 {
     return mDims;
 }
 
-void IpcNvlsTensorView::reshape(nvinfer1::Dims const& dims)
+void MulticastTensorView::reshape(nvinfer1::Dims const& dims)
 {
     auto new_size = nonNegative(volume(dims));
     if (new_size > getCapacity())
     {
-        TLLM_THROW("IpcNvlsTensorView::reshape() cannot be larger than origin tensor.");
+        TLLM_THROW("MulticastTensorView::reshape() cannot be larger than origin tensor.");
     }
     mDims = dims;
 }
 
 ///////////////////////////////////////
-// IpcNvlsTensorView IBuffer methods
+// MulticastTensorView IBuffer methods
 ///////////////////////////////////////
-void* IpcNvlsTensorView::_data() const
+void* MulticastTensorView::_data() const
 {
-    if (mUnicastView)
+    switch (mViewType)
     {
-        return lock()->data();
+    case ViewType::kUNICAST: return lock()->data();
+    case ViewType::kMULTICAST: return lock()->dataMC();
+    case ViewType::kIPC_LIST: return lock()->dataIpcList();
     }
-    else
-    {
-        return lock()->dataMC();
-    }
+    TLLM_THROW("Invalid mViewType");
+    return nullptr;
 }
 
-std::size_t IpcNvlsTensorView::getSize() const
+std::size_t MulticastTensorView::getSize() const
 {
     return lock()->getSize();
 }
 
-std::size_t IpcNvlsTensorView::getCapacity() const
+std::size_t MulticastTensorView::getCapacity() const
 {
     return lock()->getCapacity();
 }
 
-nvinfer1::DataType IpcNvlsTensorView::getDataType() const
+nvinfer1::DataType MulticastTensorView::getDataType() const
 {
     return lock()->getDataType();
 }
 
-MemoryType IpcNvlsTensorView::getMemoryType() const
+MemoryType MulticastTensorView::getMemoryType() const
 {
     return lock()->getMemoryType();
 }

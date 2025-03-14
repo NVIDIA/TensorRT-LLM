@@ -20,3 +20,15 @@ float4_sf_dtype = SF_DTYPE
 fp4_buckets = FP4_BUCKETS
 
 __all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
+
+
+def get_fp4_shape(input_shape, sf_vec_size):
+    m = 1
+    for i in range(len(input_shape) - 1):
+        m *= input_shape[i]
+
+    output_shape = [i for i in input_shape]
+    output_shape[-1] //= 2
+
+    scale_shape = pad_up(m, 128) * pad_up(input_shape[-1] // sf_vec_size, 4)
+    return output_shape, scale_shape

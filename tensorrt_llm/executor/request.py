@@ -5,7 +5,10 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
+from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
+from .postproc_worker import PostprocParams
 
 __all__ = [
     "LoRARequest",
@@ -78,6 +81,9 @@ class GenerationRequest:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
         prompt_tuning_config: Optional[list] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        postproc_params: Optional[PostprocParams] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -92,13 +98,23 @@ class GenerationRequest:
             )
 
         self.sampling_params = sampling_params
+        self.postproc_params = postproc_params
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
         self.prompt_tuning_config = prompt_tuning_config
+        self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
+        self.disaggregated_params = disaggregated_params
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
+
+
+class CancellingRequest:
+    ''' The request to cancel a generation. '''
+
+    def __init__(self, id: int):
+        self.id = id

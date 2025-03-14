@@ -141,6 +141,78 @@ struct PackType
     using type = float;
 };
 
+template <typename T>
+struct PackType<T, 1>
+{
+    struct __CUDA_ALIGN__(std::alignment_of_v<T>) type
+    {
+        T array[1];
+    };
+};
+
+template <>
+struct PackType<float, 2>
+{
+    struct __CUDA_ALIGN__(8) type
+    {
+        float array[2];
+    };
+};
+
+template <>
+struct PackType<float, 4>
+{
+    struct __CUDA_ALIGN__(16) type
+    {
+        float array[4];
+    };
+};
+
+template <>
+struct PackType<float, 8>
+{
+    struct __CUDA_ALIGN__(32) type
+    {
+        float array[8];
+    };
+};
+
+template <>
+struct PackType<float, 16>
+{
+    struct __CUDA_ALIGN__(64) type
+    {
+        float array[16];
+    };
+};
+
+template <>
+struct PackType<half, 2>
+{
+    struct __CUDA_ALIGN__(4) type
+    {
+        half array[2];
+    };
+};
+
+template <>
+struct PackType<half, 4>
+{
+    struct __CUDA_ALIGN__(8) type
+    {
+        half array[4];
+    };
+};
+
+template <>
+struct PackType<half, 8>
+{
+    struct __CUDA_ALIGN__(16) type
+    {
+        half array[8];
+    };
+};
+
 #ifdef ENABLE_BF16
 template <>
 struct PackType<__nv_bfloat16, 2>
@@ -158,6 +230,12 @@ template <>
 struct PackType<__nv_bfloat16, 8>
 {
     using type = __nv_bfloat168;
+};
+
+template <>
+struct PackType<__nv_bfloat16, 16>
+{
+    using type = __nv_bfloat1616;
 };
 #endif
 
@@ -179,6 +257,13 @@ struct PackType<__nv_fp8_e4m3, 8>
 {
     using type = __nv_fp8_8_e4m3;
 };
+
+template <>
+struct PackType<__nv_fp8_e4m3, 16>
+{
+    using type = __nv_fp8x16_e4m3;
+};
+
 #endif
 
 __inline__ __device__ void fp8x4_e4m3_to_bfloat2(__nv_bfloat162* out1, __nv_bfloat162* out2, __nv_fp8x4_e4m3 const* in)

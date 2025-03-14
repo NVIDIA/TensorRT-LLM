@@ -125,6 +125,8 @@ enum class CutlassTileConfigSM100
     CtaShape64x256x128B,
 
     // M=128
+    CtaShape128x8x256B,
+    CtaShape128x16x128B,
     CtaShape128x32x128B,
     CtaShape128x64x128B,
     CtaShape128x128x128B,
