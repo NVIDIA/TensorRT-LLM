@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>

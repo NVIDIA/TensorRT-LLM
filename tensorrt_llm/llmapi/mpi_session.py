@@ -9,9 +9,10 @@ from typing import List, Optional, TypeVar
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 if ENABLE_MULTI_DEVICE:
+    import mpi4py
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
-    from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+    from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
 
@@ -48,7 +49,9 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
     e.g. mpirun -np 4 python script.py
     '''
     if ENABLE_MULTI_DEVICE:
-        return mpi_world_size() == model_world_size and model_world_size > 1
+        return (mpi_world_size() == model_world_size
+                and model_world_size > 1) or (global_mpi_size()
+                                              > mpi_world_size())
     else:
         return False
 
@@ -59,6 +62,13 @@ def need_spawn_mpi_workers(model_world_size: int) -> bool:
         return mpi_world_size() == 1 and model_world_size > 1
     else:
         return False
+
+
+def set_mpi_session_cpp(comm):
+    if ENABLE_MULTI_DEVICE:
+        comm_fortran = comm.py2f()
+        from tensorrt_llm.bindings import MpiComm
+        MpiComm.set_raw_mpi_session_by_fortran_handle(comm_fortran)
 
 
 class MpiSession(abc.ABC):
@@ -83,6 +93,11 @@ class MpiPoolSession(MpiSession):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
+        if ENABLE_MULTI_DEVICE:
+            self.comm = mpi4py.MPI.COMM_WORLD
+
+    def get_comm(self):
+        return self.comm
 
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
@@ -118,20 +133,26 @@ class MpiPoolSession(MpiSession):
 
 class MpiCommSession(MpiSession):
 
-    def __init__(self, n_workers: int = 1):
+    def __init__(self, comm=None, n_workers: int = 1):
+        self.comm = comm
+
         if n_workers <= 0:
             raise ValueError(
                 f'n_workers must be non-negative, but got {n_workers}')
-        if n_workers != mpi_world_size():
-            raise ValueError(
-                f'n_workers must be equal to the number of processes launched by mpirun, got {n_workers} vs {mpi_world_size()}'
-            )
 
-        if mpi_rank() != 0:
-            raise RuntimeError(
-                f'only rank 0 can start multi-node session, got {mpi_rank()}')
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
+        if ENABLE_MULTI_DEVICE:
+            if not self.comm:
+                self.comm = mpi4py.MPI.COMM_WORLD
+
+            if self.comm.Get_rank() != 0:
+                raise RuntimeError(
+                    f'only rank 0 can start multi-node session, got {self.comm.Get_rank()}'
+                )
+
+            if self.comm.Get_size() != n_workers:
+                raise ValueError(
+                    f'n_workers must be equal to the number of processes , got {n_workers} vs {mpi_world_size()}'
+                )
 
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
@@ -139,20 +160,44 @@ class MpiCommSession(MpiSession):
 
         self._start_mpi_pool()
 
-    def submit(self, task: Callable[..., T], *args,
-               **kwargs) -> List[Future[T]]:
-        assert self.mpi_pool is not None, 'MPI session not started'
+        if not external_mpi_comm_available(n_workers):
+            raise RuntimeError('The LLM instance should be launched by mpirun.')
 
-        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra task dispatching to rank0 is needed
+    def get_comm(self):
+        return self.comm
+
+    def submit(self,
+               task: (...),
+               rank0_extra_kwargs: Optional[dict] = None,
+               *args,
+               **kwargs) -> List[Future]:
+        ''' Submit a task to MPI workers.
+
+        Args:
+            task: The task to be submitted.
+            rank0_extra_kwargs: Extra keyword arguments for rank0 task.
+            args: Positional arguments for the task.
+            kwargs: Keyword arguments for the task.
+        '''
+        assert self.mpi_pool is not None, 'MPI session not started'
+        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra
+        # task dispatching to rank0 is needed
+        rank0_extra_kwargs = rank0_extra_kwargs or {}
+
+        rank0_params = kwargs.copy()
+        if rank0_extra_kwargs:
+            rank0_params.update(rank0_extra_kwargs)
+
         worker_futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers - 1)
         ]
-        # A trick to wait for rank0 to be ready, or the collective tasks will hang
-        # TODO[chunweiy]: Remove this trick for reducing normal tasks latencies
-        time.sleep(4)
 
-        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
+        # A trick to wait for rank0 to be ready, or the collective tasks will hang
+        # TODO[chunweiy]: Remove this trick
+        time.sleep(10)
+
+        rank0_future = self.thread_pool.submit(task, *args, **rank0_params)
         return [rank0_future] + worker_futures
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
@@ -168,7 +213,7 @@ class MpiCommSession(MpiSession):
         assert not self.mpi_pool, 'MPI session already started'
 
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
-        comm_executor = MPICommExecutor(mpi_comm())
+        comm_executor = MPICommExecutor(self.comm)
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):

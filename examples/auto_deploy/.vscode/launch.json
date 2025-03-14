@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "build_and_run_ad.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "build_and_run_ad.py",
+            "args": [
+                "--config",
+                "{\"batch_size\": 2, \"page_size\": 16, \"world_size\": 2, \"compile_backend\": \"torch-simple\", \"attn_backend\": \"FlashInfer\", \"model\": \"meta-llama/Meta-Llama-3.1-8B-Instruct\", \"benchmark\": false}",
+                "--model-kwargs",
+                "{}",
+                // "{\"num_hidden_layers\": 3}",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}/examples/auto_deploy"
+        },
+        {
+            "name": "Python: Debug Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "purpose": [
+                "debug-test",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+    ]
+}

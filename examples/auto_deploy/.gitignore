@@ -1,0 +1,3 @@
+# Unignore the .vscode folder to track it
+!.vscode
+benchmark_results.json

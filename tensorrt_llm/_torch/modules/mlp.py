@@ -27,7 +27,7 @@ class MLP(nn.Module):
         config = config or ModelConfig()
         tp_rank = config.mapping.tp_rank
         tp_size = config.mapping.tp_size
-
+        gpus_per_node = config.mapping.gpus_per_node
         self.up_proj = Linear(
             self.hidden_size,
             self.intermediate_size,
@@ -36,10 +36,12 @@ class MLP(nn.Module):
             parallel_config=ParallelConfig(
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN),
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gpus_per_node=gpus_per_node),
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.VANILLA),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
         self.down_proj = Linear(
             self.intermediate_size,
@@ -49,8 +51,10 @@ class MLP(nn.Module):
             parallel_config=ParallelConfig(
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.ROW),
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

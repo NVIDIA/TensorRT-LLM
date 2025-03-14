@@ -22,9 +22,9 @@
 #include <string>
 
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <cxxopts.hpp>
 
 namespace tlc = tensorrt_llm::common;

@@ -363,10 +363,9 @@ size_t invokeReduceMaxGenerationLengths(void* __restrict__ reduceMaxTempStorage,
     runtime::SizeType32 batchSize, cudaStream_t stream);
 
 // inclusive prefix sum generationLengths
-void invokeScanReduceGenerationLengths(runtime::SizeType32 batchSize,
-    runtime::SizeType32 const* __restrict__ generationLengths, void* __restrict__ scanTempStorage,
-    size_t scanTempStorageBytes, runtime::SizeType32* __restrict__ scanedGenerationLengths,
-    void* __restrict__ reduceMaxTempStorage, size_t reduceMaxTempStorageBytes,
+size_t invokeScanReduceGenerationLengths(runtime::SizeType32 batchSize,
+    runtime::SizeType32 const* __restrict__ generationLengths, void* scanReduceTempStorage,
+    size_t scanReduceTempStorageBytes, runtime::SizeType32* __restrict__ scannedGenerationLengths,
     runtime::SizeType32* maxGenerationLengths, cudaStream_t stream);
 
 void invokeConvertMaskToPackedMask(runtime::SizeType32 batchSize,

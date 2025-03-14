@@ -1,0 +1,54 @@
+methods:
+  __init__:
+    name: __init__
+    parameters:
+      clamp_val:
+        annotation: Optional[List[float]]
+        default: null
+        name: clamp_val
+      exclude_modules:
+        annotation: Optional[List[str]]
+        default: null
+        name: exclude_modules
+      group_size:
+        annotation: int
+        default: 128
+        name: group_size
+      has_zero_point:
+        annotation: bool
+        default: false
+        name: has_zero_point
+      kv_cache_quant_algo:
+        annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
+        default: null
+        name: kv_cache_quant_algo
+      pre_quant_scale:
+        annotation: bool
+        default: false
+        name: pre_quant_scale
+      quant_algo:
+        annotation: Optional[tensorrt_llm.quantization.mode.QuantAlgo]
+        default: null
+        name: quant_algo
+      smoothquant_val:
+        annotation: float
+        default: 0.5
+        name: smoothquant_val
+      use_meta_recipe:
+        annotation: bool
+        default: false
+        name: use_meta_recipe
+    return_annotation: None
+  from_dict:
+    name: from_dict
+    parameters:
+      config:
+        annotation: dict
+        default: inspect._empty
+        name: config
+    return_annotation: tensorrt_llm.models.modeling_utils.QuantConfig
+  to_dict:
+    name: to_dict
+    parameters: {}
+    return_annotation: dict
+properties: {}
