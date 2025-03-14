@@ -1,0 +1,16 @@
+examples/test_bert.py::test_llm_bert_general[compare_hf-disable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:1-pp:1-float32-BertModel-bert/bert-base-uncased]
+test_e2e.py::test_gpt_fp32[use_cpp_session] # 34s
+test_unittests.py::test_unittests[attention-gpt-no-cache] # 20s
+
+# Only use 3 tests for now to meet the 1 hour time limit. Uncomment lines below to add more tests.
+# test_e2e.py::test_falcon_e2e[use_py_session-mqa] # 20s
+# test_e2e.py::test_falcon_e2e[use_py_session-mha] # 21s
+# test_e2e.py::test_falcon_e2e[use_py_session-gqa] # 45s
+# test_e2e.py::test_bert_e2e # 57s
+# examples/test_gpt.py::test_llm_gpt2_starcoder2[bfloat16-tp1] # launch MPI, 190s
+# test_e2e.py::test_chatglm_6b_sanity # 198s
+# examples/test_llama.py::test_llm_llama_v2_1gpu[llama-v2-7b-hf-disable_fp8-bfloat16-summarization-nb:1] # llama context fmha issue, 202s
+# test_unittests.py::test_unittests[model-gpt-e2e] # 227s
+# examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # multimodal context fmha issue, 333s
+# examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # mistral context fmha issue, 339s
+# test_accuracy.py::test_accuracy_gptj[gptj-context-fmha-enabled] # 1267s

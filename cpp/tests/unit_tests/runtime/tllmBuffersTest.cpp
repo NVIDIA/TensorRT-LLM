@@ -17,10 +17,11 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
@@ -36,7 +37,6 @@
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
-namespace tb = tensorrt_llm::batch_manager;
 
 class TllmBuffersTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -471,7 +471,7 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     using MemPool = MemoryPool<PinnedAllocator>;
     auto expectedSize = [](auto const& tensor)
     {
-        auto s = tensor()->getSizeInBytes();
+        auto s = tensor->getSizeInBytes();
         constexpr auto alignment = MemPool::kAlignment;
         s = s + alignment - 1 - ((s + alignment - 1) % alignment);
         return s;
@@ -483,8 +483,8 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     EXPECT_EQ(segments.size(), 0);
 
     {
-        auto a = tb::NamedTensor{nvinfer1::DataType::kFLOAT, {512, 4, 4}, "a", nullptr};
-        auto b = tb::NamedTensor{nvinfer1::DataType::kHALF, {512, 10}, "b", nullptr};
+        auto a = BufferManager::pinnedPool(ITensor::makeShape({512, 4, 4}), nvinfer1::DataType::kFLOAT);
+        auto b = BufferManager::pinnedPool(ITensor::makeShape({512, 10}), nvinfer1::DataType::kHALF);
         pool.logSegments();
         auto it = std::begin(segments);
         EXPECT_NE(it->tag, nullptr);
@@ -512,7 +512,7 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     std::size_t secondChunkSize;
     {
         // Test creating a new chunk
-        auto c = tb::NamedTensor{nvinfer1::DataType::kUINT8, {initChunkSize + 1}, "c", nullptr};
+        auto c = BufferManager::pinnedPool(ITensor::makeShape({initChunkSize + 1}), nvinfer1::DataType::kUINT8);
         pool.logSegments();
         auto it = std::begin(segments);
         EXPECT_EQ(it->tag, nullptr);

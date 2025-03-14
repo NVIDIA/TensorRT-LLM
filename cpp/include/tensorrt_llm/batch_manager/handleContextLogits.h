@@ -19,30 +19,38 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime;
-}
+class BufferManager;
+class CudaStream;
+} // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
 {
 
 class RuntimeBuffers;
 class DecoderBuffers;
+class MedusaBuffers;
 
 namespace tr = tensorrt_llm::runtime;
 
 class HandleContextLogits : Algorithm
 {
 public:
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
     constexpr static auto name{"HandleContextLogits"};
 
     HandleContextLogits() = default;
 
-    tr::SizeType32 operator()(RequestVector const& contextRequests, RuntimeBuffers const& contextRuntimeBuffers,
-        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, runtime::TllmRuntime const& runtime) const;
+    tr::SizeType32 operator()(RequestVector const& contextRequests,
+        std::vector<tr::SizeType32> const& numContextLogitsVec, tr::ITensor::SharedPtr const& logits,
+        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
+        tensorrt_llm::runtime::CudaStream const& stream, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

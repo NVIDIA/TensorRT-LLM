@@ -87,7 +87,6 @@ private:
     std::vector<int32_t> mOutHiddenSizes;
     nvinfer1::DataType mType;
     bool mRemoveInputPadding;
-    int32_t mWeightIndex;
     tensorrt_llm::kernels::DoraImpl mDoraImpl;
 
     std::vector<void const*> mExpandDoraWeightPtrs{};

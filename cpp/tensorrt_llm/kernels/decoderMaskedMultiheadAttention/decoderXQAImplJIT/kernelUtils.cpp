@@ -167,61 +167,6 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     return true;
 }
 
-bool supportConfigTllmGen(
-    XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmGenRunner)
-{
-    if (!supportConfigCommon(xqaParams, forConfigurePlugin))
-    {
-        return false;
-    }
-    if (SM < kSM_100 || SM == kSM_120)
-    {
-        return false;
-    }
-    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16}, xqaParams.data_type))
-    {
-        return false;
-    }
-    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_E4M3}, xqaParams.kv_cache_data_type))
-    {
-        return false;
-    }
-    if (xqaParams.beam_width != 1)
-    {
-        return false;
-    }
-    // NOTE(tizheng): TRTLLM-GEN XQA kernel has FP8 IO type.
-    if (!forConfigurePlugin && (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3) && (xqaParams.fp8_out_scale == nullptr))
-    {
-        return false;
-    }
-    // Check if kernel can be found.
-    if (!forConfigurePlugin)
-    {
-        TLLM_CHECK_WITH_INFO(tllmGenRunner, "TRTLLM-GEN runner is not initialized.");
-        // Create TllmGenFmhaRunnerParams based on XQAParams. Only fill necessary
-        // attributes for kernel selection.
-        TllmGenFmhaRunnerParams runnerParams;
-        memset(&runnerParams, 0, sizeof(runnerParams));
-        runnerParams.mQkvLayout
-            = xqaParams.paged_kv_cache ? kernels::QkvLayout::PagedKv : kernels::QkvLayout::ContiguousKv;
-        runnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-        runnerParams.mKernelType = FmhaKernelType::Generation;
-        // TODO: use a heuristic for tileScheduler and multiCtasKvMode.
-        runnerParams.mTileScheduler = TileScheduler::Static;
-        runnerParams.mMultiCtasKvMode = false;
-        runnerParams.mHeadDim = xqaParams.head_size;
-        runnerParams.mNumTokensPerPage = xqaParams.tokens_per_block;
-        runnerParams.mNumHeadsQPerKv = xqaParams.num_q_heads / xqaParams.num_kv_heads;
-        bool foundKernels = tllmGenRunner->isSupported(runnerParams);
-        if (!foundKernels)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 } // namespace jit
 } // namespace kernels
 } // namespace tensorrt_llm

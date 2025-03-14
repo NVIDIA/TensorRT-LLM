@@ -303,7 +303,7 @@ void invokeGatherTree(gatherTreeParam param)
         block.x = 1024;
     }
     gatherTree<<<grid, block, 0, param.stream>>>(param);
-    sync_check_cuda_error();
+    sync_check_cuda_error(param.stream);
 
     if (param.beamWidth > 1)
     {
@@ -529,7 +529,7 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
     int const nThread = min(roundUp(nBM * 2, 32), 1024);
     size_t const nByteSharedMemory = (sizeof(int) + sizeof(float)) * nBM * 2;
     finalizeKernel<<<bh.nBatchSize, nThread, nByteSharedMemory, stream>>>(bh);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
@@ -749,7 +749,7 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
         bufferCast<TokenIdType>(*decodingInput.endIds), batchSize, beamWidth, maxSeqLength, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     std::vector<float> lengthPenaltyVec;
     auto lengthPenaltyPtr = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize}), TRTDataType<float>::value));
@@ -798,10 +798,10 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
 
     // This is where transpose is done
     tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     tensorrt_llm::kernels::invokeFinalize(bh, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

@@ -1,0 +1,50 @@
+methods:
+  __init__:
+    name: __init__
+    parameters: {}
+    return_annotation: None
+  abort:
+    name: abort
+    parameters: {}
+    return_annotation: None
+  aborted:
+    name: aborted
+    parameters: {}
+    return_annotation: bool
+  aresult:
+    name: aresult
+    parameters: {}
+    return_annotation: tensorrt_llm.executor.result.GenerationResult
+  result:
+    name: result
+    parameters:
+      timeout:
+        annotation: Optional[float]
+        default: None
+        name: timeout
+    return_annotation: tensorrt_llm.executor.result.GenerationResult
+properties:
+  context_logits:
+    annotation: Optional[torch.Tensor]
+    default: inspect._empty
+    name: context_logits
+  finished:
+    annotation: bool
+    default: inspect._empty
+    name: finished
+  outputs:
+    annotation: List[tensorrt_llm.executor.result.CompletionOutput]
+    default: inspect._empty
+    name: outputs
+  prompt:
+    annotation: Optional[str]
+    default: inspect._empty
+    name: prompt
+  prompt_token_ids:
+    annotation: List[int]
+    default: inspect._empty
+    name: prompt_token_ids
+  request_id:
+    annotation: int
+    default: inspect._empty
+    name: request_id

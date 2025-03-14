@@ -48,13 +48,9 @@ std::string PathUtil::FP16_GPT_LORA_DIR()
     return ModelSpec::getDefaultModelSpec().useLoraPlugin().getModelPath();
 }
 
-std::string PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_RETURN_ACCEPTED_TOKENS_LOGITS_DIR()
+std::string PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_DRAFT_TOKENS_DIR()
 {
-    return ModelSpec::getDefaultModelSpec()
-        .useDraftTokensExternalDecoding()
-        .gatherLogits()
-        .returnAcceptedTokensLogits()
-        .getModelPath();
+    return ModelSpec::getDefaultModelSpec().useDraftTokensExternalDecoding().getModelPath();
 }
 
 std::string PathUtil::FP16_GPT_ATTENTION_PACKED_PAGED_GATHER_DIR()
@@ -357,11 +353,12 @@ std::tuple<std::vector<SizeType32>, SizeType32, SizeType32> getGivenInputLengths
     return {givenInputLengths, nbGivenInputs, maxInputLength};
 }
 
-std::vector<executor::TokenIdType> createConsecutiveTokenSequence(tr::SizeType32 length, tr::TokenIdType vocabLength)
+std::vector<executor::TokenIdType> createConsecutiveTokenSequence(
+    tr::SizeType32 length, tr::SizeType32 vocabSize, tr::TokenIdType firstTokenId)
 {
     auto result = std::vector<executor::TokenIdType>(static_cast<size_t>(length), 0);
-    std::iota(result.begin(), result.end(), 0);
-    std::transform(result.begin(), result.end(), result.begin(), [&](auto const i) { return i % vocabLength; });
+    std::iota(result.begin(), result.end(), firstTokenId);
+    std::transform(result.begin(), result.end(), result.begin(), [&](auto const i) { return i % vocabSize; });
     return result;
 }
 

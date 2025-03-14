@@ -324,7 +324,7 @@ def load_weights_from_hf_model(
     else:
         pass
 
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8
     if use_smooth_quant or int8_kv_cache:
         assert act_range is not None

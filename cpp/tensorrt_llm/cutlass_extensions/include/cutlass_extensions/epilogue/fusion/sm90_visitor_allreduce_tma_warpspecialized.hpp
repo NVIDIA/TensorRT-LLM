@@ -1,34 +1,19 @@
-/***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
-
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 /*! \file
   \brief Visitor tree store operations for the sm90 AllReduce TMA warp-specialized (ws) epilogue
 */
@@ -50,7 +35,7 @@ using namespace detail;
 
 template <int Stages, typename EpilogueTile, typename ElementT, typename StrideMNL, typename SmemLayoutAtom,
     FloatRoundStyle RoundStyle, typename CopyOpR2S, typename TileShape, typename SystemBarrier_, bool OneShot>
-struct Sm90AuxStoreReduceWarpSpecialized
+struct Sm90AuxAllReduce
 {
     using ElementAux = ElementT; // required for compilation
     using SystemBarrier = SystemBarrier_;
@@ -150,10 +135,10 @@ struct Sm90AuxStoreReduceWarpSpecialized
     }
 
     CUTLASS_HOST_DEVICE
-    Sm90AuxStoreReduceWarpSpecialized() {}
+    Sm90AuxAllReduce() {}
 
     CUTLASS_HOST_DEVICE
-    Sm90AuxStoreReduceWarpSpecialized(Params const& params, SharedStorage const& shared_storage)
+    Sm90AuxAllReduce(Params const& params, SharedStorage const& shared_storage)
         : params_ptr(&params)
         , smem_aux(const_cast<ElementT*>(shared_storage.smem_aux.data()))
     {
@@ -332,6 +317,90 @@ struct Sm90AuxStoreReduceWarpSpecialized
             cute::move(tC_rAux), tiled_r2s, cute::move(tRS_sAux), cute::move(bSG_sAux), cute::move(bSG_gAux),
             params_ptr, problem_shape_mnl, tile_coord_mnl, args.thread_idx);
     }
+};
+
+// D = AllReduce(activation(alpha * acc + beta * C))
+template <bool IsOneShot_, class SystemBarrier_, class GmemLayoutTagAux_, class ElementAux_, class ElementCompute_,
+    class ElementSource_ = ElementAux_, class ElementScalar_ = ElementCompute_,
+    FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest>
+struct Sm90LinCombAuxAllReduce
+    : LinearCombination<ElementAux_, ElementCompute_, ElementSource_, ElementScalar_, RoundStyle_>
+{
+    using ElementAux = ElementAux_;
+    using GmemLayoutTagAux = GmemLayoutTagAux_;
+    static constexpr int AlignmentAux = 128 / cute::sizeof_bits_v<ElementAux_>;
+    static constexpr bool IsAuxOutSupported = true;
+};
+
+template <int StagesD, bool IsOneShot, class SystemBarrier, class GmemLayoutTagOutput, class ElementOutput,
+    class ElementCompute, class ElementSource, class ElementScalar, FloatRoundStyle RoundStyle, class CtaTileShapeMNK,
+    class EpilogueTile, class SmemLayoutAtom, class CopyOpR2S>
+using Sm90LinearCombAuxAllReduce
+    = Sm90EVT<Sm90AuxAllReduce<StagesD, EpilogueTile, ElementOutput, cutlass::gemm::TagToStrideC_t<GmemLayoutTagOutput>,
+                  SmemLayoutAtom, RoundStyle, CopyOpR2S, CtaTileShapeMNK, SystemBarrier, IsOneShot>,   // Aux AR
+        Sm90LinearCombination<ElementOutput, ElementCompute, ElementSource, ElementScalar, RoundStyle> // beta * C +
+                                                                                                       // (alpha * acc)
+        >;
+
+template <
+    // Dispatch policy arguments
+    int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+    // Fusion Op arguments
+    bool IsOneShot, class SystemBarrier, class GmemLayoutTagD, class ElementD, class ElementCompute, class ElementC,
+    class ElementScalar, FloatRoundStyle RoundStyle,
+    // Epilogue arguments
+    class CtaTileShapeMNK, class EpilogueTile, class SmemLayoutAtom, class CopyOpR2S>
+struct FusionCallbacks<epilogue::Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    Sm90LinCombAuxAllReduce<IsOneShot, SystemBarrier, GmemLayoutTagD, ElementD, ElementCompute, ElementC, ElementScalar,
+        RoundStyle>,
+    CtaTileShapeMNK, EpilogueTile, SmemLayoutAtom, CopyOpR2S>
+    : Sm90LinearCombAuxAllReduce<StagesD, IsOneShot, SystemBarrier, GmemLayoutTagD, ElementD, ElementCompute, ElementC,
+          ElementScalar, RoundStyle, CtaTileShapeMNK, EpilogueTile, SmemLayoutAtom, CopyOpR2S>
+{
+
+    using Impl = Sm90LinearCombAuxAllReduce<StagesD, IsOneShot, SystemBarrier, GmemLayoutTagD, ElementD, ElementCompute,
+        ElementC, ElementScalar, RoundStyle, CtaTileShapeMNK, EpilogueTile, SmemLayoutAtom, CopyOpR2S>;
+    using Operation = Sm90LinCombAuxAllReduce<IsOneShot, SystemBarrier, GmemLayoutTagD, ElementD, ElementCompute,
+        ElementC, ElementScalar, RoundStyle>;
+
+    struct Arguments
+    {
+        using StrideD = cutlass::gemm::TagToStrideC_t<GmemLayoutTagD>;
+        ElementScalar alpha = ElementScalar(1);
+        ElementScalar beta = ElementScalar(0);
+        ElementScalar const* alpha_ptr = nullptr;
+        ElementScalar const* beta_ptr = nullptr;
+        ElementD* multicast_ptr_aux = nullptr;
+        ElementD* ptr_aux = nullptr;
+        StrideD dAux = {};
+        typename SystemBarrier::Params barrier_params{};
+        int rank = 0;
+        int num_ranks = 1;
+        using StrideAlpha = Stride<_0, _0, int64_t>;
+        using StrideBeta = Stride<_0, _0, int64_t>;
+        StrideAlpha dAlpha = {_0{}, _0{}, 0};
+        StrideBeta dBeta = {_0{}, _0{}, 0};
+
+        operator typename Impl::Arguments() const
+        {
+            return {{
+                        // ternary op : beta * C + (alpha * acc)
+                        {{beta}, {beta_ptr}, {dBeta}}, // leaf args : beta
+                        {},                            // leaf args : C
+                        {
+                            // binary op : alpha * acc
+                            {{alpha}, {alpha_ptr}, {dAlpha}}, // leaf args : alpha
+                            {},                               // leaf args : acc
+                            {}                                // binary args : multiplies
+                        },                                    // end binary op
+                        {}                                    // ternary args : multiply_add
+                    },                                        // end ternary op
+                {multicast_ptr_aux, ptr_aux, dAux, barrier_params, rank, num_ranks}};
+        }
+    };
+
+    // Ctor inheritance
+    using Impl::Impl;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

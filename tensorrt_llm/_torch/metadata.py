@@ -8,7 +8,7 @@ import torch
 @dataclass
 class KVCacheParams:
     """
-    Parameters for the key- value cache.
+    Parameters for the key-value cache.
     """
     # Whether to use the cache or not.
     use_cache: bool
@@ -27,6 +27,8 @@ class KVCacheParams:
     host_max_attention_window_sizes: Optional[torch.Tensor] = None
     # The number of sink tokens for each layer.
     host_sink_token_length: Optional[torch.Tensor] = None
+    # The number of extra kv for draft tokens
+    num_extra_kv_tokens: Optional[List[int]] = 0
 
 
 class CacheType(Enum):

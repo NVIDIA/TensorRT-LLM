@@ -67,6 +67,8 @@ def read_config(config_path: Path):
         'max_prompt_embedding_table_size', 0)
 
     kv_cache_type = get_kv_cache_type_from_legacy(True, paged_kv_cache)
+    language_adapter_config = pretrained_config.get("language_adapter_config",
+                                                    None)
 
     model_config = ModelConfig(
         num_heads=num_heads,
@@ -93,7 +95,7 @@ def read_config(config_path: Path):
         trtllm_modules_to_hf_modules=lora_config.get(
             'trtllm_modules_to_hf_modules'),
         skip_cross_kv=skip_cross_kv,
-    )
+        language_adapter_config=language_adapter_config)
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
 
@@ -230,7 +232,8 @@ class EncDecModelRunner:
                       input_ids,
                       remove_input_padding=False,
                       pad_token_id=0,
-                      prompt_tasks=None):
+                      prompt_tasks=None,
+                      language_adapter_routings=None):
         if remove_input_padding:
             # in remove padding mode --> flatten input, calculate actual length and max length
             # Note: 1st token should never be removed, even if it is pad_token_id
@@ -257,7 +260,10 @@ class EncDecModelRunner:
                 dtype=torch.int32,
                 device=self.device)
         max_input_length = torch.max(input_lengths).item()
-        return input_ids, input_lengths, max_input_length, prompt_tasks
+        if language_adapter_routings is not None:
+            language_adapter_routings = language_adapter_routings.to(
+                self.device)
+        return input_ids, input_lengths, max_input_length, prompt_tasks, language_adapter_routings
 
     def encoder_run(self,
                     input_ids,
@@ -269,7 +275,8 @@ class EncDecModelRunner:
                     prompt_embedding_table=None,
                     prompt_tasks=None,
                     prompt_vocab_size=None,
-                    attention_mask=None):
+                    attention_mask=None,
+                    language_adapter_routings=None):
 
         # each engine has hidden_dim/TP, don't forget to multiply TP
         hidden_size = self.encoder_model_config.hidden_size * self.encoder_runtime_mapping.tp_size
@@ -346,7 +353,8 @@ class EncDecModelRunner:
                                                            batch_size).to('cpu')
             if self.encoder_model_config.remove_input_padding:
                 inputs['host_context_lengths'] = input_lengths.to('cpu')
-
+        if language_adapter_routings is not None:
+            inputs['language_adapter_routings'] = language_adapter_routings
         # Note: runtime.Session's run() method will set input/output tensor address, here we only need to provide tensor shape
         self.encoder_session.set_shapes(inputs)
 
@@ -427,7 +435,9 @@ class EncDecModelRunner:
                  prompt_vocab_size=None,
                  attention_mask=None,
                  time_encoder=False,
-                 return_encoder_output=False):
+                 return_encoder_output=False,
+                 encoder_language_adapter_routings=None,
+                 decoder_language_adapter_routings=None):
         ## ensure all externally provided tensors are on the correct device.
         encoder_input_ids = encoder_input_ids.to(self.device)
         decoder_input_ids = decoder_input_ids.to(self.device)
@@ -440,9 +450,9 @@ class EncDecModelRunner:
         ## encoder run
         encoder_remove_input_padding = self.encoder_model_config.remove_input_padding if self.encoder_model_config else self.decoder_model_config.remove_input_padding
 
-        encoder_input_ids, encoder_input_lengths, encoder_max_input_length, prompt_tasks = self.process_input(
+        encoder_input_ids, encoder_input_lengths, encoder_max_input_length, prompt_tasks, encoder_language_adapter_routings = self.process_input(
             encoder_input_ids, encoder_remove_input_padding, pad_token_id,
-            prompt_tasks)
+            prompt_tasks, encoder_language_adapter_routings)
 
         if not self.skip_encoder:
             logger.info(f"Rank {self.runtime_rank} Running encoder engine ...")
@@ -456,7 +466,8 @@ class EncDecModelRunner:
                 prompt_embedding_table=prompt_embedding_table,
                 prompt_tasks=prompt_tasks,
                 prompt_vocab_size=prompt_vocab_size,
-                attention_mask=attention_mask)
+                attention_mask=attention_mask,
+                language_adapter_routings=encoder_language_adapter_routings)
             if time_encoder:
                 tok = time.time()
                 print(f"TRT-LLM Encoder time {(tok-tik)*1000}ms")
@@ -467,10 +478,9 @@ class EncDecModelRunner:
 
         ## decoder run
         logger.info(f"Rank {self.runtime_rank} Running decoder engine ...")
-        decoder_input_ids, decoder_input_lengths, decoder_max_input_length, _ = self.process_input(
+        decoder_input_ids, decoder_input_lengths, decoder_max_input_length, _, decoder_language_adapter_routings = self.process_input(
             decoder_input_ids, self.decoder_model_config.remove_input_padding,
-            pad_token_id)
-
+            pad_token_id, None, decoder_language_adapter_routings)
         # `cross_attention_mask` in context phase [batch_size, query_len, encoder_input_len]
         # where query_len happens to be 1 in current cases, but not necessarily always, and
         # `cross_attention_mask` in generation phase [batch_size, 1, encoder_input_len] where
@@ -514,7 +524,8 @@ class EncDecModelRunner:
             encoder_output=encoder_output,
             encoder_input_lengths=encoder_input_lengths,
             return_dict=return_dict,
-            cross_attention_mask=cross_attention_mask)
+            cross_attention_mask=cross_attention_mask,
+            language_adapter_routings=decoder_language_adapter_routings)
 
         if return_dict and return_encoder_output:
             output['encoder_output'] = encoder_output

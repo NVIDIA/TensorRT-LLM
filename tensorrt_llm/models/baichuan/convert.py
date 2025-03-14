@@ -482,7 +482,7 @@ def quantize(hf_model_dir: str,
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
         torch_dtype='auto'
-        if not config.quantization.use_plugin_sq else torch.float16,
+        if not config.quantization._use_plugin_sq else torch.float16,
         trust_remote_code=trust_remote_code)
     tokenizer = AutoTokenizer.from_pretrained(
         hf_model_dir, use_fast=False, trust_remote_code=trust_remote_code)
@@ -490,7 +490,7 @@ def quantize(hf_model_dir: str,
 
     act_range = capture_activation_range(hf_model, tokenizer, dataset)
     smoother = {}
-    if config.quantization.use_plugin_sq:
+    if config.quantization._use_plugin_sq:
         smooth_baichuan_model(hf_model, act_range,
                               config.quantization.smoothquant_val, smoother)
 
