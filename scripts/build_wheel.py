@@ -95,7 +95,7 @@ def main(*,
     project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
-
+    print("Building on thread 13.")
     # Get all submodules and check their folder exists. If not,
     # invoke git submodule update
     with open(project_dir / ".gitmodules", "r") as submodules_f:
