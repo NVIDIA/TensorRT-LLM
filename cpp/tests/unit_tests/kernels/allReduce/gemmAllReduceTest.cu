@@ -22,9 +22,9 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/allreduce_gemm/allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <NvInferRuntime.h>
 
 #include "cute/tensor.hpp"
@@ -45,12 +45,14 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
+#include "cutlass/util/reference/host/gett.hpp"
 #include "cutlass/util/reference/host/tensor_fill.h"
 
 using namespace cutlass;
 using namespace nvinfer1;
 using namespace tensorrt_llm::mpi;
 using namespace tensorrt_llm::runtime;
+using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 
 ///////////////////////////
@@ -59,6 +61,7 @@ using namespace tensorrt_llm::kernels::cutlass_kernels;
 struct Options
 {
     bool help = false;
+    bool verify = true;
     int seed = 0;
 
     // problem shape
@@ -89,6 +92,11 @@ struct Options
             help = true;
         }
 
+        if (cmd.check_cmd_line_flag("skip_check"))
+        {
+            verify = false;
+        }
+
         cmd.get_cmd_line_argument("m", M);
         cmd.get_cmd_line_argument("n", N);
         cmd.get_cmd_line_argument("k", K);
@@ -99,9 +107,9 @@ struct Options
 
         rank = COMM_SESSION.getRank();
         tp = COMM_SESSION.getSize();
-        for (int rank = 0; rank < tp; ++rank)
+        for (int i = 0; i < tp; ++i)
         {
-            tp_group.insert(rank);
+            tp_group.insert(i);
         }
         assert(K % tp == 0);
         K_tp = K / tp;
@@ -112,7 +120,7 @@ struct Options
         COMM_SESSION.bcastValue(seed, 0);
 
 #if 1
-        printf("rank: %d, m: %d, n: %d, k: %d, tp: %d, seed: %d\n", rank, M, N, K, tp, seed);
+        printf("rank: %d, m: %d, n: %d, k: %d, tp: %d, seed: %d\n", this->rank, M, N, K, tp, seed);
 #endif
     }
 
@@ -128,6 +136,7 @@ struct Options
                "  --alpha=<float>             GEMM alpha parameter\n"
                "  --beta=<float>              GEMM beta parameter\n"
                "  --iterations=<int>          Number of profiling iterations to perform.\n"
+               "  --skip_check                Skips verification (verification is slow for large shapes)"
                "\n"
                "Examples:\n"
                "\n"
@@ -137,12 +146,13 @@ struct Options
     }
 
     /// Compute performance in GFLOP/s
-    double gflops(double runtime_s) const
+    double tflops(double runtime_s) const
     {
         // Two flops per multiply-add
         uint64_t flop = uint64_t(2) * M * N * K_tp;
         double gflop = double(flop) / double(1.0e9);
-        return gflop / runtime_s;
+        double tflops = gflop / 1e3;
+        return tflops / runtime_s;
     }
 
     double effective_bandwidth(double runtime_s, size_t bytes_a, size_t bytes_b, size_t bytes_c, size_t bytes_d) const
@@ -170,14 +180,18 @@ struct Options
 struct Result
 {
     double avg_runtime_us;
-    double gflops;
+    double avg_runtime_AR_us;
+    double tflops;
     double eff_bw;
     double eff_AR_bw;
     bool passed;
+    GemmAllReduceImplInterface::LaunchConfig best_config;
 
-    Result(double avg_runtime_us = 0, double gflops = 0, double eff_bw = 0, double eff_AR_bw = 0)
+    Result(double avg_runtime_us = 0, double avg_runtime_AR_us = 0, double tflops = 0, double eff_bw = 0,
+        double eff_AR_bw = 0)
         : avg_runtime_us(avg_runtime_us)
-        , gflops(gflops)
+        , avg_runtime_AR_us(avg_runtime_AR_us)
+        , tflops(tflops)
         , eff_bw(eff_bw)
         , eff_AR_bw(eff_AR_bw)
         , passed(false)
@@ -210,7 +224,14 @@ struct ToType<cutlass::half_t>
 template <>
 struct ToType<cutlass::float_e4m3_t>
 {
+    ncclDataType_t nccl_value = ncclFloat8e4m3;
     char const* str_value = "fp8_e4m3";
+};
+
+template <>
+struct ToType<cutlass::float_e2m1_t>
+{
+    char const* str_value = "fp4_e2m1";
 };
 
 class NcclCommunicator
@@ -239,18 +260,36 @@ private:
     }
 };
 
+// Required for subbyte reference GEMM (i.e FP4)
+template <typename T>
+auto make_iterator(T* ptr)
+{
+    using namespace cute;
+    if constexpr (cute::is_subbyte_v<T>)
+    {
+        return subbyte_iterator<T>(ptr);
+    }
+    else
+    {
+        return ptr;
+    }
+}
+
 /////////////////////////////////////
 // Gemm+AR Functional test fixture
 /////////////////////////////////////
 static Options options;
 
-template <typename _ElementA, typename _ElementB, typename _ElementC, typename _ElementD>
+template <typename _ElementA, typename _ElementB, typename _ElementC, typename _ElementD, typename _ElementSFA = void,
+    typename _ElementSFB = void>
 struct TestConfig
 {
     using ElementA = _ElementA;
     using ElementB = _ElementB;
     using ElementC = _ElementC;
     using ElementD = _ElementD;
+    using ElementSFB = _ElementSFA;
+    using ElementSFA = _ElementSFB;
 };
 
 template <typename T>
@@ -261,16 +300,47 @@ protected:
     using ElementB = typename T::ElementB;
     using ElementC = typename T::ElementC;
     using ElementD = typename T::ElementD;
+    using ElementSFA = typename T::ElementSFA;
+    using ElementSFB = typename T::ElementSFB;
+    static_assert(std::is_same_v<ElementA, ElementB> && "A & B types must be same");
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    using StrideA = cutlass::gemm::TagToStrideA_t<LayoutA>;
+    using StrideB = cutlass::gemm::TagToStrideB_t<LayoutB>;
+    using StrideC = cutlass::gemm::TagToStrideC_t<LayoutC>;
+    using StrideD = cutlass::gemm::TagToStrideC_t<LayoutD>;
+
+    // Only currently supported for FP4 GEMM
+    static constexpr bool IsInputScalingNeeded = std::is_same_v<ElementSFA, cutlass::float_ue4m3_t>;
+    static constexpr bool IsFP4 = std::is_same_v<ElementA, cutlass::float_e2m1_t>;
 
     static bool isMultiGpu()
     {
         return COMM_SESSION.getSize() > 1;
     }
 
+    static void SetUpTestSuite()
+    {
+        // Blackwell skip FP4 GEMMs
+        if (getSMVersion() >= 100 && !IsFP4)
+        {
+            GTEST_SKIP() << "Skipping non-FP4 GEMM";
+        }
+        // Hopper skip FP4 GEMMs
+        else if (getSMVersion() < 100 && IsFP4)
+        {
+            GTEST_SKIP() << "Skipping FP4 GEMM";
+        }
+    }
+
     void SetUp() override
     {
-        using GemmTraits = GemmTypes<ElementA, ElementB, ElementC, ElementD, cutlass::layout::RowMajor,
-            cutlass::layout::ColumnMajor, cutlass::layout::RowMajor, cutlass::layout::RowMajor>;
+        using GemmTraits = GemmTypes<ElementA, ElementB, ElementC, ElementD, ElementSFA, ElementSFB, LayoutA, LayoutB,
+            LayoutC, LayoutD>;
 
         _gemm = std::make_shared<GemmAllReduceImplRunner<GemmTraits>>();
 
@@ -278,15 +348,14 @@ protected:
         auto const N = options.N;
         auto const K_tp = options.K_tp;
 
-        _A.reset(M * K_tp);
-        _B.reset(N * K_tp);
-        _C.reset(M * N);
+        _A.reset(cutlass::make_Coord(M * K_tp));
+        _B.reset(cutlass::make_Coord(N * K_tp));
+        _C.reset(cutlass::make_Coord(M * N));
         if (isMultiGpu())
         {
             _D_nvls.reset(M * N, options.tp_group);
             // Create workspace for max problem size
-            GemmAllReduceImplInterface::LaunchConfig launch_config = {GemmAllReduceImpl::NVLS_2SHOT,
-                MainloopScheduleType::PINGPONG, TileShape::TileShape_128x16x128, ClusterShape::ClusterShape_1x1x1};
+            GemmAllReduceImplInterface::LaunchConfig launch_config = _gemm->getSupportedLaunchConfigs()[0];
             GemmAllReduceImplInterface::ProblemArgs max_problem;
             max_problem.argProblemShape(M, N, K_tp, 1)
                 .argRanks(options.rank, options.tp_group)
@@ -296,13 +365,37 @@ protected:
         }
         else
         {
-            _D.reset(M * N);
+            _D.reset(cutlass::make_Coord(M * N));
         }
-        _D_ref.reset(M * N);
+        _D_ref.reset(cutlass::make_Coord(M * N));
+        _alpha_vec.resize(cutlass::make_Coord(1));
 
-        initialize_block(_A, options.seed + options.rank + 2024);
-        initialize_block(_B, options.seed + options.rank);
-        initialize_block(_C, options.seed);
+        if constexpr (IsInputScalingNeeded)
+        {
+            auto [layout_SFA, layout_SFB] = getLayoutSF_AB(M, N, K_tp);
+            auto size_SFA = size(filter_zeros(layout_SFA));
+            auto size_SFB = size(filter_zeros(layout_SFB));
+            _SFA.reset(cutlass::make_Coord(size_SFA));
+            _SFB.reset(cutlass::make_Coord(size_SFB));
+        }
+
+        initializeTensor(_A.host_view(), options.seed + options.rank + 2024);
+        initializeTensor(_B.host_view(), options.seed + options.rank);
+        initializeTensor(_C.host_view(), options.seed);
+        _A.sync_device();
+        _B.sync_device();
+        _C.sync_device();
+
+        if constexpr (IsInputScalingNeeded)
+        {
+            initializeTensor(_SFA.host_view(), options.seed + options.rank + 2023);
+            initializeTensor(_SFB.host_view(), options.seed + options.rank + 2022);
+            _SFA.sync_device();
+            _SFB.sync_device();
+        }
+
+        _alpha_vec.host_data()[0] = options.alpha;
+        _alpha_vec.sync_device();
     }
 
     void TearDown() override
@@ -314,26 +407,133 @@ protected:
         }
     }
 
-    void run(cudaStream_t stream = NULL)
+    /*
+     * Benchmarks each config.
+     * Benchmarks no fusion for comparison.
+     */
+    void bench(cudaStream_t stream)
     {
-        // Test
-        GemmAllReduceImplInterface::ProblemArgs args;
-        args.argProblemShape(options.M, options.N, options.K_tp, 1)
-            .argA(_A.get())
-            .argB(_B.get())
-            .argC(_C.get())
-            .argAlpha(options.alpha)
-            .argBeta(options.beta)
-            .argRanks(options.rank, options.tp_group);
+        GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
+        int const warmup = 20;
 
+        auto sweep_configs = [&]()
+        {
+            Result result;
+            tensorrt_llm::testing::GpuTimer timer;
+            float best_elapsed_us = std::numeric_limits<float>::max();
+            GemmAllReduceImplInterface::LaunchConfig best_launch_config;
+
+            auto launch_configs = _gemm->getSupportedLaunchConfigs();
+            for (auto launch_config : launch_configs)
+            {
+                args.argLaunchConfig(launch_config);
+
+                for (int i = 0; i < options.iterations + warmup; ++i)
+                {
+                    if (i == warmup)
+                    {
+                        // Synchronize ranks
+                        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+                        COMM_SESSION.barrier();
+                        timer.start(stream);
+                    }
+                    _gemm->run(args, stream);
+                }
+                timer.stop();
+                float elapsed_us = timer.elapsed_millis() * 1000.f;
+                if (options.rank == 0)
+                {
+                    double avg_runtime_us = double(elapsed_us) / double(options.iterations);
+                    std::cout << launch_config.str() << std::endl;
+                    std::cout << "  Avg runtime: " << avg_runtime_us << " us" << std::endl;
+                }
+                if (elapsed_us < best_elapsed_us)
+                {
+                    best_elapsed_us = elapsed_us;
+                    best_launch_config = launch_config;
+                }
+            }
+
+            result.best_config = best_launch_config;
+            result.avg_runtime_us = double(best_elapsed_us) / double(options.iterations);
+            double avg_runtime_s = (double) (result.avg_runtime_us / 1000000.0);
+            result.tflops = options.tflops(avg_runtime_s);
+            result.eff_bw = options.effective_bandwidth(
+                avg_runtime_s, sizeof(ElementA), sizeof(ElementB), sizeof(ElementC), sizeof(ElementD));
+            result.eff_AR_bw = options.effective_allreduce_bandwidth(avg_runtime_s, sizeof(ElementD));
+
+            return result;
+        };
+
+        // Benchmark each config.
+        auto result = sweep_configs();
+
+        // set to single device
+        args.argRanks(0, {0});
+        // Benchmark GEMM with no fusion.
+        auto result_no_fusion = sweep_configs();
+        result_no_fusion.eff_AR_bw = 0;
+        result_no_fusion.avg_runtime_AR_us = 0;
+
+        // Benchmark AR with no fusion
         if (isMultiGpu())
         {
-            args.argD(_D_nvls.getUnicastPointer(), _D_nvls.getMulticastPointer()).argWorkspace(_workspace.get());
+            tensorrt_llm::testing::GpuTimer timer;
+            for (int i = 0; i < options.iterations + warmup; ++i)
+            {
+                if (i == warmup)
+                {
+                    // Synchronize ranks
+                    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+                    COMM_SESSION.barrier();
+                    timer.start(stream);
+                }
+
+                ncclComm_t comm = NcclCommunicator::instance().comm;
+                auto dtype = ToType<ElementD>{}.nccl_value;
+                TLLM_NCCL_CHECK(ncclAllReduce(
+                    _D_ref.device_data(), _D_ref.device_data(), _D_ref.size(), dtype, ncclSum, comm, stream));
+            }
+            timer.stop();
+            float elapsed_us = timer.elapsed_millis() * 1000.f;
+            result_no_fusion.avg_runtime_AR_us = double(elapsed_us) / double(options.iterations);
+            double avg_runtime_AR_s = (double) (result_no_fusion.avg_runtime_AR_us / 1000000.0);
+            result_no_fusion.eff_AR_bw = options.effective_allreduce_bandwidth(avg_runtime_AR_s, sizeof(ElementD));
         }
-        else
+
+        if (options.rank == 0)
         {
-            args.argD(_D.get());
-        }
+            std::cout << std::endl;
+            std::cout << "  Precision: " << ToType<ElementA>{}.str_value << "x" << ToType<ElementB>{}.str_value << "="
+                      << ToType<ElementD>{}.str_value << std::endl;
+            std::cout << "  Problem Size: " << options.M << 'x' << options.N << 'x' << options.K << std::endl;
+            std::cout << "  Local Problem Size: " << options.M << 'x' << options.N << 'x' << options.K_tp << std::endl;
+            std::cout << "\n  GEMM->AR\n" << std::endl;
+            std::cout << "  " << result.best_config.str() << std::endl;
+            std::cout << "  GEMM runtime: " << result_no_fusion.avg_runtime_us << " us" << std::endl;
+            std::cout << "  GEMM TFLOPS: " << result_no_fusion.tflops << std::endl;
+            std::cout << "  GEMM effective bandwidth: " << result_no_fusion.eff_bw << " GB/s" << std::endl;
+            std::cout << "  AR runtime: " << result_no_fusion.avg_runtime_AR_us << " us" << std::endl;
+            std::cout << "  AR algo bandwidth: " << result_no_fusion.eff_AR_bw << " GB/s" << std::endl;
+            std::cout << "\n  GEMM+AR fusion\n" << std::endl;
+            std::cout << "  " << result.best_config.str() << std::endl;
+            std::cout << "  GEMM runtime: " << result.avg_runtime_us << " us" << std::endl;
+            std::cout << "  GEMM TFLOPS: " << result.tflops << std::endl;
+            std::cout << "  GEMM effective bandwidth: " << result.eff_bw << " GB/s" << std::endl;
+            std::cout << "  AR algo bandwidth: " << result.eff_AR_bw << " GB/s" << std::endl;
+            float speedup
+                = (result_no_fusion.avg_runtime_us + result_no_fusion.avg_runtime_AR_us) / result.avg_runtime_us;
+            std::cout << "\n  Speedup: " << speedup << std::endl;
+            std::cout << std::endl;
+        };
+    }
+
+    /**
+     * Run each config to ensure each one passes numerical check.
+     */
+    void run(cudaStream_t stream = NULL)
+    {
+        GemmAllReduceImplInterface::ProblemArgs args = get_arguments();
 
         Result result;
         result.passed = true;
@@ -348,75 +548,46 @@ protected:
             TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
 
             bool passed = verify(stream);
-            if (!passed)
-            {
-                std::cout << "config failed: " << launch_config.str() << std::endl;
-            }
+            std::cout << launch_config.str() << std::endl;
+            std::cout << "  Verify: " << (passed ? "Pass" : "Fail") << std::endl;
             result.passed &= passed;
         }
 
-        // Benchmark
-        tensorrt_llm::testing::GpuTimer timer;
-        int const warmup = 20;
-
-        float best_elapsed_us = std::numeric_limits<float>::max();
-        GemmAllReduceImplInterface::LaunchConfig best_launch_config;
-
-        for (auto launch_config : launch_configs)
-        {
-            args.argLaunchConfig(launch_config);
-
-            for (int i = 0; i < options.iterations + warmup; ++i)
-            {
-                if (i == warmup)
-                {
-                    // Synchronize ranks
-                    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-                    COMM_SESSION.barrier();
-                    timer.start(stream);
-                }
-                _gemm->run(args, stream);
-            }
-            timer.stop();
-            float elapsed_us = timer.elapsed_millis() * 1000.f;
-            if (options.rank == 0)
-            {
-                double avg_runtime_us = double(elapsed_us) / double(options.iterations);
-                std::cout << launch_config.str() << std::endl;
-                std::cout << "  Avg runtime: " << avg_runtime_us << " us" << std::endl;
-            }
-            if (elapsed_us < best_elapsed_us)
-            {
-                best_elapsed_us = elapsed_us;
-                best_launch_config = launch_config;
-            }
-        }
-
-        result.avg_runtime_us = double(best_elapsed_us) / double(options.iterations);
-        double avg_runtime_s = (double) (result.avg_runtime_us / 1000000.0);
-        result.gflops = options.gflops(avg_runtime_s);
-        result.eff_bw = options.effective_bandwidth(
-            avg_runtime_s, sizeof(ElementA), sizeof(ElementB), sizeof(ElementC), sizeof(ElementD));
-        result.eff_AR_bw = options.effective_allreduce_bandwidth(avg_runtime_s, sizeof(ElementD));
-
-        if (options.rank == 0)
-        {
-            std::cout << std::endl;
-            std::cout << "  Precision: " << ToType<ElementA>{}.str_value << "x" << ToType<ElementB>{}.str_value << "="
-                      << ToType<ElementD>{}.str_value << std::endl;
-            std::cout << "  Problem Size: " << options.M << 'x' << options.N << 'x' << options.K << std::endl;
-            std::cout << "  Local Problem Size: " << options.M << 'x' << options.N << 'x' << options.K_tp << std::endl;
-            std::cout << "  " << best_launch_config.str() << std::endl;
-            std::cout << "  Verify: " << (result.passed ? "Pass" : "Fail") << std::endl;
-            std::cout << "  Avg runtime: " << result.avg_runtime_us << " us" << std::endl;
-            std::cout << "  GFLOPS: " << result.gflops << std::endl;
-            std::cout << "  Effective GEMM bandwidth: " << result.eff_bw << " GB/s" << std::endl;
-            std::cout << "  Effective AR bandwidth: " << result.eff_AR_bw << " GB/s" << std::endl;
-        }
         ASSERT_TRUE(result.passed);
     }
 
 private:
+    GemmAllReduceImplInterface::ProblemArgs get_arguments()
+    {
+        GemmAllReduceImplInterface::ProblemArgs args;
+        args.argProblemShape(options.M, options.N, options.K_tp, 1)
+            .argA(_A.device_data())
+            .argB(_B.device_data())
+            .argC(_C.device_data())
+            .argAlphaPtr(_alpha_vec.device_data())
+            .argBeta(options.beta)
+            .argRanks(options.rank, options.tp_group)
+            .argWorkspace(_workspace.get());
+
+        if constexpr (IsInputScalingNeeded)
+        {
+            args.argAScale(_SFA.device_data());
+            args.argBScale(_SFB.device_data());
+        }
+
+        if (isMultiGpu())
+        {
+            args.argD(
+                _D_nvls.getUnicastPointer(), _D_nvls.getMulticastPointer(), (void**) _D_nvls.getIpcUnicastPointers());
+        }
+        else
+        {
+            args.argD(_D.device_data());
+        }
+
+        return args;
+    }
+
     template <typename ElementT>
     void print_tensor(std::string name, ElementT* data, int const H, int const W)
     {
@@ -427,7 +598,7 @@ private:
     }
 
     template <typename ElementT>
-    auto find_relative_differences(ElementT const* d_ptr_A, ElementT const* d_ptr_B, size_t capacity, ElementT epsilon,
+    auto findRelativeDifferences(ElementT const* d_ptr_A, ElementT const* d_ptr_B, size_t capacity, ElementT epsilon,
         ElementT nonzero_floor, size_t max_count = 5)
     {
         std::vector<ElementT> h_ptr_A(capacity);
@@ -451,127 +622,210 @@ private:
         return differences;
     }
 
-    bool verify(cudaStream_t stream)
+    template <typename ElementT>
+    bool compareRelativelyEqual(ElementT* expected, ElementT* actual, size_t size, float epsilon, float nonzero_floor)
     {
-        using LayoutA = cutlass::layout::RowMajor;
-        using LayoutB = cutlass::layout::ColumnMajor;
-        using LayoutC = cutlass::layout::RowMajor;
-        using LayoutD = cutlass::layout::RowMajor;
-        using ElementScalar = float;
-        using ElementAccumulator = float;
-
-        auto const M = options.M;
-        auto const N = options.N;
-        auto const K = options.K_tp;
-
-        cutlass::TensorRef ref_A(_A.get(), LayoutA::packed({M, K}));
-        cutlass::TensorRef ref_B(_B.get(), LayoutB::packed({K, N}));
-        cutlass::TensorRef ref_C(_C.get(), LayoutC::packed({M, N}));
-        cutlass::TensorRef ref_D(_D_ref.get(), LayoutD::packed({M, N}));
-
-        // Reference device GEMM implementation type
-        using DeviceGemmReference = cutlass::reference::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementC,
-            LayoutC, ElementAccumulator, ElementAccumulator>;
-
-        // Create instantiation for device reference gemm kernel
-        DeviceGemmReference gemm_reference;
-
-        // Launch device reference gemm kernel
-        gemm_reference(
-            {M, N, K}, ElementAccumulator(options.alpha), ref_A, ref_B, ElementAccumulator(options.beta), ref_C, ref_D);
-
-        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-
-        // AllReduce across ranks
-        ncclComm_t comm = NcclCommunicator::instance().comm;
-        auto dtype = ToType<ElementD>{}.nccl_value;
-        TLLM_NCCL_CHECK(ncclAllReduce(_D_ref.get(), _D_ref.get(), _D_ref.size(), dtype, ncclSum, comm, stream));
-        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Compare results
-        const ElementC epsilon(1e-2f);
-        const ElementC nonzero_floor(1e-4f);
-
-        auto D_ptr = isMultiGpu() ? _D_nvls.getUnicastPointer() : _D.get();
-
-        int local_failed = 0;
-        if (!cutlass::reference::device::BlockCompareRelativelyEqual(
-                _D_ref.get(), D_ptr, _D_ref.size(), epsilon, nonzero_floor))
+        ElementT eps = static_cast<ElementT>(epsilon);
+        ElementT floor = static_cast<ElementT>(nonzero_floor);
+        if (!cutlass::reference::device::BlockCompareRelativelyEqual(expected, actual, size, eps, floor))
         {
             if (options.rank == 0)
             {
 #if 1
-                auto differences
-                    = find_relative_differences(_D_ref.get(), D_ptr, _D_ref.size(), epsilon, nonzero_floor);
+                auto differences = findRelativeDifferences(expected, actual, size, eps, floor);
 
                 std::cerr << "Differences:" << std::endl;
                 for (auto [exp, act, pos] : differences)
                 {
-                    std::cerr << "expected: " << std::setprecision(3) << std::setw(5) << exp
-                              << ", actual: " << std::setprecision(3) << std::setw(5) << act << ", at pos: " << pos
-                              << std::endl;
+                    std::cerr << "expected: " << std::setprecision(3) << std::setw(5) << float(exp)
+                              << ", actual: " << std::setprecision(3) << std::setw(5) << float(act)
+                              << ", at pos: " << pos << std::endl;
                 }
 #endif
 #if 0
-            print_tensor("Actual", D_ptr, M, N);
-            print_tensor("Ref   ", _D_ref.get(), M, N);
+            // print_tensor("Actual", D_actual, M, N);
+            // print_tensor("Ref   ", D_expect, M, N);
 #endif
             }
-            local_failed = 1;
+            return false;
         }
-
-        // Aggregate results - if 1 rank fails, then all ranks fail.
-        int global_failed;
-        COMM_SESSION.allreduce(&local_failed, &global_failed, 1, MpiType::kINT32, MpiOp::SUM);
-
-        return global_failed == 0;
+        return true;
     }
 
-    template <class Element>
-    static void initialize_block(cutlass::DeviceAllocation<Element>& block, int seed)
+    bool verify(cudaStream_t stream)
+    {
+        auto const M = options.M;
+        auto const N = options.N;
+        auto const K = options.K_tp;
+
+        // Prepare arguments for reference GEMM
+        auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+        auto layout_A = cute::make_layout(cute::make_shape(M, K, 1), stride_A);
+        auto tensor_A = cute::make_tensor(make_iterator(_A.host_data()), layout_A);
+
+        auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        auto layout_B = cute::make_layout(cute::make_shape(N, K, 1), stride_B);
+        auto tensor_B = cute::make_tensor(make_iterator(_B.host_data()), layout_B);
+
+        auto get_mainloop_params = [&]()
+        {
+            if constexpr (IsInputScalingNeeded)
+            {
+                auto [layout_SFA, layout_SFB] = getLayoutSF_AB(M, N, K);
+                auto tensor_SFA = cute::make_tensor(_SFA.host_data(), layout_SFA);
+                auto tensor_SFB = cute::make_tensor(_SFB.host_data(), layout_SFB);
+
+                return cutlass::reference::host::GettMainloopParams<float, decltype(tensor_A), decltype(tensor_B),
+                    decltype(tensor_SFA), decltype(tensor_SFB)>{tensor_A, tensor_B, cutlass::ComplexTransform::kNone,
+                    cutlass::ComplexTransform::kNone, tensor_SFA, tensor_SFB};
+            }
+            else
+            {
+                return cutlass::reference::host::GettMainloopParams<float, decltype(tensor_A), decltype(tensor_B)>{
+                    tensor_A, tensor_B};
+            }
+        };
+
+        auto mainloop_params = get_mainloop_params();
+
+        auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+        auto layout_C = make_layout(make_shape(M, N, 1), stride_C);
+        auto tensor_C = cute::make_tensor(make_iterator(_C.host_data()), layout_C);
+
+        auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+        auto layout_D = make_layout(make_shape(M, N, 1), stride_D);
+        auto tensor_D = cute::make_tensor(make_iterator(_D_ref.host_data()), layout_D);
+
+        cutlass::reference::host::GettEpilogueParams<float, float, float, float, decltype(tensor_C), decltype(tensor_D)>
+            epilogue_params{};
+
+        epilogue_params.C = tensor_C;
+        epilogue_params.D = tensor_D;
+        epilogue_params.alpha = options.alpha;
+        epilogue_params.beta = options.beta;
+
+        // Run reference gemm
+        cutlass::reference::host::Gemm3x(mainloop_params, epilogue_params);
+        // Reference is run on host, so copy results to device
+        _D_ref.sync_device();
+
+        // run reference allreduce
+        ncclComm_t comm = NcclCommunicator::instance().comm;
+        auto dtype = ToType<ElementD>{}.nccl_value;
+        TLLM_NCCL_CHECK(
+            ncclAllReduce(_D_ref.device_data(), _D_ref.device_data(), _D_ref.size(), dtype, ncclSum, comm, stream));
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Compare results
+        float const epsilon(0.1f);
+        float const nonzero_floor(std::numeric_limits<float>::min());
+        int local_passed = 1;
+
+        ElementD* ptr = isMultiGpu() ? _D_nvls.getUnicastPointer() : _D.device_data();
+        ElementD* ptr_ref = _D_ref.device_data();
+        // Compare D output
+        local_passed &= compareRelativelyEqual(ptr_ref, ptr, M * N, epsilon, nonzero_floor);
+
+        // Aggregate results - if 1 rank fails, then all ranks fail.
+        int ranks_passed = 0;
+        COMM_SESSION.allreduce(&local_passed, &ranks_passed, 1, MpiType::kINT32, MpiOp::SUM);
+        return ranks_passed == options.tp;
+    }
+
+    template <typename Element, typename Layout>
+    bool initializeTensor(cutlass::TensorView<Element, Layout> view, uint64_t seed)
     {
         double scope_max, scope_min;
-        int bits_input = cutlass::sizeof_bits<Element>::value;
-        int bits_output = cutlass::sizeof_bits<Element>::value;
+        constexpr int bits_input = cutlass::sizeof_bits<Element>::value;
 
-        if (bits_input == 1)
+        if constexpr (bits_input == 1)
         {
             scope_max = 2;
             scope_min = 0;
         }
-        else if (bits_input <= 8)
+        else if constexpr (bits_input <= 6)
         {
             scope_max = 2;
             scope_min = -2;
         }
-        else if (bits_output == 16)
+        else if constexpr (bits_input <= 8)
         {
-            scope_max = 5;
-            scope_min = -5;
+            if constexpr (cute::is_same_v<Element, cutlass::float_ue8m0_t>)
+            {
+                scope_max = 4;
+                scope_min = 1;
+            }
+            else
+            {
+                scope_max = 1;
+                scope_min = -1;
+            }
         }
         else
         {
-            scope_max = 8;
-            scope_min = -8;
+            scope_max = 4;
+            scope_min = -4;
         }
+        cutlass::reference::host::TensorFillRandomUniform(view, seed, scope_max, scope_min, 0);
 
-        using Real = typename cutlass::RealType<Element>::Type;
-        cutlass::reference::device::BlockFillRandomUniform(
-            block.get(), block.size(), seed, static_cast<Real>(scope_max), static_cast<Real>(scope_min), 0);
+        return true;
     }
 
-    cutlass::DeviceAllocation<ElementA> _A;
-    cutlass::DeviceAllocation<ElementB> _B;
-    cutlass::DeviceAllocation<ElementC> _C;
-    cutlass::DeviceAllocation<ElementD> _D;
-    cutlass::DeviceAllocation<ElementD> _D_ref;
+    // Return scale-factor A & B tensor layouts
+    auto getLayoutSF_AB(int M, int N, int K)
+    {
+        switch (getSMVersion())
+        {
+        case 100: // blackwell
+        {
+            // Unfortunately have to construct mainloop in order to extract SFA/SFB layouts
+            using MainloopElementA = cute::tuple<ElementA, ElementSFA>;
+            using MainloopElementB = cute::tuple<ElementB, ElementSFB>;
+            constexpr static int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+            constexpr static int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+            using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
+                cutlass::arch::OpClassBlockScaledTensorOp, MainloopElementA, LayoutA, AlignmentA, MainloopElementB,
+                LayoutB, AlignmentB, float, Shape<_128, _128, _128>, Shape<_1, _1, _1>,
+                cutlass::gemm::collective::StageCount<1>,
+                cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledOmmaVs16Sm100>::CollectiveOp;
+            using Sm100BlkScaledConfig = typename CollectiveMainloop::Sm100BlkScaledConfig;
+
+            auto layout_SFA = Sm100BlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+            auto layout_SFB = Sm100BlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+            return std::make_tuple(layout_SFA, layout_SFB);
+        }
+        case 90: // hopper
+            TLLM_THROW("A/B tensor scaling not supported on Sm90 yet");
+        default: TLLM_THROW("SM version not supported");
+        }
+    }
+
+    cutlass::HostTensor<ElementA, cutlass::layout::PackedVectorLayout> _A;
+    cutlass::HostTensor<ElementB, cutlass::layout::PackedVectorLayout> _B;
+    cutlass::HostTensor<ElementC, cutlass::layout::PackedVectorLayout> _C;
+    cutlass::HostTensor<ElementD, cutlass::layout::PackedVectorLayout> _D;
+    cutlass::HostTensor<ElementD, cutlass::layout::PackedVectorLayout> _D_ref;
+    cutlass::HostTensor<float, cutlass::layout::PackedVectorLayout> _alpha_vec;
+    // Requires conditional because cannot have HostTensor with type void
+    // which is the case when we have no scale-factors.
+    typename std::conditional<IsInputScalingNeeded,
+        cutlass::HostTensor<ElementSFA, cutlass::layout::PackedVectorLayout>, void*>::type _SFA;
+    typename std::conditional<IsInputScalingNeeded,
+        cutlass::HostTensor<ElementSFB, cutlass::layout::PackedVectorLayout>, void*>::type _SFB;
     DeviceAllocationNvls<ElementD> _D_nvls;
     std::shared_ptr<PersistentWorkspaceInterface> _workspace;
     std::shared_ptr<GemmAllReduceImplInterface> _gemm;
 };
 
-using MyTypes = testing::Types<TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>,
-    TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>>;
+using MyTypes = testing::Types<
+    // fp4xfp4=fp16
+    TestConfig<cutlass::float_e2m1_t, cutlass::float_e2m1_t, cutlass::half_t, cutlass::half_t, cutlass::float_ue4m3_t,
+        cutlass::float_ue4m3_t>,
+    // fp8xfp8=fp16
+    TestConfig<cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::half_t, cutlass::half_t>,
+    // fp16xfp16=fp16
+    >;
+// TestConfig<cutlass::half_t, cutlass::half_t, cutlass::half_t, cutlass::half_t>>;
 
 TYPED_TEST_SUITE(GemmAllReduceFixture, MyTypes);
 
@@ -582,7 +836,15 @@ TYPED_TEST(GemmAllReduceFixture, RunnerTest)
 {
     cudaStream_t stream;
     cudaStreamCreate(&stream);
-    this->run(stream);
+    if (!options.verify)
+    {
+        TLLM_LOG_WARNING("Skipping verify - return success");
+    }
+    else
+    {
+        this->run(stream);
+    }
+    this->bench(stream);
     cudaStreamDestroy(stream);
 }
 
@@ -633,6 +895,13 @@ int main(int argc, char** argv)
         std::cerr << "Invalid arguments."
                   << "\n";
         return EXIT_FAILURE;
+    }
+
+    // Ensure only 1 rank prints
+    ::testing::TestEventListeners& listeners = ::testing::UnitTest::GetInstance()->listeners();
+    if (COMM_SESSION.getRank() != 0)
+    {
+        delete listeners.Release(listeners.default_result_printer());
     }
 
     return RUN_ALL_TESTS();

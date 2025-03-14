@@ -76,15 +76,9 @@ class Parameter:
     def name(self):
         return self._name
 
-    # need_transpose is WAR for bug 4641821
-    def _create_managed_tensor(self, network, need_transpose=False) -> Tensor:
+    def _create_managed_tensor(self, network) -> Tensor:
         num = len(network._inputs)
-        name = f"managed_constant_{num}"
-        self._name = name
-        shape = self._shape
-        if need_transpose:
-            assert len(shape) == 2
-            shape = list(reversed(shape))
+        self._name = f"managed_constant_{num}"
 
         if self._value is None or (isinstance(self._value, np.ndarray)
                                    and not self._value.flags['C_CONTIGUOUS']):
@@ -92,21 +86,17 @@ class Parameter:
             self._value = np.empty(self._shape, trt_dtype_to_np(self._dtype))
             network._register_unfilled_weights(
                 # use updated self._shape here
-                name,
+                self._name,
                 self._value,
                 value_old)
-        return Tensor(name=name, dtype=self._dtype, shape=shape)
+        return Tensor(name=self._name, dtype=self._dtype, shape=self._shape)
 
-    def get_managed_tensor(self,
-                           network: Network,
-                           need_transpose=False) -> Tensor:
+    def get_managed_tensor(self, network: Network) -> Tensor:
         if self._network is None or self._network() != network:
             self._network = weakref.ref(network)
             self._tensor = network.get_parameter_tensor(self)
-            self.need_transpose = need_transpose
             if self._tensor is None:
-                self._tensor = self._create_managed_tensor(
-                    network, need_transpose)
+                self._tensor = self._create_managed_tensor(network)
                 network.set_parameter_tensor(self, self._tensor)
         return self._tensor
 

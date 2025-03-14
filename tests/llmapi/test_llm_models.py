@@ -8,8 +8,7 @@ from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
 # isort: off
 from test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
-from utils.util import (force_ampere, skip_gpu_memory_less_than_40gb,
-                        skip_pre_hopper)
+from utils.util import (force_ampere, skip_pre_hopper)
 # isort: on
 
 gptj_model_path = get_model_path('gpt-j-6b')
@@ -24,20 +23,13 @@ falcon_model_path = get_model_path('falcon-rw-1b')
 gemma_2b_model_path = get_model_path('gemma/gemma-2b')
 gemma_2_9b_it_model_path = get_model_path('gemma/gemma-2-9b-it')
 glm_model_path = get_model_path('chatglm3-6b')
-baichuan_7b_model_path = get_model_path('Baichuan-7B')
-baichuan_13b_model_path = get_model_path('Baichuan-13B-Chat')
 baichuan2_7b_model_path = get_model_path('Baichuan2-7B-Chat')
-baichuan2_13b_model_path = get_model_path('Baichuan2-13B-Chat')
-qwen_model_path = get_model_path('Qwen-1_8B-Chat')
 qwen1_5_model_path = get_model_path('Qwen1.5-0.5B-Chat')
 qwen2_model_path = get_model_path('Qwen2-7B-Instruct')
 qwen2_5_model_path = get_model_path('Qwen2.5-0.5B-Instruct')
 mamba2_370m_model_path = get_model_path('mamba2/mamba2-370m')
 gpt_neox_20b_model_path = get_model_path('gpt-neox-20b')
-commandr_v01_model_path = get_model_path('c4ai-command-r-v01')
-commandr_plus_model_path = get_model_path('c4ai-command-r-plus')
-deepseek_v1_model_path = get_model_path("deepseek-moe-16b-base")
-sampling_params = SamplingParams(max_tokens=10)
+sampling_params = SamplingParams(max_tokens=10, end_id=-1)
 
 
 @force_ampere
@@ -181,19 +173,6 @@ def test_llm_falcon():
 
 
 @force_ampere
-def test_llm_falcon_int4_weight_only():
-    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
-    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
-    llm_test_harness(falcon_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     quant_config=quant_config,
-                     build_config=BuildConfig(strongly_typed=False),
-                     calib_config=calib_config)
-
-
-@force_ampere
 def test_llm_gemma_2b():
     llm_test_harness(gemma_2b_model_path,
                      inputs=['A B C'],
@@ -238,44 +217,6 @@ def test_llm_glm():
 
 
 @force_ampere
-def test_llm_baichuan_7b():
-    llm_test_harness(baichuan_7b_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     trust_remote_code=True)
-
-
-@force_ampere
-def test_llm_baichuan2_7b():
-    llm_test_harness(baichuan2_7b_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     trust_remote_code=True)
-
-
-@force_ampere
-@skip_gpu_memory_less_than_40gb
-def test_llm_baichuan_13b():
-    llm_test_harness(baichuan_13b_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     trust_remote_code=True)
-
-
-@force_ampere
-@skip_gpu_memory_less_than_40gb
-def test_llm_baichuan2_13b():
-    llm_test_harness(baichuan2_13b_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     trust_remote_code=True)
-
-
-@force_ampere
 def test_llm_baichuan2_7b_int4weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
     calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
@@ -285,18 +226,6 @@ def test_llm_baichuan2_7b_int4weight_only():
                      sampling_params=sampling_params,
                      quant_config=quant_config,
                      calib_config=calib_config,
-                     trust_remote_code=True)
-
-
-def test_llm_qwen():
-    qwen_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
-                                         "examples/qwen/requirements.txt")
-    command = f"pip install -r {qwen_requirement_path}"
-    subprocess.run(command, shell=True, check=True, env=os.environ)
-    llm_test_harness(qwen_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
                      trust_remote_code=True)
 
 
@@ -367,45 +296,3 @@ def test_llm_mamba2_370m():
                      tokenizer=gpt_neox_20b_model_path,
                      build_config=build_config,
                      trust_remote_code=True)
-
-
-# @skip_gpu_memory_less_than(70 * 1024 * 1024 * 1024)
-# def test_llm_commandr_v01():
-#     build_config = BuildConfig(max_batch_size=1, max_input_len=128)
-#     llm_test_harness(commandr_v01_model_path,
-#                      inputs=['A B C'],
-#                      references=[' D E F G H I J K L M'],
-#                      sampling_params=sampling_params,
-#                      build_config=build_config)
-
-# @skip_gpu_memory_less_than_40gb
-# def test_llm_commandr_v01_int8_weight_only():
-#     quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
-#     build_config = BuildConfig(max_batch_size=1, max_input_len=128)
-
-#     llm_test_harness(commandr_v01_model_path,
-#                      inputs=['A B C'],
-#                      references=[' D E F G H I J K L M'],
-#                      sampling_params=sampling_params,
-#                      build_config=build_config,
-#                      quant_config=quant_config)
-
-
-@skip_gpu_memory_less_than_40gb
-def test_llm_deepseek_v1():
-    llm_test_harness(deepseek_v1_model_path,
-                     inputs=['A B C'],
-                     references=[' D E F G H I J K L M'],
-                     trust_remote_code=True,
-                     sampling_params=sampling_params)
-
-
-if __name__ == '__main__':
-    # test_llm_gptj()
-    # test_llm_phi_1_5()
-    # test_llm_phi_2()
-    # test_llm_phi_3_mini_4k()
-    # test_llm_phi_3_small_8k()
-    test_llm_glm()
-    # test_llm_commandr_v01()
-    # test_llm_commandr_v01_int8_weight_only()

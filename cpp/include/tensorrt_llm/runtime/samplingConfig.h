@@ -143,9 +143,23 @@ public:
             configs, [&configs](size_t ci) { return configs[ci].topK; }, layers::DefaultDecodingParams::getTopK());
         topP = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].topP; }, layers::DefaultDecodingParams::getTopP());
-        randomSeed = fuseValues<uint64_t>(
-            configs, [&configs](size_t ci) { return configs[ci].randomSeed; },
-            layers::DefaultDecodingParams::getSeed());
+
+        // Generate a random seed for each samplingConfig with randomSeed == std::nullopt
+        randomSeed = std::vector<uint64_t>(configs.size());
+        for (size_t ci = 0; ci < configs.size(); ++ci)
+        {
+            auto const& configValue = configs[ci].randomSeed;
+            if (configValue)
+            {
+                TLLM_CHECK(configValue->size() == 1);
+                randomSeed->at(ci) = configValue->front();
+            }
+            else
+            {
+                randomSeed->at(ci) = layers::DefaultDecodingParams::generateRandomSeed();
+            }
+        }
+
         topPDecay = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].topPDecay; },
             layers::DefaultDecodingParams::getTopPDecay());

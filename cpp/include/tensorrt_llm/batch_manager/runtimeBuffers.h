@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -38,10 +39,6 @@ class TllmRuntime;
 
 namespace tensorrt_llm::batch_manager
 {
-enum CacheBufferSize
-{
-    GENERATION_LOGITS_BUFFER_LENGTH = 8
-};
 
 namespace kv_cache_manager
 {
@@ -160,10 +157,6 @@ private:
     // LoRA
     std::unique_ptr<LoraBuffers> loraBuffers;
 
-    // Helper buffers
-    TensorPtr fillValues;
-    TensorPtr fillValuesDevice;
-
 public:
     // additional buffers depending on model type
     std::unique_ptr<TransformerBuffers> transformerBuffers;
@@ -182,6 +175,9 @@ public:
     // Eagle decoding
     std::optional<runtime::EagleBuffers> eagleBuffers;
 
+    // language adapter routing information if language adapter is presented.
+    TensorPtr languageAdapterRoutings; // [numTokens, numLanguages]
+
     TensorPtr cacheIndirDecoderIOBatchedCopySrcOffsets;
     TensorPtr cacheIndirDecoderIOBatchedCopyDstOffsets;
     TensorPtr cacheIndirDecoderIOBatchedCopySizes;
@@ -191,9 +187,36 @@ public:
     TensorPtr logits;
 
     // Helper cache for store generation logits
-    TensorPtr cacheTransposedGenerationLogits; // Temporarily store the transposed results of multiple fragment logits.
-    TensorPtr cacheGenerationFragmentPointerDevice; // Temporarily store logits buffer address during the transposing.
-    TensorPtr cacheGenerationFragmentPointerHost;   // Temporarily store logits buffer address during the transposing.
+    struct GenerationLogitsCache
+    {
+        static constexpr auto kCACHE_LENGTH = 8;
+
+        TensorPtr logits; // [kCACHE_LENGTH, maxBatchSize * maxBeamWidth, vocabSizePadded], Buffer for logits between
+                          // steps to prevent from being overwritten.
+        SizeType32 offset{0};       // Record the usage offset of the cacheGenerationLogits buffer.
+
+        TensorPtr transposedLogits; // [maxBeamWidth, kCACHE_LENGTH], Temporarily store the transposed results of
+                                    // multiple fragment logits.
+        TensorPtr
+            fragmentPointerDevice;  // [kCACHE_LENGTH], Temporarily store logits buffer address during the transposing.
+        TensorPtr fragmentPointerHost; // [maxBatchSize, kCACHE_LENGTH], Temporarily store logits buffer address during
+                                       // the transposing.
+        size_t workIdx{0};             // Cycling index for workspace
+
+        void cycleWorkIdx()
+        {
+            workIdx = (workIdx + 1) % (fragmentPointerHost->getShape().d[0]);
+        }
+
+        [[nodiscard]] TensorPtr getFragmentPointerHost()
+        {
+            TensorPtr slice = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
+            cycleWorkIdx();
+            return slice;
+        };
+    };
+
+    GenerationLogitsCache generationLogitsCache;
 
     // Helper for KV cache rewind
     TensorPtr seqSlots;
@@ -216,9 +239,7 @@ private:
     // Re-capture cuda graph when max kv cache len of the batch has changed on kKV_CACHE_LEN_CUDA_GRAPH_ROUND_SIZE.
     static SizeType32 constexpr kKV_CACHE_LEN_CUDA_GRAPH_ROUND_SIZE{256};
 
-    TensorPtr cacheGenerationLogits;           // Buffer for logits between steps to prevent from being overwritten.
-    SizeType32 cacheGenerationLogitsOffset{0}; // Record the usage offset of the cacheGenerationLogits buffer.
-    TensorMap mAdditionalOutputTensors;        // Tensors storing additional output tensors.
+    TensorMap mAdditionalOutputTensors; // Tensors storing additional output tensors.
 
     // engine I/O
     TensorMap inputMap;

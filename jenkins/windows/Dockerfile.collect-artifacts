@@ -1,0 +1,33 @@
+ARG BASE_IMAGE=must_be_specified
+ARG BUILD_IMAGE=must_be_specified
+
+FROM ${BUILD_IMAGE} AS collect-artifacts-base
+
+ARG TAR_NAME=must_be_specified
+ARG TARGET_ARCH=must_be_specified
+
+RUN \
+    powershell -c \
+        New-Item -ItemType Directory -Path Package ;\
+        .\TensorRT-LLM\jenkins\windows\stage.build_input.ps1 -cloneRoot TensorRT-LLM -stagingPath Package\Staging ;\
+        cmd /c dir Package\Staging\TensorRT-LLM\src ;\
+        .\TensorRT-LLM\jenkins\windows\stage.build_output.ps1 -cloneRoot TensorRT-LLM -stagingPath Package\Staging ;\
+        cmd /c dir Package\Staging\TensorRT-LLM ;\
+        cmd /c dir Package\Staging\TensorRT-LLM\benchmarks\cpp ;\
+        .\TensorRT-LLM\jenkins\windows\package.build.ps1 -stagingPath Package\Staging -packageName Package\%TAR_NAME% ;\
+        Remove-Item -Force -path Package\Staging -Recurse ;\
+        cmd /c dir Package ;\
+        cmd /c dir ;
+
+FROM ${BASE_IMAGE} as collect-artifacts
+
+# IMPORTANT: This must be a single command that populates 1 layer.
+# This is needed to support the "simple form" of the artifact
+# extraction done by runLLMBuild() in the
+#   jenkins/L0_MergeRequest_WindowsBuild.groovy
+# script.
+#
+# If this becomes hard to do here, then the groovy script will needed to
+# be updated to extract the artifact files from multiple layers.
+# Possible, but more complicated.
+COPY --from=collect-artifacts-base /workspace/Package/ /workspace/Package/

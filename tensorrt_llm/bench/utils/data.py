@@ -1,5 +1,4 @@
 import json
-import math
 from functools import partial
 from typing import List, TextIO, Tuple
 
@@ -7,6 +6,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
+from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -52,8 +52,6 @@ def create_dataset_from_stream(
     """
     # Initialize dataset list, and metadata tracking variables.
     dataset = []
-    max_isl = 0
-    max_osl = 0
     max_requests = num_requests if num_requests > 0 else float("inf")
 
     # If we're limiting the input length to a certain size, then set up
@@ -104,22 +102,15 @@ def create_dataset_from_stream(
         all_seq_len.append(len(logits) + osl)
         dataset.append(request)
 
-    max_isl = max(all_isl)
-    max_osl = max(all_osl)
-    max_seq_len = max(all_seq_len)
-    avg_isl = math.ceil(sum(all_isl) / len(all_isl))
-    avg_osl = math.ceil(sum(all_osl) / len(all_osl))
-    avg_seq_len = math.ceil(sum(all_seq_len) / len(all_seq_len))
+    isl_stats = PercentileStats.from_iterable(all_isl)
+    osl_stats = PercentileStats.from_iterable(all_osl)
+    seq_len_stats = PercentileStats.from_iterable(all_seq_len)
 
     # Fill in basic dataset metrics here
-    # TODO: Maybe fill this out to be more complete?
     metadata = DatasetMetadata(
-        avg_isl=avg_isl,
-        avg_osl=avg_osl,
-        max_isl=max_isl,
-        max_osl=max_osl,
-        avg_sequence_length=avg_seq_len,
-        max_sequence_length=max_seq_len,
+        isl_stats=isl_stats,
+        osl_stats=osl_stats,
+        seq_len_stats=seq_len_stats,
         num_requests=len(dataset),
     )
 

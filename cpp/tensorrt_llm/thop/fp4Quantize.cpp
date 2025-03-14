@@ -47,7 +47,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(
 
     TORCH_CHECK(rank >= 2, "Input should be >=2D tensor.");
     int64_t m = 1;
-    for (auto i = 0; i < rank - 1; i++)
+    for (size_t i = 0; i < rank - 1; i++)
     {
         m *= inputShape[i];
     }
