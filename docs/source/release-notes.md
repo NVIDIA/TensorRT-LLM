@@ -14,6 +14,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### API Changes
 
 ### Known Issues
+  - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
 
 ### Fixed Issues
 
