@@ -29,14 +29,15 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202503101709-8908"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202503101709-8908"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202503150013-9079"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202503150013-9079"
 
 // DLFW torch image
 // NOTE: DLFW 25.03 has not been released yet, so we're using the internal DLFW version
-// This is a copy of "gitlab-master.nvidia.com:5005/dl/dgx/pytorch:25.03-py3-devel"
+// This is a copy of "gitlab-master.nvidia.com:5005/dl/dgx/pytorch:25.03-py3-base"
 // for anonymous access.
-DLFW_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-devel-202503122023-internal"
+DLFW_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-base-202503150013-internal-x86"
+DLFW_IMAGE_SBSA = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-base-202503150013-internal-sbsa"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -1309,7 +1310,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 false,
                 "",
                 // TODO: Change to UBUNTU_24_04_IMAGE after https://nvbugs/5161461 is fixed
-                DLFW_IMAGE,
+                DLFW_IMAGE_SBSA,
             ],
         ]
     }
@@ -1373,12 +1374,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI tests") {
-                    pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                    trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
-                        echo "###### Prerequisites Start ######"
+                pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
+                trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
+                    stage("Prerequisites") {
                         // Clean up the pip constraint file from the base NGC PyTorch image.
-                        if (values[5] == DLFW_IMAGE) {
+                        if ((values[5] == DLFW_IMAGE_SBSA) || (values[5] == DLFW_IMAGE)) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
@@ -1387,8 +1387,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                        if ((values[5] != DLFW_IMAGE) && (cpu_arch == AARCH64_TRIPLE)) {
-                            echo "###### Extra prerequisites on aarch64 Start ######"
+                    }
+                    if ((values[5] != DLFW_IMAGE_SBSA) && (cpu_arch == AARCH64_TRIPLE)) {
+                        stage("Extra prerequisites on aarch64") {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
                         }
                         def libEnv = []
