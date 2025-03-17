@@ -95,7 +95,6 @@ def main(*,
     project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
-
     # Get all submodules and check their folder exists. If not,
     # invoke git submodule update
     with open(project_dir / ".gitmodules", "r") as submodules_f:
@@ -127,6 +126,7 @@ def main(*,
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
+    print("Rebase Testing Round 12.")
 
     cmake_cuda_architectures = (
         f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
