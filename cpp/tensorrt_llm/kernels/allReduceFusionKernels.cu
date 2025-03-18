@@ -294,19 +294,23 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
-
-    int token_id = blockIdx.x / cluster.num_blocks();
-    int access_id_in_token = cluster.block_rank() * blockDim.x + threadIdx.x;
+    cg::grid_group grid = cg::this_grid();
+    int token_id = grid.cluster_rank();
+    int access_id_in_token = cluster.thread_rank();
     int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int token_stride = gridDim.x / cluster.num_blocks();
+    int token_stride = grid.num_clusters();
     int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
     int tot_access = params.size / kElemsPerAccess;
     float4 clear_vec = get_neg_zero();
     cudaGridDependencySynchronize();
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess;
+
+    // Persistent Kernel
+    // Each cluster iterate through all token it need to handle
     for (int idx = access_id; idx < tot_access; idx += access_stride)
     {
+        // LDG.128
         float val[4];
         *reinterpret_cast<float4*>(val) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
 #pragma unroll
@@ -320,15 +324,20 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 #pragma unroll
         for (int r = 0; r < NRanks; ++r)
         {
+            // STG.128 to remote rank
             reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
                 = *reinterpret_cast<float4*>(val);
         }
-    }
-    for (int idx = access_id; idx < clear_access; idx += access_stride)
-    {
 
-        reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+        if (idx < clear_access)
+        {
+            // STG.128
+            reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+        }
     }
+
+    // Persistent Kernel
+    // Each cluster iterate through all token it need to handle
     for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
     {
         float4 vals[NRanks];
@@ -339,6 +348,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 #pragma unroll
             for (int r = 0; r < NRanks; ++r)
             {
+                // LDG.128 from local rank
                 vals[r]
                     = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
                 done &= !is_neg_zero(vals[r]);
@@ -348,8 +358,11 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 #pragma unroll
         for (int r = 1; r < NRanks; ++r)
         {
+            // FFMA
             sum_val = add128<DType>(sum_val, vals[r]);
         }
+
+        // Fused Norm
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
     comm.update(params.size * NRanks);
@@ -535,7 +548,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     int block_size = warps_per_token / cluster_size * 32;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
-    int grid_size = std::min(sm_count, cluster_num * cluster_size);
+    int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
     cfg.gridDim = grid_size;
@@ -563,16 +576,16 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
 {
-#define DISPATCH1(TEMP_0, TEMP_1, TEMP_2, TEMP_3, TEMP_4)                                                              \
-    return allreduce_fusion_kernel_launcher<TEMP_0, TEMP_1, TEMP_2, TEMP_3, TEMP_4>(params);
-#define DISPATCH0(TEMP_1, TEMP_2, TEMP_3, TEMP_4)                                                                      \
-    if (params.nranks == TEMP_1 && params.dtype == nvinfer1::DataType::kHALF)                                          \
+#define DISPATCH1(DType, NRanks, ResidualOut, NormOut, QuantOut)                                                       \
+    return allreduce_fusion_kernel_launcher<DType, NRanks, ResidualOut, NormOut, QuantOut>(params);
+#define DISPATCH0(NRanks, ResidualOut, NormOut, QuantOut)                                                              \
+    if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kHALF)                                          \
     {                                                                                                                  \
-        DISPATCH1(half, TEMP_1, TEMP_2, TEMP_3, TEMP_4);                                                               \
+        DISPATCH1(half, NRanks, ResidualOut, NormOut, QuantOut);                                                       \
     }                                                                                                                  \
-    else if (params.nranks == TEMP_1 && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kBF16)                                     \
     {                                                                                                                  \
-        DISPATCH1(__nv_bfloat16, TEMP_1, TEMP_2, TEMP_3, TEMP_4);                                                      \
+        DISPATCH1(__nv_bfloat16, NRanks, ResidualOut, NormOut, QuantOut);                                              \
     }
 
     TLLM_CHECK(params.allreduce_in && params.residual_in && params.rms_gamma);

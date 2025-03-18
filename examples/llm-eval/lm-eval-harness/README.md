@@ -16,7 +16,7 @@ Run the evaluation script with the following command:
 
 ```sh
 python lm_eval_tensorrt_llm.py --model trt-llm \
-    --model_args tokenizer=<HF model folder>,engine_dir=<TRT LLM engine dir>,chunk_size=<int> \
+    --model_args tokenizer=<HF model folder>,model=<TRT LLM engine dir>,chunk_size=<int> \
     --tasks <comma separated tasks, e.g., gsm8k-cot, mmlu>
 ```
 
@@ -41,8 +41,8 @@ Install the `lm_eval` package in the `requirements.txt` file in this folder.
 Run the evaluation script with the same command as above, but include `backend=torch` in the `model_args`. For example:
 
 ```sh
-python lm_eval_tensorrt_llm.py --model torch-llm \
-    --model_args model_dir=<HF model folder>,backend=torch,chunk_size=<int> \
+python lm_eval_tensorrt_llm.py --model trt-llm \
+    --model_args model=<HF model folder>,backend=torch,chunk_size=<int> \
     --tasks <comma separated tasks, e.g., gsm8k-cot, mmlu>
 ```
 

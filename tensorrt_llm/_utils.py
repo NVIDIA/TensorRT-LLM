@@ -499,6 +499,21 @@ def mpi_allgather(obj):
     return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
 
 
+def mpi_isend(buf, dest, tag=0):
+    # isend in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Isend(buf, dest, tag=tag)
+    return None
+
+
+def mpi_recv(buf, source, tag):
+    # recv in buf-like object (e.g. numpy array)
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Recv(buf, source, tag=tag)
+    return None
+
+
 def pad_vocab_size(vocab_size, tp_size):
     return int(math.ceil(vocab_size / tp_size) * tp_size)
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -173,6 +173,56 @@ extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Te
     }
 }
 
+torch::Tensor fp8_block_scaling_moe_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+{
+    TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+    TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
+    TORCH_CHECK(mat1Scale.scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
+    TORCH_CHECK(mat2Scale.scalar_type() == at::ScalarType::Float, "Scale dtype must be FP32.");
+    TORCH_CHECK(token_offset.scalar_type() == at::ScalarType::Long, "Token offset dtype must be INT64.");
+
+    TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix of shape (m_total, k)");
+    TORCH_CHECK(mat2.dim() == 3, "mat2 must be a matrix of shape (num_problems, n, k)");
+    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[2], "mat1 and mat2 shapes cannot be multiplied");
+
+    auto const m_total = mat1.sizes()[0];
+    auto const num_problems = mat2.sizes()[0];
+    auto const n = mat2.sizes()[1];
+    auto const k = mat2.sizes()[2];
+    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+
+    at::Tensor out = at::detail::empty_cuda({m_total, n}, at::ScalarType::BFloat16, mat1.device(), std::nullopt);
+
+    auto gemm_runner = get_gemm_runner(mat1.scalar_type(), mat2.scalar_type());
+
+    auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+
+    float const* mat1ScalePtr = mat1Scale.data_ptr<float>();
+    float const* mat2ScalePtr = mat2Scale.data_ptr<float>();
+
+    auto workspace_size = static_cast<int64_t>(gemm_runner->getWorkspaceSizeBase(m_total, n, k, num_problems));
+    auto workspace = at::detail::empty_cuda({workspace_size}, at::ScalarType::Byte, mat1.device(), std::nullopt);
+    void* workspace_ptr = workspace.data_ptr();
+    gemm_runner->configureWorkspace(static_cast<char*>(workspace_ptr));
+    gemm_runner->moeGemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(),
+        static_cast<int64_t*>(token_offset.data_ptr()), num_problems, n, k, stream, mat1ScalePtr, mat2ScalePtr);
+
+    return out;
+}
+
+extern torch::Tensor fp8_block_scaling_moe_gemm(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor const& token_offset)
+{
+    auto const sm = tensorrt_llm::common::getSMVersion();
+    switch (sm)
+    {
+    case 90: return fp8_block_scaling_moe_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale, token_offset);
+    default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling MoEGEMM");
+    }
+}
+
 // All inputs are k-major
 torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor& out)
@@ -186,7 +236,6 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
         ", and ", mat2.sizes()[0]);
     TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 k dim must be the same but got", mat1.sizes()[2],
         ", and ", mat2.sizes()[2]);
-    TORCH_CHECK(mat1Scale.dim() == 1, "mat1Scale must be a vector.");
 
     // mat1 could be strided due to padding
 
@@ -261,6 +310,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp8_block_scaling_bmm_out(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor(a!) out) -> "
         "Tensor(a!)");
+    m.def(
+        "fp8_block_scaling_moe_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor token_offset) "
+        "-> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -268,4 +320,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_block_scaling_gemm", &torch_ext::fp8_block_scaling_gemm);
     m.impl("fp8_block_scaling_bmm", &torch_ext::fp8_block_scaling_bmm);
     m.impl("fp8_block_scaling_bmm_out", &torch_ext::fp8_block_scaling_bmm_out);
+    m.impl("fp8_block_scaling_moe_gemm", &torch_ext::fp8_block_scaling_moe_gemm);
 }

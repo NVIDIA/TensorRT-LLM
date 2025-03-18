@@ -363,7 +363,13 @@ void initBindings(pybind11::module_& m)
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def(
             "new_tokens",
-            [](tr::GptDecoderBatched& self, int iter = 0) { return tr::Torch::tensor(self.getNewTokens(iter)); },
+            [](tr::GptDecoderBatched& self, int iter = 0)
+            {
+                auto allNewTokens = self.getAllNewTokens();
+                auto newTokensView = std::shared_ptr<tr::ITensor>(tr::ITensor::slice(allNewTokens, iter, 1));
+                newTokensView->squeeze(0);
+                return tr::Torch::tensor(tr::ITensor::slice(newTokensView, 0, self.getActualBatchSize()));
+            },
             py::arg("iter") = 0)
         .def_property_readonly("decoding_mode", &tr::GptDecoderBatched::getDecodingMode)
         .def_property_readonly("joint_decoding_input", &tr::GptDecoderBatched::getJointDecodingInput)

@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
@@ -276,6 +277,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
     // Block/Head idx.
     size_t const head_idx = blockIdx.y;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
 
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
     {
@@ -404,6 +408,10 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
         }
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+
     // The implementation of the parallel scan in the thread block (see CUB for details).
     using BlockScan = cub::BlockScan<int, BLOCK_SIZE>;
 
@@ -450,10 +458,22 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
         "MLA can only support input sequences with the same sequence length.");
     auto seq_len = params.acc_q_len / params.batch_size;
-    applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
-        params.attention_input_buf, params.q_pe, params.latent_cache, kv_cache_buffer, params.cos_sin_cache,
-        params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len, params.seqQOffset,
-        params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride);
+
+    auto* kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>;
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = 256;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_instance, params.attention_input_buf, params.q_pe, params.latent_cache,
+        kv_cache_buffer, params.cos_sin_cache, params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len,
+        params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
+        params.q_pe_stride);
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \

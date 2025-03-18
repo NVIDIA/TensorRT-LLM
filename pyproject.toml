@@ -20,7 +20,7 @@ column_limit = 80
 ignore_patterns = ["**/auto_deploy/**"]
 
 [tool.codespell]
-skip = ".git,3rdparty,tests/llm-test-defs/turtle/test_input_files**,**.jsonl,**.json"
+skip = ".git,3rdparty,tests/integration/test_input_files**,**.jsonl,**.json"
 exclude-file = "examples/whisper/tokenizer.py"
 ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw"
 

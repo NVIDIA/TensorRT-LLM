@@ -17,11 +17,11 @@ from ..utils.logger import ad_logger
 
 
 def _flatten_args(in_spec, *args, **kwargs) -> Tuple[torch.Tensor, List[Any]]:
-    """Flatten inputs from in_spec where we assume the first input is the indices."""
+    """Flatten inputs from in_spec where we assume the first input is the main input tensor."""
     all_args: PyTree = (args, kwargs)
-    idxs, *flat_args = tree_flatten_spec(all_args, in_spec)
-    assert idxs.ndim == 2, "Expecting 2D input tensor of indices."
-    return idxs, flat_args
+    input_t, *flat_args = tree_flatten_spec(all_args, in_spec)
+    assert input_t.ndim > 1, "Expecting at least a 2D input tensor."
+    return input_t, flat_args
 
 
 class BackendRegistry:

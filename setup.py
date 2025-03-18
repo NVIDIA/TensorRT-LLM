@@ -37,6 +37,11 @@ def parse_requirements(filename: os.PathLike):
             # handle -i and --extra-index-url options
             if "-i " in line or "--extra-index-url" in line:
                 extra_URLs.append(extract_url(line))
+            # handle URLs such as git+https://github.com/flashinfer-ai/flashinfer.git@e3853dd#egg=flashinfer-python
+            elif line.startswith("git+https"):
+                idx = line.find("egg=")
+                dep = line[idx + 4:]
+                deps.append(dep)
             else:
                 deps.append(line)
     return deps, extra_URLs
@@ -87,19 +92,15 @@ if on_windows:
     package_data = [
         'libs/th_common.dll', 'libs/tensorrt_llm.dll',
         'libs/nvinfer_plugin_tensorrt_llm.dll',
-        'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd'
+        'libs/tensorrt_llm_nvrtc_wrapper.dll', 'bindings.*.pyd', "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
-        'libs/libtensorrt_llm.so',
-        'libs/libth_common.so',
+        'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_nvrtc_wrapper.so',
-        'libs/libtensorrt_llm_ucx_wrapper.so',
-        'libs/libdecoder_attention_0.so',
-        'libs/libdecoder_attention_1.so',
-        'bindings.*.so',
+        'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
+        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
     ]
 
 package_data += [

@@ -226,7 +226,7 @@ void initBindings(pybind11::module_& m)
             [](GenLlmReq& self)
             {
                 std::optional<GenLlmReq::VecTokens> draftTokens = std::nullopt;
-                if (self.getDraftTokens())
+                if (self.hasDraftTokens())
                 {
                     draftTokens = *self.getDraftTokens();
                 }

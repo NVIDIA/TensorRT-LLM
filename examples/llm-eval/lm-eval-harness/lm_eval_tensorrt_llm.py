@@ -203,15 +203,13 @@ class TRTLLMEvalBase(TemplateLM):
             k_mapping = {
                 "temperature": "temperature",
                 "top_p": "top_p",
-                "max_gen_toks": "max_tokens"
+                "max_gen_toks": "max_tokens",
+                "until": "stop",
             }
             kwargs_mapped = {
                 k_sp: gen_kwargs[k_gen]
                 for k_gen, k_sp in k_mapping.items() if k_gen in gen_kwargs
             }
-            # torch backend does not support stop words in request
-            if self.backend != 'torch':
-                kwargs_mapped["stop"] = gen_kwargs["until"]
             if "max_tokens" not in kwargs_mapped:
                 kwargs_mapped["max_tokens"] = self.max_gen_toks
             return SamplingParams(**kwargs_mapped)

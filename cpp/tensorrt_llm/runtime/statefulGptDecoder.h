@@ -21,7 +21,6 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 
 #include <memory>
 
@@ -84,15 +83,6 @@ public:
     {
         TLLM_CHECK(iter == 0);
         return mDecodingOutput->newTokens;
-    }
-
-    //! @brief Get tokens generated in the last forward pass
-    //! @returns [batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    [[nodiscard]] TensorPtr getAllNewTokens() const override
-    {
-        TensorPtr newTokens = ITensor::view(mDecodingOutput->newTokensSteps);
-        newTokens->unsqueeze(0);
-        return newTokens;
     }
 
     //! @returns [1], number of finished sequences, in pinned host memory

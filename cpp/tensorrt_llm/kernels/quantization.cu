@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
@@ -144,13 +145,35 @@ void invokeFP4Quantization(int m, int n, T const* input, float const* SFScale, i
     // Launch the cvt kernel.
     if (useUE8M0)
     {
-        cvt_fp16_to_fp4<T, true><<<grid, block, 0, stream>>>(
-            m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        auto* kernel_instance = &cvt_fp16_to_fp4<T, true>;
+        cudaLaunchConfig_t config;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput));
     }
     else
     {
-        cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
-            m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        auto* kernel_instance = &cvt_fp16_to_fp4<T, false>;
+        cudaLaunchConfig_t config;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput));
     }
 }
 
@@ -194,13 +217,35 @@ void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float con
     // Launch the cvt kernel.
     if (useUE8M0)
     {
-        cvt_fp16_to_fp4_3d<T, true><<<grid, block, 0, stream>>>(
-            b, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        auto* kernel_instance = &cvt_fp16_to_fp4_3d<T, true>;
+        cudaLaunchConfig_t config;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput));
     }
     else
     {
-        cvt_fp16_to_fp4_3d<T, false><<<grid, block, 0, stream>>>(
-            b, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+        auto* kernel_instance = &cvt_fp16_to_fp4_3d<T, false>;
+        cudaLaunchConfig_t config;
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(SFOuput));
     }
 }
 

@@ -73,10 +73,12 @@ class Attention(nn.Module):
             bias=bias,
             dtype=dtype,
             parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
+                tensor_parallel_rank=tp_rank,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+                pipeline_parallel_size=config.mapping.pp_size,
+                parallel_rank=config.mapping.rank),
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
@@ -88,24 +90,33 @@ class Attention(nn.Module):
             bias=self.dense_bias,
             dtype=dtype,
             parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
+                tensor_parallel_rank=tp_rank,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+                pipeline_parallel_size=config.mapping.pp_size,
+                parallel_rank=config.mapping.rank),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )
+        self.quant_config = config.get_quant_config()
+        self.attn_backend = config.attn_backend
+        self.pos_embd_params = pos_embd_params
+        self.rotary_emb = rotary_emb
 
+        if not config.skip_create_weights:
+            self.create_weights()
+
+    def create_weights(self):
         self.attn = create_attention(
-            config.attn_backend,
+            self.attn_backend,
             self.layer_idx,
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=pos_embd_params,
-            quant_config=config.get_quant_config(),
+            pos_embd_params=self.pos_embd_params,
+            quant_config=self.quant_config,
         )
-        self.rotary_emb = rotary_emb
 
     def forward(
         self,
@@ -134,7 +145,7 @@ class Attention(nn.Module):
                      v.contiguous()], dim=-1)
 
             out_scale = None
-            if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4:
+            if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
                 out_scale = self.o_proj.inv_input_scale
             attn_output = self.attn.forward(qkv,
                                             None,
@@ -175,6 +186,7 @@ class MLA(nn.Module):
         v_head_dim: int,
         q_lora_rank: int,
         kv_lora_rank: int,
+        predicted_tokens_per_seq: int,
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
@@ -197,6 +209,7 @@ class MLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.predicted_tokens_per_seq = predicted_tokens_per_seq
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
@@ -228,12 +241,16 @@ class MLA(nn.Module):
             tensor_parallel_size=tp_size,
             tensor_parallel_mode=TensorParallelMode.ROW,
             gpus_per_node=gpus_per_node,
+            pipeline_parallel_size=config.mapping.pp_size,
+            parallel_rank=config.mapping.rank,
         )
         col_parallel_config = ParallelConfig(
             tensor_parallel_rank=tp_rank,
             tensor_parallel_size=tp_size,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gpus_per_node=gpus_per_node,
+            pipeline_parallel_size=config.mapping.pp_size,
+            parallel_rank=config.mapping.rank,
         )
 
         assert self.num_heads % tp_size == 0
@@ -306,29 +323,49 @@ class MLA(nn.Module):
                                 parallel_config=col_parallel_config,
                                 quant_config=quant_config,
                                 skip_create_weights=config.skip_create_weights)
-        self.v_b_proj = None  # view into self.kv_b_proj.weight
+        # This parameter will view into self.kv_b_proj.weight after loading weights.
+        # For dummy weight initialization, this parameter is initialized with empty tensor.
+        self.v_b_proj = nn.Parameter(
+            torch.empty(
+                (self.num_heads, self.v_head_dim, self.kv_lora_rank),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
 
-        device = torch.device('cuda')
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
                 dtype=mla_weight_dtype,
-                device=device,
-            ))
+            ),
+            requires_grad=False,
+        )
 
         if quant_mode.has_fp8_block_scales():
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
                     (
                         self.num_heads,
-                        int(self.kv_lora_rank / 128),
-                        int(self.qk_nope_head_dim / 128),
+                        self.kv_lora_rank // 128,
+                        self.qk_nope_head_dim // 128,
                     ),
                     dtype=torch.float32,
                 ),
                 requires_grad=False,
             )
-            self.v_b_proj_scale = None  # view into self.kv_b_proj.weight_scale
+            # This parameter will view into self.kv_b_proj.weight_scale after loading weights.
+            # For dummy weight initialization, this parameter is initialized with empty tensor.
+            self.v_b_proj_scale = nn.Parameter(
+                torch.empty(
+                    (
+                        self.num_heads,
+                        self.v_head_dim // 128,
+                        self.kv_lora_rank // 128,
+                    ),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
@@ -357,6 +394,7 @@ class MLA(nn.Module):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
             v_head_dim=self.v_head_dim,
+            predicted_tokens_per_seq=self.predicted_tokens_per_seq,
         )
 
         self.mqa = create_attention(
@@ -373,6 +411,7 @@ class MLA(nn.Module):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
             v_head_dim=self.kv_lora_rank,
+            predicted_tokens_per_seq=self.predicted_tokens_per_seq,
         )
         self.rotary_emb = rotary_emb
 
@@ -386,15 +425,15 @@ class MLA(nn.Module):
         if self.is_lite:
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
-            compressed_kv = self.kv_a_layernorm(compressed_kv.contiguous())
+            compressed_kv = self.kv_a_layernorm(compressed_kv)
             compressed_q = hidden_states
         else:
             compressed_q, compressed_kv, k_pe = self.fused_a(
                 hidden_states).split([
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
                 ], -1)
-            compressed_q = self.q_a_layernorm(compressed_q.contiguous())
-            compressed_kv = self.kv_a_layernorm(compressed_kv.contiguous())
+            compressed_q = self.q_a_layernorm(compressed_q)
+            compressed_kv = self.kv_a_layernorm(compressed_kv)
 
         q = self.q_b_proj(compressed_q)
 
@@ -522,9 +561,9 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.bmm(q_nope,
-                      self.k_b_proj_trans.transpose(1, 2),
-                      out=q_nope_out)
+            torch.ops.trtllm.bmm_out(q_nope,
+                                     self.k_b_proj_trans.transpose(1, 2),
+                                     q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             q_nope, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
                 q_nope)
@@ -568,9 +607,9 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.bmm(attn_out_latent.transpose(0, 1),
-                      self.v_b_proj.transpose(1, 2),
-                      out=attn_output.transpose(0, 1))
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             attn_out_latent, attn_out_latent_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
                 attn_out_latent)
@@ -584,6 +623,5 @@ class MLA(nn.Module):
 
         # [seq, num_heads * v_head_dim]
         attn_output_flatten = attn_output.flatten(1, 2)
-        assert attn_output.data_ptr() == attn_output_flatten.data_ptr()
 
         return attn_output_flatten

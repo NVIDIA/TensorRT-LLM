@@ -557,20 +557,22 @@ ContextPhaseParams Serialization::deserializeContextPhaseParams(std::istream& is
 {
     auto reqId = su::deserialize<decltype(ContextPhaseParams::mReqId)>(is);
     auto firstGenTokens = su::deserialize<decltype(ContextPhaseParams::mFirstGenTokens)>(is);
+    auto draftTokens = su::deserialize<decltype(ContextPhaseParams::mDraftTokens)>(is);
     auto hasState = su::deserialize<bool>(is);
     if (hasState)
     {
         auto state = std::make_unique<DataTransceiverState>();
         *state = deserializeDataTransceiverState(is);
-        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release()};
+        return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens)};
     }
-    return ContextPhaseParams{std::move(firstGenTokens), reqId};
+    return ContextPhaseParams{std::move(firstGenTokens), reqId, nullptr, std::move(draftTokens)};
 }
 
 void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os)
 {
     su::serialize(contextPhaseParams.mReqId, os);
     su::serialize(contextPhaseParams.mFirstGenTokens, os);
+    su::serialize(contextPhaseParams.mDraftTokens, os);
     su::serialize(static_cast<bool>(contextPhaseParams.mState), os);
     if (contextPhaseParams.mState)
     {
@@ -583,6 +585,7 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
     size_t totalSize = 0;
     totalSize += su::serializedSize(contextPhaseParams.mReqId);
     totalSize += su::serializedSize(contextPhaseParams.mFirstGenTokens);
+    totalSize += su::serializedSize(contextPhaseParams.mDraftTokens);
     totalSize += su::serializedSize(bool{});
     if (contextPhaseParams.mState)
     {

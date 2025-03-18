@@ -1,3 +1,4 @@
+import os
 import platform
 import traceback
 from typing import List, Optional, Tuple
@@ -6,7 +7,18 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
+from ..logger import logger
+
 IS_FLASHINFER_AVAIABLE = False
+
+
+def get_env_enable_pdl():
+    return os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+
+
+ENABLE_PDL = get_env_enable_pdl()
+if ENABLE_PDL:
+    logger.info("PDL is enabled")
 
 if platform.system() != "Windows":
     try:
@@ -37,10 +49,23 @@ def _register_fake():
         bias,
         scale,
     ):
-        final_output = torch.empty_like(
-            input, dtype=torch.float8_e4m3fn if scale else input.dtype)
-        inter_output = torch.empty_like(input)
-        return final_output, inter_output
+        from tensorrt_llm.functional import AllReduceFusionOp
+        if op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            final_output = input.new_empty(fp4_shape, dtype=torch.uint8)
+            inter_output = torch.empty_like(input)
+            scale_output = input.new_empty(scale_shape, dtype=torch.uint8)
+            return [final_output, scale_output, inter_output]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+            final_output = input.new_empty(fp4_shape, dtype=torch.float8_e4m3fn)
+            inter_output = torch.empty_like(input)
+            return [final_output, inter_output]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
+            final_output = torch.empty_like(input)
+            inter_output = torch.empty_like(input)
+            return [final_output, inter_output]
+        else:
+            return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::allgather")
     def _(input, group):
@@ -60,6 +85,29 @@ def _register_fake():
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(shape, dtype=out_dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::cublas_mm")
+    def _(mat_a, mat_b, bias, out_dtype):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::fp4_gemm")
+    def _(
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+        mat1_scale: torch.Tensor,
+        mat2_scale: torch.Tensor,
+        global_scale: torch.Tensor,
+        sf_use_ue8m0: bool,
+        out_dtype=None,
+    ):
+        shape = list(mat1.shape)
+        shape[-1] = mat2.shape[0]
+        ret = mat1.new_empty(shape, dtype=out_dtype)
         return ret
 
     @torch.library.register_fake("trtllm::attention")
@@ -86,8 +134,10 @@ def _register_fake():
         rotary_cos_sin,
         latent_cache,
         q_pe,
+        block_ids_per_seq,
         is_fused_qkv,
         update_kv_cache,
+        predicted_tokens_per_seq,
         layer_idx,
         num_heads,
         num_kv_heads,
@@ -123,6 +173,35 @@ def _register_fake():
                         v_head_dim if is_mla_enable else num_heads * head_size)
         return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
 
+    @torch.library.register_fake("trtllm::noaux_tc_op")
+    def _(scores, scores_with_bias, n_group, topk_group, topk,
+          routed_scaling_factor):
+        shape = list(scores.shape)
+        shape[-1] = topk
+        return scores.new_empty(shape,
+                                dtype=scores_with_bias.dtype), scores.new_empty(
+                                    shape, dtype=torch.int32)
+
+    @torch.library.register_fake("trtllm::fused_moe")
+    def _(
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        output_dtype,
+        quant_scales=None,
+        input_sf=None,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        profile_ids=None,
+        use_fp8_block_scaling=False,
+    ):
+        output_shape = [input.shape[0], fc2_expert_weights.shape[1]]
+        return input.new_empty(output_shape, dtype=output_dtype)
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input):
         return torch.empty_like(input)
@@ -140,28 +219,40 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::deepseek_allreduce_fusion")
     def _(
-        input: torch.Tensor,
-        workspace: torch.Tensor,
-        reduce_fusion_inputs: torch.Tensor,
-        rank: int,
-        nranks: int,
-        eps: float,
-        fusion_op: int,
+        input,
+        workspace,
+        reduce_fusion_inputs,
+        rank,
+        nranks,
+        eps,
+        fusion_op,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         residual = reduce_fusion_inputs[0]
         if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
             sf_vec_size = 16
-            sf_use_ue8m0 = False
             quant_shape, scale_shape = fp4_utils.get_fp4_shape(
-                input.shape, sf_vec_size, sf_use_ue8m0)
-            return torch.empty_like(
-                quant_shape, dtype=torch.uint8), torch.empty_like(
+                input.shape, sf_vec_size)
+            return input.new_empty(
+                quant_shape, dtype=torch.uint8), input.new_empty(
                     scale_shape, dtype=torch.uint8), torch.empty_like(residual)
         elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
             return torch.empty_like(input), torch.empty_like(residual)
         else:
             raise ValueError(f"Unsupported fusion op: {fusion_op}")
+
+    @torch.library.register_fake("trtllm::fp4_quantize")
+    def _(
+        input: torch.Tensor,
+        global_scale: torch.Tensor,
+        sf_vec_size: int,
+        sf_use_ue8m0=False,
+    ):
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size)
+
+        return (input.new_empty(output_shape, dtype=torch.uint8),
+                global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
 
 @torch.library.custom_op("trtllm::ub_scaled_mm_allreduce_quant_scaled_mm_op",
@@ -199,7 +290,7 @@ def ub_scaled_mm_allreduce_quant_scaled_mm_op(
         groups,
         int(AllReduceStrategy.UB),
         0,  # UB ar does not care about AllReduceConfig
-        int(AllReduceFusionOp.RESIDUAL_RMS_NORM),
+        int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
         eps,
         True,
         False,
@@ -241,6 +332,12 @@ def _(
     return ret, residual
 
 
+# Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
+@torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
+def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    torch.bmm(a, b, out=out)
+
+
 if IS_FLASHINFER_AVAIABLE:
     from flashinfer.activation import silu_and_mul
     from flashinfer.norm import fused_add_rmsnorm, rmsnorm
@@ -248,7 +345,7 @@ if IS_FLASHINFER_AVAIABLE:
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-        return silu_and_mul(x)
+        return silu_and_mul(x, enable_pdl=ENABLE_PDL)
 
     @flashinfer_silu_and_mul.register_fake
     def _(x: torch.Tensor) -> torch.Tensor:
@@ -258,7 +355,7 @@ if IS_FLASHINFER_AVAIABLE:
     @torch.library.custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
     def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                            eps: float) -> torch.Tensor:
-        return rmsnorm(input, weight, eps)
+        return rmsnorm(input, weight, eps, enable_pdl=ENABLE_PDL)
 
     @flashinfer_rmsnorm.register_fake
     def rmsnorm_fake(input: torch.Tensor, weight: torch.Tensor,
@@ -270,7 +367,7 @@ if IS_FLASHINFER_AVAIABLE:
     def flashinfer_fused_add_rmsnorm(input: torch.Tensor,
                                      residual: torch.Tensor,
                                      weight: torch.Tensor, eps: float) -> None:
-        fused_add_rmsnorm(input, residual, weight, eps)
+        fused_add_rmsnorm(input, residual, weight, eps, enable_pdl=ENABLE_PDL)
 
     @torch.library.custom_op("trtllm::flashinfer_apply_rope_inplace",
                              mutates_args=("q", "k"))

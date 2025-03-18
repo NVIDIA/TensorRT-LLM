@@ -85,7 +85,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
             chunk.usage = UsageInfo(prompt_tokens=num_tokens,
                                     total_tokens=num_tokens,
                                     completion_tokens=0)
-        data = chunk.model_dump_json(exclude_unset=True)
+        data = chunk.model_dump_json(exclude_none=True)
         return data
 
     res: List[str] = []
@@ -136,7 +136,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens)
-        data = chunk.model_dump_json(exclude_unset=True)
+        data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
 
     if include_usage and rsp._done:
@@ -211,6 +211,7 @@ class CompletionPostprocArgs(PostprocArgs):
     num_choices: int = 1
     prompt_idx: int = 0
     prompt: Optional[str] = None
+    stream_options: Optional[StreamOptions] = None
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -218,11 +219,20 @@ class CompletionPostprocArgs(PostprocArgs):
             echo=request.echo,
             model=request.model,
             num_choices=request.n if request.n else 1,
+            stream_options=request.stream_options,
         )
 
 
 def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
+    prompt_tokens = args.num_prompt_tokens
+    if stream_option := args.stream_options:
+        include_usage = stream_option.include_usage
+        include_continuous_usage = include_usage and stream_option.continuous_usage_stats
+    else:
+        include_usage = False
+        include_continuous_usage = False
+
     for output in rsp.outputs:
         delta_text = output.text_diff
         if args.echo and args.first_iteration:
@@ -234,8 +244,26 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
             stop_reason = output.stop_reason,
         )
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
+        if include_continuous_usage:
+            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
+                                    completion_tokens=output.length,
+                                    total_tokens=output.length + prompt_tokens)
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
+
+    if include_usage and rsp._done:
+        completion_tokens = sum(output.length
+                                for output in rsp.outputs)
+        final_usage = UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+
+        final_usage_chunk = ChatCompletionStreamResponse(
+            choices=[], model=args.model, usage=final_usage)
+        final_usage_data = final_usage_chunk.model_dump_json()
+        res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
     return res
 

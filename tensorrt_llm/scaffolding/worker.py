@@ -159,6 +159,8 @@ class ProposerWorker(Worker):
         result = self.executor.submit(generation_request)
         await result.aresult()
         task.output_tokens = result.outputs[0].token_ids
+        task.cumulative_logprob = result.outputs[0].cumulative_logprob
+        task.logprobs = result.outputs[0].logprobs
         task.output_str = None
         if not task.skip_detokenizer:
             task.output_str = self.tokenizer.decode(task.output_tokens)

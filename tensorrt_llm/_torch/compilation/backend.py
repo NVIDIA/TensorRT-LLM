@@ -40,6 +40,7 @@ class Backend:
 
     @classmethod
     def get_custom_pass(cls, enable_userbuffers):
+        # TODO: add pp + tp support
         world_size = tensorrt_llm.mpi_world_size()
         if cls._custom_pass_instance == None:
             # Really naive pass manager here

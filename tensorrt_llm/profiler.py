@@ -14,7 +14,6 @@
 # limitations under the License.
 import time
 from functools import partial
-from importlib.metadata import version
 from typing import Literal, Optional, Tuple, Union
 
 # isort: off
@@ -45,7 +44,7 @@ if pynvml is None:
     logger.warning(
         "A required package 'pynvml' is not installed. Will not "
         "monitor the device memory usages. Please install the package "
-        "first, e.g, 'pip install pynvml>=11.5.0'.")
+        "first, e.g, 'pip install nvidia-ml-py>=12'.")
 
 
 class Timer:
@@ -118,21 +117,10 @@ class PyNVMLContext:
 
 if pynvml is not None:
     with PyNVMLContext():
-        driver_version = pynvml.nvmlSystemGetDriverVersion()
-        pynvml_version = version("pynvml")
-        if pynvml_version < '11.5.0' or driver_version < '526':
-            logger.warning(
-                f'Found pynvml=={pynvml_version} and cuda driver version '
-                f'{driver_version}. Please use pynvml>=11.5.0 and cuda '
-                f'driver>=526 to get accurate memory usage.')
-            # Support legacy pynvml. Note that an old API could return
-            # wrong GPU memory usage.
-            _device_get_memory_info_fn = pynvml.nvmlDeviceGetMemoryInfo
-        else:
-            _device_get_memory_info_fn = partial(
-                pynvml.nvmlDeviceGetMemoryInfo,
-                version=pynvml.nvmlMemory_v2,
-            )
+        _device_get_memory_info_fn = partial(
+            pynvml.nvmlDeviceGetMemoryInfo,
+            version=pynvml.nvmlMemory_v2,
+        )
 
 
 def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -420,8 +421,14 @@ __global__ void topk_with_k2_kernel(T* output, T* input, int64_t const num_token
         cg::thread_block block = cg::this_thread_block();
         cg::thread_block_tile<32> tile = cg::tiled_partition<32>(block);
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        asm volatile("griddepcontrol.wait;");
+#endif
         topk_with_k2(output, input, tile, lane_id, num_experts_per_group);
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <typename T, typename IdxT>
@@ -451,6 +458,10 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     T value = cuda::std::numeric_limits<T>::min();
     T topk_group_value = cuda::std::numeric_limits<T>::min();
     int32_t num_equalto_topkth_group;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;"); // I think all prolog can be put before acqbulk because it's ptr arithmetic
+#endif
 
     if (case_id < num_tokens)
     {
@@ -555,6 +566,9 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
         // Note: when if_proceed_next_topk==false, choose the first 8 experts as the default result.
         //@TODO: check if this default strategy is acceptable. Might need to leave it as nan array.
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <typename T, typename IdxT>
@@ -564,15 +578,34 @@ void invokeNoAuxTc(T* scores, T* group_scores, T* topk_values, IdxT* topk_indice
 {
     int64_t num_cases = num_tokens * n_group;
     int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
-    topk_with_k2_kernel<T><<<topk_with_k2_num_blocks, BLOCK_SIZE, 0, stream>>>(
-        group_scores, scores_with_bias, num_tokens, num_cases, n_group, num_experts / n_group);
+    auto* kernel_instance1 = &topk_with_k2_kernel<T>;
+    cudaLaunchConfig_t config;
+    config.gridDim = topk_with_k2_num_blocks;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_instance1, group_scores, scores_with_bias, num_tokens, num_cases, n_group,
+        num_experts / n_group);
     sync_check_cuda_error(stream);
+
     int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
     size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
-
-    group_idx_and_topk_idx_kernel<T, IdxT><<<topk_with_k_group_num_blocks, BLOCK_SIZE, dynamic_smem_in_bytes, stream>>>(
-        scores, group_scores, topk_values, topk_indices, scores_with_bias, num_tokens, n_group, topk_group, topk,
-        num_experts, num_experts / n_group, routed_scaling_factor);
+    auto* kernel_instance2 = &group_idx_and_topk_idx_kernel<T, IdxT>;
+    config.gridDim = topk_with_k_group_num_blocks;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = dynamic_smem_in_bytes;
+    config.stream = stream;
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel_instance2, scores, group_scores, topk_values, topk_indices, scores_with_bias,
+        num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
     sync_check_cuda_error(stream);
 }
 

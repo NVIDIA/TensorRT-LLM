@@ -18,10 +18,10 @@
 
 #include "common.h"
 #include "iBuffer.h"
+#include "statefulGptDecoderBatched.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/runtime/runtimeBuffers.h"
@@ -193,8 +193,8 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(
-                std::make_shared<GptDecoderBatched>(stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
+            mDecoders.emplace_back(std::make_shared<StatefulGptDecoderBatched>(
+                stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
         {

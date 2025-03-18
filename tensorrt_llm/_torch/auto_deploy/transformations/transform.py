@@ -134,6 +134,7 @@ class InferenceOptimizer:
         # COMPILE MODEL
         ############################################################################################
 
+        cm.info._set_generate_only_batch()
         egm_compiled = compile_and_capture(
             egm, self.compile_backend, args=cm.args, dynamic_shapes=cm.dynamic_shapes
         )

@@ -445,8 +445,9 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
             elif not load_by_shard and not has_safetensors(
-                    hf_model_or_dir
-            ) and not quant_config.quant_mode.has_any_quant():
+                    hf_model_or_dir) and (
+                        quant_config is None
+                        or not quant_config.quant_mode.has_any_quant()):
                 hf_model_or_dir = load_hf_llama(hf_model_or_dir,
                                                 load_model_on_cpu)
 

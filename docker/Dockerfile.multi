@@ -3,7 +3,7 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG BASE_TAG=25.01-py3
 ARG DEVEL_IMAGE=devel
 
-FROM ${BASE_IMAGE}:${BASE_TAG} as base
+FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
 # https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html
 # The default values come from `nvcr.io/nvidia/pytorch`
@@ -14,7 +14,10 @@ ENV GITHUB_MIRROR=$GITHUB_MIRROR
 RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
 SHELL ["/bin/bash", "-c"]
 
-FROM base as devel
+# Clean up the pip constraint file from the base NGC PyTorch image.
+RUN [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
+
+FROM base AS devel
 
 ARG PYTHON_VERSION="3.12.3"
 RUN echo "Using Python version: $PYTHON_VERSION"
@@ -63,7 +66,7 @@ RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps
 
-FROM ${DEVEL_IMAGE} as wheel
+FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
 COPY benchmarks benchmarks
 COPY cpp cpp
@@ -81,7 +84,7 @@ ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=/root/.cache/ccache \
     python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
 
-FROM ${DEVEL_IMAGE} as release
+FROM ${DEVEL_IMAGE} AS release
 
 # Create a cache directory for pip
 RUN mkdir -p /root/.cache/pip

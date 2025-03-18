@@ -11,7 +11,9 @@ onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
 psutil
-pynvml>=11.5.0
+nvidia-ml-py>=12
+# Just a wrapper since nvidia-modelopt requires pynvml
+pynvml>=12.0.0
 pulp
 pandas
 h5py==3.12.1
@@ -21,7 +23,7 @@ tensorrt~=10.8.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01 uses 2.6.0a0.
 torch>=2.6.0a0,<=2.6.0
 torchvision
-nvidia-modelopt[torch]~=0.23.0
+nvidia-modelopt[torch]~=0.25.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
 transformers==4.48.3
@@ -42,5 +44,5 @@ setuptools
 ordered-set
 peft
 einops
-flashinfer-python~=0.2.0
+flashinfer-python~=0.2.3
 opencv-python-headless

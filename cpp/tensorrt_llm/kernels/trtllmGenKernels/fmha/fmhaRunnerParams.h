@@ -253,6 +253,10 @@ struct TllmGenSelectKernelParams
     bool mSelectNewKernel;
     // The tile scheduler.
     TileScheduler mTileScheduler;
+    // The tile size for Kv.
+    int mTileSizeKv;
+    // Use 2 CTA MMA or not.
+    bool mUses2CtaMma;
 
     // The constructor.
     TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -261,7 +265,9 @@ struct TllmGenSelectKernelParams
         , mMultiCtasKvMode(params.mMultiCtasKvMode)
         , mReuseSmemKForV(false)
         , mSelectNewKernel(false)
-        , mTileScheduler(params.mTileScheduler){};
+        , mTileScheduler(params.mTileScheduler)
+        , mTileSizeKv(128)
+        , mUses2CtaMma(false){};
 };
 
 } // namespace kernels

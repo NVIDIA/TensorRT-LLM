@@ -2,7 +2,7 @@ import asyncio
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, List, Mapping, Union
 
 from .controller import Controller, ScaffoldingOutput
 from .worker import Worker
@@ -18,7 +18,7 @@ class ScaffoldingRequest:
 
 class ScaffoldingResult:
 
-    def __init__(self, ):
+    def __init__(self):
         self._done = False
         self.aqueue = asyncio.Queue()
         self.output = None
@@ -34,12 +34,13 @@ class ScaffoldingResult:
     def result(self) -> "ScaffoldingResult":
         if not self._done:
             loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(self.aresult_step(), loop).result()
+            asyncio.run_coroutine_threadsafe(self.aresult(), loop).result()
         return self
 
     async def aresult(self) -> "ScaffoldingResult":
-        if not self._done:
+        while not self._done:
             await self.aresult_step()
+
         return self
 
     def __await__(self):
@@ -106,6 +107,7 @@ class ScaffoldingLlm:
             except StopIteration as e:
                 scaffolding_output = e.value
                 request.result.set_output(scaffolding_output)
+
             self.running_req_count -= 1
             maybe_schedule()
 
@@ -158,17 +160,27 @@ class ScaffoldingLlm:
                 kwargs={},
                 result=result,
                 controller=self.controller_cls(**(self.controller_args)))
-
             await self.task_queue.put(request)
 
         asyncio.run_coroutine_threadsafe(put_request(), self.loop)
 
         return result
 
-    def generate(self, prompt: str) -> ScaffoldingResult:
-        scaffolding_result = self.generate_async(prompt)
-        scaffolding_result.result()  # wait done
-        return scaffolding_result
+    def generate(
+        self, prompts: Union[str, List[str]]
+    ) -> Union[ScaffoldingResult, List[ScaffoldingResult]]:
+
+        unbatched = not isinstance(prompts, list)
+        batched_prompts = [prompts] if unbatched else prompts
+
+        scaffolding_results = []
+        for prompt in batched_prompts:
+            scaffolding_results.append(self.generate_async(prompt))
+
+        for scaffolding_result in scaffolding_results:
+            scaffolding_result.result()
+
+        return scaffolding_results[0] if unbatched else scaffolding_results
 
     def shutdown(self):
         # Let the merge thread break

@@ -24,6 +24,7 @@
 
 namespace su = tensorrt_llm::executor::serialize_utils;
 namespace texec = tensorrt_llm::executor;
+using VecTokens = texec::VecTokens;
 
 void compareRequestPerfMetrics(texec::RequestPerfMetrics const& lh, texec::RequestPerfMetrics const& rh)
 {
@@ -413,8 +414,8 @@ TEST(SerializeUtilsTest, ResultResponse)
 {
     texec::Result res = texec::Result{false, {{1, 2, 3}}, texec::VecLogProbs{1.0, 2.0},
         std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}}, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::vector<texec::FinishReason>{texec::FinishReason::kLENGTH}, texec::ContextPhaseParams({9, 37}, 0), 3, 2,
-        true};
+        std::vector<texec::FinishReason>{texec::FinishReason::kLENGTH},
+        texec::ContextPhaseParams({9, 37}, 0, VecTokens{1, 2}), 3, 2, true};
     {
         testSerializeDeserialize(res);
     }
@@ -693,7 +694,7 @@ TEST(SerializeUtilsTest, IterationStats)
 TEST(SerializeUtilsTest, ContextPhaseParams)
 {
     {
-        auto stats = texec::ContextPhaseParams({1}, 0);
+        auto stats = texec::ContextPhaseParams({1}, 0, std::nullopt);
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
     }
@@ -701,7 +702,7 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{{10, 20}});
-        auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 1, state.release());
+        auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 1, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
     }
@@ -710,7 +711,7 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
         state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, nvinfer1::DataType::kFLOAT});
-        auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release());
+        auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
     }
@@ -719,7 +720,8 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{{10, 20}});
         auto state2 = *state;
-        auto contextPhaseParams = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 1, state.release());
+        auto contextPhaseParams
+            = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 1, state.release(), VecTokens{10, 20});
 
         auto serializedState = contextPhaseParams.getSerializedState();
         auto stateCopy = texec::Serialization::deserializeDataTransceiverState(serializedState);

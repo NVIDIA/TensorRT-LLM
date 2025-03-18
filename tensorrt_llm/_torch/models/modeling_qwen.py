@@ -14,6 +14,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -193,3 +194,92 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+
+@register_auto_model("Qwen2ForProcessRewardModel")
+class Qwen2ForProcessRewardModel(DecoderModelForCausalLM[QwenModel,
+                                                         Qwen2Config]):
+    """
+    Qwen/Qwen2.5-Math-PRM.
+    The Qwen2 Model transformer with a token classification head on top (a linear layer on top of the hidden-states
+    output) e.g. for Named-Entity-Recognition (NER) tasks.
+    """
+
+    def __init__(self, model_config: ModelConfig[Qwen2Config]):
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = QwenModel(model_config)
+        self.num_labels = 2
+
+        config = model_config.pretrained_config
+
+        # TODO: add parallel config
+        self.score = nn.Sequential(
+            Linear(config.hidden_size,
+                   config.hidden_size,
+                   dtype=config.torch_dtype), nn.ReLU(),
+            Linear(config.hidden_size,
+                   self.num_labels,
+                   dtype=config.torch_dtype))
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.LongTensor,
+                position_ids: Optional[torch.LongTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+        logits = self.score(hidden_states)
+
+        # reshape as PRM scores each token.
+        # [[input_seq_len_1, num_labels], [input_seq_len_2, num_labels], ...]
+        return torch.nested.nested_tensor(
+            list(torch.split(logits, attn_metadata.seq_lens.tolist(), dim=0)))
+
+
+@register_auto_model("Qwen2ForRewardModel")
+class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
+    """
+    Qwen/Qwen2.5-Math-RM
+    """
+
+    def __init__(self, model_config: ModelConfig[Qwen2Config]):
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = QwenModel(model_config)
+        self.num_labels = 1
+
+        config = model_config.pretrained_config
+        self.pad_token_id = config.pad_token_id
+
+        # TODO: add parallel config
+        self.score = nn.Sequential(
+            Linear(config.hidden_size,
+                   config.hidden_size,
+                   dtype=config.torch_dtype), nn.ReLU(),
+            Linear(config.hidden_size,
+                   self.num_labels,
+                   dtype=config.torch_dtype))
+
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.LongTensor,
+                position_ids: Optional[torch.LongTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+        logits = self.score(hidden_states)
+
+        # get score of last token of each batch item
+        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        return logits[end_indices]

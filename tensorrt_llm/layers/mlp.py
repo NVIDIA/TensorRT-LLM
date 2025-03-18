@@ -406,7 +406,8 @@ class FusedGatedMLP(Module):
         if lora_result is not None:
             inter = inter + lora_result
             if self.dora is not None:
-                inter = fc_gate_dora(inter, self.dora, lora_layer_params)
+                inter = fc_gate_dora(inter, self.dora, self.fused_gate_up_lora,
+                                     lora_layer_params)
 
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)

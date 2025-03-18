@@ -4,7 +4,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import MTPDecodingConfig
+from tensorrt_llm.llmapi import BuildConfig, MTPDecodingConfig
 
 example_prompts = [
     "Hello, my name is",
@@ -23,7 +23,15 @@ def add_llm_args(parser):
                         type=str,
                         nargs="+",
                         help="A single or a list of text prompts.")
-
+    # Build config
+    parser.add_argument("--max_seq_len",
+                        type=int,
+                        default=None,
+                        help="The maximum sequence length.")
+    parser.add_argument("--max_batch_size",
+                        type=int,
+                        default=2048,
+                        help="The maximum batch size.")
     # Parallelism
     parser.add_argument('--attention_backend',
                         type=str,
@@ -36,6 +44,7 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
+    parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
 
@@ -97,17 +106,20 @@ def setup_llm(args):
     mtp_config = MTPDecodingConfig(
         num_nextn_predict_layers=args.mtp_nextn) if args.mtp_nextn > 0 else None
 
-    llm = LLM(
-        model=args.model_dir,
-        pytorch_backend_config=pytorch_config,
-        kv_cache_config=kv_cache_config,
-        tensor_parallel_size=args.tp_size,
-        enable_attention_dp=args.enable_attention_dp,
-        moe_expert_parallel_size=args.moe_ep_size,
-        moe_tensor_parallel_size=args.moe_tp_size,
-        enable_chunked_prefill=args.enable_chunked_prefill,
-        speculative_config=mtp_config,
-    )
+    build_config = BuildConfig(max_seq_len=args.max_seq_len,
+                               max_batch_size=args.max_batch_size)
+
+    llm = LLM(model=args.model_dir,
+              pytorch_backend_config=pytorch_config,
+              kv_cache_config=kv_cache_config,
+              tensor_parallel_size=args.tp_size,
+              pipeline_parallel_size=args.pp_size,
+              enable_attention_dp=args.enable_attention_dp,
+              moe_expert_parallel_size=args.moe_ep_size,
+              moe_tensor_parallel_size=args.moe_tp_size,
+              enable_chunked_prefill=args.enable_chunked_prefill,
+              speculative_config=mtp_config,
+              build_config=build_config)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

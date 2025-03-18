@@ -21,14 +21,15 @@ def parse_arguments():
     return args
 
 
-def test_sync(prompt, proposer_worker):
+def test_sync(prompts, proposer_worker):
     llm = ScaffoldingLlm(
         SimpleController,
         {},
         {'generation': proposer_worker},
     )
-    result = llm.generate(prompt)
-    print(result.output.output_str)
+    results = llm.generate(prompts)
+    for result in results:
+        print(result.output.output_str)
     print(f'main shutting down...')
     llm.shutdown()
     print(f'worker shutting down...')
@@ -36,30 +37,41 @@ def test_sync(prompt, proposer_worker):
     print(f'main shut down done')
 
 
-def test_async(prompt, proposer_worker):
+def test_async(prompts, proposer_worker):
 
-    async def test_async_func(prompt, proposer_worker):
+    async def test_async_func(prompts, proposer_worker):
         llm = ScaffoldingLlm(
             SimpleController,
             {},
             {'generation': proposer_worker},
         )
-        future = llm.generate_async(prompt)
-        result = await future.aresult()
-        print(result.output.output_str)
+
+        futures = []
+        for prompt in prompts:
+            future = llm.generate_async(prompt)
+            futures.append(future)
+
+        for future in futures:
+            result = await future.aresult()
+            print(result.output.output_str)
+
         print(f'main shutting down...')
         llm.shutdown()
         print(f'worker shutting down...')
         proposer_worker.shutdown()
         print(f'main shut down done')
 
-    asyncio.run(test_async_func(prompt, proposer_worker))
+    asyncio.run(test_async_func(prompts, proposer_worker))
 
 
 def main():
     args = parse_arguments()
 
-    prompt = "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n"
+    prompts = [
+        "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n",
+        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
+        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
+    ]
     proposer_worker = ProposerWorker(
         args.generation_dir,
         pytorch_backend_config=PyTorchConfig(
@@ -70,9 +82,9 @@ def main():
     )
 
     if args.run_async:
-        test_async(prompt, proposer_worker)
+        test_async(prompts, proposer_worker)
     else:
-        test_sync(prompt, proposer_worker)
+        test_sync(prompts, proposer_worker)
 
 
 if __name__ == "__main__":

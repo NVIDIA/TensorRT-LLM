@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include <assert.h>
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -34,10 +35,13 @@ struct MlaMetaParams
     int32_t qk_nope_head_dim = 0;
     int32_t qk_rope_head_dim = 0;
     int32_t v_head_dim = 0;
+    int32_t predicted_tokens_per_seq = 1;
+    int32_t num_layers = 0;
 
     auto data() const
     {
-        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
+        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
+            predicted_tokens_per_seq, num_layers);
     }
 };
 
@@ -63,6 +67,7 @@ struct MlaParams
     int32_t q_pe_ld;
     int32_t q_pe_stride;
     MlaMetaParams meta;
+    int const* block_ids_per_seq;
 };
 
 template <typename T, typename KVCacheBuffer>

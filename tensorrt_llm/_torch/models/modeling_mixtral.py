@@ -122,6 +122,7 @@ class MixtralDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        # TODO: add pipeline parallel config
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size,

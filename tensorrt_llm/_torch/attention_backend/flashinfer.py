@@ -7,11 +7,12 @@ import flashinfer
 import torch
 from flashinfer.jit.core import check_cuda_arch
 
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend, AttentionMask, AttentionMetadata, PredefinedAttentionMask)
-from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
+                        PredefinedAttentionMask)
+from .vanilla import VanillaAttention
 
 try:
     check_cuda_arch()
@@ -442,12 +443,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
         metadata = get_metadata()
 
+        q = q.view(-1, num_heads, head_dim)
+        if k is not None:
+            k = k.view(-1, num_kv_heads, head_dim)
+        if v is not None:
+            v = v.view(-1, num_kv_heads, head_dim)
+
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            q = q.view(1, -1, num_heads, head_dim)
-            k = k.view(1, -1, num_kv_heads, head_dim)
-            v = v.view(1, -1, num_kv_heads, head_dim)
             return VanillaAttention.dummy_forward(q, k, v)
 
         assert isinstance(
@@ -455,16 +459,9 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             FlashInferAttentionMetadata,
         )
 
-        # Query
-        q = q.view(-1, num_heads, head_dim)
-
-        # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx)
 
         if k is not None and v is not None:
-            k = k.view(-1, num_kv_heads, head_dim)
-            v = v.view(-1, num_kv_heads, head_dim)
-
             if has_fp8_kv_cache:
                 assert kv_cache.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache.dtype}"
                 k = k.to(torch.float8_e4m3fn)

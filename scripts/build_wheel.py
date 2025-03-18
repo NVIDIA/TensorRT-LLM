@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
-from shutil import copy, rmtree
+from shutil import copy, copytree, rmtree
 from subprocess import CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
@@ -223,9 +223,38 @@ def main(*,
     pkg_dir = project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
+    include_dir = pkg_dir / "include"
     if lib_dir.exists():
         clear_folder(lib_dir)
+    if include_dir.exists():
+        clear_folder(include_dir)
+
+    cache_dir = os.getenv("TRTLLM_DG_CACHE_DIR")
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+    elif on_windows:
+        if os.getenv("APPDATA") is not None:
+            cache_dir = Path(os.getenv("APPDATA")) / "tensorrt_llm"
+        else:
+            cache_dir = Path(os.getenv("TEMP")) / "tensorrt_llm"
+    else:
+        if os.getenv("HOME") is not None:
+            cache_dir = Path(os.getenv("HOME")) / ".tensorrt_llm"
+        else:
+            cache_dir = Path(os.getenv("TEMP"), "/tmp") / "tensorrt_llm"
+    if cache_dir.exists():
+        clear_folder(cache_dir)
     lib_dir.mkdir(parents=True, exist_ok=True)
+    include_dir.mkdir(parents=True, exist_ok=True)
+    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cute",
+             include_dir / "cute",
+             dirs_exist_ok=True)
+    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cutlass",
+             include_dir / "cutlass",
+             dirs_exist_ok=True)
+    copytree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
+             include_dir / "deep_gemm",
+             dirs_exist_ok=True)
     if on_windows:
         copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
              lib_dir / "tensorrt_llm.dll")

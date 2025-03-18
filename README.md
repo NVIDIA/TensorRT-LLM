@@ -9,7 +9,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.8.0-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-10.8.0-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-0.18.0.dev-green)](./tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-0.19.0.dev-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/architecture/overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](./examples/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://docs.google.com/presentation/d/1gycPmtdh7uUcH6laOvW65Dbp9F1McUkGDIcAyjicBZs/edit?usp=sharing)
@@ -18,18 +18,50 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+* [2025/02/28] Spotlight🌟🌟🌟 NAVER Place Optimizes SLM-Based Vertical Services with NVIDIA TensorRT-LLM
+[➡️ link](https://developer.nvidia.com/blog/spotlight-naver-place-optimizes-slm-based-vertical-services-with-nvidia-tensorrt-llm/)
 <div align="center">
-<img src="docs/source/media/r1-perf.jpeg" width="75%">
-
-  <sub><sup>HGX B200 (8 GPUs) vs HGX H200 (8 GPUs) vs 2 x HGX H100 (normalized to 8 GPUs for comparison). Input tokens not included in TPS calculations. TensorRT-LLM Version:  0.18.0.dev2025021800 (pre-release) used for Feb measurements, SGLang used for Jan measurements. Hopper numbers in FP8. B200 numbers in FP4. Max concurrency use case. ISL/OSL: 1K/1K.</sub></sup>
+<img src=https://developer-blogs.nvidia.com/wp-content/uploads/2025/02/naver-place-app-graphic.jpg width="50%">
 <div align="left">
 
-* [2025/01/07] 🌟 Getting Started with TensorRT-LLM
-[➡️ link](https://www.youtube.com/watch?v=TwWqPnuNHV8)
+* [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell
+[➡️ link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+
+* [2025/02/20] Stay ahead of the curve 📈 Leverage the most performant & capable platform for inference. 🚀Explore the complete guide to achieve great accuracy, high throughput, and low latency at the lowest cost for your business ➡️
+[➡️ link](https://www.nvidia.com/en-us/solutions/ai/inference/balancing-cost-latency-and-performance-ebook/?ncid=so-twit-348956&linkId=100000341423615)
+
+* [2025/02/18] Unlock #LLM inference with auto-scaling on @AWS EKS ✨
+✅ Set up EFA networking & EFS storage with NVLink-connected H100 GPUs on P5.48xlarge
+✅ Deploy multi-node Triton Inference Server + TRT-LLM to scale LLaMa 3.1 405B models
+✅ Use LeaderWorkerSet & Prometheus metrics for autoscaling and orchestration
+[➡️ link](https://aws.amazon.com/blogs/hpc/scaling-your-llm-inference-workloads-multi-node-deployment-with-tensorrt-llm-and-triton-on-amazon-eks/)
+
+* [2025/02/12] 🦸⚡ Automating GPU Kernel Generation with DeepSeek-R1 and Inference Time Scaling
+[➡️ link](https://developer.nvidia.com/blog/automating-gpu-kernel-generation-with-deepseek-r1-and-inference-time-scaling/?ncid=so-twit-997075&linkId=100000338909937)
+
+* [2025/02/12] 🌟 How Scaling Laws Drive Smarter, More Powerful AI
+[➡️ link](https://blogs.nvidia.com/blog/ai-scaling-laws/?ncid=so-link-889273&linkId=100000338837832)
+
+* [2025/01/25] 🌟 Nvidia moves AI focus to inference cost, efficiency 🌟
+[➡️ link](https://www.fierceelectronics.com/ai/nvidia-moves-ai-focus-inference-cost-efficiency?linkId=100000332985606)
+
+* [2025/01/24] 🏎️🏎️🏎️ Optimize AI Inference Performance with NVIDIA Full-Stack Solutions
+[➡️ link](https://developer.nvidia.com/blog/optimize-ai-inference-performance-with-nvidia-full-stack-solutions/?ncid=so-twit-400810&linkId=100000332621049)
+
+* [2025/01/23] 🚀🚀🚀 Fast, Low-Cost Inference Offers Key to Profitable AI
+[➡️ link](https://blogs.nvidia.com/blog/ai-inference-platform/?ncid=so-twit-693236-vt04&linkId=100000332307804)
+
+* [2025/01/16] 🐍 Introducing New KV Cache Reuse Optimizations in NVIDIA TensorRT-LLM
+[➡️ link](https://developer.nvidia.com/blog/introducing-new-kv-cache-reuse-optimizations-in-nvidia-tensorrt-llm/?ncid=so-twit-363876&linkId=100000330323229)
+
+* [2025/01/14] 📣 Bing's Transition to LLM/SLM Models: Optimizing Search with TensorRT-LLM
+[➡️ link](https://blogs.bing.com/search-quality-insights/December-2024/Bing-s-Transition-to-LLM-SLM-Models-Optimizing-Search-with-TensorRT-LLM)
 
 * [2025/01/04] ⚡Boost Llama 3.3 70B Inference Throughput 3x with NVIDIA TensorRT-LLM Speculative Decoding
 [➡️ link](https://developer.nvidia.com/blog/boost-llama-3-3-70b-inference-throughput-3x-with-nvidia-tensorrt-llm-speculative-decoding/)
+
+<details close>
+<summary>Previous News</summary>
 
 * [2024/12/10] ⚡ Llama 3.3 70B from AI at Meta is accelerated by TensorRT-LLM. 🌟 State-of-the-art model on par with Llama 3.1 405B for reasoning, math, instruction following and tool use. Explore the preview
 [➡️ link](https://build.nvidia.com/meta/llama-3_3-70b-instruct)
@@ -62,9 +94,6 @@ TensorRT-LLM
 * [2024/11/02] 🌟🌟🌟 NVIDIA and LlamaIndex Developer Contest
 🙌 Enter for a chance to win prizes including an NVIDIA® GeForce RTX™ 4080 SUPER GPU, DLI credits, and more🙌
 [➡️ link](https://developer.nvidia.com/llamaindex-developer-contest)
-
-<details close>
-<summary>Previous News</summary>
 
 * [2024/10/28] 🏎️🏎️🏎️ NVIDIA GH200 Superchip Accelerates Inference by 2x in Multiturn Interactions with Llama Models
 [➡️ link](https://developer.nvidia.com/blog/nvidia-gh200-superchip-accelerates-inference-by-2x-in-multiturn-interactions-with-llama-models/)

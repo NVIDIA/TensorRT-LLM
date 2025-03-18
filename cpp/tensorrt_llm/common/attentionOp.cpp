@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
+#include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -612,33 +613,67 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept
 {
     auto const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
+    int const batch_beam = max_num_seq;
 
-    // MLA use fmha on SM90, trtllm-gen on SM100
-    size_t mla_gen_workspace_size = 0;
-    // The headDim of the output tensor.
-    int headDim = mHeadSize;
+    // Compute the workspace size for MLA.
     if (mIsMLAEnabled)
     {
-        // Used by fmha on SM90 only
+        size_t flash_mla_workspace_size = 0;
+        if (mUseFlashMLA)
+        {
+            int const FLASH_MLA_NUM_BUFFERS = 5;
+            size_t flash_mla_workspaces[FLASH_MLA_NUM_BUFFERS];
+
+            static constexpr int TileSchedulerMetaDataSize = 8;
+
+            int s_q = mMLAParams.predicted_tokens_per_seq;
+
+            int num_q_heads = mNumHeads / mCpSize;
+            int num_kv_heads = mNumKVHeads;
+            int head_size_v = mMLAParams.kv_lora_rank;
+
+            int num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
+
+            // for mla  metadata
+            flash_mla_workspaces[0] = sizeof(int) * (num_sm_parts * TileSchedulerMetaDataSize);
+            flash_mla_workspaces[1] = sizeof(int) * (batch_beam + 1); // to check in MTP
+
+            // for mla kernel
+            flash_mla_workspaces[2] = sizeof(float) * (batch_beam * s_q * num_q_heads);            // softmax_lse
+            flash_mla_workspaces[3]
+                = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);               // softmax_lse_accum
+            flash_mla_workspaces[4]
+                = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v); // out_accum
+            flash_mla_workspace_size = tc::calculateTotalWorkspaceSize(flash_mla_workspaces, FLASH_MLA_NUM_BUFFERS);
+        }
+
         size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t fmha_scheduler_counter = sizeof(uint32_t);
 
-        int const NUM_BUFFERS = 3;
+        int const NUM_BUFFERS = 7;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = cu_seqlens_size; // cu_q_len
         workspaces[1] = cu_seqlens_size; // cu_kv_len
         workspaces[2] = fmha_scheduler_counter;
+        // The multiCtasKvMode buffers. Each CTA at most handles 256 rows.
+        // And the seqLenKv is split into at most mMultiProcessorCount tiles.
+        workspaces[3] = size * 256 * mMultiProcessorCount * mMLAParams.kv_lora_rank;
+        // The partialSum size.
+        workspaces[4] = sizeof(float) * 256 * mMultiProcessorCount;
+        // The partialMax size.
+        workspaces[5] = sizeof(float) * 256 * mMultiProcessorCount;
 
-        mla_gen_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
+        workspaces[6] = flash_mla_workspace_size;
+
+        return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
 
     size_t generation_workspace_size = 0;
 
-    int const batch_beam = max_num_seq;
     int32_t const maxSeqLenTile
         = std::max(getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads));
 
-    size_t const partial_out_size = size * batch_beam * mNumHeads * headDim * maxSeqLenTile;
+    size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
     size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
     size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
     size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
@@ -648,14 +683,13 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
 
-    int const NUM_BUFFERS = 6;
+    int const NUM_BUFFERS = 5;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = partial_out_size;
     workspaces[1] = partial_sum_size;
     workspaces[2] = partial_max_size;
     workspaces[3] = shift_k_cache_size;
     workspaces[4] = cpWorkspaceSize;
-    workspaces[5] = mla_gen_workspace_size;
     generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     size_t xqa_workspace_size = 0;
@@ -701,8 +735,9 @@ int AttentionOp::mlaGeneration(
     int const num_kv_heads = 1;
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
-
-    auto const sizePerToken = num_kv_heads * head_size * sizeof(T);
+    // The element size of the KV cache.
+    int elemSize = sizeof(T);
+    auto const sizePerToken = num_kv_heads * head_size * elemSize;
 
     auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
         sizePerToken, generation_params.cyclic_attention_window_size,
@@ -720,6 +755,7 @@ int AttentionOp::mlaGeneration(
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
+    void* scratch_ptr = nextWorkspacePtr(workspace_byte_ptr, offset);
 
     params.seqQOffset = cu_q_seqlens;
     params.cu_kv_seqlens = cu_kv_seqlens;
@@ -767,7 +803,7 @@ int AttentionOp::mlaGeneration(
 
         // The partial buffers' pointers when the multiCtasKv mode is enabled.
         tllmRunnerParams.multiCtasKvCounterPtr = generation_params.semaphores;
-        tllmRunnerParams.multiCtasKvScratchPtr = workspace_byte_ptr;
+        tllmRunnerParams.multiCtasKvScratchPtr = scratch_ptr;
 
         // The sequence lengths for K/V.
         tllmRunnerParams.seqLensKvPtr = params.cache_seq_lens;
@@ -802,8 +838,7 @@ int AttentionOp::mlaGeneration(
         // The kv cache should be based on the maximum headDim of K and V due to paddings.
         int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
         tllmRunnerParams.mNumPagesInMemPool = totalMemory
-            / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
-                * sizeof(KVBlockArray::DataType));
+            / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv * elemSize);
 
         tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = stream;
@@ -811,6 +846,111 @@ int AttentionOp::mlaGeneration(
 
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
+    }
+    else if (mUseFlashMLA)
+    {
+        static constexpr int block_size_n = 64;
+        static constexpr int fixed_overhead_num_blocks = 5;
+        static constexpr int TileSchedulerMetaDataSize = 8;
+
+        int const num_q_heads = mNumHeads / mCpSize;
+        int const ngroups = num_q_heads / num_kv_heads;
+
+        int const s_q = params.acc_q_len / batch_beam;
+        assert(s_q == mMLAParams.predicted_tokens_per_seq);
+        int const head_size_v = mMLAParams.kv_lora_rank;
+        int const num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
+
+        size_t const num_splits_size = sizeof(int) * (batch_beam + 1);
+        size_t const tile_scheduler_metadata_size = sizeof(int) * (num_sm_parts * TileSchedulerMetaDataSize);
+        size_t const softmax_lse_size = sizeof(float) * (batch_beam * s_q * num_q_heads * num_kv_heads); // softmax_lse
+        size_t const softmax_lse_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);
+        size_t const out_accum_size = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v);
+
+        int* tile_scheduler_metadata_ptr
+            = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, tile_scheduler_metadata_size));
+        int* num_splits_ptr = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, num_splits_size));
+        float* softmax_lse_ptr
+            = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_size));
+        float* softmax_lse_accum_ptr
+            = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, softmax_lse_accum_size));
+        float* out_accum_ptr = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, out_accum_size));
+
+        // prepare metadata
+        Mla_metadata_params mlaMetaDataParams = {};
+        mlaMetaDataParams.seqlens_k_ptr = const_cast<int*>(params.cache_seq_lens);
+        mlaMetaDataParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+        mlaMetaDataParams.num_splits_ptr = num_splits_ptr;
+        mlaMetaDataParams.batch_size = batch_beam;
+        mlaMetaDataParams.block_size_n = block_size_n;
+        mlaMetaDataParams.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
+        mlaMetaDataParams.num_sm_parts = num_sm_parts;
+
+        // metadata should only be init once per iter, to fix later
+        get_mla_metadata_func(mlaMetaDataParams, stream);
+
+        Flash_fwd_mla_params flashMlaParams{};
+        flashMlaParams.b = batch_beam;
+        flashMlaParams.seqlen_q = ngroups * s_q;
+        flashMlaParams.cu_seqlens_k = const_cast<int*>(params.cache_seq_lens);
+        flashMlaParams.h = 1;
+        flashMlaParams.h_h_k_ratio = 1;
+
+        float softmax_scale
+            = 1.0f / (mQScaling * sqrtf((mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim) * 1.0f));
+
+        flashMlaParams.ngroups = ngroups;
+        flashMlaParams.is_causal = !(s_q == 1);
+        flashMlaParams.d = head_size;
+        flashMlaParams.d_v = head_size_v;
+        flashMlaParams.scale_softmax = softmax_scale;
+        flashMlaParams.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
+
+        flashMlaParams.q_ptr = const_cast<void*>(reinterpret_cast<void const*>(params.attention_input_buf));
+        flashMlaParams.k_ptr = kv_cache_buffer.mPrimaryPoolPtr;
+        flashMlaParams.v_ptr = flashMlaParams.k_ptr;
+        flashMlaParams.o_ptr = reinterpret_cast<void*>(params.context_buf);
+        flashMlaParams.softmax_lse_ptr = softmax_lse_ptr;
+
+        // since head_num_kv = 1
+        flashMlaParams.q_batch_stride = head_size * params.head_num * s_q;
+        flashMlaParams.k_batch_stride = mTokensPerBlock * num_kv_heads * head_size * mMLAParams.num_layers;
+        flashMlaParams.o_batch_stride = s_q * num_q_heads * head_size_v;
+        flashMlaParams.q_row_stride = head_size;
+        flashMlaParams.k_row_stride = head_size;
+        flashMlaParams.o_row_stride = head_size_v;
+        flashMlaParams.q_head_stride = head_size;
+        flashMlaParams.k_head_stride = head_size;
+        flashMlaParams.o_head_stride = head_size_v;
+
+        flashMlaParams.v_batch_stride = flashMlaParams.k_batch_stride;
+        flashMlaParams.v_row_stride = flashMlaParams.k_row_stride;
+        flashMlaParams.v_head_stride = flashMlaParams.k_head_stride;
+
+        flashMlaParams.block_table = const_cast<int*>(params.block_ids_per_seq);
+        flashMlaParams.block_table_batch_stride = generation_params.max_blocks_per_sequence;
+        flashMlaParams.page_block_size = mTokensPerBlock;
+
+        flashMlaParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+        flashMlaParams.num_sm_parts = num_sm_parts;
+        flashMlaParams.num_splits_ptr = num_splits_ptr;
+
+        flashMlaParams.softmax_lseaccum_ptr = softmax_lse_accum_ptr;
+        flashMlaParams.oaccum_ptr = out_accum_ptr;
+
+        if constexpr (std::is_same<T, half>::value)
+        {
+            run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(flashMlaParams, stream);
+        }
+        else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+        {
+
+            run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+        }
+        else
+        {
+            TLLM_THROW("Unsupported data type for FlashMLA");
+        }
     }
     else
     {
@@ -2446,6 +2586,7 @@ std::string AttentionOp::toString() const
     ss << "mFMHAForceFP32Acc: " << std::boolalpha << mFMHAForceFP32Acc << std::endl;
     ss << "mSM: " << mSM << std::endl;
     ss << "mUseTllmGen: " << mUseTllmGen << std::endl;
+    ss << "mUseFlashMLA: " << mUseFlashMLA << std::endl;
     ss << "mMultiProcessorCount: " << mMultiProcessorCount << std::endl;
     ss << "mMaxSharedMemoryPerBlockOptin: " << mMaxSharedMemoryPerBlockOptin << std::endl;
     ss << "mMultiBlockMode: " << std::boolalpha << mMultiBlockMode << std::endl;

@@ -55,7 +55,7 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 
 ## Quick Start
 
-To quickly run DeepSeek-V3, use examples/pytorch/quickstart_advanced.py:
+To quickly run DeepSeek-V3, [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
 
 ```bash
 cd examples/pytorch
@@ -70,6 +70,16 @@ Prompt: 'The president of the United States is', Generated text: ' the head of s
 Prompt: 'The capital of France is', Generated text: ' Paris. Paris is one of the most famous and iconic cities in the world, known for its rich history, culture, art, fashion, and cuisine. It'
 Prompt: 'The future of AI is', Generated text: ' a topic of great interest and speculation. While it is impossible to predict the future with certainty, there are several trends and possibilities that experts have discussed regarding the future'
 ```
+
+### Multi-Token Prediction (MTP)
+To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py).
+```bash
+cd examples/pytorch
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --mtp_nextn N
+```
+
+`N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
+
 
 ## Preparing the Dataset & Configuration for Benchmark
 

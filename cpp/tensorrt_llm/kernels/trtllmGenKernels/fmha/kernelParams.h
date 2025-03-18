@@ -88,6 +88,14 @@ struct KernelParams
     void* ptrPartialO;
     // The partial softmax max, and softmax sum for each CtaKv when the multiCtasKv mode is enabled.
     float *ptrPartialMax, *ptrPartialSum;
+    // The scaling factors for K.
+    float const* ptrSageAttnSfsK;
+    // The scaling factors for P.
+    float const* ptrSageAttnSfsP;
+    // The scaling factors for Q.
+    float const* ptrSageAttnSfsQ;
+    // The scaling factors for V.
+    float const* ptrSageAttnSfsV;
     // The device scaling factor for softmax (multiplied by log2 to use faster exp2). Only needed by
     // trt-llm fp8 kernels as the scales have to be on the device currently.
     float const* ptrScaleSoftmaxLog2;
@@ -101,26 +109,33 @@ struct KernelParams
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
+    // The batch size
+    int32_t mBatchSize;
+    // The log of the Sage Attention block size for K.
+    int32_t mLogNumEltsPerSageAttnBlkK;
+    // The log of the Sage Attention block size for P.
+    int32_t mLogNumEltsPerSageAttnBlkP;
+    // The log of the Sage Attention block size for Q.
+    int32_t mLogNumEltsPerSageAttnBlkQ;
+    // The log of the Sage Attention block size for V.
+    int32_t mLogNumEltsPerSageAttnBlkV;
     // The sequence lengths for Q and K/V.
     int32_t mMaxSeqLenQ, mMaxSeqLenKv;
     // The maximum number of pages per sequence for paged-kv buffer.
     int32_t mMaxNumPagesPerSeqKv;
-    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens without paddings.
+    // The number of heads for K/V.
+    int32_t mNumHeadsKv;
+    // The number of heads for Q.
+    int32_t mNumHeadsQ;
+    // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
+    int32_t mNumHeadsQPerKv;
+    // The hidden size of O.
+    int64_t mNumHiddenEltsO;
+    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
+    // without paddings.
     int32_t mNumMtpTokens;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
-    // The sum of sequence lengths for Q and K/V.
-    int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
-    // The batch size
-    int32_t mBatchSize;
-    // The number of heads for Q.
-    int32_t mNumHeadsQ;
-    // The number of heads for K/V.
-    int32_t mNumHeadsKv;
-    // The number of Q heads per K/V head (i.e. mNumHeadsQ / mNumHeadsKv).
-    int32_t mNumHeadsQPerKv;
-    // The hidden size of Q.
-    int64_t mNumHiddenEltsQ;
     // The output scale for FP8 quantization.
     float mOutputScale;
     // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -129,9 +144,11 @@ struct KernelParams
     float mScaleSfKv;
     // The SF scale for O.
     float mScaleSfO;
-    // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
-    // batching is enabled in TRT-LLM.
+    // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
+    // kernel when inflight batching is enabled in TRT-LLM.
     int32_t mStartTokenIdxSfO;
+    // The sum of sequence lengths for Q and K/V.
+    int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
 
     // Create the TMA shape/stride for Q.
     template <class FmhaOptions>
@@ -730,7 +747,7 @@ struct KernelParams
         params.mNumHeadsQ = options.mNumHeadsQ;
         params.mNumHeadsKv = options.mNumHeadsKv;
         params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
-        params.mNumHiddenEltsQ = options.mNumHeadsQ * options.mHeadDimQk;
+        params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
         params.mOutputScale = 1.f;
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

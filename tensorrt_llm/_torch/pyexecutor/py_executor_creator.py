@@ -5,7 +5,8 @@ import tensorrt_llm.bindings as tllm
 from tensorrt_llm._torch.attention_backend.interface import \
     AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.decoder import (BertDecoder, TorchDecoder,
+from tensorrt_llm._torch.pyexecutor.decoder import (EarlyStopDecoder,
+                                                    TorchDecoder,
                                                     TorchStarAttentionDecoder,
                                                     TRTLLMDecoder)
 from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
@@ -14,7 +15,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             MLAKVCacheManager,
                                                              ResourceManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import (BindCapacityScheduler,
                                                       BindMicroBatchScheduler,
@@ -28,7 +28,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ._util import estimate_max_kv_cache_tokens, is_bert, is_mla
+from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
 
 
 def create_py_executor(executor_config: ExecutorConfig,
@@ -93,8 +93,11 @@ def create_py_executor(executor_config: ExecutorConfig,
             max_seq_len += spec_config.max_draft_tokens
     else:
         max_seq_len = model_engine.max_seq_len
+    if spec_config is not None:
+        max_seq_len += spec_config.num_extra_kv_tokens
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
+    spec_config = model_engine.spec_config
     if not model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         executor_config.pytorch_backend_config.use_kv_cache = False
@@ -134,30 +137,37 @@ def create_py_executor(executor_config: ExecutorConfig,
     config = model_engine.model.model_config.pretrained_config
     # kv cache manager selection
     if executor_config.pytorch_backend_config.use_kv_cache:
+        num_hidden_layers = len(
+            mapping.pp_layers_torch(
+                model_engine.model.config.num_hidden_layers))
         # has kv cache
         if is_mla(config):
+            if check_flash_mla_config(config):
+                executor_config.tokens_per_block = 64
+                logger.info(
+                    f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
+                )
             executor_config.kv_cache_config.enable_block_reuse = False
             executor_config.enable_chunked_context = False
-            num_layers = model_engine.model.config.num_hidden_layers
             if spec_config is not None:
-                num_layers += get_num_spec_layers(spec_config)
-            kv_cache_manager = MLAKVCacheManager(
+                num_hidden_layers += get_num_spec_layers(spec_config)
+            kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
-                num_layers,
-                num_attention_heads,
-                1,
-                head_dim,
-                executor_config.tokens_per_block,
-                executor_config.max_seq_len,
-                executor_config.max_batch_size,
-                mapping,
+                num_layers=num_hidden_layers,
+                num_heads=num_attention_heads,
+                num_kv_heads=1,
+                head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+                tokens_per_block=executor_config.tokens_per_block,
+                max_seq_len=executor_config.max_seq_len,
+                max_batch_size=executor_config.max_batch_size,
+                mapping=mapping,
                 dtype=kv_cache_dtype,
-                kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim)
+                num_extra_kv_tokens=0
+                if spec_config is None else spec_config.num_extra_kv_tokens,
+            )
         else:
-            num_hidden_layers = model_engine.model.config.num_hidden_layers
             # the number of layers using attention in Nemotron5 is lower from the number of hidden layers
             if model_engine.model.config.architectures[
                     0] == "Nemotron5ForCausalLM":
@@ -167,15 +177,17 @@ def create_py_executor(executor_config: ExecutorConfig,
             kv_cache_manager = KVCacheManager(
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-                num_hidden_layers,
-                num_attention_heads,
-                num_key_value_heads,
-                head_dim,
-                executor_config.tokens_per_block,
-                executor_config.max_seq_len,
-                executor_config.max_batch_size,
-                mapping,
+                num_layers=num_hidden_layers,
+                num_heads=num_attention_heads,
+                num_kv_heads=num_key_value_heads,
+                head_dim=head_dim,
+                tokens_per_block=executor_config.tokens_per_block,
+                max_seq_len=executor_config.max_seq_len,
+                max_batch_size=executor_config.max_batch_size,
+                mapping=mapping,
                 dtype=kv_cache_dtype,
+                num_extra_kv_tokens=0
+                if spec_config is None else spec_config.num_extra_kv_tokens,
             )
     else:
         # no kv cache
@@ -188,6 +200,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     resources = {
         "kv_cache_manager": kv_cache_manager
     } if kv_cache_manager is not None else {}
+
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
             spec_config, model_engine.model.config, model_engine.batch_size * 2)
@@ -218,7 +231,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
-        executor_config.scheduler_config.capacity_scheduler_policy)
+        executor_config.scheduler_config.capacity_scheduler_policy,
+        num_micro_batches=mapping.pp_size)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
@@ -240,8 +254,8 @@ def create_py_executor(executor_config: ExecutorConfig,
                                 tllm.executor.DecodingMode.TopKTopP())
     else:
         # NOTE: choose decoder based on model type
-        if is_bert(config):
-            decoder = BertDecoder()
+        if not model_engine.model.model_config.is_generation:
+            decoder = EarlyStopDecoder()
         else:
             decoder = TorchDecoder(
                 max_seq_len=model_engine.max_seq_len,

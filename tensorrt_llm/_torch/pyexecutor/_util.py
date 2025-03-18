@@ -24,9 +24,20 @@ def is_mla(config):
     return False
 
 
-def is_bert(config):
-    assert hasattr(config, "architectures")
-    return "Bert" in config.architectures[0]
+def is_hopper():
+    if torch.cuda.get_device_capability() == (9, 0):
+        return True
+    return False
+
+
+def check_flash_mla_config(config):
+    if is_mla(config):
+        if is_hopper():
+            if hasattr(config, "qk_rope_head_dim"):
+                head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+                if head_dim == 576:
+                    return True
+    return False
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
