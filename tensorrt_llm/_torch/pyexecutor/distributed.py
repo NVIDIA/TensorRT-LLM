@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 import torch
 import torch.distributed as dist
 
-from ..._utils import mpi_allgather, mpi_barrier, mpi_broadcast
+from ..._utils import (mpi_allgather, mpi_barrier, mpi_broadcast, mpi_isend,
+                       mpi_recv)
 from ...mapping import Mapping
 
 
@@ -34,12 +35,40 @@ class Distributed(ABC):
         return self.mapping.cp_size
 
     @property
+    def pp_size(self):
+        return self.mapping.pp_size
+
+    @property
+    def tp_size(self):
+        return self.mapping.tp_size
+
+    @property
     def cp_rank(self):
         return self.mapping.cp_rank
 
     @property
     def tp_rank(self):
         return self.mapping.tp_rank
+
+    @property
+    def pp_rank(self):
+        return self.mapping.pp_rank
+
+    @property
+    def is_last_pp_rank(self):
+        return self.mapping.is_last_pp_rank()
+
+    @property
+    def is_first_pp_rank(self):
+        return self.mapping.is_first_pp_rank()
+
+    @property
+    def next_pp_rank(self):
+        return self.mapping.next_pp_rank()
+
+    @property
+    def prev_pp_rank(self):
+        return self.mapping.prev_pp_rank()
 
     @property
     def has_cp(self):
@@ -68,6 +97,14 @@ class MPIDist(Distributed):
 
     def barrier(self):
         mpi_barrier()
+
+    def isend_tensor(self, tensor: torch.Tensor, dest, tag=0):
+        # non-blocking send tensor
+        return mpi_isend(tensor.numpy(), dest, tag=0)
+
+    def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
+        # in-place recv tensor
+        return mpi_recv(tensor.numpy(), src, tag=0)
 
 
 class TorchDist(Distributed):

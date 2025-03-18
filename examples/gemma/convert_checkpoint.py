@@ -31,13 +31,23 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ckpt-type",
                         type=CheckpointType,
                         choices=list(CheckpointType))
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--output-model-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", "--model_dir", type=Path, required=True)
+    parser.add_argument("--output-model-dir",
+                        "--output_dir",
+                        type=Path,
+                        required=True)
     parser.add_argument("--world-size",
                         type=int,
                         default=1,
                         help="world size, only support tensor parallelism now")
     parser.add_argument(
+        '--use_weight_only',
+        default=False,
+        action="store_true",
+        help='Quantize weights for the various GEMMs to INT4/INT8.'
+        'See --weight_only_precision to set the precision')
+    parser.add_argument(
+        '--weight_only_precision',
         "--use-weight-only-with-precision",
         choices=["int8", "int4", "w4a8_awq", "w4a16_awq"],
         help=
@@ -121,6 +131,9 @@ def parse_arguments() -> argparse.Namespace:
         help='tokenizer path; defaults to jax_model_dir if left unspecified')
     parser.add_argument("--load_model_on_cpu", action="store_true")
     args = parser.parse_args()
+
+    if args.use_weight_only:
+        assert args.weight_only_precision is not None
     return args
 
 
@@ -133,13 +146,13 @@ CKPT_PARSER: Dict[CheckpointType, Type[Parsers]] = {
 
 
 def compute_quant_algo(args: argparse.Namespace) -> Optional[QuantAlgo]:
-    if args.use_weight_only_with_precision:
+    if args.weight_only_precision:
         return {
             "int8": QuantAlgo.W8A16,
             "int4": QuantAlgo.W4A16,
             "w4a8_awq": QuantAlgo.W4A8_AWQ,
             "w4a16_awq": QuantAlgo.W4A16_AWQ,
-        }[args.use_weight_only_with_precision]
+        }[args.weight_only_precision]
     elif args.enable_fp8:
         return QuantAlgo.FP8
     if args.use_smooth_quant:
@@ -167,9 +180,9 @@ def create_quant_config(args: argparse.Namespace) -> QuantConfig:
     if args.int8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8
 
-    if args.use_weight_only_with_precision:
-        use_awq = args.use_weight_only_with_precision.endswith("awq")
-        use_int4 = args.use_weight_only_with_precision.endswith("int4")
+    if args.weight_only_precision:
+        use_awq = args.weight_only_precision.endswith("awq")
+        use_int4 = args.weight_only_precision.endswith("int4")
         if use_awq:
             quant_config.group_size = 128
 

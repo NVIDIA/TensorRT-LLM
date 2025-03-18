@@ -17,8 +17,8 @@ from tensorrt_llm.llmapi import SamplingParams
 
 
 class OpenAIBaseModel(BaseModel):
-    # OpenAI API does not allow extra fields
-    model_config = ConfigDict(extra="forbid")
+    # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -54,6 +54,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     first_gen_tokens: Optional[List[int]] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
+    draft_tokens: Optional[List[int]] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -98,7 +99,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
                 request_type=tllm_disagg_params.request_type,
                 first_gen_tokens=tllm_disagg_params.first_gen_tokens,
                 ctx_request_id=tllm_disagg_params.ctx_request_id,
-                encoded_opaque_state=encoded_opaque_state)
+                encoded_opaque_state=encoded_opaque_state,
+                draft_tokens=tllm_disagg_params.draft_tokens)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -240,7 +242,8 @@ class CompletionRequest(OpenAIBaseModel):
                 request_type=self.disaggregated_params.request_type,
                 first_gen_tokens=self.disaggregated_params.first_gen_tokens,
                 ctx_request_id=self.disaggregated_params.ctx_request_id,
-                opaque_state=opaque_state)
+                opaque_state=opaque_state,
+                draft_tokens=self.disaggregated_params.draft_tokens)
 
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
@@ -301,13 +304,6 @@ class CompletionRequest(OpenAIBaseModel):
                 "special_tokens related settings are not supported")
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_stream_options(cls, data):
-        if data.get("stream_options"):
-            raise ValueError("stream_options is not supported")
-        return data
-
 
 class FunctionCall(OpenAIBaseModel):
     name: str
@@ -334,7 +330,7 @@ class ChatCompletionLogProb(OpenAIBaseModel):
 
 
 class ChatCompletionLogProbsContent(ChatCompletionLogProb):
-    top_logprobs: List[ChatCompletionLogProb] = Field(default_factory=list)
+    top_logprobs: List[ChatCompletionLogProb] = None
 
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
@@ -441,7 +437,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
-    max_tokens: Optional[int] = 16
+    max_completion_tokens: int = Field(default=16,
+                                       validation_alias='max_tokens')
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -526,7 +523,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
             return_log_probs=self.logprobs,
-            max_tokens=self.max_tokens,
+            max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
             seed=self.seed,

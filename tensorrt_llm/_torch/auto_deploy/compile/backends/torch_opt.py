@@ -20,8 +20,8 @@ class CompiledGraph(nn.Module):
         self._out_spec: TreeSpec = model._out_spec
         self.gm_compiled = torch.compile(model, dynamic=True)
         self.max_batch_size = max_batch_size
-        self.graphs: Dict[int, CUDAGraph] = {}
-        self._input_ids_buffer: torch.Tensor = torch.empty(0, 1)
+        self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
+        self._input_buffer: torch.Tensor = torch.empty(0, 1)
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
 
@@ -31,6 +31,8 @@ class CompiledGraph(nn.Module):
     @staticmethod
     def round_up_to_closest(batch_sizes: Iterable[int], bs: int) -> Optional[int]:
         """Return closest batch size larger or equal to bs."""
+        if bs > max(batch_sizes, default=0):
+            return None
         return min(batch_sizes, key=lambda x: (x < bs, abs(x - bs)), default=None)
 
     def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
@@ -69,17 +71,17 @@ class CompiledGraph(nn.Module):
         # return as sorted list
         return sorted(batch_sizes)
 
-    def _capture_cudagraph(self, idxs: torch.Tensor, flat_args: List[Any]):
-        """Capture graph for single-token generation."""
+    def _capture_cudagraph(self, input_t: torch.Tensor, flat_args: List[Any]):
+        """Capture graph for variable batch size."""
         # set the args hash --> this is used to compare the inputs during graph replay
         self._args_hash = self._get_hash(flat_args)
 
-        # set the input buffer to the max needed batch size with seq_len=1
-        assert self.max_batch_size >= idxs.shape[0], "Max batch size too small."
-        self._input_ids_buffer = idxs[:1, :1].repeat_interleave(self.max_batch_size, dim=0)
+        # set the input buffer to the max needed batch size with rest of shape as is
+        assert self.max_batch_size >= input_t.shape[0], "Max batch size too small."
+        self._input_buffer = input_t[:1].repeat_interleave(self.max_batch_size, dim=0)
 
         # unflatten args, kwargs
-        args, kwargs = self._in_spec.unflatten([self._input_ids_buffer] + flat_args)
+        args, kwargs = self._in_spec.unflatten([self._input_buffer] + flat_args)
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
@@ -91,39 +93,43 @@ class CompiledGraph(nn.Module):
         for bs in self._get_graph_batch_sizes(self.max_batch_size):
             ad_logger.info(f"Capturing graph for batch size: {bs}")
 
-            # setup args, kwargs and capture graph
-            args, kwargs = self._in_spec.unflatten([self._input_ids_buffer[:bs], *flat_args])
-            self.graphs[bs] = self._capture_one_graph(*args, **kwargs)
+            # setup args, kwargs
+            input_truncated = self._input_buffer[:bs]
+            args, kwargs = self._in_spec.unflatten([input_truncated, *flat_args])
+
+            # capture graph
+            self.graphs[input_truncated.shape] = self._capture_one_graph(*args, **kwargs)
 
     def capture_graph(self, *args, **kwargs):
         """Capture and pre-fetch the graph."""
-        idxs, flat_args = _flatten_args(self._in_spec, *args, **kwargs)
-        self._capture_cudagraph(idxs, flat_args)
+        input_t, flat_args = _flatten_args(self._in_spec, *args, **kwargs)
+        self._capture_cudagraph(input_t, flat_args)
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
-        input_ids, flat_args = _flatten_args(self._in_spec, *args, **kwargs)
-        bs, seq_len = input_ids.shape
+        input_t, flat_args = _flatten_args(self._in_spec, *args, **kwargs)
+        bs, *other_dims = input_t.shape
 
-        # regular forward for seq_len != 1, no available cudagraph for bs, or non-matching args
-        if (
-            seq_len != 1
-            or max(self.graphs, default=0) < bs
-            or self._args_hash != self._get_hash(flat_args)
-        ):
+        # round up batch size and construct rounded up shape
+        bs_graph = self.round_up_to_closest([shapes[0] for shapes in self.graphs.keys()], bs)
+        shape_rounded_up = (bs_graph, *other_dims)
+
+        # regular forward for non-matching shapes or non-matching flat_args
+        if shape_rounded_up not in self.graphs or self._args_hash != self._get_hash(flat_args):
             return self.gm_compiled(*args, **kwargs)
 
         # run forward pass via graph
-        self._input_ids_buffer[:bs] = input_ids
-        self.graphs[self.round_up_to_closest(self.graphs, bs)].replay()
+        self._input_buffer[:bs] = input_t
+        self.graphs[shape_rounded_up].replay()
 
-        # retrieve output from buffer, cut to batch size, and unfatten
+        # retrieve output from buffer, cut to batch size, and unflatten
         out_flat = [o_b[:bs].detach().clone() for o_b in self._out_buffer_flat]
         return self._out_spec.unflatten(out_flat)
 
 
 @BackendRegistry.register("torch-opt")
 class TorchOptCompiler(BackendCompiler):
+    @torch.inference_mode()
     def compile(self) -> CompiledGraph:
         compiled_gm = CompiledGraph(self.gm, max_batch_size=self.max_batch_size)
 

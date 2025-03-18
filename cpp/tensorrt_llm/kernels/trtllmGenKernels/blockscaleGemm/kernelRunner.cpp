@@ -17,6 +17,7 @@
 #include "kernelRunner.h"
 #include "kernelList.h"
 #include "kernelParams.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <iostream>
 
 namespace tensorrt_llm
@@ -112,15 +113,17 @@ void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void co
     launch_config.gridDimZ = options.mNumSlicesForSplitK;
     launch_config.hStream = stream;
     launch_config.sharedMemBytes = mKernelInfo->sharedMemSize;
-    CUlaunchAttribute launch_attribute[2];
+    CUlaunchAttribute launch_attribute[3];
     launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
     launch_attribute[0].value.clusterDim.x = 1;
     launch_attribute[0].value.clusterDim.y = 1;
     launch_attribute[0].value.clusterDim.z = 1;
     launch_attribute[1].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
     launch_attribute[1].value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_DEFAULT;
+    launch_attribute[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    launch_attribute[2].value.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     launch_config.attrs = launch_attribute;
-    launch_config.numAttrs = 2;
+    launch_config.numAttrs = 3;
     void* kernelParamsList[] = {&params};
     TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&launch_config, mFunction, kernelParamsList, nullptr));
 }

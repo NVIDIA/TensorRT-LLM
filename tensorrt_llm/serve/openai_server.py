@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import signal
+import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
@@ -337,6 +338,7 @@ class OpenAIServer:
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             print(f"Encountered an exception: {str(e)}")
+            traceback.print_exc()
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):

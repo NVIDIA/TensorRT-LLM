@@ -11,9 +11,9 @@ import torch
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue
+from ..llmapi.utils import AsyncQueue, nvtx_range
 from ..sampling_params import SamplingParams
-from .utils import has_event_loop
+from .utils import ErrorResponse, has_event_loop
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -105,6 +105,7 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
+        self.disaggregated_params = None
         self._done = False
 
         if has_event_loop():
@@ -157,45 +158,40 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
-    def _handle_sequence(self, response: "GenerationExecutor.Response",
-                         sequence_index: int):
+    def _handle_sequence(self, finish_reasons, response_tensors,
+                         sequence_index):
         """ Handle a single sequence in the response. """
-
-        tensors = response.tensors
-        assert tensors is not None
 
         beam_search = self.sampling_params.use_beam_search
         seq_idx = sequence_index
         src_idx = sequence_index if beam_search else 0
 
         output = self._outputs[seq_idx]
-        output.disaggregated_params = response.disaggregated_params
-
+        output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
-        output.token_ids.extend(tensors.output_token_ids[src_idx])
-        if tensors.cum_log_probs is not None:
-            output.cumulative_logprob = tensors.cum_log_probs[src_idx]
-        if tensors.log_probs is not None:
+        output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+        if response_tensors.cum_log_probs is not None:
+            output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
+        if response_tensors.log_probs is not None:
             output._last_logprobs_len = len(output.logprobs)
-            output.logprobs = tensors.log_probs[src_idx]
+            output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
-            if response.finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 assert len(output.logprobs) == output.length
-        if tensors.generation_logits is not None:
-            output.generation_logits = tensors.generation_logits[
+        if response_tensors.generation_logits is not None:
+            output.generation_logits = response_tensors.generation_logits[
                 src_idx, :output.length]
 
         # when sampling_params.n > 1 and is cancelled, make sure all the outputs
         # be marked as cancelled.
-        if response.finish_reasons and response.finish_reasons[
+        if finish_reasons and finish_reasons[
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
         if self._done:
-            if response.finish_reasons[src_idx] == tllm.FinishReason.END_ID:
+            if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.STOP_WORDS:
+            elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
                 output.finish_reason = 'stop'
                 for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                 ):
@@ -204,24 +200,21 @@ class GenerationResultBase:
                         if not self.sampling_params.include_stop_str_in_output:
                             output.token_ids = output.token_ids[:-len(stop_ids)]
                         break
-            elif response.finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
+            elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.TIMED_OUT:
+            elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
-            elif response.finish_reasons[
-                    src_idx] == tllm.FinishReason.CANCELLED:
+            elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:
                 raise ValueError(
-                    f"Unknown finish reason: {response.finish_reasons[src_idx]}"
-                )
+                    f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-    def _handle_response(self, response: Union["GenerationExecutor.Response",
-                                               "PostprocWorker.Output"]):
+    @nvtx_range("handle_response", color="red", category="GenerationResultBase")
+    def _handle_response(self, response: Union["PostprocWorker.Output",
+                                               tllm.Response, ErrorResponse]):
 
-        is_postprocess_res = isinstance(response, PostprocWorker.Output)
-        if is_postprocess_res:
+        if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
             if isinstance(response.res, CompletionOutput):
                 # in streaming mode
@@ -229,32 +222,50 @@ class GenerationResultBase:
             else:
                 self._outputs[0]._postprocess_result = response.res
 
-        self._done = response.is_final
+            if response.error:
+                if self._background_error_handler is not None and (
+                        handler := self._background_error_handler()):
+                    handler(response.error)
+        elif isinstance(response, tllm.Response):
+            if response.has_error():
+                if self._background_error_handler is not None and (
+                        handler := self._background_error_handler()):
+                    handler(response.error_msg)
 
-        if response.error:
+            response_result = response.result
+            self._done = response_result.is_final
+            context_phase_params = response_result.context_phase_params
+            if context_phase_params is not None:
+                self.disaggregated_params = DisaggregatedParams(
+                    request_type="context_only",
+                    first_gen_tokens=context_phase_params.first_gen_tokens,
+                    ctx_request_id=context_phase_params.req_id,
+                    opaque_state=context_phase_params.opaque_state,
+                    draft_tokens=context_phase_params.draft_tokens)
+
+            finish_reasons = response_result.finish_reasons
+            # output_token_ids = (beams, tokens)
+            if self.sampling_params.use_beam_search:
+                for beam_idx, _ in enumerate(response_result.output_token_ids):
+                    self._handle_sequence(finish_reasons, response_result,
+                                          beam_idx)
+            else:
+                self._handle_sequence(finish_reasons, response_result,
+                                      response_result.sequence_index)
+
+            if response_result.context_logits is not None:
+                self._context_logits = response_result.context_logits
+
+            # Processing background errors here ASAF during generation.
+            if self._background_error_handler and (
+                    handler := self._background_error_handler()):
+                handler()
+        elif isinstance(response, ErrorResponse):
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
-                handler(response.error)
-
-        if is_postprocess_res: return
-
-        tensors = response.tensors
-        self.disaggregated_params = response.disaggregated_params
-
-        # output_token_ids = (beams, tokens)
-        if self.sampling_params.use_beam_search:
-            for beam_idx, _ in enumerate(tensors.output_token_ids):
-                self._handle_sequence(response, beam_idx)
+                handler(response.error_msg)
         else:
-            self._handle_sequence(response, response.sequence_index)
-
-        if tensors.context_logits is not None:
-            self._context_logits = tensors.context_logits
-
-        # Processing background errors here ASAF during generation.
-        if self._background_error_handler and (
-                handler := self._background_error_handler()):
-            handler()
+            raise ValueError(f"Unknown response type: {response}")
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):

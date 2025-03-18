@@ -20,8 +20,9 @@ from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
-from .utils import (IntraProcessQueue, ProcessPoolExecutorSession,
-                    WorkerCommIpcAddrs, WorkerCommQueues, _create_rsp)
+from .utils import (ErrorResponse, IntraProcessQueue,
+                    ProcessPoolExecutorSession, WorkerCommIpcAddrs,
+                    WorkerCommQueues)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -188,9 +189,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            if isinstance(res, tllm.Response):
-                res = _create_rsp(res)
-
             queue = self._results[client_id].queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
@@ -200,7 +198,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
-            if res.is_final:
+            if (isinstance(res, tllm.Response)
+                    and res.result.is_final) or isinstance(res, ErrorResponse):
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]

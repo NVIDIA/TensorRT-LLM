@@ -4,6 +4,21 @@ import logging
 import os
 from typing import Any, Optional
 
+import torch
+from torch.cuda import device_count
+
+if (os.getenv("OMPI_COMM_WORLD_RANK")):
+    env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+elif (os.getenv("SLURM_PROCID")):
+    env_global_rank = int(os.environ["SLURM_PROCID"])
+else:
+    raise RuntimeError("Could not determine rank from environment")
+device_id = env_global_rank % device_count()
+print(
+    f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
+)
+torch.cuda.set_device(device_id)
+
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
@@ -11,7 +26,8 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             DynamicBatchConfig, SchedulerConfig)
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, MpiCommSession
+from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
+                                 MpiCommSession, MTPDecodingConfig)
 from tensorrt_llm.llmapi.disagg_utils import (parse_disagg_config_file,
                                               split_world_comm)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -21,7 +37,6 @@ logging.basicConfig(level=logging.INFO)
 
 from mpi4py.futures import MPICommExecutor
 from mpi4py.MPI import COMM_WORLD, Comm
-from torch.cuda import device_count
 
 
 #This script must be executed by all ranks
@@ -44,6 +59,7 @@ def launch_server(model: str,
                   trust_remote_code: bool = False,
                   use_cuda_graph: bool = False,
                   enable_overlap_scheduler: bool = False,
+                  mtp_nextn: int = 0,
                   **kwargs: Any):
 
     mpi_session = MpiCommSession(comm=sub_comm, n_workers=sub_comm.Get_size())
@@ -76,6 +92,9 @@ def launch_server(model: str,
         dynamic_batch_config=dynamic_batch_config,
     )
 
+    mtp_config = MTPDecodingConfig(
+        num_nextn_predict_layers=mtp_nextn) if mtp_nextn > 0 else None
+
     llm_args = {
         "model": model,
         "scheduler_config": scheduler_config,
@@ -91,6 +110,7 @@ def launch_server(model: str,
         "backend": backend if backend == "pytorch" else None,
         "pytorch_backend_config": pytorch_backend_config,
         "_mpi_session": mpi_session,
+        "speculative_config": mtp_config,
     }
 
     llm_args = update_llm_args_with_extra_dict(llm_args, kwargs)

@@ -638,15 +638,11 @@ struct Reducer<T, RanksPerNode, true>
     {
         using PackedStruct = typename PackedOn16Bytes<T>::Type;
         int ping = params.barrier_flag % 3;
-        int pong = (params.barrier_flag + 2) % 3;
         T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
         T* local_shared_buffer = reinterpret_cast<T*>(
             params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + ping * MAX_RANKS_PER_NODE]);
-        T* local_clean_buffer = reinterpret_cast<T*>(
-            params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + pong * MAX_RANKS_PER_NODE]);
         local_input_buffer += global_offset;
         local_shared_buffer += global_offset;
-        local_clean_buffer += global_offset;
         T* buffers[RanksPerNode];
 #pragma unroll
         for (int ii = 0; ii < RanksPerNode; ++ii)
@@ -664,12 +660,6 @@ struct Reducer<T, RanksPerNode, true>
             st_global_volatile(val.packed, reinterpret_cast<int4*>(buffers[ii]));
         }
         sum_vec.packed = val.packed;
-#pragma unroll
-        for (int ii = 1; ii < RanksPerNode; ++ii)
-        {
-            int rank = (params.local_rank + ii) % RanksPerNode;
-            set_neg_zero<T>(reinterpret_cast<int4*>(local_clean_buffer + rank * params.elts_total));
-        }
         PackedStruct vals[RanksPerNode - 1];
         bool done = false;
         while (!done)
@@ -696,6 +686,26 @@ struct Reducer<T, RanksPerNode, true>
         }
         return sum_vec.packed;
     }
+
+    static __device__ __forceinline__ void clear(AllReduceParams& params)
+    {
+        static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+        int token_idx = blockIdx.x + details::kLamportTokenNumThreshold - gridDim.x;
+        int tid = threadIdx.x;
+        int pong = (params.barrier_flag + 2) % 3;
+        T* local_clear_buffer = reinterpret_cast<T*>(
+            params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + pong * MAX_RANKS_PER_NODE]);
+        for (int idx = tid * kPackedSize; idx < params.fusion_params.hidden_size; idx += blockDim.x * kPackedSize)
+        {
+#pragma unroll
+            for (int ii = 1; ii < RanksPerNode; ++ii)
+            {
+                int rank = (params.local_rank + ii) % RanksPerNode;
+                set_neg_zero<T>(reinterpret_cast<int4*>(local_clear_buffer + rank * params.elts_total
+                    + token_idx * params.fusion_params.hidden_size + idx));
+            }
+        }
+    }
 };
 
 template <typename T, int RanksPerNode>
@@ -705,15 +715,11 @@ struct Reducer<T, RanksPerNode, false>
     {
         using PackedStruct = typename PackedOn16Bytes<T>::Type;
         int ping = params.barrier_flag % 3;
-        int pong = (params.barrier_flag + 2) % 3;
         T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
         T* local_shared_buffer = reinterpret_cast<T*>(
             params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + ping * MAX_RANKS_PER_NODE]);
-        T* local_clean_buffer = reinterpret_cast<T*>(
-            params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + pong * MAX_RANKS_PER_NODE]);
         local_input_buffer += global_offset;
         local_shared_buffer += global_offset;
-        local_clean_buffer += global_offset;
         T* buffers[RanksPerNode];
 #pragma unroll
         for (int ii = 0; ii < RanksPerNode; ++ii)
@@ -736,8 +742,22 @@ struct Reducer<T, RanksPerNode, false>
             } while (has_neg_zero<T>(val.packed));
             sum_vec.packed = add128b(sum_vec, val);
         }
-        set_neg_zero<T>(reinterpret_cast<int4*>(local_clean_buffer));
         return sum_vec.packed;
+    }
+
+    static __device__ __forceinline__ void clear(AllReduceParams& params)
+    {
+        static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+        int token_idx = blockIdx.x + details::kLamportTokenNumThreshold - gridDim.x;
+        int tid = threadIdx.x;
+        int pong = (params.barrier_flag + 2) % 3;
+        T* local_clear_buffer = reinterpret_cast<T*>(
+            params.fusion_params.lamport_peer_comm_buffer_ptrs[params.local_rank + pong * MAX_RANKS_PER_NODE]);
+        for (int idx = tid * kPackedSize; idx < params.fusion_params.hidden_size; idx += blockDim.x * kPackedSize)
+        {
+            set_neg_zero<T>(
+                reinterpret_cast<int4*>(local_clear_buffer + token_idx * params.fusion_params.hidden_size + idx));
+        }
     }
 };
 
@@ -746,89 +766,96 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
-    static_assert(RanksPerNode <= 8);
+    static_assert(RanksPerNode <= MAX_RANKS_PER_NODE);
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     using PackedStruct = typename PackedOn16Bytes<T>::Type;
-
-    cg::cluster_group cluster = cg::this_cluster();
-
-    __shared__ float cluster_acc, cluster_acc_sum;
-
-    int bid = blockIdx.x, tid = threadIdx.x;
-    int cluster_id = bid / ClusterSize, cluster_block_rank = bid % ClusterSize;
-
-    int token_id = cluster_id;
-    int cluster_offset = token_id * params.fusion_params.hidden_size;
-    int block_offset = cluster_block_rank * params.fusion_params.hidden_size / ClusterSize;
-    int thread_offset = tid * kPackedSize;
-
-    int inner_token_offset = block_offset + thread_offset;
-    int global_offset = cluster_offset + inner_token_offset;
-
-    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
-    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
-    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
-    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
-    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
-
-    local_final_output_buffer += global_offset;
-    intermediate_buffer += global_offset;
-    residual_buffer += global_offset;
-    bias_buffer += inner_token_offset;
-    weight_buffer += inner_token_offset;
-
-    PackedStruct weight_vec, bias_vec, residual_vec;
-    residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer);
-    if constexpr (Bias)
+    if (gridDim.x - blockIdx.x <= details::kLamportTokenNumThreshold)
     {
-        bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer);
+        cudaGridDependencySynchronize();
+        Reducer<T, RanksPerNode, PushMode>::clear(params);
+        cudaTriggerProgrammaticLaunchCompletion();
     }
-    if constexpr (Affine)
+    else
     {
-        weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer);
-    }
+        cg::cluster_group cluster = cg::this_cluster();
 
-    cudaGridDependencySynchronize();
+        __shared__ float cluster_acc, cluster_acc_sum;
 
-    float acc = 0.f;
-    PackedStruct sum_vec;
-    sum_vec.packed = Reducer<T, RanksPerNode, PushMode>::allreduce(params, global_offset);
+        int bid = blockIdx.x, tid = threadIdx.x;
+        int cluster_id = bid / ClusterSize, cluster_block_rank = bid % ClusterSize;
 
-    if constexpr (Bias)
-    {
-        sum_vec.packed = add128b(sum_vec, bias_vec);
-    }
-    sum_vec.packed = add128b(sum_vec, residual_vec);
-    *reinterpret_cast<int4*>(intermediate_buffer) = sum_vec.packed;
-    acc = accumulate<T>(acc, sum_vec);
-    acc = block_reduce_sum(acc);
-    if (ClusterSize > 1)
-    {
-        if (threadIdx.x == 0)
+        int token_id = cluster_id;
+        int cluster_offset = token_id * params.fusion_params.hidden_size;
+        int block_offset = cluster_block_rank * params.fusion_params.hidden_size / ClusterSize;
+        int thread_offset = tid * kPackedSize;
+
+        int inner_token_offset = block_offset + thread_offset;
+        int global_offset = cluster_offset + inner_token_offset;
+
+        T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+        T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+        T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+        T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+        T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+        local_final_output_buffer += global_offset;
+        intermediate_buffer += global_offset;
+        residual_buffer += global_offset;
+        bias_buffer += inner_token_offset;
+        weight_buffer += inner_token_offset;
+
+        PackedStruct weight_vec, bias_vec, residual_vec;
+        residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer);
+        if constexpr (Bias)
         {
-            cluster_acc = acc;
+            bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer);
         }
-        cluster.sync();
-        if (threadIdx.x == 0)
+        if constexpr (Affine)
         {
-            acc = 0.f;
-#pragma unroll
-            for (int ii = 0; ii < ClusterSize; ++ii)
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer);
+        }
+
+        cudaGridDependencySynchronize();
+
+        float acc = 0.f;
+        PackedStruct sum_vec;
+        sum_vec.packed = Reducer<T, RanksPerNode, PushMode>::allreduce(params, global_offset);
+
+        if constexpr (Bias)
+        {
+            sum_vec.packed = add128b(sum_vec, bias_vec);
+        }
+        sum_vec.packed = add128b(sum_vec, residual_vec);
+        *reinterpret_cast<int4*>(intermediate_buffer) = sum_vec.packed;
+        acc = accumulate<T>(acc, sum_vec);
+        acc = block_reduce_sum(acc);
+        if (ClusterSize > 1)
+        {
+            if (threadIdx.x == 0)
             {
-                acc += *cluster.map_shared_rank(&cluster_acc, ii);
+                cluster_acc = acc;
             }
-            cluster_acc_sum = acc;
+            cluster.sync();
+            if (threadIdx.x == 0)
+            {
+                acc = 0.f;
+#pragma unroll
+                for (int ii = 0; ii < ClusterSize; ++ii)
+                {
+                    acc += *cluster.map_shared_rank(&cluster_acc, ii);
+                }
+                cluster_acc_sum = acc;
+            }
+            __syncthreads();
+            acc = cluster_acc_sum;
+            cluster.sync();
         }
-        __syncthreads();
-        acc = cluster_acc_sum;
-        cluster.sync();
+        float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
+        sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+        *reinterpret_cast<int4*>(local_final_output_buffer) = sum_vec.packed;
+
+        cudaTriggerProgrammaticLaunchCompletion();
     }
-
-    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
-    sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
-    *reinterpret_cast<int4*>(local_final_output_buffer) = sum_vec.packed;
-
-    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -860,7 +887,7 @@ void lamport_style_one_shot_all_reduce_norm_kernel_launcher(AllReduceParams para
     int cluster_size = std::min(((warps_per_token + warp_min_number - 1) / warp_min_number), details::kClusterMaxSize);
     int cta_size = warps_per_token / cluster_size * details::kWarpSize;
     TLLM_CHECK(cta_size <= details::kMaxCtaSize);
-    int cta_num = token_num * cluster_size;
+    int cta_num = token_num * cluster_size + details::kLamportTokenNumThreshold;
     cudaLaunchConfig_t kernel_config = {0};
     kernel_config.gridDim = cta_num;
     kernel_config.blockDim = cta_size;
@@ -1355,6 +1382,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     if constexpr (PUSH_MODE || COPY_INPUT)
     {
         // Copy from local buffer to shareable buffer
@@ -1419,6 +1450,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         // Store to the destination buffer.
         *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false, bool Bias = false,
@@ -1783,13 +1818,33 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
     }
     if (algo == AllReduceStrategyType::ONESHOT)
     {
-        oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
     else
     {
-        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
 }
 
@@ -1849,7 +1904,8 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream); break;
     case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
     case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
-    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8} GPUs per node.");
+    case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream); break;
+    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8, 16} GPUs per node.");
     }
 }
 

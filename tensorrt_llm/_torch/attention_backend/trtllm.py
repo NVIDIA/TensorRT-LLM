@@ -51,6 +51,7 @@ class TrtllmAttentionWrapper:
     attention_window_size: int
     sink_token_length: int
     beam_width: int
+    predicted_tokens_per_seq: int
     quant_mode: int
     position_embedding_type: int
     rotary_embedding_dim: int
@@ -101,6 +102,7 @@ class TrtllmAttentionWrapper:
         self.is_mla_enable = mla_params is not None
         self.q_scaling = 1.0
         self.mla_rope_params = None
+        self.predicted_tokens_per_seq = 1
 
         if self.is_mla_enable:
             self.q_lora_rank = mla_params.q_lora_rank
@@ -108,6 +110,7 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.qk_rope_head_dim = mla_params.qk_rope_head_dim
             self.v_head_dim = mla_params.v_head_dim
+            self.predicted_tokens_per_seq = mla_params.predicted_tokens_per_seq
 
             self.rotary_embedding_dim = 0
 
@@ -122,21 +125,8 @@ class TrtllmAttentionWrapper:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-                rope_params.max_positions,
-                self.qk_rope_head_dim,
-                rope_params.theta,
-                rope_params.scale,
-                rope_params.original_max_positions,
-                rope_params.beta_fast,
-                rope_params.beta_slow,
-                rope_params.mscale,
-                rope_params.mscale_all_dim,
-            )
-            self.rotary_cos_sin = torch.tensor(rope_cos_sin,
-                                               dtype=torch.float32,
-                                               device="cuda")
-            self.rotary_inv_freq = None
+            self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_deepseek_rope_const_params(
+                self.qk_rope_head_dim)
             self.rotary_embedding_scale_type = RotaryScalingType.none
             self.rotary_embedding_scale = 1.0
             self.mla_rope_params = rope_params
@@ -187,6 +177,7 @@ class TrtllmAttentionWrapper:
         host_kv_cache_block_offsets: torch.Tensor,
         host_kv_cache_pool_pointers: torch.Tensor,
         host_kv_cache_pool_mapping: torch.Tensor,
+        block_ids_per_seq: Optional[torch.Tensor] = None,
         workspace: Optional[torch.Tensor] = None,
         cache_indirection: Optional[torch.Tensor] = None,
         kv_scale_orig_quant: Optional[torch.Tensor] = None,
@@ -248,10 +239,12 @@ class TrtllmAttentionWrapper:
         self.latent_cache = latent_cache
         self.q_pe = q_pe
         self.kwargs.update(kwargs)
+        self.block_ids_per_seq = block_ids_per_seq
 
         if self.is_mla_enable:
+            # max_context_length will increment 1 when overlap scheduler enabled
             if self.max_context_length > (self.rotary_cos_sin.shape[1] /
-                                          (2 * self.qk_rope_head_dim)):
+                                          (2 * self.qk_rope_head_dim) + 1):
                 rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
                     self.max_context_length,
                     self.qk_rope_head_dim,
@@ -375,8 +368,10 @@ class TrtllmAttentionWrapper:
             self.rotary_cos_sin,
             self.latent_cache,
             self.q_pe,
+            self.block_ids_per_seq,
             is_fused_qkv,
             update_kv_cache,
+            self.predicted_tokens_per_seq,
             self.layer_idx,
             self.num_heads,
             self.num_kv_heads,
@@ -453,6 +448,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
+            self.block_ids_per_seq = None
+            if self.is_mla:
+                self.block_table_cuda = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
 
     def prepare(self) -> None:
         prompt_lens = torch.tensor(
@@ -471,10 +476,29 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
 
+        # set block table for flashmla
+        if self.is_mla:
+            block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+                self.request_ids)
+            block_ids_per_seq_tensors = [
+                torch.tensor(sublist, dtype=torch.int)
+                for sublist in block_ids_per_seq
+            ]
+            padded_tensor = torch.nn.utils.rnn.pad_sequence(
+                block_ids_per_seq_tensors, batch_first=True, padding_value=0)
+            self.block_table_cuda[:padded_tensor.shape[0], :padded_tensor.
+                                  shape[1]].copy_(padded_tensor)
+            self.block_ids_per_seq = self.block_table_cuda[
+                self.num_contexts:self.num_contexts +
+                self.num_generations, :padded_tensor.shape[1]]
+
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv
-        self.kv_lens[:self.num_seqs].copy_(kv_lens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(self.kv_lens[:self.num_seqs],
+        # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
+        # the sequence length including the cached tokens and the input tokens.
+        self.kv_lens[:self.num_seqs].copy_(
+            kv_lens + self.kv_cache_params.num_extra_kv_tokens)
+        self.kv_lens_cuda[:self.num_seqs].copy_(kv_lens[:self.num_seqs],
                                                 non_blocking=True)
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
@@ -487,6 +511,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
+            assert self.kv_lens[:self.num_seqs].max(
+            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -528,7 +554,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
 
         self.is_mla_enable = mla_params is not None
-        self.mla_params = mla_params
+        self.mla_params = mla_params or MLAParams()
+        self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
 
         self.kv_cache_scaling_factor = torch.tensor(
             [1.0],
@@ -540,6 +567,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config:
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
+            self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
+            )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
@@ -562,48 +591,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            if not self.is_mla_enable:
-                num_heads = self.wrapper.num_heads
-                num_kv_heads = self.wrapper.num_kv_heads
-                head_dim = q.shape[-1]
-                q_size = int(head_dim * num_heads /
-                             (num_heads + 2 * num_kv_heads))
-                kv_size = int(head_dim * num_kv_heads /
-                              (num_heads + 2 * num_kv_heads))
-                q, k, v = q.split([q_size, kv_size, kv_size], dim=-1)
-                head_dim = int(q_size / num_heads)
-                assert head_dim == self.wrapper.head_size, "given head dim is not equal with head dim in q."
-                q = q.reshape(1, -1, num_heads, head_dim).contiguous()
-                k = k.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-                v = v.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-                return VanillaAttention.dummy_forward(q, k, v)
-            else:
-                # now the dummy_forward doesn't support mla, it's not accurate
-                num_heads = self.wrapper.num_heads
-                num_kv_heads = self.wrapper.num_kv_heads
-                head_dim = self.mla_params.qk_nope_head_dim + self.mla_params.qk_rope_head_dim
-                seq_len = int(q.numel() / q.shape[-1])
-                q = torch.randn(1,
-                                seq_len,
-                                num_heads,
-                                head_dim,
+            q_size = self.num_heads * self.head_dim
+            k_size = self.num_kv_heads * self.head_dim
+            v_size = self.num_kv_heads * self.v_head_dim
+            q, k, v = q.split([q_size, k_size, v_size], dim=-1)
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.v_head_dim)
+            if self.head_dim != self.v_head_dim:
+                # the dummy forward doesn't support head_dim != v_head_dim case
+                # so we use a tensor with supported shape to replace the v
+                # the memory estimation is not accurate in this case
+                v = torch.randn(q.shape[0],
+                                self.num_kv_heads,
+                                self.head_dim,
                                 dtype=q.dtype,
                                 device=q.device)
-                k = torch.randn(1,
-                                seq_len,
-                                num_kv_heads,
-                                head_dim,
-                                dtype=q.dtype,
-                                device=q.device)
-                v = torch.randn(1,
-                                seq_len,
-                                num_kv_heads,
-                                head_dim,
-                                dtype=q.dtype,
-                                device=q.device)
-                return VanillaAttention.dummy_forward(
-                    q, k, v)[..., :num_kv_heads *
-                             self.mla_params.v_head_dim].contiguous()
+            output = VanillaAttention.dummy_forward(q, k, v)
+            if self.head_dim != self.v_head_dim:
+                output = output[..., :self.num_kv_heads *
+                                self.v_head_dim].contiguous()
+            return output
 
         assert isinstance(
             metadata,
@@ -617,13 +625,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if use_paged_context_fmha and self.has_fp8_kv_cache:
             # NOTE: W4A8_AWQ can be included too, exclude for now since
             # we don't use int4 in PyTorch
-            if not (self.has_fp8_qdq or self.has_nvfp4):
+            if not (self.has_fp8_qdq or self.has_nvfp4
+                    or self.has_fp8_block_wise):
                 raise RuntimeError(
                     "When FP8 KV cache is being used, paged context FMHA cannot be used without "
                     "FP8 attention.")
-
-        assert metadata.kv_lens[:metadata.num_seqs].max(
-        ) <= metadata.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {metadata.kv_lens[:metadata.num_seqs].max()} for kv cache manager."
 
         num_seqs = metadata.num_seqs
         self.wrapper.plan(
@@ -644,6 +650,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_cache_pool_pointers,
             host_kv_cache_pool_mapping=metadata.kv_cache_manager.
             kv_cache_pool_mapping,
+            block_ids_per_seq=metadata.block_ids_per_seq,
             workspace=None,
             cache_indirection=None,
             kv_scale_orig_quant=self.kv_scale_orig_quant,
@@ -656,7 +663,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         out_dtype = None
         if out_scale is not None:
-            if (self.has_fp8_qdq or self.has_nvfp4) and self.has_fp8_kv_cache:
+            if (self.has_fp8_qdq or self.has_nvfp4
+                    or self.has_fp8_block_wise) and self.has_fp8_kv_cache:
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 

@@ -634,6 +634,7 @@ cvt_fp16_to_fp4_3d(
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
+    asm volatile("griddepcontrol.wait;");
     // Input tensor batch/row/col loops.
     for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
     {
@@ -659,6 +660,7 @@ cvt_fp16_to_fp4_3d(
             }
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -730,6 +732,7 @@ cvt_fp16_to_fp4(
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
+    asm volatile("griddepcontrol.wait;");
     // Input tensor row/col loops.
     for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
     {
@@ -748,6 +751,7 @@ cvt_fp16_to_fp4(
             out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 

@@ -193,28 +193,27 @@ void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
     std::vector<SizeType32> const& sequenceLengths, SizeType32 batchSize, SizeType32 maxBeamWidth,
     SizeType32 maxSeqLength, SizeType32 inputTokenId, SizeType32 expectedTokenId, SizeType32 endId)
 {
-    auto outputsIds = decoder.getIds();
-    // TODO: test parentIds
-    // parentIds = decoder.getParentIds();
-    ASSERT_TRUE(outputsIds);
-    auto outputShape = outputsIds->getShape();
-    EXPECT_EQ(outputShape.nbDims, 3);
-    EXPECT_EQ(outputShape.d[0], batchSize);
-    EXPECT_EQ(outputShape.d[1], maxBeamWidth);
-    EXPECT_EQ(outputShape.d[2], maxSeqLength);
-
-    auto outputsIdsHost = manager.copyFrom(*outputsIds, MemoryType::kCPU);
-    auto output = bufferCast<TokenIdType>(*outputsIdsHost);
-    manager.getStream().synchronize();
-
     for (auto b = 0; b < batchSize; ++b)
     {
+        auto outputsIds = decoder.getIds(b);
+        // TODO: test parentIds
+        // parentIds = decoder.getParentIds();
+        ASSERT_TRUE(outputsIds);
+        auto outputShape = outputsIds->getShape();
+        EXPECT_EQ(outputShape.nbDims, 2);
+        EXPECT_EQ(outputShape.d[0], maxBeamWidth);
+        EXPECT_EQ(outputShape.d[1], maxSeqLength);
+
+        auto outputsIdsHost = manager.copyFrom(*outputsIds, MemoryType::kCPU);
+        auto output = bufferCast<TokenIdType>(*outputsIdsHost);
+
         auto samplingConfig = samplingConfigs.at(b);
+
         for (auto bw = 0; bw < samplingConfig.beamWidth; ++bw)
         {
             auto const result = (samplingConfig.beamWidth == 1) ? expectedTokenId : bw;
 
-            auto* const outputPtr = output + tc::flat_index(outputShape.d, b, bw, 0);
+            auto* const outputPtr = output + tc::flat_index(outputShape.d, bw, 0);
 
             auto const inputLength = inputLengths.at(b);
             auto* begin = outputPtr;

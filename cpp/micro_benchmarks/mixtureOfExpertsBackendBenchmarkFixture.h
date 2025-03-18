@@ -301,6 +301,7 @@ public:
     constexpr static bool FP4 = std::is_same_v<DataType, SafeFP4>;
     constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8>;
     constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
+    using InputType = std::conditional_t<FP4, OutputType, DataType>;
     using WeightStorage = std::conditional_t<INT_QUANT || FP4, uint8_t, WeightType>;
     constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
@@ -422,7 +423,7 @@ public:
         check_cuda_error(cudaDeviceSynchronize());
     }
 
-    CutlassMoeFCRunner<DataType, WeightType, OutputType> mMoERunner{};
+    CutlassMoeFCRunner<DataType, WeightType, OutputType, InputType> mMoERunner{};
     char* mWorkspace{};
     float* mScaleProbs{};
     WeightStorage* mExpertWeight1{};
@@ -728,9 +729,10 @@ public:
     void runMoEPermute(MOEParallelismConfig parallelism_config)
     {
         auto stream = streamPtr->get();
-        mMoERunner.runMoe(mInputTensor, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr, mExpertWeight1,
-            mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize,
-            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, mLoraParams,
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
+            mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
+            mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, mUseLora, mLoraParams,
             /*use_fp8_block_scaling=*/false, stream);
     }
 

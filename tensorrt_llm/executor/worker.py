@@ -35,9 +35,9 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import (BATCH_RESP_IN_AWAIT, ExecutorResponse, IntraProcessQueue,
+from .utils import (BATCH_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     RequestError, WorkerCommIpcAddrs, WorkerCommQueues,
-                    _create_rsp, has_event_loop)
+                    has_event_loop)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -213,15 +213,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _has_background_error(self) -> bool:
         return not self._error_queue.empty()
 
-    def _create_error_response(self, client_id) -> ExecutorResponse:
+    def _create_error_response(self, response: tllm.Response) -> ErrorResponse:
         bck_error = self._error_queue.get_nowait()
         assert isinstance(bck_error, Exception)
-        return ExecutorResponse(client_id,
-                                tensors=None,
-                                finish_reasons=None,
-                                is_final=None,
-                                sequence_index=None,
-                                error=bck_error)
+        return ErrorResponse(response.client_id, str(bck_error),
+                             response.request_id)
 
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
@@ -751,21 +747,20 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
-            rsp = _create_rsp(response)
             queue = self.worker.return_queue(response.client_id)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
                 global_tracer().log_instant("worker-rsp.put")
-                queue.put_nowait(rsp)
+                queue.put_nowait(response)
                 async_queues.append(queue)
                 # all the loops are identical
                 event_loop = event_loop or queue.loop
             else:
-                queue.put(rsp)
+                queue.put(response)
 
-            if rsp.is_final:
+            if response.result.is_final:
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -780,13 +775,10 @@ class AwaitResponseHelper:
         for response in responses:
 
             if self.worker._has_background_error():
-                _send_rsp(
-                    self.worker,
-                    self.worker._create_error_response(response.client_id))
-                continue
+                response = self.worker._create_error_response(response)
             elif response.has_error():
-                # If there is response error, convert to ExecutorResponse and send back
-                response = _create_rsp(response)
+                response = ErrorResponse(response.client_id, response.error_msg,
+                                         response.request_id)
 
             # TODO: To verify the performance of using ZMQ instead of SharedMemory
             # to send the logits tensor back to the Proxy process.
@@ -796,19 +788,22 @@ class AwaitResponseHelper:
         ''' Perform the IPC in batch explicitly. '''
         postproc_batches = [
             []
-            for i in range(self.worker.postproc_config.num_postprocess_workers)
+            for _ in range(self.worker.postproc_config.num_postprocess_workers)
         ] if self.enable_postprocprocess_parallel else None
         rsp_batch = [] if not self.enable_postprocprocess_parallel else None
 
         for response in responses:
-            client_id = response.client_id
-            rsp = _create_rsp(response)
 
             if self.worker._has_background_error():
-                rsp = self.worker._create_error_response(client_id)
+                response = self.worker._create_error_response(response)
+            elif response.has_error():
+                # Convert to ErrorResponse, because tllm.Response cannot be
+                # serialized when it has error.
+                response = ErrorResponse(response.client_id, response.error_msg,
+                                         response.request_id)
 
             _send_rsp(self.worker,
-                      rsp,
+                      response,
                       postproc_batches=postproc_batches,
                       rsp_batch=rsp_batch)
 
@@ -833,30 +828,30 @@ def _get_params_for_first_rsp(
 
 def _send_rsp(
         worker,
-        rsp,
+        response: Union[tllm.Response, ErrorResponse],
         postproc_batches: Optional[List[List["PostprocWorker.Input"]]] = None,
-        rsp_batch: Optional[List["ExecutorResponse"]] = None):
+        rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
     if worker.result_queue is not None:
         if rsp_batch is not None:
-            rsp_batch.append(rsp)
+            rsp_batch.append(response)
         else:
-            worker.result_queue.put(rsp)
+            worker.result_queue.put(response)
     else:
         sampling_params, postproc_params = _get_params_for_first_rsp(
-            worker, rsp.client_id)
+            worker, response.client_id)
         inp = PostprocWorker.Input(
-            rsp,
+            response,
             # sampling_params is necessary for creating fake GenerationResult
             # instances in the postproc processes. They are for incremental
             # detokenize. They should be transmitted only once for each
             # Request.
             sampling_params=sampling_params,
             postproc_params=postproc_params,
-            streaming=worker._results.get(rsp.client_id, None)._streaming)
+            streaming=worker._results.get(response.client_id, None)._streaming)
 
-        pid = rsp.client_id % worker.postproc_config.num_postprocess_workers
+        pid = response.client_id % worker.postproc_config.num_postprocess_workers
 
         if not postproc_batches:
             # Group the responses into buckets for the postprocessing steps.
@@ -869,10 +864,10 @@ def _send_rsp(
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
-    if isinstance(rsp, tllm.Response):
-        if rsp.result.is_final:
-            worker._pop_result(rsp.client_id)
+    if isinstance(response, tllm.Response):
+        if response.has_error() or response.result.is_final:
+            worker._pop_result(response.client_id)
+    elif isinstance(response, ErrorResponse):
+        worker._pop_result(response.client_id)
     else:
-        assert isinstance(rsp, ExecutorResponse)
-        if rsp.is_final:
-            worker._pop_result(rsp.client_id)
+        raise ValueError(f"Unknown response type: {response}")

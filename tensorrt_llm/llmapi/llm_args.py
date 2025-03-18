@@ -255,6 +255,8 @@ LLMARGS_EXPLICIT_DOCSTRING = """
 
         tensor_parallel_size(int): The number of processes for tensor parallelism. Defaults to 1.
 
+        pipeline_parallel_size(int): The number of processes for pipeline parallelism. Defaults to 1.
+
         dtype (str): The data type for the model weights and activations. Defaults to "auto".
             Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type will be automatically inferred from the source model.
             If the source data type is "float32", it will be converted to "float16".
@@ -265,8 +267,6 @@ LLMARGS_EXPLICIT_DOCSTRING = """
 """
 
 LLMARGS_IMPLICIT_DOCSTRING = """
-        pipeline_parallel_size (int): The pipeline parallel size. Defaults to 1.
-
         context_parallel_size (int): The context parallel size. Defaults to 1.
 
         gpus_per_node (int, optional): The number of GPUs per node. None means automatic configure. Defaults to None.
@@ -375,6 +375,8 @@ class LlmArgs:
 
     tensor_parallel_size: int = 1
 
+    pipeline_parallel_size: int = 1
+
     dtype: str = "auto"
 
     revision: Optional[str] = None
@@ -382,8 +384,6 @@ class LlmArgs:
     tokenizer_revision: Optional[str] = None
 
     # Below are all remaining arguments
-    pipeline_parallel_size: int = 1
-
     context_parallel_size: int = 1
 
     gpus_per_node: Optional[int] = None

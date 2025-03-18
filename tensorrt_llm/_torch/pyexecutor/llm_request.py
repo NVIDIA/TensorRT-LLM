@@ -46,10 +46,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_max_new_tokens = self.max_new_tokens
         self.py_batch_idx = None
         self.py_rewind_len = 0
-        self.py_draft_tokens = None
+        self.py_draft_tokens = self.draft_tokens
 
 
-def convert_wordlist(self, word_list) -> List[List[int]]:
+def convert_wordlist(word_list) -> List[List[int]]:
     """Converts a wordlist from format:
 
     [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
@@ -83,7 +83,6 @@ def convert_wordlist(self, word_list) -> List[List[int]]:
         offsets.append(current_offset)
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
-    print([tokens, offsets])
     return [tokens, offsets]
 
 
@@ -96,6 +95,8 @@ def executor_request_to_llm_request(req_id: int,
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
+    py_stop_words_list = convert_wordlist(
+        executor_request.stop_words) if executor_request.stop_words else None
 
     llm_request = LlmRequest(
         request_id=req_id,
@@ -111,8 +112,7 @@ def executor_request_to_llm_request(req_id: int,
         bad_words_list=torch.tensor(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
-        stop_words_list=torch.tensor(
-            convert_wordlist(executor_request.stop_words), dtype=torch.int32)
+        stop_words_list=torch.tensor(py_stop_words_list, dtype=torch.int32)
         if executor_request.stop_words else None,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
         is None else executor_request.prompt_tuning_config.embedding_table,
@@ -140,7 +140,7 @@ def executor_request_to_llm_request(req_id: int,
         context_phase_params=executor_request.context_phase_params)
 
     # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-    # currently, keep py_stop_workds_list as python list, rather than tensor.
-    llm_request.py_stop_words_list = executor_request.stop_words
+    # currently, keep py_stop_words_list as python list, rather than tensor.
+    llm_request.py_stop_words_list = py_stop_words_list
 
     return llm_request

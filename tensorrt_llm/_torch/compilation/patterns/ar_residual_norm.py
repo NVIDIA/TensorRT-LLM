@@ -15,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 
 
 def register_ar_residual_norm(custom_pass: PatternMatcherPass):
+    # TODO: add pp + tp support
     mapping = Mapping(
         world_size=tensorrt_llm.mpi_world_size(),
         tp_size=tensorrt_llm.mpi_world_size(),

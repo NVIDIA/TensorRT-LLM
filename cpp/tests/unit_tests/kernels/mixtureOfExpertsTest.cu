@@ -117,6 +117,7 @@ protected:
     constexpr static bool FP4 = std::is_same_v<GemmDataType, SafeFP4>;
     constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType>;
     constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
+    using InputType = std::conditional_t<FP4, OutputType, GemmDataType>;
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT = 64;
@@ -232,7 +233,7 @@ protected:
         initBiasToExpertIdGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
-    CutlassMoeFCRunner<GemmDataType, WeightType, OutputType> mMoERunner{};
+    CutlassMoeFCRunner<GemmDataType, WeightType, OutputType, InputType> mMoERunner{};
     char* mWorkspace{};
     int* mSelectedExpert;
     float* mTokenFinalScales{};
@@ -981,7 +982,7 @@ protected:
         LoraParams lora_params;
         bool const useFp8BlockScales = false;
         mMoERunner.setTactic(tactic1, tactic2);
-        mMoERunner.runMoe(mInputTensor, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
             useFp8BlockScales, stream);

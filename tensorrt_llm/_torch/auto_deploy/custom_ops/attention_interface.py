@@ -297,6 +297,11 @@ class SequenceInfo:
         self.nest_sequences(input_ids)
         self.input_ids = input_ids
 
+    def _set_generate_only_batch(self) -> None:
+        """Set an example sequence for generate-only batch."""
+        self.reset()
+        self.nest_sequences([[1]] * self.max_batch_size)
+
     def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 

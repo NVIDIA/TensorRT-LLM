@@ -279,7 +279,7 @@ public:
         = 0;
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
 
-    virtual void runMoe(void const* input_activations, int const* token_selected_experts,
+    virtual void runMoe(void const* input_activations, void const* input_sf, int const* token_selected_experts,
         float const* token_final_scales, void const* fc1_expert_weights, void const* fc1_expert_biases,
         ActivationType fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
         QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
@@ -327,13 +327,14 @@ public:
 template <typename T,                   /*The type used for activations*/
     typename WeightType,                /* The type for the MoE weights */
     typename OutputType = T,            /* The type for the MoE final output */
+    typename InputType = T,             /* The type for the MoE input */
     typename BackBoneType = OutputType, /* The unquantized backbone data type of the model */
     typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 {
     using BlockScaleGemmRunner = tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
     using ScaleBiasType = BackBoneType;
-    using Self = CutlassMoeFCRunner<T, WeightType, OutputType, BackBoneType>;
+    using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
 #if defined(ENABLE_FP8)
     static constexpr bool use_fp8 = (std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value)
         && !std::is_same_v<WeightType, cutlass::uint4b_t>;
@@ -355,9 +356,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 
     // This should leave the variable unchanged in any currently supported configuration
     using UnfusedGemmOutputType = BackBoneType;
-
-    // For FP4 we do the quantization for activations on the fly, so we should take inputs in the back bone type
-    using InputActivationsType = std::conditional_t<(use_fp4 || use_w4afp8), BackBoneType, T>;
 
     // We introduce this as a separate parameter, so that if we ever remove the above condition we can decouple
     // BackBoneType and OutputType easily. For now these are required to be equivalent
@@ -393,13 +391,13 @@ public:
         return RunnerType::getConfigs(sm);
     }
 
-    void runMoe(void const* input_activations, int const* token_selected_experts, float const* token_final_scales,
-        void const* fc1_expert_weights, void const* fc1_expert_biases, ActivationType fc1_activation_type,
-        void const* fc2_expert_weights, void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows,
-        int64_t const hidden_size, int64_t const inter_size, int const num_experts, int const experts_per_token,
-        char* workspace_ptr, void* final_output, int* expanded_source_row_to_expanded_dest_row,
-        MOEParallelismConfig parallelism_config, bool use_lora, LoraParams& lora_params, bool use_fp8_block_scaling,
-        cudaStream_t stream) override;
+    void runMoe(void const* input_activations, void const* input_sf, int const* token_selected_experts,
+        float const* token_final_scales, void const* fc1_expert_weights, void const* fc1_expert_biases,
+        ActivationType fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
+        QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
+        int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
+        int* expanded_source_row_to_expanded_dest_row, MOEParallelismConfig parallelism_config, bool use_lora,
+        LoraParams& lora_params, bool use_fp8_block_scaling, cudaStream_t stream) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,

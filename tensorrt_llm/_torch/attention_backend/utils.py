@@ -38,6 +38,7 @@ def create_attention(
     qk_rope_head_dim: Optional[int] = 0,
     qk_nope_head_dim: Optional[int] = 0,
     v_head_dim: Optional[int] = 0,
+    predicted_tokens_per_seq: Optional[int] = 1,
 ):
 
     attn_cls = get_attention_backend(backend_name)
@@ -54,6 +55,7 @@ def create_attention(
                 qk_rope_head_dim=qk_rope_head_dim,
                 qk_nope_head_dim=qk_nope_head_dim,
                 v_head_dim=v_head_dim,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
             )
         else:
             mla_params = None

@@ -57,7 +57,7 @@ class _CacheManagerWithFakePool(KVCacheManager):
         )
 
     def calculate_max_num_blocks(
-        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype
+        self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
     ) -> Tuple[int, int]:
         """Calculate the maximum number of blocks needed for the cache."""
         # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks

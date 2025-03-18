@@ -51,9 +51,16 @@ std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits,
         {
             firstGenTokens.push_back(getTokens().at(beam).back());
         }
-        // TODO: fill the rank ids
-        result.contextPhaseParams = executor::ContextPhaseParams{
-            std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState()};
+        if (!hasDraftTokens())
+        {
+            result.contextPhaseParams = executor::ContextPhaseParams{
+                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), std::nullopt};
+        }
+        else
+        {
+            result.contextPhaseParams = executor::ContextPhaseParams{
+                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), *getDraftTokens()};
+        }
     }
 
     auto const calculateNbTokensOut = [this](SizeType32 maxNbTokens)

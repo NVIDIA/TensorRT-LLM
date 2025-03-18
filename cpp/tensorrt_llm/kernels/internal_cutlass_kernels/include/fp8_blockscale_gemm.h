@@ -60,7 +60,11 @@ public:
         int shape_y, cudaStream_t stream)
         = 0;
     // Returns desired workspace size in bytes.
-    virtual size_t getWorkspaceSize(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) = 0;
+    virtual size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1)
+        = 0;
+    virtual size_t getWorkspaceSize(
+        size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1)
+        = 0;
 
     void configureWorkspace(char* ws_ptr)
     {
@@ -107,7 +111,9 @@ public:
         cudaStream_t stream) override;
 
     // Returns desired workspace size in bytes.
-    size_t getWorkspaceSize(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
+    size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
+    size_t getWorkspaceSize(
+        size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1) override;
 
     size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) override;
     size_t getActScaleSize(int shape_m, int shape_k) override;
@@ -117,6 +123,9 @@ public:
 
 private:
     int64_t max_shape_m_4_align_ = 0;
+    int64_t max_shape_m_32_align_padded_ = 0;
+    int64_t top_k_ = 0;
+    int64_t num_rows_ = 0;
 };
 
 } // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

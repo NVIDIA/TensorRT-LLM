@@ -365,6 +365,7 @@ set(TRTLLM_LINK_LIBS
     ${TRT_LIB}
     common_src
     kernels_src
+    flash_mla_src
     context_attention_src
     decoder_attention_src
     trtllm_gen_fmha

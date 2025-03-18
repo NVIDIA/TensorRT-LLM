@@ -185,7 +185,7 @@ public:
     {
         texec::Request request{std::move(inputTokens), maxNewTokens};
         auto state = std::make_unique<texec::DataTransceiverState>();
-        auto stats = texec::ContextPhaseParams({}, requestId, state.release());
+        auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(requestId, std::move(request));
     }
@@ -226,7 +226,7 @@ TEST_F(MockTransceiverTest, MpiRequesterBasic)
     auto request = makeLlmRequest(0);
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
-    auto stats = texec::ContextPhaseParams({}, 0, state.release());
+    auto stats = texec::ContextPhaseParams({}, 0, state.release(), std::nullopt);
     request->setContextPhaseParams(std::move(stats));
     auto future = requester.requestAndReceiveAsync(*request);
     future.get();
@@ -327,7 +327,7 @@ protected:
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
         state->setCacheState(*mCacheState);
-        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release());
+        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
@@ -649,7 +649,7 @@ protected:
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
-        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release());
+        auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
@@ -669,7 +669,7 @@ protected:
             mContextCacheState->getParallelConfig().mEnableAttenionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
-        auto stats = texec::ContextPhaseParams({}, requestId, state.release());
+        auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
         return std::make_unique<LlmRequest>(requestId, std::move(request));
     }

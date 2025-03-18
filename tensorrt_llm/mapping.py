@@ -336,6 +336,18 @@ class Mapping(object):
                              (self.pp_rank + 1) * layers_per_pipeline_stage)
         return list(layers_range)
 
+    # TODO: Add support of uneven/arbitrary layer segmentation
+    # TODO: merge with pp_layers above
+    def pp_layers_torch(self, num_layers: int) -> List[int]:
+        layers_per_pipeline_stage = num_layers // self.pp_size
+        if self.pp_rank == self.pp_size - 1:
+            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
+                                 num_layers)
+        else:
+            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
+                                 (self.pp_rank + 1) * layers_per_pipeline_stage)
+        return list(layers_range)
+
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1
         experts_per_rank = num_experts // self.moe_ep_size

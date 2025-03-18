@@ -1,3 +1,4 @@
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
 -   repo: https://github.com/pycqa/isort
     rev: 5.12.0
@@ -78,3 +79,10 @@ repos:
         additional_dependencies:
         - mdformat_frontmatter
         files: ".*/auto_deploy/.*"
+-   repo: local
+    hooks:
+    -   id: DCO check
+        name: Checks the commit message for a developer certificate of origin signature
+        entry: ./scripts/dco_check.py
+        language: script
+        stages: [commit-msg]

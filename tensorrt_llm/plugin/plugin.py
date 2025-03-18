@@ -739,9 +739,9 @@ class CustomAllReduceHelper:
                                       is_p2p_supported)
         lamport_buffers_2 = IpcMemory(mapping, lamport_buffers_size,
                                       is_p2p_supported)
-        rank = mapping.rank
-        tp_rank = mapping.tp_rank
-        if rank == tp_rank and is_p2p_supported:
+        # TODO: it seems we may need to initialize lamport buffers for all tp groups
+        # just like its cpp counterpart (AllReduceBuffers::AllReduceBuffers()) does.
+        if is_p2p_supported:
             lamport_initialize_all(
                 lamport_buffers_0.local_ptr,
                 lamport_buffers_1.local_ptr,

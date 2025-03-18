@@ -56,14 +56,14 @@ In the `create_pytorch_model_based_executor` function, the `KVCacheManager` is i
     kv_cache_manager = KVCacheManager(
         executor_config.kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-        model_engine.model.config.num_hidden_layers,
-        model_engine.model.config.num_attention_heads,
-        model_engine.model.config.num_key_value_heads,
-        head_dim,
-        tokens_per_block,
-        max_seq_len,
-        max_num_requests,
-        mapping,
+        num_layers=model_engine.model.config.num_hidden_layers,
+        num_heads=model_engine.model.config.num_attention_heads,
+        num_kv_heads=model_engine.model.config.num_key_value_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_num_requests,
+        mapping=mapping,
         dtype=kv_cache_dtype,
     )
 ```

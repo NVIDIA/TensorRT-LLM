@@ -321,9 +321,7 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q.unsqueeze(0),
-                                                  k.unsqueeze(0),
-                                                  v.unsqueeze(0))
+            return VanillaAttention.dummy_forward(q, k, v)
 
         num_contexts = metadata.num_contexts
         num_queries = metadata.num_queries
@@ -435,7 +433,8 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
             if metadata.mapping.cp_size != 1:
                 parallel_cfg = ParallelConfig(
                     tensor_parallel_size=metadata.mapping.cp_size,
-                    tensor_parallel_rank=metadata.mapping.cp_rank)
+                    tensor_parallel_rank=metadata.mapping.cp_rank,
+                    pipeline_parallel_size=metadata.mapping.pp_size)
                 output_tensor = allgather(output, parallel_cfg, gather_dim=0)
                 lse_tensor = allgather(lse, parallel_cfg, gather_dim=0)
                 output_tensor = output_tensor.to(torch.float32)

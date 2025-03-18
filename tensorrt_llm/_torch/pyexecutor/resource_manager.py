@@ -84,26 +84,30 @@ class DummyKvCacheManager(BaseResourceManager):
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
-            self,
-            kv_cache_config: KvCacheConfigCpp,
-            kv_cache_type: CacheTypeCpp,
-            num_layers: int,
-            num_heads: int,
-            num_kv_heads: Union[int, List[Optional[int]]],
-            head_dim: int,
-            tokens_per_block: int,
-            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-            # It's derived from the model's BuildConfig for consistency with the C++ backend.
-            max_seq_len: int,
-            max_batch_size: int,
-            mapping: Mapping,
-            dtype: DataType = DataType.HALF) -> None:
-        assert not mapping.has_pp(), "TODO: enable pipeline parallelism"
-
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        kv_cache_type: CacheTypeCpp,
+        *,
+        num_layers: int,
+        num_heads: int,
+        num_kv_heads: Union[int, List[Optional[int]]],
+        head_dim: int,
+        tokens_per_block: int,
+        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+        # It's derived from the model's BuildConfig for consistency with the C++ backend.
+        max_seq_len: int,
+        max_batch_size: int,
+        mapping: Mapping,
+        dtype: DataType = DataType.HALF,
+        # Some speculative decoding methods need to use different kv lengths for the
+        # draft/target layers. Add extra tokens to haddle this issue.
+        num_extra_kv_tokens: int = 0,
+    ) -> None:
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
         self.dtype = dtype
+        self.kv_cache_type = kv_cache_type
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -137,6 +141,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        self.num_extra_kv_tokens = num_extra_kv_tokens
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         if kv_cache_config.max_attention_window is None:
@@ -153,7 +158,9 @@ class KVCacheManager(BaseResourceManager):
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             mapping=mapping,
-            dtype=dtype)
+            dtype=dtype,
+            kv_factor=self.kv_factor,
+        )
 
         max_atten_window_upper_bound = self.get_max_atten_window_upper_bound(
             blocks_in_primary_pool=self.blocks_in_primary_pool,
@@ -272,6 +279,8 @@ class KVCacheManager(BaseResourceManager):
                 if req.is_first_context_chunk():
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req)
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req.py_request_id)
                     if req.py_draft_tokens is not None:
                         for _ in range(len(req.py_draft_tokens)):
                             self.impl.add_token(req.py_request_id)
@@ -421,10 +430,13 @@ class KVCacheManager(BaseResourceManager):
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)
-        return result.reshape(result.shape[0], self.kv_factor,
-                              self.tokens_per_block,
-                              self.num_kv_heads_per_layer[layer_idx],
-                              self.head_dim)
+        return result.reshape(
+            result.shape[0],
+            self.kv_factor,
+            self.tokens_per_block,
+            self.num_kv_heads_per_layer[layer_idx],
+            self.head_dim,
+        )
 
     def flush_iteration_events(self):
         self.impl.flush_iteration_events()
@@ -437,59 +449,6 @@ class KVCacheManager(BaseResourceManager):
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
-
-
-class MLAKVCacheManager(KVCacheManager):
-
-    def __init__(
-            self,
-            kv_cache_config: KvCacheConfigCpp,
-            kv_cache_type: CacheTypeCpp,
-            num_layers: int,
-            num_heads: int,
-            num_kv_heads: Union[int, List[Optional[int]]],
-            head_dim: int,
-            tokens_per_block: int,
-            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-            # It's derived from the model's BuildConfig for consistency with the C++ backend.
-            max_seq_len: int,
-            max_batch_size: int,
-            mapping: Mapping,
-            dtype: DataType = DataType.HALF,
-            kv_lora_rank: int = None,
-            qk_rope_head_dim: int = None) -> None:
-        assert kv_lora_rank is not None and qk_rope_head_dim is not None, "both of kv_lora_rank and qk_rope_head_dim shall be set together"
-        head_dim = kv_lora_rank + qk_rope_head_dim
-
-        if isinstance(num_kv_heads, int):
-            num_kv_heads = 1
-        else:
-            assert len(num_kv_heads) == self.num_layers
-            num_kv_heads = [1 for _ in range(self.num_layers)]
-
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-
-        super().__init__(kv_cache_config, kv_cache_type, num_layers, num_heads,
-                         num_kv_heads, head_dim, tokens_per_block, max_seq_len,
-                         max_batch_size, mapping, dtype)
-
-    def calculate_max_num_blocks(
-        self,
-        kv_cache_config: KvCacheConfigCpp,
-        head_dim: int,
-        tokens_per_block: int,
-        mapping: Mapping,
-        dtype: DataType,
-    ):
-        # dim is
-        kv_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        return super().calculate_max_num_blocks(kv_cache_config,
-                                                kv_head_dim,
-                                                tokens_per_block,
-                                                mapping,
-                                                dtype,
-                                                kv_factor=1)
 
 
 class BaseDraftTokenManager(BaseResourceManager):

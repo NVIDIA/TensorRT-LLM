@@ -1,9 +1,12 @@
+import atexit
 import enum
+import os
 import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
@@ -30,6 +33,19 @@ class ParallelConfig:
     gpus_per_node: int = 8
     tensor_parallel_mode: Optional[TensorParallelMode] = None
     gather_output: bool = False
+    # pipeline parallel parameter in case we have multiple parallel groups
+    # default to TP-only mode if not specified for backward compatibility
+    # TODO Remove redundant fields. Keep only parallel_rank, tp_size, pp_size in constructor
+    # and infer tp_rank, pp_rank, etc. automatically.
+    pipeline_parallel_size: int = 1
+    parallel_rank: Optional[int] = None
+
+    def __post_init__(self):
+        self.parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
+        if self.pipeline_parallel_size > 1:
+            assert self.parallel_rank is not None, "parallel_rank must be specified for PP mode"
+        else:
+            self.parallel_rank = self.tensor_parallel_rank
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -65,7 +81,8 @@ def allreduce(
     strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     config: AllReduceConfig = AllReduceConfig(0),
     all_reduce_params: Optional[AllReduceParams] = None
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor]]:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -95,15 +112,18 @@ def allreduce(
         return input
 
     mapping = Mapping(
-        world_size=parallel_config.tensor_parallel_size,
+        world_size=parallel_config.parallel_size,
         tp_size=parallel_config.tensor_parallel_size,
-        rank=parallel_config.tensor_parallel_rank,
+        pp_size=parallel_config.pipeline_parallel_size,
+        rank=parallel_config.parallel_rank,
         gpus_per_node=parallel_config.gpus_per_node,
     )
 
     if all_reduce_params is None:
         all_reduce_params = AllReduceParams()
-    is_fused = all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
+    is_fused = all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM or \
+        all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8 or \
+        all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
     reduce_fusion_inputs = []
     if is_fused:
         if all_reduce_params.has_bias() == 1:
@@ -114,7 +134,7 @@ def allreduce(
         if all_reduce_params.has_scale() == 1:
             reduce_fusion_inputs.append(all_reduce_params.scale)
 
-    final_output, inter_output = torch.ops.trtllm.allreduce(
+    out = torch.ops.trtllm.allreduce(
         input,
         workspace,
         reduce_fusion_inputs,
@@ -127,11 +147,12 @@ def allreduce(
         all_reduce_params.has_bias(),
         all_reduce_params.has_scale(),
     )
-
-    if is_fused:
-        return final_output, inter_output
+    if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+        return out[0], out[1], out[2]
+    elif is_fused:
+        return out[0], out[1]
     else:
-        return final_output
+        return out[0]
 
 
 def userbuffers_allreduce_finalize(input: torch.Tensor) -> torch.Tensor:
@@ -169,9 +190,10 @@ def allgather(input: torch.Tensor,
         return input
 
     mapping = Mapping(
-        world_size=parallel_config.tensor_parallel_size,
+        world_size=parallel_config.parallel_size,
         tp_size=parallel_config.tensor_parallel_size,
-        rank=parallel_config.tensor_parallel_rank,
+        pp_size=parallel_config.pipeline_parallel_size,
+        rank=parallel_config.parallel_rank,
         gpus_per_node=parallel_config.gpus_per_node,
     )
 
@@ -199,9 +221,11 @@ def reducescatter(input: torch.Tensor,
         return input
 
     mapping = Mapping(
-        world_size=parallel_config.tensor_parallel_size,
+        world_size=parallel_config.parallel_size,
         tp_size=parallel_config.tensor_parallel_size,
-        rank=parallel_config.tensor_parallel_rank,
+        pp_size=parallel_config.pipeline_parallel_size,
+        rank=parallel_config.parallel_rank,
+        gpus_per_node=parallel_config.gpus_per_node,
     )
 
     output = torch.ops.trtllm.reducescatter(
@@ -230,16 +254,17 @@ class AllReduce(nn.Module):
 
         self.parallel_config = parallel_config
         self.tp_size = self.parallel_config.tensor_parallel_size
-        self.tp_rank = self.parallel_config.tensor_parallel_rank
+        self.rank = self.parallel_config.parallel_rank
         self.gpus_per_node = self.parallel_config.gpus_per_node
 
         self.workspace = None
         self.strategy = strategy
         if self.tp_size > 1:
             mapping = Mapping(
-                world_size=self.tp_size,
+                world_size=self.parallel_config.parallel_size,
                 tp_size=self.tp_size,
-                rank=self.tp_rank,
+                pp_size=self.parallel_config.pipeline_parallel_size,
+                rank=self.rank,
                 gpus_per_node=self.gpus_per_node,
             )
             if self.strategy != AllReduceStrategy.UB:
@@ -311,3 +336,39 @@ class DeepseekAllReduce(nn.Module):
             raise ValueError(f"Unsupported fusion op: {fusion_op}")
 
         return output
+
+
+class PPComm:
+    # PP communication using torch.distributed with nccl backend
+    def __init__(self, global_mapping: Mapping):
+        self.mapping = global_mapping
+        if not dist.is_initialized():
+            master_ip = os.getenv("MASTER_ADDR", "localhost")
+            master_port = os.getenv("MASTER_PORT", "6000")
+            init_method = f"tcp://{master_ip}:{master_port}"
+            dist.init_process_group(backend="nccl",
+                                    init_method=init_method,
+                                    world_size=global_mapping.world_size,
+                                    rank=global_mapping.rank)
+            atexit.register(self._cleanup)
+
+        # Force NCCL initialization and rank population via PyTorch distributed barrier.
+        # This is necessary for NOW if using pp + tp because our custom nccl allreduce
+        # op for tp groups can interfere with PyTorch's NCCL initialization when PyTorch
+        # distributed performs the first comm. op and kick off nccl init. The barrier here
+        # ensures proper NCCL setup and GPU-procs binding at beginning.
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+
+    def _cleanup(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
+        if dest is None:
+            dest = self.mapping.next_pp_rank()
+        dist.send(tensor, dest)
+
+    def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
+        if src is None:
+            src = self.mapping.prev_pp_rank()
+        dist.recv(tensor, src)

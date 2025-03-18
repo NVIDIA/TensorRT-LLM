@@ -71,13 +71,19 @@ class BindCapacityScheduler(CapacityScheduler):
         max_num_requests: int,
         kv_cache_manager,
         scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
-        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT):
+        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        num_micro_batches: int = 1,
+    ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
+
         self.impl = tb_internal.algorithms.CapacityScheduler(
-            max_num_requests, scheduler_policy, kv_cache_manager is not None,
-            False, LlmRequestState.CONTEXT_INIT,
-            LlmRequestState.GENERATION_COMPLETE)
+            max_num_requests=max_num_requests * num_micro_batches,
+            capacity_scheduler_policy=scheduler_policy,
+            has_kv_cache_manager=kv_cache_manager is not None,
+            many_micro_batches=num_micro_batches > 1,
+            no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
+            no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE)
 
     def schedule_request(
         self, active_requests: RequestList

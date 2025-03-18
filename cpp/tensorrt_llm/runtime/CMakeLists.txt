@@ -49,6 +49,7 @@ set(SRCS
     runtimeKernels.cu
     rnnStateBuffers.cpp
     statefulGptDecoder.cpp
+    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp

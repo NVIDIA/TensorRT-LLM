@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -144,12 +145,13 @@ public:
 
     ~AllreduceOp() = default;
 
-    std::tuple<torch::Tensor, torch::Tensor> run(
+    std::vector<torch::Tensor> run(
         torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         torch::Tensor output;
         torch::Tensor finalOutput;
+        torch::Tensor scaleOutput;
         size_t size = input.numel();
 
         AllReduceStrategyType runtimeStrategy;
@@ -201,29 +203,54 @@ public:
         if (runtimeStrategy == AllReduceStrategyType::UB)
         {
             output = torch::empty_like(input);
-            // Only support fp8 fusion
-            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM);
-            TLLM_CHECK(mScale);
-            TLLM_CHECK(mAffine);
-            TLLM_CHECK(!mBias);
-
-            int hidden_size = input.size(-1);
-
+            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
             TLLM_CHECK_WITH_INFO(
                 tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
             auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
-            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
             TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
+            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
             auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
-
+            int hidden_size = input.size(-1);
+            int m = size / hidden_size;
+            int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
             void* residual = reduce_fusion_inputs[0].data_ptr();
             void* gamma = reduce_fusion_inputs[1].data_ptr();
             float* scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
-            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
-                ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
-                mType, ub_comm, stream);
-            finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
-                torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+            {
+                TLLM_CHECK(mScale);
+                TLLM_CHECK(mAffine);
+                TLLM_CHECK(!mBias);
+
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
+                    ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
+                    mType, ub_comm, stream);
+                finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
+                    torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+            }
+            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                TLLM_CHECK(mScale);
+                TLLM_CHECK(mAffine);
+                TLLM_CHECK(!mBias);
+                auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
+                    ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
+                    residual, output.data_ptr(), mType, ub_comm, stream);
+                scaleOutput = torch::from_blob(
+                    ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
+                auto output_shape = input.sizes().vec();
+                output_shape.back() /= 2;
+                auto output_strides = input.strides().vec();
+                for (size_t i = 0; i < output_shape.size() - 1; i++)
+                {
+                    output_strides[i] /= 2;
+                }
+                finalOutput = torch::from_blob(
+                    ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
+            }
         }
         else if (runtimeStrategy == AllReduceStrategyType::NCCL)
         {
@@ -303,13 +330,17 @@ public:
             tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
         }
 
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
         {
-            return std::make_tuple(finalOutput, output);
+            return {finalOutput, output};
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            return {finalOutput, scaleOutput, output};
         }
         else
         {
-            return std::make_tuple(output, output);
+            return {output};
         }
     }
 
@@ -549,7 +580,7 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
+std::vector<torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
     torch::TensorList reduce_fusion_inputs, torch::List<int64_t> group_, int64_t const strategy_, int64_t const config_,
     int64_t const fusion_op_, double const eps_, bool const affine_, bool const bias_, bool const scale_)
 {
@@ -566,10 +597,9 @@ std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::o
     }
     AllreduceOp op(group, dtype, strategy, config, fusion_op, eps, affine_, bias_, scale_);
     op.initialize();
-    auto output = op.run(input, workspace, reduce_fusion_inputs);
-    return output;
+    return op.run(input, workspace, reduce_fusion_inputs);
 #else
-    return std::make_tuple(input, input);
+    return {input};
 #endif // ENABLE_MULTI_DEVICE
 }
 
@@ -579,7 +609,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "allreduce(Tensor input, Tensor? workspace, Tensor[] reduce_fusion_inputs, int[] group, int "
-        "strategy, int config, int op, float eps, bool affine, bool bias, bool scale) -> (Tensor, Tensor)");
+        "strategy, int config, int op, float eps, bool affine, bool bias, bool scale) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

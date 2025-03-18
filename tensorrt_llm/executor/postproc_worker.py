@@ -13,7 +13,6 @@ from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import nvtx_range, print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import _create_rsp
 
 if TYPE_CHECKING:
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
@@ -157,18 +156,14 @@ class PostprocWorker:
     async def _mainloop(self):
         ''' The loop for handle_response and keep producing outputs. '''
 
-        PostprocWorker.Input
-        Output = PostprocWorker.Output
-
         async def handle_single_input(inp: PostprocWorker.Input,
                                       batch: List[PostprocWorker.Output]):
             assert isinstance(inp, PostprocWorker.Input)
-            if isinstance(inp.rsp, tllm.Response):
-                inp.rsp = _create_rsp(inp.rsp)
             client_id = inp.rsp.client_id
-            is_final = bool(inp.rsp.is_final)
+            is_final = inp.rsp.result.is_final if isinstance(
+                inp.rsp, tllm.Response) else True
             res = await self._handle_input(inp)
-            batch.append(Output(client_id, res, is_final))
+            batch.append(PostprocWorker.Output(client_id, res, is_final))
             if is_final:
                 self._records.pop(client_id)
 

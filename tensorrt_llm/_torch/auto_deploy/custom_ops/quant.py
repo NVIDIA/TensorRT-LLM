@@ -2,6 +2,7 @@
 
 from typing import Optional
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -185,21 +186,22 @@ def fp4_linear(
     profiler = fp4_linear.profiler
     profile_record = fp4_linear.profile_record
 
-    assert input.dim() == 3
-    assert input.shape[-1] % 16 == 0
-    assert weight_fp4.shape[-1] % 8 == 0
+    input_shape = input.shape
+    weight_shape = weight_fp4.shape
 
+    n = weight_shape[0]
+    k = input_shape[-1]
+    assert k % 16 == 0
+    assert weight_shape[-1] % 8 == 0
     assert weight_scale.numel() % (128 * 4) == 0
 
-    b, m, k = input.shape
-    n = weight_fp4.shape[0]
     input = input.reshape(-1, k)
 
     # profile if needed and get the best config
     if (n, k) not in profile_record:
         profiler.run_profile(n, k, fp4_buckets)
         profile_record.add((n, k))
-    best_config_id = profiler.get_best_config_id(b * m, n, k)
+    best_config_id = profiler.get_best_config_id(np.prod(input_shape[:-1]), n, k)
 
     # FP4 compatibility
     assert bias is None  # Bias is not supported yet
@@ -214,7 +216,7 @@ def fp4_linear(
         x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, best_config_id
     )
 
-    return output.reshape(b, m, -1)
+    return output.reshape(*input_shape[:-1], n)
 
 
 @fp4_linear.register_fake

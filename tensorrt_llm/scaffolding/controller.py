@@ -9,6 +9,8 @@ class ScaffoldingOutput:
 
     def __init__(self):
         self.output_str = None
+        # reserved for customized controller
+        self.customized_output = None
 
 
 class Controller(ABC):

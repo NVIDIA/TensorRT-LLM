@@ -2,9 +2,8 @@ import contextlib
 import fnmatch
 import math
 import time
-from abc import ABC
 from dataclasses import dataclass
-from typing import Dict, Generic, Optional, Tuple, Type, TypeVar
+from typing import ClassVar, Dict, Generic, List, Optional, Tuple, Type, TypeVar
 
 import torch
 from torch import nn
@@ -16,9 +15,13 @@ from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig, TConfig
+from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
+from ..modules.fused_moe import FusedMoE
+from ..modules.linear import Linear, WeightMode
 from ..modules.logits_procesor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
+from ..pipeline_interface import PipelineInterface
 
 
 @contextlib.contextmanager
@@ -109,11 +112,94 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
-class DecoderModel(nn.Module, ABC):
+def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
+                                      dtype: torch.dtype):
+
+    def create_pipeline_interface(num_input_ids: torch.int):
+        tensors = {
+            key:
+            # ones to avoid NaNs for DS, that cause hang in cuda graphs
+            torch.ones((num_input_ids, hidden_size),
+                       dtype=dtype,
+                       device=torch.cuda.current_device())
+            for key in keys
+        }
+        return PipelineInterface(**tensors)
+
+    return create_pipeline_interface
+
+
+class MissingLayer(torch.nn.Identity):
+    """Signature of missing layers in pipeline parallel setup."""
+
+    def __init__(self):
+        super().__init__()
+
+
+def build_pipeline_layers(layer_list,
+                          num_hidden_layers,
+                          layer_fn,
+                          missing_layer_fn=MissingLayer):
+    layer_offset = layer_list[0]
+    layers = [
+        layer_fn(layer_idx - layer_offset)  # local layer idx to attn_backend
+        if layer_idx in layer_list else missing_layer_fn()
+        for layer_idx in range(num_hidden_layers)
+    ]
+    return nn.ModuleList(layers)
+
+
+def missing_layer_parameter(name: str, model: torch.nn.Module) -> bool:
+    """ Check if a layer parameter is missing if when pp is enabled.
+        A layer parameter is missing if either:
+            1. The model itself is a MissingLayer, or
+            2. It has a submodule that is a MissingLayer.
+    """
+    if isinstance(model, MissingLayer):
+        return True
+
+    return any(
+        name.startswith(missing_layer_name)
+        for missing_layer_name in _get_missing_layer_names(model))
+
+
+# Static cache to store missing layer names for each model instance
+_model_to_missing_layer_names: Dict[int, List[str]] = {}
+
+
+def _get_missing_layer_names(model: torch.nn.Module) -> List[str]:
+    """ Get the missing layer names of a given model when pp is enabled.
+    """
+    model_id = id(model)
+    if model_id in _model_to_missing_layer_names:
+        return _model_to_missing_layer_names[model_id]
+
+    missing_layer_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, MissingLayer):
+            # Add trailing dot to ensure exact prefix matching
+            missing_layer_names.append(name + '.')
+
+    # Cache the result
+    _model_to_missing_layer_names[model_id] = missing_layer_names
+    return missing_layer_names
+
+
+class PPInitCaller(type):
+
+    def __call__(cls, *args, **kwargs):
+        obj = type.__call__(cls, *args, **kwargs)
+        if getattr(obj, '_supports_pp', False):
+            obj.__pp_init__()
+        return obj
+
+
+class DecoderModel(nn.Module, metaclass=PPInitCaller):
     config: ModelConfig
     embed_tokens: Embedding
     layers: nn.ModuleList
     norm: RMSNorm
+    _supports_pp: ClassVar[bool] = False  # Whether the model supports PP
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
@@ -148,6 +234,85 @@ class DecoderModel(nn.Module, ABC):
 
         return hidden_states
 
+    def __pp_init__(self):
+        self.pp_rank = self.model_config.mapping.pp_rank
+        self.pp_size = self.model_config.mapping.pp_size
+        if self.pp_size == 1:
+            return
+
+        config = self.model_config.pretrained_config
+        # override embed_tokens and norm w.r.t pp rank
+        if self.pp_rank != 0:
+            self.embed_tokens = MissingLayer()
+        if self.pp_rank != self.pp_size - 1:
+            self.norm = MissingLayer()
+
+        # rebuild layers with pipeline parallel support
+        num_hidden_layers = len(self.layers)
+        self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
+            num_hidden_layers)
+        decoder_layer_cls = self.layers[0].__class__
+        if hasattr(self, 'moe_stream'):  # DeepseekV3
+            layer_fn = lambda layer_idx: decoder_layer_cls(
+                self.model_config, layer_idx, self.moe_stream)
+        else:
+            layer_fn = lambda layer_idx: decoder_layer_cls(
+                self.model_config, layer_idx)
+        self.layers = build_pipeline_layers(self.pp_layer_list,
+                                            num_hidden_layers, layer_fn)
+
+        # add create_pipeline_interface method
+        pp_interface_keys = ["hidden_states", "residual"]
+        self.create_pipeline_interface = create_pipeline_interface_factory(
+            pp_interface_keys, config.hidden_size, config.torch_dtype)
+
+        # override forward method
+        self.forward = self._pp_forward
+
+    def _pp_forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+    ) -> torch.Tensor:
+        # unpack pp_interface or embedding lookup for the input
+        if self.pp_rank != 0:
+            if pipeline_interface is None:
+                raise ValueError(
+                    "pipeline_interface is required for non-first pp rank.")
+            hidden_states, residual = pipeline_interface  # unpack pp_interface
+        else:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+            residual = None
+
+        # local forward pass
+        local_decoder_layers = ([
+            self.layers[layer_id] for layer_id in self.pp_layer_list
+        ] if self.pp_size > 1 else self.layers)
+
+        for decoder_layer in local_decoder_layers:
+            hidden_states, residual = decoder_layer(position_ids=position_ids,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    residual=residual)
+
+        # pack pp_interface or return hidden_states for last pp rank
+        if not self.pp_rank == self.pp_size - 1:
+            return PipelineInterface(hidden_states,
+                                     residual)  # pack pp_interface
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
 
 class PostInitCaller(type):
 
@@ -160,6 +325,7 @@ class PostInitCaller(type):
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
+# TODO: Maybe extract PP logic from DecoderModelForCausalLM similar to DecoderModel
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
@@ -169,48 +335,104 @@ class DecoderModelForCausalLM(nn.Module,
         super().__init__()
         self.model_config = config
         self.model = model
-        # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-        # will considering per layer QuantConfig in the future.
-        if config.mapping.enable_attention_dp:
-            self.lm_head = LMHead(
-                vocab_size,
-                hidden_size,
-                dtype=config.pretrained_config.torch_dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_rank=0,
-                    tensor_parallel_size=1,
-                    tensor_parallel_mode=None,
-                    gather_output=False,
-                ),
-            )
+        self.pp_rank = config.mapping.pp_rank
+        self.pp_size = config.mapping.pp_size
+        # Check PP support during initialization
+        self._supports_pp = getattr(self.model, '_supports_pp', False)
+        if self.pp_size > 1 and not self._supports_pp:
+            raise ValueError(
+                f"Model {type(self.model).__name__} has not enabled "
+                "pipeline parallel support yet.")
+
+        if self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+            self.lm_head = MissingLayer()
+            self.logits_processor = MissingLayer()
         else:
-            self.lm_head = LMHead(
-                vocab_size,
-                hidden_size,
-                dtype=config.pretrained_config.torch_dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_rank=config.mapping.tp_rank,
-                    tensor_parallel_size=config.mapping.tp_size,
-                    tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    gather_output=True,
-                    gpus_per_node=config.mapping.gpus_per_node,
-                ),
-            )
+            if config.mapping.enable_attention_dp:
+                self.lm_head = LMHead(
+                    vocab_size,
+                    hidden_size,
+                    dtype=config.pretrained_config.torch_dtype,
+                    parallel_config=ParallelConfig(
+                        tensor_parallel_rank=0,
+                        tensor_parallel_size=1,
+                        tensor_parallel_mode=None,
+                        gather_output=False,
+                        pipeline_parallel_size=config.mapping.pp_size,
+                        parallel_rank=config.mapping.rank,
+                    ),
+                )
+            else:
+                # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
+                # will considering per layer QuantConfig in the future.
+                self.lm_head = LMHead(
+                    vocab_size,
+                    hidden_size,
+                    dtype=config.pretrained_config.torch_dtype,
+                    parallel_config=ParallelConfig(
+                        tensor_parallel_size=config.mapping.tp_size,
+                        tensor_parallel_rank=config.mapping.tp_rank,
+                        tensor_parallel_mode=TensorParallelMode.COLUMN,
+                        gather_output=True,
+                        gpus_per_node=config.mapping.gpus_per_node,
+                        pipeline_parallel_size=config.mapping.pp_size,
+                        parallel_rank=config.mapping.rank,
+                    ),
+                )
 
-        # use embedding weights in lm_head if tie word embedding is enabled
-        if config.pretrained_config.tie_word_embeddings:
-            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                "lm_head and vocab embedding should use the same TP size")
-            assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
-                "lm_head and vocab embedding should use the same TP mode")
-            self.lm_head.weight = self.model.embed_tokens.weight
+            # use embedding weights in lm_head if tie word embedding is enabled
+            if config.pretrained_config.tie_word_embeddings and not isinstance(
+                    self.model.embed_tokens, MissingLayer):
+                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                    "lm_head and vocab embedding should use the same TP size")
+                assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
+                    "lm_head and vocab embedding should use the same TP mode")
+                self.lm_head.weight = self.model.embed_tokens.weight
 
-        self.logits_processor = LogitsProcessor()
+            self.logits_processor = LogitsProcessor()
 
     def __post_init__(self):
+        # 1. mixed precision
+        quant_config_dict = self.model_config.quant_config_dict
+        if quant_config_dict is not None:
+            for name, module in self.named_modules():
+                if isinstance(module, FusedMoE):
+                    for n, q in quant_config_dict.items():
+                        # all linear layers inside FusedMoE share the same quant config
+                        if name in n:
+                            module.quant_config = q
+                            break
+                elif isinstance(module, Linear):
+                    weight_mode = module.weights_loading_config.weight_mode
+                    prefix_name = '.'.join(name.split('.')[:-1])
+                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                        for n, q in quant_config_dict.items():
+                            # gate_proj and up_proj share the same quant config
+                            if prefix_name + '.gate_proj' in n:
+                                module.quant_config = q
+                                break
+                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                        for n, q in quant_config_dict.items():
+                            # q_proj, k_proj and v_proj share the same quant config
+                            if prefix_name + '.q_proj' in n:
+                                module.quant_config = q
+                                break
+                    else:
+                        for n, q in quant_config_dict.items():
+                            if name == n:
+                                module.quant_config = q
+                                break
+                elif isinstance(module, Attention):
+                    for n, q in quant_config_dict.items():
+                        # reuse q_proj quant config as the attention quant config
+                        if name + '.q_proj' in n:
+                            module.quant_config = q
+                            break
+                # TODO: support MLA
+
+        # 2. skip quant for modules in QuantConfig.exclude_modules
         quant_config = self.model_config.quant_config
         if quant_config is not None:
-            # skip quant for modules in QuantConfig.exclude_modules
             if quant_config.exclude_modules is not None:
                 exclude_modules = quant_config.exclude_modules
                 for name, module in self.named_modules():
@@ -231,29 +453,47 @@ class DecoderModelForCausalLM(nn.Module,
     def config(self):
         return self.model_config.pretrained_config
 
+    def create_pipeline_interface(self, num_input_ids: torch.int):
+        # create each interface buffer at runtime
+        return self.model.create_pipeline_interface(num_input_ids)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
 
-        logits = self.logits_processor.forward(
-            hidden_states,
+        if self._supports_pp and self.pp_size > 1:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pipeline_interface=pipeline_interface,
+            )
+
+            # No need to compute logits for non-last PP ranks
+            if self.pp_rank < self.pp_size - 1:
+                return output
+        else:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+            )
+
+        return self.logits_processor.forward(
+            output,
             self.lm_head,
             attn_metadata,
             return_context_logits,
         )
-        return logits
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
@@ -277,6 +517,10 @@ class DecoderModelForCausalLM(nn.Module,
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
                 if self.config.tie_word_embeddings and name.startswith(
                         "lm_head"):
+                    continue
+
+                # Skip if parameter belongs to a missing layer
+                if missing_layer_parameter(name, self):
                     continue
 
                 names = name.split('.')
@@ -357,3 +601,8 @@ def get_model_architecture(
         raise RuntimeError(
             f"Unknown model architecture: {model_config.architectures[0]}")
     return cls, model_config.architectures[0]
+
+
+def support_pp(cls: Type) -> Type:
+    cls._supports_pp = True
+    return cls

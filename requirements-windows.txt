@@ -10,7 +10,9 @@ onnx_graphsurgeon>=0.5.2
 ordered-set
 polygraphy==0.49.9
 psutil
-pynvml>=11.5.0
+nvidia-ml-py>=12
+# Just a wrapper since nvidia-modelopt requires pynvml
+pynvml>=12.0.0
 pulp
 pandas
 h5py==3.12.1
