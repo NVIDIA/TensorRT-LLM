@@ -291,6 +291,7 @@ def main(*,
             ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
             return pybind_lib[0]
 
+        print("Testing...")
         copy(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
