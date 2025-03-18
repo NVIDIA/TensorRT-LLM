@@ -17,6 +17,8 @@
 
 #pragma once
 
+break_stuff();
+
 #include "common.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/algorithm.h"
