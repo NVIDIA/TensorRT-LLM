@@ -17,7 +17,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ChatCompletionResponse,
+                                                CompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
@@ -81,6 +83,9 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
+        self.app.add_api_route("/v1/chat/completions",
+                               self.openai_chat_completion,
+                               methods=["POST"])
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -130,7 +135,7 @@ class OpenAIDisaggServer:
                 # Disable streaming for context server
                 req.stream = False
                 req.stream_options = None
-                ctx_response = await self.send_request(ctx_server, req)
+                ctx_response = await self.send_completion_request(ctx_server, req)
 
                 #TODO: Context server should skip de-tokenization and return raw tokens
                 choices = ctx_response.choices
@@ -147,6 +152,10 @@ class OpenAIDisaggServer:
             # Pick a generation server and send request
             gen_server = self.get_next_server(self.gen_servers, "generation")
             logging.info("Sending request to gen server: %s", gen_server)
+<<<<<<< HEAD
+=======
+            gen_response = await self.send_completion_request(gen_server, gen_req)
+>>>>>>> d45ef81e (Add support of chat completion in PD)
 
             if not gen_req.stream:
                 gen_response = await self.send_request(gen_server, gen_req)
@@ -158,6 +167,50 @@ class OpenAIDisaggServer:
                     media_type="text/event-stream"
                 )
 
+        except CppExecutorError as e:
+            # If internal executor error is raised, shutdown the server
+            logging.exception(e)
+            signal.raise_signal(signal.SIGINT)
+        except HTTPException as e:
+            raise e  # Re-raise HTTP exceptions properly
+        except Exception as e:
+            logging.exception(e)
+            raise HTTPException(status_code=500, detail=f"Internal server error {str(e)}")
+
+    async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
+
+        try:
+            gen_req = copy.deepcopy(req)
+
+            # Pick a context server
+            ctx_server = self.get_next_server(self.ctx_servers, "context")
+            logging.info("Sending request to ctx server: %s", ctx_server)
+
+            # Send request to context server
+            req.max_completion_tokens = 1
+            req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+            # Disable streaming for context server
+            req.stream = False
+            req.stream_options = None
+            ctx_response = await self.send_chat_request(ctx_server, req)
+
+            #TODO: Context server should skip de-tokenization and return raw tokens
+            choices = ctx_response.choices
+            if len(choices) > 1:
+                raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
+            if choices[0].disaggregated_params is None:
+                raise ValueError("Context server did not return disaggregated params")
+
+            # Append disaggregates parameters to generation request
+            gen_req.disaggregated_params = choices[0].disaggregated_params
+            gen_req.disaggregated_params.request_type = "generation_only"
+
+            # Pick a generation server and send request
+            gen_server = self.get_next_server(self.gen_servers, "generation")
+            logging.info("Sending request to gen server: %s", gen_server)
+            gen_response = await self.send_chat_request(gen_server, gen_req)
+
+            return gen_response
         except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
             logging.exception(e)
@@ -211,7 +264,24 @@ class OpenAIDisaggServer:
                     logging.error(f"Unexpected error in stream: {e}")
                     raise
 
-    async def send_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
+    async def create_chat_generator(self, url: str, request: ChatCompletionRequest):
+        async with self.session.post(url + "/v1/chat/completions", json=request.model_dump(exclude_unset=True)) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if "text/event-stream" in content_type:
+                if not request.stream:
+                    raise ValueError("Received an event-stream although request stream was False")
+
+                try:
+                    async for line in response.content.iter_any():
+                        if line:
+                            yield line
+                            await asyncio.sleep(0)
+
+                except Exception as e:
+                    logging.error(f"Unexpected error in stream: {e}")
+                    raise
+
+    async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
 
         if request.stream:
             response_generator = self.create_completion_generator(url, request)
@@ -229,6 +299,22 @@ class OpenAIDisaggServer:
                     logging.error(f"Received failed response {response_dict}")
                     response.raise_for_status()
                 return CompletionResponse(**response_dict)
+
+    async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
+
+        if request.stream:
+            response_generator = self.create_chat_generator(url, request)
+            return StreamingResponse(content=response_generator, media_type="text/event-stream")
+        else:
+            async with self.session.post(url + "/v1/chat/completions", json=request.model_dump(exclude_unset=True)) as response:
+
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    raise ValueError("Received an event-stream although request stream was False")
+
+                response_dict = await response.json()
+                response.raise_for_status()
+                return ChatCompletionResponse(**response_dict)
 
     async def check_server_ready(self, server_url: str) -> bool:
         try:

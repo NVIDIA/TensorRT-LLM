@@ -175,11 +175,14 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
                 ])
         else:
             message = ChatMessage(role=role, content=output.text)
+        disaggregated_params = ChatCompletionResponseChoice.to_disaggregated_params(
+            output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
+            disaggregated_params=disaggregated_params,
         )
 
         if args.return_logprobs:
