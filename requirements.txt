@@ -42,5 +42,5 @@ httpx
 setuptools
 ordered-set
 peft
-flashinfer @ git+https://github.com/flashinfer-ai/flashinfer.git@06309c4e
 s2wrapper @ git+https://github.com/bfshi/scaling_on_scales.git@60da2afe
+flashinfer @ git+https://github.com/flashinfer-ai/flashinfer.git@06309c4e
