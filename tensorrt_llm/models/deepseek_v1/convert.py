@@ -90,11 +90,20 @@ def convert_deepseek(hf_model,
         k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)
         v_weight = get_weight(model_params, prefix + 'self_attn.v_proj', dtype)
 
-        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-
-        split_v = split_qkv_tp(qkv_weight, config.num_attention_heads,
-                               config.hidden_size, mapping.tp_size,
-                               mapping.tp_rank)
+        if config.num_attention_heads == config.num_key_value_heads:
+            # mha
+            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            split_v = split_qkv_tp(qkv_weight, config.num_attention_heads,
+                                   config.hidden_size, mapping.tp_size,
+                                   mapping.tp_rank)
+        else:
+            # gqa
+            assert (k_weight.shape[0] % (mapping.tp_size * config.head_size)) == 0
+            assert (v_weight.shape[0] % (mapping.tp_size * config.head_size)) == 0
+            wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
+            wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
+            wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
+            split_v = torch.concat((wq, wk, wv))
 
         weights.update(
             get_trtllm_linear_weight(split_v, trtllm_prex + 'attention.qkv.'))
