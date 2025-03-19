@@ -18,6 +18,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+## Latest News
 * [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
 <div align="center">
 <img src="docs/source/media/r1-perf.jpeg" width="75%">
