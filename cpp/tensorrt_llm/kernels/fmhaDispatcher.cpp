@@ -48,6 +48,10 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     {
         mTllmGenFMHARunner.reset(
             new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv, mFixedParams.dataTypeOut));
+        if (!isSupported())
+        {
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
+        }
     }
     else
     {
@@ -92,7 +96,9 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
-        tllmRunnerParams.mHeadDim = mFixedParams.headSize;
+        // Assume same headDim for Qk and V here.
+        tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
+        tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -158,7 +164,11 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.oSfScalePtr = runnerParams.oSfScalePtr;
         tllmRunnerParams.oPtr = runnerParams.outputPtr;
         tllmRunnerParams.oSfPtr = runnerParams.outputSfPtr;
-        tllmRunnerParams.mHeadDim = mFixedParams.headSize;
+        // The sequence lengths for K/V.
+        tllmRunnerParams.seqLensKvPtr = reinterpret_cast<int const*>(runnerParams.kvSeqLenPtr);
+        // Assume same headDim for Qk and V here.
+        tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
+        tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = tllmRunnerParams.mNumHeadsQ / tllmRunnerParams.mNumHeadsKv;
@@ -176,8 +186,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
         {
             auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+            // The kv cache should be based on the maximum headDim of K and V due to paddings.
+            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
             tllmRunnerParams.mNumPagesInMemPool = totalMemory
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * tllmRunnerParams.mHeadDim
+                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.dataType));
         }
         tllmRunnerParams.mSfStartTokenIdx = 0;

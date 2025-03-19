@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/speculativeDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
+#include <NvInferRuntimeBase.h>
 #include <cub/cub.cuh>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -74,6 +76,10 @@ template void invokeFill(IBuffer&, __nv_bfloat16, CudaStream const&);
 
 namespace
 {
+//! @param data    expected shape [indicesRange, size]
+//! @param indices expected shape [gridDim.y]
+//! @param size
+//! @param values  expected shape [gridDim.y]
 template <typename T>
 __global__ void fillBatch(T* data, std::int32_t const* indices, std::size_t size, T const* values)
 {
@@ -89,14 +95,13 @@ __global__ void fillBatch(T* data, std::int32_t const* indices, std::size_t size
         data[idx] = value;
     }
 }
-} // namespace
 
 template <typename T>
 void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t slotStride, IBuffer const& values,
     CudaStream const& stream)
 {
     auto data = bufferCast<T>(buffer);
-    auto indices = bufferCast<std::int32_t>(slotIndices);
+    auto const* const indices = bufferCast<std::int32_t>(slotIndices);
     auto fillValues = bufferCast<T>(values);
     auto numSlots = slotIndices.getSize();
     auto const size = slotStride;
@@ -107,11 +112,23 @@ void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t sl
 
     fillBatch<<<gridSize, blockSize, 0, stream.get()>>>(data, indices, size, fillValues);
 }
+} // namespace
 
-// template instantiation
-template void invokeFillBatch<float>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
-template void invokeFillBatch<std::int8_t>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
-template void invokeFillBatch<std::int32_t>(IBuffer&, IBuffer const&, std::size_t, IBuffer const&, CudaStream const&);
+void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t slotStride, IBuffer const& values,
+    CudaStream const& stream)
+{
+    switch (buffer.getDataType())
+    {
+    case nvinfer1::DataType::kINT32:
+        invokeFillBatch<std::int32_t>(buffer, slotIndices, slotStride, values, stream);
+        break;
+    case nvinfer1::DataType::kINT8:
+        invokeFillBatch<std::int8_t>(buffer, slotIndices, slotStride, values, stream);
+        break;
+    case nvinfer1::DataType::kFLOAT: invokeFillBatch<float>(buffer, slotIndices, slotStride, values, stream); break;
+    default: TLLM_THROW("data type not supported");
+    }
+}
 
 namespace
 {
@@ -266,7 +283,7 @@ void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream)
     case nvinfer1::DataType::kFLOAT: invokeReduce<float>(output, input, stream); break;
     case nvinfer1::DataType::kHALF: invokeReduce<half>(output, input, stream); break;
     case nvinfer1::DataType::kINT8: invokeReduce<int8_t>(output, input, stream); break;
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
@@ -925,7 +942,7 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, 
 #ifdef ENABLE_FP8
     case nvinfer1::DataType::kFP8: invokeScatterTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
 #endif // ENABLE_FP8
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
@@ -969,7 +986,7 @@ void splitTransposed(ITensor& output, ITensor const& input, SizeType32 split, Cu
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16: invokeSplitTransposed<__nv_bfloat16>(output, input, split, stream); break;
 #endif // ENABLE_BF16
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
@@ -1011,7 +1028,7 @@ void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, Cud
 #ifdef ENABLE_FP8
     case nvinfer1::DataType::kFP8: invokeTileTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
 #endif // ENABLE_FP8
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
@@ -1042,7 +1059,7 @@ void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& 
 #ifdef ENABLE_FP8
     case nvinfer1::DataType::kFP8: invokeTileTensorInPlace<__nv_fp8_e4m3>(tensor, beamWidth, stream); break;
 #endif // ENABLE_FP8
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
@@ -1117,10 +1134,12 @@ void gatherLastTokenLogits(ITensor& output, ITensor const& input, ITensor const&
         invokeGatherLastTokenLogits<__nv_fp8_e4m3>(output, input, lastTokenIds, stream);
         break;
 #endif // ENABLE_FP8
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 
+namespace
+{
 // In the following kernel, we launch a grid with (microBatchSize * beamWidth, outputLen) blocks of threads. Each thread
 // block copies a `vocabSizePadded` length logits tensor from the "inputLogits (microBatchSize, beamWidth,
 // vocabSizePadded)" to the "outputGenerationLogits (batchSize, beamWidth, outputLen, vocabSizePadded)"
@@ -1173,7 +1192,7 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
 
     for (int i = 0; i < fragmentsVectorSize; i++)
     {
-        cachePointerHostPtr[i] = static_cast<T*>(fragmentsVector.at(i)->data());
+        cachePointerHostPtr[i] = bufferCast<T>(*fragmentsVector.at(i));
     }
     bufferManager.copy(cachePointerHost, cachePointerDevice);
 
@@ -1186,14 +1205,16 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
 
     TLLM_CHECK_WITH_INFO(outputLen >= fragmentsVectorSize, "Fragments size does not match outputLen size");
 
-    mergeLogitsFragmentsKernel<T><<<gridSize, blockSize, 0, stream.get()>>>(static_cast<T*>(output.data()),
-        static_cast<T**>(cachePointerDevice.data()), outputLen, firstBatchSlotIdx, microBatchSize, beamWidth,
-        vocabSizePadded, stepOffset);
+    mergeLogitsFragmentsKernel<T><<<gridSize, blockSize, 0, stream.get()>>>(bufferCast<T>(output),
+        bufferCast<T*>(cachePointerDevice), outputLen, firstBatchSlotIdx, microBatchSize, beamWidth, vocabSizePadded,
+        stepOffset);
 }
+} // namespace
 
-void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, std::vector<TensorPtr> fragmentsVector,
-    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType32 firstBatchSlotIdx,
-    SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream, int stepOffset)
+void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
+    std::vector<TensorPtr> const& fragmentsVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
+    SizeType32 firstBatchSlotIdx, SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream,
+    int stepOffset)
 {
     switch (output.getDataType())
     {
@@ -1217,7 +1238,7 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, s
             cachePointerHost, firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
         break;
 #endif // ENABLE_FP8
-    default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
+    default: TLLM_THROW("data type not supported");
     }
 }
 

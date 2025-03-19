@@ -73,7 +73,7 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: List[str] = list(),
          extra_make_targets: str = "",
-         trt_root: str = None,
+         trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -251,10 +251,14 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
-        copy(
-            build_dir /
-            "tensorrt_llm/batch_manager/libtensorrt_llm_ucx_wrapper.so",
-            lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
+        ):
+            copy(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
+                lib_dir / "libtensorrt_llm_ucx_wrapper.so")
         copy(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -406,6 +410,7 @@ def add_arguments(parser: ArgumentParser):
         nargs="+",
         default=[])
     parser.add_argument("--trt_root",
+                        default="/usr/local/tensorrt",
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")

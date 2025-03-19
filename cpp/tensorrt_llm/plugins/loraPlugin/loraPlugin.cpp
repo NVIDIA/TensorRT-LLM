@@ -19,10 +19,7 @@
 
 #include "pluginUtils.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
 
-#include <algorithm>
 #include <vector>
 
 using namespace nvinfer1;
@@ -261,7 +258,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         {
             // loraWeightModulePtrs has 3 pointers for each module: A,B, and an optional DoRA magnitude
             // the current LoRA plugin does not apply DoRA scaling, so the magnitude is ignored
-            RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
+            RequestType const reqType = static_cast<RequestType>(reqTypes[reqId]);
             if (reqType == RequestType::kGENERATION)
             {
                 mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
@@ -341,7 +338,7 @@ int LoraPlugin::initialize() noexcept
 
     mLoraImpl->setGemmConfig();
 
-    mPluginProfiler->profileTactics(mLoraImpl->mCublasWrapper, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(mLoraImpl->getCublasWrapper(), mType, mDims, mGemmId);
     return 0;
 }
 
@@ -388,11 +385,11 @@ LoraPluginCreator::LoraPluginCreator()
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("num_lora_modules", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("weight_index", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("num_lora_modules", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("weight_index", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

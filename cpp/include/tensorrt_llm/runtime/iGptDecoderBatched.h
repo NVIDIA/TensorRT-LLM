@@ -23,8 +23,6 @@
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
-#include "tensorrt_llm/runtime/request.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 #include <memory>
 #include <utility>
@@ -66,13 +64,15 @@ public:
 
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
+    TensorPtr
+        batchSlots; // [maxTokensPerEngineStep, batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
+    TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
 
     // parameters for beam search
     TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
                                 // within one beam for beam search, on gpu
     std::vector<std::vector<TensorPtr>>
         predictedDraftLogits;   // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
-    TensorPtr seqSlots;         // [batchSize]
 
     // explicit draft tokens data.
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
@@ -101,7 +101,7 @@ public:
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
-class IGptDecoderBatched : public virtual IStatefulGptDecoder
+class IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
@@ -109,6 +109,13 @@ public:
     using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = std::shared_ptr<ITensor>;
     using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
+
+    //! @brief Setup the decoder before calling `forward()`
+    virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig)
+        = 0;
 
     //! @brief Setup buffers for ExplicitDraftTokens decoding.
     virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
@@ -120,24 +127,15 @@ public:
     virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
 
     //! @brief Disable Lookahead decoding.
-    virtual void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests) = 0;
+    virtual void disableLookahead(
+        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots)
+        = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
-    //! @brief Call decoder forwardSync and wait for the call to `forwardAsync` associated with a token to complete.
-    virtual void forwardSync(decoder_batch::DecoderFinishedEvent const& token, decoder_batch::Output& output,
-        decoder_batch::Input const& input)
-        = 0;
-
-    //! @brief Wait for the call to `forwardAsync` associated with a token to complete.
-    virtual void forwardSync(decoder_batch::DecoderFinishedEvent const& token) = 0;
-
     //! @brief Run one step for all requests and wait for completion on the host.
-    virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input)
-    {
-        forwardSync(*forwardAsync(output, input));
-    }
+    virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
     //! @param batchIdx index of the batch
     //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
@@ -148,14 +146,18 @@ public:
     //! GptDecoderBatched It contains gathered token ids without padding, on gpu
     [[nodiscard]] virtual TensorPtr getGatheredIds(SizeType32 batchIdx) const = 0;
 
+    //! @brief Get maxTokensPerStep tokens generated in the last forward pass
+    //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
+    [[nodiscard]] virtual TensorPtr getAllNewTokens() const = 0;
+
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
     [[nodiscard]] virtual CudaEvent finalize(
         SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const
         = 0;
 
-    //! @returns [batchSize (actual)], marks finished requests (per batch)
-    [[nodiscard]] virtual std::vector<bool> getFinished() const = 0;
+    //! @returns [batchSize], number of finished sequences per request, on gpu
+    [[nodiscard]] virtual TensorPtr getFinishedSum() const = 0;
 
     //! @returns [batchSize, beamWidth], FinishedState value, on gpu
     [[nodiscard]] virtual TensorPtr getFinishReasons() const = 0;
@@ -173,8 +175,6 @@ public:
     [[nodiscard]] virtual TensorPtr getLogProbs(SizeType32 batchIdx) const = 0;
 
     [[nodiscard]] virtual TensorPtr getParentIds() const = 0;
-
-    [[nodiscard]] virtual std::vector<SizeType32> getNbSteps() const = 0;
 
     [[nodiscard]] virtual executor::DecodingMode getDecodingMode() const = 0;
 
@@ -195,6 +195,7 @@ public:
 
 protected:
     IGptDecoderBatched() = default;
+    virtual ~IGptDecoderBatched() = default;
 };
 
 } // namespace tensorrt_llm::runtime

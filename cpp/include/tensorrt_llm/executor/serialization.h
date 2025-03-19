@@ -97,7 +97,9 @@ public:
 
     // DataTransceiverState
     [[nodiscard]] static DataTransceiverState deserializeDataTransceiverState(std::istream& is);
+    [[nodiscard]] static DataTransceiverState deserializeDataTransceiverState(std::vector<char>& buffer);
     static void serialize(DataTransceiverState const& dataTransceiverState, std::ostream& os);
+    static std::vector<char> serialize(DataTransceiverState const& dataTransceiverState);
     [[nodiscard]] static size_t serializedSize(DataTransceiverState const& dataTransceiverState);
 
     // ContextPhaseParams

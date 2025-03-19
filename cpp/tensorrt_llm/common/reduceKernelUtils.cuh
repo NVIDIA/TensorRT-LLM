@@ -84,6 +84,7 @@ static float constexpr HALF_FLT_MAX = 65504.F;
 template <typename T>
 __inline__ __device__ T warpReduceSum(T val)
 {
+
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
         val = add<T>(val, __shfl_xor_sync(FINAL_MASK, val, mask, 32)); //__shfl_sync bf16 return float when sm < 80
@@ -116,6 +117,7 @@ __inline__ __device__ T blockReduceSum(T val)
 template <typename T>
 __inline__ __device__ T warpReduceMax(T val)
 {
+
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
         val = max(val, __shfl_xor_sync(FINAL_MASK, val, mask, 32));
@@ -168,6 +170,30 @@ __inline__ __device__ T blockAllReduceMax(T val)
     return val;
 }
 
+template <typename T, int SZ>
+__inline__ __device__ typename PackType<T, SZ>::type batchWarpReduceSum(typename PackType<T, SZ>::type val)
+{
+    using Packed = typename PackType<T, SZ>::type;
+
+    using type
+        = std::conditional_t<sizeof(Packed) == 4, uint32_t, std::conditional_t<sizeof(Packed) == 8, uint64_t, void>>;
+    static_assert(sizeof(Packed) == sizeof(type));
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+    {
+        //__shfl_sync bf16 return float when sm < 80
+        Packed remote;
+        *reinterpret_cast<type*>(remote.array)
+            = __shfl_xor_sync(FINAL_MASK, *reinterpret_cast<type*>(val.array), mask, 32);
+#pragma unroll SZ
+        for (int i = 0; i < SZ; i++)
+        {
+            val.array[i] = add(val.array[i], remote.array[i]);
+        }
+    }
+    return val;
+}
+
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val)
 {
@@ -214,6 +240,7 @@ __inline__ __device__ T blockReduceSumV2(T* val)
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceMaxV2(T* val)
 {
+
 #pragma unroll
     for (int i = 0; i < NUM; i++)
     {

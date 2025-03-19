@@ -3,6 +3,7 @@ import unittest
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import pynvml
 import pytest
 import tensorrt as trt
 import torch
@@ -96,6 +97,9 @@ skip_pre_hopper_unittest = unittest.skipIf(
 skip_pre_blackwell_unittest = unittest.skipIf(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
+skip_non_ada_unittest = unittest.skipIf(
+    getSMVersion() != 89,
+    reason="This test is only supported in Ada architecture")
 skip_non_hopper_unittest = unittest.skipIf(
     getSMVersion() != 90,
     reason="This test is only supported in Hopper architecture")
@@ -188,6 +192,33 @@ def modelopt_installed():
 
 skip_no_modelopt = unittest.skipIf(not modelopt_installed(),
                                    reason="Modelopt is not installed")
+
+
+def check_nvlink():
+    "check nvlink is active"
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count > 0:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            try:
+                link_state = pynvml.nvmlDeviceGetNvLinkState(handle, 0)
+                print(f"Link state is {link_state}")
+
+            except pynvml.NVMLError as error:
+                print(
+                    f"Device does not seem to support NVLink or there's an issue: {error}"
+                )
+        pynvml.nvmlShutdown()
+        return True
+
+    except pynvml.NVMLError as error:
+        print(f"Error initializing NVML or other NVML error: {error}")
+        return False
+
+
+skip_nvlink_inactive = unittest.skipIf(not check_nvlink(),
+                                       reason="nvlink is inactive.")
 
 
 # This function names will make all unit tests names to show the values of all parameters in @parameterized.expand

@@ -56,7 +56,7 @@ The Draft-Target-Model involves the use of two distinct models trained independe
 
 There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
 
-The management of Draft and Target models is facilitated through two separate `GptManager` instances.
+The management of Draft and Target models is facilitated through two separate `Executor` instances.
 It is essential that you to coordinate the interactions between the Draft and Target models effectively.
 Initially, the Draft model is queried to generate up to `K` draft tokens.
 These tokens are then forwarded to the Target model for verification.

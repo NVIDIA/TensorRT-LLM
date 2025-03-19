@@ -16,7 +16,6 @@
  */
 #include "gemmAllReducePlugin.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/allreduce_gemm/allreduce_gemm_runner.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
@@ -79,6 +78,8 @@ void GemmAllReducePluginProfiler::runTactic(int m, int n, int k, GemmAllReduceIm
     char* inputA = workspace;
     char* inputB = inputA + m * k * dtype_size;
     char* outputD = inputB + n * k * dtype_size;
+    char* inputSFA = outputD + m * n * dtype_size;
+    char* inputSFB = inputSFA + m * k * dtype_size;
     std::set<int> tpGroup = {0};
 
     // Run on single-GPU
@@ -87,6 +88,8 @@ void GemmAllReducePluginProfiler::runTactic(int m, int n, int k, GemmAllReduceIm
         .argA((void*) inputA)
         .argB((void*) inputB)
         .argD((void*) outputD, /*output_mc=*/nullptr)
+        .argAScale((void*) inputSFA)
+        .argBScale((void*) inputSFB)
         .argRanks(0, tpGroup)
         .argAlpha(1.f)
         .argBeta(0.f) // no bias
@@ -110,6 +113,9 @@ void GemmAllReducePluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k
     // No C
     // Note that D is typically IPC, however, when tuning GEMM we need it to run on single GPU
     bytes += maxM * n * dtype_size; // D
+    // scale tensors for A & B - will at most be same size as A/B
+    bytes += maxM * k * dtype_size; // A
+    bytes += n * k * dtype_size;    // B
 
     setTmpWorkspaceSizeInBytes(bytes);
 }

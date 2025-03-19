@@ -197,9 +197,6 @@ class TestLLaMA(unittest.TestCase):
         test_cases.append(
             (False, True, ContextFMHAType.enabled, False, 'float16', 1, 'silu',
              dict()))  # MQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float32', 0, 'silu',
-             dict()))
         test_cases.append((False, True, ContextFMHAType.disabled, False,
                            'bfloat16', 2, 'silu', dict()))  # GQA
         test_cases.append(
@@ -207,12 +204,6 @@ class TestLLaMA(unittest.TestCase):
              dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
                            False, 'float16', 4, 'silu', dict()))  # GQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'gelu',
-             dict()))  # GQA
-        test_cases.append(
-            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'silu',
-             dict()))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)

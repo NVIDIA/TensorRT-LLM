@@ -34,10 +34,12 @@ public:
     explicit KVCacheTransferManager(tr::BufferManager const& bufferManager);
 
     //! \brief Onboard a block to gpu memory.
-    void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools);
+    void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
+        int numTokensToCopy = 0);
 
     //! \brief Offload a block to cpu memory.
-    void offload(BlockPtr const& block, BlockPtr const& offloadBlock, std::vector<KVCacheBlockPool> const& pools);
+    void offload(BlockPtr const& block, BlockPtr const& offloadBlock, std::vector<KVCacheBlockPool> const& pools,
+        int numTokensToCopy = 0);
 
     //! \brief Synchronize the offload/onboard streams with the bufferManager stream.
     void syncTransfers();
@@ -48,8 +50,8 @@ private:
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
 
     //! \brief Copy content of src block to dst.
-    void copyBlock(
-        BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload);
+    void copyBlock(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload,
+        int numTokensToCopy = 0);
 
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;

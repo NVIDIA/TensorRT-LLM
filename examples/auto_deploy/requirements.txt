@@ -1,0 +1,2 @@
+ai-edge-model-explorer>=0.1.14
+lm_eval[api]==0.4.5

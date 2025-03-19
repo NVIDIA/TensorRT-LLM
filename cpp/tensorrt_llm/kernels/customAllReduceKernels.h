@@ -28,7 +28,7 @@ namespace tensorrt_llm::kernels
 
 constexpr size_t WARP_SIZE = 32;
 constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
-constexpr size_t MAX_RANKS_PER_NODE = 8;
+constexpr size_t MAX_RANKS_PER_NODE = 16;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
 namespace reduce_fusion::details

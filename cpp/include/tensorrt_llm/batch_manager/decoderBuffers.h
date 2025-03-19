@@ -16,24 +16,40 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <optional>
 #include <vector>
 
-namespace tensorrt_llm::runtime
-{
-class TllmRuntime;
-} // namespace tensorrt_llm::runtime
-
 namespace tensorrt_llm::batch_manager
 {
+
+class DecoderInputBuffers
+{
+public:
+    using SizeType32 = runtime::SizeType32;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+    explicit DecoderInputBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep, runtime::BufferManager const& manager);
+
+    // buffers for setup
+    TensorPtr setupBatchSlots;
+    TensorPtr inputsIds;
+
+    // buffers for forward
+    TensorPtr forwardBatchSlotsRequestOrder;
+    TensorPtr forwardBatchSlotsRequestOrderDevice;
+    TensorPtr fillValues;
+    TensorPtr fillValuesDevice;
+    TensorPtr forwardBatchSlots;
+};
 
 class DecoderStepAsyncSend
 {
@@ -96,15 +112,15 @@ public:
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
     TensorPtr sequenceLengths;     // [mMaxNumRequests]
-    TensorPtr sequenceLengthsHost; // [mMaxNumRequests] pinned host tensor
-    TensorPtr finished;            // [mMaxNumRequests] pinned host tensor
+    TensorPtr sequenceLengthsHost; // [mMaxNumRequests], pinned host tensor
     TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbs;         // [mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbs;            // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
-    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth]
+    TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
+    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
 
     class DraftBuffers
     {
@@ -120,7 +136,7 @@ public:
         std::vector<std::vector<runtime::ITensor::SharedPtr>>
             predictedDraftLogits;               // [mMaxNumRequests][mMaxNumHeads][maxDraftTokens + 1, vocabSize]
 
-        void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::TllmRuntime const& runtime,
+        void create(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
             runtime::ModelConfig const& modelConfig);
     };
 
@@ -130,7 +146,7 @@ public:
     std::optional<runtime::LookaheadDecodingBuffers> lookaheadBuffers;
 
     DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::TllmRuntime const& runtime,
+        SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
     std::unique_ptr<DecoderStepAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
@@ -161,7 +177,7 @@ public:
     TensorPtr logProbsHost;        // [beamWidth, maxSeqLen]
     TensorPtr finishReasonsHost;   // [beamWidth]
 
-    SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, runtime::TllmRuntime const& runtime);
+    SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, runtime::BufferManager const& manager);
 
     static std::unique_ptr<DecoderSlotAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
         TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,

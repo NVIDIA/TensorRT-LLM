@@ -79,7 +79,8 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
         if (tid < k && endIds != nullptr) // if returnAllSelectedToken, endIds would not be an input
         {
             auto const index = tmpTopKBufIndex + tid;
-            if (blockLane == 0 && tid == 0)
+            // endId=-1 means generation doesn't stop upon encountering a certain token.
+            if (blockLane == 0 && tid == 0 && endIds[batchSlot] > -1)
             {
                 auto const endId = endIds[batchSlot];
                 topKTmpIdBuf[index] = tmpLogBufIndex + endId;

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include "checkMacrosPlugin.h"
 #include <cstdint>

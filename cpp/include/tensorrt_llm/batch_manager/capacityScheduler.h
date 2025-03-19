@@ -165,9 +165,10 @@ public:
      * @param peftCacheManager Optional used in MaxUtilizationScheduler, GuaranteedNoEvictScheduler and
      * StaticBatchScheduler.
      * @param activeRequests
-     * @return std::tuple<RequestVector, RequestVector>, fittingRequests and pausedRequests respectively.
+     * @return std::tuple<RequestVector, RequestVector, RequestVector>, fittingRequests, fittingDisaggInitRequests and
+     * pausedRequests respectively.
      */
-    [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(RequestList const& activeRequests,
+    [[nodiscard]] std::tuple<RequestVector, RequestVector, RequestVector> operator()(RequestList const& activeRequests,
         OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;

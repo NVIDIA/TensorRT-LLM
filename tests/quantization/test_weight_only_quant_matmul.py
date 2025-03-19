@@ -124,8 +124,12 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         [
             (1, 1024, 4096, 1, True),
             (1, 1024, 4096, 1, False),
+            (4, 1024, 512, 1, True),
+            (8, 1024, 512, 1, True),
             (128, 6144, 12288, 1, True),  # FP16 * INT8
             (1, 1024, 4096, 2, True),
+            (8, 1024, 512, 2, True),
+            (16, 1024, 256, 2, True),
             (128, 6144, 12288, 2, True),  # FP16 * INT4
         ],
         name_func=unittest_name_func)
@@ -136,8 +140,10 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
         [
             (1, 1024, 4096, 1, True),
             (1, 1024, 4096, 1, False),
+            (12, 1024, 512, 1, True),
             (64, 6144, 12288, 1, True),  # BF16 * INT8
             (1, 1024, 4096, 2, True),
+            (32, 1024, 256, 2, True),
             (256, 6144, 12288, 2, True),  # BF16 * INT4
         ],
         name_func=unittest_name_func)

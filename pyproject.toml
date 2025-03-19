@@ -10,7 +10,128 @@ build-backend = "setuptools.build_meta"
 ####################################################################################################
 [tool.isort]
 line_length = 80
+extend_skip_glob = ["**/auto_deploy/**"]
 
 [tool.yapf]
 based_on_style = "pep8"
 column_limit = 80
+
+[tool.yapfignore]
+ignore_patterns = ["**/auto_deploy/**"]
+
+[tool.codespell]
+skip = ".git,3rdparty,tests/llm-test-defs/turtle/test_input_files**,**.jsonl,**.json"
+exclude-file = "examples/whisper/tokenizer.py"
+ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw"
+
+[tool.autoflake]
+in-place = true
+remove_all_unused_imports = true
+remove_unused_variables = true
+exclude = ["**/auto_deploy/**"]
+
+
+####################################################################################################
+#########################  AUTO DEPLOY LINTING AND TESTING CONFIGURATION  ##########################
+####################################################################################################
+[tool.ruff]
+line-length = 100 # Line length limit for code
+fix = true
+include = [
+    # all pyproject.toml files
+    "**/pyproject.toml",
+    # standard include of ruff restricted to auto_deploy folders
+    "**/auto_deploy/**/*.py",
+    "**/auto_deploy/**/*.pyi",
+    "**/auto_deploy/**/*.ipynb",
+]
+
+
+[tool.ruff.format]
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+docstring-code-format = true
+# Set the line length limit used when formatting code snippets in docstrings.
+docstring-code-line-length = "dynamic"
+
+
+[tool.ruff.lint]
+# See available rules at https://docs.astral.sh/ruff/rules/
+# Flake8 is equivalent to pycodestyle + pyflakes + mccabe.
+select = [
+    "D", # pydocstyle --> enforcing correct docstrings for existing docstrings
+    "E", # pycodestyle errors
+    "F", # pyflakes
+    "I", # isort
+    # "N",   # pep8 naming # no naming convention enforced for now the reduce the burden
+    "PLE", # pylint errors
+    "W",   # pycodestyle warnings
+]
+extend-ignore = [
+    # we don't enforce writing docstrings for public code to reduce the burden
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D417",
+]
+
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]
+"tests/_torch/auto_deploy/*" = ["D", "E402"]
+"*/_[a-zA-Z]*" = ["D"]                       # Private packages (_abc/*.py) or modules (_xyz.py)
+
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120 # Line length limit for comments and docstrings
+
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
+[tool.ruff.lint.isort]
+known-first-party = ["tensorrt_llm"]
+split-on-trailing-comma = false
+
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+
+[tool.mypy]
+files = ["**/auto_deploy/**"]
+install_types = true
+non_interactive = true
+show_error_codes = true
+disable_error_code = [
+    "import",
+    "assignment",
+    "operator",
+    "has-type",
+    "var-annotated",
+    "operator",
+    "call-arg",
+]
+explicit_package_bases = true
+namespace_packages = true
+# strict checks
+strict = true
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+disallow_any_generics = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
+disallow_untyped_defs = false
+warn_return_any = false
+exclude = []
+
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true

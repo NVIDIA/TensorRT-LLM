@@ -197,6 +197,8 @@ void GemmPlugin::init()
     mPluginProfiler->setPadLd(mPadLda, mPadLdb, mPadLdc);
 
     mGemmId = GemmIdCublas(mDims.n, mDims.k, mType, mTransA, mTransB, mOutputType);
+
+    mArch = tensorrt_llm::common::getSMVersion();
 }
 
 void GemmPlugin::setGemmConfig()
@@ -388,7 +390,7 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
 
     bool cudaKernelFinished = false;
     // TODO: sub tensor matmul is not supported in fp8 gemm cuda kernel
-    if (M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
+    if (mArch < 90 && M <= 4 && N <= 128000 && mUseFp8 && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode = tensorrt_llm::common::QuantMode::fromQuantAlgo("FP8");
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
@@ -396,7 +398,8 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
             nvinfer1::DataType::kFP8, mOutputType);
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
-    else if (M <= 6 && N <= 128000 && !mUseFp8 && noPadDim && cudaKernelSupportType)
+    else if (((mArch < 90 && M <= 6) || (mArch >= 90 && M <= 2)) && N <= 128000 && !mUseFp8 && noPadDim
+        && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode;
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
@@ -491,13 +494,13 @@ GemmPluginCreator::GemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLda", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLdb", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("padLdc", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("transA", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("transB", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLda", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLdb", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("padLdc", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("use_fp8", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
