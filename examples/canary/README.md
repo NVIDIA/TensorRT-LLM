@@ -29,7 +29,6 @@ The TensorRT-LLM Canary example code is located in [`examples/canary`](./).
 pip install -r requirements.txt
 
 INFERENCE_PRECISION=bfloat16
-WEIGHT_ONLY_PRECISION=int8
 MAX_BEAM_WIDTH=4
 MAX_BATCH_SIZE=8
 engine_dir="engine"
