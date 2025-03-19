@@ -30,6 +30,8 @@ def _clean_files(src_dir: PathLike, extend_files: str) -> None:
 
     for file in files_to_remove:
         file_path = src_dir / file
+        if not file_path.exists():
+            continue
         if file_path.is_dir():
             shutil.rmtree(file_path)
             logging.debug(f"Removed directory: {file_path}")
