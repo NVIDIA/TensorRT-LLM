@@ -16,8 +16,6 @@
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
 name: L0-Test
 on:
-  issue_comment:
-    types: [created]
   workflow_dispatch:
       inputs:
           sha:
@@ -30,48 +28,6 @@ on:
             description: 'test results url'
             required: true
 jobs:
-  Authorization:
-    runs-on: ubuntu-latest
-    name: Authorization
-    if: startsWith( github.event.comment.body, '/bot' )
-    steps:
-      - name: Check Team Membership
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.CI_TEAM_TOKEN }}
-          script: |
-            try {
-              const { data: membership } = await github.rest.teams.getMembershipForUserInOrg({
-                org: context.repo.owner,
-                team_slug: 'trt-llm-ci-approvers',
-                username: context.actor,
-              });
-              if (membership.state != 'active') {
-                core.setFailed('only member in [trt-llm-ci-approvers] can run', membership)
-              }
-            } catch (error) {
-              console.log('check membership failed:', error);
-              core.setFailed('only member in [trt-llm-ci-approvers] can run')
-            }
-
-  Job-trigger:
-    name: Start ci job
-    needs: [Authorization]
-    runs-on: [self-hosted, Linux, Jenkins]
-    steps:
-      - name: Start ci job
-        run: |
-          CI_SERVER="${{ secrets.CI_SERVER }}"
-          JENKINS_URL=$(echo "$CI_SERVER" | cut -d '@' -f 1)
-          TOKEN=$(echo "$CI_SERVER" | cut -d '@' -f 2)
-
-          echo '${{ toJson(github.event) }}' > githubData.json
-
-          curl -s --fail-with-body -X POST \
-            -H "Content-Type: application/json" \
-            -d @githubData.json \
-            "$JENKINS_URL/generic-webhook-trigger/invoke?token=$TOKEN"
-
   Upload-Test:
     name: Upload test results
     runs-on: linux-amd64-cpu4
@@ -83,7 +39,7 @@ jobs:
           script: |
             state = 'pending'
             description = 'collecting test results'
-            if ('${{ github.event.inputs.test_result }}' == 'SUCCESS') {
+            if ('${{ github.event.inputs.test_result }}' == 'success') {
               state = 'success'
               description = 'test passed, collecting test results'
             }
