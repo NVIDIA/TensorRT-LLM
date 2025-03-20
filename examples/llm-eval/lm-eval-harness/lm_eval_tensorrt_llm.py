@@ -33,8 +33,10 @@ from tqdm import tqdm
 
 import tensorrt_llm
 from tensorrt_llm._torch import LLM as TORCH_LLM
+from tensorrt_llm._torch.auto_deploy.shim.interface import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import DecodingConfig
+from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 from tensorrt_llm.llmapi import RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm import LLM as TRT_LLM
@@ -88,7 +90,7 @@ class TRTLLMEvalBase(TemplateLM):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        if self.backend == 'torch':
+        if self.backend in ['torch', 'autodeploy']:
             kwargs.pop('batch_size')
             if tp < 1:
                 tp = torch.cuda.device_count()
@@ -97,10 +99,17 @@ class TRTLLMEvalBase(TemplateLM):
                 "use_cuda_graph": use_cuda_graph,
                 "print_iter_log": False,
             }
-            if hasattr(PyTorchConfig, "moe_backend"):
-                pytorch_config_params["moe_backend"] = self.moe_backend
-                print(f"Info: moe_backend is set to {self.moe_backend}")
-            pytorch_config = PyTorchConfig(**pytorch_config_params)
+            if self.backend == 'torch':
+                if hasattr(PyTorchConfig, "moe_backend"):
+                    pytorch_config_params["moe_backend"] = self.moe_backend
+                    print(f"Info: moe_backend is set to {self.moe_backend}")
+                pytorch_config = PyTorchConfig(**pytorch_config_params)
+            elif self.backend == 'autodeploy':
+                assert self.max_context_length is not None, "max_context_length must be specified for autodeploy backend"
+                pytorch_config_params["attn_backend"] = "FlashInfer"
+                pytorch_config = AutoDeployConfig(**pytorch_config_params)
+                kwargs["build_config"] = BuildConfig(
+                    max_seq_len=self.max_context_length + self.max_gen_toks)
 
             # stop words not currently supported by torch backend
             self.use_stop_words = False
@@ -141,7 +150,6 @@ class TRTLLMEvalBase(TemplateLM):
                                tokenizer=self.tokenizer,
                                kv_cache_config=trt_kv_cache_config,
                                **kwargs)
-            self.max_length = build_config['max_seq_len'] - 1
             logger.info("Loaded TRT-LLM engine")
 
     @property
