@@ -3,11 +3,8 @@
 import os
 import subprocess
 import sys
-import time
 from typing import List
 
-import openai
-import requests
 
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 
