@@ -9,7 +9,7 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 
 
 # The recommended way to create a customized logits processor:
-#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Subclass LogitsProcessor and implement the processing logics in the __call__ method.
 #     * Create an instance and pass to SamplingParams.
 # Alternatively, you can create any callable with the same signature with the __call__ method.
 # This simple callback will output a specific token at each step irrespective of prompt.
@@ -32,7 +32,7 @@ class MyLogitsProcessor(LogitsProcessor):
 
 
 # The recommended way to create a customized batched logits processor:
-#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Subclass BatchedLogitsProcessor and implement the processing logics in the __call__ method.
 #     * Create an instance and pass to LLM.
 # Alternatively, you can create any callable with the same signature with the __call__ method.
 # A batched logits processor's arguments for all requests in a batch are made available as lists.
