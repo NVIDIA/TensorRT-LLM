@@ -1033,6 +1033,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 4, 4],
         "DGX_H100-4_GPUs-3": ["dgx-h100-x4", "l0_dgx_h100", 3, 4, 4],
         "DGX_H100-4_GPUs-4": ["dgx-h100-x4", "l0_dgx_h100", 4, 4, 4],
+        "A10-1": ["a10", "l0_a10", 1, 8],
+        "A10-2": ["a10", "l0_a10", 2, 8],
+        "DGX_H100-4_GPUs-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
     ]
 
     parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1), {
