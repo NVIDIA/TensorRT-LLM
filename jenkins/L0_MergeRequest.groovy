@@ -352,10 +352,10 @@ def launchReleaseCheck(pipeline)
         // Remove perf test from test list since they are dynamical generated
         sh """
             touch ${testList}
-            rm ${LLM_ROOT}/tests/integration/test_lists/test-db/*perf*
-            trt-test-db -d $testDBPath --context * --test-names --output $testList
+            rm ${testDBPath}/*perf*
+            trt-test-db -d ${testDBPath} --test-names --output ${testList}
             cd ${LLM_ROOT}/tests/integration/defs
-            pytest --apply-test-list-correction --test-list=$testList --co -q
+            pytest --apply-test-list-correction --test-list=${testList} --co -q
         """
         // Step 5: verify QA test lists
         def testQAPath = "${LLM_ROOT}/tests/integration/test_lists/qa"
