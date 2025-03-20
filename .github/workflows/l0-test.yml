@@ -32,6 +32,7 @@ on:
 jobs:
   Job-trigger:
     name: Start ci job
+    if: startsWith( github.event.comment.body, '/bot' )
     runs-on: [self-hosted, Linux, Jenkins]
     steps:
       - name: Start ci job
