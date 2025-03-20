@@ -3,11 +3,7 @@
 import os
 import subprocess
 import sys
-import time
 from typing import List
-
-import openai
-import requests
 
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 
@@ -35,54 +31,3 @@ class RemoteOpenAIServer:
                                      stderr=sys.stderr)
         self._wait_for_server(url=self.url_for("health"),
                               timeout=self.MAX_SERVER_START_WAIT_S)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired as e:
-            self.proc.kill()
-            self.proc.wait(timeout=30)
-
-    def _wait_for_server(self, *, url: str, timeout: float):
-        # run health check on the first rank only.
-        start = time.time()
-        while True:
-            try:
-                if self.rank == 0:
-                    if requests.get(url).status_code == 200:
-                        break
-                else:
-                    time.sleep(timeout)
-                    break
-            except Exception as err:
-                result = self.proc.poll()
-                if result is not None and result != 0:
-                    raise RuntimeError("Server exited unexpectedly.") from err
-
-                time.sleep(0.5)
-                if time.time() - start > timeout:
-                    raise RuntimeError(
-                        "Server failed to start in time.") from err
-
-    @property
-    def url_root(self) -> str:
-        return f"http://{self.host}:{self.port}"
-
-    def url_for(self, *parts: str) -> str:
-        return self.url_root + "/" + "/".join(parts)
-
-    def get_client(self):
-        return openai.OpenAI(
-            base_url=self.url_for("v1"),
-            api_key=self.DUMMY_API_KEY,
-        )
-
-    def get_async_client(self):
-        return openai.AsyncOpenAI(
-            base_url=self.url_for("v1"),
-            api_key=self.DUMMY_API_KEY,
-        )
