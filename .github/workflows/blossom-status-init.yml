@@ -1,0 +1,23 @@
+name: Blossom-Status-Init
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  Init-Status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update commit status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              context: 'blossom-ci',
+              sha: context.event.pull_request.head.sha,
+              state: 'pending',
+              description: 'need CI pass',
+            })
+
+
