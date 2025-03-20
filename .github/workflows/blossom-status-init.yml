@@ -15,7 +15,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               context: 'blossom-ci',
-              sha: context.event.pull_request.head.sha,
+              sha: '${{ github.event.pull_request.head.sha }}',
               state: 'pending',
               description: 'need CI pass',
             })
