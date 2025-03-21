@@ -38,7 +38,7 @@ pyzmq
 fastapi==0.115.4
 uvicorn
 httpx
-setuptools
+setuptools<0.77.1
 ordered-set
 peft
 einops
