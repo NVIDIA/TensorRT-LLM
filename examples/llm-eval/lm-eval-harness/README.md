@@ -22,30 +22,33 @@ python lm_eval_tensorrt_llm.py --model trt-llm \
 
 In the LM-Eval-Harness, model args are submitted as a comma-separated list of the form `arg=value`. The `trt-llm` model supports the following `model_args`:
 
-| Name                     | Description                                                       | Default Value  |
-|--------------------------|-------------------------------------------------------------------|----------------|
-| tokenizer                | directory containing the HF tokenizer.                            |                |
-| model                    | directory containing the TRTLLM engine or torch model.            |                |
-| max_gen_toks             | max number of tokens to generate (if not specified in gen_kwargs) | 256            |
-| chunk_size               | number of async requests to send at once to the engine            | 200            |
-| max_tokens_kv_cache      | max tokens in paged KV cache                                      | None           |
-| free_gpu_memory_fraction | KV cache free GPU memory fraction                                 | 0.9            |
-| trust_remote_code        | trust remote code; use if necessary to set up the tokenizer       | False          |
-| tp                       | tensor parallel size (for torch backend)                          | no. of workers |
-| use_cuda_graph           | enable CUDA graph                                                 | True           |
-| max_context_length       | maximum context length for evaluation                             | None           |
-| moe_expert_parallel_size | expert parallel size for MoE models                               | None           |
-| moe_backend              | backend for MoE models (e.g., "TRTLLM")                           | "TRTLLM"       |
+| Name                     | Description                                                        | Default Value  |
+|--------------------------|--------------------------------------------------------------------|----------------|
+| tokenizer                | directory containing the HF tokenizer.                             |                |
+| model                    | directory containing the TRTLLM engine or torch model.             |                |
+| max_gen_toks             | max number of tokens to generate (if not specified in gen_kwargs). | 256            |
+| chunk_size               | number of async requests to send at once to the engine.            | 200            |
+| max_tokens_kv_cache      | max tokens in paged KV cache.                                      | None           |
+| free_gpu_memory_fraction | KV cache free GPU memory fraction.                                 | 0.9            |
+| trust_remote_code        | trust remote code; use if necessary to set up the tokenizer.       | False          |
+| tp                       | tensor parallel size (for torch backend).                          | no. of workers |
+| use_cuda_graph           | enable CUDA graph.                                                 | True           |
+| max_context_length       | maximum context length for evaluation.                             | None           |
+| moe_expert_parallel_size | expert parallel size for MoE models.                               | None           |
+| attn_backend             | attention backend used in LLM API for pytorc.                      | "TRTLLM"       |
+| moe_backend              | backend for MoE models (e.g., "TRTLLM").                           | "TRTLLM"       |
+| tokenized_requests       | use tokenized requests for evaluation.                             | True           |
+| temperature              | Override the task specified generation temperature if provided.    | None           |
 
-### Torch backend
+### PyTorch or AutoDeploy backend
 
 Install the `lm_eval` package in the `requirements.txt` file in this folder.
 
-Run the evaluation script with the same command as above, but include `backend=torch` in the `model_args`. For example:
+Run the evaluation script with the same command as above, but include `backend=pytorch` or `backend=autodeploy` in the `model_args`. For example:
 
 ```sh
 python lm_eval_tensorrt_llm.py --model trt-llm \
-    --model_args model=<HF model folder>,backend=torch,chunk_size=<int> \
+    --model_args model=<HF model folder>,backend=pytorch,chunk_size=<int>,max_context_length=<int>,max_gen_toks=<int> \
     --tasks <comma separated tasks, e.g., gsm8k-cot, mmlu>
 ```
 
