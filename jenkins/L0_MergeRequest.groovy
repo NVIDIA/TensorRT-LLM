@@ -277,7 +277,7 @@ def createKubernetesPodConfig(image, type)
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.13.3-1
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
