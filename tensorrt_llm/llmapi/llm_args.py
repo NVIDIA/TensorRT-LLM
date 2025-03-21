@@ -22,6 +22,9 @@ from ..bindings.executor import (BatchingType, DecodingConfig, DecodingMode,
 from ..bindings.executor import KvCacheConfig as _KvCacheConfig
 from ..bindings.executor import \
     LookaheadDecodingConfig as _LookaheadDecodingConfig
+from ..bindings.executor import CapacitySchedulerPolicy as _CapacitySchedulerPolicy
+from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
+from ..bindings.executor import DynamicBatchConfig as _DynamicBatchConfig
 from ..bindings.executor import PeftCacheConfig, SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
@@ -274,12 +277,84 @@ class PybindMirror(ABC):
         return decorator
 
     @staticmethod
+    def get_pybind_enum_fields(pybind_class):
+        ''' Get all the enum fields from the pybind class. '''
+        return [
+            f for f in pybind_class.__members__.keys()
+            if not f.startswith('_') and not callable(getattr(pybind_class, f))
+        ]
+
+    @staticmethod
+    def mirror_pybind_enum(pybind_class):
+        ''' Mirror the enum fields from the pybind class to the Python class. '''
+        def decorator(cls):
+            assert issubclass(cls, Enum)
+            cpp_fields = PybindMirror.get_pybind_enum_fields(pybind_class)
+            python_fields = set(cls.__members__.keys())
+            
+            for field in cpp_fields:
+                if field not in python_fields:
+                    raise ValueError(
+                        f"Field {field} is not mirrored in Python class {cls.__name__} from C++ class {pybind_class.__name__}. Please update the class."
+                    )
+            return cls
+        return decorator
+
+    @staticmethod
     def get_pybind_variable_fields(config_cls):
         ''' Get all the variable fields from the pybind class. '''
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
         ]
+
+@PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
+class CapacitySchedulerPolicy(str, Enum, PybindMirror):
+    MAX_UTILIZATION = "MAX_UTILIZATION"
+    GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
+    STATIC_BATCH = "STATIC_BATCH"
+    
+    def _to_pybind(self):
+        return getattr(_CapacitySchedulerPolicy, self.value)
+
+@PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
+class ContextChunkingPolicy(str, Enum, PybindMirror):
+    ''' Context chunking policy. '''
+    FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
+    EQUAL_PROGRESS = "EQUAL_PROGRESS"
+    
+    def _to_pybind(self):
+        return getattr(_ContextChunkingPolicy, self.value)
+    
+@PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
+class DynamicBatchConfig(BaseModel, PybindMirror):
+    """Dynamic batch configuration.
+    
+    Controls how batch size and token limits are dynamically adjusted at runtime.
+    """
+    enable_batch_size_tuning: bool = Field(
+        default=False,
+        description="Controls if the batch size should be tuned dynamically")
+    
+    enable_max_num_tokens_tuning: bool = Field(
+        default=False,
+        description="Controls if the max num tokens should be tuned dynamically")
+    
+    dynamic_batch_moving_average_window: int = Field(
+        default=10,
+        description="The window size for moving average of input and output length which is used to calculate dynamic batch size and max num tokens")
+    
+    batch_size_table: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        description="A list of (batchSizeLimit, batchSize) pairs. When max capacity batch size is less than batchSizeLimit_{i} but greater or equal to batchSizeLimit_{i-1}, the batch size will be batchSize_{i}. For max capacity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512 based on the actual implementation.")
+    
+    def _to_pybind(self):
+        return _DynamicBatchConfig(
+            enable_batch_size_tuning=self.enable_batch_size_tuning,
+            enable_max_num_tokens_tuning=self.enable_max_num_tokens_tuning,
+            dynamic_batch_moving_average_window=self.dynamic_batch_moving_average_window,
+            batch_size_table=self.batch_size_table
+        )
 
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
