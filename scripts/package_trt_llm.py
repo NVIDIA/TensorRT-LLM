@@ -13,15 +13,10 @@ def _clean_files(src_dir: PathLike, extend_files: str) -> None:
     src_dir = Path(src_dir)
     files_to_remove = [
         ".devcontainer",
-        "CODEOWNERS",
         "docker/README.md",
         "examples/stable_diffusion",
         "github_docs",
         "jenkins",
-        "scripts/build_cpp_lib.sh",
-        "scripts/build_wheel_trt_automation.sh",
-        "scripts/build_wheel_trt_dev_container.sh",
-        "scripts/code_owners.py",
         "scripts/collect_unittests.py",
         "scripts/package_trt_llm.py",
         "scripts/git_replace.py",
