@@ -15,7 +15,7 @@
 # the License.
 #
 
-cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(CheckLanguage)
@@ -48,36 +48,6 @@ if(NVTX_DISABLE)
   message(STATUS "NVTX is disabled")
 else()
   message(STATUS "NVTX is enabled")
-endif()
-
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/batch_manager/CMakeLists.txt")
-  set(BUILD_BATCH_MANAGER_DEFAULT ON)
-else()
-  set(BUILD_BATCH_MANAGER_DEFAULT OFF)
-endif()
-
-option(BUILD_BATCH_MANAGER "Build batch manager from source"
-       ${BUILD_BATCH_MANAGER_DEFAULT})
-
-if(BUILD_BATCH_MANAGER)
-  message(STATUS "Building batch manager")
-else()
-  message(STATUS "Importing batch manager")
-endif()
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
-  set(BUILD_EXECUTOR_DEFAULT ON)
-else()
-  set(BUILD_EXECUTOR_DEFAULT OFF)
-endif()
-
-option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
-
-if(BUILD_EXECUTOR)
-  message(STATUS "Building executor")
-else()
-  message(STATUS "Importing executor")
 endif()
 
 if(EXISTS
