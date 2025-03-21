@@ -28,7 +28,7 @@ on:
             required: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  group: blossom-${{ github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
