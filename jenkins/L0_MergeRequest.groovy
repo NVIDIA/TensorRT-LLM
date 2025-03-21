@@ -1237,13 +1237,7 @@ pipeline {
                             }
                         }
                     } else {
-                        //launchStages(this, reuseBuild, testFilter, enableFailFast, disableIncrementalBuild, enablePublishLastKnownGood)
-                        stage("Release Check") {
-                            script {
-                                echo "Only run Release Check to keep the build status green"
-                                launchReleaseCheck(this)
-                            }
-                        }
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, disableIncrementalBuild, enablePublishLastKnownGood)
                     }
                 }
             }
