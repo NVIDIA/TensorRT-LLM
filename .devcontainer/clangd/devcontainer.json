@@ -48,7 +48,7 @@
             // "clang-format.executable": "/usr/local/bin/clang-format",
             "clangd.arguments": [
               // "--compile-commands-dir=${workspaceFolder}/cpp/build_RelWithDebInfo"
-              "--compile-commands-dir=${workspaceFolder}"
+              "--compile-commands-dir=${workspaceFolder}/cpp/build"
             ]
           }
         }
