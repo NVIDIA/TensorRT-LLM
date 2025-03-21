@@ -2,7 +2,7 @@
 
 TensorRT-LLM
 ===========================
-<h4> A TensorRT Toolbox for Optimized Large Language Model Inference</h4>
+<h4> A TensorRT Toolbox for Optimized LLM Inference</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-LLM/)
 [![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
