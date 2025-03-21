@@ -16,6 +16,8 @@
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
 name: L0-Test
 on:
+  issue_comment:
+    types: [created]
   workflow_dispatch:
       inputs:
           sha:
@@ -31,6 +33,23 @@ on:
             description: 'test results page url'
             required: false
 jobs:
+  Job-trigger:
+    name: Start ci job
+    if: startsWith( github.event.comment.body, '/bot' )
+    runs-on: [self-hosted, Linux, Jenkins]
+    steps:
+      - name: Start ci job
+        env:
+          githubData: ${{ toJSON(github.event) }}
+        run: |
+          CI_SERVER="${{ secrets.CI_SERVER }}"
+          JENKINS_URL=$(echo "$CI_SERVER" | cut -d '@' -f 1)
+          TOKEN=$(echo "$CI_SERVER" | cut -d '@' -f 2)
+          printf '%s' "$githubData" > githubData.json
+          curl -s -X POST --fail-with-body \
+            -H "Content-Type: application/json" \
+            -d @githubData.json \
+            "$JENKINS_URL/generic-webhook-trigger/invoke?token=$TOKEN"
   Upload-Test:
     name: Upload test results
     runs-on: linux-amd64-cpu4
