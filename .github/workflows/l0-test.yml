@@ -27,6 +27,9 @@ on:
           test_results_url:
             description: 'test results url'
             required: true
+          test_results_page_url:
+            description: 'test results page url'
+            required: false
 jobs:
   Upload-Test:
     name: Upload test results
@@ -52,6 +55,10 @@ jobs:
               state: state,
               description: description,
             })
+      - name: Get link to test results page
+        if: github.event.inputs.test_results_page_url != ''
+        run: |
+          echo "Test results page URL: ${{ github.event.inputs.test_results_page_url }}"
       - name: Collect test result
         run: rm -rf results && mkdir results && cd results && curl --user svc_tensorrt:${{ secrets.ARTIFACTORY_TOKEN }} -L ${{ github.event.inputs.test_results_url }} | tar -xz
       - name: Create test summary
