@@ -1805,9 +1805,6 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
         auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
         auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
 
-        runtime::CudaEvent beforeEvent{};
-        mRuntime->getStreamPtr()->record(beforeEvent);
-        mCopyBufferManager.getStream().wait(beforeEvent);
         mCopyBufferManager.copy(*sequenceLengthView, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
         mCopyBufferManager.copy(*outputIds, *mSlotDecoderBuffers[seqSlot]->outputIds);
         if (returnLogProbs)
