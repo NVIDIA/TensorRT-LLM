@@ -48,13 +48,11 @@ You can refer to [TRT-LLM installation guide](https://github.com/NVIDIA/TensorRT
 
 You are ready to run an in-framework LLama Demo now.
 
-The general entrypoint to run the auto-deploy demo is the `lm_eval_tensorrt_llm.py` script located at `examples/llm-eval/lm-eval-harness`. Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
-
-Please also refer to the [lm-eval-harness README](https://github.com/EleutherAI/lm-evaluation-harness) for more details on available tasks and command line arguments.
+The general entrypoint to run the auto-deploy demo is the `build_and_run_ad.py` script, Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
 
 ```bash
-cd examples/llm-eval/lm-eval-harness
-python lm_eval_tensorrt_llm.py --model trt-llm --model_args model=<model_name>,backend=autodeploy,max_context_length=<input token length>,max_gen_toks=<output token length>,tp=<tp>,temperature=<temperature, e.g. 0>  --tasks <task_name> --batch_size <max batch size>
+cd examples/auto_deploy
+python build_and_run_ad.py --config '{"model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}'
 ```
 
 ______________________________________________________________________
