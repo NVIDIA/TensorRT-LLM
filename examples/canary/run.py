@@ -54,6 +54,7 @@ def parse_arguments():
     parser.add_argument('--results_dir', type=str, default='tmp')
     parser.add_argument('--assets_dir', type=str, default='./assets')
     parser.add_argument('--input_file', type=str, default=None)
+    parser.add_argument('--max_new_tokens', type=int, default=None)
     parser.add_argument('--prompt_text', type=str,
                         default=None)
     parser.add_argument('--manifest_file', type=str, default=None)
@@ -65,8 +66,9 @@ def parse_arguments():
     parser.add_argument('--name',
                         type=str,
                         default="librispeech_dummy_benchmark")
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--num_beams', type=int, default=1)
+    parser.add_argument('--max_seq_len', type=int, default=None)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--enable_warmup', action='store_true')
     parser.add_argument('--accuracy_check',
@@ -361,7 +363,11 @@ class CanaryEncoder:
         logger.info(f"Creating session from engine {engine_path}")
         self.session_conformer = Session.from_serialized_engine(engine_buffer)
         self.device = torch.device("cuda:0") if torch.cuda.is_available() else "cpu"
+        
 
+
+
+  
     @staticmethod
     def get_masked_emb(enc_outputs):
         enc_emb = enc_outputs['outputs']
@@ -376,10 +382,12 @@ class CanaryEncoder:
 
         return enc_mask,enc_len
 
-    def infer(self,audio_signal, length, stream, audio_file=""):
-        audio_inputs={'audio_signal': audio_signal, 'length': length}
+    def infer(self,audio_signal, lengths, stream, audio_file=""):
+
+        audio_inputs={'audio_signal': audio_signal, 'length': lengths}
+
         outputs_info= self.session_conformer.infer_shapes([TensorInfo("audio_signal", trt.DataType.FLOAT, audio_signal.shape),
-                                                           TensorInfo("length", trt.DataType.INT64, length.shape)])
+                                                           TensorInfo("length", trt.DataType.INT64, lengths.shape)])
         enc_outputs = {
             t.name: torch.empty(tuple(t.shape),
                                 dtype=trt_dtype_to_torch(t.dtype),
@@ -407,6 +415,8 @@ class CanaryDecoding:
         self.decoder_generation_session = self.get_session(
             engine_dir, runtime_mapping, debug_mode)
         self.dtype=str_dtype_to_torch(self.decoder_config['dtype'])
+        self.max_seq_len = self.decoder_config['max_seq_len']
+        self.max_input_len = self.decoder_config['max_input_len']
 
 
     @staticmethod
@@ -454,16 +464,26 @@ class CanaryDecoding:
                  decoder_input_ids,
                  encoder_outputs,
                  encoder_input_lengths,
-                 max_new_tokens=40,
+                 max_new_tokens,
                  num_beams=1):
+        
+        
         encoder_outputs=encoder_outputs.to(dtype=self.dtype)
+
         batch_size = decoder_input_ids.shape[0]
+        
         encoder_max_input_length = encoder_outputs.shape[1]
 
         decoder_input_lengths = torch.tensor(
             [decoder_input_ids.shape[-1] for _ in range(decoder_input_ids.shape[0])], dtype=torch.int32, device='cuda'
         )
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
+
+        assert decoder_max_input_length < self.max_input_len, f"Decoder input length {decoder_max_input_length} exceeds max input length {self.max_input_len}"
+
+        if max_new_tokens  > self.max_seq_len:
+            print(f"max_new_tokens {max_new_tokens} is greater than max_seq_len {self.max_seq_len}, setting max_new_tokens to max_seq_len")
+            max_new_tokens = self.max_seq_len
 
         cross_attention_mask = torch.ones([
             batch_size, decoder_max_input_length + max_new_tokens,
@@ -477,7 +497,7 @@ class CanaryDecoding:
         self.decoder_generation_session.setup(
             decoder_input_lengths.size(0),
             decoder_max_input_length,
-            max_new_tokens,
+            max_new_tokens=max_new_tokens,
             beam_width=num_beams,
             encoder_max_input_length=encoder_max_input_length,
         )
@@ -518,6 +538,8 @@ class CanaryTRTLLM(object):
                  engine_dir,
                  debug_mode=False,
                  device="cuda:0",
+                 batch_size=8,
+                 num_beams=1,
                  use_py_session=False):
 
         self.device=device
@@ -528,13 +550,20 @@ class CanaryTRTLLM(object):
         engine_dir = Path(engine_dir)
         decoder_config = read_config('decoder', engine_dir)
         with open(os.path.join(engine_dir, 'preprocessor/config.json')) as f:
-
             preprocessor_config = json.load(f)
+
+
+        self.decoder_config = read_config('decoder', engine_dir)
+        self.max_seq_len = self.decoder_config['max_seq_len']
+        self.max_input_len = self.decoder_config['max_input_len']
+        self.max_batch_size = self.decoder_config['max_batch_size']
+
 
         self.num_feats = preprocessor_config['features']
         self.n_fft = preprocessor_config['n_fft']
         mel_basis_file = engine_dir / "preprocessor/mel_basis.pt"
         self.mel_basis = torch.load(mel_basis_file, weights_only=True,map_location=torch.device(self.device))
+
         window_size=preprocessor_config.get('window_size',0.025)
         window_stride = preprocessor_config.get('window_stride',0.010)
         window_type = preprocessor_config.get('window','hann')
@@ -543,15 +572,22 @@ class CanaryTRTLLM(object):
 
 
 
+
         self.preprocessor = MelFilterBankFeats(self.mel_basis,window_size=window_size,window_stride=window_stride,
                                                window_type=window_type,fs=sample_rate, preemp=preemp)
         self.tokenizer = CanaryTokenizer(engine_dir)
 
-        self.encoder = CanaryEncoder(engine_dir)
-        self.decoder = CanaryDecoding(engine_dir,
+        if not use_py_session:
+            print("Only Python session is supported for now. Setting use_py_session to True")
+            use_py_session = True
+        if use_py_session:
+            self.encoder = CanaryEncoder(engine_dir)
+            self.decoder = CanaryDecoding(engine_dir,
                                       runtime_mapping, tokenizer=self.tokenizer,
                                       debug_mode=debug_mode)
 
+    
+        self.use_py_session = use_py_session
 
 
     def process_batch(
@@ -560,7 +596,7 @@ class CanaryTRTLLM(object):
             audio_input_lengths,
             text_prefix=None,
             num_beams=1,
-            max_new_tokens=128,
+            max_new_tokens=None,
             prompts_cfg=None,):
         batch_size = len(audio_input_lengths)
         if prompts_cfg is None:
@@ -581,21 +617,21 @@ class CanaryTRTLLM(object):
 
         stream=torch.cuda.current_stream('cuda')
 
+        if max_new_tokens is None:
+            max_new_tokens = self.max_seq_len
+  
 
         mel,mel_input_lengths = self.preprocessor.get_feats(audio, audio_input_lengths)
-        encoder_output, encoder_output_lengths = self.encoder.infer(
-            mel, mel_input_lengths, stream)
 
-        batch_size = len(encoder_output_lengths)
-
-
-
-
-        output_ids = self.decoder.generate(decoder_input_ids,
+        if self.use_py_session:
+            encoder_output, encoder_output_lengths = self.encoder.infer(
+                mel, mel_input_lengths, stream)
+            output_ids = self.decoder.generate(decoder_input_ids,
                                            encoder_output,
                                            encoder_output_lengths,
                                            max_new_tokens=max_new_tokens,
                                            num_beams=num_beams)
+
         texts = []
         for i in range(len(output_ids)):
             text = self.tokenizer.decode(output_ids[i][0]).strip()
@@ -607,6 +643,7 @@ class CanaryTRTLLM(object):
 def decode_wav_file(
         input_file_path,
         model,
+        max_new_tokens=None,
         batch_size=1,
         text_prefix=None,
         num_beams=1):
@@ -619,7 +656,7 @@ def decode_wav_file(
 
 
     predictions = model.process_batch([waveform]*batch_size,[len(waveform)]*batch_size, text_prefix,
-                                      num_beams)
+                                      num_beams, max_new_tokens)
 
     prediction = predictions[0]
 
@@ -678,6 +715,7 @@ def batch_manifest(manifest_file, batch_size):
 def decode_manifest(
         manifest_file,
         model,
+        max_new_tokens=None,
         batch_size=1,
         num_beams=1,
         sample_rate=16000,
@@ -699,7 +737,7 @@ def decode_manifest(
 
         total_duration += sum(durations) / sample_rate
         predictions = model.process_batch(waveforms, durations,
-                                          num_beams=num_beams, prompts_cfg=prompt_cfg)
+                                          num_beams=num_beams, max_new_tokens=max_new_tokens, prompts_cfg=prompt_cfg)
         for wav_id, label, prediction, cfg in zip(ids, texts, predictions, prompt_cfg):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)
@@ -747,6 +785,7 @@ def collate_wrapper(batch):
 def decode_dataset(
         model,
         dataset,
+        max_new_tokens=None,
         text_prefix=None,
         batch_size=1,
         num_beams=1,
@@ -775,7 +814,7 @@ def decode_dataset(
 
 
         predictions = model.process_batch(waveforms_list, durations,
-                                          text_prefix, num_beams)
+                                          text_prefix, num_beams, max_new_tokens)
         for wav_id, label, prediction in zip(ids, texts, predictions):
             # remove all special tokens in the prediction
             prediction = re.sub(r'<\|.*?\|>', '', prediction)
@@ -786,9 +825,23 @@ def decode_dataset(
 
 if __name__ == '__main__':
     args = parse_arguments()
+
+    args.use_py_session=True
+
     tensorrt_llm.logger.set_level(args.log_level)
     model = CanaryTRTLLM(args.engine_dir, debug_mode=args.debug, device="cuda:0",
-                          use_py_session=args.use_py_session)
+                          use_py_session=args.use_py_session, batch_size=args.batch_size, num_beams=args.num_beams)
+
+    if args.batch_size is None:
+        if args.input_file:
+            args.batch_size=1
+        else:
+            args.batch_size=model.max_batch_size
+    else:
+        if args.batch_size > model.max_batch_size:
+            print(f"batch_size {args.batch_size} is greater than max_batch_size {model.max_batch_size}, setting batch_size to max_batch_size")
+            args.batch_size=model.max_batch_size
+        
     log_file=None
     if args.manifest_file is not None:
         args.results_dir=Path(args.manifest_file).parent.absolute()
@@ -801,21 +854,32 @@ if __name__ == '__main__':
         output_manifest = None
     if args.enable_warmup:
         if args.manifest_file:
-                  results, total_duration = decode_manifest(
-            args.manifest_file,
-            model,
-            batch_size=args.batch_size,
-            num_beams=args.num_beams,
-            output_manifest=None,
-            warmstart_batches=10
-        )
+            decode_manifest(
+                args.manifest_file,
+                model,
+                batch_size=args.batch_size,
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,
+                output_manifest=None,
+                warmstart_batches=10
+            )
+        elif args.input_file:
+            decode_wav_file(
+                args.input_file,
+                model,
+                text_prefix=args.prompt_text,
+                batch_size=args.batch_size,
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,
+            )
         else:
-
-            results, total_duration = decode_dataset(
+            decode_dataset(
                 model,
                 "hf-internal-testing/librispeech_asr_dummy",
                 batch_size=args.batch_size,
-                num_beams=args.num_beams)
+                num_beams=args.num_beams,
+                max_new_tokens=args.max_new_tokens,     
+            )
     if args.input_file:
         start_time = time.time()
 
@@ -826,7 +890,8 @@ if __name__ == '__main__':
             model,
             text_prefix=args.prompt_text,
             batch_size=args.batch_size,
-            num_beams=args.num_beams,)
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,)
             
     elif args.manifest_file:
 
@@ -837,7 +902,8 @@ if __name__ == '__main__':
             model,
             batch_size=args.batch_size,
             num_beams=args.num_beams,
-            output_manifest=output_manifest
+            output_manifest=output_manifest,
+            max_new_tokens=args.max_new_tokens,
         )
 
 
@@ -848,7 +914,8 @@ if __name__ == '__main__':
             args.dataset,
             batch_size=args.batch_size,
             text_prefix=args.prompt_text,
-            num_beams=args.num_beams,)
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,)
 
     elapsed = time.time() - start_time
     results = sorted(results)
@@ -869,7 +936,7 @@ if __name__ == '__main__':
                                                  results,
                                                  enable_log=True)
             if args.accuracy_check and args.dataset == "hf-internal-testing/librispeech_asr_dummy" and not args.input_file:
-                assert total_error_rate <= 2.8, f"Word Error rate using canary model should be 2.26%, but got {total_error_rate}"
+                assert total_error_rate <= 2.0, f"Word Error rate using canary model should be 1.22%, but got {total_error_rate}"
             s = f"total error rate: {total_error_rate:.2f}%\n"
 
     rtf = total_duration/elapsed

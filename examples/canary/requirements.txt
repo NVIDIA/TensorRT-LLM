@@ -4,8 +4,8 @@ pytorch-lightning>=2.4.0
 soundfile
 safetensors
 kaldialign
-tensorrt_llm==0.17.0
+tensorrt_llm>=0.17.0
 datasets
 lhotse
-nemo==2.1.0
+nemo_toolkit['asr']==2.2.0
 librosa

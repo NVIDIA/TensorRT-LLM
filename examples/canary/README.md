@@ -31,20 +31,28 @@ pip install -r requirements.txt
 INFERENCE_PRECISION=bfloat16
 MAX_BEAM_WIDTH=4
 MAX_BATCH_SIZE=8
-engine_dir="engine"
-checkpoint_dir=tllm_checkpoint
+MAX_FEAT_LEN=3001 #Max audio duration(ms)/10ms (window shift). Assuming 30s audio
+MAX_ENCODER_OUTPUT_LEN=376 #MAX_ENCODER_OUTPUT_LEN = 1 + (MAX_FEAT_LEN / 8), 8 is subsampling factor for canary conformer 
+MAX_TOKENS=196 # Max number of tokens to generate
+MAX_PROMPT_TOKENS=10 # Max number of tokens to be passed
+engine_dir="engine"_${INFERENCE_PRECISION}
+checkpoint_dir=tllm_checkpoint_${INFERENCE_PRECISION}
+NEMO_CHECKPOINT=/data/ASR/mayjain/canary_eval/nemo_manifests/canary-1b-ti.nemo
+
 
 
 # Export the canary model TensorRT-LLM format.
 python3 convert_checkpoint.py \
                 --dtype=${INFERENCE_PRECISION} \
-                --model_path <path_to_nemo_checkpoint> \
+                --model_path ${NEMO_CHECKPOINT} \
+                --output_dir ${checkpoint_dir} \
                 ${engine_dir}
-
 # Build the canary encoder model using conformer_onnx_trt.py
+
 python3 conformer_onnx_trt.py \
-        --max_BS <max_batch_size> \
-        tllm_checkpoint/encoder/encoder.onnx \
+        --max_BS ${MAX_BATCH_SIZE} \
+        --max_feat_len ${MAX_FEAT_LEN}
+        ${checkpoint_dir}/encoder/encoder.onnx \
         ${engine_dir}
 
 
@@ -52,27 +60,27 @@ python3 conformer_onnx_trt.py \
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --output_dir ${engine_dir}/decoder \
               --moe_plugin disable \
-              --enable_xqa disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
-              --max_seq_len 114 \ #Max number of generated tokens
-              --max_input_len 14 \ # Max number of prompt tokens
-              --max_encoder_input_len 3000 \
+              --max_seq_len ${MAX_TOKENS} \
+              --max_input_len ${MAX_PROMPT_TOKENS} \
+              --max_encoder_input_len ${MAX_ENCODER_OUTPUT_LEN}  \
               --gemm_plugin ${INFERENCE_PRECISION} \
-              --bert_attention_plugin ${INFERENCE_PRECISION} \
-              --gpt_attention_plugin ${INFERENCE_PRECISION}
+              --bert_attention_plugin disable \
+              --gpt_attention_plugin ${INFERENCE_PRECISION} \
+              --remove_input_padding enable
 ```
 
 ### Run
 
 ```bash
 # decode a single wav file
-python3 run.py --engine_dir ${engine_dir}--name single_wav_test --input_file assets/1221-135766-0002.wav
+python3 run.py --engine_dir ${engine_dir} --name single_wav_test --batch_size=1 --num_beam=<beam_len>  --input_file assets/1221-135766-0002.wav
 
 # decode a whole dataset
-python3 run.py --engine_dir ${engine_dir} --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup --name librispeech_dummy_large_v3
+python3 run.py --engine_dir ${engine_dir} --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup  --batch_size=<batch_size> --num_beam=<beam_len>  --name librispeech_dummy_large_v3
 
 # decode with a manifest file and save to manifest. 
-python3 run.py --engine_dir ${engine_dir} --enable_warmup --batch_size=<batch_size> --name <test_name> --manifest_file <path_to_manifest_file>
+python3 run.py --engine_dir ${engine_dir} --enable_warmup --batch_size=<batch_size> --num_beam=<beam_len> --name <test_name> --manifest_file <path_to_manifest_file>
 
 ```

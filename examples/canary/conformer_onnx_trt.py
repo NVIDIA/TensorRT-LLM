@@ -24,29 +24,49 @@ import click
 
 class ConformerTRT:
 
-    def __init__(self, config_file, min_feat_len=32, max_feat_len=12001, opt_feat_len=3001):
-
-        with open(config_file,'r') as f:
+    def __init__(self, checkpoint_dir, max_feat_len, min_feat_len=32, opt_feat_len=None, minBS=1, optBS=None, maxBS=4):
+        self.checkpoint_dir=checkpoint_dir
+        with open(os.path.join(checkpoint_dir, 'encoder/config.json'),'r') as f:
             self.encoder_config = json.load(f)
-        print(f"{config_file}: {self.encoder_config}")
+
         self.dtype=self.encoder_config['dtype']
-        self.feat_in=self.encoder_config['feat_in']
-        self.min_feat_len=min_feat_len
-        self.max_feat_len=max_feat_len
+
         if opt_feat_len is None:
-            opt_feat_len=int((self.max_feat_len+self.min_feat_len)/2)
-        if opt_feat_len > self.max_feat_len or opt_feat_len < self.min_feat_len:
-            raise Exception(f"Invalid opt_feat_len should be min_feat_len<opt_feat_len<max_feat_len ")
+            opt_feat_len=int((max_feat_len + min_feat_len)/2)
+
+        if optBS is None:
+            optBS=int((minBS + maxBS)/2)
+
+
+        if opt_feat_len > max_feat_len or opt_feat_len < min_feat_len:
+            raise Exception(f"Invalid opt_feat_len should be min_feat_len < opt_feat_len < max_feat_len ")
+        
+        if optBS > maxBS or optBS < minBS:
+            raise Exception(f"Invalid optBS should be minBS < optBS < maxBS")
+        
+
+        self.feat_dim=self.encoder_config['feat_in']
+        
+        self.min_feat_len=min_feat_len
         self.opt_feat_len=opt_feat_len
 
+        self.max_feat_len=max_feat_len
+
+        self.minBS=minBS
+        self.optBS=optBS
+        self.maxBS=maxBS
+
+        self.encoder_config['min_feat_len']=min_feat_len
+        self.encoder_config['opt_feat_len']=opt_feat_len
+        self.encoder_config['max_feat_len']=max_feat_len
+
+        self.encoder_config['min_batch_size']=minBS
+        self.encoder_config['opt_batch_size']=optBS
+        self.encoder_config['max_batch_size']=maxBS
 
 
     def generate_trt_engine(self,
-                            onnx_file,
-                            engine_dir,
-                            minBS=1,
-                            optBS=None,
-                            maxBS=4):
+                            engine_dir):
         print("Start converting TRT engine!")
         logger = trt.Logger(trt.Logger.VERBOSE)
         builder = trt.Builder(logger)
@@ -61,7 +81,7 @@ class ConformerTRT:
 
         #config.flags = config.flags
         parser = trt.OnnxParser(network, logger)
-
+        onnx_file=os.path.join(self.checkpoint_dir, 'encoder/encoder.onnx')
         with open(onnx_file, "rb") as model:
             if not parser.parse(model.read(), "/".join(onnx_file.split("/"))):
                 print("Failed parsing %s" % onnx_file)
@@ -71,21 +91,20 @@ class ConformerTRT:
 
         nBS = -1
         nFeats = -1
-        nMinBS = minBS
+        nMinBS = self.minBS
 
-        nMaxBS = maxBS
-        if optBS is None:
-            optBS=int((minBS+maxBS)/2)
-        nOptBS = optBS
+        nMaxBS = self.maxBS
+
+        nOptBS = self.optBS
         input_feat = network.get_input(0)
         input_len=network.get_input(1)
-        input_feat.shape = [nBS, self.feat_in, nFeats]
+        input_feat.shape = [nBS, self.feat_dim, nFeats]
         input_len.shape = [nBS]
         profile.set_shape(
             input_feat.name,
-            [nMinBS, self.feat_in, self.min_feat_len],
-            [nOptBS, self.feat_in, self.opt_feat_len],
-            [nMaxBS, self.feat_in, self.max_feat_len],
+            [nMinBS, self.feat_dim, self.min_feat_len],
+            [nOptBS, self.feat_dim, self.opt_feat_len],
+            [nMaxBS, self.feat_dim, self.max_feat_len],
         )
         profile.set_shape(
             input_len.name,
@@ -118,20 +137,23 @@ class ConformerTRT:
 
 
 @click.command()
-@click.option("--config_file", default="None")
 @click.option("--min_BS", default=1, type=int, help="Minimum batch size")
 @click.option("--opt_BS", default=None, type=int, help="Optimum batch size")
 @click.option("--max_BS", default=4, type=int, help="Maximum batch size")
-@click.argument("onnx_file", type=click.Path(exists=True),required=True)
+@click.option("--max_feat_len", default=3001, type=int, help="Maximum input length")
+@click.option("--min_feat_len", default=32, type=int, help="Minimum input length")
+@click.option("--opt_feat_len", default=None, type=int, help="Optimum input length")
+
+@click.argument("checkpoint_dir", type=click.Path(exists=True, dir_okay=True, file_okay=False),required=True)
 @click.argument("engine_dir", type=str, required=True)
-def main(onnx_file, engine_dir, config_file, min_bs, opt_bs, max_bs):
-    if config_file == 'None':
-        config_file = os.path.join(os.path.dirname(onnx_file), 'config.json')
+def main(checkpoint_dir, engine_dir, max_feat_len, min_feat_len, opt_feat_len, min_bs, opt_bs, max_bs):
 
 
 
-    conformer = ConformerTRT(config_file)
-    conformer.generate_trt_engine(onnx_file, engine_dir, min_bs, opt_bs, max_bs)
+
+    conformer = ConformerTRT(checkpoint_dir, max_feat_len, min_feat_len, opt_feat_len, min_bs, opt_bs, max_bs)
+    
+    conformer.generate_trt_engine(engine_dir)
 
 
 if __name__ == "__main__":
