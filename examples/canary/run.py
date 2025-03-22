@@ -479,7 +479,7 @@ class CanaryDecoding:
         )
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
-        assert decoder_max_input_length < self.max_input_len, f"Decoder input length {decoder_max_input_length} exceeds max input length {self.max_input_len}"
+        assert decoder_max_input_length <= self.max_input_len, f"Decoder input length {decoder_max_input_length} exceeds max input length {self.max_input_len}"
 
         if max_new_tokens  > self.max_seq_len:
             print(f"max_new_tokens {max_new_tokens} is greater than max_seq_len {self.max_seq_len}, setting max_new_tokens to max_seq_len")
