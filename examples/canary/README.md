@@ -36,17 +36,17 @@ MAX_ENCODER_OUTPUT_LEN=376 #MAX_ENCODER_OUTPUT_LEN = 1 + (MAX_FEAT_LEN / 8), 8 i
 MAX_TOKENS=196 # Max number of tokens to generate
 MAX_PROMPT_TOKENS=10 # Max number of tokens to be passed
 
+
 engine_dir="engine"_${INFERENCE_PRECISION}
 checkpoint_dir="tllm_checkpoint"_${INFERENCE_PRECISION}
-
-NEMO_CHECKPOINT=<path_to_nemo_checkpoint>
+NEMO_MODEL="nvidia/canary-1b-flash"
 
 
 
 # Export the canary model TensorRT-LLM format.
 python3 convert_checkpoint.py \
                 --dtype=${INFERENCE_PRECISION} \
-                --model_path ${NEMO_CHECKPOINT} \
+                --model_name ${NEMO_MODEL} \
                 --output_dir ${checkpoint_dir} \
                 ${engine_dir}
 

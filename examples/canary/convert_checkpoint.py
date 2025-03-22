@@ -47,9 +47,10 @@ def parse_arguments():
     parser.add_argument('--quant_ckpt_path', type=str, default=None)
     parser.add_argument('--model_name',
                         type=str,
-                        default="nvidia/canary-1b",
+                        default="nvidia/canary-1b-flash",
                         choices=[
                             "nvidia/canary-1b",
+                            "nvidia/canary-1b-flash",
                         ])
     parser.add_argument('--model_path',
                         type=str,
@@ -134,7 +135,7 @@ class CanaryModel:
                     logging.error(f"Failed to restore model from NeMo file : {args.model_path}. ")
                     raise e
         else:
-            if args.model_name == 'nvidia/canary-1b':
+            if args.model_name == 'nvidia/canary-1b' or args.model_name == 'nvidia/canary-1b-flash':
                 self.model = nemo_asr.EncDecMultiTaskModel.from_pretrained(args.model_name).to(device='cpu')
             else:
                 raise UnsupportedModel(model_name=args.model_name)
@@ -148,7 +149,7 @@ class CanaryModel:
 
     @staticmethod
     def is_supported(model_type: str):
-        supported_models = ['nvidia/canary-1b', 'nemo.canary', 'nemo/canary', 'canary']
+        supported_models = ['nvidia/canary-1b', 'nvidia/canary-1b-flash' 'nemo.canary', 'nemo/canary', 'canary']
 
         if model_type in supported_models:
             return True
