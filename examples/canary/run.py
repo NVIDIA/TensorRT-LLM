@@ -130,6 +130,7 @@ class CanaryTokenizer:
         decoder_config = read_config('decoder', engine_dir)
         self.prompt_format = decoder_config.get('prompt_format', prompt_format)
         self.blank = '▁'
+        self.has_country_code = False
         if self.prompt_format == 'canary2':
             self.default_prompt = "<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|en-US|> <|en-US|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
         else:
@@ -157,6 +158,7 @@ class CanaryTokenizer:
             lang_token=f"<|{lang.split('-')[0]}|>"
             if "-" in lang:
                 lang_country_token=f"<|{lang}|>"
+                self.has_country_code = True
             else:
                 lang_country_token=lang_token
             if lang_country_token  in self.__token_to_id__['spl_tokens']:
@@ -265,8 +267,10 @@ class CanaryTokenizer:
         # <|startofcontext|><|startoftranscript|><|emo:undefined|><|{src_lang}|><|{tgt_lang}|><|[no]pnc|><|[no]itn|><|[no]timestamp><|[no]diarize|>
         prompt = "<|startofcontext|> <|startoftranscript|> <|emo:undefined|>"
 
-
+        if not self.has_country_code and '-'  in src_lang: 
+            src_lang = src_lang.split('-')[0]
         if src_lang not in self.langs:
+            
             raise ValueError(f"Invalid language {src_lang=} specified")
 
         prompt += f" <|{src_lang}|>"
@@ -289,8 +293,10 @@ class CanaryTokenizer:
 
         if tgt_lang is None:
             tgt_lang = src_lang
-            if tgt_lang not in self.langs:
-                raise ValueError(f"Invalid language {tgt_lang=} specified")
+        if not self.has_country_code and '-'  in tgt_lang: 
+            tgt_lang = tgt_lang.split('-')[0]
+        if tgt_lang not in self.langs:
+            raise ValueError(f"Invalid language {tgt_lang=} specified")
 
         prompt += f" <|{src_lang}|> <|{tgt_lang}|> {pnc} {itn} {timestamp} {diarize}"
 
