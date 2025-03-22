@@ -28,16 +28,18 @@ The TensorRT-LLM Canary example code is located in [`examples/canary`](./).
 # install requirements first
 pip install -r requirements.txt
 
-INFERENCE_PRECISION=bfloat16
-MAX_BEAM_WIDTH=4
-MAX_BATCH_SIZE=8
+INFERENCE_PRECISION=bfloat16 # precision float16 or bfloat16
+MAX_BEAM_WIDTH=4 # max beam width of decoder
+MAX_BATCH_SIZE=8 # max batch size
 MAX_FEAT_LEN=3001 #Max audio duration(ms)/10ms (window shift). Assuming 30s audio
 MAX_ENCODER_OUTPUT_LEN=376 #MAX_ENCODER_OUTPUT_LEN = 1 + (MAX_FEAT_LEN / 8), 8 is subsampling factor for canary conformer 
 MAX_TOKENS=196 # Max number of tokens to generate
 MAX_PROMPT_TOKENS=10 # Max number of tokens to be passed
+
 engine_dir="engine"_${INFERENCE_PRECISION}
-checkpoint_dir=tllm_checkpoint_${INFERENCE_PRECISION}
-NEMO_CHECKPOINT=/data/ASR/mayjain/canary_eval/nemo_manifests/canary-1b-ti.nemo
+checkpoint_dir="tllm_checkpoint"_${INFERENCE_PRECISION}
+
+NEMO_CHECKPOINT=<path_to_nemo_checkpoint>
 
 
 
@@ -47,8 +49,9 @@ python3 convert_checkpoint.py \
                 --model_path ${NEMO_CHECKPOINT} \
                 --output_dir ${checkpoint_dir} \
                 ${engine_dir}
-# Build the canary encoder model using conformer_onnx_trt.py
 
+
+# Build the canary encoder model using conformer_onnx_trt.py
 python3 conformer_onnx_trt.py \
         --max_BS ${MAX_BATCH_SIZE} \
         --max_feat_len ${MAX_FEAT_LEN}
@@ -75,7 +78,7 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
 
 ```bash
 # decode a single wav file
-python3 run.py --engine_dir ${engine_dir} --name single_wav_test --batch_size=1 --num_beam=<beam_len>  --input_file assets/1221-135766-0002.wav
+python3 run.py --engine_dir ${engine_dir} --name single_wav_test --batch_size=1 --num_beam=<beam_len> --enable_warmup --input_file assets/1221-135766-0002.wav
 
 # decode a whole dataset
 python3 run.py --engine_dir ${engine_dir} --dataset hf-internal-testing/librispeech_asr_dummy --enable_warmup  --batch_size=<batch_size> --num_beam=<beam_len>  --name librispeech_dummy_large_v3
