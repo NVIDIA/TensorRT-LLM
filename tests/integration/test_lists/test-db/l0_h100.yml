@@ -46,8 +46,8 @@ l0_h100:
   - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[] # 5 mins
   - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b]
-  - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.2-1b]
+  - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
   - unittest/model_api/test_model_level_api.py # 9 mins on H100
   - unittest/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100
   - unittest/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
@@ -64,6 +64,7 @@ l0_h100:
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
   - accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_fp8_pre_quantized
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8
   - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8_gemm_plugin
   - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8_gemm_swiglu_plugin
   - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8_low_latency_gemm_plugin
@@ -103,9 +104,7 @@ l0_h100:
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-  - examples/test_llama.py::test_llm_llama_v2_1gpu_fp8_summary_and_mmlu[llama-v2-7b-hf-enable_fp8_paged_fmha-disable_mmlu_test]
   - examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 10 mins
-  - examples/test_llama.py::test_llm_llama_v3_1_autoq_1gpu_mmlu[llama-3.1-8b] # 12 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_mmlu[flan-t5-small-float32-tp:1-pp:1-nb:1-enable_fp8] # 7 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] # 13 mins
   - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
@@ -118,9 +117,6 @@ l0_h100:
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-2b-instruct]
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-v3-8b-instruct-hf]
-  - examples/test_llama.py::test_llm_llama_v2_1gpu_fp8_summary_and_mmlu[llama-v2-7b-hf-enable_fp8_fmha-enable_mmlu_test] # 24mins
-  - examples/test_llama.py::test_llm_llama_v3_8b_1048k_long_context_ppl[passkey-Llama-3-8B-Instruct-Gradient-1048k]
-  - examples/test_llama.py::test_llm_llama_v3_8b_1048k_long_context_ppl[SlimPajama-6B-Llama-3-8B-Instruct-Gradient-1048k]
   - accuracy/test_accuracy.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_accuracy.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_accuracy.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
@@ -143,8 +139,10 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8
+  - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context
+  - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context_ppl
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8
+  - accuracy/test_accuracy.py::TestLlama3_1_8B::test_autoq
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
