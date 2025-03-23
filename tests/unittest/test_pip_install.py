@@ -51,10 +51,14 @@ def test_pip_install():
                         help="The wheel path")
     args = parser.parse_args()
 
+    print("##########  Install required system libs  ##########")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
-        print("##########  Install required system libs  ##########")
-        subprocess.check_call("apt-get -y install python3-pip libopenmpi-dev",
-                              shell=True)
+        subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
+
+    subprocess.check_call("apt-get -y install python3-pip", shell=True)
+    subprocess.check_call("pip3 install --upgrade pip || true", shell=True)
+    subprocess.check_call("pip3 install --upgrade setuptools<77.0.1 || true",
+                          shell=True)
 
     download_wheel(args)
     print("##########  Install tensorrt_llm package  ##########")

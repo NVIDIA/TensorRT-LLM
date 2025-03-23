@@ -318,7 +318,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("tokens_per_block", &tbk::KvCacheStats::toksPerBlock)
         .def_readwrite("alloc_total_blocks", &tbk::KvCacheStats::allocTotalBlocks)
         .def_readwrite("alloc_new_blocks", &tbk::KvCacheStats::allocNewBlocks)
-        .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks);
+        .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks)
+        .def_readwrite("missed_blocks", &tbk::KvCacheStats::missedBlocks)
+        .def_readwrite("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate);
 
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t>(), py::arg("max_kv_event_entries"));

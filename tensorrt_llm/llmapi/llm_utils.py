@@ -19,8 +19,7 @@ from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, SchedulerConfig)
+                                 KvCacheRetentionConfig, SchedulerConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
@@ -31,7 +30,8 @@ from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .llm_args import (CalibConfig, ConfigArbitrateError, EagleDecodingConfig,
-                       LlmArgs, MedusaDecodingConfig, MTPDecodingConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MTPDecodingConfig,
                        _ConfigArbitrator, _ModelFormatKind, _ModelWrapper,
                        _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
@@ -802,7 +802,6 @@ __all__ = [
     'BatchingType',
     'ExecutorConfig',
     'SchedulerConfig',
-    'KvCacheConfig',
     'KvCacheRetentionConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
@@ -813,6 +812,7 @@ __all__ = [
     'BuildCacheConfig',
     'QuantConfig',
     'CalibConfig',
+    'KvCacheConfig',
     'CachedModelLoader',
     'ConfigArbitrateError',
     '_ConfigArbitrator',

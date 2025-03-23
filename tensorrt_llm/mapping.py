@@ -300,11 +300,17 @@ class Mapping(object):
     def get_local_rank(self, rank: int):
         return rank % self.gpus_per_node
 
+    def is_multi_node(self):
+        return self.world_size > self.gpus_per_node
+
     def has_tp(self):
         return self.tp_size > 1
 
     def is_last_pp_rank(self):
         return self.pp_rank == self.pp_size - 1
+
+    def is_second_last_pp_rank(self):
+        return self.pp_rank == self.pp_size - 2
 
     def is_first_pp_rank(self):
         return self.pp_rank == 0

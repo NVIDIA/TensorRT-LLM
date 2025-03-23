@@ -17,6 +17,7 @@
 
 #include "bindings.h"
 #include "tensorrt_llm/kernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -352,36 +353,30 @@ void initBindings(pybind11::module_& m)
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
             py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
             py::arg("world_config"))
-        .def("forward_async",
-            py::overload_cast<tr::decoder_batch::Output&, tr::decoder_batch::Input const&>(
-                &tr::GptDecoderBatched::forwardAsync),
-            py::arg("output"), py::arg("input"))
-        .def("setup_explicit_draft_tokens", &tr::GptDecoderBatched::setupExplicitDraftTokens,
-            py::arg("explicit_draft_tokens_buffers"))
-        .def("setup_lookahead", py::overload_cast<tr::LookaheadDecodingBuffers>(&tr::GptDecoderBatched::setupLookahead),
-            py::arg("lookahead_decoding_buffers"))
+        .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
         .def(
             "new_tokens",
             [](tr::GptDecoderBatched& self, int iter = 0)
             {
-                auto allNewTokens = self.getAllNewTokens();
+                auto allNewTokens = self.getDecoderState().getAllNewTokens();
                 auto newTokensView = std::shared_ptr<tr::ITensor>(tr::ITensor::slice(allNewTokens, iter, 1));
                 newTokensView->squeeze(0);
-                return tr::Torch::tensor(tr::ITensor::slice(newTokensView, 0, self.getActualBatchSize()));
+                return tr::Torch::tensor(
+                    tr::ITensor::slice(newTokensView, 0, self.getDecoderState().getActualBatchSize()));
             },
             py::arg("iter") = 0)
-        .def_property_readonly("decoding_mode", &tr::GptDecoderBatched::getDecodingMode)
-        .def_property_readonly("joint_decoding_input", &tr::GptDecoderBatched::getJointDecodingInput)
-        .def_property_readonly("joint_decoding_output", &tr::GptDecoderBatched::getJointDecodingOutput)
+        .def_property_readonly("joint_decoding_input",
+            [](tr::GptDecoderBatched& self) { return self.getDecoderState().getJointDecodingInput(); })
+        .def_property_readonly("joint_decoding_output",
+            [](tr::GptDecoderBatched& self) { return self.getDecoderState().getJointDecodingOutput(); })
         .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
-        .def_property_readonly("max_decoding_engine_tokens", &tr::GptDecoderBatched::getMaxDecodingEngineTokens)
-        .def_property_readonly(
-            "all_new_tokens", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
-        .def_property_readonly(
-            "finished_sum", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishedSum()); })
-        .def_property_readonly(
-            "finish_reasons", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishReasons()); });
+        .def_property_readonly("all_new_tokens",
+            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getAllNewTokens()); })
+        .def_property_readonly("finished_sum",
+            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getFinishedSum()); })
+        .def_property_readonly("finish_reasons",
+            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getFinishReasons()); });
 
     m.def(
         "lamport_initialize_all",
@@ -396,6 +391,16 @@ void initBindings(pybind11::module_& m)
         [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
         "Lmaport initialize buffer");
+    m.def(
+        "delay_kernel",
+        [](int64_t delay_micro_secs, py::object py_stream)
+        {
+            // Get the raw stream handle from PyTorch stream object
+            auto stream_ptr = py_stream.attr("cuda_stream").cast<int64_t>();
+            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
+        },
+        "Delay kernel launch on the default stream");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
-from ..custom_op import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAIABLE
 
 
 class RMSNorm(nn.Module):
@@ -23,8 +23,8 @@ class RMSNorm(nn.Module):
         residual: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if IS_FLASHINFER_AVAIABLE:
-            from ..custom_op import (flashinfer_fused_add_rmsnorm,
-                                     flashinfer_rmsnorm)
+            from ..custom_ops import (flashinfer_fused_add_rmsnorm,
+                                      flashinfer_rmsnorm)
             if residual is not None:
                 flashinfer_fused_add_rmsnorm(hidden_states, residual,
                                              self.weight, self.variance_epsilon)

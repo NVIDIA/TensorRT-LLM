@@ -1332,15 +1332,15 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
 
         if (decodingMode.isExplicitDraftTokens())
         {
-            mDecoder->setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
+            mDecoder->getDecoderState().setupExplicitDraftTokens(mDecoderBuffers->explicitDraftTokensBuffers);
         }
         if (decodingMode.isLookahead())
         {
-            mDecoder->setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
+            mDecoder->getDecoderState().setupLookahead(mDecoderBuffers->lookaheadBuffers.value());
         }
         if (decodingMode.isEagle())
         {
-            mDecoder->setupEagle(mDecoderBuffers->eagleBuffers);
+            mDecoder->getDecoderState().setupEagle(mDecoderBuffers->eagleBuffers);
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -1666,8 +1666,8 @@ void TrtGptModelInflightBatching::setupDecoderStep(
             // Setup underlying decoder.
             auto const localBatchSize = batchSlots->getSize();
             auto samplingConfig = SamplingConfig(samplingConfigs);
-            mDecoder->getUnderlyingDecoder().setup(
-                samplingConfig, localBatchSize, batchSlots, {mDecoder->getJointDecodingOutput()}, {decoderRequests});
+            mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
+                {mDecoder->getDecoderState().getJointDecodingOutput()}, {decoderRequests});
 
             auto const& stream = mDecoder->getDecoderStream();
             CudaEvent event{};
@@ -1796,9 +1796,9 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
         // Make sure that postprocessing is done before copying outputIds
         mCopyBufferManager.getStream().wait(event.get());
 
-        auto outputIds = mDecoder->getGatheredIds(seqSlot);
-        auto cumLogProbs = mDecoder->getCumLogProbs(seqSlot);
-        auto logProbs = mDecoder->getLogProbs(seqSlot);
+        auto outputIds = mDecoder->getDecoderState().getGatheredIds(seqSlot);
+        auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
+        auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
 
         runtime::CudaEvent beforeEvent{};
         mRuntime->getStreamPtr()->record(beforeEvent);
@@ -1981,20 +1981,20 @@ TrtGptModelInflightBatching::DecoderFinishedEventPtr TrtGptModelInflightBatching
     // Chain copy after decoder event, using a different stream
     mCopyBufferManager.getStream().wait(decoderFinishEvent->event);
 
-    mDecoderBuffers->newOutputTokens = mDecoder->getAllNewTokens();
+    mDecoderBuffers->newOutputTokens = mDecoder->getDecoderState().getAllNewTokens();
 
     mCopyBufferManager.copy(*mDecoderBuffers->newOutputTokens, *mDecoderBuffers->newOutputTokensHost);
     mCopyBufferManager.copy(*mDecoderBuffers->sequenceLengths, *mDecoderBuffers->sequenceLengthsHost);
 
-    auto const finishedSumDevice = mDecoder->getFinishedSum();
+    auto const finishedSumDevice = mDecoder->getDecoderState().getFinishedSum();
     mCopyBufferManager.copy(*finishedSumDevice, *mDecoderBuffers->finishedSumHost);
-    auto const finishReasonsDevice = mDecoder->getFinishReasons();
+    auto const finishReasonsDevice = mDecoder->getDecoderState().getFinishReasons();
     mCopyBufferManager.copy(*finishReasonsDevice, *mDecoderBuffers->finishReasonsHost);
 
     if (returnLogProbs)
     {
-        mDecoderBuffers->cumLogProbs = mDecoder->getCumLogProbs();
-        mDecoderBuffers->logProbs = mDecoder->getLogProbs();
+        mDecoderBuffers->cumLogProbs = mDecoder->getDecoderState().getCumLogProbs();
+        mDecoderBuffers->logProbs = mDecoder->getDecoderState().getLogProbs();
         mCopyBufferManager.copy(*mDecoderBuffers->cumLogProbs, *mDecoderBuffers->cumLogProbsHost);
         mCopyBufferManager.copy(*mDecoderBuffers->logProbs, *mDecoderBuffers->logProbsHost);
     }
@@ -2002,14 +2002,16 @@ TrtGptModelInflightBatching::DecoderFinishedEventPtr TrtGptModelInflightBatching
     if (mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
         // TODO(rkobus): keep data on device for next iteration
-        mDecoderBuffers->draftBuffers.nextDraftTokensDevice = mDecoder->getNextDraftTokens();
+        mDecoderBuffers->draftBuffers.nextDraftTokensDevice = mDecoder->getDecoderState().getNextDraftTokens();
         mCopyBufferManager.copy(
             *mDecoderBuffers->draftBuffers.nextDraftTokensDevice, *mDecoderBuffers->draftBuffers.nextDraftTokensHost);
 
         if (mModelConfig.getSpeculativeDecodingMode().variableDraftLength())
         {
-            mDecoderBuffers->draftBuffers.nextDraftTokensLengthsDevice = mDecoder->getNextDraftTokensLengths();
-            mDecoderBuffers->draftBuffers.prevDraftTokensLengthsDevice = mDecoder->getPrevDraftTokensLengths();
+            mDecoderBuffers->draftBuffers.nextDraftTokensLengthsDevice
+                = mDecoder->getDecoderState().getNextDraftTokensLengths();
+            mDecoderBuffers->draftBuffers.prevDraftTokensLengthsDevice
+                = mDecoder->getDecoderState().getPrevDraftTokensLengths();
             mCopyBufferManager.copy(*mDecoderBuffers->draftBuffers.nextDraftTokensLengthsDevice,
                 *mDecoderBuffers->draftBuffers.nextDraftTokensLengthsHost);
             mCopyBufferManager.copy(*mDecoderBuffers->draftBuffers.prevDraftTokensLengthsDevice,
@@ -2019,8 +2021,9 @@ TrtGptModelInflightBatching::DecoderFinishedEventPtr TrtGptModelInflightBatching
 
     if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
     {
-        mDecoderBuffers->draftBuffers.acceptedLengthsCumSumDevice = mDecoder->getAcceptedLengthsCumSum();
-        mDecoderBuffers->draftBuffers.acceptedPackedPathsDevice = mDecoder->getAcceptedPackedPaths();
+        mDecoderBuffers->draftBuffers.acceptedLengthsCumSumDevice
+            = mDecoder->getDecoderState().getAcceptedLengthsCumSum();
+        mDecoderBuffers->draftBuffers.acceptedPackedPathsDevice = mDecoder->getDecoderState().getAcceptedPackedPaths();
     }
 
     runtime::CudaEvent copyEvent{};

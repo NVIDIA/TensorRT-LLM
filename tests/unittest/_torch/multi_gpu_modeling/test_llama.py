@@ -29,7 +29,7 @@ def similar(a, b, threshold=0.9):
 @pytest.mark.parametrize("backend", ["TRTLLM", "FLASHINFER"],
                          ids=["trtllm", "flashinfer"])
 @pytest.mark.parametrize("quant", ["bf16", "fp8", "fp8_kv_cache"])
-@pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4], ids=["tp1", "tp2", "tp4"])
 @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
 @pytest.mark.parametrize("torch_compile", [True, False],
                          ids=["torch_compile", "eager"])
@@ -59,10 +59,6 @@ def test_llama(model_name, backend, quant, tp_size, pp_size, torch_compile):
     # 16GB weight + 8GB KV cache + 8GB cache_indirection (TRT engine only) = 32GB
     if not is_fp8 and get_total_gpu_memory(0) < 32 * 1024**3:
         pytest.skip("Not enough GPU memory to run BF16 model")
-    if pp_size > 1 and tp_size > 1:
-        pytest.skip(
-            "https://nvbugs/5164088 - Fails creating IPC memory when creating allreduce workspace"
-        )
     if torch_compile and pp_size > 1:
         pytest.skip(
             "Pipeline parallel with torch.compile is not supported yet.\n"

@@ -296,8 +296,16 @@ namespace cutlass_kernels
 
 def write_file(launcher_inl_files, operations, output_file):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    # Avoid changing modified time if file content is up to date
+    content = get_file_content(launcher_inl_files, operations)
+    try:
+        with open(output_file, mode="r") as f:
+            if f.read() == content:
+                return
+    except FileNotFoundError:
+        pass
     with open(output_file, mode="w") as f:
-        f.write(get_file_content(launcher_inl_files, operations))
+        f.write(content)
 
 
 from operator import mul, truediv
@@ -321,7 +329,11 @@ def is_gemm_op_valid_sm100(op):
     if (op.act_type == DataType.e4m3) and (tile_n == 16
                                            or tile_n == 8) and (cga_m == 1
                                                                 and cga_n == 1):
-        return True
+        # todo: double check why this is disable in CUTLASS backend. @yuhan
+        if tile_m == 128 and tile_n == 8:
+            return False
+        else:
+            return True
 
     # Default alignment requirements
     if tile_n % 32 != 0 or tile_n < 32 or tile_n > 256:
@@ -336,7 +348,7 @@ def is_gemm_op_valid_sm100(op):
         # TODO 128x256x256 FP4 compiles but crashes
         # if tile_n % 64 != 0 or tile_n < 128:
         #     return False
-        if tile_n != 128 or tile_m != 128:
+        if tile_n not in [64, 128] or tile_m != 128:
             return False
 
     return True

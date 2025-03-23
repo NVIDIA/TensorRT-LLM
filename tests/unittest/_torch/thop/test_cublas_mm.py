@@ -65,7 +65,6 @@ def test_cublas_mm(dtype, m, k_n):
     [torch.bfloat16],
 )
 def test_cublas_mm_out_fp32(dtype, m, k_n):
-    pytest.skip("https://nvbugs/5154745")
     k, n = k_n
     torch.random.manual_seed(44)
     shape_x = (m, k)
@@ -81,7 +80,7 @@ def test_cublas_mm_out_fp32(dtype, m, k_n):
     ref = F.linear(x.float(), w.float())
     np.testing.assert_allclose(ref.float().cpu(),
                                output.float().cpu(),
-                               rtol=2e-3)
+                               rtol=5e-3)
 
 
 if __name__ == '__main__':

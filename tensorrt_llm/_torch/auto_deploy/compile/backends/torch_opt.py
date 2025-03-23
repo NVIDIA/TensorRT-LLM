@@ -59,7 +59,7 @@ class CompiledGraph(nn.Module):
 
     @staticmethod
     def _get_graph_batch_sizes(
-        max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 8
+        max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 128
     ) -> List[int]:
         """Heuristic to set batch sizes for graph capture."""
         # do 1, max_bs, and extra as special batch sizes

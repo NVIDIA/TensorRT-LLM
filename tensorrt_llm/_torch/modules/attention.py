@@ -125,6 +125,7 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
+        mrope_config: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
@@ -152,7 +153,8 @@ class Attention(nn.Module):
                                             None,
                                             attn_metadata,
                                             out_scale=out_scale,
-                                            attention_mask=attention_mask)
+                                            attention_mask=attention_mask,
+                                            mrope_config=mrope_config)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
@@ -166,7 +168,8 @@ class Attention(nn.Module):
                                             k.contiguous(),
                                             v.contiguous(),
                                             attn_metadata,
-                                            attention_mask=attention_mask)
+                                            attention_mask=attention_mask,
+                                            mrope_config=mrope_config)
 
         attn_output = self.o_proj(attn_output)
 
@@ -189,6 +192,7 @@ class MLA(nn.Module):
         predicted_tokens_per_seq: int,
         max_position_embeddings: int,
         bias: bool,
+        aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
         layer_idx: Optional[int] = None,
@@ -414,6 +418,8 @@ class MLA(nn.Module):
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
         )
         self.rotary_emb = rotary_emb
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
     def forward(
         self,
@@ -432,8 +438,19 @@ class MLA(nn.Module):
                 hidden_states).split([
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
                 ], -1)
-            compressed_q = self.q_a_layernorm(compressed_q)
-            compressed_kv = self.kv_a_layernorm(compressed_kv)
+            do_multi_stream = torch.cuda.is_current_stream_capturing(
+            ) and self.aux_stream is not None
+            if do_multi_stream:
+                self.ln_events[0].record()
+                compressed_kv = self.kv_a_layernorm(compressed_kv)
+                with torch.cuda.stream(self.aux_stream):
+                    self.ln_events[0].wait()
+                    compressed_q = self.q_a_layernorm(compressed_q)
+                    self.ln_events[1].record()
+                self.ln_events[1].wait()
+            else:
+                compressed_q = self.q_a_layernorm(compressed_q)
+                compressed_kv = self.kv_a_layernorm(compressed_kv)
 
         q = self.q_b_proj(compressed_q)
 

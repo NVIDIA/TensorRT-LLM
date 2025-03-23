@@ -20,6 +20,7 @@ from .bert.model import (BertForQuestionAnswering,
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
+from .clip.model import CLIPVisionTransformer
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .commandr.model import CohereForCausalLM
@@ -50,6 +51,8 @@ from .mmdit_sd3.model import SD3Transformer2DModel
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
+from .multimodal_encoders.config import LlavaNextVisionConfig
+from .multimodal_encoders.model import LlavaNextVisionWrapper
 from .nemotron_nas.model import DeciLMForCausalLM
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
@@ -68,6 +71,7 @@ __all__ = [
     'RobertaForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
+    'CLIPVisionTransformer',
     'DiT',
     'SD3Transformer2DModel',
     'STDiT3',
@@ -84,6 +88,8 @@ __all__ = [
     'LLaMAConfig',
     'LLaMAForCausalLM',
     'LLaMAModel',
+    'LlavaNextVisionWrapper',
+    'LlavaNextVisionConfig',
     'MedusaConfig',
     'MedusaForCausalLm',
     'ReDrafterForCausalLM',
@@ -158,6 +164,7 @@ MODEL_MAP = {
     'ChatGLMForConditionalGeneration': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
     'LlavaLlamaModel': LLaMAForCausalLM,
+    'LlavaNextForConditionalGeneration': LlavaNextVisionWrapper,
     'ExaoneForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,

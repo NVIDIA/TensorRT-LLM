@@ -53,6 +53,7 @@ add_library(
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
   gatherTreeOp.cpp
+  logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   fp8BlockScaleMoe.cpp

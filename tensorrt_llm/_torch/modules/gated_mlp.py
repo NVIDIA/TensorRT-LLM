@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..custom_op import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAIABLE
 from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from .linear import Linear, WeightMode, WeightsLoadingConfig
@@ -14,7 +14,7 @@ from .linear import Linear, WeightMode, WeightsLoadingConfig
 def swiglu(x):
     if IS_FLASHINFER_AVAIABLE:
         # WAR for flashinfer activation since it does not support custom op properly
-        from ..custom_op import flashinfer_silu_and_mul
+        from ..custom_ops import flashinfer_silu_and_mul
         return flashinfer_silu_and_mul(x)
     else:
         gate, x = x.chunk(2, dim=-1)
@@ -31,7 +31,7 @@ class GatedMLP(nn.Module):
                  activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
-                 use_dp: bool = False,
+                 overridden_tp_size: Optional[int] = None,
                  is_expert: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
@@ -39,12 +39,16 @@ class GatedMLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
-        if use_dp:
-            tp_rank = 0
-            tp_size = 1
+        if overridden_tp_size is not None:
+            assert config.mapping.tp_size % overridden_tp_size == 0
+            tp_rank = config.mapping.tp_rank % overridden_tp_size
+            tp_size = overridden_tp_size
+            # "Misuse" pp_size here to perform all-reduce within smaller groups
+            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
         else:
             tp_rank = config.mapping.tp_rank
             tp_size = config.mapping.tp_size
+            pp_size = config.mapping.pp_size
         gpus_per_node = config.mapping.gpus_per_node
 
         self.gate_up_proj = Linear(
@@ -57,7 +61,7 @@ class GatedMLP(nn.Module):
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=config.mapping.pp_size,
+                pipeline_parallel_size=pp_size,
                 parallel_rank=config.mapping.rank),
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
@@ -75,7 +79,7 @@ class GatedMLP(nn.Module):
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=config.mapping.pp_size,
+                pipeline_parallel_size=pp_size,
                 parallel_rank=config.mapping.rank),
             quant_config=config.get_quant_config(),
             is_expert=is_expert,

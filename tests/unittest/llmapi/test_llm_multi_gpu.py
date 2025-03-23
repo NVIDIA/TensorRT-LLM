@@ -28,8 +28,8 @@ from test_llm import (
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
 from test_llm_kv_cache_events import create_llm
-from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
-                        skip_single_gpu, unittest_name_func, force_ampere)
+from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
+                        unittest_name_func, force_ampere)
 # isort: on
 
 # shrink the kv_cache_config to avoid OOM in CI
@@ -68,7 +68,8 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     return tmpdir
 
 
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part0
 def test_llm_loading_from_ckpt_for_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
@@ -79,7 +80,8 @@ def test_llm_loading_from_ckpt_for_tp2(
                      kv_cache_config=global_kv_cache_config)
 
 
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part0
 def test_llm_generate_tp2():
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -113,7 +115,8 @@ def test_llm_return_generation_logits_tp2():
                          ids=["enable_auto_parallel", "disable_auto_parallel"])
 @pytest.mark.parametrize("from_ckpt", [True, False],
                          ids=["from_ckpt", "from_hf"])
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part0
 def test_llm_generate_async_tp2(
         engine_from_checkpoint: tempfile.TemporaryDirectory, from_ckpt: bool,
         use_auto_parallel: bool):
@@ -129,8 +132,9 @@ def test_llm_generate_async_tp2(
                              tokenizer=tokenizer)
 
 
-@skip_single_gpu
 @skip_gpu_memory_less_than(70 * 1024**3)
+@pytest.mark.gpu2
+@pytest.mark.part1
 def test_llm_generate_mixtral_for_tp2():
     llm = LLM(get_model_path(mixtral_model_name),
               tensor_parallel_size=2,
@@ -139,8 +143,9 @@ def test_llm_generate_mixtral_for_tp2():
         print(output)
 
 
-@skip_single_gpu
 @skip_gpu_memory_less_than(70 * 1024**3)
+@pytest.mark.gpu2
+@pytest.mark.part1
 def test_llm_generate_mixtral_for_ep2():
     llm = LLM(get_model_path(mixtral_model_name),
               tensor_parallel_size=2,
@@ -164,6 +169,8 @@ def test_llm_generate_mixtral_for_ep2():
         assert pretrained_config.mapping.moe_ep_size == 2
 
 
+@pytest.mark.gpu2
+@pytest.mark.part2
 def test_llm_pp2():
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -180,7 +187,8 @@ def llm_end2end_tp2_cases():
 
 
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part2
 def test_llm_end2end_tp2(llm_additional_options):
     model_path = get_model_path(default_model_name)
 
@@ -213,27 +221,36 @@ def test_llm_end2end_tp2(llm_additional_options):
                      sampling_params=SamplingParams(max_tokens=8))
 
 
-@skip_num_gpus_less_than(4)
+@pytest.mark.gpu4
+@pytest.mark.part0
 def test_tinyllama_logits_processor_tp2pp2():
     tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
                                             pipeline_parallel_size=2)
 
 
-@skip_num_gpus_less_than(4)
-def test_tinyllama_guided_decoding_tp2pp2():
+@pytest.mark.gpu4
+@pytest.mark.part0
+@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
+def test_tinyllama_guided_decoding_tp2pp2(backend: str):
+    llm_kwargs = {}
+    if backend == 'pytorch':
+        llm_kwargs['backend'] = 'pytorch'
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config)
+        kv_cache_config=global_kv_cache_config,
+        **llm_kwargs)
 
 
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part3
 def test_llama_v2_13b_lora_tp2():
     llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
                                    kv_cache_config=global_kv_cache_config)
 
 
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
     llama_7b_multi_lora_test_harness(tensor_parallel_size=2,
                                      max_loras=1,
@@ -241,7 +258,8 @@ def test_llama_7b_multi_lora_tp2():
                                      kv_cache_config=global_kv_cache_config)
 
 
-@skip_single_gpu
+@pytest.mark.gpu2
+@pytest.mark.part3
 def test_llama_v2_7b_prompt_adapter_tp2():
     llama_v2_7b_prompt_adapter_test_harness(
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
@@ -273,6 +291,17 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
+    print(f"Command: {command}")
+
+    run_command(command)
+
+
+@skip_single_gpu
+def test_llm_multi_node_pytorch():
+    nworkers = 2
+    test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
+    os.path.join(os.path.dirname(__file__), "launch.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers} --use_pytorch"
     print(f"Command: {command}")
 
     run_command(command)

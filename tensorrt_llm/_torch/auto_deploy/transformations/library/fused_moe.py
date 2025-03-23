@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional
 import torch
 from torch.fx import GraphModule, Node
 
+from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import identify_regions_between_residuals, is_linear_op, is_op
 from .._graph import canonicalize_graph
@@ -29,6 +30,8 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
 
             # Identify routing_weights and selected_experts from the output of topk node
             topk_output_mapping = {n.args[1]: n for n in topk_node.users}
+            if len(topk_output_mapping) < 2:
+                continue
             routing_weights, selected_experts = topk_output_mapping[0], topk_output_mapping[1]
 
             # Step 2: Identify normalized_routing_weights
@@ -94,8 +97,19 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     ad_logger.info("MoE fusion")
     ad_logger.debug("Before MoE fusion: " + str(gm))
-    graph = gm.graph
+
+    with cuda_memory_tracker():
+        _insert_fused_moe_ops(gm)
+        gm = canonicalize_graph(gm)
+
+    ad_logger.debug("After MoE fusion: " + str(gm))
+    return gm
+
+
+def _insert_fused_moe_ops(gm: GraphModule):
     fused_key_counter = 0
+    graph = gm.graph
+
     for node in list(graph.nodes):
         if not is_op(node, torch.ops.moe.torch_moe):
             continue
@@ -137,10 +151,6 @@ def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
-
-    gm = canonicalize_graph(gm)
-    ad_logger.debug("After MoE fusion: " + str(gm))
-    return gm
 
 
 def _find_gate_linear_node(topk_node: Node, boundary: Optional[Node] = None) -> Optional[Node]:

@@ -187,6 +187,7 @@ class TrtllmAttentionWrapper:
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
+        mrope_config: Optional[dict] = None,
         **kwargs,
     ):
         """
@@ -213,6 +214,7 @@ class TrtllmAttentionWrapper:
             kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
+            mrope_config (dict): The dictionary containing the mRope configuration.
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -238,6 +240,10 @@ class TrtllmAttentionWrapper:
         self.attention_input_type = int(attention_input_type)
         self.latent_cache = latent_cache
         self.q_pe = q_pe
+        self.mrope_rotary_cos_sin = mrope_config.get(
+            'mrope_rotary_cos_sin') if mrope_config is not None else None
+        self.mrope_position_deltas = mrope_config.get(
+            'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
 
@@ -402,6 +408,8 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
+            self.mrope_rotary_cos_sin,
+            self.mrope_position_deltas,
         )
         return output
 
@@ -487,7 +495,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             padded_tensor = torch.nn.utils.rnn.pad_sequence(
                 block_ids_per_seq_tensors, batch_first=True, padding_value=0)
             self.block_table_cuda[:padded_tensor.shape[0], :padded_tensor.
-                                  shape[1]].copy_(padded_tensor)
+                                  shape[1]].copy_(padded_tensor,
+                                                  non_blocking=True)
             self.block_ids_per_seq = self.block_table_cuda[
                 self.num_contexts:self.num_contexts +
                 self.num_generations, :padded_tensor.shape[1]]
@@ -586,6 +595,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
+        mrope_config: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # This is only for memory estimation for now.
@@ -660,6 +670,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             attention_input_type=attention_input_type,
             latent_cache=latent_cache,
             q_pe=q_pe,
+            mrope_config=mrope_config,
         )
         out_dtype = None
         if out_scale is not None:

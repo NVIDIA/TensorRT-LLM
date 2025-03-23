@@ -22,7 +22,8 @@ from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
 from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  GuidedDecodingParams, KvCacheConfig,
                                  KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, MedusaDecodingConfig)
+                                 LookaheadDecodingConfig, MedusaDecodingConfig,
+                                 RequestOutput)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
@@ -58,6 +59,33 @@ def get_reference_count(obj):
     return sys.getrefcount(obj) - 1
 
 
+def check_output(outputs: List[RequestOutput],
+                 references: Union[List[str], List[List[str]]],
+                 *,
+                 similar_threshold: float = 0.8,
+                 finish_reasons: Optional[List[str]] = None,
+                 stop_reasons: Optional[List[Union[int, str]]] = None):
+    assert len(outputs) == len(references)
+
+    for i, (output, reference) in enumerate(zip(outputs, references)):
+        if isinstance(reference, list):
+            # N output
+            assert len(output.outputs) == len(reference)
+            for j, (out, ref) in enumerate(zip(output.outputs, reference)):
+                assert similar(out.text, ref, threshold=similar_threshold)
+                if finish_reasons is not None:
+                    assert out.finish_reason == finish_reasons[i][j]
+                if stop_reasons is not None:
+                    assert out.stop_reason == stop_reasons[i][j]
+        else:
+            out = output.outputs[0]
+            assert similar(out.text, reference, threshold=similar_threshold)
+            if finish_reasons is not None:
+                assert out.finish_reason == finish_reasons[i]
+            if stop_reasons is not None:
+                assert out.stop_reason == stop_reasons[i]
+
+
 def llm_test_harness(model_dir: str,
                      inputs: List[str],
                      references: List[str],
@@ -81,16 +109,7 @@ def llm_test_harness(model_dir: str,
     llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
     outputs = llm.generate(inputs, sampling_params=sampling_params)
     print(outputs)
-    for out, ref in zip(outputs, references):
-        if isinstance(ref, list):
-            # N output
-            assert len(out.outputs) == len(ref)
-            for o, r in zip(out.outputs, ref):
-                assert similar(o.text, r, threshold=similar_threshold)
-        else:
-            assert similar(out.outputs[0].text,
-                           ref,
-                           threshold=similar_threshold)
+    check_output(outputs, references, similar_threshold=similar_threshold)
 
     assert gc.is_tracked(llm)
     assert len(
@@ -109,25 +128,12 @@ def llm_check_output(llm: LLM,
     outputs = llm.generate(inputs,
                            sampling_params=sampling_params,
                            **gen_kwargs)
-    assert len(outputs) == len(references)
-
-    for i, (output, target_output) in enumerate(zip(outputs, references)):
-        if isinstance(target_output, list):
-            # N output
-            assert len(output.outputs) == len(target_output)
-            for j, (out, ref) in enumerate(zip(output.outputs, target_output)):
-                assert similar(out.text, ref, threshold=similar_threshold)
-                if finish_reasons is not None:
-                    assert out.finish_reason == finish_reasons[i][j]
-                if stop_reasons is not None:
-                    assert out.stop_reason == stop_reasons[i][j]
-        else:
-            out = output.outputs[0]
-            assert similar(out.text, target_output, threshold=similar_threshold)
-            if finish_reasons is not None:
-                assert out.finish_reason == finish_reasons[i]
-            if stop_reasons is not None:
-                assert out.stop_reason == stop_reasons[i]
+    print(outputs)
+    check_output(outputs,
+                 references,
+                 similar_threshold=similar_threshold,
+                 finish_reasons=finish_reasons,
+                 stop_reasons=stop_reasons)
 
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
@@ -150,6 +156,7 @@ global_kvcache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                                enable_block_reuse=False)
 
 
+@pytest.mark.part0
 @force_ampere
 def test_llm_build_config():
     build_config = BuildConfig()
@@ -182,6 +189,7 @@ def test_llm_build_config():
         assert build_config1.max_seq_len == build_config.max_seq_len
 
 
+@pytest.mark.part0
 def test_llm_args_invalid_usage():
     runtime_max_batch_size = 3
     runtime_max_num_tokens = 2
@@ -203,6 +211,7 @@ def test_llm_args_invalid_usage():
     assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
 
 
+@pytest.mark.part0
 def test_llm_loading_from_hf():
     sampling_params = SamplingParams(max_tokens=8)
     llm_test_harness(llama_model_path,
@@ -212,6 +221,7 @@ def test_llm_loading_from_hf():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_llm_loading_from_ckpt():
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     assert tokenizer is not None
@@ -229,6 +239,7 @@ def test_llm_loading_from_ckpt():
 
 
 @pytest.mark.parametrize('model_format', ['hf', 'ckpt'])
+@pytest.mark.part0
 def test_llm_with_dummy_weights(model_format):
     # dummy_dir contains config.json and tokenizer files only
     # the test fails if load_format != 'dummy'
@@ -283,6 +294,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.batch_encode_plus(texts, **kwargs)
 
 
+@pytest.mark.part0
 def test_llm_with_customized_tokenizer():
     llm = LLM(
         model=llama_model_path,
@@ -296,6 +308,7 @@ def test_llm_with_customized_tokenizer():
         print(output)
 
 
+@pytest.mark.part0
 def test_llm_without_tokenizer():
     llm = LLM(
         model=llama_model_path,
@@ -314,6 +327,7 @@ def test_llm_without_tokenizer():
         print(output)
 
 
+@pytest.mark.part0
 def test_llm_with_kv_cache_retention_config():
     kv_cache_retention_config = KvCacheRetentionConfig([
         KvCacheRetentionConfig.TokenRangeRetentionConfig(
@@ -342,6 +356,7 @@ def test_llm_with_kv_cache_retention_config():
         (llama_model_path, 0.95),
         (get_model_path(mixtral_model_name), 0.95)
     ])
+@pytest.mark.part0
 def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
     random.seed(42)
 
@@ -396,6 +411,7 @@ def is_memory_enough_for_mixtral():
         return False
 
 
+@pytest.mark.part0
 def test_llm_generate_async():
     _test_llm_generate_async()
 
@@ -506,6 +522,7 @@ def llm_for_sampling_params() -> LLM:
     return llm
 
 
+@pytest.mark.part0
 def test_user_specify_workspace():
     user_specified_ws_path = '/tmp/specified_workspace'
     shutil.rmtree(user_specified_ws_path, ignore_errors=True)
@@ -522,6 +539,7 @@ def test_user_specify_workspace():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
     llm = llm_for_sampling_params
     sampling_params_list = [
@@ -562,6 +580,7 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
         SamplingParams(max_tokens=6, n=3, use_beam_search=True),
         SamplingParams(max_tokens=6, n=2, best_of=3, use_beam_search=True),
     ])
+@pytest.mark.part0
 def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
                                       sampling_params: SamplingParams):
     llm = llm_for_sampling_params
@@ -572,6 +591,7 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_seed(llm_for_sampling_params: LLM):
     prompts = ["The capital of France is"] * 10
     # Use a high temperature and large max_tokens to increase the diversity
@@ -595,20 +615,29 @@ def test_generate_with_seed(llm_for_sampling_params: LLM):
 
 
 @force_ampere
-def test_generate_with_beam_search():
-    build_config = BuildConfig()
-    build_config.max_beam_width = 2
-    build_config.max_num_tokens = 20
+@pytest.mark.part0
+def test_generate_with_beam_search(llm_for_sampling_params: LLM):
+    llm = llm_for_sampling_params
+    references = [["D E F G H I", "D E F G I J"]]
+    sampling_params = SamplingParams(max_tokens=6, beam_width=2)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts, [["D E F G H I", "D E F G I J"]],
-        build_config=build_config,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
-        sampling_params=SamplingParams(max_tokens=6, beam_width=2))
+    # Non-streaming mode
+    outputs = llm.generate(prompts, sampling_params)
+    print(outputs)
+    check_output(outputs, references)
+
+    # Streaming mode
+    outputs = [
+        llm.generate_async(prompt, sampling_params, streaming=True)
+        for prompt in prompts
+    ]
+    outputs = [output.result() for output in outputs]
+    print(outputs)
+    check_output(outputs, references)
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_streaming_llm():
     # TODO[chunweiy]: Test with larger size when the underlying support is ready
     build_config = BuildConfig()
@@ -630,6 +659,7 @@ def test_generate_with_streaming_llm():
                      kv_cache_config=kv_cache_config)
 
 
+@pytest.mark.part0
 def test_parallel_config():
     config = _ParallelConfig()
     config.tp_size = 2
@@ -645,6 +675,7 @@ def test_parallel_config():
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("return_log_probs", [True])  # prune space
+@pytest.mark.part0
 def test_generate_with_OutputConfig(gather_context_logits: bool,
                                     gather_generation_logits: bool,
                                     return_log_probs: bool):
@@ -684,6 +715,7 @@ def test_generate_with_OutputConfig(gather_context_logits: bool,
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_stop_words():
     llm = LLM(
         model=llama_model_path,
@@ -746,6 +778,7 @@ def test_generate_with_stop_words():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_bad_words():
     llm = LLM(
         model=llama_model_path,
@@ -771,6 +804,7 @@ def test_generate_with_bad_words():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_sampling_params_misc():
     llm = LLM(
         model=llama_model_path,
@@ -835,6 +869,7 @@ def test_generate_with_sampling_params_misc():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_generate_with_embedding_bias():
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
@@ -853,6 +888,7 @@ def test_generate_with_embedding_bias():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_invalid_embedding_bias():
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
@@ -875,6 +911,7 @@ def test_invalid_embedding_bias():
 
 
 @skip_pre_hopper
+@pytest.mark.part0
 def test_generate_with_embedding_bias_fp8():
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
@@ -909,6 +946,7 @@ def test_generate_with_embedding_bias_fp8():
 
 
 @skip_pre_hopper
+@pytest.mark.part0
 def test_invalid_embedding_bias_fp8():
     tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
@@ -961,6 +999,7 @@ def tinyllama_logits_processor_test_harness(**llm_kwargs):
 
 
 @force_ampere
+@pytest.mark.part0
 def test_tinyllama_logits_processor():
     tinyllama_logits_processor_test_harness()
 
@@ -996,6 +1035,7 @@ def tinyllama_logits_processor_batched_test_harness(**llm_kwargs):
 
 
 @force_ampere
+@pytest.mark.part0
 def test_tinyllama_logits_processor_batched():
     tinyllama_logits_processor_batched_test_harness()
 
@@ -1051,10 +1091,16 @@ def tinyllama_guided_decoding_test_harness(**llm_kwargs):
 
 
 @force_ampere
-def test_tinyllama_guided_decoding():
-    tinyllama_guided_decoding_test_harness()
+@pytest.mark.part0
+@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
+def test_tinyllama_guided_decoding(backend: str):
+    llm_kwargs = {}
+    if backend == 'pytorch':
+        llm_kwargs['backend'] = 'pytorch'
+    tinyllama_guided_decoding_test_harness(**llm_kwargs)
 
 
+@pytest.mark.part0
 def test_llm_api_medusa():
     prompts = [
         "Hello, my name is",
@@ -1096,6 +1142,7 @@ def test_llm_api_medusa():
 
 
 @skip_single_gpu
+@pytest.mark.part0
 def test_llm_api_medusa_tp2():
     prompts = [
         "Hello, my name is",
@@ -1134,6 +1181,7 @@ def test_llm_api_medusa_tp2():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
+@pytest.mark.part0
 def test_llm_api_eagle():
     prompts = [
         "Hello, my name is",
@@ -1174,6 +1222,7 @@ def test_llm_api_eagle():
 
 
 @skip_single_gpu
+@pytest.mark.part0
 def test_llm_api_eagle_tp2():
     prompts = [
         "Hello, my name is",
@@ -1762,6 +1811,8 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
 
     async def task1():
         results = []
+        await asyncio.sleep(
+            3)  # ensure there's stats to collect for the assertion
         async for stats in llm.get_stats_async(timeout=2):
             print(stats)
             results.append(stats)

@@ -314,7 +314,6 @@ class TestMLlama(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mllama.config.hidden_size // mllama.config.num_attention_heads
         num_layers = mllama.config.num_hidden_layers
-        num_heads = mllama.config.num_attention_heads
         num_kv_heads = mllama.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -333,7 +332,6 @@ class TestMLlama(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

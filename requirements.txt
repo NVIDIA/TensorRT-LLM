@@ -40,9 +40,10 @@ pyzmq
 fastapi==0.115.4
 uvicorn
 httpx
-setuptools
+setuptools<77.0.1
 ordered-set
 peft
 einops
 flashinfer-python~=0.2.3
 opencv-python-headless
+xgrammar==0.1.16

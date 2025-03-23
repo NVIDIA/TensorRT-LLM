@@ -299,7 +299,7 @@ private:
                 selectKernelParams.mSelectNewKernel = true;
             }
             else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
-                && selectKernelParams.mTileSizeKv == 128)
+                && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
                 selectKernelParams.mTileSizeKv = 64;
@@ -378,20 +378,17 @@ private:
             {
                 // Otherwise, we use the high-throughput kernel (KeepsMmaAbForGeneration with tileSizeQ = 64).
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // FIXME: there are some bugs when using 2 CTA MMA, so disable it for now.
                 // Uses 2 CTA MMA if numHeadsQPerKv is 128.
-                // if(params.mNumHeadsQPerKv == 128) {
-                //     selectKernelParams.mUses2CtaMma = true;
-                //     // Each Cta only handles 256 headDimV.
-                //     selectKernelParams.mHeadDimPerCtaV = 256;
-                // }
+                if (params.mNumHeadsQPerKv == 128)
+                {
+                    selectKernelParams.mUses2CtaMma = true;
+                    // Each Cta only handles 256 headDimV.
+                    selectKernelParams.mHeadDimPerCtaV = 256;
+                }
                 // Set the multiCtasKvMode to false and use the persistent scheduler for high-throughput generation
                 // kernels.
                 selectKernelParams.mMultiCtasKvMode = false;
-                // The 2CtaMma kernels are having reg spilling issues when enabling persistent scheduler. Use static
-                // scheduler for now.
-                selectKernelParams.mTileScheduler
-                    = selectKernelParams.mUses2CtaMma ? TileScheduler::Static : TileScheduler::Persistent;
+                selectKernelParams.mTileScheduler = TileScheduler::Persistent;
             }
         }
         else if (isGenerationKernel(params.mKernelType))

@@ -302,7 +302,15 @@ void initRequestBindings(pybind11::module_& m)
         .def_property_readonly("max_ngram_size", &tle::LookaheadDecodingConfig::getNgramSize)
         .def_property_readonly("max_verification_set_size", &tle::LookaheadDecodingConfig::getVerificationSetSize)
         .def("calculate_speculative_resource", &tle::LookaheadDecodingConfig::calculateSpeculativeResource)
-        .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate));
+        .def_static(
+            "calculate_speculative_resource_tuple", &tle::LookaheadDecodingConfig::calculateSpeculativeResourceTuple)
+        .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate))
+        .def_static("get_default_lookahead_decoding_window",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingWindow; })
+        .def_static("get_default_lookahead_decoding_ngram",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingNgram; })
+        .def_static("get_default_lookahead_decoding_verification_set",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingVerificationSet; });
 
     auto TokenRangeRetentionConfigGetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig const& self)
     { return py::make_tuple(self.tokenStart, self.tokenEnd, self.priority, self.durationMs); };

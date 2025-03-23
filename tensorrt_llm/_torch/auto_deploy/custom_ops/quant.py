@@ -204,7 +204,6 @@ def fp4_linear(
     best_config_id = profiler.get_best_config_id(np.prod(input_shape[:-1]), n, k)
 
     # FP4 compatibility
-    assert bias is None  # Bias is not supported yet
     assert input_scale is not None
     assert weight_scale is not None
     assert alpha is not None
@@ -215,6 +214,9 @@ def fp4_linear(
     output = profiler.run_gemm(
         x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, best_config_id
     )
+
+    if bias is not None:
+        output = output + bias
 
     return output.reshape(*input_shape[:-1], n)
 

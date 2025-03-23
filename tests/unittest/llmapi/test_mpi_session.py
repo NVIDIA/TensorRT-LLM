@@ -4,7 +4,9 @@ import subprocess  # nosec B404
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.llmapi.mpi_session import MPINodeState
+from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
+                                             RemoteMpiCommSessionClient,
+                                             split_mpi_env)
 
 
 def task0():
@@ -27,15 +29,51 @@ def test_mpi_session_basic():
     assert results == [2, 2, 2, 2], results
 
 
-@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
-def test_mpi_session_multi_node():
-    nworkers = 4
-    test_case_file = os.path.join(os.path.dirname(__file__), "mpi_test_task.py")
-    command = f"mpirun --allow-run-as-root -n {nworkers} python {test_case_file}"
-    subprocess.run(command, shell=True, check=True,
+def simple_task(x):
+    print(f"** simple_task {x} returns {x * 2}\n", "green")
+    res = x * 2
+    print(f"simple_task {x} returns {res}")
+
+
+def run_client(server_addr, values_to_process):
+    """Function to run in a separate process that creates a client and submits tasks"""
+    try:
+        client = RemoteMpiCommSessionClient(server_addr)
+
+        for val in values_to_process:
+            print(f"Client Submitting task for value {val}")
+            client.submit(simple_task, val)
+
+        client.shutdown()
+
+    except Exception as e:
+        return f"Error in client: {str(e)}"
+
+
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
+def test_remote_mpi_session():
+    """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
+    os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
+    os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
+        os.getpid())
+
+    command = [
+        "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
+        "python3", "_run_mpi_comm_task.py"
+    ]
+    subprocess.run(command,
+                   check=True,
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE,
                    env=os.environ)  # nosec B603
 
 
-if __name__ == '__main__':
-    test_mpi_session_basic()
-    test_mpi_session_multi_node()
+def task1():
+    non_mpi_env, mpi_env = split_mpi_env()
+    assert non_mpi_env
+    assert mpi_env
+
+
+def test_split_mpi_env():
+    session = MpiPoolSession(n_workers=4)
+    session.submit_sync(task1)

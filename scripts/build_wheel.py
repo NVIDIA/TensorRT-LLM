@@ -67,6 +67,7 @@ def clear_folder(folder_path):
 
 def main(*,
          build_type: str = "Release",
+         generator: str = "",
          build_dir: Path = None,
          dist_dir: Path = None,
          cuda_architectures: str = None,
@@ -83,6 +84,7 @@ def main(*,
          cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
+         linking_install_binary: bool = False,
          python_bindings: bool = True,
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
@@ -143,7 +145,9 @@ def main(*,
 
         # The Ninja CMake generator is used for our Windows build
         # (Easier than MSBuild to make compatible with our Docker image)
-        cmake_generator = "-GNinja"
+
+    if generator:
+        cmake_generator = "-G" + generator
 
     if job_count is None:
         job_count = cpu_count()
@@ -191,30 +195,49 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
-    build_pyt = "OFF" if cpp_only else "ON"
-    th_common_lib = "" if cpp_only else "th_common"
-    build_pybind = "OFF" if cpp_only else "ON"
-    bindings_lib = "" if cpp_only else "bindings"
-    benchmarks_lib = "benchmarks" if benchmarks else ""
-    build_micro_benchmarks = "ON" if micro_benchmarks else "OFF"
-    micro_benchmarks_lib = "micro_benchmarks" if micro_benchmarks else ""
+    targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
+
+    if cpp_only:
+        build_pyt = "OFF"
+        build_pybind = "OFF"
+    else:
+        targets.extend(["bindings", "th_common"])
+        build_pyt = "ON"
+        build_pybind = "ON"
+
+    if benchmarks:
+        targets.append("benchmarks")
+
+    if micro_benchmarks:
+        targets.append("micro_benchmarks")
+        build_micro_benchmarks = "ON"
+    else:
+        build_micro_benchmarks = "OFF"
+
     disable_nvtx = "OFF" if nvtx else "ON"
-    executor_worker = "" if on_windows else "executorWorker "
+
+    if not on_windows:
+        targets.append("executorWorker")
 
     source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build or configure_cmake:
-            build_run(
+            cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
+                f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' {cmake_cuda_architectures} {cmake_def_args} {cmake_generator} -S "{source_dir}"'
             )
-        build_run(
+            print("CMake Configure command: ")
+            print(cmake_configure_command)
+            build_run(cmake_configure_command)
+        cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target tensorrt_llm nvinfer_plugin_tensorrt_llm {th_common_lib} {bindings_lib} {benchmarks_lib} '
-            f'{micro_benchmarks_lib} {executor_worker} {" ".join(extra_make_targets)}'
-        )
+            f'--target build_wheel_targets {" ".join(extra_make_targets)}')
+        print("CMake Build command: ")
+        print(cmake_build_command)
+        build_run(cmake_build_command)
 
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
@@ -255,28 +278,43 @@ def main(*,
     copytree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
              include_dir / "deep_gemm",
              dirs_exist_ok=True)
+
+    link_binary = copy
+    if skip_building_wheel and linking_install_binary:
+
+        def symlink_remove_dst(src, dst):
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+            if os.path.isdir(dst):
+                dst = os.path.join(dst, os.path.basename(src))
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.symlink(src, dst)
+
+        link_binary = symlink_remove_dst
+
     if on_windows:
-        copy(build_dir / "tensorrt_llm/tensorrt_llm.dll",
-             lib_dir / "tensorrt_llm.dll")
-        copy(build_dir / f"tensorrt_llm/thop/th_common.dll",
-             lib_dir / "th_common.dll")
-        copy(
+        link_binary(build_dir / "tensorrt_llm/tensorrt_llm.dll",
+                    lib_dir / "tensorrt_llm.dll")
+        link_binary(build_dir / f"tensorrt_llm/thop/th_common.dll",
+                    lib_dir / "th_common.dll")
+        link_binary(
             build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
-        copy(
+        link_binary(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/tensorrt_llm_nvrtc_wrapper.dll",
             lib_dir / "tensorrt_llm_nvrtc_wrapper.dll")
     else:
-        copy(build_dir / "tensorrt_llm/libtensorrt_llm.so",
-             lib_dir / "libtensorrt_llm.so")
-        copy(build_dir / "tensorrt_llm/thop/libth_common.so",
-             lib_dir / "libth_common.so")
-        copy(
+        link_binary(build_dir / "tensorrt_llm/libtensorrt_llm.so",
+                    lib_dir / "libtensorrt_llm.so")
+        link_binary(build_dir / "tensorrt_llm/thop/libth_common.so",
+                    lib_dir / "libth_common.so")
+        link_binary(
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
-        copy(
+        link_binary(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
@@ -284,15 +322,15 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
         ):
-            copy(
+            link_binary(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
-        copy(
+        link_binary(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
             lib_dir / "libdecoder_attention_0.so")
-        copy(
+        link_binary(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
@@ -303,8 +341,8 @@ def main(*,
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     if not on_windows:
-        copy(build_dir / "tensorrt_llm/executor_worker/executorWorker",
-             bin_dir / "executorWorker")
+        link_binary(build_dir / "tensorrt_llm/executor_worker/executorWorker",
+                    bin_dir / "executorWorker")
 
     if not cpp_only:
 
@@ -320,7 +358,7 @@ def main(*,
             ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
             return pybind_lib[0]
 
-        copy(get_pybind_lib(), pkg_dir)
+        link_binary(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
                 build_run(
@@ -394,6 +432,7 @@ def add_arguments(parser: ArgumentParser):
                         "-b",
                         default="Release",
                         choices=["Release", "RelWithDebInfo", "Debug"])
+    parser.add_argument("--generator", "-G", default="")
     parser.add_argument("--cuda_architectures", "-a")
     parser.add_argument("--install", "-i", action="store_true")
     parser.add_argument("--clean", "-c", action="store_true")
@@ -455,6 +494,10 @@ def add_arguments(parser: ArgumentParser):
         action="store_true",
         help=
         "Do not build the *.whl files (they are only needed for distribution).")
+    parser.add_argument(
+        "--linking_install_binary",
+        action="store_true",
+        help="Install the built binary by symbolic linking instead of copying.")
     parser.add_argument(
         "--python_bindings",
         "-p",

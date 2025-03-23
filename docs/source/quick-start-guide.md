@@ -4,18 +4,6 @@
 
 This is the starting point to try out TensorRT-LLM. Specifically, this Quick Start Guide enables you to quickly get setup and send HTTP requests using TensorRT-LLM.
 
-## Prerequisites
-
-- This quick start uses the Meta Llama 3.1 model. This model is subject to a particular [license](https://llama.meta.com/llama-downloads/). To download the model files, agree to the terms and [authenticate with Hugging Face](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true).
-
-- Complete the [installation](./installation/linux.md) steps.
-
-- Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the [Hugging Face Hub](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct).
-
-  ```console
-  git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct
-  ```
-
 ## LLM API
 The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.
 
@@ -29,8 +17,80 @@ Here is a simple example to show how to use the LLM API with TinyLlama.
 You can also directly load TensorRT Model Optimizer's [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
 To learn more about the LLM API, check out the [](llm-api/index) and [](llm-api-examples/index).
 
+(deploy-with-trtllm-serve)=
+## Deploy with trtllm-serve
+
+You can use the `trtllm-serve` command to start an OpenAI compatible server to interact with a model.
+To start the server, you can run a command like the following example:
+
+```bash
+trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
+
+After the server starts, you can access familiar OpenAI endpoints such as `v1/chat/completions`.
+You can run inference such as the following example:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "messages":[{"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Where is New York? Tell me in a single sentence."}],
+        "max_tokens": 32,
+        "temperature": 0
+    }'
+```
+
+_Example Output_
+
+```json
+{
+  "id": "chatcmpl-ef648e7489c040679d87ed12db5d3214",
+  "object": "chat.completion",
+  "created": 1741966075,
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "New York is a city in the northeastern United States, located on the eastern coast of the state of New York.",
+        "tool_calls": []
+      },
+      "logprobs": null,
+      "finish_reason": "stop",
+      "stop_reason": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 43,
+    "total_tokens": 69,
+    "completion_tokens": 26
+  }
+}
+```
+
+For examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve.rst) section.
+
+
+## Model Definition API
+
+### Prerequisites
+
+- This quick start uses the Meta Llama 3.1 model. This model is subject to a particular [license](https://llama.meta.com/llama-downloads/). To download the model files, agree to the terms and [authenticate with Hugging Face](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true).
+
+- Complete the [installation](./installation/linux.md) steps.
+
+- Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the [Hugging Face Hub](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct).
+
+  ```console
+  git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct
+  ```
+
 (quick-start-guide-compile)=
-## Compile the Model into a TensorRT Engine
+### Compile the Model into a TensorRT Engine
 
 Use the [Llama model definition](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) from the `examples/llama` directory of the GitHub repository.
 The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.
@@ -59,7 +119,7 @@ When you create a model definition with the TensorRT-LLM API, you build a graph 
 
 In this example, we included the `gpt_attention` plugin, which implements a FlashAttention-like fused attention kernel, and the `gemm` plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the [Llama example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) and {ref}`precision` section.
 
-## Run the Model
+### Run the Model
 
 Now that you have the model engine, run the engine and perform inference.
 
@@ -67,7 +127,7 @@ Now that you have the model engine, run the engine and perform inference.
 python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tokenizer_dir Meta-Llama-3.1-8B-Instruct --input_text "How do I count to nine in French?"
 ```
 
-## Deploy with Triton Inference Server
+### Deploy with Triton Inference Server
 
 To create a production-ready deployment of your LLM, use the [Triton Inference Server backend for TensorRT-LLM](https://github.com/triton-inference-server/tensorrtllm_backend) to leverage the TensorRT-LLM C++ runtime for rapid inference execution and include optimizations like in-flight batching and paged KV caching. Triton Inference Server with the TensorRT-LLM backend is available as a [pre-built container through NVIDIA NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver/tags).
 
@@ -81,16 +141,13 @@ cd tensorrtllm_backend
 
 2. Refer to [End to end workflow to run llama 7b](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md) in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.
 
-
 ## Next Steps
 
 In this Quick Start Guide, you:
 
-- Installed and built TensorRT-LLM
-- Retrieved the model weights
-- Compiled and ran the model
-- Deployed the model with Triton Inference Server
-- As an alternative to deploying the engine with FastAPI-based OpenAI API Server, you can use the [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) CLI.
+- Saw an example of the LLM API
+- Learned about deploying a model with `trtllm-serve`
+- Learned about the Model Definition API
 
 For more examples, refer to:
 

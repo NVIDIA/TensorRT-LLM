@@ -90,7 +90,7 @@ In addition, older architectures can have limitations for newer software release
 * -
   - Hardware Compatibility
 * - Operating System
-  - TensorRT-LLM requires Linux x86_64, Linux aarch64 or Windows.
+  - TensorRT-LLM requires Linux x86_64 or Linux aarch64.
 * - GPU Model Architectures
   -
     - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)

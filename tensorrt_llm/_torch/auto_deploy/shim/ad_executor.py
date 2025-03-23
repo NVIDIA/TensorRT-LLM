@@ -47,7 +47,6 @@ class _CacheManagerWithFakePool(KVCacheManager):
             kv_cache_config=kv_cache_config,
             kv_cache_type=CacheType.SELF,
             num_layers=1,
-            num_heads=1,
             num_kv_heads=1,
             head_dim=0,
             tokens_per_block=tokens_per_block,
@@ -261,7 +260,8 @@ def create_autodeploy_executor(
     max_batch_size = executor_config.max_batch_size
     max_seq_len = executor_config.max_seq_len
     tokens_per_block = executor_config.tokens_per_block
-    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {tokens_per_block=}")
+    max_num_tokens = executor_config.max_num_tokens
+    ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {tokens_per_block=}, {max_num_tokens=}")
 
     # initialize model engine
     engine = ADEngine.build_from_config(
@@ -271,6 +271,7 @@ def create_autodeploy_executor(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=tokens_per_block,
+            max_num_tokens=max_num_tokens,
         ),
         device="cuda",
     )

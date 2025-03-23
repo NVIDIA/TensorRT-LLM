@@ -1,12 +1,19 @@
 import abc
+import itertools
+import os
 import socket
 import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Optional, TypeVar
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
+
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+
+from .._utils import global_mpi_rank
+from .utils import print_colored_debug
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
@@ -49,9 +56,9 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
     e.g. mpirun -np 4 python script.py
     '''
     if ENABLE_MULTI_DEVICE:
-        return (mpi_world_size() == model_world_size
+        return (get_mpi_world_size() == model_world_size
                 and model_world_size > 1) or (global_mpi_size()
-                                              > mpi_world_size())
+                                              > get_mpi_world_size())
     else:
         return False
 
@@ -59,7 +66,7 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
 def need_spawn_mpi_workers(model_world_size: int) -> bool:
     ''' Check if the current process needs to spawn MPI workers. '''
     if ENABLE_MULTI_DEVICE:
-        return mpi_world_size() == 1 and model_world_size > 1
+        return get_mpi_world_size() == 1 and model_world_size > 1
     else:
         return False
 
@@ -134,7 +141,13 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
+        if not external_mpi_comm_available(n_workers):
+            raise RuntimeError('The LLM instance should be launched by mpirun.')
+
         self.comm = comm
+        self.n_workers = n_workers
+        self.thread_pool: Optional[ThreadPoolExecutor] = None
+        self.mpi_pool: Optional[MPIPoolExecutor] = None
 
         if n_workers <= 0:
             raise ValueError(
@@ -151,43 +164,24 @@ class MpiCommSession(MpiSession):
 
             if self.comm.Get_size() != n_workers:
                 raise ValueError(
-                    f'n_workers must be equal to the number of processes , got {n_workers} vs {mpi_world_size()}'
+                    f'n_workers must be equal to the number of processes in MPI, got {n_workers} vs {get_mpi_world_size()}'
                 )
 
-        self.n_workers = n_workers
-        self.thread_pool: Optional[ThreadPoolExecutor] = None
-        self.mpi_pool: Optional[MPIPoolExecutor] = None
-
         self._start_mpi_pool()
-
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
 
     def get_comm(self):
         return self.comm
 
-    def submit(self,
-               task: (...),
-               rank0_extra_kwargs: Optional[dict] = None,
-               *args,
-               **kwargs) -> List[Future]:
+    def submit(self, task: Callable[..., T], *args,
+               **kwargs) -> List[Future[T]]:
         ''' Submit a task to MPI workers.
 
         Args:
             task: The task to be submitted.
-            rank0_extra_kwargs: Extra keyword arguments for rank0 task.
             args: Positional arguments for the task.
             kwargs: Keyword arguments for the task.
         '''
         assert self.mpi_pool is not None, 'MPI session not started'
-        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra
-        # task dispatching to rank0 is needed
-        rank0_extra_kwargs = rank0_extra_kwargs or {}
-
-        rank0_params = kwargs.copy()
-        if rank0_extra_kwargs:
-            rank0_params.update(rank0_extra_kwargs)
-
         worker_futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers - 1)
@@ -197,7 +191,7 @@ class MpiCommSession(MpiSession):
         # TODO[chunweiy]: Remove this trick
         time.sleep(10)
 
-        rank0_future = self.thread_pool.submit(task, *args, **rank0_params)
+        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
@@ -223,7 +217,156 @@ class MpiCommSession(MpiSession):
         raise TypeError('cannot pickle MPI session')
 
 
+class RemoteTask(NamedTuple):
+    task: Callable[..., T]
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
+
+
+class RemoteMpiCommSessionClient():
+    '''
+    RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
+    '''
+
+    def __init__(self, addr: str):
+        print_colored_debug(
+            f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
+        self.addr = addr
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PAIR)
+        self.socket.connect(addr)
+        self._is_shutdown = False
+
+    def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
+        if self._is_shutdown:
+            print_colored_debug(
+                "RemoteMpiCommSessionClient is already shut down\n", "yellow")
+            return []
+        print_colored_debug(
+            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] Sending task {task} to {self.addr}\n",
+            "yellow")
+        self.socket.send_pyobj(RemoteTask(task, args, kwargs))
+        return []
+
+    def shutdown(self):
+        if self._is_shutdown:
+            return
+
+        try:
+            print_colored_debug(
+                f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
+                "green")
+            self.socket.send_pyobj(
+                None)  # ask RemoteMpiCommSessionServer to shutdown
+            self.socket.close()
+            self.context.term()
+        except zmq.error.ZMQError as e:
+            print_colored_debug(
+                f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
+                "red")
+        finally:
+            self._is_shutdown = True
+
+
+class RemoteMpiCommSessionServer():
+    '''
+    RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.
+    '''
+
+    def __init__(self,
+                 n_workers: int = 0,
+                 addr: str = f'tcp://127.0.0.1:*',
+                 comm=None,
+                 is_comm: bool = False):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PAIR)
+        self.socket.bind(addr)
+        self.addr = self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+        self.comm = comm
+
+        if self.comm is not None:
+            self.session = MpiCommSession(n_workers=self.comm.Get_size(),
+                                          comm=self.comm)
+        else:
+            self.session = MpiCommSession(
+                n_workers=n_workers) if is_comm else MpiPoolSession(
+                    n_workers=n_workers)
+
+    def serve(self):
+        print_colored_debug(
+            f"RemoteMpiCommSessionServer listening on {self.addr}\n", "yellow")
+        while True:
+            message: Optional[RemoteTask] = self.socket.recv_pyobj()
+            if message is None:
+                print_colored_debug(
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
+                    "green")
+                self.session.shutdown()
+                break
+            else:
+                print_colored_debug(
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task from {self.addr}\n",
+                    "green")
+                self.session.submit(message.task, *message.args,
+                                    **message.kwargs)
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
+
+
+def get_mpi_world_size() -> int:
+    # avoid cyclic import
+    from ..executor.utils import get_spawn_proxy_process_env
+
+    # If the proxy process is spawned, the MPI-related env will be cleaned in the proxy process, thus we made another env for the mpi_world_size
+    if get_spawn_proxy_process_env():
+        return int(os.getenv("tllm_mpi_size") or 1)
+    else:
+        return mpi_world_size()
+
+
+def split_mpi_env(mpi_env_keys: List[str] | None = None) -> Tuple[dict, dict]:
+    '''
+    Splits the environment variables into MPI-related and non-MPI-related dictionaries.
+
+    Args:
+        mpi_env_keys: Additional environment variables to be considered as MPI-related.
+
+    Returns:
+        Tuple[dict, dict]: (non_mpi_env, mpi_env)
+            - non_mpi_env: Environment dictionary without MPI-related variables
+            - mpi_env: Environment dictionary containing only MPI-related variables
+    '''
+    current_env = os.environ.copy()
+
+    # Identify MPI-related variables
+    mpi_vars = set(
+        itertools.chain([
+            var for var in current_env if var.startswith((
+                'MPI_',
+                'OMPI_',
+                'PMIX_',
+                'PMI_',
+                'OMPI_',
+                'PMIX_',
+                'PMI_',
+                'SLURM_',
+                'MPI_',
+                'UCX_',
+                'I_MPI_',
+                'HYDRA_',
+                'KMP_',
+                'MPICH_',
+                'MV2_',
+                'CRAY_',
+            ))
+        ], mpi_env_keys or []))
+
+    # Split into two dictionaries
+    non_mpi_env = {k: v for k, v in current_env.items() if k not in mpi_vars}
+    mpi_env = {k: v for k, v in current_env.items() if k in mpi_vars}
+
+    return non_mpi_env, mpi_env

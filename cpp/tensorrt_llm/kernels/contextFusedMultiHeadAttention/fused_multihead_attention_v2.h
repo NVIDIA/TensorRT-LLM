@@ -235,7 +235,8 @@ public:
     inline uint64_t hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved, bool unroll,
         bool force_fp32_acc, bool flash_attention, bool warp_specialization, bool is_alibi_supported,
         int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping,
-        unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v) const
+        unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v,
+        bool return_softmax) const
     {
         unsigned int log_block_size_q = (unsigned int) std::log2(sage_block_size_q);
         unsigned int log_block_size_k = (unsigned int) std::log2(sage_block_size_k);
@@ -249,8 +250,8 @@ public:
         {
             hash = s;
         }
-        return (uint64_t(hash) << 36) | (uint64_t(d) << 26) | (dv << 16) | (attention_mask_type << 10)
-            | (input_layout << 8) | (enable_attn_logit_softcapping ? 128ull : 0ull)
+        return (uint64_t(hash) << 37) | (uint64_t(d) << 27) | (dv << 17) | (attention_mask_type << 11)
+            | (input_layout << 9) | (return_softmax ? 256ull : 0ull) | (enable_attn_logit_softcapping ? 128ull : 0ull)
             | (is_alibi_supported ? 64ull : 0ull) | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull)
             | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
             | (unroll ? 1ull : 0ull);
@@ -263,7 +264,7 @@ public:
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
             kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout,
             kernelMeta.mTiled, kernelMeta.mEnableAttnLogitSoftcapping, kernelMeta.mSageBlockSizeQ,
-            kernelMeta.mSageBlockSizeK, kernelMeta.mSageBlockSizeV);
+            kernelMeta.mSageBlockSizeK, kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats);
     }
 
     // FMHA runner.
@@ -275,12 +276,12 @@ public:
 
         // Add debug info when kernels are not found.
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(),
-            "FMHA kernels are not found (kernel meta info: s=%d d=%d dv=%d %d %d %d %d %d %d %d %d %d %d) !",
+            "FMHA kernels are not found (kernel meta info: s=%d d=%d dv=%d %d %d %d %d %d %d %d %d %d %d %d) !",
             launch_params.kernel_s, params.d, params.dv, launch_params.interleaved, forceUnroll,
             launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
-            launch_params.enableAttnLogitSoftcapping);
+            launch_params.enableAttnLogitSoftcapping, launch_params.supportReturnSoftmaxStats);
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
@@ -381,7 +382,7 @@ public:
         uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
             static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
             params.attnLogitSoftcappingScale != 0.f, params.sageBlockSizeQ, params.sageBlockSizeK,
-            params.sageBlockSizeV);
+            params.sageBlockSizeV, false);
         auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
         return findIter != mFunctions.end();
     }
@@ -454,7 +455,7 @@ private:
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
             launch_params.enableAttnLogitSoftcapping, launch_params.sage_block_size_q, launch_params.sage_block_size_k,
-            launch_params.sage_block_size_v);
+            launch_params.sage_block_size_v, launch_params.supportReturnSoftmaxStats);
     }
 };
 

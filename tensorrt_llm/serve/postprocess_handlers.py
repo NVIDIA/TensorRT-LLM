@@ -282,6 +282,7 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
             text=text,
             index=args.prompt_idx * args.num_choices + output.index,
             disaggregated_params=disaggregated_params,
+            context_logits=None if rsp.context_logits is None else rsp.context_logits.tolist(),
             stop_reason=output.stop_reason,
             finish_reason=output.finish_reason,
         )

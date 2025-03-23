@@ -7,16 +7,47 @@ from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.mpi_session import MpiSession
+from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+                                  RemoteMpiCommSessionClient)
+from ..llmapi.utils import print_colored_debug
 
 BATCH_RESP_IN_AWAIT = os.getenv("TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT") == "1"
 
+
+def get_spawn_proxy_process_ipc_addr_env() -> str | None:
+    ''' Get the IPC address for the spawn proxy process dynamically. '''
+    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
+
+
+def get_spawn_proxy_process_env() -> bool:
+    ''' Get the environment variable for the spawn proxy process dynamically. '''
+    return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
+
+
 if BATCH_RESP_IN_AWAIT:
     logger.info("Using batched responses in await_responses")
+
+
+def create_mpi_comm_session(
+        n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
+    if get_spawn_proxy_process_env():
+        assert get_spawn_proxy_process_ipc_addr_env(
+        ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
+        print_colored_debug(
+            f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
+            "yellow")
+        return RemoteMpiCommSessionClient(
+            get_spawn_proxy_process_ipc_addr_env())
+    else:
+        print_colored_debug(
+            f"Using MpiCommSession to bind to external MPI processes\n",
+            "yellow")
+        return MpiCommSession(n_workers=n_workers)
 
 
 def has_event_loop() -> bool:
@@ -127,13 +158,3 @@ class WorkerCommIpcAddrs(NamedTuple):
     result_queue_addr: str
     stats_queue_addr: str
     kv_cache_events_queue_addr: str
-
-
-class WorkerCommQueues(NamedTuple):
-    ''' Queues for communication with the worker in the same process. '''
-    request_queue: IntraProcessQueue
-    request_error_queue: IntraProcessQueue
-    # result_queue could be an IPC address when postproc worker is enabled.
-    result_queue: IntraProcessQueue | str
-    stats_queue: IntraProcessQueue
-    kv_cache_events_queue: IntraProcessQueue

@@ -104,7 +104,6 @@ class TestMixtral(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mixtral.config.hidden_size // mixtral.config.num_attention_heads
         num_layers = mixtral.config.num_hidden_layers
-        num_heads = mixtral.config.num_attention_heads
         num_kv_heads = mixtral.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(sequence_length)
@@ -123,7 +122,6 @@ class TestMixtral(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -215,7 +213,6 @@ class TestMixtral(unittest.TestCase):
         tokens_per_block = 128
         head_dim = mixtral.config.hidden_size // mixtral.config.num_attention_heads
         num_layers = mixtral.config.num_hidden_layers
-        num_heads = mixtral.config.num_attention_heads
         num_kv_heads = mixtral.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -234,7 +231,6 @@ class TestMixtral(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

@@ -40,7 +40,8 @@ from ._common import _init, default_net, default_trtnet, precision
 # but may be called in dependencies (such as examples)
 from ._utils import mpi_barrier  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA
-from ._utils import (mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
+from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
+                     mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
                      torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
@@ -63,7 +64,10 @@ __all__ = [
     'logger',
     'str_dtype_to_trt',
     'torch_dtype_to_trt',
-    'str_dtype_to_torch'
+    'str_dtype_to_torch',
+    'default_gpus_per_node',
+    'local_mpi_rank',
+    'local_mpi_size',
     'mpi_barrier',
     'mpi_rank',
     'set_mpi_comm',

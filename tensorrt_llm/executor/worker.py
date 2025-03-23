@@ -17,12 +17,12 @@ from tensorrt_llm.logger import logger
 from .._utils import KVCacheEventSerializer, global_mpi_rank, mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
+from ..llmapi.llm_args import PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, enable_llm_debug, nvtx_range,
-                            print_colored, print_colored_debug,
-                            print_traceback_on_error)
+                            clear_sched_affinity, nvtx_range,
+                            print_colored_debug, print_traceback_on_error)
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -36,8 +36,7 @@ from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import (BATCH_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
-                    RequestError, WorkerCommIpcAddrs, WorkerCommQueues,
-                    has_event_loop)
+                    RequestError, WorkerCommIpcAddrs, has_event_loop)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -315,6 +314,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
+        mrope_config = None
         if request.prompt_adapter_request is not None:
             assert request.prompt_tuning_config is None, \
                 "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
@@ -329,6 +329,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
         elif request.prompt_tuning_config is not None:
             prompt_tuning_config = tllm.PromptTuningConfig(
                 request.prompt_tuning_config[0])
+
+        if request.mrope_config is not None:
+            mrope_config = tllm.MropeConfig(**request.mrope_config)
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -364,7 +367,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(),
-                lookahead_config=request.sampling_params.lookahead_config,
+                # Beam search enforces return_all_generated_tokens=True regardless of the passed value
+                return_all_generated_tokens=False,
+                # convert python config into pybind config
+                lookahead_config=PybindMirror.maybe_to_pybind(
+                    request.sampling_params.lookahead_config),
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
@@ -372,6 +379,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
@@ -380,6 +388,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update
@@ -426,12 +435,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._client_id_to_request_id.pop(client_id, None)
 
     def shutdown(self):
-        if enable_llm_debug():
-            try:
-                print_colored('Proxy.shutdown...\n', "yellow")
-                print(traceback.extract_stack())
-            except ValueError:
-                pass
+        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
@@ -456,6 +460,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
+
+        print_colored_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
 
     def block_subordinates(self):
         if self.rank != 0:
@@ -482,7 +488,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 @print_traceback_on_error
 def worker_main(
         engine: Path | Engine,
-        worker_queues: WorkerCommIpcAddrs | WorkerCommQueues,
+        worker_queues: WorkerCommIpcAddrs,
         log_level: str,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
@@ -490,8 +496,6 @@ def worker_main(
         tracer_init_kwargs: Optional[dict] = None,
         _torch_model_class_mapping: Optional[dict] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        rank0_extra_kwargs: Optional[
-            dict] = None,  # a placeholder for multi-node
         ready_signal: Optional[str] = None,
         is_llm_executor: Optional[
             bool] = True,  # whether it's the main executor instance
@@ -524,30 +528,24 @@ def worker_main(
     set_mpi_session_cpp(mpi_comm())
 
     if is_leader:
-        # Only set the log level for the leader process, the other processes will inherit the log level from "TLLM_LOG_LEVEL" environment variable
+        # Only set the log level for the leader process, the other processes will
+        # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
-        if isinstance(worker_queues, WorkerCommIpcAddrs):  # intra-process mode
-            request_queue = IpcQueue(worker_queues.request_queue_addr,
-                                     is_server=False,
-                                     name="worker_request_queue")
-            request_error_queue = IpcQueue(
-                worker_queues.request_error_queue_addr,
-                is_server=False,
-                name="worker_request_error_queue")
-            mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
-                                           is_server=False,
-                                           fuse_message=True,
-                                           name="worker_stats_queue")
-            kv_cache_events_queue = FusedIpcQueue(
-                worker_queues.kv_cache_events_queue_addr,
-                is_server=False,
-                fuse_message=False,
-                name="worker_kv_cache_events_queue")
-        else:
-            request_queue = worker_queues.request_queue
-            request_error_queue = worker_queues.request_error_queue
-            mp_stats_queue = worker_queues.stats_queue
-            kv_cache_events_queue = worker_queues.kv_cache_events_queue
+        request_queue = IpcQueue(worker_queues.request_queue_addr,
+                                 is_server=False,
+                                 name="worker_request_queue")
+        request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
+                                       is_server=False,
+                                       name="worker_request_error_queue")
+        mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
+                                       is_server=False,
+                                       fuse_message=True,
+                                       name="worker_stats_queue")
+        kv_cache_events_queue = FusedIpcQueue(
+            worker_queues.kv_cache_events_queue_addr,
+            is_server=False,
+            fuse_message=False,
+            name="worker_kv_cache_events_queue")
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -559,16 +557,12 @@ def worker_main(
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
-            if isinstance(worker_queues, WorkerCommIpcAddrs):
-                # IPC queue for sending results back to the proxy, and let the
-                # Proxy process to handle the postprocess
-                result_queue = FusedIpcQueue(
-                    worker_queues.result_queue_addr,
-                    is_server=False,
-                    fuse_message=not BATCH_RESP_IN_AWAIT,
-                    name="worker_result_queue")
-            else:
-                result_queue = worker_queues.result_queue
+            # IPC queue for sending results back to the proxy, and let the
+            # Proxy process to handle the postprocess
+            result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
+                                         is_server=False,
+                                         fuse_message=not BATCH_RESP_IN_AWAIT,
+                                         name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -584,15 +578,9 @@ def worker_main(
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
-        proxy_result_queue: str = worker_queues.result_queue if isinstance(
-            worker_queues,
-            WorkerCommQueues) else worker_queues.result_queue_addr
-
         print_colored_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: str = worker_queues.result_queue if isinstance(
-            worker_queues,
-            WorkerCommQueues) else worker_queues.result_queue_addr
+        proxy_result_queue: str = worker_queues.result_queue_addr
 
         assert result_queues is not None
         assert postproc_worker_config.postprocess_tokenizer_dir is not None
@@ -772,17 +760,23 @@ class AwaitResponseHelper:
         ''' Return the responses to Proxy via IPC. This will put Rsp to a Queue
         in a FusedIpcQueue, and a background thread will batch them and invoke
         IPC periodically. '''
-        for response in responses:
 
-            if self.worker._has_background_error():
-                response = self.worker._create_error_response(response)
-            elif response.has_error():
-                response = ErrorResponse(response.client_id, response.error_msg,
-                                         response.request_id)
+        with nvtx_range(f"handle_for_ipc_periodically-{len(responses)}",
+                        color="red",
+                        category="Worker"):
 
-            # TODO: To verify the performance of using ZMQ instead of SharedMemory
-            # to send the logits tensor back to the Proxy process.
-            _send_rsp(self.worker, response)
+            for response in responses:
+
+                if self.worker._has_background_error():
+                    response = self.worker._create_error_response(response)
+                elif response.has_error():
+                    response = ErrorResponse(response.client_id,
+                                             response.error_msg,
+                                             response.request_id)
+
+                # TODO: To verify the performance of using ZMQ instead of SharedMemory
+                # to send the logits tensor back to the Proxy process.
+                _send_rsp(self.worker, response)
 
     def handle_for_ipc_batched(self, responses: List[tllm.Response]) -> None:
         ''' Perform the IPC in batch explicitly. '''

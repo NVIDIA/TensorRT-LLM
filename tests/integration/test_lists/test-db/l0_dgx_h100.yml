@@ -1,0 +1,96 @@
+version: 0.0.1
+l0_dgx_h100:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/multi_gpu
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and not (tp1 and pp1) and nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and not (tp1 and pp1) and not nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "llama and not (tp1 and pp1)"
+  - unittest/_torch/auto_deploy/unit/multigpu
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8]
+  # ------------- CPP tests ---------------
+  - test_cpp.py::test_multi_gpu[90]
+  # ------------- TRT tests ---------------
+  - examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[disable_reduce_fusion-disable_fp8_context_fmha]
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[enable_reduce_fusion-enable_fp8_context_fmha]
+  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_pp4
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8_2gpus[cp2]
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_tp2cp2
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8_2gpus[pp2] # 2 mins
+  - examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp4pp2-nb:4]
+  - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-8b-enable_fp8]
+  - examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]
+  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part0"
+  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part1"
+  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part2"
+  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part3"
+  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0"
+  - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
+  - unittest/llmapi/test_llm_models_multi_gpu.py
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
+  - examples/test_qwen.py::test_llm_qwen_moe_multi_gpu_summary[qwen2_57b_a14b-tp4pp1-context_fmha]
+  - test_e2e.py::test_llmapi_exit_multi_gpu
+  - examples/test_mixtral.py::test_llm_mixtral_fp8_4gpus_summary[Mixtral-8x7B-v0.1-nb:4]
+  - examples/test_mixtral.py::test_llm_mixtral_fp8_managed_weights_4gpus_summary[Mixtral-8x7B-v0.1]
+  - examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B]
+  - test_e2e.py::test_llmapi_example_distributed_tp2
+  - unittest/functional/test_allreduce_norm.py
+  - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-cpp_e2e:False-nb:1]
+  - deterministic/test_mixtral_deterministic.py::test_llm_mixtral_4gpus_deterministic[Mixtral-8x7B-Instruct-v0.1-float16]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/auto_deploy/integration/test_ad_build.py
+  - unittest/_torch/auto_deploy/integration/test_lm_eval.py
+  # ------------- TRT tests ---------------
+  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2]
+  - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b]
+  - examples/test_dit.py::test_llm_dit_multiple_gpus[dit-xl-2-256x256-tp1]
+  - examples/test_mamba.py::test_llm_mamba2_2gpu[mamba-codestral-7B-v0.1]
+  - examples/test_phi.py::test_llm_phi_1node_2gpus_summary[phi-2-nb:4]
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_smooth_quant_ootb_tp2
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_int4_awq_tp2
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_int4_awq_pre_quantized_tp2
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_int4_gptq_pre_quantized_tp2
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[disable_reduce_fusion-enable_fp8_context_fmha]
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[enable_reduce_fusion-disable_fp8_context_fmha]
+  - test_e2e.py::test_llmapi_quant_llama_70b
+  - test_e2e.py::test_llmapi_example_distributed_autopp_tp2
+  - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-8b-disable_fp8]
+  - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[enable_gemm_allreduce_plugin-llama-3.1-8b-disable_fp8]
+  - examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[disable_gemm_allreduce_plugin-llama-3.1-8b-enable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
+  - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
+  - examples/test_gptj.py::test_llm_gptj_4gpus_summary
+  - test_e2e.py::test_model_api_examples_tp2
+  - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"

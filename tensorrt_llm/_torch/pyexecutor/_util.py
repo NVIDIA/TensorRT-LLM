@@ -104,10 +104,17 @@ def _create_dummy_context(req_id: int, input_len: int, vocab_size: int):
     return result
 
 
-def create_dummy_context_request(req_id: int, input_len: int,
+def create_dummy_context_request(max_num_tokens: int, max_seq_len: int,
                                  vocab_size: int) -> LlmRequest:
 
-    requests = [_create_dummy_context(req_id, input_len, vocab_size)]
+    requests = []
+    remaining_tokens = max_num_tokens
+    req_id = 0
+    while remaining_tokens > 0:
+        input_len = min(max_seq_len, remaining_tokens)
+        requests.append(_create_dummy_context(req_id, input_len, vocab_size))
+        remaining_tokens -= input_len
+        req_id += 1
     result = ScheduledRequests()
     result.generation_requests = []
     result.context_requests = requests
@@ -119,6 +126,7 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
                                  mapping: Mapping):
     vocab_size = model_engine.model.model_config.pretrained_config.vocab_size
     max_num_tokens = executor_config.max_num_tokens
+    max_seq_len = executor_config.max_seq_len
     fraction = executor_config.kv_cache_config.free_gpu_memory_fraction
     kv_cache_max_tokens = executor_config.kv_cache_config.max_tokens
     # todo: to support max token evaluation for cp mode
@@ -132,19 +140,26 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        req = create_dummy_context_request(0, max_num_tokens, vocab_size)
+        req = create_dummy_context_request(max_num_tokens, max_seq_len,
+                                           vocab_size)
         resource_manager.prepare_resources(req)
         model_engine.forward(req, resource_manager)
         torch.cuda.synchronize()
-        peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        # Get the torch-managed peak memory
+        torch_peak_memory = torch.cuda.memory_stats(
+        )["allocated_bytes.all.peak"]
+
+        # Clear the caching allocator before measuring the current memory usage
+        torch.cuda.empty_cache()
         end, total_gpu_memory = torch.cuda.mem_get_info()
 
-        torch.cuda.empty_cache()
         torch_used_bytes = torch.cuda.memory_stats(
         )["allocated_bytes.all.current"]
         total_used_bytes = total_gpu_memory - end
+        # Get the non-torch memory which comes from NCCL and some other components
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-        peak_memory += extra_cost
+        # Get the total peak memory
+        peak_memory = torch_peak_memory + extra_cost
         logger.info(
             f"Memory used outside torch in memory usage profiling: {extra_cost / (1<<30):.2f} GiB"
         )

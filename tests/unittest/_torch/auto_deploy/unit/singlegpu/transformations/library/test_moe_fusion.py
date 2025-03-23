@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from _graph_test_helpers import run_test
+from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.transformations.library.fused_moe import (
@@ -88,47 +89,6 @@ class MoEPatternModel(nn.Module):
 
     def get_input(self, device):
         return torch.randint(0, 100, (2, 10), device=device)
-
-
-class MoEOpModel(nn.Module):
-    def __init__(self, hidden_size=32, intermediate_size=16, num_experts=4, top_k=2):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_experts = num_experts
-        self.top_k = top_k
-
-        self.gate = nn.Linear(hidden_size, num_experts)
-
-        self.w1_weights = nn.ParameterList(
-            [nn.Parameter(torch.randn(intermediate_size, hidden_size)) for _ in range(num_experts)]
-        )
-        self.w2_weights = nn.ParameterList(
-            [nn.Parameter(torch.randn(hidden_size, intermediate_size)) for _ in range(num_experts)]
-        )
-        self.w3_weights = nn.ParameterList(
-            [nn.Parameter(torch.randn(intermediate_size, hidden_size)) for _ in range(num_experts)]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: Tensor of shape (batch, hidden_size)
-        Computes router logits via a gate, and then calls the MoE op via torch.fused_moe.torch_moe.
-        """
-
-        router_logits = self.gate(x)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(x.dtype)
-
-        out = torch.ops.moe.torch_moe(
-            x, selected_experts, routing_weights, self.w1_weights, self.w2_weights, self.w3_weights
-        )
-        return out
-
-    def get_input(self, device, dtype=torch.bfloat16):
-        return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
 
 
 def test_moe_matching():

@@ -157,6 +157,53 @@ class VisionTransformerLikeModel(nn.Module):
         return output
 
 
+class Expert(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.randn(intermediate_size, hidden_size))
+        self.w2 = nn.Parameter(torch.randn(hidden_size, intermediate_size))
+        self.w3 = nn.Parameter(torch.randn(intermediate_size, hidden_size))
+
+
+class MoEOpModel(nn.Module):
+    def __init__(self, hidden_size=32, intermediate_size=16, num_experts=4, top_k=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        self.gate = nn.Linear(hidden_size, num_experts)
+
+        self.experts = nn.ModuleList(
+            [Expert(hidden_size, intermediate_size) for _ in range(num_experts)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: Tensor of shape (batch, hidden_size)
+        Computes router logits via a gate, and then calls the MoE op via torch.moe.torch_moe.
+        """
+
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(x.dtype)
+
+        w1_list = [expert.w1 for expert in self.experts]
+        w2_list = [expert.w2 for expert in self.experts]
+        w3_list = [expert.w3 for expert in self.experts]
+
+        out = torch.ops.moe.torch_moe(
+            x, selected_experts, routing_weights, w1_list, w2_list, w3_list
+        )
+        return out
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {

@@ -1,5 +1,4 @@
 import argparse
-import time
 from typing import Any
 
 import modelopt.torch.opt as mto
@@ -8,8 +7,11 @@ from diffusers import DiffusionPipeline
 
 from tensorrt_llm._torch.auto_deploy.compile import compile_and_capture
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transformations.library.fusion import fuse_gemms
 from tensorrt_llm._torch.auto_deploy.transformations.library.quantization import quantize
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+
+torch._dynamo.config.cache_size_limit = 100
 
 
 def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> None:
@@ -28,18 +30,25 @@ def generate_image(pipe: DiffusionPipeline, prompt: str, image_name: str) -> Non
 @torch.inference_mode()
 def benchmark_model(model, generate_dummy_inputs, benchmarking_runs=200, warmup_runs=25) -> float:
     """Returns the latency of the model in seconds."""
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    input_data = generate_dummy_inputs()
+
     for _ in range(warmup_runs):
-        input_data = generate_dummy_inputs()
         _ = model(**input_data)
 
-    total_time = 0
+    torch.cuda.synchronize()
+
+    torch.cuda.profiler.cudart().cudaProfilerStart()
+    start_event.record()
     for _ in range(benchmarking_runs):
-        input_data = generate_dummy_inputs()
-        start_time = time.time()
         _ = model(**input_data)
-        end_time = time.time()
-        total_time += end_time - start_time
-    return total_time / benchmarking_runs
+    end_event.record()
+    end_event.synchronize()
+    torch.cuda.profiler.cudart().cudaProfilerStop()
+
+    return start_event.elapsed_time(end_event) / benchmarking_runs / 1000
 
 
 def generate_dummy_inputs(
@@ -127,7 +136,12 @@ def main():
 
     gm = torch_export_to_gm(model, args=(), kwargs=flux_kwargs, clone=True)
 
-    gm = quantize(gm, {}).to("cuda")
+    if args.restore_from:
+        quant_state_dict = model.state_dict()
+        gm = quantize(gm, {}).to("cuda")
+        gm.load_state_dict(quant_state_dict, strict=False)
+
+    gm = fuse_gemms(gm)
 
     gm = compile_and_capture(gm, backend="torch-opt", args=(), kwargs=flux_kwargs)
 

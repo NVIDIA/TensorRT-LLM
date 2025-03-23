@@ -91,6 +91,17 @@ void initBindings(pybind11::module_& m)
                 }
                 return value;
             })
+        .def("get_mrope_rotary_cos_sin",
+            [](GenLlmReq& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                auto tensor = self.getMropeRotaryCosSin();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(*tensor);
+                }
+                return value;
+            })
         .def("bad_words_list",
             [](GenLlmReq& self)
             {
@@ -161,6 +172,7 @@ void initBindings(pybind11::module_& m)
                 return value;
             })
         .def_property_readonly("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
+        .def_property_readonly("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_property_readonly("lookahead_config", &GenLlmReq::getLookaheadConfig)
         .def_property("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
@@ -199,6 +211,9 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("is_finished", &GenLlmReq::isFinished)
         .def_property(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+        .def_property_readonly("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def_property(
+            "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
@@ -208,6 +223,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly(
             "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
         .def_property_readonly("is_context_init_state", &GenLlmReq::isContextInitState)
+        .def_property_readonly("is_generation_in_progress_state", &GenLlmReq::isGenerationInProgressState)
         .def_property_readonly("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
         .def_property_readonly("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
         .def_property_readonly("llm_request_type", &GenLlmReq::getLlmRequestType)

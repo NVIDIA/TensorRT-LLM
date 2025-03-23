@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
+from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -121,24 +122,19 @@ def fuse_gemms(gm: GraphModule) -> GraphModule:
 
     # fuse linear nodes
     idx = -1
-    cuda_memory_before = torch.cuda.memory_allocated()
-    for parent_node, lin_children in linear_nodes.items():
-        if len(lin_children) < 2:
-            continue
-        # linear nodes to fuse
-        ad_logger.debug(
-            f"Found linear nodes to fuse: {lin_children} with parent node: {parent_node}"
-        )
-        _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+    with cuda_memory_tracker():
+        for parent_node, lin_children in linear_nodes.items():
+            if len(lin_children) < 2:
+                continue
+            # linear nodes to fuse
+            ad_logger.debug(
+                f"Found linear nodes to fuse: {lin_children} with parent node: {parent_node}"
+            )
+            _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
 
-    # clean up and return
-    gm = canonicalize_graph(gm)
-    cuda_memory_after = torch.cuda.memory_allocated()
+        # clean up and return
+        gm = canonicalize_graph(gm)
 
-    if cuda_memory_after > cuda_memory_before:
-        ad_logger.warning(
-            "Potential memory leak after gemm fusion, leaked memory: "
-            f"{cuda_memory_after - cuda_memory_before} byte"
-        )
     ad_logger.debug("After GEMM fusion: " + str(gm))
+    torch.cuda.empty_cache()
     return gm

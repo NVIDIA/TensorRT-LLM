@@ -1,6 +1,5 @@
 import concurrent.futures
 import time
-import traceback
 import weakref
 from typing import Dict, Optional, Union
 
@@ -9,20 +8,19 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_world_size
 from ..bindings import executor as tllm
-from ..llmapi.mpi_session import MpiCommSession, MpiPoolSession, MpiSession
+from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+                                  RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, print_colored)
+                            print_colored, print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
-from .utils import (ErrorResponse, IntraProcessQueue,
-                    ProcessPoolExecutorSession, WorkerCommIpcAddrs,
-                    WorkerCommQueues)
+from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
+                    create_mpi_comm_session, get_spawn_proxy_process_env)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -56,15 +54,18 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.workers_started = False
         self.worker_cls = worker_cls
 
+        mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+
         if mpi_session is None:
-            if model_world_size == mpi_world_size() and model_world_size > 1:
-                self.mpi_session = MpiCommSession(n_workers=model_world_size)
+            if mpi_process_pre_spawned:
+                self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
             self.mpi_session = mpi_session
 
-        if isinstance(self.mpi_session, MpiCommSession):
+        if isinstance(self.mpi_session,
+                      (MpiCommSession, RemoteMpiCommSessionClient)):
             print_colored(
                 "Using MpiCommSession to bind to external MPI processes\n",
                 "yellow")
@@ -76,11 +77,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        intra_node = isinstance(self.mpi_session,
-                                (MpiPoolSession, ProcessPoolExecutorSession))
-
         worker_kwargs = dict(**worker_kwargs,
-                             worker_queues=self._setup_queues(intra_node),
+                             worker_queues=self._setup_queues(),
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False)
 
@@ -92,77 +90,35 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
 
-    def _setup_queues(
-            self, intra_node: bool) -> WorkerCommIpcAddrs | WorkerCommQueues:
-        # For intra-node communication, we use IPC queues. While for inter-node
-        # communication, we use Queue instead as the MPI process is the Python
-        # main process in rank 0.
-        # TODO: In inter-node mode, it may necessary to spawn a separate process
-        # for the MPI process for higher streaming generation performance.
-        # TODO: Support postproc in the inter-node mode, since the postproc
-        # workers need IPC queues.
+    def _setup_queues(self) -> WorkerCommIpcAddrs:
 
-        if intra_node:
-            self.request_queue = IpcQueue(is_server=True,
-                                          name="proxy_request_queue")
-            self.request_error_queue = IpcQueue(
-                is_server=True, name="proxy_request_error_queue")
-            # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
-            # Use PULL mode when enable_postprocess_parallel as there are
-            # multiple senders from multiple processes.
-            self.result_queue = FusedIpcQueue(
-                is_server=True,
-                fuse_message=False,
-                socket_type=zmq.PULL
-                if self.enable_postprocess_parallel else zmq.PAIR,
-                name="proxy_result_queue")
-            self.mp_stats_queue = FusedIpcQueue(is_server=True,
-                                                fuse_message=False,
-                                                name="proxy_stats_queue")
-            self.kv_cache_events_queue = FusedIpcQueue(
-                is_server=True,
-                fuse_message=False,
-                name="proxy_kv_cache_events_queue")
-            return WorkerCommIpcAddrs(
-                request_queue_addr=self.request_queue.address,
-                request_error_queue_addr=self.request_error_queue.address,
-                result_queue_addr=self.result_queue.address,
-                stats_queue_addr=self.mp_stats_queue.address,
-                kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
-            )
-        else:
-            self.request_queue = IntraProcessQueue()
-            self.request_error_queue = IntraProcessQueue()
-            self.mp_stats_queue = IntraProcessQueue()
-            self.kv_cache_events_queue = IntraProcessQueue()
-
-            if self.enable_postprocess_parallel:
-                self.result_queue = FusedIpcQueue(
-                    is_server=True,
-                    fuse_message=False,
-                    socket_type=zmq.PULL
-                    if self.enable_postprocess_parallel else zmq.PAIR,
-                    name="proxy_result_queue")
-
-                res = WorkerCommQueues(
-                    request_queue=self.request_queue,
-                    request_error_queue=self.request_error_queue,
-                    result_queue=self.result_queue.address,
-                    stats_queue=self.mp_stats_queue,
-                    kv_cache_events_queue=self.kv_cache_events_queue,
-                )
-
-            else:
-                self.result_queue = IntraProcessQueue()
-                res = WorkerCommQueues(
-                    request_queue=self.request_queue,
-                    request_error_queue=self.request_error_queue,
-                    result_queue=self.result_queue,
-                    stats_queue=self.mp_stats_queue,
-                    kv_cache_events_queue=self.kv_cache_events_queue,
-                )
-
-            return res
+        self.request_queue = IpcQueue(is_server=True,
+                                      name="proxy_request_queue")
+        self.request_error_queue = IpcQueue(is_server=True,
+                                            name="proxy_request_error_queue")
+        # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
+        # Use PULL mode when enable_postprocess_parallel as there are
+        # multiple senders from multiple processes.
+        self.result_queue = FusedIpcQueue(
+            is_server=True,
+            fuse_message=False,
+            socket_type=zmq.PULL
+            if self.enable_postprocess_parallel else zmq.PAIR,
+            name="proxy_result_queue")
+        self.mp_stats_queue = FusedIpcQueue(is_server=True,
+                                            fuse_message=False,
+                                            name="proxy_stats_queue")
+        self.kv_cache_events_queue = FusedIpcQueue(
+            is_server=True,
+            fuse_message=False,
+            name="proxy_kv_cache_events_queue")
+        return WorkerCommIpcAddrs(
+            request_queue_addr=self.request_queue.address,
+            request_error_queue_addr=self.request_error_queue.address,
+            result_queue_addr=self.result_queue.address,
+            stats_queue_addr=self.mp_stats_queue.address,
+            kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
+        )
 
     def abort_request(self, request_id: int) -> None:
         ''' Abort a request by sending a cancelling request to the request queue.
@@ -312,18 +268,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
 
-        rank0_extra_kwargs = {}
-        if worker_queues := worker_kwargs["worker_queues"]:
-            if isinstance(worker_queues, WorkerCommQueues):
-                rank0_extra_kwargs = {"worker_queues": worker_queues}
-                worker_kwargs["worker_queues"] = None
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            rank0_extra_kwargs=rank0_extra_kwargs,
             ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
         )
         for fut in self.mpi_futures:
@@ -343,14 +293,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
             result.abort()
 
     def shutdown(self):
-        if enable_llm_debug():
-            try:
-                print_colored('Proxy.shutdown...\n', "yellow")
-                print_colored(str(traceback.format_exc()) + "\n", "yellow")
-            except ValueError:
-                pass
         if not self.workers_started:
             return
+        print_colored_debug('Proxy.shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
