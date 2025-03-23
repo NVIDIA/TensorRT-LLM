@@ -396,10 +396,12 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    // Have we begun overwriting the beginning of the sequence's kvcache
-    [[nodiscard]] bool isPreCyclic() const
+    // @brief Check whether the sequence uses cyclic KV cache.
+    // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
+    // @details If `true`, we cannot store the sequence's KV cache for reuse.
+    [[nodiscard]] bool isCyclic() const
     {
-        return mNumTokens < mCyclicThreshold;
+        return mNumTokens >= mCyclicThreshold;
     }
 
 private:

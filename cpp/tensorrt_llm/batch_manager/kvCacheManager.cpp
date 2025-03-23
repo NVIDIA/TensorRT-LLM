@@ -1146,7 +1146,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
     // the max attention window).
     // - The sequence did not switch to cyclic kv-cache during generation phase.
-    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && sequence.isPreCyclic();
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
     if (storeBlocksForReuse)
     {
         auto constexpr beamIdx = 0;
@@ -1605,7 +1605,7 @@ void KVCacheManager::addSequence(
     // Get block index that with shareAmongBeams=False.
     // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
     SizeType32 unsharedBlockIdx = -1;
-    if ((sequence.isPreCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
+    if ((!sequence.isCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
     {
         unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
             ? finalTokenKVIdx / getTokensPerBlock() + 1
@@ -1622,7 +1622,7 @@ void KVCacheManager::addSequence(
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    if (sequence.isPreCyclic() && mEnableBlockReuse)
+    if (!sequence.isCyclic() && mEnableBlockReuse)
     {
         mBlockManager.addSequence(sequence, inputLength, numContextBlocks, *llmRequest);
     }
@@ -1678,7 +1678,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse && sequence.isPreCyclic())
+    if (mEnableBlockReuse && !sequence.isCyclic())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }
