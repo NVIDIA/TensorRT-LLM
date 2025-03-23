@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from .. import bindings as tllm
+from .._utils import global_mpi_rank
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
@@ -18,18 +19,18 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
+from ..executor.utils import create_mpi_comm_session
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import LLMARGS_EXPLICIT_DOCSTRING
+from .llm_args import LLMARGS_EXPLICIT_DOCSTRING, PybindMirror
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
-from .mpi_session import (MpiCommSession, MpiPoolSession,
-                          external_mpi_comm_available)
+from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    nvtx_range)
+                    nvtx_range, print_colored_debug)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -144,8 +145,8 @@ class LLM:
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
-                    self.mpi_session = MpiCommSession(
-                        n_workers=self.args.parallel_config.world_size)
+                    self.mpi_session = create_mpi_comm_session(
+                        self.args.parallel_config.world_size)
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -258,7 +259,7 @@ class LLM:
 
         return futures
 
-    @nvtx_range("LLM.generate_async")
+    @nvtx_range("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
         inputs: PromptInputs,
@@ -289,6 +290,9 @@ class LLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
+        print_colored_debug(
+            f"rank {global_mpi_rank()} generate_async: {inputs}\n", "green")
+
         sampling_params = self._prepare_sampling_params(sampling_params)
 
         if sampling_params.n > self.args.build_config.max_batch_size:
@@ -302,6 +306,7 @@ class LLM:
 
         query_token_ids = None
         prompt_tuning_config = None
+        mrope_config = None
         if "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
@@ -314,9 +319,13 @@ class LLM:
             if queries is not None:
                 query_token_ids, _ = self.input_processor(
                     queries, sampling_params)
-            if extra_processed_inputs is not None:
+            if (extra_processed_inputs is not None
+                    and 'prompt_tuning_config' in extra_processed_inputs):
                 prompt_tuning_config = extra_processed_inputs.get(
                     'prompt_tuning_config')
+            if (extra_processed_inputs is not None
+                    and 'mrope_config' in extra_processed_inputs):
+                mrope_config = extra_processed_inputs.get('mrope_config')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -337,6 +346,7 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
             prompt_tuning_config=prompt_tuning_config,
+            mrope_config=mrope_config,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
@@ -349,6 +359,7 @@ class LLM:
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
+        To collect statistics, call this function after prompts have been submitted with LLM().generate().
 
         Args:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
@@ -361,6 +372,8 @@ class LLM:
 
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
+        To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
+        after prompts have been submitted.
 
         Args:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
@@ -496,7 +509,8 @@ class LLM:
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
         if self.args.kv_cache_config is not None:
-            executor_config.kv_cache_config = self.args.kv_cache_config
+            executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
+                self.args.kv_cache_config)
         if self.args.peft_cache_config is not None:
             executor_config.peft_cache_config = self.args.peft_cache_config
         elif self.args.build_config.plugin_config.lora_plugin:

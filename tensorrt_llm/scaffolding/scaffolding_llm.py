@@ -51,13 +51,11 @@ class ScaffoldingLlm:
 
     def __init__(
             self,
-            controller_cls: type,  # type of Controller
-            controller_args: dict,  # args for init a Crontroller instance
+            prototype_controller: Controller,
             workers: Mapping[
                 str, Worker],  # map of role of Crontroller to a worker instance
     ):
-        self.controller_cls = controller_cls
-        self.controller_args = controller_args
+        self.prototype_controller = prototype_controller
         self.workers = workers
 
         self.loop = self._get_loop()
@@ -97,9 +95,9 @@ class ScaffoldingLlm:
                     task_list = next(gen)
                     async_tasks = []
                     for task in task_list:
-                        task_role = task.role
-                        assert task_role in self.workers.keys()
-                        worker = self.workers[task_role]
+                        task_worker_tag = task.worker_tag
+                        assert task_worker_tag in self.workers.keys()
+                        worker = self.workers[task_worker_tag]
                         async_tasks.append(
                             asyncio.create_task(worker.run_task(task)))
                     await asyncio.gather(*async_tasks)
@@ -159,7 +157,8 @@ class ScaffoldingLlm:
                 prompt=prompt,
                 kwargs={},
                 result=result,
-                controller=self.controller_cls(**(self.controller_args)))
+                controller=self.prototype_controller.clone())
+
             await self.task_queue.put(request)
 
         asyncio.run_coroutine_threadsafe(put_request(), self.loop)
@@ -182,9 +181,13 @@ class ScaffoldingLlm:
 
         return scaffolding_results[0] if unbatched else scaffolding_results
 
-    def shutdown(self):
+    def shutdown(self, shutdown_wokers=False):
         # Let the merge thread break
         async def put_shutdown_task():
             await self.task_queue.put(None)
 
         asyncio.run_coroutine_threadsafe(put_shutdown_task(), self.loop)
+
+        if shutdown_wokers:
+            for worker in self.workers.values():
+                worker.shutdown()

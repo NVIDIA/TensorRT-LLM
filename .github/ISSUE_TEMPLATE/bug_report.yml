@@ -20,7 +20,7 @@ body:
           - Versions of TensorRT, Modelopt, CUDA, cuBLAS, etc. used
           - Container used (if running TensorRT-LLM in a container)
         - NVIDIA driver version
-        - OS (Ubuntu 22.04, CentOS 7, Windows 10)
+        - OS (Ubuntu 24.04, CentOS 8)
         - Any other information that may be useful in reproducing the bug
     validations:
       required: true

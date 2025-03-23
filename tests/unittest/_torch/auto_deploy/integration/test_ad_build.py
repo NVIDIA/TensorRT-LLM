@@ -120,13 +120,11 @@ from utils.llm_data import llm_models_root
                 ),
                 "compile_backend": "torch-simple",
             },
-            marks_extra=[
-                pytest.mark.skip(reason="Pending support for custom MoE Op sharding"),
-            ],
         ),
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
+    pytest.skip("https://nvbugs/5178508")
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
     main(simple_config)

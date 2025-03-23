@@ -155,8 +155,11 @@ def allreduce(
         return out[0]
 
 
-def userbuffers_allreduce_finalize(input: torch.Tensor) -> torch.Tensor:
-    output = torch.ops.trtllm.userbuffers_allreduce_finalize(input)
+def userbuffers_allreduce_finalize(
+        input: torch.Tensor,
+        force_applying_finalize: bool = False) -> torch.Tensor:
+    output = torch.ops.trtllm.userbuffers_allreduce_finalize(
+        input, force_applying_finalize)
     return output
 
 
@@ -292,12 +295,14 @@ class DeepseekAllReduce(nn.Module):
         self.tp_size = self.parallel_config.tensor_parallel_size
         self.tp_rank = self.parallel_config.tensor_parallel_rank
         self.gpus_per_node = self.parallel_config.gpus_per_node
+        self.rank = self.parallel_config.parallel_rank
         self.workspace = None
         if self.tp_size > 1:
             mapping = Mapping(
-                world_size=self.tp_size,
+                world_size=self.parallel_config.parallel_size,
                 tp_size=self.tp_size,
-                rank=self.tp_rank,
+                pp_size=self.parallel_config.pipeline_parallel_size,
+                rank=self.rank,
                 gpus_per_node=self.gpus_per_node,
             )
             self.workspace = get_deepseek_allreduce_workspace(mapping)
@@ -363,12 +368,18 @@ class PPComm:
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
+    def send(self,
+             tensor: torch.Tensor,
+             dest: Optional[int] = None,
+             tag: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        dist.send(tensor, dest)
+        dist.send(tensor, dest, tag=tag)
 
-    def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
+    def recv(self,
+             tensor: torch.Tensor,
+             src: Optional[int] = None,
+             tag: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
-        dist.recv(tensor, src)
+        dist.recv(tensor, src, tag=tag)

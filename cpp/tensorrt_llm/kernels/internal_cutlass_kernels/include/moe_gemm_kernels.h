@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,7 +101,7 @@ struct TmaWarpSpecializedGroupedGemmInput
     using SfAtom = cute::Layout<
         cute::Shape<cute::Shape<cute::_32, cute::_4>, cute::Shape<cute::Int<BlockScaleVectorSize>, cute::_4>>,
         cute::Stride<cute::Stride<cute::_16, cute::_4>, cute::Stride<cute::_0, cute::_1>>>;
-    // using Sm100BlkScaledConfig = cutlass::detail::Sm100BlockScaledConfig<BlockScaleVectorSize>;
+    // using Sm1xxBlkScaledConfig = cutlass::detail::Sm100BlockScaledConfig<BlockScaleVectorSize>;
     constexpr static int MinNumRowsAlignmentFP4 = cute::size<0>(SfAtom{});
     // A & B are swapped for transpose
     using LayoutSF = decltype(cute::blocked_product(SfAtom{},

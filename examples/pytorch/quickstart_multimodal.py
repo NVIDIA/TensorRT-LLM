@@ -76,9 +76,35 @@ def prepare_llava_next(args, inputs):
     return inputs
 
 
+def prepare_qwen2_vl(args, inputs):
+    processor = AutoProcessor.from_pretrained(args.model_dir)
+
+    def apply_template(prompt, multimodal_data):
+        content = [{
+            "type": media_type
+        } for media_type, items in multimodal_data.items()
+                   for _ in items] + [{
+                       "type": "text",
+                       "text": prompt
+                   }]
+
+        conversation = [{"role": "user", "content": content}]
+        return processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    for input in inputs:
+        input["prompt"] = apply_template(input["prompt"],
+                                         input["multi_modal_data"])
+    return inputs
+
+
 MODEL_TYPE_MAP = {
     "llava_llama": prepare_vila,
     "llava_next": prepare_llava_next,
+    "qwen2_vl": prepare_qwen2_vl,
 }
 
 
@@ -163,7 +189,7 @@ def main():
     else:
         raise ValueError(f"Unsupported modality: {args.modality}")
 
-    model_type = json.load(open(os.path.join(args.model_dir,
+    model_type = json.load(open(os.path.join(llm._hf_model_dir,
                                              'config.json')))['model_type']
     assert model_type in MODEL_TYPE_MAP, f"Unsupported model_type: {model_type}"
     inputs = MODEL_TYPE_MAP[model_type](args, inputs)

@@ -23,6 +23,13 @@ using namespace tensorrt_llm::testing;
 using DisaggParamsType = std::tuple<int, std::vector<std::string>, std::vector<std::vector<int>>,
     std::vector<std::vector<int>>, std::vector<int>, int>;
 
+enum InstanceRole : int
+{
+    CONTEXT = 1,
+    GENERATION = 0,
+    MIXED = 2
+};
+
 std::string generateTestNameDisaggParams(testing::TestParamInfo<DisaggParamsType> const& info)
 {
     auto const processNum = std::get<0>(info.param);
@@ -92,7 +99,8 @@ void verifyGenerateDistStats(std::deque<RequestStatsPerIteration> const& iterati
     {
         for (auto const& requestStats : iteration.requestStats)
         {
-            if (requestStats.stage == RequestStage::kGENERATION_COMPLETE)
+            // exclude context only requests for mixed server
+            if (requestStats.stage == RequestStage::kGENERATION_COMPLETE && requestStats.numGeneratedTokens > 1)
             {
                 EXPECT_TRUE(requestStats.disServingStats.has_value());
                 EXPECT_GT(requestStats.disServingStats.value().kvCacheTransferMS, 0.0);
@@ -159,7 +167,7 @@ void runDisaggTest(tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader& 
         requests.emplace_back(std::move(request));
     }
 
-    if (executor.isController())
+    if (executor.isControllerRank())
     {
         std::vector<IdType> reqIds;
 
@@ -417,7 +425,8 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     auto const modelNames = std::get<1>(GetParam());
     auto const participantIdsEachInstance = std::get<2>(GetParam());       // std::vector<std::vector<int>>
     auto const participantDeviceIdsEachInstance = std::get<3>(GetParam()); // std::vector<std::vector<int>>;
-    auto const instanceRoles = std::get<4>(GetParam()); // std::vector<int> ; //1 is context , 0 is generation
+    auto const instanceRoles
+        = std::get<4>(GetParam()); // std::vector<int> ; //1 is context , 0 is generation, 2 is mixed
     auto const controllerRank = std::get<5>(GetParam());
 
     // params_check
@@ -439,6 +448,7 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     std::unordered_map<SizeType32, SizeType32> deviceCounter;
     SizeType32 deviceRuseNum = 1;
     bool isContext = false;
+    bool isGeneration = false;
     std::vector<int> participatntIds;
     std::vector<int> deviceIds;
     std::string modelName;
@@ -456,7 +466,7 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
         {
             rankCounter[ranksThisInstance[j]]++;
             deviceCounter[devicesThisInstance[j]]++;
-            ASSERT_EQ(rankCounter[ranksThisInstance[j]], 1);
+            ASSERT_GE(rankCounter[ranksThisInstance[j]], 1);
             deviceRuseNum = std::max(deviceCounter[devicesThisInstance[j]], deviceRuseNum);
             ASSERT_GE(ranksThisInstance[j], 0);
             ASSERT_LT(ranksThisInstance[j], commSize);
@@ -465,13 +475,14 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
             {
                 participatntIds = ranksThisInstance;
                 deviceIds = devicesThisInstance;
-                isContext = (instanceRoles[i] > 0);
+                isContext = instanceRoles[i] == InstanceRole::CONTEXT || instanceRoles[i] == InstanceRole::MIXED;
+                isGeneration = instanceRoles[i] == InstanceRole::GENERATION || instanceRoles[i] == InstanceRole::MIXED;
                 // modelName = isContext ? contextModel : genModel;
                 modelName = modelNames[i];
             }
         }
     }
-    ASSERT_EQ(ranksNum, commSize);
+    ASSERT_GE(ranksNum, commSize);
 
     OutputConfig outConfig;
     int const beamWidth = 1;
@@ -599,9 +610,9 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     auto const& givenInput = tr::utils::loadNpy(manager, inputPath.string(), tr::MemoryType::kCPU);
     auto [givenInputLengths, nbGivenInputs, maxInputLength] = getGivenInputLengths(*givenInput, modelIds.padId);
     world_comm.barrier();
-    auto disaggExecutor
-        = tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader(modelPath, ModelType::kDECODER_ONLY,
-            executorConfig, isController, isContext, givenInputLengths.size(), participatntIds, deviceIds, commRank);
+    auto disaggExecutor = tensorrt_llm::testing::disaggexecutor::DisaggExecutorLeader(modelPath,
+        ModelType::kDECODER_ONLY, executorConfig, isController, isContext, isGeneration, givenInputLengths.size(),
+        participatntIds, deviceIds, commRank);
 
     runDisaggTest(disaggExecutor, manager, *givenInput, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult,
         outConfig, isSpeculativeDecoding, mMaxWaitMs, executorConfig.getBatchingType(), false);
@@ -836,11 +847,25 @@ INSTANTIATE_TEST_SUITE_P(GptDisaggSymmetricExecutorTest2, DisaggParamsTest,
         testing::Values(1)),
     generateTestNameDisaggParams);
 
+INSTANTIATE_TEST_SUITE_P(GptDisaggSymmetricExecutorMixedTest, DisaggParamsTest,
+    testing::Combine(testing::Values(2), testing::Values(std::vector<std::string>{"gpt", "gpt"}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {1}}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {1}}), testing::Values(std::vector<int>{2, 2}),
+        testing::Values(1)),
+    generateTestNameDisaggParams);
+
 INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorTest, DisaggParamsTest,
     testing::Combine(testing::Values(2), testing::Values(std::vector<std::string>{"gpt", "gpt"}),
         testing::Values(std::vector<std::vector<int>>{{0}, {1}}),
         testing::Values(std::vector<std::vector<int>>{{0}, {0}}), testing::Values(std::vector<int>{1, 0}),
         testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorMixedTest, DisaggParamsTest,
+    testing::Combine(testing::Values(2), testing::Values(std::vector<std::string>{"gpt", "gpt"}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {1}}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {0}}), testing::Values(std::vector<int>{2, 2}),
+        testing::Values(1)),
     generateTestNameDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorTest, DisaggParamsTest,
@@ -857,6 +882,18 @@ INSTANTIATE_TEST_SUITE_P(LlamaPP2DisaggSymmetricExecutorTest, DisaggParamsTest,
         testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}}),
         testing::Values(std::vector<std::vector<int>>{{1, 0}, {3, 2}}), testing::Values(std::vector<int>{1, 0}),
         testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorMixedTest, DisaggParamsTest,
+    testing::Combine(testing::Values(2), testing::Values(std::vector<std::string>{"llama_tp2_pp1_cp1"}),
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}), testing::Values(std::vector<std::vector<int>>{{0, 1}}),
+        testing::Values(std::vector<int>{2}), testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaPP2DisaggSymmetricExecutorMixedTest, DisaggParamsTest,
+    testing::Combine(testing::Values(2), testing::Values(std::vector<std::string>{"llama_tp1_pp2_cp1"}),
+        testing::Values(std::vector<std::vector<int>>{{0, 1}}), testing::Values(std::vector<std::vector<int>>{{0, 1}}),
+        testing::Values(std::vector<int>{2}), testing::Values(0)),
     generateTestNameDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTP2PP2DisaggSymmetricExecutorTest, DisaggParamsTest,

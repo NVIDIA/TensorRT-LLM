@@ -73,7 +73,8 @@ public:
         torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
         torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
         torch::optional<torch::Tensor> latent_cache, torch::optional<torch::Tensor> q_pe,
-        torch::optional<torch::Tensor> block_ids_per_seq) const
+        torch::optional<torch::Tensor> block_ids_per_seq, torch::optional<torch::Tensor> mrope_rotary_cos_sin,
+        torch::optional<torch::Tensor> mrope_position_deltas) const
         = 0;
 };
 
@@ -119,7 +120,8 @@ public:
         torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
         torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
         torch::optional<torch::Tensor> latent_cache, torch::optional<torch::Tensor> q_pe,
-        torch::optional<torch::Tensor> block_ids_per_seq) const override
+        torch::optional<torch::Tensor> block_ids_per_seq, torch::optional<torch::Tensor> mrope_rotary_cos_sin,
+        torch::optional<torch::Tensor> mrope_position_deltas) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -251,7 +253,11 @@ public:
                 mla_params.max_input_seq_len = max_context_q_len;
                 enqueue_params.mla_param = &mla_params;
             }
-
+            if (op.isMRoPE() && mrope_rotary_cos_sin.has_value())
+            {
+                enqueue_params.mrope_rotary_cos_sin
+                    = static_cast<float2 const*>(mrope_rotary_cos_sin.value().data_ptr());
+            }
             op.enqueueContext<T, KVBlockArray>(enqueue_params, stream);
         }
         else // generation stage
@@ -272,6 +278,10 @@ public:
             enqueue_params.semaphores = op.multiBlockSemaphores();
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
 
+            if (op.isMRoPE() && mrope_position_deltas.has_value())
+            {
+                enqueue_params.mrope_position_deltas = mrope_position_deltas.value().data_ptr<int32_t>();
+            }
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
             {
@@ -334,7 +344,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     int64_t const rotary_embedding_max_positions, int64_t const rotary_embedding_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
-    std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim)
+    std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
+    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
 
@@ -518,7 +529,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -534,7 +545,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -604,6 +615,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? qk_nope_head_dim"
         ", int? qk_rope_head_dim"
         ", int? v_head_dim"
+        ", Tensor? mrope_rotary_cos_sin"
+        ", Tensor? mrope_position_deltas"
         ") -> Tensor");
 }
 

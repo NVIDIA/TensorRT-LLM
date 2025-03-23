@@ -64,7 +64,8 @@ class MetaInitMode(TorchDispatchMode):
     aten = torch.ops.aten
     init_ops = {aten.empty.memory_format, aten.empty_like.default}
     random_init_ops = {
-        aten.normal_.default, aten.uniform_.default
+        aten.normal_.default,
+        aten.uniform_.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
 
@@ -252,9 +253,9 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
-        if hasattr(self, 'moe_stream'):  # DeepseekV3
+        if hasattr(self, 'aux_stream'):  # DeepseekV3
             layer_fn = lambda layer_idx: decoder_layer_cls(
-                self.model_config, layer_idx, self.moe_stream)
+                self.model_config, layer_idx, self.aux_stream)
         else:
             layer_fn = lambda layer_idx: decoder_layer_cls(
                 self.model_config, layer_idx)
@@ -325,7 +326,6 @@ class PostInitCaller(type):
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
-# TODO: Maybe extract PP logic from DecoderModelForCausalLM similar to DecoderModel
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
@@ -456,6 +456,10 @@ class DecoderModelForCausalLM(nn.Module,
     def create_pipeline_interface(self, num_input_ids: torch.int):
         # create each interface buffer at runtime
         return self.model.create_pipeline_interface(num_input_ids)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.lm_head.vocab_size_padded
 
     def forward(
         self,

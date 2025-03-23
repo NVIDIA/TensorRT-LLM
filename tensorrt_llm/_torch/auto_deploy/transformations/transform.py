@@ -12,6 +12,7 @@ from ._graph import move_to_device
 from .export import torch_export_to_gm
 from .library import (
     column_row_shard,
+    ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
     fuse_gemms,
@@ -89,8 +90,11 @@ class InferenceOptimizer:
         # insert MHA with KV cache
         egm = insert_mha_with_kv_cache(egm, cm, self.attention_op, self.factory.get_cache_config())
 
-        # run sharding across ranks
+        # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)
+
+        # run EP sharding across ranks
+        egm = ep_shard(egm, local_rank, world_size)
 
         ############################################################################################
         # SETUP CACHES AND LOAD WEIGHTS
@@ -98,6 +102,7 @@ class InferenceOptimizer:
 
         # initialize caches, load weights, and map to correct device
         cm.initialize_caches()
+
         self.factory.load_or_random_init(egm, mmap=True, map_location=cm.device)
         move_to_device(egm, cm.device)
 

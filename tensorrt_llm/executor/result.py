@@ -162,14 +162,17 @@ class GenerationResultBase:
                          sequence_index):
         """ Handle a single sequence in the response. """
 
-        beam_search = self.sampling_params.use_beam_search
         seq_idx = sequence_index
-        src_idx = sequence_index if beam_search else 0
+        src_idx = sequence_index if self.sampling_params.use_beam_search else 0
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
-        output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+        if self.sampling_params.use_beam_search:
+            # Beam search enforces returning all generated tokens
+            output.token_ids = response_tensors.output_token_ids[src_idx]
+        else:
+            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
         if response_tensors.log_probs is not None:

@@ -57,6 +57,9 @@ class TRTLLMEvalBase(TemplateLM):
         trust_remote_code: bool = False,
         use_cuda_graph: bool = True,
         backend: str = 'trt',
+        max_context_length: Optional[int] = None,
+        moe_expert_parallel_size: Optional[int] = None,
+        moe_backend: Optional[str] = "TRTLLM",
         **kwargs,
     ):
         # initialize TemplateLM, copied from TemplateAPI
@@ -67,7 +70,9 @@ class TRTLLMEvalBase(TemplateLM):
         self.max_gen_toks = max_gen_toks
         self.chunk_size = chunk_size
         self.backend = backend
-
+        self.max_context_length = max_context_length
+        self.moe_expert_parallel_size = moe_expert_parallel_size
+        self.moe_backend = moe_backend
         trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
         trt_kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
         if max_tokens_kv_cache is not None:
@@ -87,19 +92,29 @@ class TRTLLMEvalBase(TemplateLM):
             kwargs.pop('batch_size')
             if tp < 1:
                 tp = torch.cuda.device_count()
-            pytorch_config = PyTorchConfig(use_cuda_graph=use_cuda_graph,
-                                           print_iter_log=False)
+
+            pytorch_config_params = {
+                "use_cuda_graph": use_cuda_graph,
+                "print_iter_log": False,
+            }
+            if hasattr(PyTorchConfig, "moe_backend"):
+                pytorch_config_params["moe_backend"] = self.moe_backend
+                print(f"Info: moe_backend is set to {self.moe_backend}")
+            pytorch_config = PyTorchConfig(**pytorch_config_params)
+
             # stop words not currently supported by torch backend
             self.use_stop_words = False
 
-            self.llm = TORCH_LLM(model=model,
-                                 tensor_parallel_size=tp,
-                                 trust_remote_code=trust_remote_code,
-                                 enable_chunked_prefill=False,
-                                 pytorch_backend_config=pytorch_config,
-                                 tokenizer=self.tokenizer,
-                                 kv_cache_config=trt_kv_cache_config,
-                                 **kwargs)
+            self.llm = TORCH_LLM(
+                model=model,
+                tensor_parallel_size=tp,
+                trust_remote_code=trust_remote_code,
+                enable_chunked_prefill=False,
+                pytorch_backend_config=pytorch_config,
+                tokenizer=self.tokenizer,
+                kv_cache_config=trt_kv_cache_config,
+                moe_expert_parallel_size=self.moe_expert_parallel_size,
+                **kwargs)
             logger.info("Loaded TRT-LLM Torch engine")
         else:
             with open(Path(model) / "config.json", "r") as engine_config_file:
@@ -199,6 +214,43 @@ class TRTLLMEvalBase(TemplateLM):
         num_r = len(requests)
         desc = "Processing generate requests"
 
+        if self.max_context_length is not None:
+            """
+            Create updated_requests to contain qualified requests with the context length <= max_context_length.
+            Unqualified requests cannot simply be dropped as lm-eval library requires the number of requests to be the same.
+
+            Note: The final score will drop if disqualified requests exist.
+            """
+            request_idx_to_replace = []
+            qualified_requests = []
+            updated_requests = []
+            for i, request in enumerate(requests):
+                context, gen_kwargs = request.args
+                if len(self.tok_encode(context)) > self.max_context_length:
+                    request_idx_to_replace.append(i)
+                else:
+                    qualified_requests.append(request)
+
+            assert len(
+                qualified_requests
+            ) > 1, "No requests with context length <= max_context_length. Cannot run the evaluation."
+            if len(request_idx_to_replace) > 0:
+                print(
+                    f"Warning: {len(request_idx_to_replace)} requests with context length > max_context_length will be replaced. The final score will drop."
+                )
+
+            for i, request in enumerate(requests):
+                if i in request_idx_to_replace:
+                    # Replace the requests with context length > max_context_length with the qualified requests
+                    updated_requests.append(
+                        qualified_requests[i % len(qualified_requests)])
+                else:
+                    updated_requests.append(request)
+            assert len(
+                updated_requests
+            ) == num_r, "Number of updated requests does not match the number of requests."
+            requests = updated_requests
+
         def _get_sp(gen_kwargs):
             k_mapping = {
                 "temperature": "temperature",
@@ -227,6 +279,10 @@ class TRTLLMEvalBase(TemplateLM):
                 for j in range(i, min(i + self.chunk_size, num_r)):
                     context, gen_kwargs = requests[j].args
                     prompt_ids = self.tok_encode(context)
+                    if self.max_context_length is not None:
+                        assert len(
+                            prompt_ids
+                        ) <= self.max_context_length, f"Prompt length > {self.max_context_length}, {len(prompt_ids)}, should be filtered out."
                     kwargs_mapped = _get_sp(gen_kwargs)
                     futures[j] = self.llm.generate_async(
                         prompt_ids, kwargs_mapped)

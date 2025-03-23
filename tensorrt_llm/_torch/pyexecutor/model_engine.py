@@ -4,6 +4,7 @@ import glob
 import math
 import traceback
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
 
 import safetensors
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.attention_backend import *
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMetadata, AttentionRuntimeFeatures)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.metadata import *
 from tensorrt_llm._torch.models import AutoModelForCausalLM
@@ -35,6 +37,7 @@ from ...models.modeling_utils import QuantAlgo
 from ..pipeline_interface import PipelineInterface
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .resource_manager import ResourceManager
 from .scheduler import ScheduledRequests
@@ -221,6 +224,8 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional[SpecConfig] = None,
+        guided_decoding_config: Optional[
+            tensorrt_llm.bindings.executor.GuidedDecodingConfig] = None,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -261,6 +266,13 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_overlap_scheduler = self.pytorch_backend_config.enable_overlap_scheduler
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
+
+        self.guided_decoder: Optional[GuidedDecoder] = None
+        if self.mapping.is_last_pp_rank(
+        ) and guided_decoding_config is not None:
+            self.guided_decoder = GuidedDecoder(guided_decoding_config,
+                                                self.batch_size,
+                                                self.model.vocab_size_padded)
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
@@ -444,6 +456,11 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 self._run_cuda_graphs = _run_cuda_graphs
 
+        # TODO: current warmup_request is not suitable for star attention
+        cp_type = self.mapping.cp_config.get('cp_type', None)
+        if cp_type == 'star_attention':
+            return
+
         if self._torch_compile_enabled:
             # Disable cuda graph capture here so that we can properly capture it later
             with no_cuda_graph():
@@ -469,6 +486,26 @@ class PyTorchModelEngine(ModelEngine):
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
+
+        if self.pytorch_backend_config.autotuner_enabled:
+            with no_cuda_graph(), autotune():
+                num_tokens = min(self.max_num_tokens,
+                                 kv_cache_manager.max_seq_len - 1)
+                with release_batch(
+                        get_torch_compile_warmup_request(1,
+                                                         num_tokens)) as batch:
+                    if batch is None:
+                        # No KV cache space!
+                        pass
+                    else:
+                        logger.info(f"Run autotuning warmup for batch size={1}")
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
+
+                logger.info(f"Autotuner Cache size after warmup " +
+                            str(len(AutoTuner.get().profiling_cache)))
 
         if not self._run_cuda_graphs:
             return
@@ -800,6 +837,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_tokens = []
         draft_lens = []
+        mrope_config = defaultdict(list)
 
         batch_idx = 0
 
@@ -824,6 +862,10 @@ class PyTorchModelEngine(ModelEngine):
             if prompt_embedding_table is not None:
                 multi_modal_data.append(prompt_embedding_table)
 
+            mrope_rotary_cos_sin = request.get_mrope_rotary_cos_sin()
+            if mrope_rotary_cos_sin is not None:
+                mrope_config['mrope_rotary_cos_sin'].append(
+                    mrope_rotary_cos_sin)
             request.py_batch_idx = batch_idx
             batch_idx += 1
 
@@ -847,6 +889,13 @@ class PyTorchModelEngine(ModelEngine):
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
+
+            mrope_position_deltas = request.mrope_position_deltas
+            if mrope_position_deltas is not None:
+                mrope_config['mrope_position_deltas'].append(
+                    torch.tensor([mrope_position_deltas],
+                                 dtype=torch.int32).to('cuda',
+                                                       non_blocking=True))
         is_spec_decode = len(extend_requests) > 0
         if self._enable_overlap_scheduler and is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
@@ -1038,7 +1087,8 @@ class PyTorchModelEngine(ModelEngine):
             'position_ids':
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data
+            'multi_modal_data': multi_modal_data,
+            'mrope_config': mrope_config
         }
 
         if self.mapping.has_pp():
@@ -1508,10 +1558,10 @@ class PyTorchModelEngine(ModelEngine):
                 if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
                     pp_interface = self._forward_step_intermediate(inputs)
                     pp_interface.send()
-                    return self._post_forward_intermediate(
+                    outputs = self._post_forward_intermediate(
                         inputs, pp_interface, gather_ids)
                 else:
-                    return self._forward_step(inputs, gather_ids)
+                    outputs = self._forward_step(inputs, gather_ids)
             else:
                 if maybe_graph.needs_capture():
                     if not self.mapping.is_last_pp_rank():
@@ -1533,7 +1583,21 @@ class PyTorchModelEngine(ModelEngine):
                                                               pp_interface,
                                                               gather_ids=None)
 
-                return outputs
+            # Note: To overlap the CPU and GPU computation as much as possible,
+            # guided_decoder.build should be called immediately after the launch of the single step;
+            # while guided_decoder.execute should be called right before the samplings.
+            # We can insert other CPU computation between them in the future.
+            if self.mapping.is_last_pp_rank(
+            ) and self.guided_decoder is not None:
+                guided_decoder_resource_manager = resource_manager.get_resource_manager(
+                    "guided_decoder_resource_manager")
+                self.guided_decoder.build(scheduled_requests,
+                                          guided_decoder_resource_manager)
+                self.guided_decoder.execute(scheduled_requests,
+                                            outputs['logits'],
+                                            guided_decoder_resource_manager)
+
+            return outputs
 
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
@@ -1572,7 +1636,7 @@ class PyTorchModelEngine(ModelEngine):
             hidden_states = hidden_states.unsqueeze(0)
 
         if gather_ids is None:
-            if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
+            if attn_metadata is not None:
                 last_tokens = torch.cumsum(
                     attn_metadata.seq_lens_cuda,
                     dim=0,

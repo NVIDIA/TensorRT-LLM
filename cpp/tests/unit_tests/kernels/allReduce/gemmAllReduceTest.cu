@@ -676,8 +676,7 @@ private:
                 auto tensor_SFB = cute::make_tensor(_SFB.host_data(), layout_SFB);
 
                 return cutlass::reference::host::GettMainloopParams<float, decltype(tensor_A), decltype(tensor_B),
-                    decltype(tensor_SFA), decltype(tensor_SFB)>{tensor_A, tensor_B, cutlass::ComplexTransform::kNone,
-                    cutlass::ComplexTransform::kNone, tensor_SFA, tensor_SFB};
+                    decltype(tensor_SFA), decltype(tensor_SFB)>{tensor_A, tensor_SFA, tensor_B, tensor_SFB};
             }
             else
             {
@@ -787,11 +786,11 @@ private:
                 cutlass::arch::OpClassBlockScaledTensorOp, MainloopElementA, LayoutA, AlignmentA, MainloopElementB,
                 LayoutB, AlignmentB, float, Shape<_128, _128, _128>, Shape<_1, _1, _1>,
                 cutlass::gemm::collective::StageCount<1>,
-                cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledOmmaVs16Sm100>::CollectiveOp;
-            using Sm100BlkScaledConfig = typename CollectiveMainloop::Sm100BlkScaledConfig;
+                cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>::CollectiveOp;
+            using Sm1xxBlkScaledConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
 
-            auto layout_SFA = Sm100BlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-            auto layout_SFB = Sm100BlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+            auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+            auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
             return std::make_tuple(layout_SFA, layout_SFB);
         }
         case 90: // hopper

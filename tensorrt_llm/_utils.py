@@ -38,6 +38,7 @@ import tensorrt as trt
 
 from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -470,6 +471,9 @@ def mpi_comm():
     return comm
 
 
+local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -484,6 +488,23 @@ def global_mpi_size():
 
 def mpi_world_size():
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
+
+
+def local_mpi_rank():
+    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def local_mpi_size():
+    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+
+
+def default_gpus_per_node():
+    num_gpus = torch.cuda.device_count()
+    num_ranks = local_mpi_size()
+    assert num_gpus > 0, "No GPU found on the node"
+    if num_ranks > num_gpus:
+        logger.warning(f"{num_ranks} MPI ranks will share {num_gpus} GPUs.")
+    return min(num_ranks, num_gpus)
 
 
 def mpi_barrier():

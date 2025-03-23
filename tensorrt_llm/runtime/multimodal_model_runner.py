@@ -13,6 +13,7 @@ import math
 from typing import Optional, Tuple
 
 import torch.nn.functional as F
+from cuda import cudart
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from safetensors import safe_open
@@ -284,6 +285,7 @@ class MultimodalModelRunner:
 
     def __init__(self, args):
         self.args = args
+        self.use_trtllm_vision_engine = False
 
         self.runtime_rank = mpi_rank()
         device_id = self.runtime_rank % torch.cuda.device_count()
@@ -297,8 +299,19 @@ class MultimodalModelRunner:
         with open(os.path.join(self.visual_engine_dir, "config.json"),
                   "r") as f:
             config = json.load(f)
-        self.model_type = config['builder_config']['model_type']
-        self.vision_precision = config['builder_config']['precision']
+        if 'pretrained_config' in config:
+            if config['pretrained_config'][
+                    'architecture'] == 'LlavaNextForConditionalGeneration':
+                self.model_type = 'llava_next'
+                self.vision_precision = config['pretrained_config']['dtype']
+                self.use_trtllm_vision_engine = True
+            else:
+                logger.error(
+                    "Currently only Llava-NeXT supports TRT-LLM vision engines."
+                )
+        else:
+            self.model_type = config['builder_config']['model_type']
+            self.vision_precision = config['builder_config']['precision']
         if self.model_type == 'pix2struct':
             self.vision_precision = 'float16'
         self.decoder_llm = not (
@@ -330,8 +343,6 @@ class MultimodalModelRunner:
             if self.num_frames is None:
                 self.num_frames = 8
             assert self.args.video_path is None or self.args.image_path is None
-        self.visual_output_shape = config['builder_config'].get(
-            'output_shape', None)
 
         if self.model_type == "mllama":
             self.vision_input_names = [
@@ -342,11 +353,21 @@ class MultimodalModelRunner:
             self.vision_output_names = [
                 "encoder_output",
             ]
+        elif self.model_type == "llava_next" and self.use_trtllm_vision_engine:
+            self.vision_input_names = [
+                "pixel_values",
+            ]
+            self.vision_output_names = [
+                "image_features",
+            ]
         else:
             self.vision_input_names = ["input"]
             self.vision_output_names = ["encoder_output"]
 
         self.session = args.session
+        if self.cpp_e2e:
+            self.visual_output_shape = config['builder_config'].get(
+                'output_shape', None)
         if self.decoder_llm:
             if not supports_inflight_batching(self.llm_engine_dir):
                 logger.warning(
@@ -584,6 +605,19 @@ class MultimodalModelRunner:
             logger.info(
                 "Using C++ runtime for both visual engine and LLM decoder, skip loading visual engine in Python runtime."
             )
+        elif self.model_type == "llava_next" and self.use_trtllm_vision_engine:
+            cudart.cudaSetDevice(self.runtime_rank % torch.cuda.device_count())
+
+            vision_encoder_path = os.path.join(
+                self.visual_engine_dir, f"rank{self.runtime_rank}.engine")
+            logger.info(f'Loading engine from {vision_encoder_path}')
+            with open(vision_encoder_path, "rb") as f:
+                engine_buffer = f.read()
+            logger.info(f'Creating session from engine {vision_encoder_path}')
+            assert engine_buffer is not None
+
+            self.visual_encoder_session = Session.from_serialized_engine(
+                engine_buffer)
         else:
             vision_encoder_path = os.path.join(self.visual_engine_dir,
                                                self.args.visual_engine_name)
@@ -593,6 +627,7 @@ class MultimodalModelRunner:
             logger.info(f'Creating session from engine {vision_encoder_path}')
             self.visual_encoder_session = Session.from_serialized_engine(
                 engine_buffer)
+
         if self.model_type in ["llava_next", "llava_onevision"]:
             self.image_newlines = {}
             image_newlines_path = os.path.join(self.visual_engine_dir,
@@ -2273,5 +2308,4 @@ class MultimodalModelRunner:
                                     max_new_tokens,
                                     other_vision_inputs=other_vision_inputs,
                                     other_decoder_inputs=other_decoder_inputs)
-
         return input_text, output_text

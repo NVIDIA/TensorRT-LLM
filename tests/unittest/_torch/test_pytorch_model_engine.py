@@ -1,6 +1,5 @@
 import unittest
 from dataclasses import dataclass
-from typing import List, Optional, Union
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -11,18 +10,9 @@ from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings.executor import ExecutorConfig, KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.mapping import Mapping
-
-
-@dataclass(frozen=True, kw_only=True)
-class KVCacheParameters:
-    num_layers: int
-    num_heads: int
-    num_kv_heads: Union[int, List[Optional[int]]]
-    head_dim: int
-    max_seq_len: int
 
 
 @dataclass
@@ -99,7 +89,6 @@ def _create_request(num_tokens, req_id: int):
 
 def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     max_num_requests = 15
-    executor_config = ExecutorConfig(max_batch_size=max_num_requests)
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -121,7 +110,6 @@ def create_model_engine_and_kvcache(config: PyTorchConfig = None):
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,
-        num_heads=model_engine.model.config.num_attention_heads,
         num_kv_heads=model_engine.model.config.num_key_value_heads,
         head_dim=model_engine.model.config.head_dim,
         tokens_per_block=tokens_per_block,
@@ -138,8 +126,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
-
-        resources = {"kv_cache_manager": kv_cache_manager}
 
         seqlens_and_batch_sizes = [
             (5, 1),

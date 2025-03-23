@@ -1,3 +1,4 @@
+import math
 import os
 import warnings
 from typing import Dict, List, Optional, Tuple
@@ -46,7 +47,7 @@ class DeepseekV3MTPHead(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, lm_head: Linear,
                 attn_metadata: AttentionMetadata) -> torch.Tensor:
-        if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
+        if attn_metadata is not None:
             last_tokens = torch.cumsum(
                 attn_metadata.seq_lens_cuda,
                 dim=0,
@@ -80,6 +81,7 @@ class DeepseekV3Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         if model_config.fuse_pos_embd:
@@ -106,7 +108,8 @@ class DeepseekV3Attention(MLA):
                          pos_embd_params=pos_embd_params,
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
-                         config=model_config)
+                         config=model_config,
+                         aux_stream=aux_stream)
 
 
 class Deepseekv3RoutingImpl():
@@ -182,8 +185,8 @@ class Deepseekv3RoutingImpl():
             return topk_values, topk_indices
 
     def apply(
-            self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
-    ) -> (torch.Tensor, torch.Tensor):
+        self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         topk_values, topk_indices = self.noaux_tc(logits,
                                                   e_score_correction_bias)
         return topk_indices.to(torch.int32), topk_values.to(torch.float32)
@@ -236,7 +239,7 @@ class Deepseekv3Gate(BaseMoeRoutingMethod):
         self.e_score_correction_bias.copy_(
             weights[0]["e_score_correction_bias"][:].to(torch.float32))
 
-    def apply(self, logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
 
     @property
@@ -256,7 +259,7 @@ class Deepseekv3MoE(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  shared_expert_intermediate_size: int,
-                 moe_stream: torch.cuda.Stream,
+                 aux_stream: torch.cuda.Stream,
                  dtype: Optional[torch.dtype] = None,
                  tune_max_num_tokens: int = 8192,
                  model_config: ModelConfig = ModelConfig()):
@@ -285,14 +288,25 @@ class Deepseekv3MoE(nn.Module):
             tune_max_num_tokens=tune_max_num_tokens,
             model_config=model_config)
 
+        self.shared_output_scale = None
+        if self.use_dp:
+            shared_tp_size = 1
+        else:
+            assert shared_expert_intermediate_size % 128 == 0
+            shared_tp_size = math.gcd(
+                shared_expert_intermediate_size // 128,
+                model_config.mapping.tp_size,
+            )
+            if shared_tp_size != model_config.mapping.tp_size:
+                self.shared_output_scale = shared_tp_size / model_config.mapping.tp_size
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
             config=model_config,
-            use_dp=self.use_dp,
-            is_expert=not self.use_dp)
+            overridden_tp_size=shared_tp_size,
+            is_expert=True)
 
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
@@ -301,8 +315,8 @@ class Deepseekv3MoE(nn.Module):
             pipeline_parallel_size=model_config.mapping.pp_size,
             parallel_rank=model_config.mapping.rank)
         self.all_reduce = AllReduce(self.parallel_config)
+        self.aux_stream = aux_stream
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
-        self.moe_stream = moe_stream
 
     def reduce_scatter(self, input_tensor, all_rank_num_tokens):
         world_size = self.parallel_config.tensor_parallel_size
@@ -343,8 +357,10 @@ class Deepseekv3MoE(nn.Module):
         if do_multi_stream:
             self.moe_event[0].record()
         shared_output = self.shared_experts(hidden_states)
+        if self.shared_output_scale is not None:
+            shared_output *= self.shared_output_scale
         if do_multi_stream:
-            with torch.cuda.stream(self.moe_stream):
+            with torch.cuda.stream(self.aux_stream):
                 self.moe_event[0].wait()
                 routed_output = self.compute_routed_output(
                     hidden_states, all_rank_num_tokens)
@@ -366,7 +382,7 @@ class Deepseekv3MoE(nn.Module):
 class DeepseekV3DecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, moe_stream: torch.cuda.Stream):
+                 layer_idx: int, aux_stream: torch.cuda.Stream):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
@@ -375,15 +391,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
-        self.self_attn = DeepseekV3Attention(model_config, layer_idx=layer_idx)
+        self.self_attn = DeepseekV3Attention(model_config,
+                                             layer_idx=layer_idx,
+                                             aux_stream=aux_stream)
         self.fusion_config = EagerFusionConfig()
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        self.mlp_tp_size = model_config.mapping.tp_size
 
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-        # TODO: enable MOE fusion for MTP
-        self.enable_fusion = (self.enable_fusion
-                              and model_config.spec_config is None)
 
         pp_layer_offset = model_config.mapping.pp_layers_torch(
             config.num_hidden_layers)[0]
@@ -394,8 +410,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 and global_layer_idx % config.moe_layer_freq == 0):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
             ) and not self.enable_attention_dp
-            # Waiting for new kernel
-            self.fusion_config.POST_MOE_FUSION = False
+            self.fusion_config.POST_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
+            ) and not self.enable_attention_dp and not model_config.mapping.has_pp(
+            )
             self.mlp = Deepseekv3MoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
@@ -406,19 +423,31 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 tune_max_num_tokens=config.max_position_embeddings // 4,
                 model_config=model_config,
-                moe_stream=moe_stream)
+                aux_stream=aux_stream)
         else:
+            if self.enable_attention_dp:
+                self.mlp_tp_size = 1
+            else:
+                assert config.intermediate_size % 128 == 0
+                self.mlp_tp_size = math.gcd(
+                    math.gcd(
+                        config.intermediate_size // 128,
+                        model_config.mapping.tp_size,
+                    ),
+                    model_config.mapping.
+                    gpus_per_node,  # Avoid costly inter-node TP
+                )
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and model_config.mapping.has_tp(
             ) and model_config.quant_config.layer_quant_mode.has_nvfp4(
             ) and not self.enable_attention_dp
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not self.enable_attention_dp and not model_config.mapping.has_pp(
+            )
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,
                                 bias=False,
                                 dtype=config.torch_dtype,
                                 config=model_config,
-                                use_dp=self.enable_attention_dp,
+                                overridden_tp_size=self.mlp_tp_size,
                                 is_expert=False)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -438,8 +467,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.all_reduce = AllReduce(self.parallel_config)
         self.next_layer_layernorm: RMSNorm = None
 
-        self.deepseek_allreduce_disabled = model_config.mapping.pp_size > 1 or os.environ.get(
+        self.deepseek_allreduce_disabled = os.environ.get(
             "TRTLLM_DEEPSEEK_ALLREDUCE_FUSION_DISABLED", "0") == "1"
+        if model_config.mapping.is_multi_node():
+            self.deepseek_allreduce_disabled = True
 
         if not self.deepseek_allreduce_disabled:
             self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
@@ -524,13 +555,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                or self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1
+                or self.enable_attention_dp)),
         )
 
         if self.fusion_config.POST_MOE_FUSION:
-            # Waiting for new kernel
-            raise Exception("Not implemented")
+            if using_prev_fusion:
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ))
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.next_layer_layernorm.weight],
+                    self.next_layer_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
         elif self.fusion_config.POST_MLP_FUSION:
 
             if using_prev_fusion:
@@ -562,8 +607,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, moe_stream: torch.cuda.Stream):
-        super().__init__(model_config, layer_idx, moe_stream)
+                 layer_idx: int, aux_stream: torch.cuda.Stream):
+        super().__init__(model_config, layer_idx, aux_stream)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -601,6 +646,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        # deepseek allreduce kernel is better when m < 512
+        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
+            0) >= 512
+
         inputs_embeds = self.enorm(embed_tokens(input_ids))
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
@@ -615,16 +664,64 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(enable_allreduce=not (
+                self.fusion_config.PRE_MOE_FUSION or self.parallel_config.
+                tensor_parallel_size == 1 or self.enable_attention_dp)),
             **kwargs,
         )
 
+        # MTP Layer Must have sparse MOE
+        if self.fusion_config.PRE_MOE_FUSION:
+            # Custom AR Fusion for DeepseekV3
+            if using_prev_fusion:
+                # Custom AR Fusion for DeepseekV3
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ))
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.post_attention_layernorm.weight],
+                    self.post_attention_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states,
-                                 spec_metadata.all_rank_num_tokens)
+        hidden_states = self.mlp(
+            hidden_states,
+            spec_metadata.all_rank_num_tokens,
+            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                self.fusion_config.POST_MOE_FUSION or self.parallel_config.
+                tensor_parallel_size == 1 or self.enable_attention_dp)),
+        )
 
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        if self.fusion_config.POST_MOE_FUSION:
+            if using_prev_fusion:
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.shared_head.norm.weight,
+                        eps=self.shared_head.norm.variance_epsilon,
+                    ))
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.shared_head.norm.weight],
+                    self.shared_head.norm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
+        else:
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+
         logits = self.shared_head(hidden_states, lm_head, attn_metadata).float()
 
         return hidden_states, logits
@@ -639,14 +736,14 @@ class DeepseekV3Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        self.moe_stream = torch.cuda.Stream()
+        self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = nn.Embedding(config.vocab_size,
                                          config.hidden_size,
                                          dtype=config.torch_dtype)
 
         self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(model_config, layer_idx, self.moe_stream)
+            DeepseekV3DecoderLayer(model_config, layer_idx, self.aux_stream)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -751,7 +848,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1:
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
-                                          self.model.moe_stream)
+                                          self.model.aux_stream)
                 self.model.layers.append(mtp_layer)
                 self.mtp_worker = MTPEagleWorker(model_config.spec_config)
             else:
@@ -760,7 +857,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
                                   layer_idx + self.num_hidden_layers,
-                                  self.model.moe_stream)
+                                  self.model.aux_stream)
                     for layer_idx in range(model_nextn)
                 ])
                 self.model.layers.extend(mtp_layers)

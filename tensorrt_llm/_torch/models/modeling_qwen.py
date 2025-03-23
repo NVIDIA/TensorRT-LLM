@@ -17,6 +17,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
+from ..pipeline_interface import PipelineInterface
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -46,10 +47,17 @@ class QwenAttention(Attention):
     ):
         config = model_config.pretrained_config
         if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
+            if getattr(config, "rope_scaling", None) is not None:
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.from_string(
+                        config.rope_scaling["type"]),
+                    rope=RopeParams.from_config(config),
+                )
+            else:
+                pos_embd_params = PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.rope_gpt_neox,
+                    rope=RopeParams.from_config(config),
+                )
         else:
             pos_embd_params = None
         super().__init__(
@@ -102,6 +110,7 @@ class QwenDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -116,6 +125,7 @@ class QwenDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            mrope_config=mrope_config,
             **kwargs,
         )
 
@@ -161,6 +171,7 @@ class QwenModel(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -177,7 +188,8 @@ class QwenModel(DecoderModel):
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
-                                                    residual=residual)
+                                                    residual=residual,
+                                                    mrope_config=mrope_config)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -194,6 +206,50 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    # NOTE
+    # Qwen2-VL needs special mrope_config so adding separate
+    # forward() function to accept 'mrope_config'.
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        return_context_logits: bool = False,
+        mrope_config: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        if self._supports_pp and self.pp_size > 1:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pipeline_interface=pipeline_interface,
+                mrope_config=mrope_config,
+            )
+
+            # No need to compute logits for non-last PP ranks
+            if self.pp_rank < self.pp_size - 1:
+                return output
+        else:
+            output = self.model(
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                mrope_config=mrope_config,
+            )
+
+        return self.logits_processor.forward(
+            output,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
 
 
 @register_auto_model("Qwen2ForProcessRewardModel")

@@ -203,7 +203,8 @@ public:
         if (runtimeStrategy == AllReduceStrategyType::UB)
         {
             output = torch::empty_like(input);
-            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
                 || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
             TLLM_CHECK_WITH_INFO(
                 tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
@@ -216,7 +217,11 @@ public:
             int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
             void* residual = reduce_fusion_inputs[0].data_ptr();
             void* gamma = reduce_fusion_inputs[1].data_ptr();
-            float* scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+            float* scale = nullptr;
+            if (mScale)
+            {
+                scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+            }
 
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
             {
@@ -250,6 +255,17 @@ public:
                 }
                 finalOutput = torch::from_blob(
                     ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
+            }
+            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                TLLM_CHECK(mAffine);
+                TLLM_CHECK(!mBias);
+                TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_launcher(ub_buffer0.handle, 0, size,
+                    hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
+                auto dt = input.scalar_type();
+                finalOutput = torch::from_blob(
+                    ub_buffer0.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
             }
         }
         else if (runtimeStrategy == AllReduceStrategyType::NCCL)

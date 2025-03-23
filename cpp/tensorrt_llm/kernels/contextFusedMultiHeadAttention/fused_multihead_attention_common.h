@@ -124,6 +124,8 @@ struct MHARunnerFixedParams
     bool hasAlibi;
     // Scale the alibi bias or not ?
     bool scaleAlibi;
+    // save softmax stats?
+    bool saveSoftmax;
     // The tensor parallel size (alibi).
     int tpSize = 1;
     // The tensor parallel rank (alibi).
@@ -212,6 +214,8 @@ struct MHARunnerParams
     void* outputPtr;
     // The output scaling factor buffer ptr. (only used for FP4 output)
     void* outputSfPtr;
+    // The softmax_status ptr for RingAttention.
+    void* softmaxStatsPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -299,6 +303,8 @@ struct Fused_multihead_attention_params_v2
     void const* packed_mask_ptr;
     // The O matrix (output).
     void* o_ptr;
+    // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
+    void* softmax_stats_ptr;
 
     // The stride between rows of the Q, K and V matrices.
     int64_t qkv_stride_in_bytes;
@@ -306,10 +312,14 @@ struct Fused_multihead_attention_params_v2
     int64_t q_stride_in_bytes;
     // The stride between rows of the separate KV matrice.
     int64_t kv_stride_in_bytes;
+    // The stride between rows of the separate V matrice, set if it is not same as that of K.
+    int64_t v_stride_in_bytes = 0;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
+    // The stride between rows of softmax_stats_ptr
+    int64_t softmax_stats_stride_in_bytes;
 
     // tma descriptors on device.
     // Either q in packed qkv [B, S, 3, H, D] of separate q layout [B, S, H, D].
@@ -328,6 +338,8 @@ struct Fused_multihead_attention_params_v2
 
     // The dimensions. In ordinary multi-head attention (MHA), there are equal number of QKV heads
     int b, h, h_kv, h_q_per_kv, s, d;
+    // The dimension of V. If unset, dv = d.
+    int dv = 0;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
@@ -358,11 +370,6 @@ struct Fused_multihead_attention_params_v2
 
     // is input/output padded
     bool is_s_padded = false;
-
-    // The dimension of V.
-    int dv = 0;
-    // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
-    int64_t v_stride_in_bytes = 0;
 
     // SageAttention parameters
     struct SageAttention
@@ -431,6 +438,8 @@ struct Launch_params
     int sage_block_size_k = 0;
     // v tensor quant block size in sage attention
     int sage_block_size_v = 0;
+    // if we use a kernel that supports returning softmax statistics
+    bool supportReturnSoftmaxStats;
 };
 
 } // namespace kernels

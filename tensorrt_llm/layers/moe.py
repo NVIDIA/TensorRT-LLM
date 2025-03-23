@@ -1009,12 +1009,19 @@ class MixtureOfExperts(Module):
                                       token_final_scales, lora_layer_params,
                                       side_stream_id)
         if side_stream_id != SideStreamIDType.disable:
-            output, hidden_states = output
+            output, side_stream_sync_tensor = output
         if self.use_all_reduce:
             output = self.forward_allreduce(output, all_reduce_params,
                                             last_local_layer_residual)
         if side_stream_id != SideStreamIDType.disable:
-            output = (output, hidden_states)
+            # All tensors that the side channel receives as input must be synced
+            # on the main stream, to prevent their memory from being released or
+            # reused by the main stream before the side stream has finished.
+            tensors_to_sync = (side_stream_sync_tensor, hidden_states,
+                               token_selected_experts, token_final_scales,
+                               lora_layer_params)
+            tensors_to_sync = tuple(t for t in tensors_to_sync if t is not None)
+            output = (output, tensors_to_sync)
         return output
 
     def forward_experts(self, hidden_states, token_selected_experts,
@@ -1484,6 +1491,7 @@ class SharedMoE(MOE):
             quant_mode=self.quant_mode,
             is_expert=True,
         )
+        self.use_shared_gate = use_shared_gate
         if use_shared_gate:
             self.shared_expert_gate = RowLinear(
                 hidden_size,
@@ -1500,8 +1508,7 @@ class SharedMoE(MOE):
     def forward(self, hidden_states, lora_layer_params=None):
         side_stream_id = SideStreamIDType.moe if self.use_side_stream else SideStreamIDType.disable
         if self.use_side_stream:
-            hidden_states_sync = hidden_states
-            routed_output, hidden_states = super().forward(
+            routed_output, tensors_to_sync = super().forward(
                 hidden_states,
                 lora_layer_params=lora_layer_params,
                 side_stream_id=side_stream_id,
@@ -1524,11 +1531,11 @@ class SharedMoE(MOE):
                 self.shared_expert_gate(hidden_states,
                                         gate_lora_params)) * shared_output
         if self.use_side_stream:
-            # hidden_states_sync is included in the inputs to ensure that its
+            # tensors_to_sync are included in the inputs to ensure that their
             # memory space is not reused for other tensors on the main stream
             # until the side stream has finished
-            shared_output = cuda_stream_sync(
-                [shared_output, hidden_states_sync], side_stream_id)
+            shared_output = cuda_stream_sync([shared_output, *tensors_to_sync],
+                                             side_stream_id)
         hidden_states = routed_output + shared_output
         if self.tp_size > 1 and self.tp_group is not None:
             hidden_states = allreduce(hidden_states, self.tp_group)

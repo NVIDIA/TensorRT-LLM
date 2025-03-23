@@ -11,6 +11,7 @@ from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nvsmall import NVSmallForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
+from .modeling_qwen2vl import Qwen2VLForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -30,6 +31,7 @@ __all__ = [
     "Qwen2ForRewardModel",
     "get_model_architecture",
     "VilaModel",
+    "Qwen2VLForConditionalGeneration",
 ]
 
 if transformers.__version__ >= "4.45.1":

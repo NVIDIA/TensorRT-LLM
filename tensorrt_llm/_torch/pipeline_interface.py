@@ -25,6 +25,7 @@ class PipelineInterface:
                  residual: Optional[torch.Tensor] = None):
         self.hidden_states = hidden_states
         self.residual = residual
+        self.tag = 1234
 
     @classmethod
     def init_pp_comm(cls, mapping):
@@ -64,13 +65,13 @@ class PipelineInterface:
     def recv(self):
         """Receive tensors from previous rank."""
         if self.hidden_states is not None:
-            self._pp_comm.recv(self.hidden_states)
+            self._pp_comm.recv(self.hidden_states, tag=self.tag)
         if self.residual is not None:
-            self._pp_comm.recv(self.residual)
+            self._pp_comm.recv(self.residual, tag=self.tag)
 
     def send(self):
         """Send tensors to next rank."""
         if self.hidden_states is not None:
-            self._pp_comm.send(self.hidden_states)
+            self._pp_comm.send(self.hidden_states, tag=self.tag)
         if self.residual is not None:
-            self._pp_comm.send(self.residual)
+            self._pp_comm.send(self.residual, tag=self.tag)

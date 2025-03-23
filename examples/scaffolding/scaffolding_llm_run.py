@@ -2,7 +2,7 @@ import argparse
 import asyncio
 
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.scaffolding.controller import SimpleController
+from tensorrt_llm.scaffolding.controller import NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.worker import ProposerWorker, SamplingParams
 
@@ -22,10 +22,11 @@ def parse_arguments():
 
 
 def test_sync(prompts, proposer_worker):
+    prototype_controller = NativeGenerationController()
+
     llm = ScaffoldingLlm(
-        SimpleController,
-        {},
-        {'generation': proposer_worker},
+        prototype_controller,
+        {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
     )
     results = llm.generate(prompts)
     for result in results:
@@ -37,23 +38,19 @@ def test_sync(prompts, proposer_worker):
     print(f'main shut down done')
 
 
-def test_async(prompts, proposer_worker):
+def test_async(prompt, proposer_worker):
 
-    async def test_async_func(prompts, proposer_worker):
+    async def test_async_func(prompt, proposer_worker):
+        prototype_controller = NativeGenerationController()
         llm = ScaffoldingLlm(
-            SimpleController,
-            {},
-            {'generation': proposer_worker},
+            prototype_controller,
+            {NativeGenerationController.WorkerTag.GENERATION: proposer_worker},
         )
 
-        futures = []
-        for prompt in prompts:
-            future = llm.generate_async(prompt)
-            futures.append(future)
+        future = llm.generate_async(prompt)
 
-        for future in futures:
-            result = await future.aresult()
-            print(result.output.output_str)
+        result = await future.aresult()
+        print(result.output.output_str)
 
         print(f'main shutting down...')
         llm.shutdown()
@@ -61,7 +58,7 @@ def test_async(prompts, proposer_worker):
         proposer_worker.shutdown()
         print(f'main shut down done')
 
-    asyncio.run(test_async_func(prompts, proposer_worker))
+    asyncio.run(test_async_func(prompt, proposer_worker))
 
 
 def main():
@@ -82,7 +79,7 @@ def main():
     )
 
     if args.run_async:
-        test_async(prompts, proposer_worker)
+        test_async(prompts[0], proposer_worker)
     else:
         test_sync(prompts, proposer_worker)
 

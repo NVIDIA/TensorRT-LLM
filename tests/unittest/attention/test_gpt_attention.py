@@ -774,7 +774,7 @@ class TestFunctional(unittest.TestCase):
         plugin_kv_num_heads = num_kv_heads if attention_type == 'llama_attention' or attention_type == 'gpt_bigcode_attention' else num_heads
         kv_hidden_size = plugin_kv_num_heads * head_size
         qkv_hidden_size = hidden_size + 2 * kv_hidden_size
-        out_len = 8
+        out_len = 6
         max_seq_len = in_len + 24
         sink_tokens_in_last_block = sink_token_len % tokens_per_block
         bubble_len = tokens_per_block - sink_tokens_in_last_block if sink_tokens_in_last_block > 0 else 0

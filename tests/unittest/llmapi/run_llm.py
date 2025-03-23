@@ -15,11 +15,20 @@ from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 @click.option("--best_of", type=int, default=None)
 @click.option("--top_k", type=int, default=1)
 @click.option("--use_beam_search", is_flag=True)
+@click.option("--use_pytorch", is_flag=True)
 def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
-         best_of: Optional[int], top_k: int, use_beam_search: bool):
-    llm = LLM(model_dir,
-              tensor_parallel_size=tp_size,
-              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+         best_of: Optional[int], top_k: int, use_beam_search: bool,
+         use_pytorch: bool):
+    if use_pytorch:
+        from tensorrt_llm._torch.llm import LLM as TorchLLM
+        llm = TorchLLM(
+            model_dir,
+            tensor_parallel_size=tp_size,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
+    else:
+        llm = LLM(model_dir,
+                  tensor_parallel_size=tp_size,
+                  kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
 
     if engine_dir is not None and os.path.abspath(
             engine_dir) != os.path.abspath(model_dir):
@@ -36,6 +45,8 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
     for output in llm.generate([prompt_token_ids],
                                sampling_params=sampling_params):
         print(output)
+
+    print("run_llm.py Done")
 
 
 if __name__ == '__main__':

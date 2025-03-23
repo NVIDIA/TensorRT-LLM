@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.custom_op import flashinfer_rmsnorm
+from tensorrt_llm._torch.custom_ops import flashinfer_rmsnorm
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 
