@@ -57,7 +57,7 @@ examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1
 examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
 examples/test_medusa.py::test_llm_medusa_fp8_modelOpt_ckpt_1gpu[use_cpp_session-llama3.1-medusa-8b-hf_v0.1-bs1]
 examples/test_medusa.py::test_llm_medusa_fp8_modelOpt_ckpt_1gpu[use_py_session-llama3.1-medusa-8b-hf_v0.1-bs8]
-examples/test_mistral.py::test_llm_mistral_quantization_8gpus_summary[mistral-7b-v0.1-fp8-nb:4]
+examples/test_mistral.py::test_llm_mistral_quantization_summary[mistral-7b-v0.1-tp4pp2-nb:4]
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization]
 examples/test_mixtral.py::test_llm_mixtral_fp8_4gpus_summary[Mixtral-8x7B-v0.1-nb:4]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]

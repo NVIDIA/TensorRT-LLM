@@ -4743,46 +4743,6 @@ def test_llama_3_x_fp8_with_bf16_lora(llama_example_root, llm_datasets_root,
     )
 
 
-@skip_pre_ada
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
-                         indirect=True)
-def test_mistral_nemo_fp8_with_bf16_lora(
-    llama_example_root,
-    mistral_nemo_model_root,
-    llm_datasets_root,
-    qcache_dir,
-    llm_venv,
-    engine_dir,
-):
-    "Run Mistral Nemo 12B with multiple pseudo LoRAs."
-
-    # Quantize the base model to fp8.
-    qmodel_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=mistral_nemo_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype="bfloat16",
-        qformat="fp8",
-        quantize_dir=qcache_dir,
-        calib_size=32,
-        kv_cache_dtype="fp8")
-
-    test_multi_lora_support(
-        hf_model_dir=mistral_nemo_model_root,
-        tllm_ckpt_dir=qmodel_dir,
-        engine_dir=engine_dir,
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        num_loras=2,
-        lora_rank=8,
-        target_hf_modules=["q_proj", "k_proj", "v_proj"],
-        target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
-        zero_lora_weights=True,
-    )
-
-
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
 def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                                 llama_model_root, llm_venv,

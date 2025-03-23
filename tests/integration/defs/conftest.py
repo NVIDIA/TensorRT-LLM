@@ -1592,10 +1592,16 @@ def llm_mistral_model_root(request):
     model_root = os.path.join(models_root, "mistral-7b-v0.1")
     if request.param == "mistral-7b-v0.1":
         model_root = os.path.join(models_root, "mistral-7b-v0.1")
-    if request.param == "komt-mistral-7b-v1":
+    elif request.param == "komt-mistral-7b-v1":
         model_root = os.path.join(models_root, "komt-mistral-7b-v1")
-    if request.param == "mistral-7b-v0.3":
+    elif request.param == "mistral-7b-v0.3":
         model_root = os.path.join(models_root, "Mistral-7B-Instruct-v0.3")
+    elif request.param == "Codestral-22B-v0.1":
+        model_root = os.path.join(models_root, "Codestral-22B-v0.1")
+    elif request.param == "Ministral-8B-Instruct-2410":
+        model_root = os.path.join(models_root, "Ministral-8B-Instruct-2410")
+    elif request.param == "Mistral-Small-24B-Base-2501":
+        model_root = os.path.join(models_root, "Mistral-Small-24B-Base-2501")
 
     return model_root
 

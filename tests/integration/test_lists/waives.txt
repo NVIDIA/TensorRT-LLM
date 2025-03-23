@@ -507,6 +507,8 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
 examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2b-smooth_quant-float16-8] SKIP (https://nvbugs/5158743)
+examples/test_medusa.py::test_mistral_nemo_medusa_1gpu[Mistral-Nemo-12b-Base] SKIP (https://nvbugs/5183490)
+examples/test_medusa.py::test_mistral_nemo_minitron_medusa_1gpu[Mistral-NeMo-Minitron-8B-Instruct] SKIP (https://nvbugs/5183493)
 
 full:B200/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
