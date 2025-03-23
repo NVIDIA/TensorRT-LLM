@@ -61,7 +61,7 @@ import tensorrt_llm.profiler as profiler
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi import LLM, KvCacheConfig
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -247,6 +247,12 @@ def parse_args():
     parser.add_argument('--enable_overlap_scheduler',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=0.9,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
 
     # MMLU args
     parser.add_argument(
@@ -294,6 +300,9 @@ def main():
     else:
         build_config = None
 
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=args.kv_cache_free_gpu_memory_fraction)
+
     if args.backend == "pytorch":
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
         config = PyTorchConfig(
@@ -308,13 +317,15 @@ def main():
             pytorch_backend_config=config,
             enable_chunked_prefill=args.enable_chunked_prefill,
             build_config=build_config,
+            kv_cache_config=kv_cache_config,
             enable_attention_dp=args.enable_attention_dp)
     else:
         llm = LLM(model=args.engine_dir or args.hf_model_dir,
                   tokenizer=args.tokenizer_dir,
                   tensor_parallel_size=args.tp_size,
                   enable_chunked_prefill=args.enable_chunked_prefill,
-                  build_config=build_config)
+                  build_config=build_config,
+                  kv_cache_config=kv_cache_config)
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     print(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")

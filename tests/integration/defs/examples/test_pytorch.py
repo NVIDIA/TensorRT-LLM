@@ -80,6 +80,7 @@ def test_llm_deepseek_1gpu(
         "--backend=pytorch",
         "--check_accuracy",
         "--enable_overlap_scheduler",
+        "--kv_cache_free_gpu_memory_fraction=0.8",
         f"--accuracy_threshold={acc_thres}",
     ]
 
