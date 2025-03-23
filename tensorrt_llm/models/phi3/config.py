@@ -91,9 +91,19 @@ class Phi3Config(PretrainedConfig):
             kwargs['dense_attention_every_n_layers'] = getattr(
                 hf_config, "dense_attention_every_n_layers", None)
             kwargs['norm_epsilon'] = hf_config.layer_norm_epsilon
+            kwargs['rotary_pct'] = getattr(hf_config, "partial_rotary_factor",
+                                           1.0)
+            kwargs['tie_word_embeddings'] = getattr(hf_config,
+                                                    "tie_word_embeddings",
+                                                    False)
         else:
             kwargs['rotary_base'] = hf_config.rope_theta
+            kwargs['rotary_pct'] = getattr(hf_config, "partial_rotary_factor",
+                                           1.0)
             kwargs['norm_epsilon'] = hf_config.rms_norm_eps
+            kwargs['tie_word_embeddings'] = getattr(hf_config,
+                                                    "tie_word_embeddings",
+                                                    False)
         moe_variant = hf_config.architectures[0] == "PhiMoEForCausalLM"
         if moe_variant:
             kwargs.update({

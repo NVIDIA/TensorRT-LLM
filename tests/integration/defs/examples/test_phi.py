@@ -507,11 +507,8 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
 @pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2",
-    "Phi-3-mini-128k-instruct",
-    "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct",
-    'Phi-3.5-MoE-instruct',
+    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
+    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
@@ -566,11 +563,8 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
 
 @skip_pre_ada
 @pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2",
-    "Phi-3-mini-128k-instruct",
-    "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct",
-    "Phi-3.5-MoE-instruct",
+    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
+    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
@@ -614,6 +608,7 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
         "Phi-3.5-mini-instruct": ["qkv_proj"],
         "Phi-3.5-MoE-instruct":
         ["q_proj", "k_proj", "v_proj", "w1", "w2", "w3"],
+        "Phi-4-mini-instruct": ["qkv_proj"],
     }
     trtllm_target_modules = {
         "phi-2": ["attn_q", "attn_k", "attn_v"],
@@ -624,6 +619,7 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
             "attn_q", "attn_k", "attn_v", "moe_h_to_4h", "moe_4h_to_h",
             "moe_gate"
         ],
+        "Phi-4-mini-instruct": ["attn_qkv"],
     }
     model_name = os.path.basename(llm_phi_model_root)
     test_multi_lora_support(
