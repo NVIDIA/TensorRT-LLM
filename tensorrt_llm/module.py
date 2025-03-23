@@ -126,12 +126,23 @@ class Module(object):
             if remove_duplicate:
                 memo.add(self)
             yield prefix, self, parent
-            for name, module in self._modules.items():
+
+            if parent:
+                # Use the up-to-date module from the parent, to allow replacing
+                # layers while iterating this generator.
+                module_name = prefix.rsplit('.', 1)[-1]
+                module = getattr(parent, module_name)
                 if module is None:
+                    return
+            else:
+                module = self
+
+            for child_name, child_module in module._modules.items():
+                if child_module is None:
                     continue
-                submodule_prefix = prefix + ('.' if prefix else '') + name
-                for m in module.named_modules_with_parent(
-                        memo, submodule_prefix, self, remove_duplicate):
+                submodule_prefix = prefix + ('.' if prefix else '') + child_name
+                for m in child_module.named_modules_with_parent(
+                        memo, submodule_prefix, module, remove_duplicate):
                     yield m
 
     def named_children(self):

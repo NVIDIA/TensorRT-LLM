@@ -334,6 +334,8 @@ struct LookaheadDecodingConfig
 
     /// @brief return <maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen>
     [[nodiscard]] std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
+    static std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResourceTuple(
+        SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
 
     /// @brief return true when `this` can be executed on resources defined by `that`
     [[nodiscard]] bool isLE(LookaheadDecodingConfig const& that) const;
@@ -341,12 +343,12 @@ struct LookaheadDecodingConfig
     /// @brief return true when the parameter combination is valid.
     static bool isLegal(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize) noexcept;
 
-private:
-    friend class Serialization;
-
     static constexpr SizeType32 kDefaultLookaheadDecodingWindow = 4;
     static constexpr SizeType32 kDefaultLookaheadDecodingNgram = 3;
     static constexpr SizeType32 kDefaultLookaheadDecodingVerificationSet = 4;
+
+private:
+    friend class Serialization;
 
     // Number of NGrams in lookahead branch per step.
     SizeType32 mWindowSize;
@@ -611,6 +613,7 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
+    /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
     /// @param lookaheadConfig The lookahead speculative decoding configuration
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor

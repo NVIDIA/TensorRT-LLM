@@ -17,7 +17,7 @@ class LogitsProcessor(nn.Module):
                 return_context_logits: bool = False) -> torch.Tensor:
 
         if not return_context_logits:
-            if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
+            if attn_metadata is not None:
                 last_tokens = torch.cumsum(
                     attn_metadata.seq_lens_cuda,
                     dim=0,

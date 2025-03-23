@@ -175,7 +175,8 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.all_reduce = AllReduce(
+            self.parallel_config) if not is_expert else None
         self._weights_created = False
         self.is_expert = is_expert
         self.use_custom_cublas_mm = use_custom_cublas_mm

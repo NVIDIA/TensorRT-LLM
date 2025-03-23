@@ -6,3 +6,4 @@ myst_parser
 breathe
 pygit2
 sphinx_copybutton
+autodoc_pydantic

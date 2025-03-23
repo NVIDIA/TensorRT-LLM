@@ -327,7 +327,6 @@ class TestVila(unittest.TestCase):
         tokens_per_block = 128
         head_dim = vila.config.hidden_size // vila.config.num_attention_heads
         num_layers = vila.config.num_hidden_layers
-        num_heads = vila.config.num_attention_heads
         num_kv_heads = vila.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
 
@@ -345,7 +344,6 @@ class TestVila(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -428,7 +426,6 @@ class TestVila(unittest.TestCase):
         tokens_per_block = 128
         head_dim = vila.config.hidden_size // vila.config.num_attention_heads
         num_layers = vila.config.num_hidden_layers
-        num_heads = vila.config.num_attention_heads
         num_kv_heads = vila.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(context_sequence_lengths)
@@ -442,7 +439,6 @@ class TestVila(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
@@ -810,7 +806,6 @@ class TestNVila(unittest.TestCase):
         tokens_per_block = 128
         head_dim = vila.config.hidden_size // vila.config.num_attention_heads
         num_layers = vila.config.num_hidden_layers
-        num_heads = vila.config.num_attention_heads
         num_kv_heads = vila.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
 
@@ -828,7 +823,6 @@ class TestNVila(unittest.TestCase):
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
-            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

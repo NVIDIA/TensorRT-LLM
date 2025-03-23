@@ -58,6 +58,9 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         out_dtype=output_dtype,
         userbuffers_id=-1,
     )
+    # set pytorch's cublas workspace size to 32MB to be aligned with trtllm
+    old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = f"{32*1024*1024}"
     ref = torch._scaled_mm(
         x,
         w.t(),
@@ -66,6 +69,7 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         scale_b=scale_w,
         use_fast_accum=True,
     )
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = old_env
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
 
     if getSMVersion() == 90:

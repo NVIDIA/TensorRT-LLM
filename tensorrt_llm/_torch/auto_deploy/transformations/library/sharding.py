@@ -196,7 +196,7 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
        linear node to the last linear node of an identified sharding region.
     # 5. Shard the GEMM nodes or skip accordingly.
     """
-    ad_logger.info("Sharding graph")
+    ad_logger.info("Sharding graph for TP")
     ad_logger.debug("Before sharding graph: " + str(gm))
 
     if world_size < 2:

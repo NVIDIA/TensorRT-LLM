@@ -210,7 +210,6 @@ To get started with TensorRT-LLM, visit our documentation:
 - [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
 - [Release Notes](https://nvidia.github.io/TensorRT-LLM/release-notes.html)
 - [Installation Guide for Linux](https://nvidia.github.io/TensorRT-LLM/installation/linux.html)
-- [Installation Guide for Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html)
 - [Installation Guide for Grace Hopper](https://nvidia.github.io/TensorRT-LLM/installation/grace-hopper.html)
 - [Supported Hardware, Models, and other Software](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
 

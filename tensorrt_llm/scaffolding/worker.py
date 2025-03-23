@@ -153,8 +153,8 @@ class ProposerWorker(Worker):
     async def run_task(self, task: Task) -> TaskStatus:
         assert isinstance(
             task, GenerationTask
-        ), 'Only GenerationTask(role="generation") should be dispatched to ProposerWorker'
-        assert task.type == 'generate', 'ProposerWorker only supports generation tasks with type "generate"'
+        ), 'Only GenerationTas should be dispatched to ProposerWorker'
+
         generation_request = self._create_generation_request_from_task(task)
         result = self.executor.submit(generation_request)
         await result.aresult()

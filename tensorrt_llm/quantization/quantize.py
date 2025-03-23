@@ -40,6 +40,7 @@ def quantize_layers(
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
         is_excluded = False
+        quant_cls = None
 
         # handle exclusion
         for exclude_module in exclude_modules:
@@ -47,36 +48,26 @@ def quantize_layers(
                 is_excluded = True
                 break
 
-        # MOE module will be quantize when initialization.
+        # MoE modules are quantized on their constructor, so they must always
+        # be re-created with the appropriate quant_mode. When excluded,
+        # re-create with quant_mode 0.
         # We need to handle it specially, we may want to redesign MoE implementation
         if isinstance(module, MixtureOfExperts):
-            # We need to re-initialize a correct version of MOE module.
-            if is_excluded:
-                quant_mode = QuantMode(0)
-            else:
-                quant_mode = quant_config.quant_mode
-
-            init_params = get_init_params(module, MixtureOfExperts)
-            init_params["quant_mode"] = quant_mode
-            if preprocess_init_params is not None:
-                preprocess_init_params(init_params, name, module)
-
-            original_layer = MixtureOfExperts(**init_params)
-            if parent is not None:
-                setattr(parent, module_name, original_layer)
-            else:
-                model = original_layer
+            quant_cls = type(module)
         elif not is_excluded:
-            quant_cls = None
             for cls in quant_map:
                 if isinstance(module, cls):
                     quant_cls = quant_map[cls]
                     break
 
-            if quant_cls is None:
-                continue
-
+        if quant_cls:
             init_params = get_init_params(module, quant_cls)
+            if isinstance(module, MixtureOfExperts):
+                if is_excluded:
+                    quant_mode = QuantMode(0)
+                else:
+                    quant_mode = quant_config.quant_mode
+                init_params["quant_mode"] = quant_mode
             if "bias" in init_params and not isinstance(module,
                                                         MixtureOfExperts):
                 init_params["bias"] = init_params["bias"] is not None

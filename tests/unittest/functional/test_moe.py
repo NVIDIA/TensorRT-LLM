@@ -607,6 +607,8 @@ class TestMoE(unittest.TestCase):
 
         # Build time is also proportional to the size of these (more plugin profiler runs) so dont make them too big
         # TODO Increasing these also cause some failures (observed on Hopper), not sure if this is a problem or not
+        torch.random.manual_seed(42)
+
         max_num_seq = 10
         max_seq_len = 4
 
@@ -733,6 +735,8 @@ class TestMoE(unittest.TestCase):
     @parameterized.expand(get_mlp_params(), name_func=unittest_name_func)
     def test_mlp_comparison(self, dtype_str, actfn, use_plugin):
         """ This test uses one expert and compares the result to a plain MLP """
+        torch.random.manual_seed(42)
+
         use_int4_weights = dtype_str == 'int4'
         custom_map = {
             "int4": trt.int8,
@@ -907,6 +911,8 @@ class TestMoE(unittest.TestCase):
         if getSMVersion() != 90:
             pytest.skip("OOTB tests disabled on pre-Hopper architectures")
 
+        torch.random.manual_seed(42)
+
         use_int4_weights = dtype_str == 'int4'
         custom_map = {
             "int4": trt.int8,
@@ -1020,6 +1026,8 @@ class TestMoE(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mlp_lora_comparison(self, dtype_str, actfn, use_plugin, lora_rank):
         """This test uses one expert and compares the result to a plain MLP"""
+        torch.random.manual_seed(42)
+
         use_int4_weights = dtype_str == "int4"
         weight_dtype = (trt.int8 if use_int4_weights else
                         tensorrt_llm.str_dtype_to_trt(dtype_str))

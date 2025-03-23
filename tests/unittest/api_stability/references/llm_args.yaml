@@ -99,7 +99,7 @@ methods:
         default: null
         name: iter_stats_max_iterations
       kv_cache_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.KvCacheConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
         default: null
         name: kv_cache_config
       load_format:
@@ -175,7 +175,7 @@ methods:
         default: false
         name: skip_tokenizer_init
       speculative_config:
-        annotation: Union[tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
+        annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
           tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
         name: speculative_config

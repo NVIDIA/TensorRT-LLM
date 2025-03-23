@@ -32,6 +32,14 @@ def add_llm_args(parser):
                         type=int,
                         default=2048,
                         help="The maximum batch size.")
+    parser.add_argument(
+        "--max_num_tokens",
+        type=int,
+        default=8192,
+        help=
+        "The maximum total tokens (context + generation) across all sequences in a batch."
+    )
+
     # Parallelism
     parser.add_argument('--attention_backend',
                         type=str,
@@ -107,7 +115,8 @@ def setup_llm(args):
         num_nextn_predict_layers=args.mtp_nextn) if args.mtp_nextn > 0 else None
 
     build_config = BuildConfig(max_seq_len=args.max_seq_len,
-                               max_batch_size=args.max_batch_size)
+                               max_batch_size=args.max_batch_size,
+                               max_num_tokens=args.max_num_tokens)
 
     llm = LLM(model=args.model_dir,
               pytorch_backend_config=pytorch_config,

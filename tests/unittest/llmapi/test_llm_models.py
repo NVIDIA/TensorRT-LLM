@@ -11,40 +11,18 @@ from test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
 from utils.util import (force_ampere, skip_pre_hopper)
 # isort: on
 
-gptj_model_path = get_model_path('gpt-j-6b')
 gpt2_model_path = get_model_path('gpt2-medium')
 starcoder2_model_path = get_model_path('starcoder2-3b')
 phi_3_mini_4k_model_path = get_model_path('Phi-3/Phi-3-mini-4k-instruct')
 phi_3_small_8k_model_path = get_model_path('Phi-3/Phi-3-small-8k-instruct')
 phi_3_medium_4k_model_path = get_model_path('Phi-3/Phi-3-medium-4k-instruct')
 gemma_2_9b_it_model_path = get_model_path('gemma/gemma-2-9b-it')
-gemma_2b_model_path = get_model_path('gemma/gemma-2b')
 glm_model_path = get_model_path('chatglm3-6b')
 qwen2_model_path = get_model_path('Qwen2-7B-Instruct')
 qwen2_5_model_path = get_model_path('Qwen2.5-0.5B-Instruct')
 mamba2_370m_model_path = get_model_path('mamba2/mamba2-370m')
 gpt_neox_20b_model_path = get_model_path('gpt-neox-20b')
 sampling_params = SamplingParams(max_tokens=10, end_id=-1)
-
-
-@force_ampere
-def test_llm_gptj():
-    llm_test_harness(gptj_model_path,
-                     inputs=["A B C"],
-                     references=["D E F G H I J K L M"],
-                     sampling_params=sampling_params)
-
-
-@force_ampere
-def test_llm_gptj_int4_weight_only():
-    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
-    calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
-    llm_test_harness(gptj_model_path,
-                     inputs=["A B C"],
-                     references=["D E F G H I J K L M"],
-                     sampling_params=sampling_params,
-                     quant_config=quant_config,
-                     calib_config=calib_config)
 
 
 @force_ampere
@@ -56,6 +34,7 @@ def test_llm_gpt2():
 
 
 @force_ampere
+@pytest.mark.part1
 def test_llm_gpt2_sq():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
@@ -70,6 +49,7 @@ def test_llm_gpt2_sq():
 
 
 @force_ampere
+@pytest.mark.part1
 def test_llm_gpt2_int8_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16,
                                kv_cache_quant_algo=QuantAlgo.INT8)
@@ -83,6 +63,7 @@ def test_llm_gpt2_int8_weight_only():
 
 
 @skip_pre_hopper
+@pytest.mark.part1
 def test_llm_gpt2_fp8():
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
@@ -95,6 +76,7 @@ def test_llm_gpt2_fp8():
 
 
 @force_ampere
+@pytest.mark.part0
 def test_llm_starcoder2():
     llm_test_harness(starcoder2_model_path,
                      inputs=["def print_hello_world():"],
@@ -103,6 +85,7 @@ def test_llm_starcoder2():
 
 
 @skip_pre_hopper
+@pytest.mark.part0
 def test_llm_starcoder2_fp8():
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
@@ -146,6 +129,7 @@ def test_llm_phi_3_small_8k():
 
 
 @force_ampere
+@pytest.mark.part1
 def test_llm_gemma_2_9b_it():
     build_config = BuildConfig()
     build_config.max_batch_size = 512

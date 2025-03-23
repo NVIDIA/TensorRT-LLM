@@ -139,6 +139,8 @@ class LlamaModel(DecoderModel):
                 tensor_parallel_rank=model_config.mapping.tp_rank,
                 tensor_parallel_size=model_config.mapping.tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
+                pipeline_parallel_size=model_config.mapping.pp_size,
+                parallel_rank=model_config.mapping.rank,
                 gather_output=True,
                 gpus_per_node=model_config.mapping.gpus_per_node,
             ),

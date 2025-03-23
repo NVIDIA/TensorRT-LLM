@@ -1,0 +1,43 @@
+version: 0.0.1
+l0_gh200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+  tests:
+  - unittest/attention/test_gpt_attention.py -k "partition0"
+  - unittest/attention/test_gpt_attention.py -k "partition1"
+  - unittest/attention/test_gpt_attention.py -k "partition2"
+  - unittest/attention/test_gpt_attention.py -k "partition3"
+  - unittest/attention/test_gpt_attention.py -k "xqa_generic"
+  - unittest/model/test_gpt_e2e.py
+  - unittest/bindings
+  - test_cache.py::test_cache_sanity # 1 sec
+  - unittest/llmapi/test_llm_quant.py
+  - test_e2e.py::test_llmapi_quickstart_atexit
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+  tests:
+  - unittest/test_model_runner_cpp.py
+  - accuracy/test_accuracy.py::TestGptNext::test_auto_dtype # 1.5 mins
+  - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
+  - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
+  - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
+  - unittest/model/eagle
+  - unittest/model_api/test_model_level_api.py
+  - unittest/model_api/test_model_quantization.py
+  - unittest/model_api/test_model_api_multi_gpu.py

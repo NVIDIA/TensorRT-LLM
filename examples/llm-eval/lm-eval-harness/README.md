@@ -32,7 +32,10 @@ In the LM-Eval-Harness, model args are submitted as a comma-separated list of th
 | free_gpu_memory_fraction | KV cache free GPU memory fraction                                 | 0.9            |
 | trust_remote_code        | trust remote code; use if necessary to set up the tokenizer       | False          |
 | tp                       | tensor parallel size (for torch backend)                          | no. of workers |
-| use_cuda_graph           |                                                                   | True           |
+| use_cuda_graph           | enable CUDA graph                                                 | True           |
+| max_context_length       | maximum context length for evaluation                             | None           |
+| moe_expert_parallel_size | expert parallel size for MoE models                               | None           |
+| moe_backend              | backend for MoE models (e.g., "TRTLLM")                           | "TRTLLM"       |
 
 ### Torch backend
 

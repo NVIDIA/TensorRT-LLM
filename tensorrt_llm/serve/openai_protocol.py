@@ -76,6 +76,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
     logprobs: Optional[CompletionLogProbs] = None
+    context_logits: Optional[Union[List[float], List[List[
+        float]]]] = None  # For reward models, the output is score logits instead of text.
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
         default=None,
@@ -172,6 +174,7 @@ class CompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    return_context_logits: bool = False
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -224,6 +227,7 @@ class CompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            return_context_logits=self.return_context_logits,
 
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,

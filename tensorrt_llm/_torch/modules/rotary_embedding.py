@@ -134,13 +134,13 @@ class RotaryEmbedding(nn.Module):
         """
         if IS_FLASHINFER_AVAIABLE:
             from ..attention_backend import FlashInferAttentionMetadata
-            if attn_metadata is not None and attn_metadata.kv_cache_manager is not None:
+            if attn_metadata is not None:
                 from ..attention_backend import (FlashInferAttentionMetadata,
                                                  StarAttentionMetadata)
                 if isinstance(attn_metadata, StarAttentionMetadata):
                     pass
                 elif isinstance(attn_metadata, FlashInferAttentionMetadata):
-                    from ..custom_op import flashinfer_apply_rope_inplace
+                    from ..custom_ops import flashinfer_apply_rope_inplace
                     assert len(targets) == 2
                     q = targets[0]
                     seq_len = q.size()[0]

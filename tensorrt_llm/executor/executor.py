@@ -7,7 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, Generator, List, Optional, Union
+from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
+                    Union)
 
 import numpy as np
 import torch
@@ -43,6 +44,11 @@ __all__ = [
 if enable_llm_debug():
     # Mainly enable more detailed logging from cpp runtime.
     set_level("info")
+
+
+async def empty_async_iterable() -> AsyncIterable:
+    if False:  # ensures the function remains an async generator
+        yield
 
 
 class CppExecutorError(RuntimeError):
@@ -109,6 +115,7 @@ class GenerationExecutor(ABC):
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             streaming: bool = False,
             prompt_tuning_config: Optional[list] = None,
+            mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
             postproc_params: Optional[PostprocParams] = None
@@ -134,6 +141,7 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
                 prompt_tuning_config=prompt_tuning_config,
+                mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
                 disaggregated_params=disaggregated_params))
         return result
@@ -256,7 +264,11 @@ class GenerationExecutor(ABC):
         Returns:
             List[dict]: A list of runtime stats as dict.
         """
-        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
+        if self._iter_stats_result is None:
+            print_colored(
+                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats() AFTER prompts have been submitted.\n",
+                "yellow")
+            return []
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result.get_results()
@@ -267,7 +279,11 @@ class GenerationExecutor(ABC):
         Returns:
             IterationResult: An async iterable object containing runtime stats.
         """
-        assert self._iter_stats_result is not None, "Stats IterationResult is not properly instantiated."
+        if self._iter_stats_result is None:
+            print_colored(
+                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "yellow")
+            return empty_async_iterable()
 
         self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result

@@ -35,8 +35,14 @@ extensions = [
     'sphinx.ext.todo',
     'sphinxarg.ext',
     'sphinx_click',
-    'sphinx_copybutton'
+    'sphinx_copybutton',
+    'sphinxcontrib.autodoc_pydantic'
 ]
+
+autodoc_pydantic_model_show_json = True
+autodoc_pydantic_model_show_config_summary = True
+autodoc_pydantic_field_doc_policy = "description"
+autodoc_pydantic_model_show_field_list = True  # Display field list with descriptions
 
 myst_url_schemes = {
     "http":
@@ -114,6 +120,7 @@ Runtime
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
+# compile cpp doc
 subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
 gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
             runtime_summary)

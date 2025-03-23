@@ -22,7 +22,7 @@ def torch_moe(
         x (torch.Tensor): Input tensor of shape (B, H) or (B, S, H), where B is the batch size,
             S is the sequence length, and H is the hidden size.
         selected_experts (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the indices
-            of the selected experts for each token.
+            of the selected experts for each token. Only experts within range [0,num_experts) is processed
         routing_weights (torch.Tensor): A tensor of shape (B, TOP_K) or (B*S, TOP_K) containing the normalized
             routing weights for the selected experts.
         w1_weight (List[torch.Tensor]): A list of expert weight tensors for w1, each of shape
@@ -39,9 +39,14 @@ def torch_moe(
     num_experts = len(w1_weight)
 
     final_hidden_states = torch.zeros_like(x)
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(
-        2, 1, 0
+    valid_mask = (selected_experts >= 0) & (selected_experts < num_experts)
+    # For out-of-range indices, set them to num_experts
+    selected_experts_fixed = torch.where(
+        valid_mask, selected_experts, torch.full_like(selected_experts, num_experts)
     )
+    # Create one-hot encoding with an extra class.
+    one_hot = torch.nn.functional.one_hot(selected_experts_fixed, num_classes=num_experts + 1)
+    expert_mask = one_hot[..., :num_experts].permute(2, 1, 0)
 
     for expert_idx in range(num_experts):
         idx, top_x = torch.where(expert_mask[expert_idx])
@@ -146,8 +151,18 @@ def trtllm_fused_moe(
 ) -> torch.Tensor:
     routing_weights = routing_weights.to(torch.float32)
     selected_experts = selected_experts.to(torch.int32)
+
     return torch.ops.trtllm.fused_moe(
-        x, selected_experts, routing_weights, w3_w1_stacked_weight, w2_stacked_weight, x.dtype
+        x,
+        selected_experts,
+        routing_weights,
+        w3_w1_stacked_weight,
+        w2_stacked_weight,
+        x.dtype,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
     )
 
 

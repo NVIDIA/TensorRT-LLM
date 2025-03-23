@@ -89,7 +89,6 @@ class KVCacheManager(BaseResourceManager):
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
-        num_heads: int,
         num_kv_heads: Union[int, List[Optional[int]]],
         head_dim: int,
         tokens_per_block: int,
@@ -103,7 +102,6 @@ class KVCacheManager(BaseResourceManager):
         # draft/target layers. Add extra tokens to haddle this issue.
         num_extra_kv_tokens: int = 0,
     ) -> None:
-        self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
         self.dtype = dtype
@@ -213,8 +211,6 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
 
-        self.max_num_slots = max_batch_size
-
     def shutdown(self):
         self.impl.release_pools()
 
@@ -229,7 +225,6 @@ class KVCacheManager(BaseResourceManager):
             kv_cache_config,
             kv_cache_type,
             num_layers=model_config.num_attention_layers(mapping.pp_size),
-            num_heads=model_config.num_heads,
             # NOTE: this preserves existing behavior in KV cache manager.
             # But we should change this to pass a list at some point.
             # We're assuming the KV cache is homogeneous here.
@@ -485,7 +480,39 @@ class BaseDraftTokenManager(BaseResourceManager):
         return 0
 
 
-class ResourceManager(object):
+class SlotManager:
+
+    def __init__(self, max_num_requests: int):
+        self.max_num_requests = max_num_requests
+        self.slot_mapping = dict()
+        self.free_slots = set(range(max_num_requests))
+
+    def get_slot(self, request_id: int):
+        return self.slot_mapping.get(request_id, None)
+
+    def fill_slot_id_tensor(self, requests: List[LlmRequest],
+                            slot_id_tensor: torch.Tensor):
+        for i, request in enumerate(requests):
+            slot_id = self.get_slot(request.request_id)
+            if slot_id is not None:
+                slot_id_tensor[i] = slot_id
+            else:
+                raise ValueError(f"Request {request.request_id} has no slot id")
+
+    def add_slot(self, request_id: int):
+        if len(self.free_slots) == 0:
+            raise ValueError("No free slots")
+        slot = self.free_slots.pop()
+        self.slot_mapping[request_id] = slot
+        return slot
+
+    def remove_slot(self, request_id: int):
+        assert request_id in self.slot_mapping
+        slot = self.slot_mapping.pop(request_id)
+        self.free_slots.add(slot)
+
+
+class ResourceManager:
 
     def __init__(self, resource_managers: dict[str, BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)

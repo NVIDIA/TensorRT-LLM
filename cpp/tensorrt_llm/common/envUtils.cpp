@@ -217,6 +217,12 @@ int getEnvMmhaKernelBlockSize()
     return mmhaKernelBlockSize;
 }
 
+bool getEnvUseTileSizeKv64ForTrtllmGen()
+{
+    static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
+    return useTileSizeKv64;
+}
+
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;

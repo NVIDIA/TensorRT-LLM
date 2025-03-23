@@ -1,5 +1,6 @@
 import re
 from collections import Counter
+from typing import List
 
 
 def extract_answer(string: str,
@@ -64,6 +65,19 @@ def get_majority_result(
         return None, None
 
     majority_result = Counter(valid_answers_and_results).most_common(1)[0][0]
-
     # return result and extracted result
     return majority_result[0], majority_result[1]
+
+
+def get_digit_majority_vote_result(results: List[str]) -> str:
+
+    def is_digit(result: str):
+        extracted_answer = extract_answer(result)
+        if extracted_answer is None:
+            return False
+        return extracted_answer.isdigit()
+
+    vote_result = get_majority_result(results,
+                                      result_extractor=extract_answer,
+                                      result_validator=is_digit)[0]
+    return vote_result if vote_result else results[0]
