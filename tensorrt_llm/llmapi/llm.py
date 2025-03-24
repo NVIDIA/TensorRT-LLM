@@ -503,7 +503,8 @@ class LLM:
         max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
-            scheduler_config=self.args.scheduler_config,
+            scheduler_config=PybindMirror.maybe_to_pybind(
+                self.args.scheduler_config),
             batching_type=self.args.batching_type or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -512,7 +513,8 @@ class LLM:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
         if self.args.peft_cache_config is not None:
-            executor_config.peft_cache_config = self.args.peft_cache_config
+            executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
+                self.args.peft_cache_config)
         elif self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")

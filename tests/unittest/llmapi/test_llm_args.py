@@ -98,3 +98,76 @@ def test_KvCacheConfig_declaration():
 
 def test_KvCacheConfig_default_values():
     check_defaults(KvCacheConfig, tle.KvCacheConfig)
+
+
+def test_CapacitySchedulerPolicy():
+    val = CapacitySchedulerPolicy.MAX_UTILIZATION
+    assert PybindMirror.maybe_to_pybind(
+        val) == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
+
+
+def test_ContextChunkingPolicy():
+    val = ContextChunkingPolicy.EQUAL_PROGRESS
+    assert PybindMirror.maybe_to_pybind(
+        val) == tle.ContextChunkingPolicy.EQUAL_PROGRESS
+
+
+def test_DynamicBatchConfig_declaration():
+    config = DynamicBatchConfig(enable_batch_size_tuning=True,
+                                enable_max_num_tokens_tuning=True,
+                                dynamic_batch_moving_average_window=10)
+
+    pybind_config = PybindMirror.maybe_to_pybind(config)
+
+    assert pybind_config.enable_batch_size_tuning == True
+    assert pybind_config.enable_max_num_tokens_tuning == True
+    assert pybind_config.dynamic_batch_moving_average_window == 10
+
+
+def test_SchedulerConfig_declaration():
+    config = SchedulerConfig(
+        capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
+        dynamic_batch_config=DynamicBatchConfig(
+            enable_batch_size_tuning=True,
+            enable_max_num_tokens_tuning=True,
+            dynamic_batch_moving_average_window=10))
+
+    pybind_config = PybindMirror.maybe_to_pybind(config)
+    assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
+    assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
+    assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
+                                      config.dynamic_batch_config._to_pybind())
+
+
+def test_PeftCacheConfig_default_values():
+    check_defaults(PeftCacheConfig, tle.PeftCacheConfig)
+
+
+def test_PeftCacheConfig_declaration():
+    config = PeftCacheConfig(num_host_module_layer=1,
+                             num_device_module_layer=1,
+                             optimal_adapter_size=64,
+                             max_adapter_size=128,
+                             num_put_workers=1,
+                             num_ensure_workers=1,
+                             num_copy_streams=1,
+                             max_pages_per_block_host=24,
+                             max_pages_per_block_device=8,
+                             device_cache_percent=0.5,
+                             host_cache_size=1024,
+                             lora_prefetch_dir=".")
+
+    pybind_config = PybindMirror.maybe_to_pybind(config)
+    assert pybind_config.num_host_module_layer == 1
+    assert pybind_config.num_device_module_layer == 1
+    assert pybind_config.optimal_adapter_size == 64
+    assert pybind_config.max_adapter_size == 128
+    assert pybind_config.num_put_workers == 1
+    assert pybind_config.num_ensure_workers == 1
+    assert pybind_config.num_copy_streams == 1
+    assert pybind_config.max_pages_per_block_host == 24
+    assert pybind_config.max_pages_per_block_device == 8
+    assert pybind_config.device_cache_percent == 0.5
+    assert pybind_config.host_cache_size == 1024
+    assert pybind_config.lora_prefetch_dir == "."
