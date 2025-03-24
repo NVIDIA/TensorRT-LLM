@@ -413,7 +413,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mHeadSize = head_size;
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-    op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+    op->mFP8GenerationMLA = false;
     op->mTokensPerBlock = tokens_per_block;
     op->mMaxContextLength = max_context_length;
     op->mQScaling = q_scaling;
@@ -434,6 +434,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     {
         int32_t const layer_num = host_kv_cache_pool_mapping.size(0);
         op->mIsMLAEnabled = true;
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
