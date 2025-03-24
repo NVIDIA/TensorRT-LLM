@@ -82,6 +82,8 @@ def compile_and_capture(
 ) -> nn.Module:
     """Compile or capture graph for single-token generation."""
     elapsed_time = -time.time()
+    ad_logger.info("Fusion before compiling...")
+
     ad_logger.info(f"Compiling for {backend} backend...")
 
     compiler_cls = BackendRegistry.get(backend)

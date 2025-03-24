@@ -191,6 +191,12 @@ class SequenceInfo:
     def num_pages(self) -> int:
         return self._num_pages
 
+    @num_pages.setter
+    def num_pages(self, value):
+        self._num_pages = value
+        # update the cache_loc tensor
+        self.cache_loc.resize_(value)
+
     @property
     def is_paged(self) -> bool:
         return self.page_size < self.max_seq_len
@@ -305,6 +311,17 @@ class SequenceInfo:
         )
         self.nest_sequences(input_ids)
         self.input_ids = input_ids
+
+    def _set_max_num_tokens_batch(self) -> None:
+        """Set an example sequence so that number of tokens processed is max_num_tokens."""
+        self.reset()
+        input_ids = torch.ones(
+            self.max_batch_size,
+            self.max_num_tokens // self.max_batch_size,
+            dtype=torch.int,
+            device=self.device,
+        )
+        self.nest_sequences(input_ids)
 
     def _set_generate_only_batch(self) -> None:
         """Set an example sequence for generate-only batch."""

@@ -1,5 +1,8 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+import gc
+
+import torch
 from torch.fx import GraphModule
 
 from ..compile import compile_and_capture
@@ -103,6 +106,7 @@ class InferenceOptimizer:
         # initialize caches, load weights, and map to correct device
         cm.initialize_caches()
 
+        # load weights
         self.factory.load_or_random_init(egm, mmap=True, map_location=cm.device)
         move_to_device(egm, cm.device)
 
@@ -136,6 +140,31 @@ class InferenceOptimizer:
                 pass
 
         ############################################################################################
+        # RESIZE CACHE
+        ############################################################################################
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
+        current_cache_size = cm.current_cache_size_bytes()
+        current_num_pages = cm.info.num_pages
+        ad_logger.info(
+            f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
+        )
+
+        # Let's run a forward pass to get the memory usage
+        cm.info._set_max_num_tokens_batch()
+        free_mem_pre, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
+        egm(*cm.args)
+        free_mem_post, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
+
+        # FIXME: 0.8 is hard coded to ensure we have enough memory for graph capture.
+        new_cache_size = free_mem_post * 0.8 + current_cache_size
+        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        ad_logger.info(f"New cache size: {new_cache_size}, New num pages: {new_num_pages}")
+        cm.resize_cache(new_num_pages)
+
+        ############################################################################################
         # COMPILE MODEL
         ############################################################################################
 
@@ -145,4 +174,6 @@ class InferenceOptimizer:
         )
         cm.info.reset()
 
+        torch.cuda.empty_cache()
+        gc.collect()
         return egm_compiled

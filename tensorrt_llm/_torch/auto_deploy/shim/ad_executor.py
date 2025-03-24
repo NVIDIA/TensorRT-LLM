@@ -62,6 +62,7 @@ class _CacheManagerWithFakePool(KVCacheManager):
         # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks
         # just like in the original implementation. However, let's wait for the layer-wise attention
         # implementation before over-optimizing the function here
+        ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
         return self.num_blocks, 0
 
 

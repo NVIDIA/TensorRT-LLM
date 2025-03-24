@@ -144,6 +144,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "enable_overlap_scheduler": True,
         "kv_cache_dtype": kv_cache_dtype,
     }
+    backend = params.get("backend", "pytorch")
 
     return {
         "sw_version": version("tensorrt_llm"),
@@ -154,7 +155,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "chunking": False,
         },
         "world_config": world_config,
-        "backend": "pytorch",
+        "backend": backend,
         "decoding_config": {},
         "performance_options": {
             "cuda_graphs": True,
