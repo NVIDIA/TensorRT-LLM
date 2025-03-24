@@ -177,7 +177,7 @@ class TestMinitron4BBase(AccuracyTestHarness):
 class TestGptJ6B(AccuracyTestHarness):
     MODEL_NAME = "EleutherAI/gpt-j-6b"
     MODEL_PATH = f"{llm_models_root()}/gpt-j-6b"
-    EXAMPLE_FOLDER = "gptj"
+    EXAMPLE_FOLDER = "models/contrib/gptj"
 
     def test_auto_dtype(self):
         # float16
