@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import time
@@ -178,6 +179,21 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     if args.int8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8
 
+    # Check if model ckpt is pre-quantized to fp8.
+    hf_quant_config_file = Path(args.model_dir) / "hf_quant_config.json"
+    if hf_quant_config_file.exists():
+        with open(hf_quant_config_file, 'r') as f:
+            hf_quant_config = json.load(f)
+        if hf_quant_config.get("producer", {}).get("name") == "modelopt":
+            if hf_quant_config.get("quantization",
+                                   {}).get("quant_algo") == "FP8":
+                print("Setting FP8 quantization for weights.")
+                quant_config.quant_algo = QuantAlgo.FP8
+            if hf_quant_config.get("quantization",
+                                   {}).get("kv_cache_quant_algo") == "FP8":
+                print("Setting FP8 quantization for KV Cache.")
+                quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+
     return quant_config
 
 
@@ -208,7 +224,11 @@ def convert_and_save_hf(args):
             calib_dataset=args.calib_dataset,
             **override_fields)
     else:
-        hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
+        is_prequantized_to_fp8 = quant_config.quant_algo == QuantAlgo.FP8
+        if is_prequantized_to_fp8:
+            hf_model = model_dir
+        else:
+            hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,

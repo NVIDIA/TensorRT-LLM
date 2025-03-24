@@ -281,6 +281,8 @@ class ModelWeightsLoader:
             tp_rank = self.model.config.mapping.moe_tp_rank
         external_key = self.translate_to_external_key(
             tllm_key, tllm_to_externel_key_dict)
+        print("[ModelWeightsLoader::load] tllm_key: ", tllm_key,
+              " external_key: ", external_key)
         if isinstance(external_key, list):
             v = [
                 self.load_tensor(k, tp_size, tp_dim, tp_rank)
@@ -288,6 +290,11 @@ class ModelWeightsLoader:
             ]
         else:
             v = self.load_tensor(external_key, tp_size, tp_dim, tp_rank)
+
+        # HACK: This is to account for all layernorms in Minitron being NemotronLayerNorm-1P.
+        if 'layernorm.weight' in tllm_key or 'ln_f.weight' in tllm_key:
+            print('Adding 1 for layernorm.')
+            v += 1.0
 
         if preprocess is not None:
             v = preprocess(v)

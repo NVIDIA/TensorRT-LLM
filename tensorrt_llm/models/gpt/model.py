@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Union
 
 from ..._utils import pad_vocab_size
@@ -27,6 +28,7 @@ from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.functional import quantize_fp8_per_token
 from ...quantization.layers import Fp8RowwiseMLP
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig)
 from .config import GPTConfig
@@ -316,13 +318,17 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                              mapping=mapping,
                                              quant_config=quant_config,
                                              **kwargs)
-
-        if not use_preloading:
-            hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
-        weights = load_weights_from_hf_model(hf_model, config)
-
-        model = cls(config)
-        model.load(weights)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            custom_dict = {'fc': 'up_proj'}
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            model = cls(config)
+            loader.generate_tllm_weights(model, {})
+        else:
+            if not use_preloading:
+                hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
+            weights = load_weights_from_hf_model(hf_model, config)
+            model = cls(config)
+            model.load(weights)
         return model
 
     @classmethod
