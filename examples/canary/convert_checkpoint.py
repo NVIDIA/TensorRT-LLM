@@ -134,6 +134,8 @@ class CanaryModel:
                 except Exception as e:
                     logging.error(f"Failed to restore model from NeMo file : {args.model_path}. ")
                     raise e
+            else:
+                raise UnsupportedModel(model_name=args.model_name)
         else:
             if args.model_name == 'nvidia/canary-1b' or args.model_name == 'nvidia/canary-1b-flash':
                 self.model = nemo_asr.EncDecMultiTaskModel.from_pretrained(args.model_name).to(device='cpu')
@@ -149,7 +151,7 @@ class CanaryModel:
 
     @staticmethod
     def is_supported(model_type: str):
-        supported_models = ['nvidia/canary-1b', 'nvidia/canary-1b-flash' 'nemo.canary', 'nemo/canary', 'canary']
+        supported_models = ['nvidia/canary-1b', 'nvidia/canary-1b-flash', 'nemo.canary', 'nemo/canary', 'canary']
 
         if model_type in supported_models:
             return True
