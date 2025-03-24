@@ -42,14 +42,6 @@ def generate_causal_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
-    def as_bert_attention_metadata(self, **kwargs) -> "AttentionMetadata":
-        """
-        Convert the attention metadata to a BERT attention metadata.
-        This is a dummy method because vanilla attention does not require any preparation.
-        """
-        assert self.kv_cache_manager is None, "BERT attention should not have KV cache manager"
-        return self
-
     def prepare(self) -> None:
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
