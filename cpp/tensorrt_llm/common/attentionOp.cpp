@@ -2317,31 +2317,29 @@ int AttentionOp::initialize() noexcept
         // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
+
+        // setting attention mask type based on the mask type
+        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+
         if (isCrossAttention())
         {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::PADDING;
+            // Temporary check for cross attention
+            TLLM_CHECK_DEBUG(mMaskType == tensorrt_llm::kernels::AttentionMaskType::PADDING);
             // always use paged-kv-fmha if paged_kv cache is used.
             fmhaParams.attentionInputLayout
                 = mPagedKVCache ? AttentionInputLayout::Q_PAGED_KV : AttentionInputLayout::Q_CONTIGUOUS_KV;
         }
         else if (!mUseKVCache)
         {
-            int8_t mask_type = static_cast<int8_t>(mMaskType);
-            // check if mask_type is valid for ContextAttentionMaskType
-            TLLM_CHECK_WITH_INFO(mask_type >= 0 && mask_type <= 3, "Invalid mask type");
-            fmhaParams.attentionMaskType = static_cast<ContextAttentionMaskType>(mask_type);
             fmhaParams.attentionInputLayout = AttentionInputLayout::PACKED_QKV;
         }
         else
         {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            // Temporary check for other attention types
+            TLLM_CHECK_DEBUG(mMaskType == tensorrt_llm::kernels::AttentionMaskType::CAUSAL);
             fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA && !mIsMLAEnabled)
                 ? AttentionInputLayout::Q_PAGED_KV
                 : AttentionInputLayout::PACKED_QKV;
-        }
-        if (useCustomMask())
-        {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
         }
         fmhaParams.isSPadded = !mRemovePadding;
         fmhaParams.numQHeads = mNumAttnHeads;
