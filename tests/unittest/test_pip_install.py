@@ -57,7 +57,7 @@ def test_pip_install():
 
     subprocess.check_call("apt-get -y install python3-pip", shell=True)
     subprocess.check_call("pip3 install --upgrade pip || true", shell=True)
-    subprocess.check_call("pip3 install --upgrade setuptools<77.0.1 || true",
+    subprocess.check_call("pip3 install --upgrade setuptools || true",
                           shell=True)
 
     download_wheel(args)
