@@ -12,6 +12,7 @@ from tensorrt_llm.functional import Tensor
 from tensorrt_llm.layers.linear import Linear
 from tensorrt_llm.layers.lora import Lora, LoraRuntimeParams
 from tensorrt_llm.runtime.session import Session
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 # Add the unittest directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
@@ -134,7 +135,7 @@ class TestLoraLinearPivotVsTrt:
     def _setup_pivot_linear(self):
         """Set up the pivot linear layer with weights."""
         pivot_linear = PivotLinear(in_features=self.hidden_size,
-                                   out_features=self.hidden_size)
+                                   out_features=self.hidden_size, layer_idx=0)
         pivot_linear = pivot_linear.to(
             dtype=tensorrt_llm.str_dtype_to_torch(self.dtype))
         pivot_linear.weight.data = self.weight
@@ -154,7 +155,22 @@ class TestLoraLinearPivotVsTrt:
 
         # Set up and run pivot implementation
         pivot_linear = self._setup_pivot_linear()
-        lora_params = {"lora_weight_ins": self.A, "lora_weight_outs": self.B}
+        
+        # Create lora_params in the same format as before
+        lora_params = {
+            'num_seqs': self.batch_size,
+            'host_request_types': torch.zeros(self.batch_size, dtype=torch.int32),
+            'prompt_lens_cpu': torch.tensor([self.seq_len] * self.batch_size),
+            0: {  # layer_idx
+                LoraModuleType.DENSE: {  # module_type
+                    'adapter_size': torch.tensor([self.lora_rank]),
+                    'weight_pointers': torch.tensor([[self.B.data_ptr(), self.A.data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [self.B, self.A]  
+                }
+            }
+        }
+        
         outputs_pivot = pivot_linear(self.activations, lora_params=lora_params)
 
         # Compare outputs
