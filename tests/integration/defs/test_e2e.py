@@ -1440,10 +1440,34 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         str(example_root / "quickstart_advanced.py"),
         "--enable_overlap_scheduler",
         "--use_cuda_graph",
-        "--mtp_nextn",
+        "--spec_decode_nextn",
         "1",  # test 1 MTP module
+        "--spec_decode_algo",
+        "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
+     "EAGLE3-LLaMA3.1-Instruct-8B"),
+])
+def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
+                                        model_path, eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--spec_decode_nextn",
+        "4",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--eagle_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--kv_cache_enable_block_reuse",
     ])
 
 

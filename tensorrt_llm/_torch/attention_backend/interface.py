@@ -21,6 +21,7 @@ from ..pyexecutor.resource_manager import KVCacheManager
 class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
+    has_speculative_draft_tokens: bool = False
 
 
 @dataclass(kw_only=True)

@@ -22,6 +22,7 @@ from ..modules.linear import Linear, WeightMode
 from ..modules.logits_procesor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
+from ..speculative import SpecMetadata
 
 
 @contextlib.contextmanager
@@ -213,6 +214,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -469,9 +471,9 @@ class DecoderModelForCausalLM(nn.Module,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-
         if self._supports_pp and self.pp_size > 1:
             output = self.model(
                 input_ids=input_ids,
@@ -479,6 +481,7 @@ class DecoderModelForCausalLM(nn.Module,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 pipeline_interface=pipeline_interface,
+                spec_metadata=spec_metadata,
             )
 
             # No need to compute logits for non-last PP ranks
@@ -490,6 +493,7 @@ class DecoderModelForCausalLM(nn.Module,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
+                spec_metadata=spec_metadata,
             )
 
         return self.logits_processor.forward(

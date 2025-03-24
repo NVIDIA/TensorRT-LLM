@@ -276,6 +276,7 @@ class TorchDecoder(Decoder):
                 generation_requests.append(request)
 
         for request in extend_requests:
+            num_accepted = 0
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
@@ -290,12 +291,15 @@ class TorchDecoder(Decoder):
                         # Reject.
                         break
 
+                    num_accepted += 1
                     new_token = new_tokens_list[idx + i + 1]
                     num_tokens = request.add_new_token(new_token, beam_idx)
 
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
                         break
+            request.py_num_accepted_draft_tokens = num_accepted
+            request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
             idx += len(request.py_draft_tokens) + 1
 
         for request in generation_requests:
