@@ -800,16 +800,17 @@ WeightOnlyQuantColumnLinear = WeightOnlyQuantLinear
 class WeightOnlyQuantRowLinear(RowLinear):
 
     def __init__(
-            self,
-            in_features,
-            out_features,
-            bias=True,
-            dtype=None,
-            tp_group=None,
-            tp_size=1,
-            tp_rank=0,
-            quant_mode=QuantMode.use_weight_only(),
-            prefer_managed_weight=True,
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        tp_rank=0,
+        quant_mode=QuantMode.use_weight_only(),
+        prefer_managed_weight=True,
+        is_expert=False,
     ):
         multiple = 64 * tp_size
         self.is_padded = False
@@ -826,7 +827,8 @@ class WeightOnlyQuantRowLinear(RowLinear):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         prefer_managed_weight=prefer_managed_weight)
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_expert=is_expert)
         if quant_mode.is_int8_weight_only():
             self.weight_only_quant_mode = 1
         elif quant_mode.is_int4_weight_only():
@@ -863,9 +865,17 @@ class WeightOnlyQuantRowLinear(RowLinear):
                                   == AllReduceFusionOp.RESIDUAL_RMS_NORM)
             if fuse_bias_into_all_reduce:
                 all_reduce_params.bias = self.bias.value
-            x = allreduce(x, self.tp_group, all_reduce_params=all_reduce_params)
-            if need_bias and not fuse_bias_into_all_reduce:
-                x = x + self.bias.value
+            if not self.is_expert:
+                x = allreduce(x,
+                              self.tp_group,
+                              all_reduce_params=all_reduce_params)
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias
+            else:
+                if need_bias and not fuse_bias_into_all_reduce:
+                    bias = cast(self.bias.value, x.dtype)
+                    x = x + bias / self.tp_size
             return x
 
         if self.bias is not None:
