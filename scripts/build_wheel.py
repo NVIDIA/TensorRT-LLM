@@ -108,6 +108,11 @@ def main(*,
     if any(not (project_dir / submodule / ".git").exists()
            for submodule in submodules):
         build_run('git submodule update --init --recursive')
+
+    # Invoke git lfs automatically for downloading kernels
+    build_run('git lfs install')
+    build_run('git lfs pull')
+
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
     build_run(f"\"{sys.executable}\" -m pip install -r {requirements_filename}")
