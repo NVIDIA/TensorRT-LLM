@@ -572,9 +572,7 @@ def generate_summary_cmd(example_root, *args, **kwargs):
 
 def generate_mmlu_cmd(example_root, *args, **kwargs):
     "generate mmlu command"
-    mmlu_cmd = [
-        f"{example_root}/../mmlu.py", "--test_trt_llm", "--check_accuracy"
-    ]
+    mmlu_cmd = [f"{example_root}/../mmlu_llmapi.py", "--check_accuracy"]
 
     for key, value in kwargs.items():
         if isinstance(value, bool):

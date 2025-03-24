@@ -31,6 +31,8 @@ import psutil
 import pytest
 import yaml
 
+from tensorrt_llm.bindings import ipc_nvls_supported
+
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
@@ -2175,6 +2177,9 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
+                                  reason="NVLS is not supported")
+
 
 def skip_fp8_pre_ada(use_fp8):
     "skip fp8 tests if sm version less than 8.9"
@@ -2186,14 +2191,6 @@ def skip_fp4_pre_blackwell(use_fp4):
     "skip fp4 tests if sm version less than 10.0"
     if use_fp4 and get_sm_version() < 100:
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
-
-
-def skip_if_no_nvls(llm_venv):
-    output_str = llm_venv.run_output(
-        "from tensorrt_llm.bindings import ipc_nvls_supported; print('NVLS supported' if ipc_nvls_supported() else 'False')"
-    )
-    if 'NVLS supported' not in output_str:
-        pytest.skip("NVLS is not supported")
 
 
 @pytest.fixture(autouse=True)

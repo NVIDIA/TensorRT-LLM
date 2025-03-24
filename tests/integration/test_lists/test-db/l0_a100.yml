@@ -28,7 +28,7 @@ l0_a100:
   - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only_manage_weights[int4]
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_smooth_quant_ootb_manage_weights
   - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_int8_gptq
-  - examples/test_qwen.py::test_llm_qwen_int4_single_gpu_summary[qwen2_7b_awq-nb:1]
+  - accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_int4_awq_pre_quantized
 - condition:
     ranges:
       system_gpu_count:
