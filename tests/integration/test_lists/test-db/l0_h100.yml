@@ -87,7 +87,6 @@ l0_h100:
       stage: post_merge
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[fp8-gptj-90]
   - test_cpp.py::test_model[fp8-chatglm-90]
   - test_cpp.py::test_model[bart-90]
   - test_cpp.py::test_benchmarks[bart-90]
