@@ -94,6 +94,7 @@ def _register_fake():
         context_lengths,
         host_context_lengths,
         host_request_types,
+        use_kv_cache,
         kv_cache_block_offsets,
         host_kv_cache_block_offsets,
         host_kv_cache_pool_pointers,

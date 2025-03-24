@@ -67,8 +67,10 @@ public:
         int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
         torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-        torch::Tensor kv_cache_block_offsets, torch::Tensor host_kv_cache_block_offsets,
-        torch::Tensor host_kv_cache_pool_pointers, torch::Tensor host_kv_cache_pool_mapping,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
+        torch::optional<torch::Tensor> host_kv_cache_pool_mapping,
         torch::optional<torch::Tensor> cache_indirection, torch::optional<torch::Tensor> kv_scale_orig_quant,
         torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
         torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
@@ -114,8 +116,10 @@ public:
         int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
         torch::Tensor workspace, torch::Tensor output, torch::Tensor qkv, torch::Tensor sequence_length,
         torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-        torch::Tensor kv_cache_block_offsets, torch::Tensor host_kv_cache_block_offsets,
-        torch::Tensor host_kv_cache_pool_pointers, torch::Tensor host_kv_cache_pool_mapping,
+        torch::optional<torch::Tensor> kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+        torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
+        torch::optional<torch::Tensor> host_kv_cache_pool_mapping,
         torch::optional<torch::Tensor> cache_indirection, torch::optional<torch::Tensor> kv_scale_orig_quant,
         torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
         torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
@@ -187,13 +191,20 @@ public:
         int const cyclic_attention_window_size = attention_window_size;
         bool const can_use_one_more_block = beam_width > 1;
 
-        int max_blocks_per_sequence = kv_cache_block_offsets.size(-1);
-        int32_t const pool_index = host_kv_cache_pool_mapping.index({op.mLayerIdx, 0}).item<int32_t>();
-        int32_t const layer_idx_in_cache_pool = host_kv_cache_pool_mapping.index({op.mLayerIdx, 1}).item<int32_t>();
-        KVBlockArray::DataType* block_offsets
-            = static_cast<KVBlockArray::DataType*>(kv_cache_block_offsets.index({pool_index, seq_offset}).data_ptr());
-        KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
-            host_kv_cache_block_offsets.index({pool_index, seq_offset}).data_ptr());
+        int max_blocks_per_sequence = kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
+        int32_t const pool_index = kv_cache_block_offsets.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
+            : 0;
+        int32_t const layer_idx_in_cache_pool = kv_cache_block_offsets.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
+            : 0;
+        KVBlockArray::DataType* block_offsets = static_cast<KVBlockArray::DataType*>(kv_cache_block_offsets.has_value()
+                ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                : nullptr);
+        KVBlockArray::DataType* host_block_offsets
+            = static_cast<KVBlockArray::DataType*>(host_kv_cache_block_offsets.has_value()
+                    ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                    : nullptr);
 
         auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
@@ -201,12 +212,17 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        void* host_primary_pool_pointer = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(host_kv_cache_pool_pointers.index({pool_index, 0}).item<int64_t>())
-            + intra_pool_offset);
-        void* host_secondary_pool_pointer = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(host_kv_cache_pool_pointers.index({pool_index, 1}).item<int64_t>())
-            + intra_pool_offset);
+        void* host_primary_pool_pointer = nullptr;
+        void* host_secondary_pool_pointer = nullptr;
+        if (host_kv_cache_pool_pointers.has_value())
+        {
+            host_primary_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
+                + intra_pool_offset);
+            host_secondary_pool_pointer = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
+                + intra_pool_offset);
+        }
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
@@ -330,9 +346,10 @@ using torch_ext::trtllm::attention::AttentionInputType;
 torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
     std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
-    torch::Tensor host_context_lengths, torch::Tensor host_request_types, torch::Tensor kv_cache_block_offsets,
-    torch::Tensor host_kv_cache_block_offsets, torch::Tensor host_kv_cache_pool_pointers,
-    torch::Tensor host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
+    torch::Tensor host_context_lengths, torch::Tensor host_request_types, bool const use_kv_cache,
+    torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+    torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
+    torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
     torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
     torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
@@ -414,9 +431,15 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
+    // TODO: seems like mask_type is not used for initialize() and context
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-    op->mTokensPerBlock = tokens_per_block;
+    op->mUseKVCache = use_kv_cache;
+    op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
+    if (tokens_per_block.has_value())
+    {
+        op->mTokensPerBlock = tokens_per_block.value();
+    }
     op->mMaxContextLength = max_context_length;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
@@ -462,6 +485,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         TLLM_LOG_TRACE(
             "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
         op->initialize();
+        TLLM_LOG_DEBUG(
+            "Attention op for layer %d is initialized, the AttentionOp is %s", layer_idx, op->toString().c_str());
         runner->prepare(*op);
         op_cache[cache_key] = op;
     }
@@ -572,10 +597,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor context_lengths"
         ", Tensor host_context_lengths"
         ", Tensor host_request_types"
-        ", Tensor kv_cache_block_offsets"
-        ", Tensor host_kv_cache_block_offsets"
-        ", Tensor host_kv_cache_pool_pointers"
-        ", Tensor host_kv_cache_pool_mapping"
+        ", bool use_kv_cache"
+        ", Tensor? kv_cache_block_offsets"
+        ", Tensor? host_kv_cache_block_offsets"
+        ", Tensor? host_kv_cache_pool_pointers"
+        ", Tensor? host_kv_cache_pool_mapping"
         ", Tensor? cache_indirection"
         ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
@@ -592,7 +618,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int num_heads"
         ", int num_kv_heads"
         ", int head_size"
-        ", int tokens_per_block"
+        ", int? tokens_per_block"
         ", int max_num_requests"
         ", int max_context_length"
         ", int attention_window_size"
