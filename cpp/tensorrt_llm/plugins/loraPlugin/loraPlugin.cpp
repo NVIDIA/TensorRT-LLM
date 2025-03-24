@@ -48,6 +48,7 @@ LoraPlugin::LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, in
     , mPluginProfiler(pluginProfiler)
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("Plugin type: %d", static_cast<int>(mType));
     mOutHiddenSizes.resize(mNumLoraModules);
     mOutHiddenSizes.assign(out_hidden_sizes.begin(), out_hidden_sizes.end());
     init();
@@ -292,6 +293,82 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     // only used for unified gemm
     auto bestTactic = mPluginProfiler->getBestConfig(numTokens, mGemmId);
     mLoraImpl->setBestTactic(bestTactic);
+
+    // Add debug prints for LoraImpl->run parameters
+    TLLM_LOG_INFO("DEBUG: loraPlugin.cpp - LoraImpl->run parameters:");
+    TLLM_LOG_INFO("DEBUG: numTokens = %d", numTokens);
+    TLLM_LOG_INFO("DEBUG: numReqs = %d", numReqs);
+    TLLM_LOG_INFO("DEBUG: input shape = [%d, %d, %d]", inputDesc[getInputTensorIdx()].dims.d[0],
+        inputDesc[getInputTensorIdx()].dims.d[1], inputDesc[getInputTensorIdx()].dims.d[2]);
+    TLLM_LOG_INFO("DEBUG: mExpandLoraRanks size = %zu", mExpandLoraRanks.size());
+    TLLM_LOG_INFO("DEBUG: mExpandLoraWeightPtrs size = %zu", mExpandLoraWeightPtrs.size());
+    TLLM_LOG_INFO("DEBUG: mWeightIndex = %d", mWeightIndex);
+    TLLM_LOG_INFO("DEBUG: outputs size = %d", mNumLoraModules);
+    TLLM_LOG_INFO("DEBUG: workspace size = %zu", mLoraImpl->getWorkspaceSize(numTokens, numReqs, mType));
+    TLLM_LOG_INFO("DEBUG: stream = %p", (void*) stream);
+
+    // Add more detailed debug prints
+    TLLM_LOG_INFO("DEBUG: loraPlugin.cpp - Additional details:");
+    TLLM_LOG_INFO("DEBUG: input dtype = %d", (int) mType);
+    TLLM_LOG_INFO("DEBUG: mTransA = %d, mTransB = %d", mTransA, mTransB);
+    TLLM_LOG_INFO("DEBUG: mMaxLowRank = %d", mMaxLowRank);
+    TLLM_LOG_INFO("DEBUG: mRemoveInputPadding = %d", mRemoveInputPadding);
+
+    // Print output hidden sizes
+    std::string outHiddenSizesStr;
+    for (size_t i = 0; i < mOutHiddenSizes.size(); ++i)
+    {
+        outHiddenSizesStr += std::to_string(mOutHiddenSizes[i]);
+        if (i < mOutHiddenSizes.size() - 1)
+            outHiddenSizesStr += ", ";
+    }
+    TLLM_LOG_INFO("DEBUG: mOutHiddenSizes = [%s]", outHiddenSizesStr.c_str());
+
+    // Print first few values of mExpandLoraRanks
+    TLLM_LOG_INFO("DEBUG: First 5 mExpandLoraRanks values: [%d, %d, %d, %d, %d]",
+        mExpandLoraRanks.size() > 0 ? mExpandLoraRanks[0] : -1, mExpandLoraRanks.size() > 1 ? mExpandLoraRanks[1] : -1,
+        mExpandLoraRanks.size() > 2 ? mExpandLoraRanks[2] : -1, mExpandLoraRanks.size() > 3 ? mExpandLoraRanks[3] : -1,
+        mExpandLoraRanks.size() > 4 ? mExpandLoraRanks[4] : -1);
+
+    // Print actual tensor values - SAFE VERSION
+    TLLM_LOG_INFO("DEBUG: loraPlugin.cpp - Tensor values:");
+    TLLM_LOG_INFO("DEBUG: Input tensor pointer: %p", input);
+
+    // Print first few weight pointers - more defensive approach
+    TLLM_LOG_INFO("DEBUG: First 5 weight pointers: [%p, %p, %p, %p, %p]",
+        mExpandLoraWeightPtrs.size() > 0 ? mExpandLoraWeightPtrs[0] : nullptr,
+        mExpandLoraWeightPtrs.size() > 1 ? mExpandLoraWeightPtrs[1] : nullptr,
+        mExpandLoraWeightPtrs.size() > 2 ? mExpandLoraWeightPtrs[2] : nullptr,
+        mExpandLoraWeightPtrs.size() > 3 ? mExpandLoraWeightPtrs[3] : nullptr,
+        mExpandLoraWeightPtrs.size() > 4 ? mExpandLoraWeightPtrs[4] : nullptr);
+
+    // Check if all tokens use the same LoRA weights and ranks (for unified GEMM path)
+    bool useUnifiedGemm = true;
+    if (mExpandLoraRanks.size() > 1)
+    {
+        int32_t firstRank = mExpandLoraRanks[0];
+        void const* firstWeightPtr = mExpandLoraWeightPtrs[0];
+
+        TLLM_LOG_INFO(
+            "DEBUG: Checking for unified GEMM path - First rank: %d, First weight ptr: %p", firstRank, firstWeightPtr);
+
+        for (size_t i = 1; i < mExpandLoraRanks.size(); ++i)
+        {
+            if (mExpandLoraRanks[i] != firstRank || mExpandLoraWeightPtrs[i] != firstWeightPtr)
+            {
+                useUnifiedGemm = false;
+                TLLM_LOG_INFO("DEBUG: Found different rank or weight ptr at index %zu: rank=%d, ptr=%p", i,
+                    mExpandLoraRanks[i], mExpandLoraWeightPtrs[i]);
+                break;
+            }
+        }
+    }
+
+    TLLM_LOG_INFO("DEBUG: GEMM path selection: %s", useUnifiedGemm ? "UNIFIED GEMM" : "SPLIT GEMM (CUTLASS)");
+
+    // Add a debug print to show the actual GEMM path being used
+    TLLM_LOG_INFO("DEBUG: Calling LoraImpl->run with useUnifiedGemm=%d", useUnifiedGemm);
+
     mLoraImpl->run(numTokens, numReqs, input, mExpandLoraRanks.data(), mExpandLoraWeightPtrs.data(), mWeightIndex,
         outputs, workspace, stream);
 
@@ -433,21 +510,26 @@ IPluginV2* LoraPluginCreator::createPlugin(char const* name, PluginFieldCollecti
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             in_hidden_size = *(static_cast<int32_t const*>(fields[i].data));
+            TLLM_LOG_DEBUG("Read in_hidden_size: %d", in_hidden_size);
         }
         else if (!strcmp(attrName, "transa"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             transA = *(static_cast<int const*>(fields[i].data));
+            TLLM_LOG_DEBUG("Read transA: %d", transA);
         }
         else if (!strcmp(attrName, "transb"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             transB = *(static_cast<int const*>(fields[i].data));
+            TLLM_LOG_DEBUG("Read transB: %d", transB);
         }
         else if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
+            TLLM_LOG_DEBUG(
+                "Received type_id from Python: %d (kFLOAT=0, kHALF=1, kINT8=2, kINT32=3)", static_cast<int>(type));
         }
         else if (!strcmp(attrName, "remove_input_padding"))
         {

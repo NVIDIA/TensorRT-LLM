@@ -54,6 +54,7 @@ add_library(
   fp8Quantize.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
+  loraOp.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
