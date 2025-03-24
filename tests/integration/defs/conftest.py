@@ -219,7 +219,7 @@ def whisper_example_root(llm_root, llm_venv):
 def opt_example_root(llm_root, llm_venv):
     "Get opt example root"
 
-    example_root = os.path.join(llm_root, "examples", "opt")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib", "opt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -450,7 +450,7 @@ def llm_exaone_model_root(request) -> str:
 @pytest.fixture(scope="module")
 def falcon_example_root(llm_root, llm_venv):
     "Get falcon example root"
-    example_root = os.path.join(llm_root, "examples", "falcon")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",  "falcon")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -666,7 +666,7 @@ def sdxl_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def deepseek_v2_example_root(llm_root, llm_venv):
     "Get deepseek v2 example root"
-    example_root = os.path.join(llm_root, "examples", "deepseek_v2")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib", "deepseek_v2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
