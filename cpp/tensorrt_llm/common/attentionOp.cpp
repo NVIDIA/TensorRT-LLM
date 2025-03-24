@@ -1160,10 +1160,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 reinterpret_cast<BufferDataType*>(params.key_value_cache));
         }
     }
-    else
-    {
-        TLLM_LOG_DEBUG("%s No kv cache used", __PRETTY_FUNCTION__);
-    }
 
     auto cublasHandle = mCublasWrapper->getCublasHandle();
     TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
@@ -1469,11 +1465,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->cu_q_seqlens = cu_q_seqlens;
             invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
         }
-        // else if (!mUseKVCache)
-        // {
-        //     // FIXME: temporary skip the qkv process for bert
-        //     TLLM_LOG_DEBUG("%s Skip the qkv process for bert", __PRETTY_FUNCTION__);
-        // }
         else
         {
             invokeQKVPreprocessing(preprocessingParams, stream);
@@ -1548,19 +1539,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
 
-        TLLM_LOG_DEBUG("%s start to run fmha kernel", __PRETTY_FUNCTION__);
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
 
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
-        // if (mUseKVCache)
-        // {
-        //     TLLM_LOG_DEBUG("%s start to run kv cache postprocessing", __PRETTY_FUNCTION__);
-        //     invokeKvCachePostprocessing(preprocessingParams, stream);
-        // }
-        TLLM_LOG_DEBUG("%s start to run kv cache postprocessing", __PRETTY_FUNCTION__);
         invokeKvCachePostprocessing(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
@@ -2342,13 +2326,11 @@ int AttentionOp::initialize() noexcept
         }
         else if (!mUseKVCache)
         {
-            // TODO: we should set attention mask based on the mask_type
             int8_t mask_type = static_cast<int8_t>(mMaskType);
             // check if mask_type is valid for ContextAttentionMaskType
             TLLM_CHECK_WITH_INFO(mask_type >= 0 && mask_type <= 3, "Invalid mask type");
             fmhaParams.attentionMaskType = static_cast<ContextAttentionMaskType>(mask_type);
             fmhaParams.attentionInputLayout = AttentionInputLayout::PACKED_QKV;
-            TLLM_LOG_DEBUG("%s set attention mask type to %d", __PRETTY_FUNCTION__, mask_type);
         }
         else
         {
@@ -2385,8 +2367,6 @@ int AttentionOp::initialize() noexcept
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
-        TLLM_LOG_DEBUG(
-            "%s MHARunnerFixedParams fmhaParams: %s", __PRETTY_FUNCTION__, fmhaParams.convertToStrOutput().c_str());
 
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)

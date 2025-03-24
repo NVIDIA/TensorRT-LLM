@@ -440,7 +440,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         Returns the max sequence length.
         If the attention uses cached KV, it will return max_seq_len from the KV cache manager.
-        If the attention is no cache, max_seq_len should be set in the constructor, and it will return the max sequence length set by user.
+        If the attention is no cache, max_seq_len should be set manually by user.
         """
         if self.kv_cache_manager is not None:
             return self.kv_cache_manager.max_seq_len
@@ -478,7 +478,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_requests, ),
             device='cuda',

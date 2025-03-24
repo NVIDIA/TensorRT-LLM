@@ -431,7 +431,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
-    // TODO: seems like mask_type is not used for initialize() and context
     op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
     op->mUseKVCache = use_kv_cache;
@@ -486,8 +485,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         TLLM_LOG_TRACE(
             "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
         op->initialize();
-        TLLM_LOG_DEBUG(
-            "Attention op for layer %d is initialized, the AttentionOp is %s", layer_idx, op->toString().c_str());
         runner->prepare(*op);
         op_cache[cache_key] = op;
     }
