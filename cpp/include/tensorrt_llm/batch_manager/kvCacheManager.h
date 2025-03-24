@@ -300,7 +300,7 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenerationRequest(LlmRequest::RequestIdType requestId, SizeType32 numTokens, SizeType32 beamWidth,
-        SizeType32 maxBlocks, SizeType32 numPools = 1,
+        SizeType32 maxBlocks, SizeType32 cyclicThreshold, SizeType32 numPools = 1,
         executor::KvCacheRetentionConfig kvCacheRetentionConfig = executor::KvCacheRetentionConfig())
         : mRequestId(requestId)
         , mNumTokens(numTokens)
@@ -310,6 +310,7 @@ public:
               runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
               runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
+        , mCyclicThreshold(cyclicThreshold)
     {
         auto cacheBlockIdsRange = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices);
         std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
@@ -395,14 +396,12 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    [[nodiscard]] bool getContextRequiresCyclicKvCache() const
+    // @brief Check whether the sequence uses cyclic KV cache.
+    // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
+    // @details If `true`, we cannot store the sequence's KV cache for reuse.
+    [[nodiscard]] bool isCyclic() const
     {
-        return mContextRequiresCyclicKvCache;
-    }
-
-    void setContextRequiresCyclicKvCache(bool contextRequiresCyclicKvCache)
-    {
-        mContextRequiresCyclicKvCache = contextRequiresCyclicKvCache;
+        return mNumTokens >= mCyclicThreshold;
     }
 
 private:
@@ -419,8 +418,8 @@ private:
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
 
-    // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
-    bool mContextRequiresCyclicKvCache{false};
+    // Number of tokens at which the KV Cache begins sliding
+    SizeType32 mCyclicThreshold;
 };
 
 // attach metadata to a pool pointer
@@ -972,37 +971,40 @@ public:
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
-        SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
+        SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, CudaStreamPtr stream,
+        std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = false, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
-        SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
+        SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
+        std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = false, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
         bool copyOnpartialReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
-        SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
+        SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, CudaStreamPtr stream,
+        std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = true, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
-        SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 temporaryAttentionWindow,
-        SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
-        bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
-        bool enablePartialReuse = true, bool copyOnpartialReuse = true);
+        SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
+        SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
+        std::optional<SizeType32> maxSequenceLength, bool enableBlockReuse = false, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true);
 
     ~KVCacheManager() override = default;
 
@@ -1264,8 +1266,9 @@ private:
     // Maximum number of blocks per sequence
     SizeType32 mMaxBlocksPerSeq;
     // Maximum kv cache length per sequence
-    // Enable cyclic kv cache when it exceeds
     SizeType32 mMaxAttentionWindow;
+    // Minimum kv cache length per sequence
+    SizeType32 mMinAttentionWindow;
     // Temporary kv cache length per sequence.
     // Only needed when chunked context + sliding window attention are used together.
     // And it should only be considered when allocating blocks.

@@ -293,9 +293,9 @@ protected:
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         mManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock, totalNumBlocks,
-            blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth, maxAttentionWindow, temporaryAttentionWindow,
-            sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, CacheType::kSELF, std::nullopt,
-            nullptr, true);
+            blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth, std::vector<SizeType32>{maxAttentionWindow},
+            temporaryAttentionWindow, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks,
+            CacheType::kSELF, std::nullopt, nullptr, true);
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, dataType);
         mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
@@ -580,9 +580,9 @@ protected:
             numHeadsPerRankForContext = numHeads;
         }
         mManager = std::make_unique<KVCacheManager>(numLayers / mPpSize, numHeadsPerRank, sizePerHead, tokensPerBlock,
-            totalNumBlocks, blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth, maxAttentionWindow,
-            temporaryAttentionWindow, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, cacheType,
-            std::nullopt, nullptr, true);
+            totalNumBlocks, blocksInSecondaryPool, mMaxNumSequences, maxBeamWidth,
+            std::vector<SizeType32>{maxAttentionWindow}, temporaryAttentionWindow, sinkTokenLength, stream,
+            std::nullopt, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, true);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
