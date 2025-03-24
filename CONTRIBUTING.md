@@ -47,20 +47,28 @@ pre-commit install
 git commit -m "fix"
 
 isort....................................................................Passed
-CRLF end-lines remover...............................(no files to check)Skipped
+CRLF end-lines remover...................................................Passed
 yapf.....................................................................Failed
 - hook id: yapf
 - files were modified by this hook
 check for added large files..............................................Passed
 check for merge conflicts................................................Passed
 check for broken symlinks............................(no files to check)Skipped
-detect private key...................................(no files to check)Skipped
+detect private key.......................................................Passed
 fix end of files.........................................................Passed
-check yaml...........................................(no files to check)Skipped
+check yaml...............................................................Passed
 trim trailing whitespace.................................................Passed
+check toml...............................................................Passed
+mixed line ending........................................................Passed
+debug statements (python)................................................Passed
+check json...........................................(no files to check)Skipped
 autoflake................................................................Passed
-clang-format.........................................(no files to check)Skipped
-cmake-format.........................................(no files to check)Skipped
+clang-format.............................................................Passed
+cmake-format.............................................................Passed
+codespell................................................................Passed
+ruff.....................................................................Passed
+ruff-format..............................................................Passed
+mdformat.................................................................Passed
 ```
 
 If any files were modified by this hook, you will need to stage and commit them again.
