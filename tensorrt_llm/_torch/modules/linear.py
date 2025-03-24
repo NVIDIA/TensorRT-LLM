@@ -14,6 +14,7 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 from ...models.modeling_utils import QuantConfig
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..utils import Fp4QuantizedTensor, is_torch_compiling
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 
 E2M1_MAX = 6.0
 
@@ -56,7 +57,7 @@ def load_weight_shard(
         tensor_shape = weight.get_shape()
 
         def maybe_convert_to_torch_tensor(
-            tensor, indices: Union[slice | tuple[slice]] = slice(None)):
+            tensor, indices: Union[slice , tuple[slice]] = slice(None)):
             return tensor[indices].to(device)
     else:
         raise ValueError(f'unsupported weight type: {type(weight)}')
@@ -139,10 +140,12 @@ class Linear(nn.Module):
                  weights_loading_config: Optional[WeightsLoadingConfig] = None,
                  is_expert: bool = False,
                  skip_create_weights: bool = False,
-                 use_custom_cublas_mm: bool = False):
+                 use_custom_cublas_mm: bool = False,
+                 layer_idx: Optional[int] = None):
         from tensorrt_llm._torch.distributed import AllReduce
 
         super().__init__()
+        self.layer_idx = layer_idx
         self.has_bias = bias
         self.dtype = dtype
         self.parallel_config = parallel_config or ParallelConfig()
@@ -180,6 +183,10 @@ class Linear(nn.Module):
         self._weights_created = False
         self.is_expert = is_expert
         self.use_custom_cublas_mm = use_custom_cublas_mm
+
+        self.linear_lora = LoraLayer(
+            [LoraModuleType.DENSE],
+            [self.out_features])  # todo didnt add bingind to moudle type
 
         if not skip_create_weights:
             self.create_weights()
@@ -374,11 +381,11 @@ class Linear(nn.Module):
         return output
 
     def forward(
-            self,
-            input: Union[torch.Tensor, Fp4QuantizedTensor],
-            *,
-            all_reduce_params: Optional[AllReduceParams] = None,
-            lora_params=None,
+        self,
+        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params=None,
     ) -> torch.Tensor:
         from tensorrt_llm._torch.distributed import allgather
 
@@ -408,13 +415,18 @@ class Linear(nn.Module):
                 output = allgather(output, self.parallel_config)
         else:
             output = self.apply_linear(input, self.weight, self.bias)
-        
-        if lora_params is not None:
-            A = lora_params['lora_weight_ins']
-            B = lora_params['lora_weight_outs']
-            lora_output = (input @ A.T) @ B.T
 
-            output = output + lora_output
+        if lora_params is not None:
+            linear_lora_output = self.linear_lora(input, lora_params,
+                                           self.layer_idx)
+            if linear_lora_output is not None:
+                output = output + linear_lora_output
+
+        #     A = lora_params['lora_weight_ins']
+        #     B = lora_params['lora_weight_outs']
+        #     lora_output = (input @ A.T) @ B.T
+
+        #     output = output + lora_output
 
         return output
 
