@@ -50,14 +50,6 @@ public:
     void run(tensorrt_llm::kernels::MHARunnerParams runnerParams);
 
 private:
-    // Helper function to convert mask type
-    inline TrtllmGenAttentionMaskType convertToTrtllmGenMaskType(ContextAttentionMaskType maskType) const
-    {
-        int8_t mask_type = static_cast<int8_t>(maskType);
-        TLLM_CHECK_WITH_INFO(mask_type >= 0 && mask_type <= 3, "Invalid mask type");
-        return static_cast<TrtllmGenAttentionMaskType>(mask_type);
-    }
-
     // The fixed fmha parameters.
     kernels::MHARunnerFixedParams mFixedParams;
     // Whether to enable trtllm-gen kernels.

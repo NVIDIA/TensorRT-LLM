@@ -234,6 +234,14 @@ struct TllmGenFmhaRunnerParams
     float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
+
+    // set the attention mask type
+    TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
+    {
+        TLLM_CHECK_WITH_INFO(maskType >= 0 && maskType <= 3, "Invalid mask type for TrtllmGenAttentionMaskType");
+        mMaskType = static_cast<TrtllmGenAttentionMaskType>(maskType);
+        return *this;
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
