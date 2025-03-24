@@ -537,6 +537,36 @@ class TestMinitron4BBase(HumanevalTestHarness):
                  extra_eval_args=["--eval_task=code_completion"])
 
 
+class TestGptJ6B(CnnDailymailTestHarness):
+    MODEL_NAME = "EleutherAI/gpt-j-6b"
+    MODEL_PATH = f"{llm_models_root()}/gpt-j-6b"
+    EXAMPLE_FOLDER = "gptj"
+
+    def test_auto_dtype(self):
+        # float16
+        self.run(dtype='auto')
+
+    def test_float32(self):
+        self.run(dtype='float32')
+
+    @skip_pre_ada
+    def test_fp8(self):
+        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
+
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
+    def test_cyclic_kv_cache(self):
+        self.run(extra_acc_spec="max_attention_window_size=900",
+                 extra_eval_args=["--max_attention_window_size=900"])
+
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
+    def test_cyclic_kv_cache_beam_search(self):
+        self.run(extra_acc_spec="max_attention_window_size=900;beam_width=4",
+                 extra_build_args=["--max_beam_width=4"],
+                 extra_eval_args=[
+                     "--max_attention_window_size=900", "--num_beams=4"
+                 ])
+
+
 @pytest.mark.skip_less_device_memory(50000)
 class TestPhi2(CnnDailymailTestHarness):
     MODEL_NAME = "microsoft/phi-2"

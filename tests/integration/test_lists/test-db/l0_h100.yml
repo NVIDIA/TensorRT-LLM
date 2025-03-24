@@ -127,6 +127,9 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_cuda_graph # 1 min
   - accuracy/test_accuracy.py::TestGpt2::test_context_fmha_disabled # 1 min
   - accuracy/test_accuracy.py::TestGptNext::test_auto_dtype # 1.5 mins
+  - accuracy/test_accuracy.py::TestGptJ6B::test_float32 # 4 mins
+  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache
+  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache_beam_search
   - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_accuracy.py::TestMamba130M::test_auto_dtype # 1 min
   - accuracy/test_accuracy.py::TestVicuna7B::test_lookahead # 5 mins
@@ -145,6 +148,7 @@ l0_h100:
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
+  - examples/test_gptj.py::test_llm_gptj_fp8_manage_weights_summary
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/model_api/test_model_quantization.py # 20 mins on H100
   - test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b] # 55.77s H100 only

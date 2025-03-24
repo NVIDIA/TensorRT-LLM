@@ -1,8 +1,0 @@
-examples/test_gpt.py::test_llm_gpt2_1gpu[disable_gemm_plugin-disable_attention_plugin]
-examples/test_gpt.py::test_llm_gpt2_santacoder_1node_4gpus[serial_build-disable_fmha-disable_gemm_plugin-disable_attention_plugin]
-examples/test_gpt.py::test_llm_gpt2_starcoder_1node_4gpus[starcoder-disable_fmha-disable_gemm_plugin-disable_attention_plugin]
-examples/test_gpt.py::test_llm_gpt3_175b_1node_8gpus[serial_build-disable_fmha-disable_gemm_plugin-disable_attention_plugin]
-examples/test_llama.py::test_llm_llama_code_llama_1gpu_summary[CodeLlama-7b-Instruct-disable_context_fmha-disable_gemm_plugin-disable_attention_plugin-nb:1]
-examples/test_llama.py::test_llm_llama_v2_1gpu_weight_streaming[llama-v2-7b-hf-1.0-ootb]
-examples/test_llama.py::test_llm_llama_v2_1gpu_weight_streaming[llama-v2-70b-hf-0.05-ootb]
-examples/test_phi.py::test_llm_phi_single_gpu_summary[phi-2-float16-disable_gemm_plugin-disable_attention_plugin-disable_fmha-nb:2]

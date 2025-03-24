@@ -1,4 +1,0 @@
-examples/test_chatglm.py::test_llm_chatglm_6b_single_gpu_summary[disable_paged_kv_cache-enable_remove_input_padding-disable_weight_only-nb:2]
-examples/test_chatglm.py::test_llm_chatglm2_6b_single_gpu_summary[chatglm2-6b-disable_paged_kv_cache-enable_remove_input_padding-disable_weight_only-disable_fmha-nb:4]
-examples/test_chatglm.py::test_llm_chatglm3_6b_single_gpu_summary[chatglm3-6b-disable_paged_kv_cache-enable_remove_input_padding-disable_weight_only-disable_fmha-nb:4]
-examples/test_chatglm.py::test_llm_chatglm3_6b_single_gpu_summary[chatglm3-6b-base-disable_paged_kv_cache-enable_remove_input_padding-disable_weight_only-disable_fmha-nb:4]

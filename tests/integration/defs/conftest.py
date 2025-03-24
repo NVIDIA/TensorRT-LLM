@@ -465,6 +465,18 @@ def plugin_gen_path(llm_root):
 
 
 @pytest.fixture(scope="module")
+def internlm2_example_root(llm_root, llm_venv):
+    "Get internlm2 example root"
+    example_root = os.path.join(llm_root, "examples", "internlm2")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
 def qwen_example_root(llm_root, llm_venv):
     "Get qwen example root"
     example_root = os.path.join(llm_root, "examples", "qwen")
