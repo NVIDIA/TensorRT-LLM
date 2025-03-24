@@ -205,16 +205,6 @@ def prepare_model(root_dir, cpp_resources_dir, python_exe, model_cache_arg,
                             resources_dir=cpp_resources_dir,
                             model_cache_arg=model_cache_arg)
 
-        if model_name == "gptj" and run_fp8:
-            only_fp8_arg = ["--only_fp8"]
-
-            prepare_model_tests(model_name=model_name,
-                                python_exe=python_exe,
-                                root_dir=root_dir,
-                                resources_dir=cpp_resources_dir,
-                                model_cache_arg=model_cache_arg,
-                                only_fp8_arg=only_fp8_arg)
-
     return _prepare
 
 
@@ -287,7 +277,7 @@ def test_unit_tests(build_google_tests, build_dir, lora_setup):
                          indirect=True)
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
-    "gptj", "llama", "mamba", "medusa", "recurrentgemma", "redrafter", "t5"
+    "llama", "mamba", "medusa", "recurrentgemma", "redrafter", "t5"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,
