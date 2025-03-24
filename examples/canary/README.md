@@ -54,7 +54,7 @@ python3 convert_checkpoint.py \
 # Build the canary encoder model using conformer_onnx_trt.py
 python3 conformer_onnx_trt.py \
         --max_BS ${MAX_BATCH_SIZE} \
-        --max_feat_len ${MAX_FEAT_LEN}
+        --max_feat_len ${MAX_FEAT_LEN} \
         ${checkpoint_dir}/encoder/encoder.onnx \
         ${engine_dir}
 
