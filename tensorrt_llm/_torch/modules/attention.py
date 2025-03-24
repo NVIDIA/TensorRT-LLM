@@ -126,9 +126,21 @@ class Attention(nn.Module):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
+        lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
+        if lora_params is not None:
+            q = (hidden_states @ lora_params["lora_weight_ins_q"].T
+                 ) @ lora_params["lora_weight_outs_q"].T
+            k = (hidden_states @ lora_params["lora_weight_ins_k"].T
+                 ) @ lora_params["lora_weight_outs_k"].T
+            v = (hidden_states @ lora_params["lora_weight_ins_v"].T
+                 ) @ lora_params["lora_weight_outs_v"].T
+
+            packed_lora_qkv = torch.cat([q, k, v], dim=-1)
+            qkv = qkv + packed_lora_qkv
+
         is_fused_qkv = False
         if isinstance(self.attn, TrtllmAttention):
             is_fused_qkv = True
@@ -172,6 +184,12 @@ class Attention(nn.Module):
                                             mrope_config=mrope_config)
 
         attn_output = self.o_proj(attn_output)
+        if lora_params is not None:
+            lora_o = (attn_output @ lora_params["lora_weight_ins_o"].T
+                        ) @ lora_params["lora_weight_outs_o"].T
+
+            attn_output = attn_output + lora_o
+
 
         return attn_output
 

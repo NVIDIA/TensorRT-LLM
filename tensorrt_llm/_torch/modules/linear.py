@@ -377,7 +377,8 @@ class Linear(nn.Module):
             self,
             input: Union[torch.Tensor, Fp4QuantizedTensor],
             *,
-            all_reduce_params: Optional[AllReduceParams] = None
+            all_reduce_params: Optional[AllReduceParams] = None,
+            lora_params=None,
     ) -> torch.Tensor:
         from tensorrt_llm._torch.distributed import allgather
 
@@ -407,6 +408,13 @@ class Linear(nn.Module):
                 output = allgather(output, self.parallel_config)
         else:
             output = self.apply_linear(input, self.weight, self.bias)
+        
+        if lora_params is not None:
+            A = lora_params['lora_weight_ins']
+            B = lora_params['lora_weight_outs']
+            lora_output = (input @ A.T) @ B.T
+
+            output = output + lora_output
 
         return output
 
