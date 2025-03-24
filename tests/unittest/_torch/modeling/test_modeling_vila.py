@@ -3,7 +3,6 @@ import sys
 import unittest
 from copy import deepcopy
 from typing import Any
-from unittest.mock import patch
 
 import torch
 from parameterized import parameterized
@@ -265,7 +264,6 @@ VILA_1_5_3B_CONFIG = {
         "use_bfloat16": False
     }
 }
-
 
 NVILA_8B_CONFIG = {
     "_attn_implementation_autoset": True,
