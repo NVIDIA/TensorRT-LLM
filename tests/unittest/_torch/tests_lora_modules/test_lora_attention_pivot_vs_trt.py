@@ -19,6 +19,7 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.layers import Attention
 from tensorrt_llm.layers.lora import Lora, LoraParams
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../functional'))
 
@@ -79,8 +80,6 @@ class TestLoraAttention:
             self.kv_cache_manager.shutdown()
 
     def _create_attention_inputs(self):
-        """Create input tensors and weights for attention."""
-        # Create hidden states
         hidden_states = torch.empty(
             size=[self.batch_size, self.seq_len, self.hidden_size],
             dtype=self.torch_dtype,
@@ -92,7 +91,7 @@ class TestLoraAttention:
                                dtype=self.torch_dtype)
         torch.nn.init.xavier_uniform_(q_weight)
 
-        # Set K and V weights to identity matrix
+        # Set K and V and O weights to identity matrix
         eye_weight = torch.eye(self.hidden_size, dtype=self.torch_dtype)
         qkv_weight = torch.cat([q_weight, eye_weight, eye_weight], dim=-1)
         out_weight = eye_weight
@@ -125,6 +124,8 @@ class TestLoraAttention:
             tmp.transpose(1, 0).contiguous() for tmp in lora_weight_outs
         ]
 
+
+        # Create weight pointers for TensorRT
         lora_weights_pointers = []
         for in_ptr, out_ptr in zip(lora_weight_ins, lora_weight_outs):
             lora_weights_pointers.append(in_ptr.data_ptr())
@@ -328,16 +329,43 @@ class TestLoraAttention:
         # Create attention metadata
         attn_metadata = self._create_attention_metadata(model_config)
 
+                        # Set up and run TensorRT network
+        builder, net = self._setup_trt_network(hidden_states, lora_params,
+                                               attention_module)
+        trt_output = self._run_trt_inference(builder, net, hidden_states,
+                                             lora_params)
+
         # Create LoRA parameters for pivot attention
-        lora_params_dict = {
-            "lora_weight_ins_q": lora_params['lora_weight_ins'][0],
-            "lora_weight_outs_q": lora_params['lora_weight_outs'][0],
-            "lora_weight_ins_k": lora_params['lora_weight_ins'][0],
-            "lora_weight_outs_k": lora_params['lora_weight_outs'][0],
-            "lora_weight_ins_v": lora_params['lora_weight_ins'][0],
-            "lora_weight_outs_v": lora_params['lora_weight_outs'][0],
-            "lora_weight_ins_o": lora_params['lora_weight_ins'][0],
-            "lora_weight_outs_o": lora_params['lora_weight_outs'][0]
+        lora_params_pivot = {
+            'num_seqs': self.batch_size,
+            'host_request_types': torch.zeros(self.batch_size, dtype=torch.int32),
+            'prompt_lens_cpu': torch.tensor([self.seq_len] * self.batch_size),
+            0: {  # layer_idx
+                LoraModuleType.ATTENTION_Q: {  # Q module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[lora_params['lora_weight_outs'][0].data_ptr(), lora_params['lora_weight_ins'][0].data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [lora_params['lora_weight_outs'][0], lora_params['lora_weight_ins'][0]]
+                },
+                LoraModuleType.ATTENTION_K: {  # K module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[lora_params['lora_weight_outs'][0].data_ptr(), lora_params['lora_weight_ins'][0].data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [lora_params['lora_weight_outs'][0], lora_params['lora_weight_ins'][0]]
+                },
+                LoraModuleType.ATTENTION_V: {  # V module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[lora_params['lora_weight_outs'][0].data_ptr(), lora_params['lora_weight_ins'][0].data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [lora_params['lora_weight_outs'][0], lora_params['lora_weight_ins'][0]]
+                },
+                LoraModuleType.ATTENTION_DENSE: {  # Output projection module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[lora_params['lora_weight_outs'][0].data_ptr(), lora_params['lora_weight_ins'][0].data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [lora_params['lora_weight_outs'][0], lora_params['lora_weight_ins'][0]]
+                }
+            }
         }
 
         # Run pivot attention
@@ -349,13 +377,9 @@ class TestLoraAttention:
                 hidden_states=hidden_states_pivot,
                 attn_metadata=attn_metadata,
                 attention_mask=PredefinedAttentionMask.CAUSAL,
-                lora_params=lora_params_dict)
+                lora_params=lora_params_pivot)
 
-        # Set up and run TensorRT network
-        builder, net = self._setup_trt_network(hidden_states, lora_params,
-                                               attention_module)
-        trt_output = self._run_trt_inference(builder, net, hidden_states,
-                                             lora_params)
+
 
         # Compare outputs
         a_tol = 5e-5 if (self.dtype == "float32") else 2e-3

@@ -199,7 +199,7 @@ class TestLoraAttentionPivotVsVanilla:
                 [self.batch_size, self.seq_len, self.hidden_size])
             torch_out = torch_out.squeeze(0)
 
-            # Apply output LoRA
+            # Apply output LoRA and skip projection of O matrix since it's identity
             lora_o = (torch_out @ B_o.T) @ A_o.T
             torch_out = torch_out + lora_o
         else:
