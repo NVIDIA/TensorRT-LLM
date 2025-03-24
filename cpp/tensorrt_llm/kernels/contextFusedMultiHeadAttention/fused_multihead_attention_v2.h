@@ -21,7 +21,6 @@
 #include "fused_multihead_attention_common.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tmaDescriptor.h"
 
 #include <algorithm>
@@ -318,7 +317,6 @@ public:
             }
             else
             {
-                TLLM_LOG_WARNING("buggy path");
                 // Note that this path won't be used. will be dropped later.
                 // tricks for launching warp-specialized flash attention kernels on Hopper
                 block_size.y = std::min(params.b * params.h, launch_params.multi_processor_count);
@@ -326,7 +324,6 @@ public:
                 // distribute m steps to multiple blocks (fully utilize SMs)
                 // block.x = blocks that handle single head, block.y = blocks that handle different heads
                 size_t sms_per_head = (launch_params.multi_processor_count) / block_size.y;
-                // WARNING: there is a bug here.
                 size_t m_steps = size_t((params.s + kernelMeta.mUnrollStep * NUM_COMPUTE_GROUPS - 1)
                     / kernelMeta.mUnrollStep * NUM_COMPUTE_GROUPS);
 

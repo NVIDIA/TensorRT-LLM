@@ -439,7 +439,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         Returns the max sequence length.
         If the attention uses cached KV, it will return max_seq_len from the KV cache manager.
-        If the attention is no cache, max_seq_len should be set in the constructor, and it will return the max sequence length set by user.
+        If the attention is no cache, max_seq_len should be set manually by user.
         """
         if self.kv_cache_manager is not None:
             return self.kv_cache_manager.max_seq_len
@@ -477,7 +477,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_requests, ),
             device='cuda',
@@ -708,68 +707,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             TrtllmAttentionMetadata,
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
-
-        #TODO: Debug, remove this after testing
-        # if no_cache:
-        #     print("WARNING: This is no cache path for TRT-LLM Attention")
-
-        #     # NOTE: just for testing
-        #     # from .vanilla import VanillaAttention
-        #     # return VanillaAttention.no_kv_cache_forward(
-        #     #     q, k, v, self.wrapper.num_heads, self.wrapper.num_kv_heads,
-        #     #     metadata)
-        #     # NOTE: just for testing
-        #     max_num_requests = metadata.num_contexts
-        #     max_context_length = max_num_requests
-        #     # temporary no cache logic
-        #     # plan with no cache
-        #     num_seqs = metadata.num_seqs
-        #     self.wrapper.plan(
-        #         tokens_per_block=None,
-        #         max_num_requests=
-        #         max_num_requests,  # TODO: see original code why this is in kv_cache_manager?
-        #         max_context_length=
-        #         max_context_length,  # TODO: see original code why this is in kv_cache_manager?
-        #         attention_window_size=None,
-        #         sink_token_length=0,
-        #         beam_width=1,
-        #         sequence_length=metadata.kv_lens_cuda[:num_seqs],
-        #         host_past_key_value_lengths=metadata.kv_lens[:num_seqs],
-        #         context_lengths=metadata.prompt_lens_cuda[:num_seqs],
-        #         host_context_lengths=metadata.prompt_lens_cpu[:num_seqs],
-        #         host_request_types=metadata.host_request_types[:num_seqs],
-        #         kv_cache_block_offsets=None,
-        #         host_kv_cache_block_offsets=None,
-        #         host_kv_cache_pool_pointers=None,
-        #         host_kv_cache_pool_mapping=None,
-        #         workspace=None,
-        #         cache_indirection=None,
-        #         kv_scale_orig_quant=None,
-        #         kv_scale_quant_orig=None,
-        #         out_scale=out_scale,
-        #         use_paged_context_fmha=False,
-        #         attention_input_type=AttentionInputType.context_only,
-        #         latent_cache=None,
-        #         q_pe=None,
-        #     )
-        #     # run with no cache
-        #     out_dtype = None
-        #     if out_scale is not None:
-        #         if (self.has_fp8_qdq
-        #                 or self.has_nvfp4) and self.has_fp8_kv_cache:
-        #             # TODO(qijun): revisit fp8_context_fmha logic
-        #             out_dtype = torch.float8_e4m3fn
-
-        # output = self.wrapper.run(q,
-        #                           k,
-        #                           v,
-        #                           out_dtype=out_dtype,
-        #                           is_fused_qkv=not metadata.is_cross
-        #                           and k is None,
-        #                           update_kv_cache=not metadata.is_cross
-        #                           or k is not None,
-        #                           attention_mask=attention_mask)
-        # return output
 
         use_paged_context_fmha = (metadata.runtime_features.chunked_prefill
                                   or metadata.runtime_features.cache_reuse

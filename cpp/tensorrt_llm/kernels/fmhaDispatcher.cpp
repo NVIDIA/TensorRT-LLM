@@ -198,8 +198,6 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
     }
     else
     {
-        TLLM_LOG_DEBUG(
-            "%s MHARunnerFixedParams mFixedParams: %s", __PRETTY_FUNCTION__, mFixedParams.convertToStrOutput().c_str());
         mFMHARunner->run(runnerParams);
     }
 }
