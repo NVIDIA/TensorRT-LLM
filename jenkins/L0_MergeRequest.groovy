@@ -302,15 +302,13 @@ def launchReleaseCheck(pipeline)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            python3-pip \
+            golang-go  \
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: cloning tekit source code
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep pre-commit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep bandit requirements-dev.txt`")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit install")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run -a --show-diff-on-failure || (git restore . && false)")
         sh "cd ${LLM_ROOT} && bandit --configfile scripts/bandit.yaml -r tensorrt_llm | tee /tmp/bandit.log"
@@ -357,7 +355,7 @@ def launchReleaseCheck(pipeline)
         }
     }
 
-    def image = "urm-rn.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main"
     stageName = "Release Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
         stage("[${stageName}] Run") {
