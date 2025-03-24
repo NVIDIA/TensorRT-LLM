@@ -349,7 +349,8 @@ class AccuracyTestHarness:
             if self.quant_algo == QuantAlgo.NVFP4:
                 convert_cmd.append("--use_nvfp4")
             elif self.quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--use_fp8")
+                if self.EXAMPLE_FOLDER != "gpt":  # --use_fp8 flag is not needed for gpt.
+                    convert_cmd.append("--use_fp8")
             elif self.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 convert_cmd.append("--use_fp8_rowwise")
             elif quant_config._use_plugin_sq:
@@ -378,7 +379,8 @@ class AccuracyTestHarness:
             if self.kv_cache_quant_algo == QuantAlgo.INT8:
                 convert_cmd.append("--int8_kv_cache")
             elif self.kv_cache_quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--fp8_kv_cache")
+                if self.EXAMPLE_FOLDER != "gpt":  # --fp8_kv_cache flag is not needed for gpt.
+                    convert_cmd.append("--fp8_kv_cache")
 
         if quant_config._requires_calibration:
             convert_cmd.append(

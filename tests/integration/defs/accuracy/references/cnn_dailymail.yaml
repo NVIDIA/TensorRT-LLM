@@ -202,3 +202,7 @@ Qwen/Qwen2.5-1.5B-Instruct:
     accuracy: 31.515
   - quant_algo: FP8
     accuracy: 31.560
+nvidia/Nemotron-Mini-4B-Instruct:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 25.72
