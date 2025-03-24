@@ -615,7 +615,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
     static int SM = tensorrt_llm::common::getSMVersion();
     int token_num = params.size / params.hidden_dim;
-    bool oneshot = use_oneshot(token_num);
+    bool oneshot = params.use_oneshot;
     int cluster_num = token_num;
     std::array<int, NRanks> begin_tokens, token_num_per_ranks;
     if (!oneshot)
