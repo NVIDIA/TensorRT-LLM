@@ -246,8 +246,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 _SyncQueue.notify_many(queue.loop, async_queues)
         except AsyncQueue.EventLoopShutdownError:
             # This happens in the last results loop while the generate workflow is stopped.
-            pass
+            logger.debug("worker.py: EventLoopShutdownError")
         except Exception as e:
+            logger.error(f"worker.py: Error in _iteration_result_task: {e}")
             raise e
 
         return True  # success
