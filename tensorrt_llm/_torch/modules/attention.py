@@ -148,21 +148,11 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-            # todo not sure its the right place for this
+            
             qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
                                            self.layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
-            # q = (hidden_states @ lora_params["lora_weight_ins_q"].T
-            #      ) @ lora_params["lora_weight_outs_q"].T
-            # k = (hidden_states @ lora_params["lora_weight_ins_k"].T
-            #      ) @ lora_params["lora_weight_outs_k"].T
-            # v = (hidden_states @ lora_params["lora_weight_ins_v"].T
-            #      ) @ lora_params["lora_weight_outs_v"].T
-
-            # packed_lora_qkv = torch.cat([q, k, v], dim=-1)
-            # qkv = qkv + packed_lora_qkv
-
 
 
         if is_fused_qkv:
@@ -209,11 +199,6 @@ class Attention(nn.Module):
                                            self.layer_idx)
             if attn_lora_output is not None:
                 attn_output = attn_output + attn_lora_output
-
-            # lora_o = (attn_output @ lora_params["lora_weight_ins_o"].T
-            #             ) @ lora_params["lora_weight_outs_o"].T
-
-            # attn_output = attn_output + lora_o
 
 
         return attn_output

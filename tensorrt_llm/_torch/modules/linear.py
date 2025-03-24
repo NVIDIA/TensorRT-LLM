@@ -421,13 +421,7 @@ class Linear(nn.Module):
                                            self.layer_idx)
             if linear_lora_output is not None:
                 output = output + linear_lora_output
-
-        #     A = lora_params['lora_weight_ins']
-        #     B = lora_params['lora_weight_outs']
-        #     lora_output = (input @ A.T) @ B.T
-
-        #     output = output + lora_output
-
+                
         return output
 
     def load_weights(self, weights: List[Dict]):
