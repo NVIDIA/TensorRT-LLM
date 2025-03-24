@@ -111,6 +111,7 @@ def main(args):
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
                            split=dataset_split)
+    dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
 
@@ -168,7 +169,6 @@ def main(args):
                 f.write(f'Model path: {args.hf_model_dir}\n')
                 f.write(f'Tokenizer path: {args.tokenizer_dir}\n')
 
-    # TODO: Add random_seed flag in gptj
     rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
         args.rouge_dir) else "rouge"
     metric_tensorrt_llm = [
@@ -746,12 +746,30 @@ def main(args):
             for beam_idx in range(num_sequences):
                 logger.info(f"TensorRT-LLM beam {beam_idx} result")
                 if args.eval_task != "eval_context_ppl":
-                    computed_metrics_tensorrt_llm = metric_tensorrt_llm[
-                        beam_idx].compute()
-                    for key in computed_metrics_tensorrt_llm.keys():
-                        logger.info(
-                            f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
-                        )
+                    if args.estimate_accuracy_std_dev:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute(use_aggregator=False)
+                        computed_std_dev_tensorrt_llm = {
+                            key: np.std(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        computed_metrics_tensorrt_llm = {
+                            key: np.mean(scores)
+                            for key, scores in
+                            computed_metrics_tensorrt_llm.items()
+                        }
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key} : {computed_metrics_tensorrt_llm[key]*100} ({computed_std_dev_tensorrt_llm[key]*100})"
+                            )
+                    else:
+                        computed_metrics_tensorrt_llm = metric_tensorrt_llm[
+                            beam_idx].compute()
+                        for key in computed_metrics_tensorrt_llm.keys():
+                            logger.info(
+                                f"  {key} : {computed_metrics_tensorrt_llm[key]*100}"
+                            )
                     if args.check_accuracy and beam_idx == 0:
                         rouge1 = computed_metrics_tensorrt_llm['rouge1'] * 100
                         assert rouge1 > args.tensorrt_llm_rouge1_threshold, f"[FAILED] rouge1 ({rouge1}) is smaller than threshold ({args.tensorrt_llm_rouge1_threshold})."
@@ -798,6 +816,7 @@ if __name__ == '__main__':
                             'eval_context_ppl'
                         ])
     parser.add_argument('--check_accuracy', action='store_true')
+    parser.add_argument('--estimate_accuracy_std_dev', action='store_true')
     parser.add_argument('--tensorrt_llm_rouge1_threshold',
                         type=float,
                         default=15.0)

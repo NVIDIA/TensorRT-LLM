@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -60,7 +61,11 @@ public:
         int shape_y, cudaStream_t stream)
         = 0;
     // Returns desired workspace size in bytes.
-    virtual size_t getWorkspaceSize(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) = 0;
+    virtual size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1)
+        = 0;
+    virtual size_t getWorkspaceSize(
+        size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1)
+        = 0;
 
     void configureWorkspace(char* ws_ptr)
     {
@@ -107,7 +112,9 @@ public:
         cudaStream_t stream) override;
 
     // Returns desired workspace size in bytes.
-    size_t getWorkspaceSize(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
+    size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
+    size_t getWorkspaceSize(
+        size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1) override;
 
     size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) override;
     size_t getActScaleSize(int shape_m, int shape_k) override;
@@ -117,6 +124,8 @@ public:
 
 private:
     int64_t max_shape_m_4_align_ = 0;
+    int64_t max_shape_m_32_align_padded_ = 0;
+    int64_t expected_m_ = 0;
 };
 
 } // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

@@ -302,7 +302,15 @@ void initRequestBindings(pybind11::module_& m)
         .def_property_readonly("max_ngram_size", &tle::LookaheadDecodingConfig::getNgramSize)
         .def_property_readonly("max_verification_set_size", &tle::LookaheadDecodingConfig::getVerificationSetSize)
         .def("calculate_speculative_resource", &tle::LookaheadDecodingConfig::calculateSpeculativeResource)
-        .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate));
+        .def_static(
+            "calculate_speculative_resource_tuple", &tle::LookaheadDecodingConfig::calculateSpeculativeResourceTuple)
+        .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate))
+        .def_static("get_default_lookahead_decoding_window",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingWindow; })
+        .def_static("get_default_lookahead_decoding_ngram",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingNgram; })
+        .def_static("get_default_lookahead_decoding_verification_set",
+            []() { return tle::LookaheadDecodingConfig::kDefaultLookaheadDecodingVerificationSet; });
 
     auto TokenRangeRetentionConfigGetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig const& self)
     { return py::make_tuple(self.tokenStart, self.tokenEnd, self.priority, self.durationMs); };
@@ -365,13 +373,13 @@ void initRequestBindings(pybind11::module_& m)
     auto ContextPhaseParamsGetState = [](tle::ContextPhaseParams const& self)
     {
         auto serializedState = self.getSerializedState();
-        return py::make_tuple(
-            self.getFirstGenTokens(), self.getReqId(), py::bytes(serializedState.data(), serializedState.size()));
+        return py::make_tuple(self.getFirstGenTokens(), self.getReqId(),
+            py::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
     };
 
     auto ContextPhaseParamsSetState = [](py::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid ContextPhaseParams state!");
         }
@@ -379,19 +387,21 @@ void initRequestBindings(pybind11::module_& m)
         auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
         return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
             state[1].cast<tle::ContextPhaseParams::RequestIdType>(),
-            std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()));
+            std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
+            state[3].cast<std::optional<VecTokens>>());
     };
 
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
         .def(py::init(
             [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
-                py::bytes const& opaque_state)
+                py::bytes const& opaque_state, std::optional<VecTokens> const& draft_tokens)
             {
                 auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
                 return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
-                    std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()));
+                    std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
             }))
         .def_property_readonly("first_gen_tokens", &tle::ContextPhaseParams::getFirstGenTokens)
+        .def_property_readonly("draft_tokens", &tle::ContextPhaseParams::getDraftTokens)
         .def_property_readonly("req_id", &tle::ContextPhaseParams::getReqId)
         .def_property_readonly("opaque_state",
             [](tle::ContextPhaseParams const& self)

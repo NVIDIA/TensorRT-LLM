@@ -1,10 +1,12 @@
 import os
 from abc import ABC, abstractmethod
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
-from ..._utils import mpi_allgather, mpi_barrier, mpi_broadcast
+from ..._utils import (mpi_allgather, mpi_barrier, mpi_broadcast, mpi_comm,
+                       mpi_isend, mpi_recv)
 from ...mapping import Mapping
 
 
@@ -34,12 +36,44 @@ class Distributed(ABC):
         return self.mapping.cp_size
 
     @property
+    def pp_size(self):
+        return self.mapping.pp_size
+
+    @property
+    def tp_size(self):
+        return self.mapping.tp_size
+
+    @property
     def cp_rank(self):
         return self.mapping.cp_rank
 
     @property
     def tp_rank(self):
         return self.mapping.tp_rank
+
+    @property
+    def pp_rank(self):
+        return self.mapping.pp_rank
+
+    @property
+    def is_last_pp_rank(self):
+        return self.mapping.is_last_pp_rank()
+
+    @property
+    def is_second_last_pp_rank(self):
+        return self.mapping.is_second_last_pp_rank()
+
+    @property
+    def is_first_pp_rank(self):
+        return self.mapping.is_first_pp_rank()
+
+    @property
+    def next_pp_rank(self):
+        return self.mapping.next_pp_rank()
+
+    @property
+    def prev_pp_rank(self):
+        return self.mapping.prev_pp_rank()
 
     @property
     def has_cp(self):
@@ -60,6 +94,10 @@ class Distributed(ABC):
 
 class MPIDist(Distributed):
 
+    def __init__(self, mapping: Mapping):
+        super().__init__(mapping)
+        self.create_tp_comm()
+
     def broadcast(self, obj, root=0):
         return mpi_broadcast(obj, root)
 
@@ -68,6 +106,30 @@ class MPIDist(Distributed):
 
     def barrier(self):
         mpi_barrier()
+
+    def isend(self, buf: np.ndarray, dest, tag=0):
+        # non-blocking send numpy buffer
+        return mpi_isend(buf, dest, tag)
+
+    def recv(self, buf: np.ndarray, src, tag=0):
+        # in-place recv numpy buffer
+        return mpi_recv(buf, src, tag)
+
+    def isend_tensor(self, tensor: torch.Tensor, dest, tag=0):
+        return self.isend(tensor.numpy(), dest, tag)
+
+    def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
+        return self.recv(tensor.numpy(), src, tag)
+
+    def create_tp_comm(self):
+        new_group = mpi_comm().group.Incl(self.mapping.tp_group)
+        self.tp_comm = mpi_comm().Create_group(new_group)
+
+    def tp_allgather(self, obj):
+        return self.tp_comm.allgather(obj)
+
+    def tp_broadcast(self, obj, root=0):
+        return self.tp_comm.bcast(obj, root)
 
 
 class TorchDist(Distributed):

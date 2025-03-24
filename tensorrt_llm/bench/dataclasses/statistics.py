@@ -79,11 +79,11 @@ class RequestRecord(BaseModel):
         return self.end_timestamp - self.start_timestamp
 
     @computed_field
-    def total_token_throughput(self) -> float:
+    def output_token_throughput(self) -> float:
         """
         Returns the total token throughput of the request (Total output tokens / E2E Latency).
         """
-        return self.num_total_output_tokens / self.end_to_end_latency
+        return float(self.num_total_output_tokens) / self.end_to_end_latency
 
     @computed_field
     def generation_token_throughput(self) -> float:
@@ -131,6 +131,7 @@ class BenchmarkStatistics(BaseModel):
 
     # Percentile-related Statistics
     request_latency_percentiles: Optional[PercentileStats] = None
+    output_throughput_percentiles: Optional[PercentileStats] = None
     token_percentiles: Optional[PercentileStats] = None
     tpot_percentiles: Optional[PercentileStats] = None
     ttft_percentiles: Optional[PercentileStats] = None
@@ -151,12 +152,20 @@ class BenchmarkStatistics(BaseModel):
         return int(self.total_output_tokens - self.num_requests)
 
     @computed_field
-    def token_throughput_ns(self) -> float:
-        return float(self.total_output_tokens) / self.total_latency_ns
+    def total_generation_time_ns(self) -> float:
+        return self.generation_latency_percentiles.average * self.num_requests
 
     @computed_field
-    def generation_token_throughput_ns(self) -> float:
-        return self.generation_tp_percentiles.average
+    def per_user_time_per_output_token_ns(self) -> float:
+        return self.tpot_percentiles.average
+
+    @computed_field
+    def per_user_time_to_first_token_ns(self) -> float:
+        return self.ttft_percentiles.average
+
+    @computed_field
+    def per_user_generation_token_throughput_ns(self) -> float:
+        return 1.0 / self.tpot_percentiles.average
 
     @computed_field
     def request_throughput_ns(self) -> float:
@@ -169,3 +178,11 @@ class BenchmarkStatistics(BaseModel):
     @computed_field
     def average_output_length(self) -> float:
         return float(self.total_output_tokens) / self.num_requests
+
+    @computed_field
+    def output_throughput_tok_ns(self) -> float:
+        return float(self.total_output_tokens) / self.total_latency_ns
+
+    @computed_field
+    def output_throughput_tok_ns_per_user(self) -> float:
+        return self.output_throughput_percentiles.average

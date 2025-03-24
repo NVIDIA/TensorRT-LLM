@@ -6485,6 +6485,7 @@ ACT2FN = {
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
     'sigmoid': sigmoid,
+    'quick_gelu': quick_gelu,
 }
 
 GATED_ACT_2_ACT = {

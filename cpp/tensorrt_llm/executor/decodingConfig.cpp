@@ -130,12 +130,18 @@ bool LookaheadDecodingConfig::isLegal(
 
 std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> LookaheadDecodingConfig::calculateSpeculativeResource() const
 {
-    SizeType32 maxPathLen = mNgramSize;
-    SizeType32 maxDraftTokens =                                        //
-        ((mNgramSize == 1) ? 0 : (mNgramSize - 2))                     // lookahead Window first
-        + (mWindowSize - 1 + mVerificationSetSize) * (mNgramSize - 1); // lookahead Window rest and guess tokens
-    SizeType32 maxDecodingTokens = maxDraftTokens + 1;                 // + golden Token
-    SizeType32 maxDraftPathLen = mNgramSize - 1;
+    return calculateSpeculativeResourceTuple(mWindowSize, mNgramSize, mVerificationSetSize);
+}
+
+std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> LookaheadDecodingConfig::calculateSpeculativeResourceTuple(
+    SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize)
+{
+    SizeType32 maxPathLen = ngramSize;
+    SizeType32 maxDraftTokens =                                     //
+        ((ngramSize == 1) ? 0 : (ngramSize - 2))                    // lookahead Window first
+        + (windowSize - 1 + verificationSetSize) * (ngramSize - 1); // lookahead Window rest and guess tokens
+    SizeType32 maxDecodingTokens = maxDraftTokens + 1;              // + golden Token
+    SizeType32 maxDraftPathLen = ngramSize - 1;
     return std::make_tuple(maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen);
 }
 

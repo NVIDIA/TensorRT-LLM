@@ -1,0 +1,52 @@
+version: 0.0.1
+trt_llm_release_perf_cluster_test:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+  tests:
+  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128+512,32-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:nvfp4-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128+512,32-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v2_13b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-loras:8-gpus:2]
+  - perf/test_perf.py::test_perf[t5_large-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000+500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-quant:fp8-gpus:2]
+
+# Tests for systems with 4+ GPUs
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+  tests:
+  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:4]
+  - perf/test_perf.py::test_perf[baichuan2_13b_chat-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:4]
+  - perf/test_perf.py::test_perf[starcoder_15.5b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-gpus:4]
+  - perf/test_perf.py::test_perf[falcon_40b-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128-gpus:4]
+
+# Tests for systems with 8+ GPUs
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+  tests:
+  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:8]
+  - perf/test_perf.py::test_perf[bloom_176b-cppmanager-exe-plugin_ifb-float16-maxbs:8-input_output_len:128,128+512,32-reqs:80-gpus:8]
+  - perf/test_perf.py::test_perf[falcon_180b-cppmanager-exe-plugin_ifb-float16-maxbs:8-input_output_len:128,128+512,32-reqs:80-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_175b-cppmanager-exe-plugin_ifb-float16-maxbs:8-input_output_len:128,128+512,32-reqs:80-gpus:8]
+
+# GB chip specific tests with high memory
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      gpu_memory:
+        gt: 100000
+    wildcards:
+      chip: 'gb*'
+      linux_distribution_name: '*'
+  tests:
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:fp8-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:nvfp4-ep:8-tp:8-gpus:8]

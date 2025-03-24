@@ -300,11 +300,17 @@ class Mapping(object):
     def get_local_rank(self, rank: int):
         return rank % self.gpus_per_node
 
+    def is_multi_node(self):
+        return self.world_size > self.gpus_per_node
+
     def has_tp(self):
         return self.tp_size > 1
 
     def is_last_pp_rank(self):
         return self.pp_rank == self.pp_size - 1
+
+    def is_second_last_pp_rank(self):
+        return self.pp_rank == self.pp_size - 2
 
     def is_first_pp_rank(self):
         return self.pp_rank == 0
@@ -334,6 +340,18 @@ class Mapping(object):
         layers_per_pipeline_stage = num_layers // self.pp_size
         layers_range = range(self.pp_rank * layers_per_pipeline_stage,
                              (self.pp_rank + 1) * layers_per_pipeline_stage)
+        return list(layers_range)
+
+    # TODO: Add support of uneven/arbitrary layer segmentation
+    # TODO: merge with pp_layers above
+    def pp_layers_torch(self, num_layers: int) -> List[int]:
+        layers_per_pipeline_stage = num_layers // self.pp_size
+        if self.pp_rank == self.pp_size - 1:
+            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
+                                 num_layers)
+        else:
+            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
+                                 (self.pp_rank + 1) * layers_per_pipeline_stage)
         return list(layers_range)
 
     def ep_experts(self, num_experts: int) -> List[int]:

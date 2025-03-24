@@ -1,0 +1,167 @@
+gpt2:
+  - accuracy: 18.408
+  - quant_algo: W8A16
+    accuracy: 18.408
+  - quant_algo: W4A16
+    accuracy: 15.251
+  - kv_cache_quant_algo: INT8
+    accuracy: 18.208
+  - quant_algo: W8A8_SQ_PER_TENSOR_PLUGIN
+    accuracy: 18.377
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 18.408
+  - extra_acc_spec: beam_width=4
+    accuracy: 24.933
+  - extra_acc_spec: beam_width=256
+    num_samples: 32
+    accuracy: 29.422
+gpt2-medium:
+  - accuracy: 22.730
+  - quant_algo: FP8
+    accuracy: 22.249
+gpt-next:
+  - accuracy: 25.516
+EleutherAI/gpt-j-6b:
+  - accuracy: 27.883
+  - dtype: float32
+    accuracy: 26.449
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.883
+  - extra_acc_spec: max_attention_window_size=900
+    accuracy: 10
+  - extra_acc_spec: max_attention_window_size=900;beam_width=4
+    accuracy: 10
+microsoft/phi-2:
+  - accuracy: 31.255
+microsoft/Phi-3-mini-4k-instruct:
+  - accuracy: 33.147
+microsoft/Phi-3-mini-128k-instruct:
+  - accuracy: 31.331
+state-spaces/mamba-130m-hf:
+  - accuracy: 19.470
+lmsys/vicuna-7b-v1.3:
+  - spec_dec_algo: lookahead
+    accuracy: 33.427
+  - dtype: float16
+    spec_dec_algo: medusa
+    accuracy: 33.419
+  - spec_dec_algo: eagle
+    accuracy: 27.832
+llama-7b-hf:
+  - accuracy: 30.457
+  - quant_algo: W4A16_GPTQ
+    accuracy: 28.844
+  - extra_acc_spec: beam_width=5
+    accuracy: 33.611
+  - extra_acc_spec: streamingllm
+    accuracy: 30.351
+meta-llama/Llama-2-7b-hf:
+  - accuracy: 28.960
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 28.227
+  - quant_algo: W8A8_SQ_PER_CHANNEL
+    accuracy: 30.000
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 28.726
+  - quant_algo: W4A16_AWQ
+    accuracy: 29.144
+  - quant_algo: W4A16_GPTQ
+    accuracy: 27.999
+TinyLlama/TinyLlama-1.1B-Chat-v1.0:
+  - accuracy: 28.328
+  - quant_algo: W8A16
+    accuracy: 28.003
+  - quant_algo: W8A16
+    kv_cache_quant_algo: INT8
+    accuracy: 27.089
+  - quant_algo: W4A16
+    accuracy: 25.194
+  - quant_algo: W4A16
+    kv_cache_quant_algo: INT8
+    accuracy: 23.987
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.882
+  - extra_acc_spec: pp_size=4
+    accuracy: 15.123
+meta-llama/Meta-Llama-3-8B-Instruct:
+  - accuracy: 34.957
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 34.737
+  - quant_algo: W8A16_GPTQ
+    accuracy: 34.858
+meta-llama/Llama-3.1-8B:
+  - accuracy: 24.360
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 25.004
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 24.359
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    accuracy: 24.814
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    extra_acc_spec: meta_recipe
+    accuracy: 24.922
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 33.574
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 33.464
+meta-llama/Llama-3.2-1B:
+  - accuracy: 27.427
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 27.931
+  - quant_algo: W8A8_SQ_PER_CHANNEL
+    accuracy: 25.631
+  - quant_algo: W4A16_AWQ
+    accuracy: 25.028
+  - quant_algo: W4A16_AWQ
+    kv_cache_quant_algo: INT8
+    accuracy: 24.354
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.029
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    accuracy: 27.257
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    extra_acc_spec: meta_recipe
+    accuracy: 27.614
+mistralai/Mixtral-8x7B-v0.1:
+  - accuracy: 28.810
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.109
+google/gemma-2b:
+  - accuracy: 16.722
+  - quant_algo: W8A16
+    accuracy: 16.137
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 16.500
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 15.915
+  - quant_algo: W4A16_AWQ
+    accuracy: 16.638
+google/gemma-7b:
+  - accuracy: 23.420
+  - quant_algo: W8A16
+    accuracy: 23.099
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 21.507
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 19.357
+  - quant_algo: W4A16_AWQ
+    accuracy: 20.283
+google/gemma-2-9b-it:
+  - accuracy: 21.962
+  - quant_algo: W8A16
+    accuracy: 21.677
+  - quant_algo: W4A16
+    accuracy: 21.896
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 21.962

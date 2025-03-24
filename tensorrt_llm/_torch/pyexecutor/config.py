@@ -66,6 +66,10 @@ class PyTorchConfig:
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
 
+    # Enable autotuner only when torch compile is enabled
+    # TODO: after it can be work stable in warmup stage
+    autotuner_enabled: bool = True
+
     # If true, enable layerwise nvtx marker
     enable_layerwise_nvtx_marker: bool = False
     # How to load the model weights. By default, detect the weight type
@@ -148,7 +152,7 @@ def update_executor_config(
 
     if build_config is not None:
         executor_config.max_seq_len = build_config.max_seq_len
-        executor_config.tokens_per_block = build_config.plugin_config.tokens_per_block
+        executor_config.tokens_per_block = executor_config.tokens_per_block or build_config.plugin_config.tokens_per_block
 
     executor_config.hf_model_dir = hf_model_dir
     executor_config.trt_engine_dir = trt_engine_dir

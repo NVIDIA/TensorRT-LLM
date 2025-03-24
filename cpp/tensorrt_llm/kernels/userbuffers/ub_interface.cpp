@@ -82,9 +82,19 @@ void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset
 }
 
 int allgather2_userbuff_residual_launcher(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
+    bool force_enable)
 {
-    return allgather2_userbuff_residual_impl(handler, offset, elements, hidden_size, residual, dataType, comm, stream);
+    return allgather2_userbuff_residual_impl(
+        handler, offset, elements, hidden_size, residual, dataType, comm, stream, force_enable);
+}
+
+int allreduce2_userbuff_inplace_rmsnorm_launcher(int const handler, size_t const offset, size_t const elements,
+    int const hidden_size, void* beta, void* gamma, float eps, void* residual_in, void* residual_out,
+    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+{
+    return allreduce2_userbuff_inplace_rmsnorm_impl(
+        handler, offset, elements, hidden_size, beta, gamma, eps, residual_in, residual_out, dataType, comm, stream);
 }
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t const offset, int const out_handler,
@@ -151,7 +161,8 @@ void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset
 }
 
 int allgather2_userbuff_residual_launcher(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
+    bool force_enable)
 {
     return 0;
 }

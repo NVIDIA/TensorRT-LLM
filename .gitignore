@@ -33,6 +33,7 @@ config.json
 cpp/cmake-build-*
 cpp/.ccache
 tensorrt_llm/bin
+tensorrt_llm/include
 tensorrt_llm/libs
 tensorrt_llm/bindings.*.so
 tensorrt_llm/bindings.pyi

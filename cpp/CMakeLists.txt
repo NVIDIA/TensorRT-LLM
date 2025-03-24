@@ -763,3 +763,8 @@ if(MEASURE_BUILD_TIME)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_CUSTOM "${CMAKE_COMMAND} -E time")
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${CMAKE_COMMAND} -E time")
 endif()
+
+set(BUILD_WHEEL_TARGETS
+    tensorrt_llm;nvinfer_plugin_tensorrt_llm
+    CACHE STRING "Targets used to build wheel")
+add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

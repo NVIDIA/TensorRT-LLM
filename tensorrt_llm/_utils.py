@@ -38,6 +38,7 @@ import tensorrt as trt
 
 from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -470,6 +471,9 @@ def mpi_comm():
     return comm
 
 
+local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -486,6 +490,23 @@ def mpi_world_size():
     return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
+def local_mpi_rank():
+    return local_comm.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def local_mpi_size():
+    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+
+
+def default_gpus_per_node():
+    num_gpus = torch.cuda.device_count()
+    num_ranks = local_mpi_size()
+    assert num_gpus > 0, "No GPU found on the node"
+    if num_ranks > num_gpus:
+        logger.warning(f"{num_ranks} MPI ranks will share {num_gpus} GPUs.")
+    return min(num_ranks, num_gpus)
+
+
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()
@@ -497,6 +518,21 @@ def mpi_broadcast(obj, root=0):
 
 def mpi_allgather(obj):
     return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
+
+
+def mpi_isend(buf, dest, tag=0):
+    # isend in buf-like objects (e.g. numpy array)
+    # return request handle if ENABLE_MULTI_DEVICE
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Isend(buf, dest, tag=tag)
+    return None
+
+
+def mpi_recv(buf, source, tag):
+    # recv in buf-like object (e.g. numpy array)
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().Recv(buf, source, tag=tag)
+    return None
 
 
 def pad_vocab_size(vocab_size, tp_size):

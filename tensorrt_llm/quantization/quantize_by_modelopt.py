@@ -940,18 +940,6 @@ def quantize_and_export(*,
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
-            # Workaround for lm_head quantization
-            # Can be removed after modelopt version is > 0.23
-            if quantize_lm_head:
-                with open(f"{export_path}/config.json", "r") as f:
-                    tensorrt_llm_config = json.load(f)
-                if 'lm_head' in tensorrt_llm_config['quantization'][
-                        'exclude_modules']:
-                    tensorrt_llm_config['quantization'][
-                        'exclude_modules'].remove('lm_head')
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
-
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

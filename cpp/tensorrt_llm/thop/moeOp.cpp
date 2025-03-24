@@ -151,6 +151,44 @@ public:
         return iter->second;
     }
 
+    template <typename Type, bool NeedQuant = false>
+    std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(c10::ScalarType output_type)
+    {
+        switch (output_type)
+        {
+        case c10::ScalarType::Long: // INT64 == FP4
+        case c10::ScalarType::Float8_e4m3fn:
+            // TODO We need an atomic FP8 reduction for the finalize fusions
+            C10_THROW_ERROR_FORMATTED(NotImplementedError,
+                "Outputting " << torch::toString(output_type) << " directly is not currently supported");
+            // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
+        case c10::ScalarType::Half:
+            if constexpr (NeedQuant)
+            {
+                return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, half>>();
+            }
+            else
+            {
+                return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, Type>>();
+            }
+#ifdef ENABLE_BF16
+        case c10::ScalarType::BFloat16:
+            if constexpr (NeedQuant)
+            {
+                return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
+            }
+            else
+            {
+                return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, Type>>();
+            }
+#endif
+        default:
+            C10_THROW_ERROR_FORMATTED(Error,
+                "Invalid output type " << torch::toString(output_type) << " specified for "
+                                       << torch::toString(mActivationDtype));
+        }
+    };
+
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
         bool use_fp8_block_scaling)
     {
@@ -178,46 +216,26 @@ public:
 #endif
 #endif
 
-        // Templated lambda for picking the right output type for fp8/fp4
-        auto switch_output_type = [&](auto&& argType)
-        {
-            using Type = std::decay_t<decltype(argType)>;
-            switch (mOutputDtype)
-            {
-            case c10::ScalarType::Long: // INT64 == FP4
-            case c10::ScalarType::Float8_e4m3fn:
-                // TODO We need an atomic FP8 reduction for the finalize fusions
-                C10_THROW_ERROR_FORMATTED(NotImplementedError,
-                    "Outputting " << torch::toString(mOutputDtype) << " directly is not currently supported");
-                // mKernelRunner = std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
-                break;
-            case c10::ScalarType::Half:
-                mKernelRunner = std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, half, half>>();
-                break;
-#ifdef ENABLE_BF16
-            case c10::ScalarType::BFloat16:
-                mKernelRunner
-                    = std::make_unique<kernels::CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
-                break;
-#endif
-            default:
-                C10_THROW_ERROR_FORMATTED(Error,
-                    "Invalid output type " << torch::toString(mOutputDtype) << " specified for "
-                                           << torch::toString(mActivationDtype));
-            }
-        };
-
 #ifdef ENABLE_FP8
         if (isFp8Quant())
         {
-            switch_output_type(__nv_fp8_e4m3{});
+            mKernelRunner = switch_output_type<__nv_fp8_e4m3>(mOutputDtype);
         }
 #endif
 #ifdef ENABLE_FP4
         if (isNvfp4Quant())
         {
             mInnerDimMultiplier = 16;
-            switch_output_type(__nv_fp4_e2m1{});
+            switch (mActivationDtype)
+            {
+            case c10::ScalarType::Half:
+#ifdef ENABLE_BF16
+            case c10::ScalarType::BFloat16:
+#endif
+                mKernelRunner = switch_output_type<__nv_fp4_e2m1, true>(mOutputDtype);
+                break;
+            default: mKernelRunner = switch_output_type<__nv_fp4_e2m1, false>(mOutputDtype);
+            }
         }
 #endif
         if (!mKernelRunner)
@@ -315,8 +333,8 @@ public:
     torch::Tensor runMoe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
         torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
+        int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -374,6 +392,7 @@ public:
         kernels::LoraParams lora_params{};
 
         mKernelRunner->runMoe(input.const_data_ptr(),
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -662,21 +681,21 @@ private:
 
     bool isNvfp4Quant() const
     {
-        return mActivationDtype == c10::ScalarType::Long && mWeightDtype == c10::ScalarType::Long;
+        return mWeightDtype == c10::ScalarType::Long;
     }
 };
 
 torch::Tensor fused_moe(torch::Tensor const& input, torch::Tensor const& token_selected_experts,
     torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
     torch::Tensor const& fc2_expert_weights, c10::ScalarType const& output_dtype,
-    torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, int64_t const tp_size, int64_t const tp_rank,
-    int64_t const ep_size, int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids,
-    bool use_fp8_block_scaling)
+    torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
+    int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+    torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool use_fp8_block_scaling)
 {
     return FusedMoeRunner::getInstance(
         input.scalar_type(), fc1_expert_weights.scalar_type(), output_dtype, use_fp8_block_scaling)
         ->runMoe(input, token_selected_experts, token_final_scales, fc1_expert_weights, fc2_expert_weights,
-            quant_scales, tp_size, tp_rank, ep_size, ep_rank, profile_ids);
+            quant_scales, input_sf, tp_size, tp_rank, ep_size, ep_rank, profile_ids);
 }
 
 } // namespace torch_ext
@@ -696,6 +715,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? token_final_scales, Tensor fc1_expert_weights, Tensor fc2_expert_weights, "
         "ScalarType output_dtype, "
         "Tensor[]? quant_scales=None, "
+        "Tensor? input_sf=None, "
         "int tp_size=1, int tp_rank=0, int ep_size=1, int ep_rank=0, int[]? profile_ids=None, "
         "bool use_fp8_block_scaling=False) -> Tensor");
 }

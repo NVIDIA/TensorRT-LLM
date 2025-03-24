@@ -124,10 +124,6 @@ public:
     //! @returns [batchSize, beamWidth], tokens generated in `iter` (per beam), on gpu
     [[nodiscard]] virtual TensorPtr getNewTokens(SizeType32 iter = 0) const = 0;
 
-    //! @brief Get maxTokensPerStep tokens generated in the last forward pass
-    //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
-    [[nodiscard]] virtual TensorPtr getAllNewTokens() const = 0;
-
     //! @returns [1], number of finished sequences, in pinned host memory
     [[nodiscard]] virtual TensorPtr getNbFinished() const = 0;
 

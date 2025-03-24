@@ -20,11 +20,13 @@ class DisaggregatedParams:
     first_gen_tokens: Optional[List[int]] = None
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
+    draft_tokens: Optional[List[int]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
 
         return tllme.ContextPhaseParams(self.first_gen_tokens,
-                                        self.ctx_request_id, self.opaque_state)
+                                        self.ctx_request_id, self.opaque_state,
+                                        self.draft_tokens)
 
     def get_request_type(self) -> tllme.RequestType:
         if self.request_type == "context_only":

@@ -1,6 +1,6 @@
 import json
-import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
 import transformers
@@ -21,10 +21,15 @@ class ModelConfig(Generic[TConfig]):
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     skip_create_weights: bool = False
+    is_generation: bool = True
 
     attn_backend: str = 'TRTLLM'
 
-    is_generation: bool = True
+    def __post_init__(self):
+        if self.pretrained_config and hasattr(self.pretrained_config,
+                                              "architectures"):
+            self.is_generation = self.is_generation_model(
+                self.pretrained_config.architectures)
 
     @property
     def fuse_pos_embd(self):
@@ -51,7 +56,8 @@ class ModelConfig(Generic[TConfig]):
             )
             return True
         return model_architectures[0] not in [
-            "Qwen2ForProcessRewardModel", "BertForSequenceClassification"
+            "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
+            "Qwen2ForRewardModel"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -66,11 +72,16 @@ class ModelConfig(Generic[TConfig]):
             trust_remote_code=trust_remote_code,
         )
 
+        # Find the cache path by looking for the config.json file which should be in all
+        # huggingface models
+        model_dir = Path(
+            transformers.file_utils.get_file_from_repo(checkpoint_dir,
+                                                       'config.json')).parent
         quant_config = QuantConfig()
-        quant_config_file = os.path.join(checkpoint_dir, 'hf_quant_config.json')
-
-        # quantized ckpt in ModelOpt format
-        if os.path.exists(quant_config_file):
+        layer_quant_config = None
+        # quantized ckpt in modelopt format
+        quant_config_file = model_dir / 'hf_quant_config.json'
+        if quant_config_file.exists():
             with open(quant_config_file) as f:
                 quant_config_dict = json.load(f)
 
@@ -87,6 +98,17 @@ class ModelConfig(Generic[TConfig]):
             quant_config.group_size = _load_json_quant_config('group_size')
             quant_config.exclude_modules = _load_json_quant_config(
                 'exclude_modules')
+
+            if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+                mixed_quant_config_file = model_dir / 'quant_cfg.json'
+                with open(mixed_quant_config_file) as fm:
+                    mixed_quant_config = json.load(fm)
+                    mixed_quant_config = mixed_quant_config['quantized_layers']
+                    for k in mixed_quant_config:
+                        config = QuantConfig()
+                        config.quant_algo = mixed_quant_config[k]['quant_algo']
+                        mixed_quant_config[k] = config
+                layer_quant_config = mixed_quant_config
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
@@ -97,9 +119,7 @@ class ModelConfig(Generic[TConfig]):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.exclude_modules = ["*eh_proj"]
 
-        is_generation = cls.is_generation_model(pretrained_config.architectures)
-
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
-                   is_generation=is_generation,
+                   quant_config_dict=layer_quant_config,
                    **kwargs)

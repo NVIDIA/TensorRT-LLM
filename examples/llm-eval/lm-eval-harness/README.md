@@ -16,7 +16,7 @@ Run the evaluation script with the following command:
 
 ```sh
 python lm_eval_tensorrt_llm.py --model trt-llm \
-    --model_args tokenizer=<HF model folder>,engine_dir=<TRT LLM engine dir>,chunk_size=<int> \
+    --model_args tokenizer=<HF model folder>,model=<TRT LLM engine dir>,chunk_size=<int> \
     --tasks <comma separated tasks, e.g., gsm8k-cot, mmlu>
 ```
 
@@ -32,7 +32,10 @@ In the LM-Eval-Harness, model args are submitted as a comma-separated list of th
 | free_gpu_memory_fraction | KV cache free GPU memory fraction                                 | 0.9            |
 | trust_remote_code        | trust remote code; use if necessary to set up the tokenizer       | False          |
 | tp                       | tensor parallel size (for torch backend)                          | no. of workers |
-| use_cuda_graph           |                                                                   | True           |
+| use_cuda_graph           | enable CUDA graph                                                 | True           |
+| max_context_length       | maximum context length for evaluation                             | None           |
+| moe_expert_parallel_size | expert parallel size for MoE models                               | None           |
+| moe_backend              | backend for MoE models (e.g., "TRTLLM")                           | "TRTLLM"       |
 
 ### Torch backend
 
@@ -41,8 +44,8 @@ Install the `lm_eval` package in the `requirements.txt` file in this folder.
 Run the evaluation script with the same command as above, but include `backend=torch` in the `model_args`. For example:
 
 ```sh
-python lm_eval_tensorrt_llm.py --model torch-llm \
-    --model_args model_dir=<HF model folder>,backend=torch,chunk_size=<int> \
+python lm_eval_tensorrt_llm.py --model trt-llm \
+    --model_args model=<HF model folder>,backend=torch,chunk_size=<int> \
     --tasks <comma separated tasks, e.g., gsm8k-cot, mmlu>
 ```
 

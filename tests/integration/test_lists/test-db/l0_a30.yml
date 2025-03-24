@@ -1,0 +1,112 @@
+version: 0.0.1
+l0_a30:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
+  - unittest/_torch -k "modeling_llama"
+  - unittest/_torch/modeling -k "modeling_mixtral"
+  - unittest/_torch/modeling -k "modeling_mllama"
+  - unittest/_torch/modeling -k "modeling_nvsmall"
+  - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modeling -k "modeling_qwen"
+  - unittest/_torch/modeling -k "modeling_vila"
+  - unittest/_torch/modeling -k "modeling_nemotron"
+  - unittest/_torch/auto_deploy/unit/singlegpu
+  # ------------- CPP tests ---------------
+  - test_cpp.py::test_unit_tests[80]
+  - test_cpp.py::test_model[gpt-80]
+  - test_cpp.py::test_benchmarks[gpt-80]
+  # ------------- TRT tests ---------------
+  - unittest/model/test_nemotron_nas.py -k "not fp8"
+  - unittest/model/test_gpt.py -k "partition0" # 10 mins
+  - unittest/model/test_gpt.py -k "partition1" # 10 mins
+  - unittest/model/test_gpt.py -k "partition2" # 10 mins
+  - unittest/model/test_gpt.py -k "partition3" # 10 mins
+  - unittest/model/test_gpt.py -k "other" # 1 mins
+  - examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]
+  - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
+  - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+  - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-vision-trtllm-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity # 4 mins
+  - accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_weight_streaming[0.1]
+  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-mini-4k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
+  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-mini-128k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
+  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3.5-mini-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
+  - examples/test_multimodal.py::test_llm_multimodal_general[deplot-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] # 5 mins
+  - examples/test_llama.py::test_llm_llama_1gpu_batched_beam_search[llama-7b] # 2 mins
+  - examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2-9b-it-other-bfloat16-8]
+  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] # 6 mins
+  - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1] # 4 mins
+  - examples/test_medusa.py::test_llm_medusa_fp8_modelOpt_ckpt_1gpu[use_cpp_session-llama3.1-medusa-8b-hf_v0.1-bs1] # 5 mins
+  - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
+  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_0.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]
+  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]
+  - examples/test_internlm.py::test_llm_internlm2_7b_1node_1gpu[bfloat16-enable_context_fmha-enable_gemm_plugin-enable_attention_plugin-nb:2] # 5 mins
+  - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
+  - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min
+  - examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2] # 1 min
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+  tests:
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-flax-no_paged_cache-disable_quant-float16-enable_attn_plugin-disable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-fp8-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int8_sq-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int4_awq-float16-enable_attn_plugin-enable_gemm_plugin]
+  - examples/test_gpt.py::test_llm_gpt2_medium_1gpu[non_streaming-use_cpp_session-enable_gemm_plugin] # 5 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_1gpu[streaming-use_cpp_session-enable_gemm_plugin] # 5 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_stop_words_1gpu[streaming-use_cpp_session] # 1 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_stop_words_1gpu[non_streaming-use_cpp_session] # 1 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_stop_words_1gpu[non_streaming-use_py_session] # 1 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_bad_words_1gpu[streaming-use_cpp_session] # 1 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_bad_words_1gpu[non_streaming-use_cpp_session] # 1 mins
+  - examples/test_gpt.py::test_llm_gpt2_medium_bad_words_1gpu[non_streaming-use_py_session] # 1 mins
+  - examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weight_only]
+  - examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[enable_weight_only]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
+  - accuracy/test_accuracy.py::TestLlama7B::test_manage_weights # 2 mins
+  - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
+  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] # 5 mins
+  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
+  - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
+  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
+  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:1] # ? mins
+  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:4] # ? mins
+  - examples/test_exaone.py::test_llm_exaone_2gpu[exaone-float16-nb:1] # ? mins
+  - examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] # 5 mins
+  - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
+  - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min
+  - examples/test_prompt_lookup.py::test_llm_prompt_lookup_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-prompt_lookup_num_tokens_8-float16-bs2] # 1 min

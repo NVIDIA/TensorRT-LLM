@@ -56,6 +56,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | Qwen2.5-7B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2.5-32B(-Instruct)|     Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2.5-72B(-Instruct)|     Y   |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| QwQ-32B            |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
 Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 

@@ -1,16 +1,63 @@
 #!/bin/bash
-set -e
+set -ex
 
 task_with_command="${@:1}"
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
-# Works with Slurm launching with `--mpi=pmix`
-mpi_rank=${PMIX_RANK:-$native_mpi_rank}
-echo "mpi_rank: $mpi_rank" >> /dev/stderr
+mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+
+log_stderr() { echo "$@" >&2; }
+log_stderr "mpi_rank: $mpi_rank"
+
+pid=$(ps -o pid= -p $$ | tr -d ' ')
+
+# Tell TRTLLM to spawn a additional process for the Proxy
+export TLLM_SPAWN_PROXY_PROCESS=1
+export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="ipc:///tmp/trtllm-ipc-${pid}"
+
+function mpi_size {
+    if [ -n "$SLURM_JOB_NUM_NODES" ]; then
+        echo "$SLURM_JOB_NUM_NODES"
+    elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
+        echo "$OMPI_COMM_WORLD_SIZE"
+    else
+        echo "1"
+    fi
+}
+
+export tllm_mpi_size=$(mpi_size)
+log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
-    echo "${mpi_rank} run ${task_with_command} ..." >> /dev/stderr
-    $task_with_command
+    log_stderr "rank${mpi_rank} run ${task_with_command} in background"
+
+    # MPI doesn't allow spawn a process sharing the MPI environment in a MPI
+    # process, or duplicate MPI_Init in the child process will cause undefined
+    # behavior. Thus we need to clean the MPI environment in the parent process
+    # before spawning the child process, and restore the MPI environment later
+    # before running MPI operations in the parent process.
+    mpi_blacklist=(
+        OMPI_ PMIX_ PMI_ SLURM_ MPI_ UCX_
+        I_MPI_ HYDRA_ KMP_ MPICH_ MV2_ CRAY_
+    )
+
+    (
+        # Remove MPI-related variables only in the subshell context
+        for var in $(compgen -e); do
+            for prefix in "${mpi_blacklist[@]}"; do
+                if [[ "$var" == "$prefix"* ]]; then
+                    unset "$var"
+                    break
+                fi
+            done
+        done
+
+        # Execute the task with cleaned environment
+        $task_with_command
+    ) &
+
+    log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_size) ..."
+    python3 -m tensorrt_llm.llmapi.mgmn_leader_node
 else
-    echo "${mpi_rank} launch worker ..." >> /dev/stderr
+    log_stderr "rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_size) ..."
     python3 -m tensorrt_llm.llmapi.mgmn_worker_node
 fi

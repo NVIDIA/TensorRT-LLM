@@ -167,7 +167,16 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     auto contextState = std::make_unique<executor::DataTransceiverState>();
     contextState->setCommState(*mCommState);
     contextState->setCacheState(*mCacheState);
-    llmRequest->setContextPhaseParams(executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release()});
+    if (!llmRequest->hasDraftTokens())
+    {
+        llmRequest->setContextPhaseParams(
+            executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt});
+    }
+    else
+    {
+        llmRequest->setContextPhaseParams(executor::ContextPhaseParams{
+            {}, llmRequest->mRequestId, contextState.release(), *llmRequest->getDraftTokens()});
+    }
 }
 
 void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)

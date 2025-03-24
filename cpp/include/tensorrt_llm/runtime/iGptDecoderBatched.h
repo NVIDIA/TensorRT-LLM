@@ -23,8 +23,6 @@
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
-#include "tensorrt_llm/runtime/request.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
 #include <memory>
 #include <utility>
@@ -103,7 +101,7 @@ public:
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
-class IGptDecoderBatched : public virtual IStatefulGptDecoder
+class IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
@@ -112,14 +110,12 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
     using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
-    //! @brief Setup buffers for ExplicitDraftTokens decoding.
-    virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
-
-    //! @brief Setup buffers for Eagle decoding.
-    virtual void setupEagle(EagleBuffers::Inputs eagleBuffers) = 0;
-
-    //! @brief Setup buffers for Lookahead decoding.
-    virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
+    //! @brief Setup the decoder before calling `forward()`
+    virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig)
+        = 0;
 
     //! @brief Disable Lookahead decoding.
     virtual void disableLookahead(
@@ -132,92 +128,15 @@ public:
     //! @brief Run one step for all requests and wait for completion on the host.
     virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
-    //! @param batchIdx index of the batch
-    //! @returns [maxBeamWidth, maxInputLength + maxNewTokens], contains input token ids and generated token
-    //! ids without padding for request `batchIdx`, on gpu
-    [[nodiscard]] virtual TensorPtr getIds(SizeType32 batchIdx) const = 0;
-
-    //! @returns [batchSize, maxBeamWidth, maxInputLength + maxNewTokens], only used for beam search in
-    //! GptDecoderBatched It contains gathered token ids without padding, on gpu
-    [[nodiscard]] virtual TensorPtr getGatheredIds(SizeType32 batchIdx) const = 0;
-
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
     [[nodiscard]] virtual CudaEvent finalize(
         SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const
         = 0;
 
-    //! @returns [batchSize], number of finished sequences per request, on gpu
-    [[nodiscard]] virtual TensorPtr getFinishedSum() const = 0;
-
-    //! @returns [batchSize, beamWidth], FinishedState value, on gpu
-    [[nodiscard]] virtual TensorPtr getFinishReasons() const = 0;
-
-    //! @returns [batchSize, beamWidth], cumulative log probabilities (per beam), on gpu
-    [[nodiscard]] virtual TensorPtr getCumLogProbs() const override = 0;
-
-    //! @returns [beamWidth], cumulative log probabilities (per beam) for request batchIdx, on gpu
-    [[nodiscard]] virtual TensorPtr getCumLogProbs(SizeType32 batchIdx) const = 0;
-
-    //! @returns [batchSize, beamWidth, maxSeqLen], log probabilities (per beam), on gpu
-    [[nodiscard]] virtual TensorPtr getLogProbs() const override = 0;
-
-    //! @returns [beamWidth, maxSeqLen], cumulative log probabilities (per beam) for request batchIdx, on gpu
-    [[nodiscard]] virtual TensorPtr getLogProbs(SizeType32 batchIdx) const = 0;
-
-    [[nodiscard]] virtual TensorPtr getParentIds() const = 0;
-
-    [[nodiscard]] virtual executor::DecodingMode getDecodingMode() const = 0;
-
-    //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
-    virtual TensorPtr getNextDraftTokens() const = 0;
-
-    //! @returns [batchSize], predicted draft tokens lengths for previous step, on gpu
-    virtual TensorPtr getPrevDraftTokensLengths() const = 0;
-
-    //! @returns [batchSize], predicted draft tokens lengths for next step, on gpu
-    virtual TensorPtr getNextDraftTokensLengths() const = 0;
-
-    //! @returns [batchSize + 1], exclusive sum of accepted draft token lengths, on gpu
-    virtual TensorPtr getAcceptedLengthsCumSum() const = 0;
-
-    //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
-    virtual TensorPtr getAcceptedPackedPaths() const = 0;
-
 protected:
     IGptDecoderBatched() = default;
-
-private:
-    // these methods from base type are overwritten and should not be called
-    void forward(decoder::Output& output, decoder::Input const& input) override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
-
-    TensorPtr getGatheredIds() const override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
-
-    TensorPtr getIds() const override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
-
-    void forwardSync() override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
-
-    void forwardAsync(decoder::Output& output, decoder::Input const& input) override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
-
-    void finalize(SamplingConfig const& samplingConfig) const override
-    {
-        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
-    }
+    virtual ~IGptDecoderBatched() = default;
 };
 
 } // namespace tensorrt_llm::runtime

@@ -4,6 +4,7 @@ einops
 graphviz
 mypy
 mako
+oyaml
 parameterized
 pre-commit
 pybind11
@@ -27,5 +28,5 @@ jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
 ruff==0.9.4
-lm_eval[api]==0.4.5
+lm_eval[api]==0.4.8
 docstring_parser

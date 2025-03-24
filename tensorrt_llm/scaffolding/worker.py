@@ -153,12 +153,14 @@ class ProposerWorker(Worker):
     async def run_task(self, task: Task) -> TaskStatus:
         assert isinstance(
             task, GenerationTask
-        ), 'Only GenerationTask(role="generation") should be dispatched to ProposerWorker'
-        assert task.type == 'generate', 'ProposerWorker only supports generation tasks with type "generate"'
+        ), 'Only GenerationTas should be dispatched to ProposerWorker'
+
         generation_request = self._create_generation_request_from_task(task)
         result = self.executor.submit(generation_request)
         await result.aresult()
         task.output_tokens = result.outputs[0].token_ids
+        task.cumulative_logprob = result.outputs[0].cumulative_logprob
+        task.logprobs = result.outputs[0].logprobs
         task.output_str = None
         if not task.skip_detokenizer:
             task.output_str = self.tokenizer.decode(task.output_tokens)

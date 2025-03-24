@@ -2,7 +2,8 @@ import argparse
 import json
 
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.scaffolding.controller import BestOfNController
+from tensorrt_llm.scaffolding.controller import (MajorityVoteController,
+                                                 NativeGenerationController)
 from tensorrt_llm.scaffolding.math_utils import *
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.worker import ProposerWorker, SamplingParams
@@ -19,6 +20,7 @@ def parse_arguments():
     # https://github.com/QwenLM/Qwen2.5-Math/blob/main/evaluation/data/aime24/test.jsonl
     parser.add_argument('--jsonl_file', type=str, default='./test.jsonl')
     parser.add_argument('--threshold', type=float, default=None)
+    parser.add_argument('--sample_num', type=int, default=10)
     args = parser.parse_args()
     return args
 
@@ -34,6 +36,7 @@ def load_test_file(jsonl_file: str):
 
 def main():
     args = parse_arguments()
+    workers = {}
 
     proposer_worker = ProposerWorker(
         args.generation_dir,
@@ -44,29 +47,37 @@ def main():
         sampling_params=SamplingParams(max_tokens=2048),
     )
 
-    llm = ScaffoldingLlm(
-        BestOfNController,
-        {"custom_sampling_params": {
+    prototype_generation_controller = NativeGenerationController(
+        custom_sampling_params={
             "max_tokens": 4096,
             "top_p": 0.9,
-        }},
-        {'generation': proposer_worker},
+        })
+    workers[NativeGenerationController.WorkerTag.GENERATION] = proposer_worker
+
+    prototype_majority_vote_controller = MajorityVoteController(
+        generation_controller=prototype_generation_controller,
+        default_sample_num=args.sample_num,
+    )
+
+    llm = ScaffoldingLlm(
+        prototype_majority_vote_controller,
+        workers=workers,
     )
     test_dataset = load_test_file(args.jsonl_file)
     total_count = 0
     correct_count = 0
-    controller_name = "BestOfNController"
+    controller_name = "MajorityVoteController"
 
-    results = []
+    prompts = []
     for i in range(len(test_dataset)):
         test_case = test_dataset[i]
-        prompt = test_case["problem"]
-        result = llm.generate_async(prompt)
-        results.append(result)
+        prompts.append(test_case["problem"])
+
+    results = llm.generate(prompts)
+
     for i in range(len(results)):
         result = results[i]
         test_case = test_dataset[i]
-        prompt = test_case["problem"]
         ref_answer = int(test_case["answer"])
         result.result()
         output = result.output

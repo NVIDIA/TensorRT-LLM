@@ -52,9 +52,10 @@ class DummyDecoder(Decoder):
                 request.state = LlmRequestState.GENERATION_COMPLETE
 
 
-class BertDecoder(Decoder):
+class EarlyStopDecoder(Decoder):
     """
-    Use Decoder class for Bert model request so it will early stop
+    Use for skipping decoding step for non generation model,
+    such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
     def setup_decoder(self, scheduled_requests: ScheduledRequests,
@@ -189,9 +190,10 @@ class TorchDecoder(Decoder):
                                                   >= self.max_seq_len)
 
     def _meet_stop_token_criteria(self, request: LlmRequest):
-        assert isinstance(request.py_stop_words_list,
-                          list), "request.py_stop_words_list should be a list"
         if request.py_stop_words_list:
+            assert isinstance(
+                request.py_stop_words_list,
+                list), "request.py_stop_words_list should be a list"
             stop_words_list, prefix_sum = request.py_stop_words_list
             tokens = request.get_tokens(0)
             offset = 0
@@ -232,7 +234,8 @@ class TorchDecoder(Decoder):
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
-        decoder_event.synchronize()
+        if decoder_event:
+            decoder_event.synchronize()
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
 
         idx = 0
@@ -352,7 +355,8 @@ class TorchStarAttentionDecoder(TorchDecoder):
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
-        decoder_event.synchronize()
+        if decoder_event:
+            decoder_event.synchronize()
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
 
         beam_idx = 0

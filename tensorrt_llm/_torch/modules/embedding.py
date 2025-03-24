@@ -59,6 +59,13 @@ class LMHead(Linear):
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
         self.register_parameter("bias", None)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        if self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+            return self.out_features * self.tp_size
+        else:
+            return self.out_features
+
     def forward(
             self,
             input: torch.Tensor,

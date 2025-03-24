@@ -126,6 +126,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // Are the input sequences padded ?
     mKernelParams.is_s_padded = mFixedParams.isSPadded;
 
+    mKernelParams.softmax_stats_ptr = runnerParams.softmaxStatsPtr;
+    mKernelParams.softmax_stats_stride_in_bytes = sizeof(float) * mFixedParams.numQHeads;
+
     // Packed QKV input layout.
     mKernelParams.qkv_stride_in_bytes = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
             + mFixedParams.numKvHeads * mFixedParams.headSize + mFixedParams.numKvHeads * mFixedParams.headSizeV,
@@ -401,6 +404,21 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.sage_block_size_q = mFixedParams.sageBlockSizeQ;
     mLaunchParams.sage_block_size_k = mFixedParams.sageBlockSizeK;
     mLaunchParams.sage_block_size_v = mFixedParams.sageBlockSizeV;
+    // for not (sm90 + warp_specialization + flash attention kernel) kernel:
+    //   all kernels enable saving softmaxStatsPtr, just let softmaxStatsPtr != null
+    // for (sm90 + warp_specialization + flash attention) kernel:
+    //   we need to explicitly set supportReturnSoftmaxStats to true when
+    //  satisfying the following constrains
+    if (!isSm90)
+    {
+        mLaunchParams.supportReturnSoftmaxStats = true;
+    }
+    else
+    {
+        mLaunchParams.supportReturnSoftmaxStats = (runnerParams.softmaxStatsPtr != nullptr
+            && mLaunchParams.flash_attention && mLaunchParams.warp_specialization
+            && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -70,7 +70,7 @@ def _init(log_level: object = None) -> None:
         ft_decoder_lib = project_dir + '/libs/libth_common.so'
     try:
         torch.classes.load_library(ft_decoder_lib)
-        from ._torch.custom_op import _register_fake
+        from ._torch.custom_ops import _register_fake
         _register_fake()
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'

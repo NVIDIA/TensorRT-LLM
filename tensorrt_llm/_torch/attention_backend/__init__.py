@@ -1,4 +1,4 @@
-from ..custom_op import IS_FLASHINFER_AVAIABLE
+from ..custom_ops import IS_FLASHINFER_AVAIABLE
 from .interface import AttentionBackend, AttentionMetadata
 from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
 from .vanilla import VanillaAttention, VanillaAttentionMetadata

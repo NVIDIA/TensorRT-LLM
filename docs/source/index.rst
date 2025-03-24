@@ -27,8 +27,6 @@ Welcome to TensorRT-LLM's Documentation!
 
    installation/linux.md
    installation/build-from-source-linux.md
-   installation/windows.md
-   installation/build-from-source-windows.md
    installation/grace-hopper.md
 
 
@@ -78,8 +76,8 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Command-Line Reference
    :hidden:
 
-   commands/trtllm-build.rst
-   commands/trtllm-serve.rst
+   commands/trtllm-build
+   commands/trtllm-serve
 
 
 .. toctree::

@@ -2,15 +2,13 @@
 
 This document explains how to build and run the C++ tests, and the included [resources](resources).
 
-Windows users: Be sure to set DLL paths as specified in [Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
-
 ## All-in-one script
 
-The Pytest script [test_cpp.py](../../tests/llm-test-defs/turtle/defs/test_cpp.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the C++ tests all in one go.
+The Pytest script [test_cpp.py](../../tests/integration/defs/test_cpp.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the C++ tests all in one go.
 To get an overview of the tests and their parameterization, call:
 
 ```bash
-pytest tests/llm-test-defs/turtle/defs/test_cpp.py --collect-only
+pytest tests/integration/defs/test_cpp.py --collect-only
 ```
 
 All tests take the number of the CUDA architecture of the GPU you wish to use as a parameter e.g. 90 for Hopper.
@@ -21,13 +19,13 @@ Example calls could look like this:
 ```bash
 export LLM_MODELS_ROOT="/path/to/model_cache"
 
-pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_unit_tests[90]
+pytest tests/integration/defs/test_cpp.py::test_unit_tests[90]
 
-pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_model[llama-90]
+pytest tests/integration/defs/test_cpp.py::test_model[llama-90]
 
-pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_benchmarks[gpt-90]
+pytest tests/integration/defs/test_cpp.py::test_benchmarks[gpt-90]
 
-pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_multi_gpu[90]
+pytest tests/integration/defs/test_cpp.py::test_multi_gpu[90]
 ```
 
 ## Manual steps

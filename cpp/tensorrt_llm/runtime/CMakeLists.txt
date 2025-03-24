@@ -32,6 +32,7 @@ set(SRCS
     loraModule.cpp
     loraCache.cpp
     decodingOutput.cpp
+    decoderState.cpp
     generationConfig.cpp
     gptDecoder.cpp
     gptDecoderBatched.cpp
@@ -49,6 +50,7 @@ set(SRCS
     runtimeKernels.cu
     rnnStateBuffers.cpp
     statefulGptDecoder.cpp
+    statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
     tllmLogger.cpp

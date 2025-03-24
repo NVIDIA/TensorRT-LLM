@@ -1,7 +1,6 @@
 import copy
 import re
 from dataclasses import dataclass, field
-from importlib.metadata import version
 from typing import Dict, Tuple, Union
 
 import pynvml
@@ -467,10 +466,7 @@ def infer_cluster_info() -> ClusterInfo:
             pynvml.NVML_CLOCK_MEM,
         )
         logger.info(f"Memory clock: {mem_clock} MHz")
-        if version("pynvml") < '11.5.0':
-            mem_bus_width = properties.memoryBusWidth
-        else:
-            mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
         logger.info(f"Memory bus width: {mem_bus_width}")
         memory_bw = mem_bus_width * mem_clock * 2 // int(8e3)
         logger.info(f"Memory bandwidth: {memory_bw} GB/s")
@@ -492,11 +488,7 @@ def infer_cluster_info() -> ClusterInfo:
             if nvl_version >= 4:
                 intra_node_sharp = True
         else:
-            if version("pynvml") < '11.5.0':
-                pcie_gen = pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle)
-                pcie_speed = (2**pcie_gen) * 1000
-            else:
-                pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
+            pcie_speed = pynvml.nvmlDeviceGetPcieSpeed(handle)
             logger.info(f"PCIe speed: {pcie_speed} Mbps")
             pcie_link_width = pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle)
             logger.info(f"PCIe link width: {pcie_link_width}")

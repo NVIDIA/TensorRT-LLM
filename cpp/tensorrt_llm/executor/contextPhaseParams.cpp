@@ -27,23 +27,28 @@ namespace su = tensorrt_llm::executor::serialize_utils;
 namespace tensorrt_llm::executor
 {
 
-ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state)
+ContextPhaseParams::ContextPhaseParams(
+    VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mState{StatePtr{state, deleter}}
-{
-}
-
-ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId)
-    : mReqId{reqId}
-    , mFirstGenTokens{std::move(firstGenTokens)}
+    , mDraftTokens{std::move(draftTokens)}
 {
 }
 
 ContextPhaseParams::ContextPhaseParams(
-    VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState)
+    VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
+    , mDraftTokens{std::move(draftTokens)}
+{
+}
+
+ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
+    std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens)
+    : mReqId{reqId}
+    , mFirstGenTokens{std::move(firstGenTokens)}
+    , mDraftTokens{std::move(draftTokens)}
 {
 
     su::VectorWrapBuf<char> strbuf(const_cast<std::vector<char>&>(serializedState));
@@ -60,6 +65,7 @@ ContextPhaseParams::ContextPhaseParams(ContextPhaseParams const& other)
     // type, a `unique_ptr` with a custom destructor member is used here.
     mReqId = other.mReqId;
     mFirstGenTokens = other.mFirstGenTokens;
+    mDraftTokens = other.mDraftTokens;
     if (other.mState)
     {
         auto* otherState = static_cast<DataTransceiverState*>(other.mState.get());
@@ -82,6 +88,11 @@ ContextPhaseParams::~ContextPhaseParams() = default;
 VecTokens const& ContextPhaseParams::getFirstGenTokens() const& noexcept
 {
     return mFirstGenTokens;
+}
+
+std::optional<VecTokens> const& ContextPhaseParams::getDraftTokens() const& noexcept
+{
+    return mDraftTokens;
 }
 
 VecTokens ContextPhaseParams::popFirstGenTokens() && noexcept
@@ -122,7 +133,7 @@ void ContextPhaseParams::deleter(void const* data)
 
 bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexcept
 {
-    if (mFirstGenTokens != other.mFirstGenTokens || mReqId != other.mReqId
+    if (mFirstGenTokens != other.mFirstGenTokens || mReqId != other.mReqId || mDraftTokens != other.mDraftTokens
         || static_cast<bool>(mState) != static_cast<bool>(other.mState))
     {
         return false;

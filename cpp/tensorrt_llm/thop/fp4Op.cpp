@@ -108,20 +108,20 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn)
 {
     constexpr int kColumnGroup0Size = 4;
     constexpr int kRowGroup0Size = 32;
-    constexpr int kRowGroup1Size = 128;
+    constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
     // int paddedRow = PadUpFn(totalRow, 128);
     int paddedColumn = PadUpFn(totalColumn, 4);
 
     int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
     int columnGroupIdx = colIdx / kColumnGroup0Size;
-    int columnGroupStride = 512;
+    constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
 
     int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
-    int rowGroup0Stride = 16;
     int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
-    int rowGroup1Stride = 4;
     int rowGroupIdx = rowIdx / kRowGroup1Size;
+    constexpr int rowGroup1Stride = kColumnGroup0Size;
+    constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
     int rowGroupStride = kRowGroup1Size * paddedColumn;
 
     return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride

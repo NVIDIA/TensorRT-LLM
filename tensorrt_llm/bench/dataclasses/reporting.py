@@ -54,20 +54,6 @@ class StatsKeeper:
         record.num_input_tokens = num_tokens
         record.start_timestamp = timestamp
 
-    def register_response(self, request_id: int, timestamp: int, final: bool,
-                          error: bool, decode_iter: int, tokens: List[int],
-                          time_on_first_token: int) -> None:
-        """
-        Register a response from a new request.
-
-        DEPRECATED after switching to LLM API.
-        """
-        record = self.requests[request_id]
-        record.register_event(error, final, timestamp, decode_iter, tokens,
-                              time_on_first_token)
-        if final:
-            self.num_complete = self.num_complete + 1
-
     def register_request_perf_item(self, request_perf_item: PerfItemTuple):
         """
         Register request perf items, used exclusively with LLM API.
@@ -98,6 +84,8 @@ class StatsKeeper:
         request_latencies = []
         generation_latencies = []
         generation_throughputs = []
+        output_throughput_per_user = []
+
         intertoken_avg_latencies = []
         output_tokens = []
         request_acceptance = []
@@ -119,6 +107,7 @@ class StatsKeeper:
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
             request_acceptance.append(request_ar)
+            output_throughput_per_user.append(entry.output_token_throughput)
             total_decoding_iterations += entry.decode_iteration + 1
 
             output_tokens.append(entry.num_total_output_tokens)
@@ -139,6 +128,8 @@ class StatsKeeper:
                 request_latencies),
             tpot_percentiles=PercentileStats.from_iterable(
                 intertoken_avg_latencies),
+            output_throughput_percentiles=PercentileStats.from_iterable(
+                output_throughput_per_user),
             ttft_percentiles=PercentileStats.from_iterable(ttft_times),
             generation_tp_percentiles=PercentileStats.from_iterable(
                 generation_throughputs),
@@ -194,19 +185,26 @@ class ReportUtility:
         return rate * 1.0e9
 
     @property
-    def total_latency_s(self) -> float:
-        """Total latency in seconds."""
-        return self.convert_to_s(self.statistics.total_latency_ns)
-
-    @property
     def request_throughput_req_s(self) -> float:
         """Request throughput in requests per second."""
-        return self.statistics.num_requests / self.total_latency_s
+        return self.convert_rate_to_s(self.statistics.request_throughput_ns)
 
     @property
     def output_throughput_tok_s(self) -> float:
         """Output throughput in tokens per second."""
-        return self.statistics.total_output_tokens / self.total_latency_s
+        return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
+
+    @property
+    def per_user_generation_token_throughput_s(self) -> float:
+        """Output throughput per user in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.per_user_generation_token_throughput_ns)
+
+    @property
+    def per_user_output_throughput_tok_s(self) -> float:
+        """Output throughput per user in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.output_throughput_tok_ns_per_user)
 
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
@@ -315,10 +313,9 @@ class ReportUtility:
             # Output throughput (total output (OSL) tokens / end-to-end latency)
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
-            # Output throughput per user (average per request total tokens / avg request latency)
+            # Output throughput per user (average per request output throughput)
             "output_throughput_per_user_tok_s":
-            self.statistics.token_percentiles.average / self.convert_to_s(
-                self.statistics.request_latency_percentiles.average),
+            self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
             "output_throughput_per_gpu_tok_s":
             self.output_throughput_tok_s / self.rt_cfg.world_config.world_size,
@@ -337,15 +334,16 @@ class ReportUtility:
                 # Token output speed (1 / time-per-output-token)
                 # NOTE: Excludes TTFT by nature of using TPOT.
                 "token_output_speed_tok_s":
-                self.convert_rate_to_s(
-                    1.0 / self.statistics.tpot_percentiles.average),
+                self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
                 "avg_ttft_ms":
-                self.convert_to_ms(self.statistics.ttft_percentiles.average),
-                # Average per request time-per-output-token (TPOT)
+                self.convert_to_ms(
+                    self.statistics.per_user_time_to_first_token_ns),
+                # Average per request token time-per-output-token (TPOT)
                 "avg_tpot_ms":
-                self.convert_to_ms(self.statistics.tpot_percentiles.average),
-                # Per request Time-per-output-token percentiles (TPOT)
+                self.convert_to_ms(
+                    self.statistics.per_user_time_per_output_token_ns),
+                # Average per request Time-per-output-token percentiles (TPOT)
                 "tpot_percentiles":
                 self.statistics.tpot_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json') | {
@@ -490,9 +488,9 @@ class ReportUtility:
                 f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
                 f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
                 f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
-                "\n-- Time-per-Output-Token [TPOT] Breakdown (ms) ----------\n\n"
+                "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
-                "\n-- Time-to-First-Token [TTFT] Breakdown (ms) ------------\n\n"
+                "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
                 f"{ttft_stats}\n")
 
         perf_stats += (

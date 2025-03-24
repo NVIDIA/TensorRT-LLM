@@ -17,7 +17,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+                             register_auto_model, support_pp)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -123,6 +123,7 @@ class LlamaDecoderLayer(DecoderLayer):
         return hidden_states, residual
 
 
+@support_pp
 class LlamaModel(DecoderModel):
 
     def __init__(self, model_config: ModelConfig[LlamaConfig]):
@@ -138,6 +139,8 @@ class LlamaModel(DecoderModel):
                 tensor_parallel_rank=model_config.mapping.tp_rank,
                 tensor_parallel_size=model_config.mapping.tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
+                pipeline_parallel_size=model_config.mapping.pp_size,
+                parallel_rank=model_config.mapping.rank,
                 gather_output=True,
                 gpus_per_node=model_config.mapping.gpus_per_node,
             ),

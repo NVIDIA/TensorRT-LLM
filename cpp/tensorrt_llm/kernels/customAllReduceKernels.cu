@@ -746,7 +746,7 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
-    static_assert(RanksPerNode <= 8);
+    static_assert(RanksPerNode <= MAX_RANKS_PER_NODE);
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     using PackedStruct = typename PackedOn16Bytes<T>::Type;
 
@@ -1355,6 +1355,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
     }
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     if constexpr (PUSH_MODE || COPY_INPUT)
     {
         // Copy from local buffer to shareable buffer
@@ -1419,6 +1423,10 @@ static __global__ void oneShotAllReduceKernel(AllReduceParams params)
         // Store to the destination buffer.
         *reinterpret_cast<int4*>(&local_output_buffer[iter_offset]) = sums.packed;
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, int RANKS_PER_NODE, bool COPY_INPUT = true, bool PUSH_MODE = false, bool Bias = false,
@@ -1783,13 +1791,33 @@ void AllReduceDispatch(AllReduceStrategyType algo, AllReduceStrategyConfig confi
     }
     if (algo == AllReduceStrategyType::ONESHOT)
     {
-        oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &oneShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
     else
     {
-        twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>
-            <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
+        auto* kernel_instance = &twoShotAllReduceKernel<T, RANKS_PER_NODE, !USE_MEMCPY, PUSH_MODE>;
+        cudaLaunchConfig_t config;
+        config.gridDim = blocks_per_grid;
+        config.blockDim = threads_per_block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel_instance, params);
     }
 }
 
@@ -1849,7 +1877,8 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     case 4: AllReduceDispatchRanksPerNode<T, 4>(strat, config, fusionOp, params, stream); break;
     case 6: AllReduceDispatchRanksPerNode<T, 6>(strat, config, fusionOp, params, stream); break;
     case 8: AllReduceDispatchRanksPerNode<T, 8>(strat, config, fusionOp, params, stream); break;
-    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8} GPUs per node.");
+    case 16: AllReduceDispatchRanksPerNode<T, 16>(strat, config, fusionOp, params, stream); break;
+    default: TLLM_THROW("Custom all reduce only supported on {2, 4, 6, 8, 16} GPUs per node.");
     }
 }
 

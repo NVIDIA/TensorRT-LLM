@@ -24,8 +24,8 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import (OMPI_COMM_TYPE_HOST, mpi_barrier, mpi_comm,
-                                 mpi_rank, mpi_world_size)
+from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
+                                 mpi_comm, mpi_rank, mpi_world_size)
 from tensorrt_llm.auto_parallel import infer_cluster_config
 from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
@@ -438,9 +438,8 @@ def parallel_build(model_config: PretrainedConfig,
             assert len(exceptions
                        ) == 0, "Engine building failed, please check error log."
     else:
-        mpi_local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
-        mpi_local_rank = mpi_local_comm.Get_rank()
-        node_gpu_count = torch.cuda.device_count()
+        mpi_local_rank = local_mpi_rank()
+        node_gpu_count = local_mpi_size()
         exceptions = []
         for engine_rank in range(world_size):
             if engine_rank % mpi_world_size() != mpi_rank():

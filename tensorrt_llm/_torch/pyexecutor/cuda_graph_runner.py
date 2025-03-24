@@ -1,3 +1,4 @@
+import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -5,6 +6,20 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.utils import make_weak_ref
+
+from ..pipeline_interface import PipelineInterface
+
+_local = threading.local()
+
+
+def set_graph_capturing(enable: bool):
+    _local.is_graph_capturing = enable
+
+
+def is_graph_capturing() -> bool:
+    if not hasattr(_local, 'is_graph_capturing'):
+        return False
+    return _local.is_graph_capturing
 
 
 class DecodingCUDAGraphRunner:
@@ -15,6 +30,8 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        has_pp: bool = False,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -43,6 +60,8 @@ class DecodingCUDAGraphRunner:
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
+        self.pipeline_interface = pipeline_interface
+        self.has_pp = has_pp
         self._output = None
         self._graph = None
 
@@ -59,15 +78,19 @@ class DecodingCUDAGraphRunner:
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
         }
+        if self.has_pp:
+            inputs["pipeline_interface"] = self.pipeline_interface
+
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
+        set_graph_capturing(True)
         for _ in range(2):
             forward_fn(inputs)
-
         with torch.cuda.graph(self._graph, pool=pool):
             output = forward_fn(inputs)
+        set_graph_capturing(False)
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
         return self._graph.pool()
@@ -95,6 +118,13 @@ class DecodingCUDAGraphRunner:
         position_ids = inputs["position_ids"]
         self.input_ids.copy_(input_ids)
         self.position_ids.copy_(position_ids)
+
+        if self.pipeline_interface is not None:
+            assert "pipeline_interface" in inputs
+            pipeline_interface = inputs["pipeline_interface"]
+            for key in ["hidden_states", "residual"]:
+                self.pipeline_interface[key].copy_(pipeline_interface[key])
+
         assert self._output is not None and self._graph is not None
         self._graph.replay()
         return self._output

@@ -20,6 +20,7 @@ from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
+from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -72,6 +73,7 @@ class PhiDecoderLayer(Module):
         use_cache=False,
         kv_cache_params=None,
         attention_params=None,
+        lora_layer_params=None,
     ):
         residual = hidden_states
 
@@ -84,6 +86,7 @@ class PhiDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             norm_before_bmm1=True,
+            lora_layer_params=lora_layer_params,
         )
 
         if use_cache:
@@ -119,18 +122,18 @@ class PhiModel(Module):
         prompt_embedding_table=None,
         prompt_tasks=None,
         prompt_vocab_size=None,
+        lora_params=None,
     ):
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
                 ] if prompt_embedding_table is not None else []
         hidden_states = self.vocab_embedding(input_ids, *args)
 
-        hidden_states = self.layers(
-            hidden_states,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            kv_cache_params=kv_cache_params,
-            attention_params=attention_params,
-        )
+        hidden_states = self.layers(hidden_states,
+                                    use_cache=use_cache,
+                                    attention_mask=attention_mask,
+                                    kv_cache_params=kv_cache_params,
+                                    attention_params=attention_params,
+                                    lora_params=lora_params)
         if use_cache:
             hidden_states, presents = hidden_states
 
@@ -159,6 +162,12 @@ class PhiForCausalLM(DecoderModelForCausalLM):
                                tp_group=config.mapping.tp_group,
                                tp_size=config.mapping.tp_size,
                                gather_output=True)
+
+        self.trtllm_modules_to_hf_modules = {
+            "attn_q": "q_proj",
+            "attn_k": "k_proj",
+            "attn_v": "v_proj"
+        }
 
         super().__init__(config, transformer, lm_head)
 
@@ -205,3 +214,6 @@ class PhiForCausalLM(DecoderModelForCausalLM):
         model = cls(config)
         model.load(weights)
         return model
+
+    def use_lora(self, lora_config: LoraConfig):
+        use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)

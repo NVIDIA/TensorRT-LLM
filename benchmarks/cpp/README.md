@@ -11,11 +11,6 @@ Please follow the [`installation document`](../../README.md#installation) to bui
 
 Note that the benchmarking source code for C++ runtime is not built by default, you can use the argument `--benchmarks` in [`build_wheel.py`](source:scripts/build_wheel.py) to build the corresponding executable.
 
-Windows users: Follow the
-[`Windows installation document`](../../windows/README.md)
-instead, and be sure to set DLL paths as specified in
-[Extra Steps for C++ Runtime Usage](../../windows/README.md#extra-steps-for-c-runtime-usage).
-
 ### 2. Launch C++ benchmarking (Inflight/V1 batching)
 
 #### Prepare dataset

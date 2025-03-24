@@ -53,13 +53,13 @@ public:
         TensorPtr minNormedScoresCBA; // [BS]
         TensorPtr batchDones;         // [BS]
 
-        void empty(BufferManager& manager);
+        void empty(BufferManager const& manager);
 
         void reshape(SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSequenceLength);
 
         void release();
 
-        void init(BufferManager& manager, TokenIdType endId);
+        void init(BufferManager const& manager, TokenIdType endId);
 
         BeamHypotheses slice(SizeType32 batchIndex, SizeType32 size) const;
     };

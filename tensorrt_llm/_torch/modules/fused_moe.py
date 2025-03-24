@@ -5,7 +5,9 @@ import torch
 from torch import nn
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
+from ..distributed import allgather
 from ..model_config import ModelConfig
+from ..utils import disable_fp4_allgather, is_torch_compiling, reswizzle_sf
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -233,11 +235,16 @@ class FusedMoE(nn.Module):
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
 
+        self.use_dp = model_config.mapping.enable_attention_dp
+
         # All ranks participate in allreduce regardless of EP/TP combination
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node)
+            gpus_per_node=model_config.mapping.gpus_per_node,
+            pipeline_parallel_size=model_config.mapping.pp_size,
+            parallel_rank=model_config.mapping.rank)
+        self.parallel_size = self.parallel_config.tensor_parallel_size
 
         self.all_reduce = AllReduce(self.parallel_config)
 
@@ -256,6 +263,32 @@ class FusedMoE(nn.Module):
         if not model_config.skip_create_weights:
             self.create_weights()
 
+    def setup_quant_scales(self):
+        self.quant_scales = None
+        if not self.has_any_quant:
+            return
+        if self.has_fp8_qdq:
+            self.quant_scales = FusedMoEQuantScalesFP8(
+                fc1_dequant=self.fc31_dequant,
+                fc2_quant=self.fc2_quant,
+                fc2_dequant=self.fc2_dequant,
+                fc1_input_dequant=self.fc31_input_dequant,
+            )
+        elif self.has_fp8_block_scales:
+            self.quant_scales = FusedMoEQuantScalesFP8BlockScales(
+                fc_weight_scales=self.w3_w1_weight_scaling_factor,
+                proj_weight_scales=self.w2_weight_scaling_factor,
+            )
+        elif self.has_nv_fp4:
+            self.quant_scales = FusedMoEQuantScalesNVFP4(
+                fc1_act_global=self.fc31_input_scale,
+                fc1_weight_block=self.w3_w1_weight_scale,
+                fc1_global=self.fc31_alpha,
+                fc2_act_global=self.fc2_input_scale,
+                fc2_weight_block=self.w2_weight_scale,
+                fc2_global=self.fc2_alpha,
+            )
+
     def create_weights(self):
         if self._weights_created:
             return
@@ -270,9 +303,16 @@ class FusedMoE(nn.Module):
             self.intermediate_size_per_partition,
         )
 
+        self.quant_scales = None
+        self.has_any_quant = False
+        self.has_fp8_qdq = False
+        self.has_fp8_block_scales = False
+        self.has_nv_fp4 = False
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
+            self.has_any_quant = True
             qc = self.quant_config
             if qc.quant_mode.has_fp8_qdq():
+                self.has_fp8_qdq = True
                 weight_dtype = torch.float8_e4m3fn
 
                 fc31_dequant = nn.Parameter(torch.empty(
@@ -300,13 +340,14 @@ class FusedMoE(nn.Module):
                                                   requires_grad=False)
                 self.register_parameter("fc31_input_dequant",
                                         fc31_input_dequant)
-
             elif qc.quant_mode.has_fp8_block_scales():
+                self.has_fp8_block_scales = True
                 weight_dtype = torch.float8_e4m3fn
-
+                cell_div = lambda x, y: (x + y - 1) // y
                 w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
-                    (self.expert_size_per_partition, w3_w1_weight_shape[1] //
-                     128, w3_w1_weight_shape[2] // 128),
+                    (self.expert_size_per_partition,
+                     cell_div(self.intermediate_size_per_partition, 128) * 2,
+                     cell_div(w3_w1_weight_shape[2], 128)),
                     dtype=torch.float32,
                     device=device),
                                                            requires_grad=False)
@@ -314,17 +355,18 @@ class FusedMoE(nn.Module):
                                         w3_w1_weight_scaling_factor)
 
                 w2_weight_scaling_factor = nn.Parameter(torch.empty(
-                    (self.expert_size_per_partition, w2_weight_shape[1] // 128,
-                     w2_weight_shape[2] // 128),
+                    (self.expert_size_per_partition,
+                     cell_div(w2_weight_shape[1],
+                              128), cell_div(w2_weight_shape[2], 128)),
                     dtype=torch.float32,
                     device=device),
                                                         requires_grad=False)
                 self.register_parameter("w2_weight_scaling_factor",
                                         w2_weight_scaling_factor)
-
             elif qc.quant_mode.has_nvfp4():
+                self.has_nv_fp4 = True
                 weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
-                scaling_vector_size = 16
+                self.scaling_vector_size = 16
                 # Divide by 16 because we use int64 to pack 16 fp4 values
                 w3_w1_weight_shape = (self.expert_size_per_partition,
                                       self.intermediate_size_per_partition * 2,
@@ -338,7 +380,7 @@ class FusedMoE(nn.Module):
                 w3_w1_weight_scale = nn.Parameter(torch.ones(
                     self.expert_size_per_partition,
                     self.intermediate_size_per_partition * 2,
-                    self.hidden_size // scaling_vector_size // 4,
+                    self.hidden_size // self.scaling_vector_size // 4,
                     dtype=FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE,
                     device=device),
                                                   requires_grad=False)
@@ -350,7 +392,7 @@ class FusedMoE(nn.Module):
                     torch.ones(self.expert_size_per_partition,
                                self.hidden_size,
                                self.intermediate_size_per_partition //
-                               scaling_vector_size // 4,
+                               self.scaling_vector_size // 4,
                                dtype=FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE,
                                device=device),
                     requires_grad=False)
@@ -380,11 +422,11 @@ class FusedMoE(nn.Module):
                     device=device),
                                          requires_grad=False)
                 self.register_parameter("fc2_alpha", fc2_alpha)
-
             else:
                 # TODO: support other quant mode
                 raise ValueError(
                     f"unsupported quantization mode: {qc.quant_mode}")
+            self.setup_quant_scales()
 
         # Fused gate_up_proj (column parallel)
         w3_w1_weight = nn.Parameter(torch.empty(w3_w1_weight_shape,
@@ -401,11 +443,54 @@ class FusedMoE(nn.Module):
         self.register_parameter("w2_weight", w2_weight)
         self._weights_created = True
 
-    def forward(self, x: torch.Tensor,
-                router_logits: torch.Tensor) -> torch.Tensor:
+    def all_gather(self, input_tensors):
+        flatten_inputs = []
+        shapes = []
+        dtypes = []
+        lengths = []
+        start_indices = []
+        start_idx = 0
+        for input_tensor in input_tensors:
+            if input_tensor is None:
+                continue
+            shapes.append(input_tensor.shape)
+            dtypes.append(input_tensor.dtype)
+            lengths.append(input_tensor.nbytes)
+            start_indices.append(start_idx)
+            start_idx += input_tensor.nbytes
+            flatten_input = input_tensor.view(-1).view(torch.uint8)
+            flatten_inputs.append(flatten_input)
+
+        if len(flatten_inputs) == 0:
+            return input_tensors
+
+        flatten_outputs = allgather(
+            torch.cat(flatten_inputs),
+            self.parallel_config,
+            gather_dim=0,
+        ).view(self.parallel_size, -1)
+
+        outputs = []
+        for input_tensor in input_tensors:
+            if input_tensor is None:
+                output = None
+            else:
+                dtype = dtypes.pop(0)
+                nbytes = lengths.pop(0)
+                start_idx = start_indices.pop(0)
+                shape = [self.parallel_size, *shapes.pop(0)]
+                output = flatten_outputs[:, start_idx:start_idx +
+                                         nbytes].view(dtype).view(*shape)
+            outputs.append(output)
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
         output_dtype = x.dtype
 
-        quant_scales = None
         use_fp8_block_scaling = False
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -418,52 +503,55 @@ class FusedMoE(nn.Module):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
-        if self.quant_config and self.quant_config.quant_mode.has_any_quant():
-            if self.quant_config.quant_mode.has_fp8_qdq():
+        x_sf = None
+        if self.has_any_quant:
+            if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
-                quant_scales = FusedMoEQuantScalesFP8(
-                    fc1_dequant=self.fc31_dequant,
-                    fc2_quant=self.fc2_quant,
-                    fc2_dequant=self.fc2_dequant,
-                    fc1_input_dequant=self.fc31_input_dequant,
-                )
-            elif self.quant_config.quant_mode.has_nvfp4():
-                # nvfp4 input quantization happens inside the custom op
-                x = x.view(FUSED_MOE_NVFP4_INPUT_DTYPE)
-                quant_scales = FusedMoEQuantScalesNVFP4(
-                    fc1_act_global=self.fc31_input_scale,
-                    fc1_weight_block=self.w3_w1_weight_scale,
-                    fc1_global=self.fc31_alpha,
-                    fc2_act_global=self.fc2_input_scale,
-                    fc2_weight_block=self.w2_weight_scale,
-                    fc2_global=self.fc2_alpha,
-                )
-            elif self.quant_config.quant_mode.has_fp8_block_scales():
-                quant_scales = FusedMoEQuantScalesFP8BlockScales(
-                    fc_weight_scales=self.w3_w1_weight_scaling_factor,
-                    proj_weight_scales=self.w2_weight_scaling_factor,
-                )
-                use_fp8_block_scaling = True
+            elif self.has_nv_fp4:
+                x_row = x.shape[0]
+                x_col = x.shape[1]
+                if not disable_fp4_allgather():
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False)
 
+            elif self.has_fp8_block_scales:
+                use_fp8_block_scaling = True
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
-        if not self.has_been_profiled:
-            self.profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-                x.dtype, self.w3_w1_weight.dtype, output_dtype,
-                use_fp8_block_scaling)
-            self.profiler.run_profile(
-                self.w2_weight, self.routing_method.experts_per_token,
-                self.tp_size, self.tp_rank, self.ep_size, self.ep_rank,
-                get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
-            self.has_been_profiled = True
+        if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
+        ):
+            x_sf, token_selected_experts, token_final_scales = self.all_gather(
+                [x_sf, token_selected_experts, token_final_scales])
+            x = allgather(x, self.parallel_config, gather_dim=0)
+            token_selected_experts = token_selected_experts.flatten(
+                0, 1).contiguous()
+            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
 
-        profile_ids = self.profiler.get_profile_ids(
-            next_positive_power_of_2(x.shape[0]), self.w2_weight,
-            self.routing_method.experts_per_token, self.num_experts)
+            if x_sf is not None:
+                x_sf = reswizzle_sf(x_sf, x_row, x_col,
+                                    self.scaling_vector_size)
+
+        if is_torch_compiling():
+            profile_ids = None
+        else:
+            if not self.has_been_profiled:
+                self.profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
+                    x.dtype, self.w3_w1_weight.dtype, output_dtype,
+                    use_fp8_block_scaling)
+                self.profiler.run_profile(
+                    self.w2_weight, self.routing_method.experts_per_token,
+                    self.tp_size, self.tp_rank, self.ep_size, self.ep_rank,
+                    get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
+                self.has_been_profiled = True
+
+            profile_ids = self.profiler.get_profile_ids(
+                next_positive_power_of_2(x.shape[0]), self.w2_weight,
+                self.routing_method.experts_per_token, self.num_experts)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -472,7 +560,8 @@ class FusedMoE(nn.Module):
             self.w3_w1_weight,
             self.w2_weight,
             output_dtype,
-            quant_scales=quant_scales,
+            quant_scales=self.quant_scales,
+            input_sf=x_sf,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
@@ -481,7 +570,7 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
         )
 
-        if self.reduce_results and self.parallel_config.tensor_parallel_size > 1:
+        if self.reduce_results and self.parallel_size > 1:
             final_hidden_states = self.all_reduce(final_hidden_states)
 
         return final_hidden_states
@@ -538,6 +627,8 @@ class FusedMoE(nn.Module):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
+            # Re-setup quant scales after loading weights as the tensors may have been modified.
+            self.setup_quant_scales()
 
     def _load_fp8_block_scales_scales(self, weights: Dict):
         all_w2_scales = [

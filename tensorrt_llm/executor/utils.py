@@ -1,24 +1,53 @@
 import asyncio
 import concurrent.futures
 import os
-import time
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
-from ..llmapi.mpi_session import MpiSession
+from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+                                  RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
 
 BATCH_RESP_IN_AWAIT = os.getenv("TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT") == "1"
 
+
+def get_spawn_proxy_process_ipc_addr_env() -> str | None:
+    ''' Get the IPC address for the spawn proxy process dynamically. '''
+    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
+
+
+def get_spawn_proxy_process_env() -> bool:
+    ''' Get the environment variable for the spawn proxy process dynamically. '''
+    return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
+
+
 if BATCH_RESP_IN_AWAIT:
     logger.info("Using batched responses in await_responses")
+
+
+def create_mpi_comm_session(
+        n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
+    if get_spawn_proxy_process_env():
+        assert get_spawn_proxy_process_ipc_addr_env(
+        ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
+        print_colored_debug(
+            f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
+            "yellow")
+        return RemoteMpiCommSessionClient(
+            get_spawn_proxy_process_ipc_addr_env())
+    else:
+        print_colored_debug(
+            f"Using MpiCommSession to bind to external MPI processes\n",
+            "yellow")
+        return MpiCommSession(n_workers=n_workers)
 
 
 def has_event_loop() -> bool:
@@ -68,6 +97,12 @@ class ExecutorResponseTensors(NamedTuple):
     generation_logits: Optional[torch.Tensor | str]
     log_probs: Optional[list]
     cum_log_probs: Optional[list]
+
+
+class ErrorResponse(NamedTuple):
+    client_id: int
+    error_msg: str
+    request_id: int
 
 
 class ExecutorResponse(NamedTuple):
@@ -123,62 +158,3 @@ class WorkerCommIpcAddrs(NamedTuple):
     result_queue_addr: str
     stats_queue_addr: str
     kv_cache_events_queue_addr: str
-
-
-class WorkerCommQueues(NamedTuple):
-    ''' Queues for communication with the worker in the same process. '''
-    request_queue: IntraProcessQueue
-    request_error_queue: IntraProcessQueue
-    # result_queue could be an IPC address when postproc worker is enabled.
-    result_queue: IntraProcessQueue | str
-    stats_queue: IntraProcessQueue
-    kv_cache_events_queue: IntraProcessQueue
-
-
-def _create_rsp(response) -> ExecutorResponse:
-    client_id = response.client_id
-    if response.has_error():
-        # This error will be dispatched to the user's generate_async for the corresponding request. It won't
-        # stop the whole service.
-        rsp = ExecutorResponse(
-            client_id,
-            tensors=None,
-            # Note: error Response only has one finish reason.
-            # Since the error will be raised in the main thread, so the finish reason is not actually used.
-            finish_reasons=[tllm.FinishReason.NOT_FINISHED],
-            is_final=True,
-            sequence_index=None,
-            error=response.error_msg,
-            timestamp=time.perf_counter())
-
-    else:
-        response_result = response.result
-        tensors = ExecutorResponseTensors(
-            output_token_ids=response_result.output_token_ids,
-            context_logits=response_result.context_logits,
-            generation_logits=response_result.generation_logits,
-            log_probs=response_result.log_probs,
-            cum_log_probs=response_result.cum_log_probs,
-        )
-
-        disaggregated_params = None
-        context_phase_params = response_result.context_phase_params
-        if context_phase_params is not None:
-            disaggregated_params = DisaggregatedParams(
-                request_type="context_only",
-                first_gen_tokens=context_phase_params.first_gen_tokens,
-                ctx_request_id=context_phase_params.req_id,
-                opaque_state=context_phase_params.opaque_state)
-
-        rsp = ExecutorResponse(client_id,
-                               tensors,
-                               finish_reasons=response_result.finish_reasons,
-                               is_final=response_result.is_final,
-                               sequence_index=response_result.sequence_index,
-                               error=None,
-                               timestamp=time.perf_counter(),
-                               disaggregated_params=disaggregated_params)
-
-        print_colored_debug(f"rsp: {rsp}\n", color="yellow")
-
-    return rsp

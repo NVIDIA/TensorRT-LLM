@@ -40,13 +40,13 @@ public:
     static void sendBuffer(
         executor::kv_cache::Connection const& connection, runtime::IBuffer const& buf, uint64_t requestId)
     {
-        int const tag = ((requestId & 0xFFF) << 12) | (kDATA_TAG & 0xFF);
+        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
         connection.send(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
     }
 
     static void recvBuffer(executor::kv_cache::Connection const& connection, runtime::IBuffer& buf, uint64_t requestId)
     {
-        int const tag = ((requestId & 0xFFF) << 12) | (kDATA_TAG & 0xFF);
+        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
         connection.recv(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
     }
 

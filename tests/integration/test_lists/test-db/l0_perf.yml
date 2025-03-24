@@ -1,0 +1,29 @@
+version: 0.0.1
+l0_perf:
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*a100*'
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+    tests:
+      - perf/test_perf.py::test_perf[bert_base-plugin-float16-bs:32-input_len:32]
+      - perf/test_perf.py::test_perf[bert_base-cpp-plugin-float16-bs:32-input_len:32]
+      - perf/test_perf.py::test_perf[bert_base-ootb-float16-bs:32-input_len:32]
+      - perf/test_perf.py::test_perf[bert_base-cpp-ootb-float16-bs:32-input_len:32]
+      - perf/test_perf.py::test_perf[roberta_base-cpp-plugin-float16-bs:32-input_len:128+512]
+      - perf/test_perf.py::test_perf[gpt_350m-plugin-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-ootb-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-ootb-float16-gwp:0.5-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin_ifb-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin_ifb-float16-gwp:0.0-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin_ifb-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[t5_base-plugin-float16-bs:8-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[flan_t5_base-plugin-float16-bs:8-input_output_len:60,20]
+      - perf/test_perf.py::test_perf[bart_large_cnn-plugin-float16-bs:8-input_output_len:60,20]

@@ -37,7 +37,9 @@ class MLP(nn.Module):
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+                pipeline_parallel_size=config.mapping.pp_size,
+                parallel_rank=config.mapping.rank),
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.VANILLA),
             quant_config=config.get_quant_config(),
@@ -52,7 +54,9 @@ class MLP(nn.Module):
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+                pipeline_parallel_size=config.mapping.pp_size,
+                parallel_rank=config.mapping.rank),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )

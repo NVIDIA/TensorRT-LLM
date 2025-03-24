@@ -217,6 +217,40 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     TLLM_CHECK(d == a + getSerializationSize());
 }
 
+template <typename Type, bool NeedQuant = false>
+std::unique_ptr<CutlassMoeFCRunnerInterface> switch_output_type(nvinfer1::DataType output_type)
+{
+    switch (output_type)
+    {
+    case nvinfer1::DataType::kFP4:
+    case nvinfer1::DataType::kFP8:
+        // TODO We need an atomic FP8 reduction for the finalize fusions
+        TLLM_THROW("Outputting %d directly is not currently supported", static_cast<int>(output_type));
+        // return std::make_unique<CutlassMoeFCRunner<Type, Type>>();
+    case nvinfer1::DataType::kHALF:
+        if constexpr (NeedQuant)
+        {
+            return std::make_unique<CutlassMoeFCRunner<Type, Type, half, half>>();
+        }
+        else
+        {
+            return std::make_unique<CutlassMoeFCRunner<Type, Type, half, Type>>();
+        }
+#ifdef ENABLE_BF16
+    case nvinfer1::DataType::kBF16:
+        if constexpr (NeedQuant)
+        {
+            return std::make_unique<CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
+        }
+        else
+        {
+            return std::make_unique<CutlassMoeFCRunner<Type, Type, __nv_bfloat16, Type>>();
+        }
+#endif
+    default: TLLM_THROW("Invalid output type %d", static_cast<int>(output_type));
+    }
+};
+
 void MixtureOfExpertsPlugin::init()
 {
     TLLM_CHECK_WITH_INFO(mType == DataType::kFP8 || mType == DataType::kFP4 || mOutputType == mType,
@@ -252,7 +286,7 @@ void MixtureOfExpertsPlugin::init()
 #ifdef ENABLE_FP8
     else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kHALF)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half>>();
+        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
     }
 #endif
 #ifdef ENABLE_BF16
@@ -271,46 +305,22 @@ void MixtureOfExpertsPlugin::init()
 #ifdef ENABLE_FP8
     else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kBF16)
     {
-        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16>>();
+        mMOERunner
+            = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_bfloat16>>();
     }
 #endif
 #endif
 
-    // Templated lambda for picking the right output type for fp8/fp4
-    auto switch_output_type = [&](auto&& argType)
-    {
-        using Type = std::decay_t<decltype(argType)>;
-        switch (mOutputType)
-        {
-        case nvinfer1::DataType::kFP4: // INT64 == FP4
-        case nvinfer1::DataType::kFP8:
-            // TODO We need an atomic FP8 reduction for the finalize fusions
-            TLLM_THROW("Outputting %d directly is not currently supported", static_cast<int>(mOutputType));
-            // mMOERunner = std::make_unique<CutlassMoeFCRunner<Type, Type>>();
-            break;
-        case nvinfer1::DataType::kHALF:
-            mMOERunner = std::make_unique<CutlassMoeFCRunner<Type, Type, half, half>>();
-            break;
-#ifdef ENABLE_BF16
-        case nvinfer1::DataType::kBF16:
-            mMOERunner = std::make_unique<CutlassMoeFCRunner<Type, Type, __nv_bfloat16, __nv_bfloat16>>();
-            break;
-#endif
-        default:
-            TLLM_THROW(
-                "Invalid output type %d specified for %d", static_cast<int>(mOutputType), static_cast<int>(mType));
-        }
-    };
 #ifdef ENABLE_FP8
     if (mType == DataType::kFP8 && mWeightType == DataType::kFP8)
     {
-        switch_output_type(__nv_fp8_e4m3{});
+        mMOERunner = switch_output_type<__nv_fp8_e4m3>(mOutputType);
     }
 #endif
 #ifdef ENABLE_FP4
     if (mType == DataType::kFP4 && mWeightType == DataType::kFP4)
     {
-        switch_output_type(__nv_fp4_e2m1{});
+        mMOERunner = switch_output_type<__nv_fp4_e2m1, true>(mOutputType);
     }
 #endif
 
@@ -940,7 +950,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
 
     mMOERunner->setTactic(gemm1, gemm2);
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+        static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
         inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
