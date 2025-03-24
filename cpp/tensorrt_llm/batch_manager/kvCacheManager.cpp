@@ -430,17 +430,14 @@ bool BlockManager::verifyQueueIntegrity()
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
-    if (!sequence.getContextRequiresCyclicKvCache())
-    {
-        constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
-        auto const& cacheBlockIds = sequence.getCacheBlockIds();
-        auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
+    auto const& cacheBlockIds = sequence.getCacheBlockIds();
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
-        auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
-        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
-    }
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
 void BlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -1149,8 +1146,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
     // the max attention window).
     // - The sequence did not switch to cyclic kv-cache during generation phase.
-    bool const storeBlocksForReuse
-        = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.getContextRequiresCyclicKvCache();
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
     if (storeBlocksForReuse)
     {
         auto constexpr beamIdx = 0;
@@ -1163,16 +1159,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
         auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-
-        // TODO (jdebache): implicit check depending on implementation detail of other parts of this component. Fix.
-        // Here we implicitly check whether we used cyclic kv-cache by comparing how many blocks of kv-cache the
-        // sequence is occupying (i.e. constrained by the max attention window), versus how many it would need if the
-        // whole sequence had been stored (no maximum attention window required). If the whole sequence doesn't fit the
-        // stored blocks, then we had to use cyclic kv-cache.
-        if (!(blockKeys.size() > cacheBlockIds[beamIdx].size())) // No cyclic kv-cache -> store blocks.
-        {
-            storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
-        }
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
 
     auto node = mAllocatedBlocksPerSeq.extract(requestId);
@@ -1209,12 +1196,12 @@ void BlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
-        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindow, temporaryAttentionWindow,
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow,
         sinkTokenLength, std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)),
         maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, false, enablePartialReuse,
         copyOnPartialReuse)
@@ -1223,13 +1210,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
 
 KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, int64_t stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
-        maxNumSequences, maxBeamWidth, maxAttentionWindow, temporaryAttentionWindow, sinkTokenLength,
+        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, std::move(eventManager), false,
         enablePartialReuse, copyOnPartialReuse)
@@ -1238,14 +1225,15 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
 
 KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, CudaStreamPtr stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
     bool copyOnPartialReuse)
     : mMaxBeamWidth(maxBeamWidth)
-    , mMaxAttentionWindow(maxAttentionWindow)
+    , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
+    , mMinAttentionWindow(*std::min_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
     , mTemporaryAttentionWindow(temporaryAttentionWindow)
     , mTokensPerBlock(tokensPerBlock)
     , mSinkBubbleLength(BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock))
@@ -1267,7 +1255,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // If maxBeamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
     // tokens, when enabling cyclic kv cache.
     mUseOneMoreBlock
-        = maxSequenceLength.has_value() && maxSequenceLength.value() > maxAttentionWindow && maxBeamWidth > 1;
+        = maxSequenceLength.has_value() && maxSequenceLength.value() > mMaxAttentionWindow && maxBeamWidth > 1;
     TLLM_CHECK_WITH_INFO(!mUseOneMoreBlock || mTemporaryAttentionWindow == 0,
         "Can't support sliding window attention, paged context fmha, and beam search are used together.");
     if (mUseOneMoreBlock)
@@ -1285,14 +1273,14 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
 
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, std::vector<SizeType32> const& maxAttentionWindowVec,
     SizeType32 temporaryAttentionWindow, SizeType32 sinkTokenLength, CudaStreamPtr stream,
     std::optional<runtime::SizeType32> maxSequenceLength, bool enableBlockReuse, bool onboardBlocks,
     CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enableHashKey, bool enablePartialReuse,
     bool copyOnPartialReuse)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksInPrimaryPool,
-        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindow, temporaryAttentionWindow,
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, temporaryAttentionWindow,
         sinkTokenLength, std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType,
         secondaryOffloadMinPriority, std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
 {
@@ -1603,16 +1591,12 @@ void KVCacheManager::addSequence(
     {
         auto lck = std::scoped_lock(mSequencesMtx);
         return mSequences.emplace(requestId,
-            GenerationRequest(requestId, inputLength, beamWidth, mMaxBlocksPerSeq, mBlockManager.getNumPools(),
-                kvCacheRetentionConfig));
+            GenerationRequest(requestId, inputLength, beamWidth, mMaxBlocksPerSeq,
+                mMinAttentionWindow + mSinkBubbleLength, // When the request has started cycling, disable reuse.
+                mBlockManager.getNumPools(), kvCacheRetentionConfig));
     }();
     TLLM_CHECK(emplaceDone);
     auto& sequence = seqIt->second;
-
-    // Enable cyclic kv cache when inputLength exceeds maxAttentionWindow.
-    // Note that currently cyclic kv cache doesn't work with shared kv cache of different beams.
-    sequence.setContextRequiresCyclicKvCache(
-        inputLength >= mMaxTokenNum); // We decide at the outset whether a request uses cyclic kv-cache or not.
 
     // Get the final token index in kv cache
     SizeType32 const finalTokenKVIdx
@@ -1621,8 +1605,7 @@ void KVCacheManager::addSequence(
     // Get block index that with shareAmongBeams=False.
     // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
     SizeType32 unsharedBlockIdx = -1;
-    if ((!sequence.getContextRequiresCyclicKvCache() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0)
-        && !isCrossKv())
+    if ((!sequence.isCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
     {
         unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
             ? finalTokenKVIdx / getTokensPerBlock() + 1
@@ -1639,7 +1622,7 @@ void KVCacheManager::addSequence(
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    if (!sequence.getContextRequiresCyclicKvCache() && mEnableBlockReuse)
+    if (!sequence.isCyclic() && mEnableBlockReuse)
     {
         mBlockManager.addSequence(sequence, inputLength, numContextBlocks, *llmRequest);
     }
@@ -1695,7 +1678,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse && !sequence.getContextRequiresCyclicKvCache())
+    if (mEnableBlockReuse && !sequence.isCyclic())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }

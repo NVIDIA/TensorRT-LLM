@@ -188,7 +188,7 @@ class KVCacheManager(BaseResourceManager):
             'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
-            'max_attention_window': max_kv_cache_len,
+            'max_attention_window_vec': [max_kv_cache_len],
             'temporary_attention_window': 0,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
