@@ -289,6 +289,7 @@ public:
 
             if (isPostNormFusion())
             {
+                // TODO: Requires further unificiation for different fusion patterns and strategies.
                 tensorrt_llm::kernels::ar_fusion::AllReduceFusionParams allreduce_fusion_params;
 
                 allreduce_fusion_params.quant_out = nullptr;
