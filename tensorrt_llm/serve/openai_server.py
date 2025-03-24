@@ -16,23 +16,21 @@ from openai.types.chat import ChatCompletionMessageParam
 from transformers import PreTrainedTokenizer
 
 # yapf: disable
-from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.executor.postproc_worker import PostprocParams
-from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.utils import nvtx_mark
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                CompletionRequest,
-                                                CompletionResponse,
-                                                CompletionResponseChoice,
-                                                ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo)
-from tensorrt_llm.serve.postprocess_handlers import (
-    ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
-    chat_stream_post_processor, completion_response_post_processor,
-    completion_stream_post_processor)
-from tensorrt_llm.version import __version__ as VERSION
+from ..executor import CppExecutorError
+from ..executor.postproc_worker import PostprocParams
+from ..llmapi import LLM
+from ..llmapi.llm import RequestOutput
+from ..llmapi.utils import nvtx_mark
+from ..version import __version__ as VERSION
+from .openai_protocol import (ChatCompletionRequest, ChatCompletionResponse,
+                              CompletionRequest, CompletionResponse,
+                              CompletionResponseChoice, ErrorResponse,
+                              ModelCard, ModelList, UsageInfo)
+from .postprocess_handlers import (ChatPostprocArgs, CompletionPostprocArgs,
+                                   chat_response_post_processor,
+                                   chat_stream_post_processor,
+                                   completion_response_post_processor,
+                                   completion_stream_post_processor)
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
