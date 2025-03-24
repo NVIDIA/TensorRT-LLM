@@ -189,7 +189,6 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
-        use_kv_cache: bool = True,
         **kwargs,
     ):
         """
@@ -206,10 +205,10 @@ class TrtllmAttentionWrapper:
             context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
-            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block.
-            host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU.
-            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
-            host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
+            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
+            host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
+            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
+            host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
             workspace (torch.Tensor): An optional workspace tensor on GPU.
             cache_indirection (torch.Tensor): A tensor for beam search on GPU, its shape is (batch_size, beam_width, max_seqlen), for a sequence si, a beam bi and a token ti, the element cache_indirection[si][bi][ti] is an integer between 0 and beam_width-1 that indicates which path in the beam to read the K and V elements from in the KV cache.
             kv_scale_orig_quant (torch.Tensor): The tensor to store the scaling factor for quantization to INT8/FP8 in the KV cache, with shape (1) on GPU.
@@ -217,7 +216,6 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
-            use_kv_cache (bool): Whether to use the KV cache.
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -247,7 +245,6 @@ class TrtllmAttentionWrapper:
             'mrope_rotary_cos_sin') if mrope_config is not None else None
         self.mrope_position_deltas = mrope_config.get(
             'mrope_position_deltas') if mrope_config is not None else None
-        self.use_kv_cache = use_kv_cache
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
 
@@ -369,7 +366,6 @@ class TrtllmAttentionWrapper:
             self.context_lengths,
             self.host_context_lengths,
             self.host_request_types,
-            self.use_kv_cache,
             self.kv_cache_block_offsets,
             self.host_kv_cache_block_offsets,
             self.host_kv_cache_pool_pointers,
@@ -439,7 +435,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def max_seq_len(self) -> int:
         """
         Returns the max sequence length.
-        If the attention uses cached KV, it will return max_seq_len from the KV cache manager.
+        If the attention uses KV cache, it will return max_seq_len from the KV cache manager.
         If the attention is no cache, max_seq_len should be set manually by user.
         """
         if self.kv_cache_manager is not None:
@@ -735,7 +731,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
-            use_kv_cache=metadata.kv_cache_params.use_cache,
         )
         out_dtype = None
         if out_scale is not None:

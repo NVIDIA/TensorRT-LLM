@@ -70,13 +70,12 @@ public:
         torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
-        torch::optional<torch::Tensor> host_kv_cache_pool_mapping,
-        torch::optional<torch::Tensor> cache_indirection, torch::optional<torch::Tensor> kv_scale_orig_quant,
-        torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
-        torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
-        torch::optional<torch::Tensor> latent_cache, torch::optional<torch::Tensor> q_pe,
-        torch::optional<torch::Tensor> block_ids_per_seq, torch::optional<torch::Tensor> mrope_rotary_cos_sin,
-        torch::optional<torch::Tensor> mrope_position_deltas) const
+        torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
+        torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
+        torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
+        torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
+        torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas) const
         = 0;
 };
 
@@ -119,12 +118,12 @@ public:
         torch::optional<torch::Tensor> kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_block_offsets,
         torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
-        torch::optional<torch::Tensor> host_kv_cache_pool_mapping,
-        torch::optional<torch::Tensor> cache_indirection, torch::optional<torch::Tensor> kv_scale_orig_quant,
-        torch::optional<torch::Tensor> kv_scale_quant_orig, torch::optional<torch::Tensor> out_scale,
-        torch::optional<torch::Tensor> rotary_inv_freq, torch::optional<torch::Tensor> rotary_cos_sin,
-        torch::optional<torch::Tensor> latent_cache, torch::optional<torch::Tensor> q_pe,
-        torch::optional<torch::Tensor> block_ids_per_seq, torch::optional<torch::Tensor> mrope_rotary_cos_sin,
+        torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
+        torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
+        torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
+        torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
+        torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin,
         torch::optional<torch::Tensor> mrope_position_deltas) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
@@ -212,17 +211,16 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        void* host_primary_pool_pointer = nullptr;
-        void* host_secondary_pool_pointer = nullptr;
-        if (host_kv_cache_pool_pointers.has_value())
-        {
-            host_primary_pool_pointer = reinterpret_cast<void*>(
+        void* host_primary_pool_pointer = op.useKVCache()
+            ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
-                + intra_pool_offset);
-            host_secondary_pool_pointer = reinterpret_cast<void*>(
+                + intra_pool_offset)
+            : nullptr;
+        void* host_secondary_pool_pointer = op.useKVCache()
+            ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
-                + intra_pool_offset);
-        }
+                + intra_pool_offset)
+            : nullptr;
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
@@ -346,7 +344,7 @@ using torch_ext::trtllm::attention::AttentionInputType;
 torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
     std::optional<torch::ScalarType> out_dtype, torch::optional<torch::Tensor> workspace_,
     torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths, torch::Tensor context_lengths,
-    torch::Tensor host_context_lengths, torch::Tensor host_request_types, bool const use_kv_cache,
+    torch::Tensor host_context_lengths, torch::Tensor host_request_types,
     torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
     torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
     torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
@@ -355,19 +353,23 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
     torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq, bool const is_fused_qkv,
     bool const update_kv_cache, int64_t const predicted_tokens_per_seq, int64_t const layer_idx,
-    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type, double const rotary_embedding_scale,
-    double const rotary_embedding_short_m_scale, double const rotary_embedding_long_m_scale,
-    int64_t const rotary_embedding_max_positions, int64_t const rotary_embedding_original_max_positions,
-    bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
-    std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
+    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
+    int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
+    int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
+    double const rotary_embedding_scale, double const rotary_embedding_short_m_scale,
+    double const rotary_embedding_long_m_scale, int64_t const rotary_embedding_max_positions,
+    int64_t const rotary_embedding_original_max_positions, bool const use_paged_context_fmha,
+    std::optional<int64_t> attention_input_type, bool is_mla_enable, std::optional<int64_t> q_lora_rank,
+    std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
+    // Use these tensors to infer if the attention is using KV cache
+    bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
+        && host_kv_cache_pool_pointers.has_value() && host_kv_cache_pool_mapping.has_value();
 
     TLLM_CHECK_WITH_INFO(is_fused_qkv, "Only fused QKV is supported now");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
@@ -595,7 +597,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor context_lengths"
         ", Tensor host_context_lengths"
         ", Tensor host_request_types"
-        ", bool use_kv_cache"
         ", Tensor? kv_cache_block_offsets"
         ", Tensor? host_kv_cache_block_offsets"
         ", Tensor? host_kv_cache_pool_pointers"
