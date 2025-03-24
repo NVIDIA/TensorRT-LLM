@@ -23,7 +23,6 @@ from pathlib import Path
 
 import numpy
 import numpy as np
-import soundfile
 import tensorrt as trt
 
 import torch
@@ -131,10 +130,7 @@ class CanaryTokenizer:
         self.prompt_format = decoder_config.get('prompt_format', prompt_format)
         self.blank = '▁'
         self.has_country_code = False
-        if self.prompt_format == 'canary2':
-            self.default_prompt = "<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|en-US|> <|en-US|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
-        else:
-            self.default_prompt = "<|startoftranscript|><|en|> <|transcribe|> <|en|> <|pnc|>"
+  
 
         with open(vocab_file, 'r') as jfp:
             vocab = json.load(jfp)
@@ -168,6 +164,18 @@ class CanaryTokenizer:
                 self.__token_to_id__['spl_tokens'][lang_country_token]=self.__token_to_id__['spl_tokens'][lang_token]
                 if lang_country_token != lang_token:
                     self.langs.append(lang.split('-')[0])
+        
+        if self.has_country_code:
+            dpl='en-US'
+        else:
+            dpl='en'
+        if self.prompt_format == 'canary2':
+                self.default_prompt = f"<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|{dpl}|> <|{dpl}|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
+        else:
+            if self.has_country_code:
+                self.default_prompt = f"<|startoftranscript|><|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
+            else:
+                self.default_prompt = f"<|startoftranscript|><|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
                 
 
         self.id_to_token = {}
@@ -269,6 +277,7 @@ class CanaryTokenizer:
 
         if not self.has_country_code and '-'  in src_lang: 
             src_lang = src_lang.split('-')[0]
+
         if src_lang not in self.langs:
             
             raise ValueError(f"Invalid language {src_lang=} specified")
@@ -608,7 +617,7 @@ class CanaryTRTLLM(object):
         if prompts_cfg is None:
             if text_prefix is None:
                 text_prefix = self.tokenizer.default_prompt
-
+                
             prompt_id = self.tokenizer.encode(text_prefix)
             prompt_id = torch.tensor(prompt_id)
             decoder_input_ids = prompt_id.repeat(batch_size, 1)
@@ -810,7 +819,7 @@ def decode_dataset(
         waveforms, durations, texts, ids = batch
         total_duration += sum(durations) / sample_rate
         max_durations=max(durations)
-        max_batch_len = max(max_durations, sample_rate*15)
+        max_batch_len = max(max_durations, sample_rate*3)
         waveforms_list=[]
 
         for idx in range(len(waveforms)):
