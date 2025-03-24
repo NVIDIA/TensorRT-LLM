@@ -365,55 +365,6 @@ def gpt_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def mpt_example_root(llm_root, llm_venv):
-    "Get mpt example root"
-
-    example_root = os.path.join(llm_root, "examples", "mpt")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def gptj_example_root(llm_root, llm_venv):
-    "Get gptj example root"
-    example_root = os.path.join(llm_root, "examples", "gptj")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def gptneox_example_root(llm_root, llm_venv):
-    "Get gptneox example root"
-    example_root = os.path.join(llm_root, "examples", "gptneox")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def bloom_example_root(llm_root, llm_venv):
-    "Get bloom example root"
-    example_root = os.path.join(llm_root, "examples", "bloom")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def chatglm_6b_example_root(llm_root, llm_venv):
     "Get chatglm-6b example root"
     example_root = os.path.join(llm_root, "examples", "chatglm")
@@ -511,30 +462,6 @@ def plugin_gen_path(llm_root):
     "Path to the plugin_gen.py script"
     return os.path.join(llm_root, "tensorrt_llm", "tools", "plugin_gen",
                         "plugin_gen.py")
-
-
-@pytest.fixture(scope="module")
-def baichuan_example_root(llm_root, llm_venv):
-    "Get baichuan example root"
-    example_root = os.path.join(llm_root, "examples", "baichuan")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def internlm_example_root(llm_root, llm_venv):
-    "Get internlm example root"
-    example_root = os.path.join(llm_root, "examples", "internlm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
 
 
 @pytest.fixture(scope="module")
@@ -853,29 +780,6 @@ def gpt_next_root():
 
 
 @pytest.fixture(scope="function")
-def llm_opt_model_root(request):
-    "Get opt model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    opt_model_root = os.path.join(models_root, "opt-125m")
-
-    if hasattr(request, "param"):
-        if request.param == "opt-350m":
-            opt_model_root = os.path.join(models_root, "opt-350m")
-        elif request.param == "opt-2.7b":
-            opt_model_root = os.path.join(models_root, "opt-2.7b")
-        elif request.param == "opt-66b":
-            opt_model_root = os.path.join(models_root, "opt-66b")
-        elif request.param == "opt-125m":
-            opt_model_root = os.path.join(models_root, "opt-125m")
-
-    assert exists(opt_model_root), f"{opt_model_root} does not exist!"
-
-    return opt_model_root
-
-
-@pytest.fixture(scope="function")
 def bert_model_root(hf_bert_model_root):
     "Get bert model root"
     models_root = llm_models_root()
@@ -987,27 +891,6 @@ def update_transformers(llm_venv, llm_root):
 def remove_file(fn):
     if os.path.isfile(fn) or os.path.islink(fn):
         os.remove(fn)
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("mpt-7b", True)
-def llm_mpt_7b_model_root():
-    "Get mpt model root"
-    raise RuntimeError("mpt-7b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("mpt-125m", True)
-def llm_mpt_125m_model_root():
-    "get mpt 125m model path"
-    raise RuntimeError("mpt-125m must be cached")
-
-
-@pytest.fixture(scope="function")
-@cached_in_llm_models_root("mpt-30b", True)
-def llm_mpt_30b_model_root():
-    "get mpt 30b model path"
-    raise RuntimeError("mpt-30b must be cached")
 
 
 @pytest.fixture(scope="module")
@@ -1639,33 +1522,6 @@ def llm_long_alpaca_model_root(llm_venv):
 
 
 @pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt-j-6b", True)
-def llm_gptj_model_root(llm_venv):
-    "prepare gptj model & return gptj model root"
-    workspace = llm_venv.get_working_directory()
-    gptj_model_root = os.path.join(workspace, "gptj")
-    call(
-        f"git clone https://huggingface.co/EleutherAI/gpt-j-6b {gptj_model_root}",
-        shell=True)
-    remove_file(f"{gptj_model_root}/pytorch_model.bin")
-    wget(
-        "https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/pytorch_model.bin",
-        out=gptj_model_root)
-    wget(
-        "https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/tokenizer.json",
-        out=gptj_model_root)
-    wget(
-        "https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/tokenizer_config.json",
-        out=gptj_model_root)
-    wget("https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/vocab.json",
-         out=gptj_model_root)
-    wget("https://huggingface.co/EleutherAI/gpt-j-6b/resolve/main/merges.txt",
-         out=gptj_model_root)
-
-    return gptj_model_root
-
-
-@pytest.fixture(scope="module")
 @cached_in_llm_models_root("gpt-neox-20b", True)
 def llm_gptneox_model_root(llm_venv):
     "return gptneox model root"
@@ -1694,100 +1550,6 @@ def llm_phi_model_root(request):
     ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
 
     return phi_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("bloom-560m", True)
-def llm_bloom_560m_model_root(llm_venv):
-    "prepare bloom 560m model & return bloom model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "bloom-560m")
-
-    call(f"git clone https://huggingface.co/bigscience/bloom-560m {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("bloom-3b", True)
-def llm_bloom_3b_model_root(llm_venv):
-    "prepare bloom 3b model & return bloom model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "bloom-3b")
-
-    call(f"git clone https://huggingface.co/bigscience/bloom-3b {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("bloom-7b1", True)
-def llm_bloom_7b1_model_root(llm_venv):
-    "prepare bloom 7b1 model & return bloom model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "bloom-7b1")
-
-    call(f"git clone https://huggingface.co/bigscience/bloom-7b1 {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("bloom", True)
-def llm_bloom_176b_model_root(llm_venv):
-    "prepare bloom 176b model & return bloom model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "bloom-176b")
-    # There is no https://huggingface.co/bigscience/bloom-176b, just */bloom
-    call(f"git clone https://huggingface.co/bigscience/bloom {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-rw-1b", True)
-def llm_falcon_rw_1b_model_root(llm_venv):
-    "prepare falcon-rw-1b model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-rw-1b")
-
-    call(f"git clone https://huggingface.co/tiiuae/falcon-rw-1b {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-7b-instruct", True)
-def llm_falcon_7b_model_root(llm_venv):
-    "prepare falcon-7b model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-7b-instruct")
-
-    call(
-        f"git clone https://huggingface.co/tiiuae/falcon-7b-instruct {model_root}",
-        shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-40b", True)
-def llm_falcon_40b_model_root(llm_venv):
-    "prepare falcon 40b model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-40b-instruct")
-
-    call(
-        f"git clone https://huggingface.co/tiiuae/falcon-40b-instruct "
-        f"{model_root}",
-        shell=True)
-
-    return model_root
 
 
 @pytest.fixture(scope="module")
@@ -1881,24 +1643,6 @@ def llm_glm_10b_model_root(llm_venv):
     model_root = os.path.join(workspace, "glm-10b")
 
     return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_baichuan_model_version_and_root(request):
-    "prepare baichuan model & return model version and model root"
-    model_version = request.param
-    repo_name_dict = {
-        "v1_7b": "Baichuan-7B",
-        "v1_13b": "Baichuan-13B-Chat",
-        "v2_7b": "Baichuan2-7B-Chat",
-        "v2_13b": "Baichuan2-13B-Chat",
-    }
-    assert model_version in repo_name_dict
-    repo_name = repo_name_dict[model_version]
-    models_root = llm_models_root()
-    baichuan_model_root = os.path.join(models_root, repo_name)
-
-    return model_version, baichuan_model_root
 
 
 @pytest.fixture(scope="module")
@@ -2076,16 +1820,6 @@ def deepseek_model_root(request):
         model_root = os.path.join(models_root, "deepseek-coder-6.7b-instruct")
 
     return model_root
-
-
-@pytest.fixture(scope="function")
-def deepseek_v2_model_root(request):
-    models_root = llm_models_root()
-    model_name = request.param
-    deepseek_v2_model_root = os.path.join(models_root, model_name)
-    assert exists(
-        deepseek_v2_model_root), f"{deepseek_v2_model_root} does not exist!"
-    return deepseek_v2_model_root
 
 
 @pytest.fixture(scope="module")

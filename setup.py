@@ -54,7 +54,7 @@ def sanity_check():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
-            'please execute `build_wheels.py` first, and then run `pip install -e .`.'
+            'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
 
 
