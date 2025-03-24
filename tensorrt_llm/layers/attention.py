@@ -395,13 +395,13 @@ class Attention(Module):
         self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
-        self.num_kv_heads = num_kv_heads
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
