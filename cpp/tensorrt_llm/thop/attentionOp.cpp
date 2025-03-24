@@ -355,7 +355,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
     torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq, bool const is_fused_qkv,
     bool const update_kv_cache, int64_t const predicted_tokens_per_seq, int64_t const layer_idx,
-    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size, int64_t const tokens_per_block,
+    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
     int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
     double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
@@ -457,7 +457,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 
     if (is_mla_enable)
     {
-        int32_t const layer_num = host_kv_cache_pool_mapping.size(0);
+        TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
+        int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
         op->mIsMLAEnabled = true;
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
