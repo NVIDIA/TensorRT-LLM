@@ -11,6 +11,9 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+LLM_GIT_SOURCECODE = "llm_git_sourcecode.tar.gz"
+LLM_GIT_SOURCECODE_URL = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${LLM_GIT_SOURCECODE}"
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -368,7 +371,10 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    // Download and extract the source code
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+    sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
+
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -441,8 +447,10 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "ccache -sv"
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
-    // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    // Download and extract the source code
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+    sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
+
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"

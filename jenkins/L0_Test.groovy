@@ -19,6 +19,9 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+LLM_GIT_SOURCECODE = "llm_git_sourcecode.tar.gz"
+LLM_GIT_SOURCECODE_URL = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${LLM_GIT_SOURCECODE}"
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -411,8 +414,9 @@ def runLLMDocBuild(pipeline, config)
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
     sh "env | sort"
-    // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    // Download and extract the source code
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+    sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
@@ -1230,8 +1234,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
+                        // Download and extract the source code
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+                        sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")

@@ -18,6 +18,9 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+LLM_GIT_SOURCECODE = "llm_git_sourcecode.tar.gz"
+LLM_GIT_SOURCECODE_URL = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${LLM_GIT_SOURCECODE}"
+
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
@@ -284,16 +287,35 @@ def setupPipelineEnvironment(pipeline, testFilter)
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
         echo "Using GitLab repo: ${LLM_REPO}."
         sh "git config --global --add safe.directory \"*\""
+
+        // Use MR commit if available, otherwise use branch commit
+        def commitRef = env.gitlabMergeRequestLastCommit ?: (env.gitlabBranch ?: "main")
+        trtllm_utils.checkoutSource(LLM_REPO, commitRef, LLM_ROOT, true, true)
+
+        // Set gitlabCommit for downstream use
         if (env.gitlabMergeRequestLastCommit) {
             env.gitlabCommit = env.gitlabMergeRequestLastCommit
         } else {
-            branch = env.gitlabBranch ? env.gitlabBranch : "main"
-            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-            env.gitlabCommit = checkoutCommit
+            env.gitlabCommit = sh(script: "cd ${LLM_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
         }
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+
+        sh "rm -rf ${LLM_GIT_SOURCECODE}"
+        echo "Preparing to archive source code..."
+        // Check if pigz exists
+        def pigzExists = sh(script: "which pigz > /dev/null 2>&1", returnStatus: true) == 0
+        if (pigzExists) {
+            echo "Using pigz for compression"
+            sh "tar -cf ${LLM_GIT_SOURCECODE} ${LLM_ROOT}/ --use-compress-program='pigz -k'"
+        } else {
+            echo "Not find pigz, using gzip instead"
+            sh "tar -czf ${LLM_GIT_SOURCECODE} ${LLM_ROOT}/"
+        }
+        echo "Source code archive created successfully"
+        trtllm_utils.uploadArtifacts("${LLM_GIT_SOURCECODE}", "${UPLOAD_PATH}/")
+        echo "Source code archive uploaded successfully"
+
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter)
     })
 }
@@ -306,8 +328,11 @@ def launchReleaseCheck(pipeline)
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
-        // Step 1: cloning tekit source code
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+
+        // Download and extract the source code
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+        sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
+
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep pre-commit requirements-dev.txt`")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep bandit requirements-dev.txt`")
@@ -522,8 +547,11 @@ def collectTestResults(pipeline, testFilter)
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
                 sh "coverage --version"
 
-                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                // Download and extract the source code
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${LLM_GIT_SOURCECODE_URL}")
+                sh "tar -xzf ${LLM_GIT_SOURCECODE} && rm -rf ${LLM_GIT_SOURCECODE}"
                 sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
+
                 def coverageConfigFile = "cov/.coveragerc"
                 sh """
                     echo '[paths]' > ${coverageConfigFile}
