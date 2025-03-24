@@ -107,7 +107,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     constexpr SizeType32 beam{0};
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = BlockRange(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -121,7 +121,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         }
     }
     TLLM_CHECK(blockNum > 0);
-    int deviceId = mCacheManager->getBlockManager().getBufferManager().getStream().getDevice();
+    int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
     if (common::getEnvTryZCopyForKVCacheTransfer()
         && destConfig.getParallelConfig().mPipelineParallelism == selfConfig.getParallelConfig().mPipelineParallelism)
@@ -330,7 +330,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
     // diff end
     constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();

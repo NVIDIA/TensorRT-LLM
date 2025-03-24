@@ -134,7 +134,7 @@ class GemmaConfig(PretrainedConfig):
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
-            hf_config = transformers.GemmaConfig.from_pretrained(
+            hf_config = transformers.Gemma2Config.from_pretrained(
                 hf_config_or_dir)
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))

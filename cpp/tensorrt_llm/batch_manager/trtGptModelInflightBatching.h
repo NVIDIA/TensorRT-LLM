@@ -50,6 +50,7 @@ namespace tensorrt_llm::batch_manager
 namespace kv_cache_manager
 {
 class KVCacheManager;
+struct OffsetTableDimensions;
 } // namespace kv_cache_manager
 
 namespace rnn_state_manager
@@ -86,9 +87,17 @@ namespace utils
 class CudaGraphExecutorCache;
 } // namespace utils
 
+struct RewindInputs
+{
+    SizeType32 maxBlocksPerSeq;
+    bool isUseOneMoreBlock;
+    SizeType32 numKvHeads;
+};
+
 class TrtGptModelInflightBatching : public TrtGptModel
 {
     using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+    using OffsetTableDimensions = kv_cache_manager::OffsetTableDimensions;
     using KVCacheManager = kv_cache_manager::KVCacheManager;
     using KvCacheType = kv_cache_manager::CacheType;
     using KvCacheConfig = kv_cache_manager::KvCacheConfig;
@@ -334,7 +343,7 @@ private:
 
     [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
-    void reshapeKvTensors(SizeType32 maxBlocksPerSeq, kv_cache_manager::CacheType kvCacheType, SizeType32 numPools);
+    void reshapeKvTensors(OffsetTableDimensions const& dims);
 
     // This function waits for MPI async sends on a separate thread
     void asyncSendWaitThread();
@@ -544,6 +553,7 @@ private:
     RequestVector mDraftRequestsWaitingToSendLogits;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
+    RewindInputs mRewindInputs;
 
     /******************** Algorithms ********************/
     // Algorithms are reentrant, they are assigned a state at

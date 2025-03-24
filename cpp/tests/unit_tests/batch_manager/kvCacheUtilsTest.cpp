@@ -84,16 +84,21 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
 
+    auto constexpr beamWidth = 1;
+    auto constexpr numBlocksPerBeam = blocksInPrimaryPool / beamWidth;
+    auto constexpr maxSequenceLength = tokensPerBlock * numBlocksPerBeam;
+    auto const maxAttentionWindowVec = std::vector<BlockManager::SizeType32>{maxAttentionWindow};
+
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, maxNumSequences, stream, onboardBlocks);
-    blockManager.allocatePools(dataType, false);
+        blocksInPrimaryPool, blocksInSecondaryPool, maxNumSequences, stream, maxSequenceLength, beamWidth,
+        maxAttentionWindowVec, std::nullopt, dataType, 0, onboardBlocks);
+    blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
     EXPECT_EQ(blockManager.getMaxNumBlocks(), blocksInPrimaryPool);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     SizeType32 constexpr maxNewTokens{0};
-    auto constexpr beamWidth = 1;
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
@@ -102,14 +107,14 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
 
-    GenerationRequest seq0{requestId, inputLength, beamWidth, maxBlocksPerSeq, maxAttentionWindow};
+    GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0);
+    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
 
-    auto const blockIds = seq0.getCacheBlockIds().at(beamIdx);
+    auto const blockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(blockIds, ::testing::ElementsAreArray({0, 1, 2}));
 
     auto const pool = blockManager.getPrimaryPool(0);
