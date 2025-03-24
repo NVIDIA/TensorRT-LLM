@@ -131,6 +131,7 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
+    bool use_oneshot;
     FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
