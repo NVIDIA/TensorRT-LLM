@@ -319,7 +319,7 @@ def launchReleaseCheck(pipeline)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            python3-pip \
+            golang-go  \
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
@@ -368,7 +368,7 @@ def launchReleaseCheck(pipeline)
         }
     }
 
-    def image = "urm.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main"
     stageName = "Release Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
         stage("[${stageName}] Run") {
