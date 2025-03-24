@@ -33,7 +33,7 @@ namespace
 auto const TEST_RESOURCE_PATH = std::filesystem::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
 auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 auto const GPT_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "gpt2" / "xgrammar_tokenizer_info.json";
-auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "llama-7b-hf" / "xgrammar_tokenizer_info.json";
+auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = DATA_PATH / "TinyLlama-1.1B-Chat-v1.0" / "xgrammar_tokenizer_info.json";
 } // namespace
 
 class GuidedDecoderTest : public ::testing::Test

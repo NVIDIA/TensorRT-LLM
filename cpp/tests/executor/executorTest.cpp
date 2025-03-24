@@ -3513,11 +3513,11 @@ TEST_P(GuidedDecodingParamsTest, All)
     }
     else // llama
     {
-        expectedOutputTokens.push_back({29896, 29974, 29896, 29922, 29906, 13, 5618, 338, 29871, 29896});
+        expectedOutputTokens.push_back({13, 13, 28956, 13, 29912, 13, 1678, 376, 29896, 1115});
         expectedOutputTokens.push_back({6377, 29896, 1115, 376, 29896, 613, 376, 29896, 29974, 29896});
-        expectedOutputTokens.push_back({6377, 29874, 1983, 29893, 29872, 29878, 1115, 29871, 29896, 29913});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
-        expectedOutputTokens.push_back({29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896});
+        expectedOutputTokens.push_back({6377, 12011, 1115, 29871, 29896, 29913});
+        expectedOutputTokens.push_back({29896});
+        expectedOutputTokens.push_back({29896});
     }
 
     if (executor.canEnqueueRequests())
@@ -3548,10 +3548,7 @@ TEST_P(GuidedDecodingParamsTest, All)
                     auto& newTokens = result.outputTokenIds.at(0);
 
                     int reqIdx = std::find(reqIds.begin(), reqIds.end(), reqId) - reqIds.begin();
-                    for (int i = 0; i < maxNewTokens; i++)
-                    {
-                        EXPECT_EQ(newTokens[i], expectedOutputTokens[reqIdx][i]);
-                    }
+                    EXPECT_THAT(newTokens, ::testing::ElementsAreArray(expectedOutputTokens[reqIdx]));
                 }
                 numFinished++;
             }
@@ -4399,7 +4396,7 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
         = Request(finishedTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth));
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     std::vector<std::vector<int>> finishedReponse
-        = {{101, 102, 103, 104, 29889, 13, 13, 20001, 29901}, {101, 102, 103, 104, 29889, 13, 13, 2277, 29937}};
+        = {{101, 102, 103, 104, 1, 17607, 1711, 29889, 13}, {101, 102, 103, 104, 1, 17607, 1711, 310, 278}};
 
     // assume responses will come in FIFO order
     std::vector<BeamTokens> refResponses = {immediateCancelResponse, oneForwardResponse, finishedReponse};

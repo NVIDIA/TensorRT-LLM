@@ -37,7 +37,7 @@ def generate_output(engine: str,
                     cp_size: int = 1,
                     max_output_len: int = 8):
 
-    model = 'llama-7b-hf'
+    model = 'TinyLlama-1.1B-Chat-v1.0'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
@@ -46,7 +46,7 @@ def generate_output(engine: str,
     engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
-    input_file = data_dir / 'input_tokens.npy'
+    input_file = data_dir / 'input_tokens_llama.npy'
     model_data_dir = data_dir / model
     if num_beams <= 1:
         output_dir = model_data_dir / 'sampling'

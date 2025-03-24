@@ -48,7 +48,7 @@ using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
 
 auto constexpr GPT_MODEL_DIR = "gpt2";
 auto constexpr GPTJ_MODEL_DIR = "gpt-j-6b";
-auto constexpr LLAMA_MODEL_DIR = "llama-7b-hf";
+auto constexpr LLAMA_MODEL_DIR = "TinyLlama-1.1B-Chat-v1.0";
 auto constexpr MEDUSA_MODEL_DIR = "vicuna-7b-medusa";
 auto constexpr EAGLE_MODEL_DIR = "vicuna-7b-eagle";
 auto constexpr MAMBA_MODEL_DIR = "mamba-2.8b-hf";
@@ -60,6 +60,7 @@ auto constexpr GLM_MODEL_DIR = "glm-10b";
 auto constexpr FP8_GPT_ATTENTION_PLUGIN_IFB_PACKED_PATH = "fp8-plugin";
 
 auto constexpr INPUT_FILE = "input_tokens.npy";
+auto constexpr INPUT_LLAMA_FILE = "input_tokens_llama.npy";
 auto constexpr INPUT_VICUNA_FILE = "input_vicuna.npy";
 auto constexpr LONG_INPUT_FILE = "input_tokens_long.npy";
 auto constexpr CHATGLM_INPUT_FILE = "input_tokens_chatglm-6b.npy";
@@ -1545,21 +1546,21 @@ INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
     testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
         testing::Values(
             //
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePackedInput(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .usePipelineParallelism(4),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useTensorParallelism(4),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
@@ -1684,7 +1685,7 @@ INSTANTIATE_TEST_SUITE_P(LlamaLookaheadDecodingTests, ParamTest,
     testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
         testing::Values(
             //
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+            ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
