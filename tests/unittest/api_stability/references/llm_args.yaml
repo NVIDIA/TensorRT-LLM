@@ -147,7 +147,7 @@ methods:
         default: false
         name: normalize_log_probs
       peft_cache_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.PeftCacheConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
         name: peft_cache_config
       pipeline_parallel_size:
@@ -167,7 +167,7 @@ methods:
         default: null
         name: revision
       scheduler_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.SchedulerConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
         default: null
         name: scheduler_config
       skip_tokenizer_init:
