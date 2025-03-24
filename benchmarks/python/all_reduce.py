@@ -140,7 +140,7 @@ def allreduce_benchmark(dtype: str,
                             with torch.cuda.graph(graph, stream=stream):
                                 output = func(input)
                         tllm.mpi_barrier()
-                        delay_kernel(1000000, stream)
+                        delay_kernel(3000, stream)
                         torch.cuda.profiler.start()
                         for i in range(outer_loop):
                             start[i].record(stream)
