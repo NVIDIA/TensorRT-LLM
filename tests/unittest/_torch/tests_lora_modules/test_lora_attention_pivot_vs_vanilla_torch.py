@@ -15,6 +15,7 @@ from tensorrt_llm._torch.models.modeling_llama import LlamaAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 # Add the functional directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../functional'))
@@ -111,8 +112,7 @@ class TestLoraAttentionPivotVsVanilla:
         """Set up the attention module with weights."""
         model_config = ModelConfig(pretrained_config=self.llama_config,
                                    attn_backend="VANILLA")
-        layer_idx = 0
-        attention_module = LlamaAttention(model_config, layer_idx=layer_idx).to(
+        attention_module = LlamaAttention(model_config, layer_idx=0).to(
             self.device).to(self.dtype)
 
         # Set weights
@@ -163,13 +163,21 @@ class TestLoraAttentionPivotVsVanilla:
         packed_torch_qkv = hidden_states.to("cuda") @ qkv_weight.to("cuda")
 
         if lora_params:
+            # Get the LoRA weights from the new structure
+            dense_params = lora_params[0][LoraModuleType.ATTENTION_DENSE] # TODO 0 is the layer_idx, needs to pass it here somehow
+            Q_params = lora_params[0][LoraModuleType.ATTENTION_Q]
+            K_params = lora_params[0][LoraModuleType.ATTENTION_K]
+            V_params = lora_params[0][LoraModuleType.ATTENTION_V]
+
+            A_q, B_q = Q_params['weight_tensors'][0], Q_params['weight_tensors'][1]
+            A_k, B_k = K_params['weight_tensors'][0], K_params['weight_tensors'][1]
+            A_v, B_v = V_params['weight_tensors'][0], V_params['weight_tensors'][1]
+            A_o, B_o = dense_params['weight_tensors'][0], dense_params['weight_tensors'][1]
+
             # Apply LoRA
-            lora_output_q = (
-                hidden_states @ lora_params['B_q'].T) @ lora_params['A_q'].T
-            lora_output_k = (
-                hidden_states @ lora_params['B_k'].T) @ lora_params['A_k'].T
-            lora_output_v = (
-                hidden_states @ lora_params['B_v'].T) @ lora_params['A_v'].T
+            lora_output_q = (hidden_states @ B_q.T) @ A_q.T
+            lora_output_k = (hidden_states @ B_k.T) @ A_k.T
+            lora_output_v = (hidden_states @ B_v.T) @ A_v.T
 
             # Combine base and LoRA outputs
             packed_lora_torch_qkv = torch.cat(
@@ -192,7 +200,7 @@ class TestLoraAttentionPivotVsVanilla:
             torch_out = torch_out.squeeze(0)
 
             # Apply output LoRA
-            lora_o = (torch_out @ lora_params['B_o'].T) @ lora_params['A_o'].T
+            lora_o = (torch_out @ B_o.T) @ A_o.T
             torch_out = torch_out + lora_o
         else:
             # Run vanilla attention without LoRA
@@ -245,34 +253,47 @@ class TestLoraAttentionPivotVsVanilla:
                               hidden_states.to("cuda") @ qkv_weight.to("cuda"),
                               atol=2e-1)
 
-        # Run vanilla attention with LoRA
+        # Create lora_params in the new format
         lora_params = {
-            'A_q': A_q,
-            'B_q': B_q,
-            'A_k': A_k,
-            'B_k': B_k,
-            'A_v': A_v,
-            'B_v': B_v,
-            'A_o': A_o,
-            'B_o': B_o
+            'num_seqs': self.batch_size,
+            'host_request_types': torch.zeros(self.batch_size, dtype=torch.int32),
+            'prompt_lens_cpu': torch.tensor([self.seq_len] * self.batch_size),
+            0: {  # layer_idx
+                LoraModuleType.ATTENTION_Q: {  # Q module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[A_q.data_ptr(), B_q.data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [A_q, B_q]
+                },
+                LoraModuleType.ATTENTION_K: {  # K module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[A_k.data_ptr(), B_k.data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [A_k, B_k]
+                },
+                LoraModuleType.ATTENTION_V: {  # V module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[A_v.data_ptr(), B_v.data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [A_v, B_v]
+                },
+                LoraModuleType.ATTENTION_DENSE: {  # Output projection module
+                    'adapter_size': torch.tensor([8]),  # lora_rank
+                    'weight_pointers': torch.tensor([[A_o.data_ptr(), B_o.data_ptr()]]),
+                    'is_dora': False,
+                    'weight_tensors': [A_o, B_o]
+                }
+            }
         }
+
+        # Run vanilla attention with LoRA
         vanilla_output = self._run_vanilla_attention(hidden_states, qkv_weight,
                                                      lora_params)
 
         # Run pivot attention with LoRA
-        pivot_lora_params = {
-            "lora_weight_ins_q": B_q,
-            "lora_weight_outs_q": A_q,
-            "lora_weight_ins_k": B_k,
-            "lora_weight_outs_k": A_k,
-            "lora_weight_ins_v": B_v,
-            "lora_weight_outs_v": A_v,
-            "lora_weight_ins_o": B_o,
-            "lora_weight_outs_o": A_o
-        }
         pivot_output = self._run_pivot_attention(attention_module,
                                                  hidden_states, attn_metadata,
-                                                 pivot_lora_params)
+                                                 lora_params)
 
         # Compare outputs
         a_tol = 5e-5 if (self.dtype == torch.float32) else 2e-3
@@ -287,4 +308,4 @@ if __name__ == "__main__":
     test = TestLoraAttentionPivotVsVanilla()
     test.setup_method(None)  # None is passed as method parameter
     test.test_attention_with_lora()
-    test.teardown_method(None)  # None is passed as method parameter
+    test.teardown_method(None)  # None is passed as method parameter 

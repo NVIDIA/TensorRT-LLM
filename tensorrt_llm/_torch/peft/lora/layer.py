@@ -36,7 +36,7 @@ class LoraModuleType(IntEnum):
     MLP_ROUTER = 17  # MLP router
     MLP_GATE_UP = 18  # Combined gate and up projections
 
-    # TODO (Daniel): added deense layer 
+    # TODO (Daniel): added dense layer 
     DENSE = 19  # Dense layer
     def __str__(self):
         """Return the name of the enum value."""
@@ -99,7 +99,6 @@ class LoraLayer(torch.nn.Module):
     def forward(self, x, lora_params: Dict,
                 layer_idx: int) -> Union[torch.Tensor, None]:
         if bool(lora_params):
-
             lora_ranks = []
             lora_weight_pointers = []
             lora_weight_tensors = []   # TODO (Daniel) needs to delete this when we use loraOps which uses ptr
@@ -122,9 +121,25 @@ class LoraLayer(torch.nn.Module):
             if len(active_lora_module_ids) == 0:
                 return None
             else:
-                lora_weight_tensors = lora_weight_tensors[0]
+                # If there's only one module, use the existing implementation
+                if len(active_lora_module_ids) == 1:
+                    lora_weight_tensors = lora_weight_tensors[0]
+                    lora_output = (x @ lora_weight_tensors[1].T) @ lora_weight_tensors[0].T
+                    return lora_output
                 
-                lora_output = (x @ lora_weight_tensors[1].T) @ lora_weight_tensors[0].T
+                # For multiple modules, compute and concatenate outputs
+                lora_outputs = []
+                for module_idx in self.lora_module_types:
+                    module_idx = int(module_idx)
+                    if module_idx in active_lora_module_ids:
+                        i = active_lora_module_ids.index(module_idx)
+                        weight_tensors = lora_weight_tensors[i]
+                        A, B = weight_tensors[0], weight_tensors[1]
+                        lora_output = (x @ B.T) @ A.T
+                        lora_outputs.append(lora_output)
+                
+                # Concatenate outputs from all modules
+                lora_output = torch.cat(lora_outputs, dim=-1)
                 return lora_output
 
                 # TODO(Daniel): use torch implementation. For now, this is just a placeholder, until we will do the biniding to lora ops C++ 
