@@ -601,6 +601,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # set params that are used in wrapper.plan()
         self.kv_cache_block_offsets = None
         self.host_kv_cache_block_offsets = None
+        self.block_ids_per_seq = None
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
