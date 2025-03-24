@@ -47,3 +47,4 @@ einops
 flashinfer-python~=0.2.3
 opencv-python-headless
 xgrammar==0.1.16
+backoff
