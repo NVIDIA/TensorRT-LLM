@@ -25,7 +25,7 @@ __global__ void delayStreamKernel(long long delay_micro_secs)
     for (int i = 0; i < delay_micro_secs; ++i)
     {
         // The largest delay __nanosleep can do is 1 millisecond, thus we use for loop to achieve longer delay.
-        __nanosleep(1000000);
+        __nanosleep(1000);
     }
 }
 

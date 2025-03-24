@@ -26,6 +26,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              DeepseekAllReduce, ParallelConfig,
                                              TensorParallelMode)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
 from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 
@@ -140,7 +141,7 @@ def allreduce_benchmark(dtype: str,
                             with torch.cuda.graph(graph, stream=stream):
                                 output = func(input)
                         tllm.mpi_barrier()
-                        delay_kernel(3000, stream)
+                        delay_kernel(2000000, stream)
                         torch.cuda.profiler.start()
                         for i in range(outer_loop):
                             start[i].record(stream)
