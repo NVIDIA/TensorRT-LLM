@@ -20,7 +20,6 @@ from typing import Union, Iterable, Tuple, TextIO, List, Dict
 import numpy as np
 import torch
 import numpy
-import soundfile as sf
 import click
 import kaldialign, logging
 import torch.nn.functional as F
