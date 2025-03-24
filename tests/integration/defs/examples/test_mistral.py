@@ -22,8 +22,8 @@ from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          test_multi_lora_support, venv_check_call,
                          venv_mpi_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
-                           evaltool_wikilingua_post_process, get_device_memory,
-                           skip_post_blackwell, skip_pre_ada)
+                           evaltool_wikilingua_post_process, get_device_count,
+                           get_device_memory, skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
@@ -40,8 +40,17 @@ def mistral_example_root(llm_venv):
     if platform.system() != "Windows":
         # https://github.com/Dao-AILab/flash-attention/issues/345
         # No wheel for flash-attn on windows and compilation fails locally.
-        llm_venv.run_cmd(
-            ['-m', 'pip', 'install', '--upgrade', 'flash-attn==2.4.2'])
+        install_cmd = [
+            "MAX_JOBS=4",
+            "python3",
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "flash-attn==2.4.2",
+        ]
+
+        check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("run_type", [
@@ -346,6 +355,84 @@ def test_llm_mistral_v1_smooth_quant_4gpus(llama_example_root,
                         summary_cmd)
 
 
+def test_fp8_quantization(
+    llm_venv,
+    llama_example_root,
+    model_root,
+    llm_datasets_root,
+    dtype,
+    qcache_dir,
+    engine_dir,
+    run_type,
+    tp_size=1,
+    pp_size=1,
+    calib_size=32,
+    num_beams=1,
+    rouge1_threshold=None,
+    llm_rouge_root=None,
+):
+    world_size = tp_size * pp_size
+
+    print("Quantizing engine...")
+    # Quantize HF llama checkpoint into FP8 format
+    ckpt_dir = quantize_data(llm_venv=llm_venv,
+                             example_root=llama_example_root,
+                             model_dir=model_root,
+                             calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
+                             dtype=dtype,
+                             qformat='fp8',
+                             quantize_dir=qcache_dir,
+                             tp_size=tp_size,
+                             pp_size=pp_size,
+                             calib_size=calib_size,
+                             kv_cache_dtype='fp8')
+
+    print("Build engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}",
+        f"--gpt_attention_plugin={dtype}",
+        f"--gemm_plugin={dtype}",
+        "--remove_input_padding=enable",
+        f"--moe_plugin={dtype}",
+        f"--max_beam_width={num_beams}",
+        "--context_fmha=enable",
+        f"--workers={world_size}",
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    if run_type == "inference":
+        print("Run inference...")
+        venv_mpi_check_call(llm_venv, [
+            ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            f"{llama_example_root}/../run.py",
+            "--max_output_len=50",
+            f"--tokenizer_dir={model_root}",
+            f"--engine_dir={engine_dir}",
+            f"--num_beams={num_beams}",
+        ])
+    elif run_type == "summarization":
+        print("Run summarize...")
+        assert rouge1_threshold is not None
+        assert llm_rouge_root is not None
+
+        summary_cmd = generate_summary_cmd(
+            llama_example_root,
+            hf_model_dir=model_root,
+            data_type=dtype,
+            engine_dir=engine_dir,
+            tensorrt_llm_rouge1_threshold=rouge1_threshold,
+            num_beams=num_beams,
+            dataset_dir=llm_datasets_root,
+            rouge_dir=llm_rouge_root)
+
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            summary_cmd)
+
+
 @pytest.mark.parametrize("run_type", ['inference', 'summarization'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
                          indirect=True)
@@ -363,55 +450,22 @@ def test_llm_mistral_nemo_fp8_quantization_1gpu(mistral_nemo_model_root,
     if num_beams > 2 and get_device_memory() < 80000:
         pytest.skip("device memory is insufficient.")
 
-    # Quantize HF llama checkpoint into FP8 format
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=mistral_nemo_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype=data_type,
-        qformat="fp8",
-        quantize_dir=qcache_dir,
+    test_fp8_quantization(
+        llm_venv=llm_venv,
+        llama_example_root=llama_example_root,
+        model_root=mistral_nemo_model_root,
+        llm_datasets_root=llm_datasets_root,
+        dtype='float16',
+        qcache_dir=qcache_dir,
+        engine_dir=engine_dir,
+        run_type=run_type,
+        tp_size=1,
+        pp_size=1,
         calib_size=512,
-        kv_cache_dtype="fp8")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--remove_input_padding=enable",
-        f"--max_beam_width={num_beams}",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    if run_type == "inference":
-        print("Run inference...")
-        venv_check_call(llm_venv, [
-            f"{llama_example_root}/../run.py",
-            "--max_output_len=50",
-            f"--tokenizer_dir={mistral_nemo_model_root}",
-            f"--engine_dir={engine_dir}",
-            f"--num_beams={num_beams}",
-        ])
-    elif run_type == "summarization":
-        print("Run summarize...")
-        tensorrt_llm_rouge1_threshold = 24
-
-        summary_cmd = generate_summary_cmd(
-            llama_example_root,
-            hf_model_dir=mistral_nemo_model_root,
-            data_type=data_type,
-            engine_dir=engine_dir,
-            tensorrt_llm_rouge1_threshold=tensorrt_llm_rouge1_threshold,
-            num_beams=num_beams,
-            dataset_dir=llm_datasets_root,
-            rouge_dir=llm_rouge_root)
-
-        venv_check_call(llm_venv, summary_cmd)
+        num_beams=num_beams,
+        rouge1_threshold=24.0 if run_type == 'summarization' else None,
+        llm_rouge_root=llm_rouge_root if run_type == 'summarization' else None,
+    )
 
 
 @skip_pre_ada
@@ -429,117 +483,68 @@ def test_llm_mistral_nemo_minitron_fp8_quantization(
         qformat='fp8',
         num_beams=1):
     "Run Mistral Nemo Minitron 8B quantization."
-    data_type = "bfloat16"
-    tp_size, pp_size = 1, 1
-    world_size = tp_size * pp_size
-
-    print("Quantizing engine...")
-    # Quantize HF llama checkpoint into FP8 format.
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=mistral_nemo_minitron_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype=data_type,
-        qformat=qformat,
-        quantize_dir=qcache_dir,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        calib_size=512)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        f"--moe_plugin={data_type}",
-        f"--max_beam_width={num_beams}",
-        "--context_fmha=enable",
-        f"--workers={world_size}",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run summarize...")
-    tensorrt_llm_rouge1_threshold = 22.0
-
-    summary_cmd = generate_summary_cmd(
-        llama_example_root,
-        hf_model_dir=mistral_nemo_minitron_model_root,
-        data_type=data_type,
-        num_beams=num_beams,
-        tensorrt_llm_rouge1_threshold=tensorrt_llm_rouge1_threshold,
+    test_fp8_quantization(
+        llm_venv=llm_venv,
+        llama_example_root=llama_example_root,
+        model_root=mistral_nemo_minitron_model_root,
+        llm_datasets_root=llm_datasets_root,
+        dtype='bfloat16',
+        qcache_dir=qcache_dir,
         engine_dir=engine_dir,
-        dataset_dir=llm_datasets_root,
-        rouge_dir=llm_rouge_root)
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        summary_cmd)
+        run_type='summarization',
+        tp_size=1,
+        pp_size=1,
+        calib_size=512,
+        num_beams=num_beams,
+        rouge1_threshold=22.0,
+        llm_rouge_root=llm_rouge_root,
+    )
 
 
 @skip_pre_ada
-@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("qformat", ['fp8'])
-@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
+@pytest.mark.parametrize(
+    "tp_pp_size", [(1, 1), (4, 2)],
+    ids=lambda tp_pp_size: f'tp{tp_pp_size[0]}pp{tp_pp_size[1]}')
+@pytest.mark.parametrize("llm_mistral_model_root", [
+    'mistral-7b-v0.1', 'Codestral-22B-v0.1', 'Ministral-8B-Instruct-2410',
+    'Mistral-Small-24B-Base-2501'
+],
                          indirect=True)
-def test_llm_mistral_quantization_8gpus_summary(
-        llama_example_root, llm_mistral_model_root, llm_datasets_root,
-        llm_rouge_root, llm_venv, engine_dir, num_beams, qcache_dir, qformat):
+def test_llm_mistral_quantization_summary(llama_example_root,
+                                          llm_mistral_model_root,
+                                          llm_datasets_root, llm_rouge_root,
+                                          llm_venv, engine_dir, num_beams,
+                                          qcache_dir, tp_pp_size):
     "run mixtral fp8 on 2gpus"
-    data_type = "float16"
-    tp_size, pp_size = 4, 2
-    world_size = tp_size * pp_size
-
-    print("Quantizing engine...")
-    # Quantize HF llama checkpoint into FP8 format
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=llm_mistral_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype=data_type,
-        qformat=qformat,
-        quantize_dir=qcache_dir,
+    tp_size, pp_size = tp_pp_size
+    if get_device_count() < tp_size * pp_size:
+        pytest.skip(
+            f"Device number is less than {tp_size * pp_size}. Skipping.")
+    rouge1_threshold_map = {
+        'mistral-7b-v0.1': 21.0,
+        'Mistral-Small-24B-Base-2501': 23.0,
+        'Codestral-22B-v0.1': 25.0,
+        'Ministral-8B-Instruct-2410': 20.0,
+    }
+    os.path.basename(llm_mistral_model_root)
+    test_fp8_quantization(
+        llm_venv=llm_venv,
+        llama_example_root=llama_example_root,
+        model_root=llm_mistral_model_root,
+        llm_datasets_root=llm_datasets_root,
+        dtype='bfloat16',
+        qcache_dir=qcache_dir,
+        engine_dir=engine_dir,
+        run_type='summarization',
         tp_size=tp_size,
         pp_size=pp_size,
-        calib_size=32)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        f"--moe_plugin={data_type}",
-        f"--max_beam_width={num_beams}",
-        "--context_fmha=enable",
-        f"--workers={world_size}",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run summarize...")
-    tensorrt_llm_rouge1_threshold = 22.0
-
-    summary_cmd = generate_summary_cmd(
-        llama_example_root,
-        hf_model_dir=llm_mistral_model_root,
-        data_type="fp16",
+        calib_size=512,
         num_beams=num_beams,
-        tensorrt_llm_rouge1_threshold=tensorrt_llm_rouge1_threshold,
-        engine_dir=engine_dir,
-        dataset_dir=llm_datasets_root,
-        rouge_dir=llm_rouge_root)
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        summary_cmd)
+        rouge1_threshold=24.0,
+        llm_rouge_root=llm_rouge_root,
+    )
 
 
 @pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
@@ -693,28 +698,21 @@ def test_llm_mistral_lora_1gpu(llama_example_root, llm_mistral_model_root,
     venv_check_call(llm_venv, run_cmd)
 
 
-@skip_pre_ada
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("mistral_nemo_minitron_model_root",
-                         ['Mistral-NeMo-Minitron-8B-Instruct'],
-                         indirect=True)
-def test_mistral_nemo_minitron_fp8_with_bf16_lora(
+def test_fp8_model_with_bf16_lora(
     llama_example_root,
-    mistral_nemo_minitron_model_root,
+    model_root,
     llm_datasets_root,
     qcache_dir,
     llm_rouge_root,
     llm_venv,
     engine_dir,
-    num_beams=1,
+    num_beams,
 ):
-    "Run Mistral Nemo Minitron 8B with multiple pseudo LoRAs."
-
     # Quantize the base model to fp8.
     qmodel_dir = quantize_data(
         llm_venv,
         llama_example_root,
-        model_dir=mistral_nemo_minitron_model_root,
+        model_dir=model_root,
         calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
         dtype="bfloat16",
         qformat="fp8",
@@ -723,7 +721,7 @@ def test_mistral_nemo_minitron_fp8_with_bf16_lora(
         kv_cache_dtype="fp8")
 
     test_multi_lora_support(
-        hf_model_dir=mistral_nemo_minitron_model_root,
+        hf_model_dir=model_root,
         tllm_ckpt_dir=qmodel_dir,
         engine_dir=engine_dir,
         llm_venv=llm_venv,
@@ -816,3 +814,82 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
     ]
 
     venv_check_call(llm_venv, mmlu_cmd)
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("mistral_nemo_minitron_model_root",
+                         ['Mistral-NeMo-Minitron-8B-Instruct'],
+                         indirect=True)
+def test_mistral_nemo_minitron_fp8_with_bf16_lora(
+    llama_example_root,
+    mistral_nemo_minitron_model_root,
+    llm_datasets_root,
+    qcache_dir,
+    llm_rouge_root,
+    llm_venv,
+    engine_dir,
+    num_beams=1,
+):
+    "Run Mistral Nemo Minitron 8B with multiple pseudo LoRAs."
+    test_fp8_model_with_bf16_lora(llama_example_root=llama_example_root,
+                                  model_root=mistral_nemo_minitron_model_root,
+                                  llm_datasets_root=llm_datasets_root,
+                                  qcache_dir=qcache_dir,
+                                  llm_rouge_root=llm_rouge_root,
+                                  llm_venv=llm_venv,
+                                  engine_dir=engine_dir,
+                                  num_beams=num_beams)
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
+                         indirect=True)
+def test_mistral_nemo_fp8_with_bf16_lora(
+    llama_example_root,
+    mistral_nemo_model_root,
+    llm_datasets_root,
+    qcache_dir,
+    llm_rouge_root,
+    llm_venv,
+    engine_dir,
+    num_beams=1,
+):
+    "Run Mistral Nemo 12B with multiple pseudo LoRAs."
+    test_fp8_model_with_bf16_lora(llama_example_root=llama_example_root,
+                                  model_root=mistral_nemo_model_root,
+                                  llm_datasets_root=llm_datasets_root,
+                                  qcache_dir=qcache_dir,
+                                  llm_rouge_root=llm_rouge_root,
+                                  llm_venv=llm_venv,
+                                  engine_dir=engine_dir,
+                                  num_beams=num_beams)
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_mistral_model_root", [
+    'Codestral-22B-v0.1', 'Ministral-8B-Instruct-2410',
+    'Mistral-Small-24B-Base-2501', 'mistral-7b-v0.1'
+],
+                         indirect=True)
+def test_mistral_fp8_with_bf16_lora(
+    llama_example_root,
+    llm_mistral_model_root,
+    llm_datasets_root,
+    qcache_dir,
+    llm_rouge_root,
+    llm_venv,
+    engine_dir,
+    num_beams=1,
+):
+    "Run Mistral models with multiple pseudo LoRAs."
+    test_fp8_model_with_bf16_lora(llama_example_root=llama_example_root,
+                                  model_root=llm_mistral_model_root,
+                                  llm_datasets_root=llm_datasets_root,
+                                  qcache_dir=qcache_dir,
+                                  llm_rouge_root=llm_rouge_root,
+                                  llm_venv=llm_venv,
+                                  engine_dir=engine_dir,
+                                  num_beams=num_beams)

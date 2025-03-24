@@ -769,15 +769,13 @@ def generate_dummy_loras(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         zero_weights=False):
 
-    import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM
 
     print("Creating pseudo LoRAs...")
     model = AutoModelForCausalLM.from_pretrained(
         hf_model_dir,
-        torch_dtype=torch.float16,
-        device_map="auto",
+        device_map="cpu",
         trust_remote_code=True,
     )
     lora_config = LoraConfig(r=lora_rank,
@@ -896,7 +894,7 @@ def generate_dummy_medusa(hf_model_dir,
 
     # Create the base model.
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        hf_model_dir, trust_remote_code=True)
+        hf_model_dir, device_map="cpu", trust_remote_code=True)
 
     if mode == "medusa":
         config = {
@@ -914,7 +912,7 @@ def generate_dummy_medusa(hf_model_dir,
 
     # Create a dummy trainer.
     trainer = transformers.Trainer(model=model, tokenizer=tokenizer)
-    trainer._move_model_to_device(model, 'cuda')
+    trainer._move_model_to_device(model, 'cpu')
 
     # Enable HF checkpointing so that the saved model will contain the speculative decoding module.
     mto.enable_huggingface_checkpointing()

@@ -17,7 +17,7 @@ import os
 
 import pytest
 from defs.common import convert_weights, generate_dummy_medusa, venv_check_call
-from defs.conftest import skip_fp8_pre_ada
+from defs.conftest import skip_fp8_pre_ada, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
@@ -263,7 +263,7 @@ def test_llama_medusa_1gpu(llama_model_root,
                            engine_dir,
                            batch_size=1,
                            data_type='bfloat16',
-                           num_medusa_heads=4,
+                           num_medusa_heads=2,
                            use_py_session=True):
 
     test_with_dummy_medusa(hf_model_root=llama_model_root,
@@ -289,7 +289,7 @@ def test_codellama_medusa_1gpu(code_llama_model_root,
                                engine_dir,
                                batch_size=1,
                                data_type='bfloat16',
-                               num_medusa_heads=4,
+                               num_medusa_heads=2,
                                use_py_session=True):
 
     test_with_dummy_medusa(hf_model_root=code_llama_model_root,
@@ -304,7 +304,12 @@ def test_codellama_medusa_1gpu(code_llama_model_root,
                            model_type='llama')
 
 
-@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_mistral_model_root", [
+    'mistral-7b-v0.1', 'Codestral-22B-v0.1', 'Ministral-8B-Instruct-2410',
+    'Mistral-Small-24B-Base-2501'
+],
                          indirect=True)
 def test_mistral_medusa_1gpu(llm_mistral_model_root,
                              medusa_example_root,
@@ -315,7 +320,7 @@ def test_mistral_medusa_1gpu(llm_mistral_model_root,
                              engine_dir,
                              batch_size=1,
                              data_type='bfloat16',
-                             num_medusa_heads=4,
+                             num_medusa_heads=2,
                              use_py_session=True):
 
     test_with_dummy_medusa(hf_model_root=llm_mistral_model_root,
@@ -327,7 +332,7 @@ def test_mistral_medusa_1gpu(llm_mistral_model_root,
                            data_type=data_type,
                            num_medusa_heads=num_medusa_heads,
                            use_py_session=use_py_session,
-                           model_type='mistral')
+                           model_type='llama')
 
 
 @pytest.mark.parametrize("llm_qwen_model_root", [
@@ -344,7 +349,7 @@ def test_qwen_medusa_1gpu(llm_qwen_model_root,
                           engine_dir,
                           batch_size=1,
                           data_type='bfloat16',
-                          num_medusa_heads=4,
+                          num_medusa_heads=2,
                           use_py_session=True):
 
     test_with_dummy_medusa(hf_model_root=llm_qwen_model_root,
@@ -359,6 +364,8 @@ def test_qwen_medusa_1gpu(llm_qwen_model_root,
                            model_type='qwen')
 
 
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("llm_phi_model_root", [
     "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
     "Phi-3.5-mini-instruct"
@@ -373,7 +380,7 @@ def test_phi_medusa_1gpu(llm_phi_model_root,
                          engine_dir,
                          batch_size=1,
                          data_type='bfloat16',
-                         num_medusa_heads=4,
+                         num_medusa_heads=2,
                          use_py_session=True):
 
     test_with_dummy_medusa(hf_model_root=llm_phi_model_root,
@@ -386,3 +393,60 @@ def test_phi_medusa_1gpu(llm_phi_model_root,
                            num_medusa_heads=num_medusa_heads,
                            use_py_session=use_py_session,
                            model_type='phi')
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("mistral_nemo_minitron_model_root",
+                         ['Mistral-NeMo-Minitron-8B-Instruct'],
+                         indirect=True)
+def test_mistral_nemo_minitron_medusa_1gpu(mistral_nemo_minitron_model_root,
+                                           medusa_example_root,
+                                           llm_datasets_root,
+                                           llm_rouge_root,
+                                           llm_venv,
+                                           cmodel_dir,
+                                           engine_dir,
+                                           batch_size=1,
+                                           data_type='bfloat16',
+                                           num_medusa_heads=2,
+                                           use_py_session=True):
+
+    test_with_dummy_medusa(hf_model_root=mistral_nemo_minitron_model_root,
+                           medusa_example_root=medusa_example_root,
+                           llm_venv=llm_venv,
+                           cmodel_dir=cmodel_dir,
+                           engine_dir=engine_dir,
+                           batch_size=batch_size,
+                           data_type=data_type,
+                           num_medusa_heads=num_medusa_heads,
+                           use_py_session=use_py_session,
+                           model_type='llama')
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
+                         indirect=True)
+def test_mistral_nemo_medusa_1gpu(mistral_nemo_model_root,
+                                  medusa_example_root,
+                                  llm_datasets_root,
+                                  llm_rouge_root,
+                                  llm_venv,
+                                  cmodel_dir,
+                                  engine_dir,
+                                  batch_size=1,
+                                  data_type='bfloat16',
+                                  num_medusa_heads=2,
+                                  use_py_session=True):
+
+    test_with_dummy_medusa(hf_model_root=mistral_nemo_model_root,
+                           medusa_example_root=medusa_example_root,
+                           llm_venv=llm_venv,
+                           cmodel_dir=cmodel_dir,
+                           engine_dir=engine_dir,
+                           batch_size=batch_size,
+                           data_type=data_type,
+                           num_medusa_heads=num_medusa_heads,
+                           use_py_session=use_py_session,
+                           model_type='llama')
