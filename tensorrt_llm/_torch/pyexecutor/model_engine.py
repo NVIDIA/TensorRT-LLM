@@ -1258,6 +1258,10 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         # this is for no cache attention, not for dummy attention
         if not attn_metadata.is_dummy_attention and attn_metadata.kv_cache_manager is None:
+            assert isinstance(
+                attn_metadata,
+                (VanillaAttentionMetadata, TrtllmAttentionMetadata)
+            ), "Only vanilla and trtllm attention metadata are supported for no cache attention for now"
             attn_metadata.max_seq_len = self.max_seq_len
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
