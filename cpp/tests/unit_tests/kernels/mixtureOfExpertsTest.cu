@@ -539,7 +539,7 @@ protected:
 
             invokeFP4Quantization(out_shape, in_shape, weight_start, global_scales + i,
                 reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start), false,
-                mMultiProcessorCount, mStream->get());
+                tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
         }
     }
 
