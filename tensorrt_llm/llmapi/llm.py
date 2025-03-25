@@ -87,8 +87,8 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
 class LLM:
     """LLM class is the main class for running a LLM model.
 
-    Args:
-    """
+    Parameters:
+"""
 
     def __init__(self,
                  model: Union[str, Path],
