@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
@@ -559,6 +560,22 @@ void Executor::Impl::setOrchLeaderComm(
     else
     {
         mOrchLeaderComm = nullptr;
+    }
+    if (tensorrt_llm::common::getEnvUseUCXKvCache() && mWorldRank == 0 && !mIsWorker)
+    {
+        TLLM_LOG_DEBUG("rank %d | setOrchLeaderComm | participantId.back() %d",
+            tensorrt_llm::mpi::MpiComm::world().getRank(), participantIds.back());
+        if (std::find(participantIds.begin(), participantIds.end(), worldSize - 1) != participantIds.end())
+        {
+            TLLM_LOG_DEBUG("rank %d | mWorldRank %d | splitting world comm executorImpl",
+                tensorrt_llm::mpi::MpiComm::world().getRank(), mWorldRank);
+            auto worldComm = std::addressof(tensorrt_llm::mpi::MpiComm::session());
+            worldComm->barrier();
+            TLLM_LOG_DEBUG("rank %d | mWorldRank %d | splitting world comm executorImpl - barrier passed",
+                tensorrt_llm::mpi::MpiComm::world().getRank(), mWorldRank);
+            tensorrt_llm::mpi::MpiComm selfComm = worldComm->split(1, 0);
+            TLLM_LOG_DEBUG("rank %d | selfComm: %p", mWorldRank, selfComm.getSize());
+        }
     }
 #endif // ENABLE_MULTI_DEVICE
 }
