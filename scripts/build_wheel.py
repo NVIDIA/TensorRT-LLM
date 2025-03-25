@@ -24,6 +24,7 @@ from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import CalledProcessError, check_output, run
+from tempfile import TemporaryDirectory
 from textwrap import dedent
 from typing import List
 
@@ -220,6 +221,45 @@ def main(*,
         targets.append("executorWorker")
 
     source_dir = get_source_dir()
+
+    def install_conan():
+        # Determine the system ID
+        with Path("/etc/os-release").open("r") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    system_id = line.split("=")[1].strip()
+                    break
+            else:
+                system_id = "unknown"
+        # Install Conan if it's not already installed
+        # TODO move this install to the container image
+        conan_path = "conan"
+        if "rocky" not in system_id:
+            build_run(f"\"{sys.executable}\" -m pip install conan==2.14.0")
+        else:
+            conan_dir = Path(build_dir, "tool/conan")
+            conan_dir.mkdir(parents=True, exist_ok=True)
+            conan_path = conan_dir / "bin/conan"
+            if not conan_path.exists():
+                with TemporaryDirectory() as tmpdir:
+                    tmpdir_p = Path(tmpdir)
+                    archive_p = tmpdir_p / "conan.tgz"
+                    build_run(
+                        f"wget --retry-connrefused -O {archive_p} https://github.com/conan-io/conan/releases/download/2.14.0/conan-2.14.0-linux-x86_64.tgz"
+                    )
+                    build_run(f"tar -C {conan_dir} -xf {archive_p}")
+        # Install dependencies with Conan
+        build_run(
+            f"{conan_path} remote add -verror --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan"
+        )
+        build_run(f"{conan_path} profile detect -f")
+        build_run(
+            f"{conan_path} install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+        )
+        cmake_def_args.append(
+            f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake")
+
+    install_conan()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build or configure_cmake:
