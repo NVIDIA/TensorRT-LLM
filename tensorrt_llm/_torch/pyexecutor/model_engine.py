@@ -10,36 +10,33 @@ from typing import Any, Dict, Optional, Tuple
 import safetensors
 import torch
 
-import tensorrt_llm._torch
-import tensorrt_llm.bindings
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.attention_backend import *
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionMetadata, AttentionRuntimeFeatures)
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.metadata import *
-from tensorrt_llm._torch.models import AutoModelForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import MetaInitMode, timing
-from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
-from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, KVCacheManager)
-from tensorrt_llm._torch.speculative import (SpecConfig, SpecMetadata,
-                                             get_spec_metadata)
-from tensorrt_llm._torch.utils import set_torch_compiling
+from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
-from ..._utils import nvtx_range
-from ...models.modeling_utils import QuantAlgo
+from ..attention_backend.interface import (AttentionMetadata,
+                                           AttentionRuntimeFeatures)
+from ..attention_backend.utils import get_attention_backend
+from ..autotuner import AutoTuner, autotune
+from ..compilation.backend import Backend
+from ..metadata import KVCacheParams
+from ..model_config import ModelConfig
+from ..models import AutoModelForCausalLM
+from ..models.modeling_utils import MetaInitMode, timing
 from ..pipeline_interface import PipelineInterface
+from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
+from ..utils import set_torch_compiling
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .distributed import MPIDist
 from .guided_decoder import GuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .resource_manager import ResourceManager
+from .resource_manager import (BaseResourceManager, KVCacheManager,
+                               ResourceManager)
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
@@ -74,9 +71,8 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
 
 
-def validate_and_set_kv_cache_quant(
-        model_config: tensorrt_llm._torch.model_config.ModelConfig,
-        pyt_kv_cache_dtype: str) -> QuantAlgo:
+def validate_and_set_kv_cache_quant(model_config: ModelConfig,
+                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -224,8 +220,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional[SpecConfig] = None,
-        guided_decoding_config: Optional[
-            tensorrt_llm.bindings.executor.GuidedDecodingConfig] = None,
+        guided_decoding_config: Optional[GuidedDecodingConfig] = None,
     ):
         self.ub_buffers = None
         self.batch_size = batch_size
@@ -710,8 +705,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
                     **kwargs):
-        config = tensorrt_llm._torch.model_config.ModelConfig.from_pretrained(
-            checkpoint_dir, trust_remote_code=True, **kwargs)
+        config = ModelConfig.from_pretrained(checkpoint_dir,
+                                             trust_remote_code=True,
+                                             **kwargs)
         config.spec_config = self.spec_config
 
         validate_and_set_kv_cache_quant(
