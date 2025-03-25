@@ -1,8 +1,8 @@
 # DeepSeek‑V3
 
-This guide walks you through the complete process of running the Deepseek‑v3 model using NVIDIA's TRTLLM framework with the PyTorch backend. It covers everything from downloading the model weights, preparing the dataset and configuration files, to running the throughput benchmark.
+This guide walks you through the complete process of running the DeepSeek‑v3 model using NVIDIA's TensorRT-LLM framework with the PyTorch backend. It covers everything from downloading the model weights, preparing the dataset and configuration files, to running the throughput benchmark.
 
-> **Note:** This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TRT-LLM from source and docker image.
+> **Note:** This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and docker image.
 
 ---
 
@@ -26,7 +26,7 @@ This guide walks you through the complete process of running the Deepseek‑v3 m
 
 ## Overview
 
-Deepseek‑v3 is a high‑capacity language model that can be executed using NVIDIA's TRTLLM framework with a PyTorch backend. This guide details a benchmark recipe where you will:
+DeepSeek‑v3 is a high‑capacity language model that can be executed using NVIDIA's TensorRT-LLM framework with a PyTorch backend. This guide details a benchmark recipe where you will:
 
 - Download the model weights.
 - Build a test dataset.
@@ -38,13 +38,13 @@ Deepseek‑v3 is a high‑capacity language model that can be executed using NVI
 ## Hardware
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory. 8\*H100 (640GB) is not enough to accommodate the weights. The following steps have been tested on 8\*H20 141GB, we will test on 8*H20 96GB in the future.
 
-DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TRTLLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
+DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TensorRT-LLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
 
 ---
 
 ## Downloading the Model Weights
 
-Deepseek‑v3 model weights are available on [Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V3). To download the weights, execute the following commands (replace `<YOUR_MODEL_DIR>` with the target directory where you want the weights stored):
+DeepSeek‑v3 model weights are available on [Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-V3). To download the weights, execute the following commands (replace `<YOUR_MODEL_DIR>` with the target directory where you want the weights stored):
 
 ```bash
 git lfs install
@@ -165,7 +165,7 @@ Benchmark logs are saved to `/workspace/trt_bench.log`.
 ---
 
 ## Multi-node
-TRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
+TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
 
 ### mpirun
 mpirun requires each node to have passwordless ssh access to the other node. We need to setup the environment inside the docker container. Run the container with host network and mount the current directory as well as model directory to the container.
@@ -278,10 +278,10 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
 
 ### Advanced Features
 ### FlashMLA
-TRT-LLM has already integrated FlashMLA in the pytorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
 
 ### DeepGEMM
-TRT-LLM also supports DeepGEMM for DeepSeek-V3/R1. DeepGEMM provides significant e2e performance boost. DeepGEMM is enabled by an environment variable `TRTLLM_DG_ENABLED`:
+TensorRT-LLM also supports DeepGEMM for DeepSeek-V3/R1. DeepGEMM provides significant e2e performance boost. DeepGEMM is enabled by an environment variable `TRTLLM_DG_ENABLED`:
 
 ```bash
 #single-node
@@ -339,4 +339,4 @@ The cuda kernels of DeepGEMM are JIT compiled using NVCC. You need to install CU
 
 ---
 
-By following these steps, you should be able to successfully run the Deepseek‑v3 benchmark using TRTLLM with the PyTorch backend.
+By following these steps, you should be able to successfully run the DeepSeek‑v3 benchmark using TensorRT-LLM with the PyTorch backend.
