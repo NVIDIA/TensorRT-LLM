@@ -30,17 +30,46 @@ static void listenerCallback(ucp_conn_request_h connRequest, void* arg)
 
 static std::string getLocalIp()
 {
-    char hostname[256];
-    gethostname(hostname, sizeof(hostname));
-    struct hostent* hostEntry = gethostbyname(hostname);
-    if (hostEntry != nullptr)
+    struct ifaddrs *ifaddr, *ifa;
+    void* addr_ptr;
+    std::string ip("UNKNOWN IP");
+
+    // Get the list of network interfaces
+    if (getifaddrs(&ifaddr) == -1)
     {
-        return inet_ntoa(*((struct in_addr*) hostEntry->h_addr_list[0]));
+        perror("getifaddrs");
+        return ip;
     }
-    return "Unknown";
+
+    // Loop through the linked list of interfaces
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+    {
+        // Check if the interface is an IP interface
+        if (ifa->ifa_addr == nullptr)
+            continue;
+
+        // Check for InfiniBand interfaces (usually named ib0, ib1, etc.)
+        if (std::string(ifa->ifa_name).find("ib") == 0)
+        {
+            // Check if the address family is AF_INET (IPv4)
+            if (ifa->ifa_addr->sa_family == AF_INET)
+            {
+                addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
+                char address_buffer[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
+                std::cout << "InfiniBand Interface: " << ifa->ifa_name << " IP Address: " << address_buffer
+                          << std::endl;
+                ip = std::string(address_buffer);
+                break;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return ip;
 }
 
-UcxConnectionManager::UcxConnectionManager(mpi::MpiComm const* comm)
+UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm)
     : mComm(comm)
 {
     try
@@ -50,8 +79,17 @@ UcxConnectionManager::UcxConnectionManager(mpi::MpiComm const* comm)
         TLLM_CUDA_CHECK(cudaGetDevice(&device));
         mUcxCtx = ucxx::createContext({}, ucxx::Context::defaultFeatureFlags);
 
-        mWorkersPool.push_back(mUcxCtx->createWorker());
-        mWorkersPool.back().get()->startProgressThread(true);
+        try
+        {
+            mWorkersPool.push_back(mUcxCtx->createWorker());
+            mWorkersPool.back().get()->startProgressThread(true);
+        }
+        catch (std::exception const& e)
+        {
+            std::string error = "Error creating worker and starting progress thread for rank "
+                + std::to_string(mComm->getRank()) + ": " + std::string(e.what());
+            throw std::runtime_error(error);
+        }
 
         try
         {
@@ -72,13 +110,15 @@ UcxConnectionManager::UcxConnectionManager(mpi::MpiComm const* comm)
         std::vector<char> allIps(comm->getSize() * MAX_IP_LENGTH);
 
         // Perform Allgather operation
-        mComm->allgather(
-            localIpBuffer.data(), allIps.data(), comm->getSize() * MAX_IP_LENGTH, tensorrt_llm::mpi::MpiType::kCHAR);
+        std::cout << "rank " << comm->getRank() << " | allgather start"
+                  << " | comm size " << comm->getSize() << std::endl;
+        mComm->allgather(localIpBuffer.data(), allIps.data(), MAX_IP_LENGTH, tensorrt_llm::mpi::MpiType::kCHAR);
+        std::cout << "rank " << comm->getRank() << " | allgather done" << std::endl;
 
         for (int i = 0; i < comm->getSize(); i++)
         {
             std::string ip(allIps.data() + i * MAX_IP_LENGTH);
-            TLLM_LOG_DEBUG("rank %d | got IP %s from rank %d", comm->getRank(), ip.c_str(), i);
+            std::cout << "rank " << comm->getRank() << " | got IP " << ip << " from rank " << i << std::endl;
             mIpToMpiRank[ip] = i;
         }
         comm->barrier();
@@ -86,6 +126,8 @@ UcxConnectionManager::UcxConnectionManager(mpi::MpiComm const* comm)
         for (int i = comm->getRank() + 1; i < comm->getSize(); i++)
         {
             std::string ip(allIps.data() + i * MAX_IP_LENGTH);
+            std::cout << "rank " << comm->getRank() << " | adding connection to rank " << i << " | ip: " << ip
+                      << " | port: " << listenerPort + i << std::endl;
             addConnection(ip, listenerPort + i);
         }
     }
@@ -103,7 +145,7 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mListener->createEndpointFromConnRequest(connRequest, true);
         uint64_t id = getNewConnectionId(newEp);
-        mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp, shared_from_this()));
+        mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp));
     }
     catch (std::exception const& e)
     {
@@ -118,8 +160,13 @@ void UcxConnectionManager::addConnection(std::string ip, uint16_t port)
     try
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
+        std::cout << "rank " << mComm->getRank() << " passed createEndpointFromHostname | addConnection | ip: " << ip
+                  << " | port: " << port << std::endl;
         uint64_t id = getNewConnectionId(newEp);
-        mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp, shared_from_this()));
+        std::cout << "rank " << mComm->getRank() << " passed getNewConnectionId | addConnection | id: " << id
+                  << std::endl;
+        mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp));
+        std::cout << "rank " << mComm->getRank() << " passed emplace | addConnection | id: " << id << std::endl;
     }
     catch (std::exception const& e)
     {
@@ -137,26 +184,39 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
     char lIpStr[INET6_ADDRSTRLEN];
     char rIpStr[INET6_ADDRSTRLEN];
     char portStr[INET6_ADDRSTRLEN];
-    ucs_status_t status = ucp_ep_query(newEp->getHandle(), &ep_attr);
-    if (status == UCS_OK)
+    // ucs_status_t status = ucp_ep_query(newEp->getHandle(), &ep_attr);
+    while (ucp_ep_query(newEp->getHandle(), &ep_attr) != UCS_OK)
+        ;
+
+    ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
+    std::cout << "rank " << mComm->getRank()
+              << " passed sockaddr_get_ip_port_str | getNewConnectionId | rIpStr: " << rIpStr
+              << " | portStr: " << portStr << std::endl;
+    remotePort = static_cast<ucxx::Tag>(std::stoull(portStr));
+    std::cout << "rank " << mComm->getRank() << " passed stoull | getNewConnectionId | remotePort: " << remotePort
+              << std::endl;
+    remoteIp = std::stoull(rIpStr);
+    std::cout << "rank " << mComm->getRank()
+              << " passed sockaddr_get_ip_port_str | getNewConnectionId | portStr: " << portStr << std::endl;
+    ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.local_sockaddr, lIpStr, portStr, INET6_ADDRSTRLEN);
+    localPort = static_cast<ucxx::Tag>(std::stoull(portStr));
+    std::cout << "rank " << mComm->getRank() << " passed stoull | getNewConnectionId | lIpStr: " << lIpStr
+              << "| localPort: " << localPort << std::endl;
+    mMpiRankToConnectionId[mIpToMpiRank[std::string(rIpStr)]]
+        = ((remotePort << (32 + 16)) | (localPort << 32) | remoteIp);
+    std::cout << "rank " << mComm->getRank()
+              << " passed mMpiRankToConnectionId | getNewConnectionId | mMpiRankToConnectionId: "
+              << mMpiRankToConnectionId[mIpToMpiRank[std::string(rIpStr)]] << std::endl;
+    return ((remotePort << (32 + 16)) | (localPort << 32) | remoteIp);
+}
+
+void UcxConnectionManager::initializeConnections()
+{
+    for (auto& connection : mConnections)
     {
-        ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
-        remotePort = static_cast<ucxx::Tag>(std::stoull(portStr));
-        remoteIp = std::stoull(lIpStr);
-        ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.local_sockaddr, lIpStr, portStr, INET6_ADDRSTRLEN);
-        localPort = static_cast<ucxx::Tag>(std::stoull(portStr));
-        mMpiRankToConnectionId[mIpToMpiRank[std::string(rIpStr)]]
-            = ((remotePort << (32 + 16)) | (localPort << 32) | remoteIp);
-        return ((remotePort << (32 + 16)) | (localPort << 32) | remoteIp);
+        std::cout << "UcxConnectionManager::initializeConnections " << std::endl;
+        connection.second->initialize(shared_from_this());
     }
-    else
-    {
-        if (status == UCS_ERR_NOT_CONNECTED)
-        {
-            TLLM_LOG_ERROR("UCX connection has not been established yet");
-        }
-    }
-    return 0;
 }
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
@@ -195,10 +255,7 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
 #endif
 
 std::unique_ptr<ConnectionManager> makeMpiConnectionManager(mpi::MpiComm const* comm)
-{
-    try
-    {
-        return std::make_unique<UcxConnectionManager>(comm);
+return UcxConnectionManager::create(comm);
     }
     catch (std::exception const& e)
     {

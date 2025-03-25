@@ -29,11 +29,11 @@ class UcxConnection : public Connection
 {
 public:
     UcxConnection() = default;
-    explicit UcxConnection(
-        uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, std::shared_ptr<UcxConnectionManager> manager);
+    explicit UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint);
     // UcxConnection(UcxConnection&& other);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
+    void initialize(std::shared_ptr<UcxConnectionManager> manager);
 
 private:
     void initializeEndpointTag(int maxTryTimes = 10);
