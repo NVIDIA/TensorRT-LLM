@@ -123,18 +123,4 @@ private:
 //     std::unordered_set<std::string> mSelfIps;
 // };
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-
-extern "C"
-{
-    [[nodiscard]] std::unique_ptr<ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm);
-}
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
-
 } // namespace tensorrt_llm::executor::kv_cache
