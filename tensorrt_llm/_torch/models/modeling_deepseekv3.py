@@ -483,7 +483,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, wave
+        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
             0) > 128
 
