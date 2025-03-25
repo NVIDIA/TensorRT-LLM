@@ -1317,7 +1317,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // - The sequence did not switch to cyclic kv-cache during generation phase.
     //  A sequence is cyclic if its *minimum window size* is crossed, even if other window sizes were not reached.
     bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    for (auto& [_, manager] : mWindowBlockManagers)
     {
         if (storeBlocksForReuse)
         {
@@ -1806,11 +1806,11 @@ void KVCacheManager::addSequence(
         }
 
         // Consider the temporaryAttentionWindow when allocating blocks.
-        inputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
-        auto const numContextBlocks = tc::ceilDiv(inputLength, getTokensPerBlock());
+        auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
+        auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
         if (!sequence.isCyclic() && mEnableBlockReuse)
         {
-            mBlockManager.addSequence(sequence, inputLength, numContextBlocks, *llmRequest, windowSize);
+            mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
         }
         else
         {
