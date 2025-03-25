@@ -9,7 +9,7 @@ from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
-from ..shim.interface import CachedSequenceInterface, AutoDeployConfig
+from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
 from ..utils.logger import ad_logger
 from ._graph import move_to_device
 from .export import torch_export_to_gm
@@ -25,6 +25,7 @@ from .library import (
     match_moe_pattern,
     quantize,
 )
+
 
 class InferenceOptimizer:
     def __init__(
@@ -162,9 +163,9 @@ class InferenceOptimizer:
         egm(*cm.args)
         free_mem_post, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
-        memory_for_forward_pass = (free_mem_pre - free_mem_post)
+        memory_for_forward_pass = free_mem_pre - free_mem_post
         ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
-        
+
         # FIXME: 0.8 is hard coded to ensure we have enough memory for graph capture.
         new_cache_size = free_mem_post * 0.8 + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
@@ -178,7 +179,9 @@ class InferenceOptimizer:
         cm.info._set_generate_only_batch()
         compiler_kwargs = {"cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes}
         egm_compiled = compile_and_capture(
-            egm, self.compile_backend, args=cm.args, 
+            egm,
+            self.compile_backend,
+            args=cm.args,
             kwargs=compiler_kwargs,
             dynamic_shapes=cm.dynamic_shapes,
         )
