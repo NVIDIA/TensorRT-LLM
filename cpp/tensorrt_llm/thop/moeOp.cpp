@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/common/workspace.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
