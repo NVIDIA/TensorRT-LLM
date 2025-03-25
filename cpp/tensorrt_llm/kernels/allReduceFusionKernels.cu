@@ -406,49 +406,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 }
 
 template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_oneshot_sync(AllReduceFusionParams params)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-
-    int token_id = blockIdx.x / cluster.num_blocks();
-    int access_id_in_token = cluster.block_rank() * blockDim.x + threadIdx.x;
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int token_stride = gridDim.x / cluster.num_blocks();
-    int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
-    int tot_access = params.size / kElemsPerAccess;
-    cudaGridDependencySynchronize();
-    SyncComm<NRanks> comm(params.workspace);
-    for (int idx = access_id; idx < tot_access; idx += access_stride)
-    {
-        float4 val;
-        val = reinterpret_cast<float4*>(params.allreduce_in)[idx];
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r)
-        {
-            reinterpret_cast<float4*>(comm.comm_bufs[r])[params.rank * tot_access + idx] = val;
-        }
-    }
-    Barrier<NRanks> barrier(params.rank, comm);
-    barrier.sync();
-    for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
-    {
-        float4 vals[NRanks];
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r)
-        {
-            vals[r] = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[r * tot_access + idx];
-        }
-        float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
-    }
-    comm.update(barrier.m_flag_value);
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
 __global__ void allreduce_fusion_kernel_twoshot_sync(
     AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
@@ -536,13 +493,6 @@ void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfi
 }
 
 template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-void launch_oneshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
-{
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &cfg, allreduce_fusion_kernel_oneshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>, params));
-}
-
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
 void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg,
     std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
@@ -612,7 +562,6 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     if (oneshot)
     {
         launch_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(params, cfg);
-        // launch_oneshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(params, cfg);
     }
     else
     {
