@@ -29,13 +29,12 @@ def repr_annotation(field_type: type) -> str:
 
 @dataclass(slots=True)
 class ParamSnapshot:
-    name: str
     annotation: type
     default: Any = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
-        return cls(param.name, param.annotation, param.default)
+        return cls(param.annotation, param.default)
 
     @classmethod
     def from_docstring(cls, param: docstring_parser.common.DocstringParam):
@@ -58,7 +57,7 @@ class ParamSnapshot:
             except (NameError, SyntaxError):
                 default = param.default
 
-        return cls(param.arg_name, annotation, default)
+        return cls(annotation, default)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -78,19 +77,17 @@ class ParamSnapshot:
         return d
 
     def assert_equal(self, other: 'ParamSnapshot'):
-        assert self.name == other.name
         assert self.annotation == other.annotation
         assert self.default == other.default
 
 
 @dataclass(slots=True)
 class MethodSnapshot:
-    name: str
     parameters: Dict[str, ParamSnapshot]
     return_annotation: type
 
     @classmethod
-    def from_inspect(cls, name: str, method: MethodType):
+    def from_inspect(cls, method: MethodType):
         signature = inspect.signature(method)
         parameters = {}
         for param_name, param in signature.parameters.items():
@@ -100,10 +97,10 @@ class MethodSnapshot:
         return_annotation = signature.return_annotation
         if isinstance(return_annotation, str):
             return_annotation = eval(return_annotation)
-        return cls(name, parameters, return_annotation)
+        return cls(parameters, return_annotation)
 
     @classmethod
-    def from_docstring(cls, name: str, method: MethodType):
+    def from_docstring(cls, method: MethodType):
         doc = docstring_parser.parse(method.__doc__)
         parameters = {}
         for param in doc.params:
@@ -113,7 +110,7 @@ class MethodSnapshot:
             return_annotation = None
         else:
             return_annotation = eval(doc.returns.type_name)
-        return cls(name, parameters, return_annotation)
+        return cls(parameters, return_annotation)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -134,20 +131,17 @@ class MethodSnapshot:
         return d
 
     def merge(self, other: 'MethodSnapshot'):
-        assert self.name == other.name
         assert self.parameters.keys().isdisjoint(other.parameters.keys())
         self.parameters.update(copy.deepcopy(other.parameters))
         assert self.return_annotation == other.return_annotation
 
     def assert_equal(self, other: 'MethodSnapshot'):
-        assert self.name == other.name
         assert self.parameters.keys() == other.parameters.keys()
         for name, param in self.parameters.items():
             param.assert_equal(other.parameters[name])
         assert self.return_annotation == other.return_annotation
 
     def assert_containing(self, other: 'MethodSnapshot'):
-        assert self.name == other.name
         for name, param in other.parameters.items():
             assert name in self.parameters
             self.parameters[name].assert_equal(param)
@@ -167,16 +161,14 @@ class ClassSnapshot:
                 inst, predicate=inspect.ismethod):
             if method_name.startswith("_") and method_name != "__init__":
                 continue
-            methods[method_name] = MethodSnapshot.from_inspect(
-                method_name, method)
+            methods[method_name] = MethodSnapshot.from_inspect(method)
         properties = {}
         for prop_name, prop in inspect.getmembers(
                 snapshot_cls, predicate=lambda x: isinstance(x, property)):
             if prop_name.startswith("_"):
                 continue
             annotation = inspect.signature(prop.fget).return_annotation
-            properties[prop_name] = ParamSnapshot(prop_name, annotation,
-                                                  inspect._empty)
+            properties[prop_name] = ParamSnapshot(annotation, inspect._empty)
         return cls(methods, properties)
 
     @classmethod
@@ -189,10 +181,9 @@ class ClassSnapshot:
                 continue
             if method_name == "__init__":
                 methods["__init__"] = MethodSnapshot.from_docstring(
-                    "__init__", snapshot_cls)
+                    snapshot_cls)
             else:
-                methods[method_name] = MethodSnapshot.from_docstring(
-                    method_name, method)
+                methods[method_name] = MethodSnapshot.from_docstring(method)
         properties = {}
         doc = docstring_parser.parse(snapshot_cls.__doc__)
         for param in doc.params:

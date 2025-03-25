@@ -1,36 +1,28 @@
 methods:
   __init__:
-    name: __init__
     parameters:
       # Experimental features
       additional_model_outputs:
         annotation: Optional[List[tensorrt_llm.sampling_params.AdditionalModelOutput]]
         default: null
-        name: additional_model_outputs
       return_perf_metrics:
         annotation: bool
         default: false
-        name: return_perf_metrics
       # Deprecated arguments
       beam_width:
         annotation: int
         default: 1
-        name: beam_width
       max_new_tokens:
         annotation: Optional[int]
         default: null
-        name: max_new_tokens
       min_length:
         annotation: Optional[int]
         default: null
-        name: min_length
       num_return_sequences:
         annotation: Optional[int]
         default: null
-        name: num_return_sequences
       random_seed:
         annotation: Optional[int]
         default: null
-        name: random_seed
     return_annotation: None
 properties: {}
