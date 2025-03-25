@@ -365,7 +365,7 @@ def parse_args():
     parser.add_argument("--test_trt_llm", action="store_true")
     parser.add_argument("--test_hf", action="store_true")
     parser.add_argument('--check_accuracy', action='store_true')
-    parser.add_argument('--accuracy_threshold', type=float, default=0.3)
+    parser.add_argument('--accuracy_threshold', type=float, default=30)
     parser.add_argument('--max_ite', type=int, default=10000000)
     parser = add_common_args(parser)
 
@@ -480,15 +480,16 @@ def main():
 
     if runtime_rank == 0:
         for subcat in subcat_cors:
-            subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
-            print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
+            acc = np.mean(np.concatenate(subcat_cors[subcat])) * 100
+            print(f"Average accuracy {acc:.2f} - {subcat}")
 
         for cat in cat_cors:
-            cat_acc = np.mean(np.concatenate(cat_cors[cat]))
-            print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
+            acc = np.mean(np.concatenate(cat_cors[cat])) * 100
+            print(f"Average accuracy {acc:.2f} - {cat}")
 
-        weighted_acc = np.mean(np.concatenate(all_cors))
-        print("Average accuracy: {:.3f}".format(weighted_acc))
+        weighted_acc = np.mean(np.concatenate(all_cors)) * 100
+        print(f"MMLU weighted average accuracy: {weighted_acc:.2f}")
+
         if args.check_accuracy:
             assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
         return weighted_acc
