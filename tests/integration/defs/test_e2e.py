@@ -467,6 +467,27 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     check_call(benchmark_cmd, shell=True)
 
 
+def test_trtllm_bench_mgmn(llm_root, llm_venv):
+    model_name = "meta-llama/Llama-3.1-8B"
+    llama_model_dir = Path(
+        llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
+    dataset_path = trtllm_bench_prolog(llm_root,
+                                       llm_venv,
+                                       engine_dir=None,
+                                       model_subdir=llama_model_dir,
+                                       model_name=model_name,
+                                       quant=None,
+                                       streaming=False,
+                                       skip_engine_build=True)
+    benchmark_cmd = \
+        f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
+        f"--model_path {llama_model_dir} " \
+        f"throughput " \
+        f"--dataset {dataset_path} --backend pytorch --tp 2"
+
+    check_call(benchmark_cmd, shell=True)
+
+
 @pytest.mark.parametrize("model_subdir", [
     "llama-3.1-model/Meta-Llama-3.1-8B",
 ],
