@@ -471,10 +471,6 @@ examples/test_medusa.py::test_codellama_medusa_1gpu[CodeLlama-7b-Instruct] SKIP 
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-v2-7b-hf] SKIP (https://nvbugs/5155143)
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.2-1b] SKIP (https://nvbugs/5155143)
 examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.1-8b] SKIP (https://nvbugs/5155143)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
 examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2b-smooth_quant-float16-8] SKIP (https://nvbugs/5158743)
 
 full:L40S/accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype SKIP (https://nvbugs/5176851)
