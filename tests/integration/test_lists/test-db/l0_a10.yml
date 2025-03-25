@@ -125,7 +125,6 @@ l0_a10:
   - test_e2e.py::test_benchmark_sanity[t5_base]
   - examples/test_openai.py::test_llm_openai_triton_1gpu
   - examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu
-  - test_e2e.py::test_model_api_examples # check with Tao can we remove it
   - test_e2e.py::test_build_time_benchmark_sanity
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 4 mins

@@ -152,5 +152,4 @@ l0_h100:
   - test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b] # 55.77s H100 only
   - test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m] # 34.07s H100 only
   - unittest/bindings # 8 mins on H100
-  - test_e2e.py::test_model_api_examples
   - test_e2e.py::test_build_time_benchmark_sanity
