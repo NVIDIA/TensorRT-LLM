@@ -130,7 +130,6 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     req->checkError();
 }
 
-
 } // namespace tensorrt_llm::executor::kv_cache
 
 #endif
