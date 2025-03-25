@@ -20,9 +20,6 @@ file(GLOB_RECURSE SRC_CPP *.cpp)
 set(SRC_CU)
 set(SRC_CU_EXTRA)
 
-# Exclude files in nvrtcWrapper folder.
-list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
-
 filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
