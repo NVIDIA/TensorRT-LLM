@@ -333,6 +333,7 @@ public:
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
+        , mCyclicThreshold(windowSizeToMetadata.cbegin()->second.maxTokenNum) // min window size + sink bubble length
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
         mCacheBlockIds.reserve(numWindowSizes);
@@ -435,9 +436,9 @@ public:
     // @brief Check whether the sequence uses cyclic KV cache.
     // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
     // @details If `true`, we cannot store the sequence's KV cache for reuse.
-    [[nodiscard]] bool isCyclic(WindowSizeMetadata metadata) const
+    [[nodiscard]] bool isCyclic() const
     {
-        return mNumTokens >= metadata.maxTokenNum;
+        return mNumTokens >= mCyclicThreshold;
     }
 
 private:
@@ -453,6 +454,9 @@ private:
     std::unordered_map<SizeType32, runtime::ITensor::SharedPtr> mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
+
+    // Number of tokens at which the KV Cache begins sliding [for the minimum attention window]
+    SizeType32 mCyclicThreshold;
 };
 
 // attach metadata to a pool pointer

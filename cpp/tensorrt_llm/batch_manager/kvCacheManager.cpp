@@ -534,12 +534,8 @@ bool WindowBlockManager::verifyQueueIntegrity()
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
     constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
-    for (auto const& [windowSize, metadata] : mWindowSizeToMetadata)
+    for (auto const& [windowSize, _] : mWindowBlockManagers)
     {
-        if (sequence.isCyclic(metadata))
-        {
-            continue;
-        }
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
@@ -1319,11 +1315,11 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
     // the max attention window).
     // - The sequence did not switch to cyclic kv-cache during generation phase.
+    //  A sequence is cyclic if its *minimum window size* is crossed, even if other window sizes were not reached.
+    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        auto const& metadata = mWindowSizeToMetadata.at(windowSize);
-        bool const store = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic(metadata);
-        if (store)
+        if (storeBlocksForReuse)
         {
             manager.storeBlocksForReuse(sequence, llmRequest);
         }
@@ -1802,8 +1798,7 @@ void KVCacheManager::addSequence(
         // Get block index that with shareAmongBeams=False.
         // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
         SizeType32 unsharedBlockIdx = -1;
-        if ((!sequence.isCyclic(metadata) || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0)
-            && !isCrossKv())
+        if ((!sequence.isCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
         {
             unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
                 ? finalTokenKVIdx / getTokensPerBlock() + 1
@@ -1813,7 +1808,7 @@ void KVCacheManager::addSequence(
         // Consider the temporaryAttentionWindow when allocating blocks.
         inputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
         auto const numContextBlocks = tc::ceilDiv(inputLength, getTokensPerBlock());
-        if (!sequence.isCyclic(metadata) && mEnableBlockReuse)
+        if (!sequence.isCyclic() && mEnableBlockReuse)
         {
             mBlockManager.addSequence(sequence, inputLength, numContextBlocks, *llmRequest, windowSize);
         }
@@ -1822,7 +1817,8 @@ void KVCacheManager::addSequence(
             if (!mEnableBlockReuse && llmRequest && llmRequest->getKvCacheRetentionConfig().has_value())
             {
                 TLLM_LOG_WARNING(
-                    "Request %d has a retention configuration set, but block reuse is disabled. The retention config "
+                    "Request %d has a retention configuration set, but block reuse is disabled. The retention "
+                    "config "
                     "will "
                     "have no effect.",
                     llmRequest->mRequestId);
@@ -1871,7 +1867,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse)
+    if (mEnableBlockReuse && !sequence.isCyclic())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }
@@ -2115,8 +2111,8 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
             wholeSequenceLength, sinkTokenLength, maxAttentionWindow, tokensPerBlock);
     }
 
-    // If the whole attention window can fit in the output, then we can simply multiply the cost of a sequence of length
-    // max attention window by the beam width.
+    // If the whole attention window can fit in the output, then we can simply multiply the cost of a sequence of
+    // length max attention window by the beam width.
     if (maxAttentionWindow <= outputLength)
     {
         return KVCacheManager::calculateMaxBlockRequirementsPerBeam(
@@ -2148,9 +2144,9 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
         return (blockCapacity / beamWidth) * tokensPerBlock;
     }
 
-    // Otherwise, we need to determine how many context tokens we can fit on top of the output tokens. First, there are
-    // a few context tokens we might be able to fit 'for free' because the output is not a multiple of the number of
-    // tokens per block.
+    // Otherwise, we need to determine how many context tokens we can fit on top of the output tokens. First, there
+    // are a few context tokens we might be able to fit 'for free' because the output is not a multiple of the
+    // number of tokens per block.
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
 }
