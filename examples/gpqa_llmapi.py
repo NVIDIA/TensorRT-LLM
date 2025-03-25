@@ -314,11 +314,11 @@ def parse_args():
                         help="Maximum number of tokens")
     parser.add_argument("--tp_size",
                         type=int,
-                        default=8,
+                        default=1,
                         help="Tensor Parallel size (only for pytorch backend)")
     parser.add_argument("--ep_size",
                         type=int,
-                        default=4,
+                        default=1,
                         help="Expert Parallel size (only for pytorch backend)")
 
     # KV cache
@@ -330,9 +330,10 @@ def parse_args():
                         default=True,
                         action='store_false',
                         help='Enable block reuse for KV cache')
+    # TODO: change the default value back to 0.95
     parser.add_argument("--kv_cache_fraction",
                         type=float,
-                        default=0.95,
+                        default=0.85,
                         help='Fraction of KV cache to use')
 
     # Optimizations
