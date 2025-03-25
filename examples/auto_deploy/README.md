@@ -67,14 +67,22 @@ The exported graph then undergoes a series of automated transformations, includi
 
 AutoDeploy officially supports a range of Hugging Face models that have been tested to work out of the box:
 
-| Model Series | HF Model Card | Precision | Supported Config |
-| ------ | ------ |------ | ------ |
-| LLaMA | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
-| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
-| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | FP8 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
-| DeepSeek | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
-| Mistral | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
-| BigCode | bigcode/starcoder2-15b | FP32 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
+<details>
+<summary>Click to expand supported models list</summary>
+
+| Model Series | HF Model Card | Precision | World Size | Runtime | Compile Backend || Attention Backend ||
+|--------------|----------------------|-----------|------------|---------|-----------------|--------------------|--------|--------------------|
+|              |               |           |            |         | torch-simple    | torch-opt          | TritonWithFlattenedInputs | FlashInfer |
+| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+
+</details>
+
+**Bring Your Own Model**: AutoDeploy utilizes `torch.export` and graph pattern matching rather than hard-coded architectures. Therefore, many models beyond our officially tested ones are supported out-of-the-box. Users have successfully deployed various additional models without modifications.
 
 ### Runtime Integrations
 
@@ -198,6 +206,9 @@ AutoDeploy can be seamlessly integrated into your existing workflows using TRT-L
 
 Here is an example of how you can build an LLM object with AutoDeploy integration:
 
+<details>
+<summary>Click to expand the example</summary>
+
 ```
 from tensorrt_llm import LLM
 from tensorrt_llm.builder import BuildConfig
@@ -234,6 +245,8 @@ llm = LLM(
 )
 
 ```
+
+</details>
 
 For more examples on TRT-LLM LLM API, visit [`this page`](https://nvidia.github.io/TensorRT-LLM/llm-api-examples/).
 
