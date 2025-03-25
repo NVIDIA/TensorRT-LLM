@@ -421,6 +421,11 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
     auto const processNum = std::get<0>(GetParam());
     auto const modelNames = std::get<1>(GetParam());
     auto const participantIdsEachInstance = std::get<2>(GetParam());       // std::vector<std::vector<int>>
@@ -632,6 +637,11 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     if (!(tensorrt_llm::common::getEnvUseUCXKvCache()))
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
+    }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
     }
     auto const processNum = std::get<0>(GetParam());
     auto const modelNames = std::get<1>(GetParam());
