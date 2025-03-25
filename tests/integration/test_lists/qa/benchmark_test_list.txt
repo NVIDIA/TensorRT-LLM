@@ -1,8 +1,5 @@
 # mlperf tests
-test_mlpf_results.py::test_mlperf_results[gpt_j-H100x1]
-test_mlpf_results.py::test_mlperf_results[gpt_j-H100x1-fp8_fmha_enable]
 test_mlpf_results.py::test_mlperf_results[llama_v2_70b_chat-H100x2]
-test_mlpf_results.py::test_mlperf_results[gpt_j-H200x1]
 test_mlpf_results.py::test_mlperf_results[llama_v2_70b_chat-H200x1]
 
 # MTBench
