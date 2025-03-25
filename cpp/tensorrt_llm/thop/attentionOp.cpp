@@ -190,20 +190,15 @@ public:
         int const cyclic_attention_window_size = attention_window_size;
         bool const can_use_one_more_block = beam_width > 1;
 
-        int max_blocks_per_sequence = kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-        int32_t const pool_index = kv_cache_block_offsets.has_value()
-            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
-            : 0;
-        int32_t const layer_idx_in_cache_pool = kv_cache_block_offsets.has_value()
-            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
-            : 0;
-        KVBlockArray::DataType* block_offsets = static_cast<KVBlockArray::DataType*>(kv_cache_block_offsets.has_value()
-                ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                : nullptr);
-        KVBlockArray::DataType* host_block_offsets
-            = static_cast<KVBlockArray::DataType*>(host_kv_cache_block_offsets.has_value()
-                    ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
-                    : nullptr);
+        int max_blocks_per_sequence = op.useKVCache() ? kv_cache_block_offsets.value().size(-1) : 0;
+        int32_t const pool_index
+            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>() : 0;
+        int32_t const layer_idx_in_cache_pool
+            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>() : 0;
+        KVBlockArray::DataType* block_offsets = static_cast<KVBlockArray::DataType*>(
+            op.useKVCache() ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
+        KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
+            op.useKVCache() ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
 
         auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
@@ -437,10 +432,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
     op->mUseKVCache = use_kv_cache;
     op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
-    if (tokens_per_block.has_value())
-    {
-        op->mTokensPerBlock = tokens_per_block.value();
-    }
+    op->mTokensPerBlock = tokens_per_block.value_or(0);
     op->mMaxContextLength = max_context_length;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType

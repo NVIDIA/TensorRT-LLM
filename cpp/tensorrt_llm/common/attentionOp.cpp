@@ -2323,20 +2323,16 @@ int AttentionOp::initialize() noexcept
 
         if (isCrossAttention())
         {
-            // Temporary check for cross attention
-            TLLM_CHECK_DEBUG(mMaskType == tensorrt_llm::kernels::AttentionMaskType::PADDING);
             // always use paged-kv-fmha if paged_kv cache is used.
             fmhaParams.attentionInputLayout
                 = mPagedKVCache ? AttentionInputLayout::Q_PAGED_KV : AttentionInputLayout::Q_CONTIGUOUS_KV;
         }
-        else if (!mUseKVCache)
+        else if (!useKVCache())
         {
             fmhaParams.attentionInputLayout = AttentionInputLayout::PACKED_QKV;
         }
         else
         {
-            // Temporary check for other attention types
-            TLLM_CHECK_DEBUG(mMaskType == tensorrt_llm::kernels::AttentionMaskType::CAUSAL);
             fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA && !mIsMLAEnabled)
                 ? AttentionInputLayout::Q_PAGED_KV
                 : AttentionInputLayout::PACKED_QKV;
