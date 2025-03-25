@@ -183,7 +183,6 @@ public:
     void prepareDisaggGenInitRequests(RequestList const& activeRequests, RequestVector& newGenReques);
     void checkDisaggGenTransferStatus(RequestList const& activeRequests);
     void prepareDistGenBufferAndDecoder(RequestVector const& generationRequests);
-    RequestVector scheduleDistGenInitRequests(RequestList const& activeRequests);
 
     void resetIterationStats() override;
 
@@ -306,8 +305,6 @@ private:
     /// @param[in] genBufferId The id of the generation buffers for those requests.
     void copyCacheIndirectionFromOutputsToInputs(ScheduledRequests const& scheduledRequests, SizeType32 genBufferId);
 
-    void invokeLogitsPostProcessors(ScheduledRequests const& scheduledRequests);
-
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {
         return getModelConfig().computeGenerationLogits() || mGatherGenerationLogits;
@@ -335,13 +332,6 @@ private:
     [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
     void reshapeKvTensors(SizeType32 maxBlocksPerSeq, kv_cache_manager::CacheType kvCacheType, SizeType32 numPools);
-
-    // This function waits for MPI async sends on a separate thread
-    void asyncSendWaitThread();
-
-    void draftModelSendLogitsThread();
-    std::optional<TensorPtr> targetModelReceiveLogits(
-        executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo);
 
     [[nodiscard]] bool hasSpeculativeDecodingFastLogits() const noexcept override
     {
