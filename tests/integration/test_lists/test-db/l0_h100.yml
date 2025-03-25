@@ -146,7 +146,6 @@ l0_h100:
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
-  - examples/test_gptj.py::test_llm_gptj_fp8_manage_weights_summary
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/model_api/test_model_quantization.py # 20 mins on H100
   - test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b] # 55.77s H100 only
