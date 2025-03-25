@@ -112,19 +112,19 @@ l0_a10:
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
   - accuracy/test_accuracy.py::TestGpt2::test_context_fmha_disabled # 1 min
-  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache
-  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache_beam_search
   - accuracy/test_accuracy.py::TestLlama7B::test_auto_dtype # 2 mins
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestPhi2::test_auto_dtype # 2 mins
+  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - test_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min
   - test_e2e.py::test_benchmark_sanity[t5_base]
   - examples/test_openai.py::test_llm_openai_triton_1gpu
   - examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu
-  - test_e2e.py::test_model_api_examples # check with Tao can we remove it
   - test_e2e.py::test_build_time_benchmark_sanity
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 4 mins

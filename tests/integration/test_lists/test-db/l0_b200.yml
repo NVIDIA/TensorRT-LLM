@@ -26,15 +26,14 @@ l0_b200:
   - examples/test_pytorch.py::test_llm_deepseek_1gpu[deepseek-v3-lite-disable_fp8-enable_fp4]
   - examples/test_pytorch.py::test_llm_deepseek_1gpu[deepseek-v3-lite-disable_fp8-disable_fp4]
   # ------------- TRT tests ---------------
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4_model_config[llama-v3-8b-instruct-hf-fp4_plugin] # 4 mins
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-v3-8b-instruct-hf-enable_norm_quant_fusion-disable_fused_quant-fp4_plugin-float16]
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-v3-8b-instruct-hf-enable_norm_quant_fusion-enable_fused_quant-fp4_plugin-float16]
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-v3-8b-instruct-hf-disable_norm_quant_fusion-disable_fused_quant-fp4_plugin-float16]
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-v3-8b-instruct-hf-disable_norm_quant_fusion-enable_fused_quant-fp4_plugin-float16]
-  - examples/test_llama.py::test_llm_llama_1gpu_fp4[llama-v3-8b-instruct-hf-disable_norm_quant_fusion-disable_fused_quant-fp4_ootb-float16]
+  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4
+  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
+  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-enable_fused_quant]
+  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-disable_fused_quant]
+  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
   - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_auto_dtype
   - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_fp8
+  - accuracy/test_accuracy.py::TestMixtral8x7B::test_nvfp4_pre_quantized
   - unittest/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - examples/test_mixtral.py::test_llm_mixtral_1gpu_fp4_llmapi[Mixtral-8x7B-Instruct-v0.1] # 9 mins on B200
   - unittest/functional/test_fp4_gemm.py # 3 mins on B200
