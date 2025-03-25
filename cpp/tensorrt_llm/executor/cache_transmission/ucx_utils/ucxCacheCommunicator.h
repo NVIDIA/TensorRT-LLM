@@ -55,6 +55,7 @@ private:
 
 public:
     explicit UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
+    ~UcxConnectionManager();
 
     // Factory function
     static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
