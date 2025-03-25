@@ -10,8 +10,22 @@
  * its affiliates is strictly prohibited.
  */
 
-#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
+
+#if defined(_WIN32)
+#include <windows.h>
+#define dllOpen(name) LoadLibrary(name ".dll")
+#define dllClose(handle) FreeLibrary(static_cast<HMODULE>(handle))
+#define dllGetSym(handle, name) static_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name))
+#else // For non-Windows platforms
+#include <dlfcn.h>
+#define dllOpen(name) dlopen("lib" name ".so", RTLD_LAZY)
+#define dllClose(handle) dlclose(handle)
+#define dllGetSym(handle, name) dlsym(handle, name)
+#endif // defined(_WIN32)
+
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
@@ -51,6 +65,7 @@ using testing::ReturnRef;
 
 namespace
 {
+std::mutex mDllMutex;
 
 template <typename T>
 T serializeDeserialize(T const& val)
@@ -298,8 +313,30 @@ protected:
             CacheType::kSELF, std::nullopt, nullptr, true);
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(
             numLayers, numHeads, sizePerHead, tokensPerBlock, 1, 1, dataType);
-        mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
 
+        if (tensorrt_llm::common::getEnvUseUCXKvCache())
+        {
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            void* WrapperLibHandle{nullptr};
+            WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)(
+                tensorrt_llm::mpi::MpiComm const* comm);
+            *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
+            mConnectionManager = makeUcxConnectionManager(mComm);
+        }
+        else
+        {
+            mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
+        }
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
         mManager->allocatePools(dataType, useUvm);
