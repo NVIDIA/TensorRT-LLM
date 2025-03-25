@@ -85,7 +85,7 @@ def _test_llm_multimodal_general(llm_venv,
     # ckpt from llm_models/<model_name> --> cmodels/<model_name>/<dtype>
     model_name = tllm_model_name
     model_name = "pix2struct" if model_name == "deplot" else model_name
-    opt_example_root = multimodal_example_root + "/../opt"
+    opt_example_root = multimodal_example_root + "/../models/contrib/opt"
     enc_dec_example_root = multimodal_example_root + "/../enc_dec"
     llama_example_root = multimodal_example_root + "/../llama"
     cogvlm_example_root = multimodal_example_root + "/../cogvlm"
