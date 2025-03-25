@@ -39,12 +39,16 @@ All the integration tests are launched by pytest. The integration tests are curr
 
 You can read the pytest official doc for details, https://docs.pytest.org/en/stable/
 
+### Prepare model files (Non-NVIDIA developers)
+
+Many integration tests rely on real model data. To correctly run the integration test, you must place all needed models in a directory and set environment variable `LLM_MODELS_ROOT` to it.
+
+The subdirectory hierarchy of each model can be found in the codebase. For example, `bert_example_root` in `integration/defs/conftest.py`.
+
 Examples to run integration test locally.
 
 ```bash
-# The integration tests will read the models weights data from path specified LLM_MODELS_ROOT env
-# Test would fail or be skipped if LLM_MODELS_ROOT is not set to a correct directory.
-export LLM_MODELS_ROOT=/home/scratch.trt_llm_data/llm-models
+export LLM_MODELS_ROOT=/path-to-models
 
 # in root dir
 pip install -r requirements-dev.txt
@@ -84,15 +88,14 @@ For more options, refer to pytest --help, paying attention to Custom options add
 2. The `LLM_MODELS_ROOT` is not set correctly
 
     ```bash
-        AssertionError: /scratch.trt_llm_data/llm-models/gpt2-medium does not exist, and fail_if_path_is_invalid is True, please check the cache directory
+        AssertionError: ...llm-models/gpt2-medium does not exist, and fail_if_path_is_invalid is True, please check the cache directory
         assert False
 
       conftest.py:149: AssertionError
     ```
-    If you see above failures when running pytest locally, its likely that you didn't set the `LLM_MODELS_ROOT` env correctly. The default one is `/scratch.trt_llm_data`, since this is the one used in CI env.
+    If you see above failures when running pytest locally, its likely that you didn't set the `LLM_MODELS_ROOT` env correctly. The default value is a NVIDIA internal path that is used in CI environment.
 
-    You should set this `LLM_MODELS_ROOT` correctly to the path where you mount the IT scratch `dc2-cdot87-swgpu01-lif1b:/vol/scratch19/scratch.trt_llm_data/llm-models`.
-    If you are running in computelab nodes, the scratch path is `/home/scratch.trt_llm_data/llm-models`, and you should add `-v /home/scratch.trt_llm_data:/home/scratch.trt_llm_data:ro` when starting your container, and `export LLM_MODELS_ROOT=/home/scratch.trt_llm_data/llm-models` before running the pytest.
+    When you finish setup the model directory, remember to mount it in the docker container.
 
 
 ## 4. C++ runtime test
@@ -159,3 +162,55 @@ pytest unittest/an_existing_file.py -m "part0 and gpu2" # run some cases in a fi
 For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not thrid_keyword"` which covers your filter.
 
 3. Choose a suitable GPU and add a line of your cases. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
+
+## 4. Run a CI stage locally
+
+Each yml file in `integration/test_lists/test-db` corresponds to a CI stage. You can run a stage locally, e.g. `l0_a10.yml`, as follows.
+
+1. Open `l0_a10.yml`, it should look like:
+
+```yaml
+version: 0.0.1
+l0_a10:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+  tests:
+  # ------------- PyTorch tests ---------------
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  # ------------- CPP tests ---------------
+  - test_cpp.py::test_model[medusa-86]
+  - test_cpp.py::test_model[redrafter-86]
+  - test_cpp.py::test_model[mamba-86]
+  - test_cpp.py::test_model[recurrentgemma-86]
+  - test_cpp.py::test_model[eagle-86]
+```
+
+2. Copy all items in `tests` field to a text file, for example, `a10_list.txt`. Don't forget to remove extra characters like comments and the dash marks.
+
+```
+disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+test_cpp.py::test_model[medusa-86]
+test_cpp.py::test_model[redrafter-86]
+test_cpp.py::test_model[mamba-86]
+test_cpp.py::test_model[recurrentgemma-86]
+test_cpp.py::test_model[eagle-86]
+```
+
+3. Invoke `pytest` with TRT-LLM custom option `--test-list`:
+
+```shell
+pytest integration --test-list="a10_list.txt"
+```

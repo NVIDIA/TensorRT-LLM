@@ -1503,17 +1503,20 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, trtllm.Response]):
+        if 0 not in self.dist.mapping.tp_group:
+            return
 
         logger.debug(
-            f'before ag, rank = {self.dist.rank}, responses = {responses}')
+            f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            resonses_list = self.dist.allgather(responses)
-            gather_responses = {}
-            for resp in resonses_list:
-                gather_responses.update(resp)
-            responses = gather_responses
+            responses_list = self.dist.tp_gather(responses)
+            if self.dist.rank == 0:
+                gather_responses = {}
+                for resp in responses_list:
+                    gather_responses.update(resp)
+                responses = gather_responses
         logger.debug(
-            f'after ag, rank = {self.dist.rank}, responses = {responses}')
+            f'after gather, rank = {self.dist.rank}, responses = {responses}')
         if self.dist.rank == 0:
             with self.response_cv:
                 for req_id, resp in responses.items():
