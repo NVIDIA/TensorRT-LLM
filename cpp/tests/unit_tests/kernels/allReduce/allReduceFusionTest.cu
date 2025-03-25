@@ -213,12 +213,35 @@ struct CudaBuffer
 };
 
 template <typename DType>
+struct DTypeTraits;
+
+template <>
+struct DTypeTraits<half>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclFloat16;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kHALF;
+};
+
+template <>
+struct DTypeTraits<__nv_bfloat16>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclBfloat16;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kBF16;
+};
+
+template <>
+struct DTypeTraits<float>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclFloat32;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kFLOAT;
+};
+
+template <typename DType>
 class TestRunner
 {
-    static_assert(std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>);
-    static constexpr ncclDataType_t kNCCLDataType = std::is_same_v<DType, half> ? ncclFloat16 : ncclBfloat16;
-    static constexpr nvinfer1::DataType kTRTDataType
-        = std::is_same_v<DType, half> ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kBF16;
+    static constexpr ncclDataType_t kNCCLDataType = DTypeTraits<DType>::kNCCLDataType;
+    static constexpr nvinfer1::DataType kTRTDataType = DTypeTraits<DType>::kTRTDataType;
+    static constexpr bool kQuantOut = !std::is_same_v<DType, float>;
 
 public:
     TestRunner(int max_token_num, int hidden_dim)
@@ -257,8 +280,8 @@ public:
         m_params.residual_in = m_residual_in.device_data();
         m_params.residual_out = m_residual_out.device_data();
         m_params.norm_out = m_norm_out.device_data();
-        m_params.quant_out = m_quant_out.device_data();
-        m_params.scale_out = m_scale_out.device_data();
+        m_params.quant_out = kQuantOut ? m_quant_out.device_data() : nullptr;
+        m_params.scale_out = kQuantOut ? m_scale_out.device_data() : nullptr;
         m_params.rms_gamma = m_rms_gamma.device_data();
         m_params.scale_factor = m_scale_factor.device_data<float>();
         m_params.rms_eps = 1e-3;
@@ -273,7 +296,10 @@ public:
         m_scale_factor.random<float>(1.f, 1.f);
         // Because scale_out internally performs layout interleaving, not all elements will be covered, so it should be
         // reset before calling the kernel to ensure correct comparison results
-        m_scale_out.clear();
+        if (kQuantOut)
+        {
+            m_scale_out.clear();
+        }
     }
 
     template <typename Func>
@@ -351,15 +377,18 @@ public:
         TLLM_CHECK(
             compare<DType>(m_rank, m_norm_out.host_data(), ref_output.host_data(), message_size, "norm out", 1e-2));
 
-        // Here, we also only compare the accuracy of quantization. Since there are no differences in computation order,
-        // atol is set to 0.
-        invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
-            m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(), ref_scale.device_data<int32_t>(),
-            false, 128, 0);
-        TLLM_CHECK(
-            compare<int8_t>(m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, "quant out", 0));
-        TLLM_CHECK(
-            compare<int8_t>(m_rank, m_scale_out.host_data(), ref_scale.host_data(), scale_out_size, "scale out", 0));
+        if (kQuantOut)
+        {
+            // Here, we also only compare the accuracy of quantization. Since there are no differences in computation
+            // order, atol is set to 0.
+            invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
+                m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(),
+                ref_scale.device_data<int32_t>(), false, 128, 0);
+            TLLM_CHECK(compare<int8_t>(
+                m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, "quant out", 0));
+            TLLM_CHECK(compare<int8_t>(
+                m_rank, m_scale_out.host_data(), ref_scale.host_data(), scale_out_size, "scale out", 0));
+        }
     }
 
     void run_nccl_allreduce(int token_num, int hidden_dim)
@@ -477,6 +506,42 @@ TEST(Kernel_AllReduceFusion, AccuracyFixedTokenNum)
             }
         }
     }
+}
+
+TEST(Kernel_AllReduceFusion, AccuracyDifferentDType)
+{
+#define TEST_DTYPE(DType)                                                                                              \
+    {                                                                                                                  \
+        TestRunner<DType> runner(max_token_num, hidden_dim);                                                           \
+        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                                \
+        {                                                                                                              \
+            if (rank == 0)                                                                                             \
+            {                                                                                                          \
+                TLLM_LOG_INFO("dtype is %s, token_num %d, hidden_dim %d", #DType, token_num, hidden_dim);              \
+            }                                                                                                          \
+            runner.run_once(&TestRunner<DType>::run_kernel, token_num, hidden_dim);                                    \
+            runner.verify(token_num, hidden_dim);                                                                      \
+        }                                                                                                              \
+    }
+
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    int min_token_num = 1;
+    int max_token_num = 2048;
+    for (auto hidden_dim : candidate_hidden_dim)
+    {
+        TEST_DTYPE(half);
+        TEST_DTYPE(__nv_bfloat16);
+        TEST_DTYPE(float);
+    }
+#undef TEST_DTYPE
 }
 
 TEST(Kernel_AllReduceFusion, Perf)

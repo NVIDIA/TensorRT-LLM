@@ -25,7 +25,29 @@
 
 namespace tensorrt_llm::kernels::ar_fusion
 {
-static constexpr int kElemsPerAccess = 8;
+template <typename DType>
+struct ElemsPerAccess;
+
+template <>
+struct ElemsPerAccess<half>
+{
+    static constexpr int value = 8;
+};
+
+template <>
+struct ElemsPerAccess<nv_bfloat16>
+{
+    static constexpr int value = 8;
+};
+
+template <>
+struct ElemsPerAccess<float>
+{
+    static constexpr int value = 4;
+};
+
+template <typename DType>
+static constexpr int kElemsPerAccess = ElemsPerAccess<DType>::value;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
