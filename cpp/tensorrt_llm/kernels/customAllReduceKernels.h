@@ -19,6 +19,7 @@
 #include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <limits>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -37,7 +38,6 @@ static constexpr int kBytesPerAccess = 16;
 static constexpr int kWarpSize = 32;
 static constexpr int kMaxCtaSize = 1024;
 static constexpr int kClusterMaxSize = 8;
-static constexpr int kLamportTokenNumThreshold = 16;
 static constexpr int kLamportHiddenSizeThreshold = 256;
 }; // namespace reduce_fusion::details
 
@@ -119,7 +119,6 @@ struct AllReduceFusionParams
     float eps;
     // new residual
     void* intermediate_buffer;
-    void* lamport_peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 3];
 };
 
 struct AllReduceParams
@@ -130,17 +129,13 @@ struct AllReduceParams
     size_t rank_offset;
     size_t ranks_per_node;
     size_t local_rank;
-    uint32_t barrier_flag;
-    uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
-    uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
-    void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE];
+    void** workspace;
     void* local_output_buffer_ptr;
     void const* local_input_buffer_ptr;
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
-        int token_num, int hidden_size, AllReduceFusionOp op);
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
@@ -150,7 +145,5 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 
 void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
-
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

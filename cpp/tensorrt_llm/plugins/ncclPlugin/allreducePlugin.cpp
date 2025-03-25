@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -479,40 +480,90 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                 break;
             ++tpRank;
         }
-
-        int token_num = size / inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
         int hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
-        auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, hidden_size,
-            mOp);
 
-        params.local_output_buffer_ptr = outputs[0];
-        params.local_input_buffer_ptr = inputs[0];
-        params.elts_total = size;
-
-        int fusion_ptr_idx = 2;
-        params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
-        params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
-        params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
-            params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
-        params.fusion_params.hidden_size = hidden_size;
-        params.fusion_params.eps = mEps;
-        params.fusion_params.intermediate_buffer = outputs[1];
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
-            for (size_t i = 0; i < tpSize; ++i)
-            {
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 4 + i];
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 5 + i];
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE * 2]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 6 + i];
-            }
+            auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
+                reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank);
+
+            params.local_output_buffer_ptr = outputs[0];
+            params.local_input_buffer_ptr = inputs[0];
+            params.elts_total = size;
+
+            int fusion_ptr_idx = 2;
+            params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
+            params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
+            params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            params.fusion_params.hidden_size = hidden_size;
+            params.fusion_params.eps = mEps;
+            params.fusion_params.intermediate_buffer = outputs[1];
+            TLLM_LOG_DEBUG("customAllReduce called");
+            tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
         }
-        TLLM_LOG_DEBUG("customAllReduce called");
-        tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
+        else
+        {
+            using namespace tensorrt_llm::kernels::ar_fusion;
+            AllReduceFusionParams params;
+            params.stream = stream;
+            params.dtype = mType;
+            params.nranks = tpSize;
+            params.rank = tpRank;
+            params.size = size;
+            params.hidden_dim = hidden_size;
+            params.workspace = reinterpret_cast<void**>(const_cast<void*>(inputs[1]));
+            params.allreduce_in = inputs[0];
+            params.use_oneshot = (size / hidden_size) <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken
+                || common::getEnvForceDeterministicAllReduce();
+
+            params.residual_in = nullptr;
+            params.rms_gamma = nullptr;
+
+            params.allreduce_out = nullptr;
+            params.quant_out = nullptr;
+            params.scale_out = nullptr;
+            params.residual_out = nullptr;
+            params.norm_out = nullptr;
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                int fusion_ptr_idx = 2;
+                if (mBias)
+                {
+                    params.pattern = AllReduceFusionPattern::kARBiasResidualRMSNorm;
+                    params.bias_in = inputs[fusion_ptr_idx++];
+                }
+                else
+                {
+                    params.pattern = AllReduceFusionPattern::kARResidualRMSNorm;
+                }
+                params.norm_out = outputs[0];
+                params.residual_out = outputs[1];
+                params.residual_in = inputs[fusion_ptr_idx++];
+                params.rms_gamma = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+                params.rms_eps = mEps;
+            }
+            else if (mOp == AllReduceFusionOp::NONE)
+            {
+                params.allreduce_out = outputs[0];
+                if (mBias)
+                {
+                    params.pattern = AllReduceFusionPattern::kAllReduceBias;
+                    params.bias_in = inputs[2];
+                }
+                else
+                {
+                    params.pattern = AllReduceFusionPattern::kAllReduce;
+                }
+            }
+            else
+            {
+                TLLM_CHECK_WITH_INFO(false, "Unsupported allreduce fusion op");
+            }
+
+            TLLM_LOG_DEBUG("allreduce_fusion_op called");
+            allreduce_fusion_op(params);
+        }
     }
 
     return 0;

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -69,10 +70,10 @@ public:
         bool const fakeBuffers = false);
 
     TensorPtr mAllReduceCommPtrs;
+    TensorPtr mFlagPtrs;
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;
 };
 
-void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
 bool canAccessPeer(WorldConfig const& worldConfig);
 
 } // namespace tensorrt_llm::runtime

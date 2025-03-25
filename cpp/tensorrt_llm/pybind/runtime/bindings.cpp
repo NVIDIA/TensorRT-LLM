@@ -17,7 +17,6 @@
 
 #include "bindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
@@ -375,14 +374,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly(
             "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
 
-    m.def(
-        "lamport_initialize_all",
-        [](intptr_t buffer_0, intptr_t buffer_1, intptr_t buffer_2, size_t size)
-        {
-            tr::lamportInitializeAll(reinterpret_cast<void*>(buffer_0), reinterpret_cast<void*>(buffer_1),
-                reinterpret_cast<void*>(buffer_2), size);
-        },
-        "Lamport initialize all buffers");
     m.def(
         "lamport_initialize",
         [](intptr_t buffer, size_t size)

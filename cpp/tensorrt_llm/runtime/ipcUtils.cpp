@@ -147,9 +147,12 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (fakeBuffers)
     {
+        using namespace tensorrt_llm::utils;
         auto const tpSize = worldConfig.getTensorParallelism();
-        mAllReduceCommPtrs = BufferManager::cpu(
-            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 2}), nvinfer1::DataType::kINT64);
+        mAllReduceCommPtrs = BufferManager::gpuSync(
+            ITensor::makeShape({static_cast<SizeType32>(customAllReduceUtils::NUM_POINTERS_PER_RANK) * tpSize
+                + static_cast<SizeType32>(customAllReduceUtils::NUM_FLAGS_POINTERS)}),
+            nvinfer1::DataType::kINT64);
     }
     else
     {
@@ -157,63 +160,46 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
 
         auto const tpSize = worldConfig.getTensorParallelism();
         bool const forceDeterministic = common::getEnvForceDeterministicAllReduce();
-        // Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
-        auto const bufferSize = (forceDeterministic ? 1 : tpSize)
-            * std::min(
-                static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
-                utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
-        size_t realHiddenSize = tpSize * hiddenSize;
-        // PUSH_MODE need TP_SIZE times the activation tensor size
+        // Disable the two-shot strategy for deterministic all-reduce
+        auto const bufferSize = tpSize
+            * (forceDeterministic ? 1
+                                  : std::min(static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength
+                                          * hiddenSize * sizeof(float),
+                                      utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize)));
         auto const lamportBufferSize = forceDeterministic
-            ? 1 // zero size is not allowed for IpcMemory::allocateIpcMemory.
-            : (tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * realHiddenSize
-                * sizeof(half));
-        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
+            ? utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize)
+            : tpSize * tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken * hiddenSize * sizeof(float);
+        auto const flagsSize = tpSize * tensorrt_llm::kernels::ar_fusion::kBarrierFlagCount * sizeof(int);
 
-        for (auto size :
-            {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
+        for (auto size : {bufferSize, bufferSize, flagsSize, lamportBufferSize * 3})
         {
             mIpcMemoryHandles.emplace_back(size, manager, worldConfig, isP2pSupported);
         }
 
-        mAllReduceCommPtrs
-            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
-                nvinfer1::DataType::kINT64);
-        auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
-        auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
-        auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
-        *CustomARFlagPtr = 0;
-        *LamportFlagPtr = 0;
-
+        std::vector<void*> allReduceCommPtrsHost(static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 1);
+        mFlagPtrs = manager.copyFrom(std::vector<uint32_t>{0, 0, 0, static_cast<uint32_t>(lamportBufferSize), 0},
+            ITensor::makeShape({5}), MemoryType::kGPU);
+        allReduceCommPtrsHost[mIpcMemoryHandles.size() * tpSize] = mFlagPtrs->data();
         for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
         {
             auto const& memCommPtrs = mIpcMemoryHandles[memIdx].getCommPtrs();
             TLLM_CHECK(memCommPtrs.size() == static_cast<std::size_t>(tpSize));
-            std::copy(memCommPtrs.begin(), memCommPtrs.end(), commPtrs.begin() + memIdx * tpSize);
+            std::copy(memCommPtrs.begin(), memCommPtrs.end(), allReduceCommPtrsHost.begin() + memIdx * tpSize);
         }
+        mAllReduceCommPtrs = manager.copyFrom(allReduceCommPtrsHost,
+            ITensor::makeShape({static_cast<long>(allReduceCommPtrsHost.size())}), MemoryType::kGPU);
 #if ENABLE_MULTI_DEVICE
         auto tp_rank = worldConfig.getTensorParallelRank();
         // When p2p is not supported all the mIpcMemoryHandles are
         // null
         if (isP2pSupported)
         {
-            lamportInitializeAll(mIpcMemoryHandles[4].getCommPtrs()[tp_rank],
-                mIpcMemoryHandles[5].getCommPtrs()[tp_rank], mIpcMemoryHandles[6].getCommPtrs()[tp_rank],
-                lamportBufferSize);
+            tensorrt_llm::kernels::ar_fusion::lamport_initialize(
+                mIpcMemoryHandles[3].getCommPtrs()[tp_rank], lamportBufferSize * 3, 0);
         }
 #endif
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size)
-{
-#if ENABLE_MULTI_DEVICE
-    tensorrt_llm::kernels::lamportInitialize(buffer_0, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
-    tensorrt_llm::kernels::lamportInitialize(buffer_1, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
-    tensorrt_llm::kernels::lamportInitialize(buffer_2, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
-    cudaDeviceSynchronize();
-#endif
 }
 
 } // namespace tensorrt_llm::runtime

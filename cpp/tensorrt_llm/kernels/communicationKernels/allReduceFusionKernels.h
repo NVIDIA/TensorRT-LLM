@@ -16,8 +16,6 @@
 
 #pragma once
 #include <NvInferRuntime.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,42 +24,21 @@
 
 namespace tensorrt_llm::kernels::ar_fusion
 {
-template <typename DType>
-struct ElemsPerAccess;
-
-template <>
-struct ElemsPerAccess<half>
-{
-    static constexpr int value = 8;
-};
-
-template <>
-struct ElemsPerAccess<nv_bfloat16>
-{
-    static constexpr int value = 8;
-};
-
-template <>
-struct ElemsPerAccess<float>
-{
-    static constexpr int value = 4;
-};
-
-template <typename DType>
-static constexpr int kElemsPerAccess = ElemsPerAccess<DType>::value;
-static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
+static constexpr int kOneShotMaxToken = 128;
 
 enum class AllReduceFusionPattern : int
 {
     kAllReduce = 0,
-    kARResidualRMSNorm = 1,
-    kARResidualRMSNormFP8Quant = 2,
-    kARResidualRMSNormFP4Quant = 3,
+    kAllReduceBias = 1,
+    kARResidualRMSNorm = 2,
+    kARBiasResidualRMSNorm = 3,
+    kARResidualRMSNormFP8Quant = 4,
+    kARResidualRMSNormFP4Quant = 5,
     // The difference between these two and the standard version is that the NormOut version outputs the result of the
     // norm.
-    kARResidualRMSNormOutFP8Quant = 4,
-    kARResidualRMSNormOutFP4Quant = 5
+    kARResidualRMSNormOutFP8Quant = 6,
+    kARResidualRMSNormOutFP4Quant = 7,
 };
 
 enum class QuantType : int
@@ -75,11 +52,12 @@ template <AllReduceFusionPattern Pattern>
 struct FusionPatternTraits;
 
 #define DEFINE_FUSION_PATTERN_TRAITS(                                                                                  \
-    pattern, hasAllReduceOut, hasResidual, hasResidualOut, hasRMSNorm, hasNormOut, quantType)                          \
+    pattern, hasAllReduceOut, hasBias, hasResidual, hasResidualOut, hasRMSNorm, hasNormOut, quantType)                 \
     template <>                                                                                                        \
     struct FusionPatternTraits<pattern>                                                                                \
     {                                                                                                                  \
         static constexpr bool kHasAllReduceOut = hasAllReduceOut;                                                      \
+        static constexpr bool kHasBias = hasBias;                                                                      \
         static constexpr bool kHasResidual = hasResidual;                                                              \
         static constexpr bool kHasResidualOut = hasResidualOut;                                                        \
         static constexpr bool kHasRMSNorm = hasRMSNorm;                                                                \
@@ -87,21 +65,28 @@ struct FusionPatternTraits;
         static constexpr QuantType kQuantType = quantType;                                                             \
     };
 
-DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduce, true, false, false, false, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
-    AllReduceFusionPattern::kARResidualRMSNorm, false, true, true, true, true, QuantType::kNone);
+    AllReduceFusionPattern::kAllReduce, true, false, false, false, false, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
-    AllReduceFusionPattern::kARResidualRMSNormFP8Quant, false, true, true, true, false, QuantType::kFP8);
+    AllReduceFusionPattern::kAllReduceBias, true, true, false, false, false, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
-    AllReduceFusionPattern::kARResidualRMSNormFP4Quant, false, true, true, true, false, QuantType::kFP4);
+    AllReduceFusionPattern::kARResidualRMSNorm, false, false, true, true, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
-    AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, true, true, true, true, QuantType::kFP8);
+    AllReduceFusionPattern::kARBiasResidualRMSNorm, false, true, true, true, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
-    AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true, true, true, true, QuantType::kFP4);
+    AllReduceFusionPattern::kARResidualRMSNormFP8Quant, false, false, true, true, true, false, QuantType::kFP8);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormFP4Quant, false, false, true, true, true, false, QuantType::kFP4);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, false, true, true, true, true, QuantType::kFP8);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, false, true, true, true, true, QuantType::kFP4);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
 constexpr bool HasResidual = FusionPatternTraits<Pattern>::kHasResidual;
+template <AllReduceFusionPattern Pattern>
+constexpr bool HasBias = FusionPatternTraits<Pattern>::kHasBias;
 template <AllReduceFusionPattern Pattern>
 constexpr bool HasRMSNorm = FusionPatternTraits<Pattern>::kHasRMSNorm;
 template <AllReduceFusionPattern Pattern>
@@ -121,14 +106,15 @@ struct AllReduceFusionParams
     int size;
     int hidden_dim;
     void** workspace;
-    void* allreduce_in;
-    void* residual_in;
+    void const* allreduce_in;
+    void const* residual_in;
+    void const* bias_in;
     void* allreduce_out;
     void* residual_out;
     void* norm_out;
     void* quant_out;
     void* scale_out;
-    void* rms_gamma;
+    void const* rms_gamma;
     float rms_eps;
     float* scale_factor;
     bool use_oneshot;
@@ -138,4 +124,6 @@ struct AllReduceFusionParams
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
+
+void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
 } // namespace tensorrt_llm::kernels::ar_fusion

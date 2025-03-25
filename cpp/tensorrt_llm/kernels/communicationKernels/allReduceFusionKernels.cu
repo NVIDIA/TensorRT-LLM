@@ -13,166 +13,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceUtils.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
 namespace tensorrt_llm::kernels::ar_fusion
 {
-template <int NRanks>
-struct SyncComm
+
+__global__ void lamport_initialize_kernel(float* ptr, int size)
 {
-    __device__ __forceinline__ SyncComm(void** workspace)
-    {
-        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
-        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[1];
-        flag_value = *flag_ptr;
-        for (int r = 0; r < NRanks; ++r)
-        {
-            comm_bufs[r] = workspace[r];
-            barrier_flags[r] = workspace[NRanks + r];
-        }
-        __syncthreads();
-        if (threadIdx.x == 0)
-        {
-            atomicAdd(counter_ptr, 1);
-        }
-    }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size)
+        return;
+    ptr[idx] = -0.f;
+}
 
-    __device__ __forceinline__ void update(int new_flag_value)
-    {
-        if (blockIdx.x == 0 && threadIdx.x == 0)
-        {
-            while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x)
-            {
-            }
-            *flag_ptr = new_flag_value;
-            *counter_ptr = 0;
-        }
-    }
-
-    int* counter_ptr;
-    int* flag_ptr;
-    void* comm_bufs[NRanks];
-    void* barrier_flags[NRanks];
-    int flag_value;
-};
-
-template <int NRanks>
-struct LamportComm
+void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
 {
-    __device__ __forceinline__ LamportComm(void** workspace, int rank)
-    {
-        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
-        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
-        flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
-        clear_size = *clear_ptr;
-        int data_offset = flag_value % 3;
-        int clear_offset = (flag_value + 2) % 3;
-        for (int r = 0; r < NRanks; ++r)
-        {
-            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
-        }
-        clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
-        __syncthreads();
-        if (threadIdx.x == 0)
-        {
-            atomicAdd(counter_ptr, 1);
-        }
-    }
-
-    __device__ __forceinline__ void update(int new_clear_size)
-    {
-        if (blockIdx.x == 0 && threadIdx.x == 0)
-        {
-            while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x)
-            {
-            }
-            *flag_ptr = (flag_value + 1) % 3;
-            *clear_ptr = new_clear_size;
-            *counter_ptr = 0;
-        }
-    }
-
-    int* counter_ptr;
-    int* flag_ptr;
-    int* clear_ptr;
-    uint8_t* data_bufs[NRanks];
-    uint8_t* clear_buf;
-    int clear_size;
-    int flag_value;
-};
-
-template <int NRanks>
-class Barrier
-{
-public:
-    __device__ __forceinline__ Barrier(int rank, SyncComm<NRanks> const& comm)
-    {
-        if (threadIdx.x < NRanks)
-        {
-            m_flag_value = comm.flag_value;
-            int current_rank = rank;
-            int target_rank = threadIdx.x;
-            m_target_flag = reinterpret_cast<int*>(comm.barrier_flags[target_rank]) + current_rank;
-            m_current_flag
-                = reinterpret_cast<int*>(comm.barrier_flags[current_rank]) + blockIdx.x * NRanks + target_rank;
-        }
-    }
-
-    __device__ __forceinline__ void sync()
-    {
-        __syncthreads();
-        if (threadIdx.x < NRanks)
-        {
-            m_flag_value = next_flag(m_flag_value);
-            // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if the
-            // corresponding CTA has not been launched.
-            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
-            {
-                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
-            }
-            while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
-            {
-            }
-        }
-        __syncthreads();
-    }
-
-protected:
-    __device__ __forceinline__ void st_flag(int* addr, int flag)
-    {
-        asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
-    }
-
-    __device__ __forceinline__ int ld_flag(int* addr)
-    {
-        int flag;
-        asm volatile("ld.global.acquire.sys.b32 %0, [%1];" : "=r"(flag) : "l"(addr));
-        return flag;
-    }
-
-    __device__ __forceinline__ int next_flag(int flag)
-    {
-        return flag == 2 ? 0 : flag + 1;
-    }
-
-    __device__ __forceinline__ int prev_flag(int flag)
-    {
-        return flag == 0 ? 2 : flag - 1;
-    }
-
-public:
-    int m_flag_value;
-
-private:
-    int* m_target_flag;
-    int* m_current_flag;
-};
+    int grid_size = (bytes + 127) / 128;
+    lamport_initialize_kernel<<<grid_size, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
+}
 
 template <typename DType, typename PackedType>
 __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType const& b)
@@ -200,11 +64,15 @@ public:
     {
         if constexpr (HasRMSNorm<Pattern>)
         {
-            m_gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[m_access_id_in_token];
+            m_gamma_val = reinterpret_cast<float4 const*>(params.rms_gamma)[m_access_id_in_token];
+        }
+        if constexpr (HasBias<Pattern>)
+        {
+            m_bias_val = reinterpret_cast<float4 const*>(params.bias_in)[m_access_id_in_token];
         }
         if constexpr (HasResidual<Pattern>)
         {
-            m_residual_val = reinterpret_cast<float4*>(params.residual_in)[m_access_id];
+            m_residual_val = reinterpret_cast<float4 const*>(params.residual_in)[m_access_id];
         }
         if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
         {
@@ -224,7 +92,7 @@ public:
             m_access_id = access_id;
             if constexpr (HasResidual<Pattern>)
             {
-                m_residual_val = reinterpret_cast<float4*>(m_params.residual_in)[m_access_id];
+                m_residual_val = reinterpret_cast<float4 const*>(m_params.residual_in)[m_access_id];
             }
         }
     }
@@ -234,6 +102,10 @@ public:
         if constexpr (HasAllReduceOut<Pattern>)
         {
             reinterpret_cast<float4*>(m_params.allreduce_out)[m_access_id] = val;
+        }
+        if constexpr (HasBias<Pattern>)
+        {
+            val = add128<DType>(val, m_bias_val);
         }
         if constexpr (HasResidual<Pattern>)
         {
@@ -332,6 +204,7 @@ private:
     float m_scale_factor;
     float4 m_residual_val;
     float4 m_gamma_val;
+    float4 m_bias_val;
 };
 
 __device__ __forceinline__ bool is_neg_zero(float v)
@@ -457,7 +330,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
     for (int idx = access_id; idx < tot_access; idx += access_stride)
     {
         float val[4];
-        *reinterpret_cast<float4*>(val) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+        *reinterpret_cast<float4*>(val) = reinterpret_cast<float4 const*>(params.allreduce_in)[idx];
 #pragma unroll
         for (int i = 0; i < kElemsPerAccess<DType> / sizeof(float); ++i)
         {
@@ -530,7 +403,7 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(
         for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
         {
             reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx]
-                = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+                = reinterpret_cast<float4 const*>(params.allreduce_in)[idx];
         }
     }
     Barrier<NRanks> barrier(params.rank, comm);
@@ -601,11 +474,6 @@ void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t
 {
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, DType, NRanks, Fp32Acc>,
         params, begin_tokens, token_num_per_ranks));
-}
-
-bool use_oneshot(int token_num)
-{
-    return token_num <= kOneShotMaxToken;
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
@@ -713,9 +581,37 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                                          \
     }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kAllReduceBias)                                                 \
+    {                                                                                                                  \
+        if (params.bias_in)                                                                                            \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduceBias, NRanks);                                  \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kAllReduceBias can not work with "                    \
+                "bias_in=nullptr! Fallback to kAllReduce!");                                                           \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                                      \
+        }                                                                                                              \
+    }                                                                                                                  \
     else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNorm)                                             \
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                                  \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARBiasResidualRMSNorm)                                         \
+    {                                                                                                                  \
+        if (params.bias_in)                                                                                            \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARBiasResidualRMSNorm, NRanks);                          \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARBiasResidualRMSNorm can not work with "            \
+                "bias_in=nullptr! Fallback to kARResidualRMSNorm!");                                                   \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                              \
+        }                                                                                                              \
     }                                                                                                                  \
     else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP8Quant)                                     \
     {                                                                                                                  \

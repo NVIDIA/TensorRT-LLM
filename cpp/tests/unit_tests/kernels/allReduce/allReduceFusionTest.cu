@@ -25,8 +25,8 @@
 #include <random>
 #include <vector>
 
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
-#include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -228,6 +228,45 @@ struct CudaBuffer
     }
 };
 
+struct SetDevice
+{
+    SetDevice(int device_id)
+    {
+        TLLM_CUDA_CHECK(cudaSetDevice(device_id));
+    }
+};
+
+class Workspace
+{
+public:
+    Workspace(int world_size, int rank, int max_token_num, int max_hidden_size,
+        std::shared_ptr<tensorrt_llm::runtime::CudaStream> stream_ptr)
+        : world_config(world_size, 1, 1, rank, world_size)
+        , set_device(world_config.getDevice())
+        , p_s(stream_ptr)
+        , buf_mgr(p_s)
+        , buffers(1, 1, max_token_num, max_hidden_size, buf_mgr, world_config)
+    {
+    }
+
+    void** get_workspace()
+    {
+        return reinterpret_cast<void**>(buffers.mAllReduceCommPtrs->data());
+    }
+
+    cudaStream_t get_stream() const
+    {
+        return p_s->get();
+    }
+
+protected:
+    tr::WorldConfig world_config;
+    SetDevice set_device;
+    std::shared_ptr<tr::CudaStream> p_s;
+    tr::BufferManager buf_mgr;
+    tr::AllReduceBuffers buffers;
+};
+
 template <typename DType>
 struct DTypeTraits;
 
@@ -289,7 +328,7 @@ public:
         m_rms_gamma.allocate(hidden_dim * sizeof(DType));
         m_scale_factor.allocate(sizeof(float));
         m_stream = std::make_shared<tr::CudaStream>();
-        m_workspace = std::make_shared<ar_fusion::Workspace>(m_rank, m_world_size, max_token_num, hidden_dim, m_stream);
+        m_workspace = std::make_shared<Workspace>(m_world_size, m_rank, max_token_num, hidden_dim, m_stream);
 
         m_params.nranks = m_world_size;
         m_params.rank = m_rank;
@@ -331,6 +370,7 @@ public:
         cudaEvent_t begin, end;
         cudaEventCreate(&begin);
         cudaEventCreate(&end);
+        cudaDeviceSynchronize();
         m_mpi_comm.barrier();
         for (int i = 0; i < warmup; ++i)
         {
@@ -467,6 +507,7 @@ public:
 
     void run_kernel(int token_num, int hidden_dim)
     {
+        m_params.use_oneshot = token_num <= tensorrt_llm::kernels::ar_fusion::kOneShotMaxToken;
         ar_fusion::allreduce_fusion_op(m_params);
     }
 
@@ -490,10 +531,34 @@ private:
     CudaBuffer m_scale_out;
     CudaBuffer m_rms_gamma;
     CudaBuffer m_scale_factor;
-    std::shared_ptr<ar_fusion::Workspace> m_workspace;
+    std::shared_ptr<Workspace> m_workspace;
     ar_fusion::AllReduceFusionParams m_params;
     std::shared_ptr<tr::CudaStream> m_stream;
 };
+
+template <typename DType>
+bool skip_test(int world_size, int token_num, int hidden_dim)
+{
+    auto message_size = token_num * hidden_dim * sizeof(DType);
+    auto const max_workspace_size
+        = ::tensorrt_llm::utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(world_size);
+    if (message_size <= max_workspace_size)
+    {
+        if (world_size <= 2)
+        {
+            return false;
+        }
+        else if (world_size <= 4)
+        {
+            return message_size >= 1 * 1000 * 1000;
+        }
+        else
+        {
+            return message_size >= 500 * 1000;
+        }
+    }
+    return true;
+}
 
 TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
 {
@@ -516,6 +581,10 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
         for (int i = 0; i < iter; ++i)
         {
             int token_num = get_random_int(min_token_num, max_token_num);
+            if (skip_test<half>(world_size, token_num, hidden_dim))
+            {
+                continue;
+            }
             if (rank == 0)
             {
                 printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
@@ -551,6 +620,10 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
         Runner runner(max_token_num, hidden_dim);
         for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
         {
+            if (skip_test<half>(world_size, token_num, hidden_dim))
+            {
+                continue;
+            }
             if (rank == 0)
             {
                 printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
@@ -589,6 +662,10 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
         Runner runner(max_token_num, hidden_dim);
         for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
         {
+            if (skip_test<half>(world_size, token_num, hidden_dim))
+            {
+                continue;
+            }
             if (rank == 0)
             {
                 printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
@@ -615,6 +692,10 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
         Runner runner(max_token_num, hidden_dim);                                                                      \
         for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                                \
         {                                                                                                              \
+            if (skip_test<DType>(world_size, token_num, hidden_dim))                                                   \
+            {                                                                                                          \
+                continue;                                                                                              \
+            }                                                                                                          \
             if (rank == 0)                                                                                             \
             {                                                                                                          \
                 printf("[Verify] pattern %-20s, dtype %-10s, token_num %-4d, hidden_dim %-4d ...", #FusionPattern,     \
@@ -676,6 +757,10 @@ TEST(Kernel_AllReduceFusion, Perf)
     Runner runner(max_token_num, hidden_dim);
     for (auto token_num : candidate_token_num)
     {
+        if (skip_test<half>(world_size, token_num, hidden_dim))
+        {
+            continue;
+        }
         auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
         if (rank == 0)
         {

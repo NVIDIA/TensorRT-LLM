@@ -352,6 +352,7 @@ private:
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
         allreduce_fusion_params.norm_out = nullptr;
+        allreduce_fusion_params.use_oneshot = false;
 
         // Determine if using oneshot or twoshot allreduce kernel
         if (strategy == AllReduceStrategyType::MIN_LATENCY)
