@@ -256,7 +256,7 @@ class ClassSnapshot:
 
 class ApiStabilityTestHarness:
     TEST_CLASS = None
-    REFERENCE_COMMITTED_DIR = f"{os.path.dirname(__file__)}/references_v1"
+    REFERENCE_COMMITTED_DIR = f"{os.path.dirname(__file__)}/references_committed_v1"
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
     REFERENCE_FILE = None
 
