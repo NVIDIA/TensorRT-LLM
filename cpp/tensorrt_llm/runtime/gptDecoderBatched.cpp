@@ -395,16 +395,12 @@ CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto& stream = mRuntimeStream;
-    auto manager = BufferManager{stream};
+    auto [dInput, dOutput] = prepareGatherTree(*mDecoderState, batchSlot, streaming, *mRuntimeStream);
 
-    auto [dInput, dOutput] = prepareGatherTree(*mDecoderState, batchSlot, streaming, *stream);
-
-    kernels::gatherTree(dOutput, dInput, manager, samplingConfig);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
 
     CudaEvent event{};
-    stream->record(event);
-    mRuntimeStream->wait(event);
+    mRuntimeStream->record(event);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return event;
 }

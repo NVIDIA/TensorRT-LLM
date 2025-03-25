@@ -15,11 +15,10 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingKernels.h"
+
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -720,10 +719,14 @@ void invokeTransposeLogProbs(float* outputLogProbs, float* outputLogProbsTiled, 
 namespace runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
-void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
-    SamplingConfig const& samplingConfig)
+void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const& stream = cudaStream.get();
+    BufferManager manager{std::make_shared<CudaStream>(stream)};
+
     auto& finalOutputIds = *decodingOutput.gatheredIds;
     auto const& finalOutputIdsShape = finalOutputIds.getShape();
     auto const& decodingOutputIdsShape = decodingOutput.ids->getShape();
@@ -742,8 +745,6 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     TLLM_CHECK_WITH_INFO(decodingOutputIdsShape.d[2] <= maxSeqLength,
         common::fmtstr("Decoder seq length size (" FMT_DIM ") is too large for final seq length (" FMT_DIM ")",
             decodingOutputIdsShape.d[2], maxSeqLength));
-
-    auto const& stream = manager.getStream().get();
 
     // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
