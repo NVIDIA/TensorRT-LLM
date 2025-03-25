@@ -82,7 +82,7 @@ AutoDeploy officially supports a range of Hugging Face models that have been tes
 
 </details>
 
-**Bring Your Own Model**: AutoDeploy utilizes `torch.export` and graph pattern matching rather than hard-coded architectures. Therefore, many models beyond our officially tested ones are supported out-of-the-box. Users have successfully deployed various additional models without modifications.
+**Bring Your Own Model**: AutoDeploy utilizes `torch.export` and graph pattern matching rather than hard-coded architectures. Therefore, many models beyond our officially tested ones are supported out-of-the-box.
 
 ### Runtime Integrations
 
