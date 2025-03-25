@@ -669,6 +669,49 @@ protected:
             }
             mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
         }
+        else if (tensorrt_llm::common::getEnvUseUCXKvCache())
+        {
+            TLLM_LOG_INFO("Enable UCX KV cache transport.");
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            void* WrapperLibHandle{nullptr};
+            WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)(
+                tensorrt_llm::mpi::MpiComm const* comm);
+            *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
+            mConnectionManager = makeUcxConnectionManager(mComm);
+            if (mIsContext)
+            {
+                mResponder = mIsMLA
+                    ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
+                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
+                    : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
+                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
+            }
+            else
+            {
+                mRequester = mIsMLA
+                    ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
+                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
+                    : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
+                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
+            }
+
+            std::vector<int> contextRankVec(mContextRankSize);
+            for (int i = 0; i < contextRankVec.size(); i++)
+            {
+                contextRankVec[i] = i;
+            }
+            mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
+        }
         else
         {
             TLLM_CHECK(false);
@@ -930,6 +973,11 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
     AsymmetricTestParam param = GetParam();
     int contextTp = std::get<0>(param);
     int contextPp = std::get<1>(param);
@@ -1014,6 +1062,12 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
+
     AsymmetricTestParam param = GetParam();
     int contextTp = std::get<0>(param);
     int contextPp = std::get<1>(param);

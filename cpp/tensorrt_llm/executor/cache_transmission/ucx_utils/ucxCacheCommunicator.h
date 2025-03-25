@@ -53,8 +53,8 @@ private:
     std::mutex mPendingGIDFuturesMutex;
     std::queue<std::shared_ptr<std::future<void>>> mPendingGIDFutures;
 
-    uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> newEp);
-    uint64_t addConnection(std::string ip, uint16_t port);
+    uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
+    uint64_t addConnection(std::string const& ip, uint16_t port);
     // void initializeConnections();
     void updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Request> request, uint64_t* gid, uint64_t connectionId);
 
@@ -63,14 +63,14 @@ public:
     ~UcxConnectionManager();
 
     // Factory function
-    static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
+    [[nodiscard]] static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
     {
         return std::make_unique<UcxConnectionManager>(comm);
     }
 
     [[nodiscard]] uint64_t getLocalGID() const;
 
-    uint64_t addConnection(ucp_conn_request_h connRequest);
+    void addConnection(ucp_conn_request_h connRequest);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
 };

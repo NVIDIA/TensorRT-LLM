@@ -283,23 +283,32 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                 env=new_env,
                 timeout=600)
 
-    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
-    if _os.path.exists(
-            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
-        ucx_env = copy.copy(cpp_env)
-        ucx_env["UCX_MEMTYPE_CACHE"] = "n"
-        ucx_trans_test = [
-            "mpirun",
-            "-n",
-            "2",
-            "--allow-run-as-root",
-            "batch_manager/ucxDataTransceiverTest",
-        ]
-        run_command(ucx_trans_test, cwd=tests_dir, env=ucx_env, timeout=300)
-    else:
-        _logger.info(
-            "batch_manager/ucxDataTransceiverTest not found, so skipping.")
+    # Cache transceiver tests with UCX
+    new_env = copy.copy(cpp_env)
+    new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    cache_trans_test = [
+        "mpirun",
+        "-n",
+        "2",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
+    new_env = copy.copy(cpp_env)
+    new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    # Cache transceiver tests
+    cache_trans_test_8_proc = [
+        "mpirun",
+        "-n",
+        "8",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test_8_proc,
+                cwd=tests_dir,
+                env=new_env,
+                timeout=600)
 
 def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
@@ -479,7 +488,6 @@ def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
 
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
     trt_model_test = produce_mpirun_command(
@@ -494,7 +502,6 @@ def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
 
     mgpu_env = copy.copy(cpp_env)
     mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
     trt_model_test = produce_mpirun_command(

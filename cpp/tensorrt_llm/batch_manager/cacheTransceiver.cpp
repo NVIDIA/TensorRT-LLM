@@ -147,74 +147,34 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else if (mCommType == CommType::UCX)
     {
         mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-        mManager = std::make_unique<executor::kv_cache::UcxConnectionManager>(mMpiWorldComm);
-        mDataResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-            mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        mDataRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-            mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        /*
-                {
-                    std::lock_guard<std::mutex> lock(mDllMutex);
-                    mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
-                    TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
-                    auto load_sym = [](void* handle, char const* name)
-                    {
-                        void* ret = dllGetSym(handle, name);
-                        TLLM_CHECK_WITH_INFO(ret != nullptr,
-                            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is
-           not " "built with UCX support, please rebuild in UCX-enabled environment."); return ret;
-                    };
-                    std::unique_ptr<DataResponder> (*makeUcxCacheResponder)(
-                        executor::kv_cache::CacheState, SizeType32, kv_cache_manager::BaseKVCacheManager*);
-                    std::unique_ptr<DataRequester> (*makeUcxCacheRequester)(
-                        executor::kv_cache::CacheState, SizeType32, kv_cache_manager::BaseKVCacheManager*);
-                    *(void**) (&makeUcxCacheResponder) = load_sym(mWrapperLibHandle, "makeUcxCacheResponder");
-                    *(void**) (&makeUcxCacheRequester) = load_sym(mWrapperLibHandle, "makeUcxCacheRequester");
-                    mDataResponder = makeUcxCacheResponder(*mCacheState, worldConfig.getRank(), cacheManager);
-                    mDataRequester = makeUcxCacheRequester(*mCacheState, worldConfig.getRank(), cacheManager);
-                }
-                namespace su = tensorrt_llm::executor::serialize_utils;
-
-                if (mMpiGroupComm->getSize() > 1)
-                {
-                    mMpiGroupComm->barrier();
-                    executor::kv_cache::CommState commState = mDataResponder->getCommState();
-                    std::ostringstream oStream;
-                    su::serialize(commState, oStream);
-                    auto str = oStream.str();
-                    std::vector<char> buffer(str.begin(), str.end());
-                    std::vector<SizeType32> sizeofBuffer(mMpiGroupComm->getSize());
-                    SizeType32 bufferSize = buffer.size();
-                    mMpiGroupComm->allgather(&bufferSize, sizeofBuffer.data(), 1, mpi::MpiType::kINT32);
-                    SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
-                    std::vector<char> recvBuffer(recvBufferSize);
-                    std::vector<int> displs(mMpiGroupComm->getSize());
-                    for (int r = 0; r < mMpiGroupComm->getSize(); r++)
-                    {
-                        displs[r] = (r == 0) ? 0 : (displs[r - 1] + sizeofBuffer[r - 1]);
-                    }
-                    mMpiGroupComm->allgatherv(buffer.data(), bufferSize, mpi::MpiType::kCHAR, recvBuffer.data(),
-           sizeofBuffer, displs, mpi::MpiType::kCHAR);
-
-                    // deserialize
-                    std::vector<executor::kv_cache::CommState> commSessionCommState(mMpiGroupComm->getSize());
-                    std::vector<executor::kv_cache::SocketState> socketStates;
-                    for (int i = 0; i < mMpiGroupComm->getSize(); i++)
-                    {
-                        std::vector<char> serBuffer(
-                            recvBuffer.begin() + displs[i], recvBuffer.begin() + (displs[i] + sizeofBuffer[i]));
-                        su::VectorWrapBuf<char> strbuf(serBuffer);
-                        std::istream is(&strbuf);
-                        commSessionCommState[i] = su::deserialize<executor::kv_cache::CommState>(is);
-                        TLLM_CHECK_WITH_INFO(
-                            commSessionCommState[i].getSocketState().size() == 1, "getSocketState size should be 1");
-                        socketStates.push_back(commSessionCommState[i].getSocketState()[0]);
-                    }
-                    executor::kv_cache::CommState allCommState{socketStates, worldConfig.getRank()};
-                    mDataResponder->setCommState(std::move(allCommState));
-                }
-        */
-        // TLLM_CHECK(false);
+        {
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)(
+                mpi::MpiComm const* comm);
+            *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
+            mManager = makeUcxConnectionManager(mMpiWorldComm);
+        }
+        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
+        mDataResponder = isMLA
+            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
+            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
+        mDataRequester = isMLA
+            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
+            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
     }
     else
     {

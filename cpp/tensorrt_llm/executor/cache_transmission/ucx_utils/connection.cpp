@@ -29,7 +29,7 @@ UcxConnection::UcxConnection(
     : mConnectionId(connectionId)
     , mLocalGID(manager->getLocalGID())
     , mRemoteGID(std::numeric_limits<uint64_t>::max())
-    , mEndpoint(endpoint)
+    , mEndpoint(std::move(endpoint))
     , mManager(manager)
 {
     if (mEndpoint)
