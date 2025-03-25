@@ -391,11 +391,12 @@ std::pair<DecodingInput, DecodingOutput> prepareGatherTree(
 } // namespace
 
 // TODO call this at the end of forward if mFinished[i] changes from false to true?
-CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const
+CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+    SamplingConfig const& samplingConfig, bool streaming) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto [dInput, dOutput] = prepareGatherTree(*mDecoderState, batchSlot, streaming, *mRuntimeStream);
+    auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
     kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
 

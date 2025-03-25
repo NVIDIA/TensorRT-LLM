@@ -35,6 +35,10 @@ class LlmRequest;
 
 namespace tensorrt_llm::runtime
 {
+namespace decoder
+{
+class DecoderState;
+}
 
 namespace decoder_batch
 {
@@ -130,8 +134,8 @@ public:
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    [[nodiscard]] virtual CudaEvent finalize(
-        SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const
+    [[nodiscard]] virtual CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+        SamplingConfig const& samplingConfig, bool streaming) const
         = 0;
 
 protected:

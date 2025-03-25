@@ -1800,7 +1800,7 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
 
     if (mWorldConfig.isLastPipelineParallelRank())
     {
-        auto event = mDecoder->finalize(seqSlot, samplingConfig, streaming);
+        auto event = mDecoder->finalize(mDecoder->getDecoderState(), seqSlot, samplingConfig, streaming);
         // Make sure that postprocessing is done before copying outputIds
         mCopyBufferManager.getStream().wait(event.get());
 
