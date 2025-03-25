@@ -276,6 +276,38 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
+### Advanced Features
+### FlashMLA
+TRT-LLM has already integrated FlashMLA in the pytorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+
+### DeepGEMM
+TRT-LLM also supports DeepGEMM for DeepSeek-V3/R1. DeepGEMM provides significant e2e performance boost. DeepGEMM is enabled by an environment variable `TRTLLM_DG_ENABLED`:
+
+```bash
+mpirun -H <HOST1>:8,<HOST2>:8 \
+      -n 16 \
+      -x "TRTLLM_DG_ENABLED=1" \
+      -x "CUDA_HOME=/usr/local/cuda" \
+      trtllm-llmapi-launch trtllm-bench \
+      --model deepseek-ai/DeepSeek-V3 \
+      --model_path /models/DeepSeek-V3 \
+      throughput \
+      --backend pytorch \
+      --max_batch_size ${MAX_BATCH_SIZE} \
+      --max_num_tokens ${MAX_NUM_TOKENS} \
+      --dataset dataset.txt \
+      --tp 16 \
+      --ep 16 \
+      --kv_cache_free_gpu_mem_fraction 0.9 \
+      --extra_llm_api_options /workspace/extra-llm-api-config.yml \
+      --concurrency ${CONCURRENCY} \
+      --num_requests ${NUM_REQUESTS} \
+      --streaming \
+      --report_json "${OUTPUT_FILENAME}.json"
+```
+
+The cuda kernels of DeepGEMM are JIT compiled using NVCC. You need to install CUDA Toolkit 12.3 or above and specify the path to the CUDA Toolkit in the environment variable `CUDA_HOME`. We recommend you to use the latest version of CUDA Toolkit. In the case of compilation errors, you can set the environment variable `TRTLLM_DG_JIT_DEBUG` to 1 to print the debug information of the JIT compilation.
+
 ---
 
 ## Notes and Troubleshooting
