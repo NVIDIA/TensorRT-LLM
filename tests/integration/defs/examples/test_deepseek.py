@@ -8,9 +8,9 @@ from defs.conftest import get_sm_version, llm_models_root
 
 @pytest.mark.parametrize("model_name", ["DeepSeek-R1"], ids=["deepseek_r1"])
 @pytest.mark.parametrize("quant", ["fp4", "fp8"])
-@pytest.mark.parametrize("tp_size", [1, 2, 4], ids=["tp1", "tp2", "tp4"])
-@pytest.mark.parametrize("pp_size", [1, 2, 4], ids=["pp1", "pp2", "pp4"])
-@pytest.mark.parametrize("ep_size", [1, 2, 4], ids=["ep1", "ep2", "ep4"])
+@pytest.mark.parametrize("tp_size", [8], ids=["tp8"])
+@pytest.mark.parametrize("pp_size", [1], ids=["pp1"])
+@pytest.mark.parametrize("ep_size", [1, 4, 8], ids=["ep1", "ep4", "ep8"])
 @pytest.mark.parametrize("mtp_nextn", [0, 1, 2],
                          ids=["nextn0", "nextn1", "nextn2"])
 @pytest.mark.parametrize("enable_dp", [True, False],
@@ -56,8 +56,8 @@ def test_deepseek_gpqa_llmapi(llmapi_example_root, llm_datasets_root, llm_venv,
             "PP is not supported for gpqa test, and it will be added in the near future"
         )
 
-    model_dir = str(llm_models_root() / model_name / model_path[quant])
-    gpqa_data_path = str(llm_datasets_root() / "gpqa/gpqa_diamond.csv")
+    model_dir = str(Path(llm_models_root()) / model_name / model_path[quant])
+    gpqa_data_path = str(Path(llm_datasets_root) / "gpqa/gpqa_diamond.csv")
 
     assert Path(model_dir).exists()
 
@@ -67,7 +67,7 @@ def test_deepseek_gpqa_llmapi(llmapi_example_root, llm_datasets_root, llm_venv,
         f"--hf_model_dir={model_dir}", f"--data_dir={gpqa_data_path}",
         f"--tp_size={tp_size}", f"--ep_size={ep_size}", "--concurrency=8",
         f"--mtp_nextn={mtp_nextn}", "--print_iter_log", "--batch_size=32",
-        "--max_num_tokens=4096"
+        "--max_num_tokens=4096", "--check_accuracy", "--accuracy_threshold=0.65"
     ]
     if enable_cuda_graph:
         gpqa_cmd.append("--use_cuda_graph")

@@ -400,6 +400,8 @@ def main():
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        # TODO: there is a known issue in autotuner_enabled warmup,
+        # and it will be fixed in the near future
         autotuner_enabled=False)
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=args.kv_cache_enable_block_reuse,
