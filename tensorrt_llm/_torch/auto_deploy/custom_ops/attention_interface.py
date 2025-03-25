@@ -6,6 +6,7 @@ object-oriented interface to the high-level runtime via the SequenceInfo datacla
 is also responsible for functionalizing information about the sequence and pass it on the the
 various attention interface. The AttentionDescriptor is the main interface to the attention operator
 and operates on a purely functional paradigm that is compatible with the torch custom op system.
+
 """
 
 from abc import ABC, abstractmethod
@@ -121,8 +122,8 @@ class SequenceInfo:
             self.page_size = self.max_seq_len
         if self.max_num_tokens < 1:
             self.max_num_tokens = self.max_batch_size * self.max_seq_len
-        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len, we use the provided max_num_tokens to
-        # calculate the number of pages
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
+        # we use the provided max_num_tokens to calculate the number of pages
         total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
@@ -324,7 +325,7 @@ class SequenceInfo:
             dtype=torch.int,
             device=self.device,
         )
-        self.pages_per_seq.fill_(seq_len//self.page_size)
+        self.pages_per_seq.fill_(seq_len // self.page_size)
         self.nest_sequences(input_ids)
 
     def _set_generate_only_batch(self) -> None:
