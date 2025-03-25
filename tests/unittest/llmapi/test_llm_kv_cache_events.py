@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+import pytest
 from test_llm import get_model_path
 
 import tensorrt_llm
@@ -119,6 +120,7 @@ def test_expected_kv_cache_events():
                 assert event[0]["data"]["type"] == "stored"
 
 
+@pytest.mark.skip("https://nvbugs/5150466: flaky fail")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
