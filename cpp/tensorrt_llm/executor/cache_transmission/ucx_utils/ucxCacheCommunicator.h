@@ -56,7 +56,7 @@ private:
     uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     uint64_t addConnection(std::string const& ip, uint16_t port);
     // void initializeConnections();
-    void updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Request> request, uint64_t* gid, uint64_t connectionId);
+    void updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Endpoint> const& newEp);
 
 public:
     explicit UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);

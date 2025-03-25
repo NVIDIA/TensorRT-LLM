@@ -151,7 +151,7 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
         TLLM_LOG_DEBUG(
             "rank %d | comm split start - barrier passed | world comm size %d", comm->getRank(), comm->getSize());
         // auto worldComm = std::addressof(tensorrt_llm::mpi::MpiComm::session());
-        tensorrt_llm::mpi::MpiComm kvCacheComm(comm->split(300, mComm->getRank()));
+        tensorrt_llm::mpi::MpiComm kvCacheComm(comm->split(300, comm->getRank()));
         TLLM_LOG_DEBUG("rank %d | comm split done | kvCacheComm size %d, kvCacheComm rank %d", comm->getRank(),
             kvCacheComm.getSize(), kvCacheComm.getRank());
 
@@ -171,7 +171,6 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
                 kvCacheComm.getRank(), i, ip.c_str(), listenerPort + globalRank);
             mGIDToConnectionId[globalRank] = addConnection(ip, listenerPort + globalRank);
             mConnections[mGIDToConnectionId[globalRank]].get()->mRemoteGID = globalRank;
-            mConnections[mGIDToConnectionId[globalRank]].get()->sendGID();
         }
         TLLM_LOG_DEBUG("rank %d | done initiating connections", comm->getRank());
 
@@ -212,16 +211,22 @@ UcxConnectionManager::~UcxConnectionManager()
     }
 }
 
-void UcxConnectionManager::updateGIDToConnectionIdMap(
-    std::shared_ptr<ucxx::Request> request, uint64_t* gid, uint64_t connectionId)
+void UcxConnectionManager::updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Endpoint> const& newEp)
 {
+    uint64_t remoteGID;
+    std::shared_ptr<ucxx::Request> request
+        = newEp->streamRecv(reinterpret_cast<void*>(&remoteGID), sizeof(remoteGID), false);
     while (request->isCompleted() == false)
         ;
+    uint64_t id = getNewConnectionId(newEp);
+    TLLM_LOG_DEBUG("addConnection | rank %d | emplacing connection id %lu", mComm->getRank(), id);
+    mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp, this));
+    mConnections[id].get()->mRemoteGID = remoteGID;
     std::unique_lock<std::mutex> lock(mGIDToConnectionIdMutex);
-    mGIDToConnectionId[*gid] = connectionId;
+    mGIDToConnectionId[remoteGID] = id;
     lock.unlock();
-    TLLM_LOG_DEBUG("updateGIDToConnectionIdMap | rank %d | remote gid: %lu | connectionId: %lu", mComm->getRank(), *gid,
-        connectionId);
+    TLLM_LOG_DEBUG(
+        "updateGIDToConnectionIdMap | rank %d | remote gid: %lu | connectionId: %lu", mComm->getRank(), remoteGID, id);
 }
 
 void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
@@ -229,14 +234,9 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     try
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mListener->createEndpointFromConnRequest(connRequest, true);
-        uint64_t id = getNewConnectionId(newEp);
-        TLLM_LOG_DEBUG("addConnection | rank %d | emplacing connection id %lu", mComm->getRank(), id);
-        mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp, this));
-        std::shared_ptr<ucxx::Request> request = newEp->streamRecv(
-            reinterpret_cast<void*>(&mConnections[id]->mRemoteGID), sizeof(mConnections[id]->mRemoteGID), false);
         std::unique_lock<std::mutex> lock(mPendingGIDFuturesMutex);
-        mPendingGIDFutures.push(std::make_shared<std::future<void>>(std::async(std::launch::async,
-            [this, request, id]() { this->updateGIDToConnectionIdMap(request, &mConnections[id]->mRemoteGID, id); })));
+        mPendingGIDFutures.push(std::make_shared<std::future<void>>(
+            std::async(std::launch::async, &UcxConnectionManager::updateGIDToConnectionIdMap, this, newEp)));
         lock.unlock();
     }
     catch (std::exception const& e)
@@ -254,6 +254,12 @@ uint64_t UcxConnectionManager::addConnection(std::string const& ip, uint16_t por
         std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
         TLLM_LOG_DEBUG("rank %d passed createEndpointFromHostname | addConnection | ip: %s | port: %d",
             mComm->getRank(), ip.c_str(), port);
+        auto localGID = getLocalGID();
+        std::shared_ptr<ucxx::Request> request
+            = newEp->streamSend(reinterpret_cast<void*>(&localGID), sizeof(localGID), false);
+        while (request->isCompleted() == false)
+            ;
+        request->checkError();
         uint64_t id = getNewConnectionId(newEp);
         TLLM_LOG_DEBUG("rank %d passed getNewConnectionId | addConnection | id: %lu", mComm->getRank(), id);
         mConnections.emplace(id, std::make_shared<UcxConnection>(id, newEp, this));
@@ -279,11 +285,8 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
     char portStr[INET6_ADDRSTRLEN];
 
     ucs_status_t status;
-    while ((status = ucp_ep_query(newEp->getHandle(), &ep_attr)) != UCS_OK)
-    {
-        TLLM_LOG_DEBUG("rank %d | ucp_ep_query failed | retrying | status: %d", mComm->getRank(), status);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    status = ucp_ep_query(newEp->getHandle(), &ep_attr);
+    TLLM_CHECK(status == UCS_OK);
 
     ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
     TLLM_LOG_DEBUG("rank %d passed sockaddr_get_ip_port_str | getNewConnectionId | rIpStr: %s | portStr: %s",
