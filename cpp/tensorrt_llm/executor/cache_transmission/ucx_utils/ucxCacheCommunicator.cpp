@@ -195,6 +195,14 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
     }
 }
 
+UcxConnectionManager::~UcxConnectionManager()
+{
+    for (auto& worker : mWorkersPool)
+    {
+        worker->stopProgressThread();
+    }
+}
+
 void UcxConnectionManager::updateGIDToConnectionIdMap(
     std::shared_ptr<ucxx::Request> request, uint64_t* gid, uint64_t connectionId)
 {
