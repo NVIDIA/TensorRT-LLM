@@ -1,6 +1,7 @@
 # Build UCX data transceiver as shared library for runtime symbol loading, to
 # make UCX on-demand runtime dependency.
-add_library(${UCX_WRAPPER_TARGET} SHARED connection.cpp)
+add_library(${UCX_WRAPPER_TARGET} SHARED connection.cpp
+                                         ucxCacheCommunicator.cpp)
 set_target_properties(
   ${UCX_WRAPPER_TARGET}
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
