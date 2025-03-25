@@ -21,6 +21,7 @@ from .library import (
     insert_mha_with_kv_cache,
     match_moe_pattern,
     quantize,
+    unfuse_weights,
 )
 
 
@@ -73,6 +74,9 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
+
+        # unfuse weights
+        egm = unfuse_weights(egm)
 
         # quantization
         egm = quantize(egm, self.factory.get_quant_config())

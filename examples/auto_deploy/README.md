@@ -75,6 +75,7 @@ AutoDeploy officially supports a range of Hugging Face models that have been tes
 | DeepSeek | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
 | Mistral | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
 | BigCode | bigcode/starcoder2-15b | FP32 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs,FlashInfer |
+| Phi4/Phi3 | microsoft/phi-4<br>microsoft/Phi-3-mini-4k-instruct<br>microsoft/Phi-3-medium-4k-instruct | BF16 | world_size:1,2,4<br>runtime:demollm,trtllm<br>compile_backend:torch-simple, torch-opt<br>attn_backend:TritonWithFlattenedInputs |
 
 ### Runtime Integrations
 
