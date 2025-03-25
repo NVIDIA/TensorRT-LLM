@@ -15,16 +15,22 @@
  * limitations under the License.
  */
 
+#include "ucxCacheCommunicator.h"
 #if ENABLE_UCX
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-UcxConnection::UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint)
+UcxConnection::UcxConnection(
+    uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager)
     : mConnectionId(connectionId)
+    , mLocalGID(manager->getLocalGID())
+    , mRemoteGID(std::numeric_limits<uint64_t>::max())
     , mEndpoint(endpoint)
+    , mManager(manager)
 {
     if (mEndpoint)
     {
@@ -32,10 +38,28 @@ UcxConnection::UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoi
     }
 }
 
-void UcxConnection::initialize(std::shared_ptr<UcxConnectionManager> manager)
+// void UcxConnection::initialize(UcxConnectionManager* manager)
+// {
+//     std::cout << "UcxConnection::initialize" << std::endl;
+//     mManager = manager;
+//     if (mManager)
+//     {
+//         mLocalGID = mManager->getLocalGID();
+//         TLLM_LOG_DEBUG("UcxConnection::initialize | rank %d | local gid: %lu", mManager->getRank(), mLocalGID);
+//     }
+// }
+
+void UcxConnection::sendGID()
 {
-    std::cout << "UcxConnection::initialize" << std::endl;
-    mManager = std::move(manager);
+    if (mLocalGID == std::numeric_limits<uint64_t>::max())
+    {
+        throw std::runtime_error("UcxConnection::sendGID | mLocalGID is not set");
+    }
+    std::shared_ptr<ucxx::Request> request
+        = mEndpoint->streamSend(reinterpret_cast<void*>(&mLocalGID), sizeof(mLocalGID), false);
+    while (request->isCompleted() == false)
+        ;
+    request->checkError();
 }
 
 void UcxConnection::initializeEndpointTag(int maxTryTimes)
@@ -68,7 +92,9 @@ void UcxConnection::initializeEndpointTag(int maxTryTimes)
         // Network port value is defined to fit in 16 bit.
         // sendTag format : [remotePort localPort remotIP]
         mSendTag = static_cast<ucxx::Tag>((localPort << (16 + 32)) | (remotePort << 32) | std::stoull(lIpStr));
+        TLLM_LOG_DEBUG("UcxConnection::initializeEndpointTag | localGID %d | sendTag: %lu", mLocalGID, mSendTag);
         mRecvTag = static_cast<ucxx::Tag>((remotePort << (16 + 32)) | (localPort << 32) | std::stoull(rIpStr));
+        TLLM_LOG_DEBUG("UcxConnection::initializeEndpointTag | localGID %d | recvTag: %lu", mLocalGID, mRecvTag);
     }
     else
     {
@@ -92,10 +118,12 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     // Guard to ensure CUDA context is initialized for UCX ops
     TLLM_CUDA_CHECK(cudaFree(0));
     TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
+    TLLM_LOG_DEBUG("UcxConnection::send | rank %d | sendTag: %lu | remote gid: %lu", mLocalGID, mSendTag, mRemoteGID);
     auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
     auto req = mEndpoint->tagSend(const_cast<void*>(data), size, mSendTag, false, completionCallback);
     std::unique_lock<std::mutex> lk(mMtx);
     mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    TLLM_LOG_DEBUG("UcxConnection::send | rank %d | sendTag: %lu | remote gid: %lu", mLocalGID, mSendTag, mRemoteGID);
     // throw if there is error
     req->checkError();
 }
@@ -105,10 +133,12 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     // Guard to ensure CUDA context is initialized for UCX ops
     TLLM_CUDA_CHECK(cudaFree(0));
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
+    TLLM_LOG_DEBUG("UcxConnection::recv | rank %d | tagReceiveFrom: %lu", mLocalGID, mRecvTag);
     auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
     auto req = mEndpoint->tagRecv(data, size, mRecvTag, ucxx::TagMaskFull, false, completionCallback);
     std::unique_lock<std::mutex> lk(mMtx);
     mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    TLLM_LOG_DEBUG("UcxConnection::recv | rank %d | recvTag: %lu | remote gid: %lu", mLocalGID, mRecvTag, mRemoteGID);
     // throw if there is error
     req->checkError();
 }

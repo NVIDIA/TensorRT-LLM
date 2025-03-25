@@ -43,12 +43,15 @@ private:
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
     std::map<uint64_t, std::shared_ptr<UcxConnection>> mConnections;
     std::shared_ptr<ucxx::Listener> mListener;
-    std::map<std::string, uint64_t> mIpToMpiRank;
-    std::map<uint64_t, uint64_t> mMpiRankToConnectionId;
+    std::mutex mGIDToConnectionIdMutex;
+    std::map<uint64_t, uint64_t> mGIDToConnectionId;
+    std::mutex mPendingGIDFuturesMutex;
+    std::queue<std::shared_ptr<std::future<void>>> mPendingGIDFutures;
 
     uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> newEp);
-    void addConnection(std::string ip, uint16_t port);
-    void initializeConnections();
+    uint64_t addConnection(std::string ip, uint16_t port);
+    // void initializeConnections();
+    void updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Request> request, uint64_t* gid, uint64_t connectionId);
 
 public:
     explicit UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
@@ -56,12 +59,14 @@ public:
     // Factory function
     static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
     {
-        auto instance = std::make_unique<UcxConnectionManager>(comm);
-        instance->initializeConnections();
-        return instance;
+        return std::make_unique<UcxConnectionManager>(comm);
+        // instance->initializeConnections();
+        // return instance;
     }
 
-    void addConnection(ucp_conn_request_h connRequest);
+    [[nodiscard]] uint64_t getLocalGID() const;
+
+    uint64_t addConnection(ucp_conn_request_h connRequest);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
 };
