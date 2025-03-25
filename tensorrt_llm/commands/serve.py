@@ -91,12 +91,17 @@ from tensorrt_llm.serve import OpenAIServer
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
 )
+@click.option("--chunked_context",
+              is_flag=True,
+              default=False,
+              help="Enable chunked context (chunked prefill)."
+)
 def main(model: str, tokenizer: Optional[str], host: str, port: int,
          log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
          max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
          ep_size: Optional[int], gpus_per_node: Optional[int],
          kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
-         trust_remote_code: bool, extra_llm_api_options: Optional[str]):
+         trust_remote_code: bool, chunked_context: bool, extra_llm_api_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -132,6 +137,7 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
         "trust_remote_code": trust_remote_code,
         "build_config": build_config,
         "kv_cache_config": kv_cache_config,
+        "enable_chunked_prefill":chunked_context,
         "backend": backend if backend == "pytorch" else None,
         "pytorch_backend_config": pytorch_backend_config,
         "_num_postprocess_workers": num_postprocess_workers,
