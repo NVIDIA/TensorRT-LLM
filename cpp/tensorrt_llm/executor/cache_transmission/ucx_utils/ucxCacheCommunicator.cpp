@@ -286,7 +286,14 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
 
     ucs_status_t status;
     status = ucp_ep_query(newEp->getHandle(), &ep_attr);
-    TLLM_CHECK(status == UCS_OK);
+    while (status == UCS_ERR_NOT_CONNECTED)
+    {
+        TLLM_LOG_DEBUG(
+            "rank %d  ucp_ep_query | ep not connected yet | status: %s", mComm->getRank(), ucs_status_string(status));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        status = ucp_ep_query(newEp->getHandle(), &ep_attr);
+    }
+    TLLM_CHECK_WITH_INFO(status == UCS_OK, "Error in ucp_ep_query | status: %s", ucs_status_string(status));
 
     ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
     TLLM_LOG_DEBUG("rank %d passed sockaddr_get_ip_port_str | getNewConnectionId | rIpStr: %s | portStr: %s",
@@ -354,8 +361,11 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
 #endif
 
-std::unique_ptr<ConnectionManager> makeMpiConnectionManager(mpi::MpiComm const* comm)
-return UcxConnectionManager::create(comm);
+std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm)
+{
+    try
+    {
+        return UcxConnectionManager::create(comm);
     }
     catch (std::exception const& e)
     {
