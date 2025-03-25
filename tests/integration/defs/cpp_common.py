@@ -280,7 +280,6 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
 
     # Cache transceiver tests with UCX
     new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     cache_trans_test = [
         "mpirun",
@@ -292,7 +291,6 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
     new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     # Cache transceiver tests
     cache_trans_test_8_proc = [
@@ -486,7 +484,6 @@ def run_disagg_tests(build_dir: _pl.Path):
 
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     new_env = copy.copy(cpp_env)
-    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     new_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
     trt_model_test = produce_mpirun_command(
@@ -501,7 +498,6 @@ def run_disagg_tests(build_dir: _pl.Path):
 
     mgpu_env = copy.copy(cpp_env)
     mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     mgpu_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
     trt_model_test = produce_mpirun_command(
