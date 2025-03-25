@@ -14,7 +14,9 @@ from ..compiler import BackendCompiler, BackendRegistry, _flatten_args
 
 
 class CompiledGraph(nn.Module):
-    def __init__(self, model: GraphModule, max_batch_size: int, cuda_graph_batch_sizes: List[int]):
+    def __init__(
+        self, model: GraphModule, max_batch_size: int, cuda_graph_batch_sizes: List[int] = None
+    ):
         super().__init__()
         self._in_spec: TreeSpec = model._in_spec
         self._out_spec: TreeSpec = model._out_spec

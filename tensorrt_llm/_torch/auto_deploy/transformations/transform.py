@@ -157,7 +157,7 @@ class InferenceOptimizer:
         )
 
         # Let's run a forward pass to get the memory usage
-        cm.info._set_max_batch_sample()
+        cm.info._set_max_num_tokens_sample()
         free_mem_pre, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
         egm(*cm.args)
