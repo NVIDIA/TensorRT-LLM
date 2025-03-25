@@ -23,7 +23,8 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import CalledProcessError, check_output, run
+from subprocess import DEVNULL, CalledProcessError, check_output, run
+from tempfile import TemporaryDirectory
 from textwrap import dedent
 from typing import List
 
@@ -63,6 +64,66 @@ def clear_folder(folder_path):
             rmtree(item_path)
         else:
             os.remove(item_path)
+
+
+def install_conan(build_dir: Path, build_run):
+    # Determine the system ID
+    system_id = "unknown"
+    os_release_path = Path("/etc/os-release")
+    if os_release_path.exists():
+        with os_release_path.open("r") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    system_id = line.split("=")[1].strip().strip('"')
+                    break
+
+    tool_dir = build_dir / "tool"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+
+    # Install Conan if it's not already installed
+    if "rocky" in system_id:
+        conan_dir = tool_dir / "conan"
+        conan_dir.mkdir(parents=True, exist_ok=True)
+        conan_path = conan_dir / "bin/conan"
+        if not conan_path.exists():
+            with TemporaryDirectory() as tmpdir:
+                tmpdir_p = Path(tmpdir)
+                archive_p = tmpdir_p / "conan.tgz"
+                build_run(
+                    f"wget --retry-connrefused -O {archive_p} https://github.com/conan-io/conan/releases/download/2.14.0/conan-2.14.0-linux-x86_64.tgz"
+                )
+                build_run(f"tar -C {conan_dir} -xf {archive_p}")
+    else:
+        # Install Conan into a venv using pip
+        conan_venv_dir = tool_dir / "conan_venv"
+        if not conan_venv_dir.exists():
+            print(f"Creating Conan venv at {conan_venv_dir}")
+            build_run(f'"{sys.executable}" -m venv {conan_venv_dir}')
+
+        venv_pip = conan_venv_dir / "bin" / "pip"
+        conan_path = conan_venv_dir / "bin" / "conan"
+
+        # Check if conan of the correct version is already installed
+        try:
+            conan_version_output = check_output(
+                [f"{conan_path}", "--version"],
+                stderr=DEVNULL).decode().strip()
+            installed_version = re.search(r'Conan version (\S+)',
+                                          conan_version_output).group(1)
+            if installed_version != "2.14.0":
+                raise ValueError(
+                    f"Found Conan version {installed_version}, expected 2.14.0")
+        except (FileNotFoundError, CalledProcessError, ValueError) as e:
+            print(f"Installing Conan 2.14.0 in venv: {e}")
+            build_run(f'"{venv_pip}" install conan==2.14.0')
+
+    # Install Conan
+    build_run(
+        f'"{conan_path}" remote add -verror --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan',
+        stdout=DEVNULL,
+        stderr=DEVNULL)
+    build_run(f'"{conan_path}" profile detect -f')
+    return conan_path
 
 
 def main(*,
@@ -168,7 +229,7 @@ def main(*,
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
-    first_build = not build_dir.exists()
+    first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
@@ -207,9 +268,18 @@ def main(*,
         targets.append("executorWorker")
 
     source_dir = get_source_dir()
+
+    conan_path = install_conan(build_dir, build_run)
+
     with working_directory(build_dir):
-        cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build or configure_cmake:
+            build_run(
+                f"{conan_path} install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+            )
+            cmake_def_args.append(
+                f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
+            )
+            cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
