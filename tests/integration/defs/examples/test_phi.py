@@ -415,7 +415,7 @@ def test_phi3_mtbench(phi_example_root, llm_phi_model_root, llm_venv,
 def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
                            llm_phi_model_root, llm_datasets_root, llm_venv,
                            cmodel_dir, engine_dir, llm_lora_model_root,
-                           qcache_dir):
+                           qcache_dir_without_install_package):
     "run phi lora test on 1gpu"
     print("Converting checkpoint...")
     model_name = 'phi-3-lora'
@@ -429,7 +429,7 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
             dtype="float16",
             qformat="fp8",
             kv_cache_dtype="fp8",
-            quantize_dir=qcache_dir,
+            quantize_dir=qcache_dir_without_install_package,
             calib_size=512)
     else:
         model_dir = convert_weights(llm_venv=llm_venv,
