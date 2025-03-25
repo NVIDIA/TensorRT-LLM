@@ -552,7 +552,7 @@ def worker_main(
             # processes, each one is a PAIR zmq socket
             result_queues = [
                 FusedIpcQueue(is_server=True,
-                              fuse_message=True,
+                              fuse_message=not BATCH_RESP_IN_AWAIT,
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
@@ -803,9 +803,10 @@ class AwaitResponseHelper:
 
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
-                self.worker.postproc_queues[wid].put(batch)
+                if len(batch) > 0:
+                    self.worker.postproc_queues[wid].put(batch)
 
-        if rsp_batch:
+        if rsp_batch and len(rsp_batch) > 0:
             self.worker.result_queue.put(rsp_batch)
 
 
