@@ -78,7 +78,7 @@ public:
 
 extern "C"
 {
-    std::unique_ptr<ConnectionManager> makeUcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
+    [[nodiscard]] std::unique_ptr<ConnectionManager> makeUcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
 }
 
 #if defined(__clang__)
