@@ -1,12 +1,10 @@
-import copy
 import json
 import math
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
-                    Tuple, Union)
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 import torch
 import yaml
@@ -16,14 +14,15 @@ from transformers import PreTrainedTokenizerBase
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
-from ..bindings.executor import BatchingType
+from ..bindings.executor import BatchingType as _BatchingType
 from ..bindings.executor import \
     CapacitySchedulerPolicy as _CapacitySchedulerPolicy
 from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
 from ..bindings.executor import DecodingConfig, DecodingMode
 from ..bindings.executor import DynamicBatchConfig as _DynamicBatchConfig
-from ..bindings.executor import (EagleConfig, ExecutorConfig,
-                                 ExtendedRuntimePerfKnobConfig)
+from ..bindings.executor import EagleConfig, ExecutorConfig
+from ..bindings.executor import \
+    ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig
 from ..bindings.executor import KvCacheConfig as _KvCacheConfig
 from ..bindings.executor import \
     LookaheadDecodingConfig as _LookaheadDecodingConfig
@@ -31,6 +30,7 @@ from ..bindings.executor import PeftCacheConfig as _PeftCacheConfig
 from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
+from ..llmapi.mpi_session import MpiSession
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
@@ -38,10 +38,10 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
-from .mpi_session import MpiSession
 from .tokenizer import TokenizerBase, tokenizer_factory
+from .utils import generate_api_docs_as_docstring, get_type_repr
+
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import append_docstring
 
 
 @dataclass
@@ -123,27 +123,30 @@ class _ParallelConfig:
                        auto_parallel=self.auto_parallel)
 
 
-@dataclass(slots=True)
-class CalibConfig:
+class CalibConfig(BaseModel):
     """
     Calibration configuration.
-
-    Args:
-        device (Literal['cuda', 'cpu']): The device to run calibration. Defaults to 'cuda'.
-        calib_dataset (str): The name or local path of calibration dataset. Defaults to 'cnn_dailymail'.
-        calib_batches (int): The number of batches that the calibration runs. Defaults to 512.
-        calib_batch_size (int): The batch size that the calibration runs. Defaults to 1.
-        calib_max_seq_length (int): The maximum sequence length that the calibration runs. Defaults to 512.
-        random_seed (int): The random seed used for calibration. Defaults to 1234.
-        tokenizer_max_seq_length (int): The maximum sequence length to initialize tokenizer for calibration. Defaults to 2048.
     """
-    device: Literal['cuda', 'cpu'] = 'cuda'
-    calib_dataset: str = 'cnn_dailymail'
-    calib_batches: int = 512
-    calib_batch_size: int = 1
-    calib_max_seq_length: int = 512
-    random_seed: int = 1234
-    tokenizer_max_seq_length: int = 2048
+    device: Literal['cuda',
+                    'cpu'] = Field(default='cuda',
+                                   description="The device to run calibration.")
+    calib_dataset: str = Field(
+        default='cnn_dailymail',
+        description="The name or local path of calibration dataset.")
+    calib_batches: int = Field(
+        default=512,
+        description="The number of batches that the calibration runs.")
+    calib_batch_size: int = Field(
+        default=1, description="The batch size that the calibration runs.")
+    calib_max_seq_length: int = Field(
+        default=512,
+        description="The maximum sequence length that the calibration runs.")
+    random_seed: int = Field(
+        default=1234, description="The random seed used for calibration.")
+    tokenizer_max_seq_length: int = Field(
+        default=2048,
+        description=
+        "The maximum sequence length to initialize tokenizer for calibration.")
 
     @classmethod
     def from_dict(cls, config: dict) -> 'CalibConfig':
@@ -163,7 +166,7 @@ class CalibConfig:
         Returns:
             dict: The dict dumped from CalibConfig.
         """
-        return asdict(self)
+        return self.model_dump()
 
 
 class _ModelFormatKind(Enum):
@@ -334,6 +337,15 @@ class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
     """
     Combined metaclass for Enum and PybindMirror.  This is crucial.
     """
+
+
+@PybindMirror.mirror_pybind_enum(_BatchingType)
+class BatchingType(str, Enum, metaclass=PybindMirrorEnumMeta):
+    STATIC = "STATIC"
+    INFLIGHT = "INFLIGHT"
+
+    def _to_pybind(self):
+        return getattr(_BatchingType, self.value)
 
 
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
@@ -592,6 +604,36 @@ class KvCacheConfig(BaseModel, PybindMirror):
             copy_on_partial_reuse=self.copy_on_partial_reuse)
 
 
+@PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
+class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
+    """
+    Configuration for extended runtime performance knobs.
+    """
+
+    multi_block_mode: bool = Field(
+        default=True, description="Whether to use multi-block mode.")
+
+    enable_context_fmha_fp32_acc: bool = Field(
+        default=False,
+        description="Whether to enable context FMHA FP32 accumulation.")
+
+    cuda_graph_mode: bool = Field(default=False,
+                                  description="Whether to use CUDA graph mode.")
+
+    cuda_graph_cache_size: int = Field(
+        default=0,
+        description=
+        "Number of cuda graphs to be cached in the runtime. The larger the cache, the better the perf, but more GPU memory is consumed."
+    )
+
+    def _to_pybind(self):
+        return _ExtendedRuntimePerfKnobConfig(
+            multi_block_mode=self.multi_block_mode,
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
+            cuda_graph_mode=self.cuda_graph_mode,
+            cuda_graph_cache_size=self.cuda_graph_cache_size)
+
+
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
@@ -632,274 +674,229 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
-# The docstring for LlmArgs and LLM; will be appended to the two classes' apidocs.
-LLMARGS_EXPLICIT_DOCSTRING = """
-        model (str, pathlib.Path): The model name or a local model directory.
-            Note that if the value could be both a model name or a local model directory, the local model directory will be prioritized.
+class LlmArgs(BaseModel):
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "underscore_attrs_are_private": True
+    }
 
-        tokenizer (str, pathlib.Path, transformers.PreTrainedTokenizerBase, tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional):
-            The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer. Defaults to None.
-
-        tokenizer_mode (Literal['auto', 'slow']): The tokenizer mode. Defaults to 'auto'.
-            'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer.
-            The fast tokenizer is based on Huggingface's Rust library tokenizers, which achieves a significant speed-up compared to its slow counterpart.
-
-        skip_tokenizer_init (bool): Whether to skip initialization of tokenizer and detokenizer. Defaults to False.
-            LLM.generate and LLM.generate_async will accept prompt token ids as input only.
-
-        trust_remote_code (bool): Whether to trust remote code when downloading model and tokenizer from Hugging Face. Defaults to False.
-
-        tensor_parallel_size(int): The number of processes for tensor parallelism. Defaults to 1.
-
-        dtype (str): The data type for the model weights and activations. Defaults to "auto".
-            Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type will be automatically inferred from the source model.
-            If the source data type is "float32", it will be converted to "float16".
-
-        revision (str, optional): The revision of the model to use. Defaults to None.
-
-        tokenizer_revision (str, optional): The revision of the tokenizer to use. Defaults to None.
-"""
-
-LLMARGS_IMPLICIT_DOCSTRING = """
-        pipeline_parallel_size(int): The number of processes for pipeline parallelism. Defaults to 1.
-
-        context_parallel_size (int): The context parallel size. Defaults to 1.
-
-        gpus_per_node (int, optional): The number of GPUs per node. None means automatic configure. Defaults to None.
-
-        load_format (Literal['auto', 'dummy']): The format of the model weights to load. Defaults to 'auto'.
-            * 'auto' will try to load the weights from the provided checkpoint.
-            * 'dummy' will initialize the weights with random values, which is mainly for profiling.
-
-        enable_tqdm (bool): Whether to display a progress bar during model building. Defaults to False.
-
-        enable_lora (bool): Enable LoRA adapters. Defaults to False.
-
-        max_lora_rank (int, optional): Maximum LoRA rank. If specified, it overrides `build_config.lora_config.max_lora_rank`. Defaults to None.
-
-        max_loras (int): Maximum number of LoRA adapters to be stored in GPU memory. Defaults to 4.
-
-        max_cpu_loras (int): Maximum number of LoRA adapters to be stored in CPU memory. Defaults to 4.
-
-        enable_prompt_adapter (bool): Enable prompt adapters. Defaults to False.
-
-        max_prompt_adapter_token (int): Maximum number of prompt adapter tokens. Defaults to 0.
-
-        quant_config (tensorrt_llm.llmapi.QuantConfig, optional): The quantization configuration for the model. Defaults to None.
-
-        calib_config (tensorrt_llm.llmapi.CalibConfig, optional): The calibration configuration for the model. Defaults to None.
-
-        build_config (tensorrt_llm.llmapi.BuildConfig, optional): The build configuration for the model. Defaults to None.
-
-        kv_cache_config (tensorrt_llm.llmapi.llm_args.KvCacheConfig, optional): The key-value cache configuration for the model. Defaults to None.
-
-        enable_chunked_prefill (bool): Whether to enable chunked prefill. Defaults to False.
-
-        guided_decoding_backend (str, optional): The guided decoding backend, currently supports 'xgrammar'. Defaults to None.
-
-        batched_logits_processor (tensorrt_llm.sampling_params.BatchedLogitsProcessor, optional): The batched logits postprocessor callback. Defaults to None.
-            The BatchedLogitsProcessor class is recommended for callback creation.
-
-        iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics. Defaults to None.
-
-        request_stats_max_iterations (int, optional): The maximum number of iterations for request statistics. Defaults to None.
-
-        workspace (str, optional): The directory to store intermediate files. Defaults to None.
-
-        embedding_parallel_mode (str): The parallel mode for embeddings. Defaults to 'SHARDING_ALONG_VOCAB'.
-
-        auto_parallel (bool): Enable auto parallel mode. Defaults to False.
-
-        auto_parallel_world_size (int): The MPI world size for auto parallel. Defaults to 1.
-
-        moe_tensor_parallel_size (int, optional): The tensor parallel size for MoE models's expert weights. Defaults to None.
-
-        moe_expert_parallel_size (int, optional): The expert parallel size for MoE models's expert weights. Defaults to None.
-
-        enable_attention_dp (bool): Enable attention data parallel. Defaults to False.
-
-        cp_config (dict, optional): Context parallel config. Defaults to None.
-
-        fast_build (bool): Enable features for faster engine building. Defaults to False.
-            This may cause some performance degradation and is currently incompatible with int8/int4 quantization.
-
-        enable_build_cache (bool, tensorrt_llm.llmapi.BuildCacheConfig): Whether to enable build caching for the model. Defaults to False.
-
-        peft_cache_config (tensorrt_llm.llmapi.llm_args.PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
-
-        scheduler_config (tensorrt_llm.llmapi.llm_args.SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
-
-        speculative_config (tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.MedusaDecodingConfig, tensorrt_llm.llmapi.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, optional): The speculative decoding configuration. Defaults to None.
-
-        decoding_config (tensorrt_llm.bindings.executor.DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
-
-        batching_type (tensorrt_llm.bindings.executor.BatchingType, optional): The batching type for the model. Defaults to None.
-
-        normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
-
-        gather_generation_logits (bool): Enable gathering generation logits. Defaults to False.
-
-        max_input_len (int): The maximum input length allowed for the model. Defaults to 1024.
-
-        max_seq_len (int): The maximum sequence length for generation. Defaults to None.
-
-        max_beam_width (int): The maximum beam width used in beam search. Defaults to 1.
-
-        max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
-
-        max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
-
-        extended_runtime_perf_knob_config (tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
-
-        backend (str, optional): The backend to use. None means TensorRT engine and C++ executor. Defaults to None.
-"""
-
-
-@append_docstring(LLMARGS_EXPLICIT_DOCSTRING + LLMARGS_IMPLICIT_DOCSTRING)
-@dataclass
-class LlmArgs:
-    """The arguments for constructing a LLM instance.
-
-    Args:
-    """
     # Explicit arguments
-    model: Union[str, Path]
+    model: Union[str, Path] = Field(
+        description=
+        "The path to the model checkpoint or the model name from the Hugging Face Hub."
+    )
 
-    tokenizer: Optional[Union[str, Path, TokenizerBase,
-                              PreTrainedTokenizerBase]] = None
+    tokenizer: Optional[Union[
+        str, Path, TokenizerBase, PreTrainedTokenizerBase]] = Field(
+            description=
+            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub."
+        )
 
-    tokenizer_mode: Literal['auto', 'slow'] = 'auto'
+    tokenizer_mode: Literal['auto', 'slow'] = Field(
+        default='auto', description="The mode to initialize the tokenizer.")
 
-    skip_tokenizer_init: bool = False
+    skip_tokenizer_init: bool = Field(
+        default=False,
+        description="Whether to skip the tokenizer initialization.")
 
-    trust_remote_code: bool = False
+    trust_remote_code: bool = Field(
+        default=False, description="Whether to trust the remote code.")
 
-    tensor_parallel_size: int = 1
+    tensor_parallel_size: int = Field(default=1,
+                                      description="The tensor parallel size.")
 
-    dtype: str = "auto"
+    dtype: str = Field(default="auto",
+                       description="The data type to use for the model.")
 
-    revision: Optional[str] = None
+    revision: Optional[str] = Field(
+        default=None, description="The revision to use for the model.")
 
-    tokenizer_revision: Optional[str] = None
+    tokenizer_revision: Optional[str] = Field(
+        default=None, description="The revision to use for the tokenizer.")
 
     # Below are all remaining arguments
-    pipeline_parallel_size: int = 1
 
-    context_parallel_size: int = 1
+    pipeline_parallel_size: int = Field(
+        default=1, description="The pipeline parallel size.")
 
-    gpus_per_node: Optional[int] = None
+    context_parallel_size: int = Field(default=1,
+                                       description="The context parallel size.")
 
-    moe_tensor_parallel_size: Optional[int] = None
+    gpus_per_node: Optional[int] = Field(
+        default=None, description="The number of GPUs per node.")
 
-    moe_expert_parallel_size: Optional[int] = None
+    moe_tensor_parallel_size: Optional[int] = Field(
+        default=None,
+        description="The tensor parallel size for MoE models's expert weights.")
 
-    enable_attention_dp: bool = False
+    moe_expert_parallel_size: Optional[int] = Field(
+        default=None,
+        description="The expert parallel size for MoE models's expert weights.")
 
-    cp_config: Optional[dict] = None
+    enable_attention_dp: bool = Field(
+        default=False, description="Enable attention data parallel.")
 
-    auto_parallel: bool = False
+    cp_config: Optional[dict] = Field(default=None,
+                                      description="Context parallel config.")
 
-    auto_parallel_world_size: int = 1
+    auto_parallel: bool = Field(default=False,
+                                description="Enable auto parallel mode.")
 
-    load_format: Literal['auto', 'dummy'] = 'auto'
+    auto_parallel_world_size: int = Field(
+        default=1, description="The world size for auto parallel mode.")
 
-    enable_tqdm: bool = False
+    load_format: Literal['auto', 'dummy'] = Field(
+        default='auto', description="The format to load the model.")
+
+    enable_tqdm: bool = Field(default=False,
+                              description="Enable tqdm for progress bar.")
 
     # LoRA arguments
-    enable_lora: bool = False
+    enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
-    max_lora_rank: Optional[int] = None
+    max_lora_rank: Optional[int] = Field(default=None,
+                                         description="The maximum LoRA rank.")
 
-    max_loras: int = 4
+    max_loras: int = Field(default=4, description="The maximum number of LoRA.")
 
-    max_cpu_loras: int = 4
+    max_cpu_loras: int = Field(default=4,
+                               description="The maximum number of LoRA on CPU.")
 
     # Prompt adapter arguments
-    enable_prompt_adapter: bool = False
+    enable_prompt_adapter: bool = Field(default=False,
+                                        description="Enable prompt adapter.")
 
-    max_prompt_adapter_token: int = 0
+    max_prompt_adapter_token: int = Field(
+        default=0, description="The maximum number of prompt adapter tokens.")
 
     # Quantization and calibration configurations
-    quant_config: Optional[QuantConfig] = None
+    quant_config: Optional[QuantConfig] = Field(
+        default=None, description="Quantization config.")
 
-    calib_config: Optional[CalibConfig] = None
+    calib_config: Optional[CalibConfig] = Field(
+        default=None, description="Calibration config.")
 
     # BuildConfig is introduced to give users a familiar interface to configure the model building.
-    build_config: Optional[BuildConfig] = None
+    build_config: Optional[object] = Field(
+        default=None,
+        description="Build config.",
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
-    kv_cache_config: Optional[KvCacheConfig] = None
+    kv_cache_config: Optional[KvCacheConfig] = Field(
+        default=None, description="KV cache config.")
 
-    enable_chunked_prefill: bool = False
+    enable_chunked_prefill: bool = Field(default=False,
+                                         description="Enable chunked prefill.")
 
-    guided_decoding_backend: Optional[str] = None
+    guided_decoding_backend: Optional[str] = Field(
+        default=None, description="Guided decoding backend.")
 
-    batched_logits_processor: Optional[BatchedLogitsProcessor] = None
+    batched_logits_processor: Optional[object] = Field(
+        default=None,
+        description="Batched logits processor.",
+        json_schema_extra={
+            "type": f"Optional[{get_type_repr(BatchedLogitsProcessor)}]"
+        })
 
-    iter_stats_max_iterations: Optional[int] = None
+    iter_stats_max_iterations: Optional[int] = Field(
+        default=None,
+        description="The maximum number of iterations for iter stats.")
 
-    request_stats_max_iterations: Optional[int] = None
+    request_stats_max_iterations: Optional[int] = Field(
+        default=None,
+        description="The maximum number of iterations for request stats.")
 
-    workspace: Optional[str] = None
+    workspace: Optional[str] = Field(default=None,
+                                     description="The workspace for the model.")
 
     # A handful of options from PretrainedConfig
-    embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
+    embedding_parallel_mode: str = Field(
+        default='SHARDING_ALONG_VOCAB',
+        description="The embedding parallel mode.")
 
-    fast_build: bool = False
+    fast_build: bool = Field(default=False, description="Enable fast build.")
 
     # Once set, the model will reuse the build_cache
-    enable_build_cache: Union[BuildCacheConfig, bool] = False
+    enable_build_cache: Union[BuildCacheConfig,
+                              bool] = Field(default=False,
+                                            description="Enable build cache.")
 
-    peft_cache_config: Optional[PeftCacheConfig] = None
+    peft_cache_config: Optional[PeftCacheConfig] = Field(
+        default=None, description="PEFT cache config.")
 
-    scheduler_config: Optional[SchedulerConfig] = None
+    scheduler_config: Optional[SchedulerConfig] = Field(
+        default=None, description="Scheduler config.")
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[LookaheadDecodingConfig,
-                                       MedusaDecodingConfig,
-                                       EagleDecodingConfig,
-                                       MTPDecodingConfig]] = None
+    speculative_config: Optional[Union[
+        LookaheadDecodingConfig, MedusaDecodingConfig, EagleDecodingConfig,
+        MTPDecodingConfig]] = Field(default=None,
+                                    description="Speculative decoding config.")
 
-    decoding_config: Optional[DecodingConfig] = None
+    batching_type: Optional[BatchingType] = Field(default=None,
+                                                  description="Batching type.")
 
-    batching_type: Optional[BatchingType] = None
+    normalize_log_probs: bool = Field(
+        default=False, description="Normalize log probabilities.")
 
-    normalize_log_probs: bool = False
-
-    gather_generation_logits: bool = False
+    gather_generation_logits: bool = Field(
+        default=False, description="Gather generation logits.")
 
     extended_runtime_perf_knob_config: Optional[
-        ExtendedRuntimePerfKnobConfig] = None
+        ExtendedRuntimePerfKnobConfig] = Field(
+            default=None, description="Extended runtime perf knob config.")
 
-    # TODO: remove this option in the future
-    _use_runtime_defaults: bool = True
+    max_batch_size: Optional[int] = Field(default=None,
+                                          description="The maximum batch size.")
 
     # generation constraints
-    max_input_len: int = 1024
+    max_input_len: int = Field(default=1024,
+                               description="The maximum input length.")
 
-    max_seq_len: int = None
+    max_seq_len: int = Field(default=None,
+                             description="The maximum sequence length.")
 
-    max_beam_width: int = 1
+    max_beam_width: int = Field(default=1,
+                                description="The maximum beam width.")
 
-    max_batch_size: Optional[int] = None
+    max_num_tokens: Optional[int] = Field(
+        default=None, description="The maximum number of tokens.")
 
-    max_num_tokens: Optional[int] = None
+    backend: Optional[str] = Field(default=None,
+                                   description="The backend to use.")
 
-    # backend to use
-    backend: Optional[str] = None
+    mpi_session: Optional[object] = Field(
+        default=None,
+        description="The optional MPI session to use for this LLM instance.",
+        alias="_mpi_session",
+        json_schema_extra={"type": get_type_repr(MpiSession)})
 
-    # Optional mpi session to use for this LLM instance
-    _mpi_session: Optional[MpiSession] = None
+    num_postprocess_workers: int = Field(
+        default=0,
+        description="The number of postprocess worker processes.",
+        alias="_num_postprocess_workers")
 
-    # private options
-    _num_postprocess_workers: int = 0  # Number of postprocess worker processes
-    _postprocess_tokenizer_dir: Optional[str] = None
+    postprocess_tokenizer_dir: Optional[str] = Field(
+        default=None,
+        description="The postprocess tokenizer directory.",
+        alias="_postprocess_tokenizer_dir")
+
+    def __init__(self,
+                 decoding_config: Optional[DecodingConfig] = None,
+                 **kwargs: Any):
+        super().__init__(**kwargs)
+        self._decoding_config = decoding_config
+
+    @property
+    def decoding_config(self) -> Optional[DecodingConfig]:
+        return self._decoding_config
+
+    @decoding_config.setter
+    def decoding_config(self, decoding_config: Optional[DecodingConfig]):
+        self._decoding_config = decoding_config
 
     def __post_init__(self):
-        # TODO[chunweiy]: Enable this option in the future
-        # Currently we want LLMAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
-        # magics.
-        self.perform_config_arbitration = False
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -1023,9 +1020,7 @@ class LlmArgs:
         return kwargs_dict
 
     def _setup(self):
-        ''' This method will setup the configs right before building the model.
-        It will check the consistency of the configs and arbitrate the conflicts.
-        '''
+        ''' This method will setup the configs right before building the model. '''
 
         assert isinstance(self.model,
                           (str, Path)), f"Invalid model: {self.model}"
@@ -1115,9 +1110,6 @@ class LlmArgs:
         if self.enable_prompt_adapter:
             self.build_config.max_prompt_embedding_table_size = self.max_prompt_adapter_token * self.build_config.max_batch_size
 
-        if self.perform_config_arbitration:
-            self._perform_config_arbitration()
-
         if self.speculative_config:
             if isinstance(self.speculative_config, LookaheadDecodingConfig):
                 lookahead_config = self.speculative_config
@@ -1175,37 +1167,6 @@ class LlmArgs:
                 )
         else:
             self.decoding_config = None
-
-    def _perform_config_arbitration(self):
-        '''
-        Arbitrate the configurations for the model building. The configs between different functional or performance
-        features might be conflicted, and this method will arbitrate the conflicts and raise errors if necessary.
-        '''
-        self._config_arbitrator = _ConfigArbitrator()
-        if self._build_config_mutable:
-            if not self.build_config.max_num_tokens:
-                self.build_config.max_num_tokens = 2048
-
-            self._setup_enable_chunked_context()
-            self._setup_enable_streaming_llm()
-            self._setup_quant_config()
-
-            if self.build_config.max_beam_width > 1:
-                self._config_arbitrator.claim_func(
-                    "beam_search (beam_width > 1)",
-                    config_name="kv_cache_config",
-                    enable_block_reuse=False)
-
-        else:
-            self._setup_build_config_into_config_arbitrator()
-
-        self._setup_kv_cache_config()
-
-        self._config_arbitrator(plugin_config=self.build_config.plugin_config,
-                                kv_cache_config=self.kv_cache_config,
-                                build_config=self.build_config)
-
-        self._config_arbitrator = None
 
     @property
     def _build_config_mutable(self) -> bool:
@@ -1291,48 +1252,6 @@ class LlmArgs:
                 f"Invalid embedding_parallel_mode: {self.llm_args.embedding_parallel_mode}"
             )
 
-    def _setup_build_config_into_config_arbitrator(self):
-        # Setup the ConfigArbitrator with the plugin_config, the runtime configs such as KvCacheConfig should not be
-        # conflict with it.
-        build_config = asdict(self.build_config)
-        del build_config['plugin_config']
-
-        self._config_arbitrator.setup("BuildConfig is readonly",
-                                      config_name="build_config",
-                                      **build_config)
-
-        plugin_config = asdict(self.build_config.plugin_config)
-        self._config_arbitrator.setup("PluginConfig is readonly",
-                                      config_name="plugin_config",
-                                      **plugin_config)
-
-    def _setup_enable_chunked_context(self):
-
-        def fallback():
-            logger.warning(
-                f"Disabling chunked context due to configuration conflict.")
-            self.enable_chunked_prefill = False
-
-        if self.enable_chunked_prefill:
-            if self._build_config_mutable:
-                self._config_arbitrator.claim_perf("chunked_context",
-                                                   config_name="plugin_config",
-                                                   use_paged_context_fmha=True,
-                                                   fallback=fallback)
-
-    def _setup_enable_streaming_llm(self):
-        if self.build_config.plugin_config.streamingllm:
-            self._validate_kv_cache_config()
-
-            self._config_arbitrator.claim_func("streamingllm",
-                                               config_name="plugin_config",
-                                               streamingllm=True,
-                                               use_paged_context_fmha=False)
-
-            self._config_arbitrator.claim_func("streamingllm",
-                                               config_name="kv_cache_config",
-                                               enable_block_reuse=False)
-
     def _validate_kv_cache_config(self):
         if self.kv_cache_config is None:
             raise ValueError("KvCacheConfig is required for streaming LLM.")
@@ -1354,31 +1273,9 @@ class LlmArgs:
             raise ValueError(
                 "KvCacheConfig.sink_token_length should be greater than 0.")
 
-    def _setup_kv_cache_config(self):
-        assert self.kv_cache_config is not None
 
-        if self.kv_cache_config.enable_block_reuse:
-            self._config_arbitrator.claim_func("enable_block_reuse",
-                                               config_name="kv_cache_config",
-                                               enable_block_reuse=True)
-            self._config_arbitrator.claim_func("enable_block_reuse",
-                                               config_name="plugin_config",
-                                               use_paged_context_fmha=True)
-
-    def _setup_quant_config(self):
-        if self.quant_config.quant_algo is QuantAlgo.FP8:
-            self._config_arbitrator.claim_func("fp8_quant",
-                                               config_name="plugin_config",
-                                               use_paged_context_fmha=False)
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if '_config_arbitrator' in state:
-            del state['_config_arbitrator']
-        return state
+LLMARGS_EXPLICIT_DOCSTRING = generate_api_docs_as_docstring(LlmArgs,
+                                                            indent=' ' * 4)
 
 
 def update_llm_args_with_extra_dict(
@@ -1423,120 +1320,6 @@ def update_llm_args_with_extra_options(llm_args: Dict,
             llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
                                                        extra_llm_api_options)
     return llm_args
-
-
-class ConfigArbitrateError(Exception):
-    ''' Exception raised when there is a conflict in configurations. '''
-
-    def __init__(self, message):
-        super().__init__(message)
-
-
-class _ConfigArbitrator:
-    ''' The ConfigArbitrator will arbitrate the options from different sources and raise errors if there are conflicts. '''
-
-    def __init__(self):
-        # Dict of configs, the format is {config_name: {option: value}}
-        self.virtual_configs: Dict[str, Dict[str, Any]] = {}
-        # The claims for functionalities, the format is {config_name: [(func_name, {option: value})]}
-        self.func_claims: Dict[str, List[Tuple[str, dict]]] = {}
-        # The claims for performances, the format is {perf_name: [(config_name, {option: value}, fallback)]},
-        # the fallback is a callback function to be called when the performance is abandoned.
-        self.perf_claims: Dict[str, List[Tuple[str, dict,
-                                               Optional[Callable[[],
-                                                                 None]]]]] = {}
-        # Track where the option settings came from, this will be used for messages when encountered conflicts.
-        # The format is {config_name: {option: error_information}}
-        self.option_sources: Dict[str, Dict[str, str]] = {}
-
-    def __call__(self, **configs) -> None:
-        '''
-        Args:
-            configs: name to config instance for each config need to be arbitrated.
-        '''
-        self._arbitrate()
-
-        # Apply the successfully arbitrated virtual configs to the real configs
-        for name, config in configs.items():
-            if name in self.virtual_configs:
-                virtual_config = self.virtual_configs[name]
-                for option, value in virtual_config.items():
-                    setattr(config, option, value)
-
-    def setup(self, info: str, config_name: str, **kwargs):
-        ''' Setup with some pre-defined configs comes from environment such as GPU arch. '''
-        config = self.virtual_configs.setdefault(config_name, {})
-        option_sources = self.option_sources.setdefault(config_name, {})
-        for option, value in kwargs.items():
-            assert config.get(option, value) == value
-            config[option] = value
-            option_sources[option] = info
-
-    def claim_func(self, func: str, config_name: str, **options):
-        ''' Claim a functionality demanding with configs and options.
-        The functionality should be fulfilled, or errors will be raised. '''
-
-        claims = self.func_claims.setdefault(config_name, [])
-        claims.append((func, options))
-
-    def claim_perf(self,
-                   perf: str,
-                   config_name: str,
-                   fallback: Optional[Callable[[], None]] = None,
-                   **options):
-        ''' Claim a performance demanding for configs and options.
-        The performance could be abandoned if the demanding is not available.'''
-        claims = self.perf_claims.setdefault(perf, [])
-        claims.append((config_name, options, fallback))
-
-    def _arbitrate(self):
-        ''' Arbitrate the configs for all the functionalities and performances. '''
-
-        # Resolve functionality claims
-        for config_name, funcs in self.func_claims.items():
-            virtual_config = self.virtual_configs.setdefault(config_name, {})
-            option_sources = self.option_sources.setdefault(config_name, {})
-            for func, options in funcs:
-                for option, value in options.items():
-                    if option in virtual_config:
-                        if virtual_config[option] != value:
-                            existing_func = option_sources[option]
-                            raise ConfigArbitrateError(
-                                f"Cannot set '{option}' to be '{value}' when enabling '{func}', "
-                                f"since '{existing_func}' has set it to be '{virtual_config[option]}'."
-                            )
-                    else:
-                        virtual_config[option] = value
-                        # Track where the setting came from
-                        option_sources[option] = func
-
-        # copy for restore
-        # Resolve performance claims
-        for perf, options in self.perf_claims.items():
-            option_sources = copy.copy(self.option_sources)
-            virtual_configs = copy.copy(self.virtual_configs)
-            restore = False
-            for config_name, options, fallback in options:
-                virtual_config = virtual_configs.setdefault(config_name, {})
-                option_source = option_sources.setdefault(config_name, {})
-                for option, value in options.items():
-                    if option in virtual_config and virtual_config[
-                            option] != value:
-                        logger.warning(
-                            f"Ignoring performance claim '{perf}' for option '{option}' due to conflict."
-                        )
-                        restore = True
-                    else:
-                        virtual_config[option] = value
-                        option_source[option] = perf
-                    if restore: break
-                if restore:
-                    if fallback: fallback()
-                    break
-
-            if not restore:
-                self.option_sources = option_sources
-                self.virtual_configs = virtual_configs
 
 
 def get_model_format(model_dir: str) -> _ModelFormatKind:

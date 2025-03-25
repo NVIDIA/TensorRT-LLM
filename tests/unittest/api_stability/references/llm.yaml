@@ -1,5 +1,8 @@
 methods:
   __init__:
+    kwargs:
+      annotation: Any
+      default: inspect._empty
     parameters: {}
     return_annotation: None
   generate:
