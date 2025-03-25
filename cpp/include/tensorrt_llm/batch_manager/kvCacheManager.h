@@ -333,7 +333,14 @@ public:
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mCyclicThreshold(windowSizeToMetadata.cbegin()->second.maxTokenNum) // min window size + sink bubble length
+        // min window size + sink bubble length
+        // Why use the minimum window size:
+        // Chunked Prefill + Reuse calls `setPrepopulatedPromptLen()` which sets
+        // `mContextCurrentPosition` - this cannot be done for some windows sizes and
+        // not for others, the state needs to remain identical for all window sizes. So
+        // we currently resort to strictly disabling the reuse code path for all window
+        // sizes at once or enable it for all window sizes at once.
+        , mCyclicThreshold(windowSizeToMetadata.cbegin()->second.maxTokenNum)
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
         mCacheBlockIds.reserve(numWindowSizes);
