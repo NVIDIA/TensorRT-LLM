@@ -1,3 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
 #include "tensorrt_llm/common/logger.h"
 #include <exception>
@@ -128,23 +145,6 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
         tensorrt_llm::mpi::MpiComm kvCacheComm(comm->split(300, mComm->getRank()));
         TLLM_LOG_DEBUG("rank %d | comm split done | kvCacheComm size %d, kvCacheComm rank %d", comm->getRank(),
             kvCacheComm.getSize(), kvCacheComm.getRank());
-        // if (excludeRank0)
-        // {
-        //     MPI_Comm newComm;
-        //     MPI_Group worldGroup, newGroup;
-        //     MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
-        //     std::vector<int> ranks(comm->getSize() - 1);
-        //     for (int i = 0; i < comm->getSize() - 1; i++) {ranks[i]=i+1;}
-        //     MPI_Group_incl(worldGroup, comm->getSize() - 1, ranks, &newGroup);
-
-        //     // Create the new communicator
-        //     MPI_Comm_create_group(MPI_COMM_WORLD, newGroup, 0, &newComm);
-        //     MPI_Group_free(&newGroup);
-        //     MPI_Group_free(&world_group);
-        //     kvCacheComm = tensorrt_llm::mpi::MpiComm(newComm,true);
-        // }else{
-        //     kvCacheComm = *comm;
-        // }
 
         int excludeRank0 = comm->getSize() != kvCacheComm.getSize();
 
@@ -290,15 +290,6 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
         localPort);
     return ((remotePort << (32 + 16)) | (localPort << 32) | remoteIp);
 }
-
-// void UcxConnectionManager::initializeConnections()
-// {
-//     for (auto& connection : mConnections)
-//     {
-//         TLLM_LOG_DEBUG("UcxConnectionManager::initializeConnections");
-//         connection.second->initialize(this);
-//     }
-// }
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
