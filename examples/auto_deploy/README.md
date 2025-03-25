@@ -65,7 +65,9 @@ The exported graph then undergoes a series of automated transformations, includi
 
 ### Supported Models
 
-AutoDeploy officially supports a range of Hugging Face models that have been tested to work out of the box:
+**Bring Your Own Model**: AutoDeploy leverages `torch.export` and dynamic graph pattern matching, enabling seamless integration for a wide variety of models without relying on hard-coded architectures.
+
+Additionally, we have officially verified and fully optimized support for the following models:
 
 <details>
 <summary>Click to expand supported models list</summary>
@@ -81,8 +83,6 @@ AutoDeploy officially supports a range of Hugging Face models that have been tes
 | BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
 
 </details>
-
-**Bring Your Own Model**: AutoDeploy utilizes `torch.export` and graph pattern matching rather than hard-coded architectures. Therefore, many models beyond our officially tested ones are supported out-of-the-box.
 
 ### Runtime Integrations
 
