@@ -184,10 +184,6 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto eventStart = CudaEvent{};
-    mRuntimeStream->record(eventStart);
-    mDecoderStream->wait(eventStart.get());
-
     auto const maxDecodingEngineTokens
         = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
 
@@ -201,10 +197,6 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
         }
     }
 
-    CudaEvent event{};
-    mDecoderStream->record(event);
-    mRuntimeStream->wait(event);
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -213,7 +205,15 @@ GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    auto eventStart = CudaEvent{};
+    mRuntimeStream->record(eventStart);
+    mDecoderStream->wait(eventStart.get());
+
     forwardDispatch(output, input);
+
+    CudaEvent event{};
+    mDecoderStream->record(event);
+    mRuntimeStream->wait(event);
 
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
