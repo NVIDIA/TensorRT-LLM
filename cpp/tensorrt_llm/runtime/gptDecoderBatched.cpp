@@ -182,6 +182,8 @@ T maxOfActiveSlots(std::vector<T> const& values, std::vector<bool> const& active
 
 void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto eventStart = CudaEvent{};
     mRuntimeStream->record(eventStart);
     mDecoderStream->wait(eventStart.get());
@@ -192,12 +194,18 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
     for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
         prepareForward(si, output, input);
-        forwardDecoder(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput());
+
+        if (mDecoderState->getJointDecodingInput().batchSize > 0)
+        {
+            mDecoder->forwardAsync(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput());
+        }
     }
 
     CudaEvent event{};
     mDecoderStream->record(event);
     mRuntimeStream->wait(event);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
@@ -318,18 +326,6 @@ void GptDecoderBatched::prepareForward(
     dOutput.newTokens = newTokensStepView;
     dOutput.finishReasons = finishedStepsOutput;
     dOutput.lengths = sequenceLengths;
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void GptDecoderBatched::forwardDecoder(DecodingOutput& output, DecodingInput const& input)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (input.batchSize > 0)
-    {
-        mDecoder->forwardAsync(output, input);
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

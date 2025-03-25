@@ -98,9 +98,6 @@ private:
     //! @brief Prepare Input and Output for decoder step
     void prepareForward(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input);
 
-    //! @brief Calls decoder for whole batch
-    void forwardDecoder(DecodingOutput& output, DecodingInput const& input);
-
 private:
     CudaStreamPtr mRuntimeStream;
     CudaStreamPtr mDecoderStream;
