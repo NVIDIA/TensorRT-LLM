@@ -14,16 +14,18 @@
 # limitations under the License.
 import pytest
 
+from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
+                                 MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, skip_no_nvls, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper)
-from .accuracy_core import (AccuracyTestHarness, CnnDailymail, Humaneval, Mmlu,
-                            PassKeyRetrieval64k, PassKeyRetrieval128k,
+from .accuracy_core import (CliAccuracyTestHarness, CnnDailymail, Humaneval,
+                            Mmlu, PassKeyRetrieval64k, PassKeyRetrieval128k,
                             SlimPajama6B, ZeroScrolls)
 
 
-class TestGpt2(AccuracyTestHarness):
+class TestGpt2(CliAccuracyTestHarness):
     MODEL_NAME = "gpt2"
     MODEL_PATH = f"{llm_models_root()}/gpt2"
     EXAMPLE_FOLDER = "gpt"
@@ -99,7 +101,7 @@ class TestGpt2(AccuracyTestHarness):
         self.run(extra_summarize_args=["--cuda_graph_mode"])
 
 
-class TestGpt2Medium(AccuracyTestHarness):
+class TestGpt2Medium(CliAccuracyTestHarness):
     MODEL_NAME = "gpt2-medium"
     MODEL_PATH = f"{llm_models_root()}/gpt2-medium"
     EXAMPLE_FOLDER = "gpt"
@@ -117,7 +119,7 @@ class TestGpt2Medium(AccuracyTestHarness):
                  extra_convert_args=["--quantize_lm_head"])
 
 
-class TestSantacoder(AccuracyTestHarness):
+class TestSantacoder(CliAccuracyTestHarness):
     MODEL_NAME = "bigcode/santacoder"
     MODEL_PATH = f"{llm_models_root()}/santacoder"
     EXAMPLE_FOLDER = "gpt"
@@ -127,7 +129,7 @@ class TestSantacoder(AccuracyTestHarness):
         self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
 
 
-class TestStarcoder2_3B(AccuracyTestHarness):
+class TestStarcoder2_3B(CliAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-3b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-3b"
     EXAMPLE_FOLDER = "gpt"
@@ -136,7 +138,7 @@ class TestStarcoder2_3B(AccuracyTestHarness):
         self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
 
 
-class TestStarcoder2_15B(AccuracyTestHarness):
+class TestStarcoder2_15B(CliAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-15b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-model"
     EXAMPLE_FOLDER = "gpt"
@@ -146,7 +148,7 @@ class TestStarcoder2_15B(AccuracyTestHarness):
                  quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
 
 
-class TestGptNext(AccuracyTestHarness):
+class TestGptNext(CliAccuracyTestHarness):
     MODEL_NAME = "gpt-next"
     MODEL_PATH = f"{llm_models_root()}/gpt-next/megatron_converted_843m_tp1_pp1.nemo"
     MODEL_FORMAT = "NEMO"
@@ -157,7 +159,7 @@ class TestGptNext(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestMinitron4BBase(AccuracyTestHarness):
+class TestMinitron4BBase(CliAccuracyTestHarness):
     MODEL_NAME = "nvidia/Minitron-4B-Base"
     MODEL_PATH = f"{llm_models_root()}/nemotron/Minitron-4B-Base"
     EXAMPLE_FOLDER = "gpt"
@@ -174,7 +176,7 @@ class TestMinitron4BBase(AccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
-class TestNemotronMini4BInstruct(AccuracyTestHarness):
+class TestNemotronMini4BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron/Nemotron-Mini-4B-Instruct"
     EXAMPLE_FOLDER = "gpt"
@@ -188,7 +190,7 @@ class TestNemotronMini4BInstruct(AccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
 
-class TestPhi2(AccuracyTestHarness):
+class TestPhi2(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
     MODEL_PATH = f"{llm_models_root()}/phi-2"
     EXAMPLE_FOLDER = "phi"
@@ -201,7 +203,7 @@ class TestPhi2(AccuracyTestHarness):
         self.run(tp_size=2)
 
 
-class TestPhi3Mini4kInstruct(AccuracyTestHarness):
+class TestPhi3Mini4kInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct"
     EXAMPLE_FOLDER = "phi"
@@ -210,7 +212,7 @@ class TestPhi3Mini4kInstruct(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestPhi3Mini128kInstruct(AccuracyTestHarness):
+class TestPhi3Mini128kInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-128k-instruct"
     EXAMPLE_FOLDER = "phi"
@@ -219,7 +221,7 @@ class TestPhi3Mini128kInstruct(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestPhi3Small8kInstruct(AccuracyTestHarness):
+class TestPhi3Small8kInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-small-8k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-8k-instruct"
     EXAMPLE_FOLDER = "phi"
@@ -228,7 +230,7 @@ class TestPhi3Small8kInstruct(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestPhi3Small128kInstruct(AccuracyTestHarness):
+class TestPhi3Small128kInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3-small-128k-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-128k-instruct"
     EXAMPLE_FOLDER = "phi"
@@ -237,7 +239,7 @@ class TestPhi3Small128kInstruct(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestPhi3_5MiniInstruct(AccuracyTestHarness):
+class TestPhi3_5MiniInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-3.5/Phi-3.5-mini-instruct"
     EXAMPLE_FOLDER = "phi"
@@ -249,7 +251,7 @@ class TestPhi3_5MiniInstruct(AccuracyTestHarness):
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
 @pytest.mark.skip_less_device_memory(40000)
-class TestLongAlpaca7B(AccuracyTestHarness):
+class TestLongAlpaca7B(CliAccuracyTestHarness):
     MODEL_NAME = "Yukang/LongAlpaca-7B"
     MODEL_PATH = f"{llm_models_root()}/LongAlpaca-7B"
     EXAMPLE_FOLDER = "llama"
@@ -267,7 +269,7 @@ class TestLongAlpaca7B(AccuracyTestHarness):
                  })
 
 
-class TestMamba130M(AccuracyTestHarness):
+class TestMamba130M(CliAccuracyTestHarness):
     MODEL_NAME = "state-spaces/mamba-130m-hf"
     MODEL_PATH = f"{llm_models_root()}/mamba/mamba-130m-hf"
     EXAMPLE_FOLDER = "mamba"
@@ -276,7 +278,7 @@ class TestMamba130M(AccuracyTestHarness):
         self.run(dtype='auto')
 
 
-class TestVicuna7B(AccuracyTestHarness):
+class TestVicuna7B(CliAccuracyTestHarness):
     MODEL_NAME = "lmsys/vicuna-7b-v1.3"
     MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
     EXAMPLE_FOLDER = "llama"
@@ -288,7 +290,7 @@ class TestVicuna7B(AccuracyTestHarness):
     def test_lookahead(self, mocker):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
-        self.run(spec_dec_algo="lookahead",
+        self.run(spec_dec_algo=LookaheadDecodingConfig.decoding_type,
                  extra_build_args=[
                      "--max_draft_len=83",
                      "--speculative_decoding_mode=lookahead_decoding"
@@ -308,7 +310,7 @@ class TestVicuna7B(AccuracyTestHarness):
             extra_summarize_args.append("--cuda_graph_mode")
 
         self.run(dtype="float16",
-                 spec_dec_algo="medusa",
+                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
                  extra_convert_args=[
                      f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
                      "--num_medusa_heads=4"
@@ -339,7 +341,7 @@ class TestVicuna7B(AccuracyTestHarness):
             extra_summarize_args.extend(
                 ["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
 
-        self.run(spec_dec_algo="eagle",
+        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -351,7 +353,7 @@ class TestVicuna7B(AccuracyTestHarness):
                  extra_summarize_args=extra_summarize_args)
 
 
-class TestLlama7B(AccuracyTestHarness):
+class TestLlama7B(CliAccuracyTestHarness):
     MODEL_NAME = "llama-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llama-models/llama-7b-hf"
     EXAMPLE_FOLDER = "llama"
@@ -382,7 +384,7 @@ class TestLlama7B(AccuracyTestHarness):
         self.run(extra_build_args=["--fast_build"])
 
 
-class TestLlama2_7B(AccuracyTestHarness):
+class TestLlama2_7B(CliAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-2-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llama-models-v2/llama-v2-7b-hf"
     EXAMPLE_FOLDER = "llama"
@@ -462,7 +464,7 @@ class TestLlama2_7B(AccuracyTestHarness):
         self.run(extra_build_args=["--weight_sparsity"])
 
 
-class TestTinyLlama1_1BChat(AccuracyTestHarness):
+class TestTinyLlama1_1BChat(CliAccuracyTestHarness):
     MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     MODEL_PATH = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
     EXAMPLE_FOLDER = "llama"
@@ -498,7 +500,7 @@ class TestTinyLlama1_1BChat(AccuracyTestHarness):
         self.run(extra_acc_spec="pp_size=4", pp_size=4)
 
 
-class TestLlama3_8BInstruct(AccuracyTestHarness):
+class TestLlama3_8BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-models-v3/llama-v3-8b-instruct-hf"
     EXAMPLE_FOLDER = "llama"
@@ -546,7 +548,7 @@ class TestLlama3_8BInstruct(AccuracyTestHarness):
                  extra_build_args=extra_build_args)
 
 
-class TestLlama3_8BInstructGradient1048k(AccuracyTestHarness):
+class TestLlama3_8BInstructGradient1048k(CliAccuracyTestHarness):
     MODEL_NAME = "gradientai/Llama-3-8B-Instruct-Gradient-1048k"
     MODEL_PATH = f"{llm_models_root()}/llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"
     EXAMPLE_FOLDER = "llama"
@@ -561,7 +563,7 @@ class TestLlama3_8BInstructGradient1048k(AccuracyTestHarness):
                  extra_build_args=["--gather_context_logits"])
 
 
-class TestLlama3_1_8B(AccuracyTestHarness):
+class TestLlama3_1_8B(CliAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
     EXAMPLE_FOLDER = "llama"
@@ -632,7 +634,7 @@ class TestLlama3_1_8B(AccuracyTestHarness):
                  ])
 
 
-class TestLlama3_1_8BInstruct(AccuracyTestHarness):
+class TestLlama3_1_8BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
     EXAMPLE_FOLDER = "llama"
@@ -659,12 +661,12 @@ class TestLlama3_1_8BInstruct(AccuracyTestHarness):
             "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
         ]
         self.run(dtype="float16",
-                 spec_dec_algo="medusa",
+                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
 
 
-class TestLlama3_2_1B(AccuracyTestHarness):
+class TestLlama3_2_1B(CliAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.2-1B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
     EXAMPLE_FOLDER = "llama"
@@ -768,7 +770,7 @@ class TestLlama3_2_1B(AccuracyTestHarness):
                  ])
 
 
-class TestMixtral8x7B(AccuracyTestHarness):
+class TestMixtral8x7B(CliAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
     EXAMPLE_FOLDER = "llama"
@@ -819,7 +821,7 @@ class TestMixtral8x7B(AccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
-class TestGemma2B(AccuracyTestHarness):
+class TestGemma2B(CliAccuracyTestHarness):
     MODEL_NAME = "google/gemma-2b"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-2b"
     EXAMPLE_FOLDER = "gemma"
@@ -848,7 +850,7 @@ class TestGemma2B(AccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(40000)
-class TestGemma7B(AccuracyTestHarness):
+class TestGemma7B(CliAccuracyTestHarness):
     MODEL_NAME = "google/gemma-7b"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-7b"
     EXAMPLE_FOLDER = "gemma"
@@ -878,7 +880,7 @@ class TestGemma7B(AccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(40000)
-class TestGemma2_9BIt(AccuracyTestHarness):
+class TestGemma2_9BIt(CliAccuracyTestHarness):
     MODEL_NAME = "google/gemma-2-9b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-2-9b-it"
     EXAMPLE_FOLDER = "gemma"
@@ -901,7 +903,7 @@ class TestGemma2_9BIt(AccuracyTestHarness):
                  extra_convert_args=["--device_map=sequential"])
 
 
-class TestQwen7BChat(AccuracyTestHarness):
+class TestQwen7BChat(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen-7B-Chat"
     MODEL_PATH = f"{llm_models_root()}/Qwen-7B-Chat"
     EXAMPLE_FOLDER = "qwen"
@@ -919,7 +921,7 @@ class TestQwen7BChat(AccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(40000)
-class TestQwen1_5MoeA2_7BChat(AccuracyTestHarness):
+class TestQwen1_5MoeA2_7BChat(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
     MODEL_PATH = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
     EXAMPLE_FOLDER = "qwen"
@@ -932,7 +934,7 @@ class TestQwen1_5MoeA2_7BChat(AccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W8A16)
 
 
-class TestQwen2_0_5BInstruct(AccuracyTestHarness):
+class TestQwen2_0_5BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-0.5B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-0.5B-Instruct"
     EXAMPLE_FOLDER = "qwen"
@@ -950,7 +952,7 @@ class TestQwen2_0_5BInstruct(AccuracyTestHarness):
                  quant_algo=QuantAlgo.FP8)
 
 
-class TestQwen2_7BInstruct(AccuracyTestHarness):
+class TestQwen2_7BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
     EXAMPLE_FOLDER = "qwen"
@@ -968,7 +970,7 @@ class TestQwen2_7BInstruct(AccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(40000)
-class TestQwen2_57B_A14B(AccuracyTestHarness):
+class TestQwen2_57B_A14B(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-57B-A14B"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-57B-A14B"
     EXAMPLE_FOLDER = "qwen"
@@ -984,7 +986,7 @@ class TestQwen2_57B_A14B(AccuracyTestHarness):
         self.run(tp_size=2, pp_size=2)
 
 
-class TestQwen2_5_1_5BInstruct(AccuracyTestHarness):
+class TestQwen2_5_1_5BInstruct(CliAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2.5-1.5B-Instruct"
     EXAMPLE_FOLDER = "qwen"
