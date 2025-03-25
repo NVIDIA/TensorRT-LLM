@@ -25,8 +25,8 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
-const uint16_t listenerPort = 12345;
-int const MAX_IP_LENGTH = 16;
+constexpr uint16_t listenerPort = 12345;
+constexpr int MAX_IP_LENGTH = 16;
 static void listenerCallback(ucp_conn_request_h connRequest, void* arg);
 static std::string getLocalIp();
 
@@ -84,7 +84,7 @@ static std::string getLocalIp()
             //     continue;
 
             TLLM_LOG_DEBUG("Interface: %s IP Address: %s", ifa->ifa_name, address_buffer);
-            ip = std::string(address_buffer);
+            ip = address_buffer;
             break;
         }
     }
@@ -134,7 +134,8 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
         }
         catch (std::exception const& e)
         {
-            std::string error = "Error creating listener for rank " + std::to_string(comm->getRank()) + ": " + e.what();
+            std::string error
+                = "Error creating listener for rank " + std::to_string(mComm->getRank()) + ": " + e.what();
             TLLM_THROW(error);
         }
 
@@ -223,7 +224,7 @@ void UcxConnectionManager::updateGIDToConnectionIdMap(
         connectionId);
 }
 
-uint64_t UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
+void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
 {
     try
     {
@@ -237,7 +238,6 @@ uint64_t UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
         mPendingGIDFutures.push(std::make_shared<std::future<void>>(std::async(std::launch::async,
             [this, request, id]() { this->updateGIDToConnectionIdMap(request, &mConnections[id]->mRemoteGID, id); })));
         lock.unlock();
-        return id;
     }
     catch (std::exception const& e)
     {
@@ -247,7 +247,7 @@ uint64_t UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     }
 }
 
-uint64_t UcxConnectionManager::addConnection(std::string ip, uint16_t port)
+uint64_t UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
 {
     try
     {
@@ -268,7 +268,7 @@ uint64_t UcxConnectionManager::addConnection(std::string ip, uint16_t port)
     }
 }
 
-uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> newEp)
+uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp)
 {
     ucp_ep_attr_t ep_attr;
     ep_attr.field_mask = UCP_EP_ATTR_FIELD_LOCAL_SOCKADDR | UCP_EP_ATTR_FIELD_REMOTE_SOCKADDR;
@@ -277,7 +277,7 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
     char lIpStr[INET6_ADDRSTRLEN];
     char rIpStr[INET6_ADDRSTRLEN];
     char portStr[INET6_ADDRSTRLEN];
-    // ucs_status_t status = ucp_ep_query(newEp->getHandle(), &ep_attr);
+
     ucs_status_t status;
     while ((status = ucp_ep_query(newEp->getHandle(), &ep_attr)) != UCS_OK)
     {
