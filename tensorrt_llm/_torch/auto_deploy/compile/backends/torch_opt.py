@@ -138,7 +138,7 @@ class CompiledGraph(nn.Module):
 class TorchOptCompiler(BackendCompiler):
     @torch.inference_mode()
     def compile(self) -> CompiledGraph:
-        cuda_graph_batch_sizes = self.kwargs.get("cuda_graph_batch_sizes", None)
+        cuda_graph_batch_sizes = self.compiler_kwargs.get("cuda_graph_batch_sizes", None)
         compiled_gm = CompiledGraph(
             self.gm,
             max_batch_size=self.max_batch_size,

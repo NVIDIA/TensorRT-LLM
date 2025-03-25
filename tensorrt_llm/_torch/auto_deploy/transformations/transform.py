@@ -24,6 +24,7 @@ from .library import (
     insert_mha_with_kv_cache,
     match_moe_pattern,
     quantize,
+    resize_kv_cache,
 )
 
 
@@ -148,29 +149,8 @@ class InferenceOptimizer:
         ############################################################################################
         # RESIZE CACHE
         ############################################################################################
-        free_mem, total_mem = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
-        current_cache_size = cm.current_cache_size_bytes()
-        current_num_pages = cm.info.num_pages
-        ad_logger.info(
-            f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
-        )
-
-        # Let's run a forward pass to get the memory usage
-        cm.info._set_max_num_tokens_sample()
-        free_mem_pre, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
-        egm(*cm.args)
-        free_mem_post, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
-        memory_for_forward_pass = free_mem_pre - free_mem_post
-        ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
-
-        # FIXME: 0.8 is hard coded to ensure we have enough memory for graph capture.
-        new_cache_size = free_mem_post * 0.8 + current_cache_size
-        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
-        ad_logger.info(f"New cache size: {new_cache_size}, New num pages: {new_num_pages}")
-        cm.resize_cache(new_num_pages)
+        # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph capture.
+        resize_kv_cache(egm, cm, free_mem_ratio=0.8)
 
         ############################################################################################
         # COMPILE MODEL
@@ -182,8 +162,8 @@ class InferenceOptimizer:
             egm,
             self.compile_backend,
             args=cm.args,
-            kwargs=compiler_kwargs,
             dynamic_shapes=cm.dynamic_shapes,
+            compiler_kwargs=compiler_kwargs,
         )
         cm.info.reset()
 
