@@ -65,19 +65,27 @@ static std::string getLocalIp()
         if (ifa->ifa_addr == nullptr)
             continue;
 
-        // Check for InfiniBand interfaces (usually named ib0, ib1, etc.)
-        if (std::string(ifa->ifa_name).find("ib") == 0)
+        // Skip the loopback interface
+        if (std::string(ifa->ifa_name) == "lo")
+            continue;
+
+        // Check if the address family is AF_INET (IPv4)
+        if (ifa->ifa_addr->sa_family == AF_INET)
         {
-            // Check if the address family is AF_INET (IPv4)
-            if (ifa->ifa_addr->sa_family == AF_INET)
-            {
-                addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-                char address_buffer[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-                TLLM_LOG_DEBUG("InfiniBand Interface: %s IP Address: %s", ifa->ifa_name, address_buffer);
-                ip = std::string(address_buffer);
-                break;
-            }
+            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
+            char address_buffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
+
+            // Check if the address is not a private IP (optional)
+            // You might want to skip private IPs if you need a public IP
+            // if (std::string(address_buffer).find("10.") == 0 ||
+            //     std::string(address_buffer).find("172.16.") == 0 ||
+            //     std::string(address_buffer).find("192.168.") == 0)
+            //     continue;
+
+            TLLM_LOG_DEBUG("Interface: %s IP Address: %s", ifa->ifa_name, address_buffer);
+            ip = std::string(address_buffer);
+            break;
         }
     }
 
@@ -254,7 +262,8 @@ uint64_t UcxConnectionManager::addConnection(std::string ip, uint16_t port)
     }
     catch (std::exception const& e)
     {
-        std::string error = "Error in addConnection(ip) for rank " + std::to_string(mComm->getRank()) + ": " + e.what();
+        std::string error = "Error in addConnection(ip) for rank " + std::to_string(mComm->getRank()) + " to ip: " + ip
+            + " port: " + std::to_string(port) + ": " + e.what();
         TLLM_THROW(error);
     }
 }
