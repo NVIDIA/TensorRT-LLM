@@ -349,9 +349,6 @@ accuracy/test_accuracy.py::TestStarcoder2_15B::test_smooth_quant_ootb
 accuracy/test_accuracy.py::TestGptNext::test_auto_dtype
 accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
 accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
-accuracy/test_accuracy.py::TestGptJ6B::test_float32
-accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache
-accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache_beam_search
 accuracy/test_accuracy.py::TestPhi2::test_auto_dtype
 accuracy/test_accuracy.py::TestPhi2::test_tp2
 accuracy/test_accuracy.py::TestPhi3Mini4kInstruct::test_auto_dtype
@@ -388,6 +385,7 @@ accuracy/test_accuracy.py::TestLlama2_7B::test_int4_awq_tp2
 accuracy/test_accuracy.py::TestLlama2_7B::test_int4_awq_pre_quantized_tp2
 accuracy/test_accuracy.py::TestLlama2_7B::test_int4_gptq_pre_quantized_tp2
 accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity
+accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_float32
 accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only[int8]
 accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only[int4]
 accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only_int8_kv_cache[int8]
@@ -422,6 +420,8 @@ accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8
 accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_pp2
 accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_rowwise
 accuracy/test_accuracy.py::TestLlama3_2_1B::test_weight_streaming[1.0]
+accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache
+accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
 accuracy/test_accuracy.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_accuracy.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
 accuracy/test_accuracy.py::TestMixtral8x7B::test_nvfp4_pre_quantized
