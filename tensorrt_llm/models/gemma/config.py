@@ -121,6 +121,15 @@ class GemmaConfig(PretrainedConfig):
             } if self.is_gemma_2 else {})
         }
 
+    @staticmethod
+    def get_hf_config(config_dir: Union[str, PathLike]):
+        import transformers
+        SUPPORTED_HF_ARCHITECTURES = (transformers.GemmaConfig,
+                                      transformers.Gemma2Config)
+        hf_config = transformers.AutoConfig.from_pretrained(config_dir)
+        assert isinstance(hf_config, SUPPORTED_HF_ARCHITECTURES)
+        return hf_config
+
     @classmethod
     def from_hugging_face(
         cls,
@@ -134,8 +143,7 @@ class GemmaConfig(PretrainedConfig):
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
-            hf_config = transformers.Gemma2Config.from_pretrained(
-                hf_config_or_dir)
+            hf_config = cls.get_hf_config(hf_config_or_dir)
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
