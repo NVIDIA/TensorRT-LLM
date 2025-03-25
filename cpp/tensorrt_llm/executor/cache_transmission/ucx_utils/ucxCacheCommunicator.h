@@ -12,9 +12,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
-#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h" //TODO: remove when progressing to standalone UCX stack
 
 #include "ucxx/api.h"
@@ -28,6 +26,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include <map>
 #include <memory>
 #include <string>
@@ -49,9 +48,19 @@ private:
 
     uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> newEp);
     void addConnection(std::string ip, uint16_t port);
+    void initializeConnections();
 
 public:
-    explicit UcxConnectionManager(mpi::MpiComm const* comm);
+    explicit UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
+
+    // Factory function
+    static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
+    {
+        auto instance = std::make_unique<UcxConnectionManager>(comm);
+        instance->initializeConnections();
+        return instance;
+    }
+
     void addConnection(ucp_conn_request_h connRequest);
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -64,7 +73,7 @@ public:
 
 extern "C"
 {
-    std::unique_ptr<ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm);
+    std::unique_ptr<ConnectionManager> makeUcxConnectionManager(tensorrt_llm::mpi::MpiComm const* comm);
 }
 
 #if defined(__clang__)
