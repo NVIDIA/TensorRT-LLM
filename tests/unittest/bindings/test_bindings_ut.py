@@ -546,8 +546,7 @@ def test_KvCache_events_binding():
         1,
         'max_beam_width':
         1,
-        'max_attention_window':
-        10,
+        'max_attention_window_vec': [10],
         'temporary_attention_window':
         0,
         'sink_token_length':

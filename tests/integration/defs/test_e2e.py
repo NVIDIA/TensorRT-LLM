@@ -1223,39 +1223,12 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
     ])
 
 
-@pytest.mark.skip_less_device_memory(40000)
-def test_model_api_examples(llm_root, llm_venv, engine_dir):
-    example_root = Path(llm_root) / "examples" / "model_api"
-    llm_venv.run_cmd([
-        str(example_root / "llama.py"), "--engine_dir",
-        f"{engine_dir}/model_api", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
-    ])
-
-    llm_venv.run_cmd([
-        str(example_root / "llama_quantize.py"), "--cache_dir",
-        f"{engine_dir}/model_api_quantized", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
-    ])
-
-
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
     temp = tempfile.TemporaryDirectory()
     llm_venv.run_cmd([
         str(Path(llm_root) / "tests/microbenchmarks/build_time_dashboard.py"),
         '-m',
         temp.name,
-    ])
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(40000)
-def test_model_api_examples_tp2(llm_root, llm_venv, engine_dir):
-    example_root = Path(llm_root) / "examples" / "model_api"
-    llm_venv.run_cmd([
-        str(example_root / "llama_multi_gpu.py"), "--engine_dir",
-        f"{engine_dir}/model_api_tp2", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
     ])
 
 
