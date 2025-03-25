@@ -187,11 +187,9 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         if hf_quant_config.get("producer", {}).get("name") == "modelopt":
             if hf_quant_config.get("quantization",
                                    {}).get("quant_algo") == "FP8":
-                print("Setting FP8 quantization for weights.")
                 quant_config.quant_algo = QuantAlgo.FP8
             if hf_quant_config.get("quantization",
                                    {}).get("kv_cache_quant_algo") == "FP8":
-                print("Setting FP8 quantization for KV Cache.")
                 quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
     return quant_config
@@ -209,6 +207,9 @@ def convert_and_save_hf(args):
     }
 
     quant_config = args_to_quant_config(args)
+    is_prequantized_to_fp8 = quant_config.quant_algo == QuantAlgo.FP8
+    if is_prequantized_to_fp8:
+        override_fields.update({'prequantized_ckpt_path': args.model_dir})
 
     if args.smoothquant is not None or args.int8_kv_cache:
         mapping = Mapping(world_size=world_size,
@@ -224,11 +225,7 @@ def convert_and_save_hf(args):
             calib_dataset=args.calib_dataset,
             **override_fields)
     else:
-        is_prequantized_to_fp8 = quant_config.quant_algo == QuantAlgo.FP8
-        if is_prequantized_to_fp8:
-            hf_model = model_dir
-        else:
-            hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
+        hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
@@ -318,7 +315,6 @@ def main():
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
     args = parse_arguments()
-    args.tp_size * args.pp_size
 
     tik = time.time()
 

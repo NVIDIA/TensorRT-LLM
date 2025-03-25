@@ -302,6 +302,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        prequantized_ckpt_path = kwargs.pop('prequantized_ckpt_path', None)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -318,11 +319,30 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                              mapping=mapping,
                                              quant_config=quant_config,
                                              **kwargs)
-        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if prequantized_ckpt_path is not None and os.environ.get(
+                "TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {'fc': 'up_proj'}
-            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            loader = ModelWeightsLoader(prequantized_ckpt_path, custom_dict)
             model = cls(config)
-            loader.generate_tllm_weights(model, {})
+
+            # This is to account for all layernorms in nemotron variants being NemotronLayerNorm-1P.
+            def apply_layernorm_1p(weights):
+                return weights + 1.0
+
+            loader.update_key_mapping(model)
+            tllm_weights = {}
+            for tllm_key, _ in model.named_parameters():
+                if config.gpt_variant == "nemotron" and (
+                        'layernorm.weight' in tllm_key
+                        or 'ln_f.weight' in tllm_key):
+                    tllm_weights.update(
+                        loader.load(tllm_key,
+                                    preprocess=apply_layernorm_1p,
+                                    custom_postprocess_kwargs={}))
+                else:
+                    tllm_weights.update(
+                        loader.load(tllm_key, custom_postprocess_kwargs={}))
+            loader.fill(tllm_weights)
         else:
             if not use_preloading:
                 hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
