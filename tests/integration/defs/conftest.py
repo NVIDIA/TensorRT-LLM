@@ -325,6 +325,24 @@ def minitron_model_root(request):
 
 
 @pytest.fixture(scope="function")
+def nemotron_mini_4b_model_root(request):
+    "Get Nemotron Mini 4b model root"
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+
+    if hasattr(request, "param"):
+        assert request.param == "nemotron_mini_4b_prequantized_fp8_bfloat16"
+        nemotron_mini_4b_model_root = os.path.join(
+            models_root,
+            "nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export")
+
+    assert exists(nemotron_mini_4b_model_root
+                  ), f"{nemotron_mini_4b_model_root} does not exist!"
+
+    return nemotron_mini_4b_model_root
+
+
+@pytest.fixture(scope="function")
 def mistral_nemo_model_root(request):
     "Get Mistral Nemo model root"
     models_root = llm_models_root()
