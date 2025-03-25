@@ -13,6 +13,7 @@ from ..model_config import ModelConfig
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 
 
 class Attention(nn.Module):
@@ -103,6 +104,13 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
         self.rotary_emb = rotary_emb
+        self.splitted_qkv_lora = LoraLayer([
+            LoraModuleType.ATTENTION_Q, LoraModuleType.ATTENTION_K, LoraModuleType.ATTENTION_V
+        ], [self.q_size, self.kv_size, self.kv_size])
+        self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
+                                        [self.q_size + 2 * self.kv_size])
+
+        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE], [self.hidden_size])
 
         if not config.skip_create_weights:
             self.create_weights()
@@ -126,12 +134,26 @@ class Attention(nn.Module):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
+        lora_params=None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         is_fused_qkv = False
         if isinstance(self.attn, TrtllmAttention):
             is_fused_qkv = True
+
+        if lora_params is not None:
+            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
+                                              self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
+
+            
+            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
+                                           self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
+
 
         if is_fused_qkv:
             if self.pos_embd_params is None and position_ids is not None:
@@ -172,6 +194,12 @@ class Attention(nn.Module):
                                             mrope_config=mrope_config)
 
         attn_output = self.o_proj(attn_output)
+        if lora_params is not None:
+            attn_lora_output = self.o_lora(attn_output, lora_params,
+                                           self.layer_idx)
+            if attn_lora_output is not None:
+                attn_output = attn_output + attn_lora_output
+
 
         return attn_output
 
