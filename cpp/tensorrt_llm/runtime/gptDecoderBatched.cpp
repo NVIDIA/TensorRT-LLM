@@ -200,8 +200,7 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
-    decoder_batch::Output& output, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -218,7 +217,7 @@ GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_unique<decoder_batch::DecoderFinishedEvent>(std::move(eventStop), input.active);
+    return eventStop;
 }
 
 // TODO(rkobus): produce new input and output
@@ -334,7 +333,7 @@ void GptDecoderBatched::forward(decoder_batch::Output& output, decoder_batch::In
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto decoderFinishEvent = forwardAsync(output, input);
-    decoderFinishEvent->event.synchronize();
+    decoderFinishEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
