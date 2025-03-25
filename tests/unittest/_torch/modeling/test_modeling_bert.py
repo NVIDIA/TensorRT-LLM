@@ -101,21 +101,16 @@ class TestBertForSequenceClassification(unittest.TestCase):
         # Fill the metadata for tllm attn
         request_ids = [1]
         prompt_lens = [input_ids.size(-1)]
-        kwargs = {
-            "max_num_requests": 1,
-            "max_num_tokens": 8192,
-            "kv_cache_manager": None,
-            "request_ids": request_ids,
-            "prompt_lens": prompt_lens,
-        }
-        # if metadata_cls is TrtllmAttentionMetadata:
-        #     kwargs["is_no_cache"] = True
-        #     kwargs["max_seq_len"] = input_ids.size(-1)
 
-        attn_metadata = metadata_cls(**kwargs)
-        attn_metadata.seq_lens = torch.tensor([input_ids.size(-1)],
-                                              dtype=torch.int)
-        attn_metadata.num_contexts = 1
+        attn_metadata = metadata_cls(
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=None,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+        )
         attn_metadata.max_seq_len = input_ids.size(-1)
         attn_metadata.prepare()
 
@@ -125,9 +120,6 @@ class TestBertForSequenceClassification(unittest.TestCase):
 
         # Run inference
         with torch.inference_mode():
-            if backend == 'TRTLLM':
-                attn_metadata.prepare()
-            #NOTE:attn_metadata.prepare is not needed for no cache case
             # TRT-LLM model forward
             tllm_outputs = tllm_model(
                 input_ids=input_ids,

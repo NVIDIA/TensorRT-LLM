@@ -206,9 +206,9 @@ class TrtllmAttentionWrapper:
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
             kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case. If kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
+            host_kv_cache_block_offsets (torch.Tensor): Same as kv_cache_block_offsets, but on CPU.
+            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
+            host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
             workspace (torch.Tensor): An optional workspace tensor on GPU.
             cache_indirection (torch.Tensor): A tensor for beam search on GPU, its shape is (batch_size, beam_width, max_seqlen), for a sequence si, a beam bi and a token ti, the element cache_indirection[si][bi][ti] is an integer between 0 and beam_width-1 that indicates which path in the beam to read the K and V elements from in the KV cache.
             kv_scale_orig_quant (torch.Tensor): The tensor to store the scaling factor for quantization to INT8/FP8 in the KV cache, with shape (1) on GPU.
@@ -533,7 +533,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
 
         if not self.is_dummy_attention and self.kv_cache_manager is None:
-            self._as_no_cache_attention_metadata()
+            # Convert the attention metadata to a TRT-LLM no cache attention metadata.
+            assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
+            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
+
+            # setting kv cache params
+            self.kv_cache_params = KVCacheParams(use_cache=False, )
+
+            # trtllm attn metadata prepare() requires this
+            self.prompt_lens = self.context_lens
+
+            # set params that are used in wrapper.plan()
+            self.kv_cache_block_offsets = None
+            self.host_kv_cache_block_offsets = None
+            self.block_ids_per_seq = None
+
         prompt_lens = torch.tensor(
             self.prompt_lens,
             dtype=torch.int,
