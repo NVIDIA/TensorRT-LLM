@@ -194,7 +194,6 @@ def is_dist_op(node: Node) -> bool:
     return is_op(node, dist_ops)
 
 
-
 def is_chunk_or_slice_op(node: Node) -> bool:
     """Check if the node is a chunk or slice op."""
     target_ops = {
