@@ -1,6 +1,7 @@
 #!/bin/bash
 set -x
-pkill -9 -f disaggregated || true
+pkill -9 -f launch_disaggregated || true
+pkill -9 -f trtllm-serve || true
 
 rm -rf output.json || true
 rm -rf output_streaming.json || true
@@ -16,8 +17,10 @@ CLIENT_DIR=${EXAMPLE_DIR}/clients
 
 CONFIG_FILE=""
 if [[ "${TEST_DESC}" == "2_ranks" ]]; then
+  NUM_RANKS=2
   CONFIG_FILE=${EXAMPLE_DIR}/disagg_config.yaml
 elif [[ "${TEST_DESC}" == "cuda_graph" ]]; then
+  NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_cuda_graph_padding.yaml
 elif [[ "${TEST_DESC}" == "mixed" ]]; then
   NUM_RANKS=2
@@ -29,6 +32,7 @@ elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp_8_overlap_dp" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_overlap_dp.yaml
 elif [[ "${TEST_DESC}" == "4_ranks" ]]; then
+  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp1.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8" ]]; then
   NUM_RANKS=4
@@ -68,7 +72,8 @@ echo "------------------"
 cat output_disagg
 
 if [[ "${SKIP_KILL}" != "yes" ]]; then
-  pkill -9 -f disaggregated || true
+  pkill -9 -f launch_disaggregated || true
+  pkill -9 -f trtllm-serve || true
 fi
 
 expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")

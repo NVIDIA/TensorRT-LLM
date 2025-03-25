@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import click
 import yaml
@@ -14,18 +14,12 @@ from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               parse_disagg_config_file)
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
+from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
 
-@click.group()
-def cli():
-    pass
-
-
 def get_llm_args(model: str,
-                 llm_args_dict: dict,
                  tokenizer: Optional[str] = None,
                  backend: Optional[str] = None,
                  max_beam_width: int = BuildConfig.max_beam_width,
@@ -38,7 +32,8 @@ def get_llm_args(model: str,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
                  num_postprocess_workers: int = 0,
-                 trust_remote_code: bool = False):
+                 trust_remote_code: bool = False,
+                 **llm_args_dict: Any):
 
     if gpus_per_node is None:
         gpus_per_node = device_count()
@@ -81,7 +76,7 @@ def get_llm_args(model: str,
         "_postprocess_tokenizer_dir": tokenizer or model,
     }
 
-    llm_args = update_llm_args_with_extra_options(llm_args, llm_args_dict)
+    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict)
 
     return llm_args
 
@@ -104,7 +99,7 @@ def launch_server(host: str, port: int, llm_args: dict):
     asyncio.run(server(host, port))
 
 
-@click.command("trtllm-serve")
+@click.command("serve")
 @click.argument("model", type=str)
 @click.option("--tokenizer",
               type=str,
@@ -181,12 +176,14 @@ def launch_server(host: str, port: int, llm_args: dict):
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
 )
-def main(model: str, tokenizer: Optional[str], host: str, port: int,
-         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-         ep_size: Optional[int], gpus_per_node: Optional[int],
-         kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
-         trust_remote_code: bool, extra_llm_api_options: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tp_size: int, pp_size: int, ep_size: Optional[int],
+          gpus_per_node: Optional[int],
+          kv_cache_free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          extra_llm_api_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -200,7 +197,6 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
 
     llm_args = get_llm_args(
         model=model,
-        llm_args_dict=llm_args_dict,
         tokenizer=tokenizer,
         backend=backend,
         max_beam_width=max_beam_width,
@@ -211,11 +207,12 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
         pipeline_parallel_size=pp_size,
         moe_expert_parallel_size=ep_size,
         gpus_per_node=gpus_per_node,
-        kv_cache_free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
-        trust_remote_code=trust_remote_code)
+        trust_remote_code=trust_remote_code,
+        **llm_args_dict)
 
-    launch_server(host, port, tokenizer, model, llm_args)
+    launch_server(host, port, llm_args)
 
 
 def get_ctx_gen_server_urls(
@@ -249,7 +246,7 @@ def get_ctx_gen_server_urls(
               help="Request timeout")
 def disaggregated(config_file: Optional[str], server_start_timeout: int,
                   request_timeout: int):
-    """Running in disaggregated mode"""
+    """Running server in disaggregated mode"""
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
@@ -270,21 +267,29 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
-@click.option("-t",
-              "--server_start_timeout",
-              type=int,
-              default=180,
-              help="Server start timeout")
-def disaggregated_mpi_worker(config_file: Optional[str],
-                             server_start_timeout: int, request_timeout: int):
-    """Running in disaggregated mode"""
+def disaggregated_mpi_worker(config_file: Optional[str]):
+    """Launching disaggregated MPI worker"""
 
+    import torch
     from mpi4py.futures import MPICommExecutor
     from mpi4py.MPI import COMM_WORLD
+    from torch.cuda import device_count
 
     from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi import MpiCommSession
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
+
+    if (os.getenv("OMPI_COMM_WORLD_RANK")):
+        env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+    elif (os.getenv("SLURM_PROCID")):
+        env_global_rank = int(os.environ["SLURM_PROCID"])
+    else:
+        raise RuntimeError("Could not determine rank from environment")
+    device_id = env_global_rank % device_count()
+    print(
+        f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
+    )
+    torch.cuda.set_device(device_id)
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
@@ -318,9 +323,22 @@ def disaggregated_mpi_worker(config_file: Optional[str],
                 raise RuntimeError(f"rank{COMM_WORLD} should not have executor")
 
 
-cli.add_command(main)
-cli.add_command(disaggregated)
-cli.add_command(disaggregated_mpi_worker)
+class DefaultGroup(click.Group):
+    """Custom Click group to allow default command behavior"""
+
+    def resolve_command(self, ctx, args):
+        # If the first argument is not a recognized subcommand, assume "serve"
+        if args and args[0] not in self.commands:
+            return "serve", self.commands["serve"], args
+        return super().resolve_command(ctx, args)
+
+
+main = DefaultGroup(
+    commands={
+        "serve": serve,
+        "disaggregated": disaggregated,
+        "disaggregated_mpi_worker": disaggregated_mpi_worker
+    })
 
 if __name__ == "__main__":
     main()
