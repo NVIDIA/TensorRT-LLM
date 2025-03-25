@@ -64,7 +64,7 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
             #L2046 for the rounding algorithm
             - Overview of the CUDA caching allocator:
             https://zdevito.github.io/2022/08/04/cuda-caching-allocator.html"""
-        
+
         return torch.cat(tensors, dim=0)
 
     def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
