@@ -344,7 +344,7 @@ def launchReleaseCheck(pipeline)
             }
         }
         // Step 3: do some check in container
-        sh "cd ${LLM_ROOT}/cpp && /usr/lib/go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+        sh "cd ${LLM_ROOT}/cpp && /root/go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
         // Step 4: verify L0 test lists
         sh "pip3 install --extra-index-url https://urm-rn.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
 	def testDBPath = "${LLM_ROOT}/tests/integration/test_lists/test-db"
