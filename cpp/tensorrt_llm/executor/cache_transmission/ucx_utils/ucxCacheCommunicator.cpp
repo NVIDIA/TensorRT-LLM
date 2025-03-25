@@ -104,7 +104,8 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
 
         try
         {
-            mListener = mWorkersPool.front()->createListener(listenerPort + comm->getRank(), listenerCallback, this);
+            TLLM_LOG_DEBUG("rank %d | creating listener on port %d", mComm->getRank(), listenerPort + mComm->getRank());
+            mListener = mWorkersPool.front()->createListener(listenerPort + mComm->getRank(), listenerCallback, this);
         }
         catch (std::exception const& e)
         {
@@ -119,25 +120,56 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
 
         // Allocate buffer for all IP addresses
         std::vector<char> allIps(comm->getSize() * MAX_IP_LENGTH);
+        TLLM_LOG_DEBUG("rank %d | comm split start - barrier| world comm size %d", comm->getRank(), comm->getSize());
+        comm->barrier();
+        TLLM_LOG_DEBUG(
+            "rank %d | comm split start - barrier passed | world comm size %d", comm->getRank(), comm->getSize());
+        // auto worldComm = std::addressof(tensorrt_llm::mpi::MpiComm::session());
+        tensorrt_llm::mpi::MpiComm kvCacheComm(comm->split(300, mComm->getRank()));
+        TLLM_LOG_DEBUG("rank %d | comm split done | kvCacheComm size %d, kvCacheComm rank %d", comm->getRank(),
+            kvCacheComm.getSize(), kvCacheComm.getRank());
+        // if (excludeRank0)
+        // {
+        //     MPI_Comm newComm;
+        //     MPI_Group worldGroup, newGroup;
+        //     MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
+        //     std::vector<int> ranks(comm->getSize() - 1);
+        //     for (int i = 0; i < comm->getSize() - 1; i++) {ranks[i]=i+1;}
+        //     MPI_Group_incl(worldGroup, comm->getSize() - 1, ranks, &newGroup);
+
+        //     // Create the new communicator
+        //     MPI_Comm_create_group(MPI_COMM_WORLD, newGroup, 0, &newComm);
+        //     MPI_Group_free(&newGroup);
+        //     MPI_Group_free(&world_group);
+        //     kvCacheComm = tensorrt_llm::mpi::MpiComm(newComm,true);
+        // }else{
+        //     kvCacheComm = *comm;
+        // }
+
+        int excludeRank0 = comm->getSize() != kvCacheComm.getSize();
 
         // Perform Allgather operation
-        TLLM_LOG_DEBUG("rank %d | allgather start | comm size %d", comm->getRank(), comm->getSize());
-        mComm->allgather(localIpBuffer.data(), allIps.data(), MAX_IP_LENGTH, tensorrt_llm::mpi::MpiType::kCHAR);
-        TLLM_LOG_DEBUG("rank %d | allgather done", comm->getRank());
+        TLLM_LOG_DEBUG("rank %d | allgather start | world comm size %d,", comm->getRank(), comm->getSize());
+        kvCacheComm.allgather(localIpBuffer.data(), allIps.data(), MAX_IP_LENGTH, tensorrt_llm::mpi::MpiType::kCHAR);
+        TLLM_LOG_DEBUG("rank %d | allgather done | kvCacheComm size %d, kvCacheComm rank %d", comm->getRank(),
+            kvCacheComm.getSize(), kvCacheComm.getRank());
 
-        for (int i = comm->getRank() + 1; i < comm->getSize(); i++)
+        for (int i = kvCacheComm.getRank() + 1; i < kvCacheComm.getSize(); i++)
         {
+            int globalRank = i + (excludeRank0 ? 1 : 0);
             std::string ip(allIps.data() + i * MAX_IP_LENGTH);
-            TLLM_LOG_DEBUG("rank %d | adding connection to rank %d | ip: %s | port: %d", comm->getRank(), i, ip.c_str(),
-                listenerPort + i);
-            mGIDToConnectionId[i] = addConnection(ip, listenerPort + i);
-            mConnections[mGIDToConnectionId[i]].get()->mRemoteGID = i;
-            mConnections[mGIDToConnectionId[i]].get()->sendGID();
+            TLLM_LOG_DEBUG("kvCacheComm rank %d | adding connection to kvCacheComm rank %d | ip: %s | port: %d",
+                kvCacheComm.getRank(), i, ip.c_str(), listenerPort + globalRank);
+            mGIDToConnectionId[globalRank] = addConnection(ip, listenerPort + globalRank);
+            mConnections[mGIDToConnectionId[globalRank]].get()->mRemoteGID = globalRank;
+            mConnections[mGIDToConnectionId[globalRank]].get()->sendGID();
         }
-        while (static_cast<int>(mGIDToConnectionId.size()) < comm->getSize() - 1)
+        TLLM_LOG_DEBUG("rank %d | done initiating connections", comm->getRank());
+
+        while (static_cast<int>(mGIDToConnectionId.size()) < kvCacheComm.getSize() - 1)
         {
-            TLLM_LOG_DEBUG("rank %d | waiting for %d connections, current size %d", comm->getRank(), comm->getSize(),
-                mConnections.size());
+            TLLM_LOG_DEBUG("kvCacheComm rank %d | waiting for %d connections, current size %d", comm->getRank(),
+                kvCacheComm.getSize(), mConnections.size());
             std::unique_lock<std::mutex> lock(mPendingGIDFuturesMutex);
             if (!mPendingGIDFutures.empty())
             {
@@ -149,9 +181,11 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
             else
             {
                 lock.unlock();
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
         }
+        TLLM_LOG_DEBUG("rank %d | done initiating connections | mGIDToConnectionId size %d", comm->getRank(),
+            mGIDToConnectionId.size());
     }
     catch (std::exception const& e)
     {
@@ -227,8 +261,12 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
     char rIpStr[INET6_ADDRSTRLEN];
     char portStr[INET6_ADDRSTRLEN];
     // ucs_status_t status = ucp_ep_query(newEp->getHandle(), &ep_attr);
-    while (ucp_ep_query(newEp->getHandle(), &ep_attr) != UCS_OK)
-        ;
+    ucs_status_t status;
+    while ((status = ucp_ep_query(newEp->getHandle(), &ep_attr)) != UCS_OK)
+    {
+        TLLM_LOG_DEBUG("rank %d | ucp_ep_query failed | retrying | status: %d", mComm->getRank(), status);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
     TLLM_LOG_DEBUG("rank %d passed sockaddr_get_ip_port_str | getNewConnectionId | rIpStr: %s | portStr: %s",
