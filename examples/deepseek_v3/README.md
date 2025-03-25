@@ -284,6 +284,26 @@ TRT-LLM has already integrated FlashMLA in the pytorch backend. It is enabled au
 TRT-LLM also supports DeepGEMM for DeepSeek-V3/R1. DeepGEMM provides significant e2e performance boost. DeepGEMM is enabled by an environment variable `TRTLLM_DG_ENABLED`:
 
 ```bash
+#single-node
+TRTLLM_DG_ENABLED=1 \
+trtllm-bench \
+      --model deepseek-ai/DeepSeek-V3 \
+      --model_path /models/DeepSeek-V3 \
+      throughput \
+      --backend pytorch \
+      --max_batch_size ${MAX_BATCH_SIZE} \
+      --max_num_tokens ${MAX_NUM_TOKENS} \
+      --dataset dataset.txt \
+      --tp 8 \
+      --ep 8 \
+      --kv_cache_free_gpu_mem_fraction 0.9 \
+      --extra_llm_api_options /workspace/extra-llm-api-config.yml \
+      --concurrency ${CONCURRENCY} \
+      --num_requests ${NUM_REQUESTS} \
+      --streaming \
+      --report_json "${OUTPUT_FILENAME}.json"
+
+# multi-node
 mpirun -H <HOST1>:8,<HOST2>:8 \
       -n 16 \
       -x "TRTLLM_DG_ENABLED=1" \
