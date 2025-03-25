@@ -102,8 +102,7 @@ void UcxConnection::initializeEndpointTag(int maxTryTimes)
 
 void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    // Guard to ensure CUDA context is initialized for UCX ops
-    TLLM_CUDA_CHECK(cudaFree(0));
+
     TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
     TLLM_LOG_DEBUG("UcxConnection::send | rank %d | sendTag: %lu | remote gid: %lu", mLocalGID, mSendTag, mRemoteGID);
     auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
