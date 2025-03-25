@@ -43,9 +43,6 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
-#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
-#include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
-
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
