@@ -96,14 +96,8 @@ class ADEngine(ModelEngine):
         )
 
         # construct inference optimizer
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
-            compile_backend = "torch-opt"
-        else:
-            compile_backend = "torch-simple"
         build_and_optimize = InferenceOptimizer(
-            factory=factory, attn_backend=ad_config.attn_backend, compile_backend=compile_backend
+            factory=factory, ad_config=ad_config
         )
 
         # construct engine

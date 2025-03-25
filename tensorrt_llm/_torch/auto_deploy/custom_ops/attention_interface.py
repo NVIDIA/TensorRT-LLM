@@ -121,7 +121,7 @@ class SequenceInfo:
             self.page_size = self.max_seq_len
         if self.max_num_tokens < 1:
             self.max_num_tokens = self.max_batch_size * self.max_seq_len
-        total_tokens = self.max_batch_size * self.page_size
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
@@ -312,15 +312,17 @@ class SequenceInfo:
         self.nest_sequences(input_ids)
         self.input_ids = input_ids
 
-    def _set_max_num_tokens_batch(self) -> None:
-        """Set an example sequence so that number of tokens processed is max_num_tokens."""
+    def _set_max_batch_sample(self) -> None:
+        """Set an example sequence with max_batch_size."""
         self.reset()
+        seq_len = self.max_num_tokens // self.max_batch_size
         input_ids = torch.ones(
             self.max_batch_size,
-            self.max_num_tokens // self.max_batch_size,
+            seq_len,
             dtype=torch.int,
             device=self.device,
         )
+        self.pages_per_seq.fill_(seq_len//self.page_size)
         self.nest_sequences(input_ids)
 
     def _set_generate_only_batch(self) -> None:

@@ -9,7 +9,7 @@ from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
-from ..shim.interface import CachedSequenceInterface
+from ..shim.interface import CachedSequenceInterface, AutoDeployConfig
 from ..utils.logger import ad_logger
 from ._graph import move_to_device
 from .export import torch_export_to_gm
@@ -26,18 +26,23 @@ from .library import (
     quantize,
 )
 
-
 class InferenceOptimizer:
     def __init__(
         self,
         factory: ModelFactory,
         *,  # TODO (lliebenwein): temporary until we have a better config system
-        attn_backend: str,
-        compile_backend: str,
+        ad_config: AutoDeployConfig,
         visualize: bool = False,
     ):
         self.factory = factory
-        self.attn_backend = attn_backend
+        self.attn_backend = ad_config.attn_backend
+        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
+        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+        self.ad_config = ad_config
+        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+            compile_backend = "torch-opt"
+        else:
+            compile_backend = "torch-simple"
         self.compile_backend = compile_backend
         self.visualize = visualize
 
@@ -151,13 +156,15 @@ class InferenceOptimizer:
         )
 
         # Let's run a forward pass to get the memory usage
-        cm.info._set_max_num_tokens_batch()
+        cm.info._set_max_batch_sample()
         free_mem_pre, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
         egm(*cm.args)
         free_mem_post, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
-
+        memory_for_forward_pass = (free_mem_pre - free_mem_post)
+        ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
+        
         # FIXME: 0.8 is hard coded to ensure we have enough memory for graph capture.
         new_cache_size = free_mem_post * 0.8 + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
@@ -169,8 +176,11 @@ class InferenceOptimizer:
         ############################################################################################
 
         cm.info._set_generate_only_batch()
+        compiler_kwargs = {"cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes}
         egm_compiled = compile_and_capture(
-            egm, self.compile_backend, args=cm.args, dynamic_shapes=cm.dynamic_shapes
+            egm, self.compile_backend, args=cm.args, 
+            kwargs=compiler_kwargs,
+            dynamic_shapes=cm.dynamic_shapes,
         )
         cm.info.reset()
 

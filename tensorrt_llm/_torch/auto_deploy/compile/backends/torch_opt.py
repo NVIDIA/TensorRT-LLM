@@ -14,7 +14,7 @@ from ..compiler import BackendCompiler, BackendRegistry, _flatten_args
 
 
 class CompiledGraph(nn.Module):
-    def __init__(self, model: GraphModule, max_batch_size: int):
+    def __init__(self, model: GraphModule, max_batch_size: int, cuda_graph_batch_sizes: List[int]):
         super().__init__()
         self._in_spec: TreeSpec = model._in_spec
         self._out_spec: TreeSpec = model._out_spec
@@ -24,7 +24,8 @@ class CompiledGraph(nn.Module):
         self._input_buffer: torch.Tensor = torch.empty(0, 1)
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
-
+        self.cuda_graph_batch_sizes = cuda_graph_batch_sizes if cuda_graph_batch_sizes is not None else self._get_graph_batch_sizes(self.max_batch_size)
+    
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
 
@@ -90,7 +91,7 @@ class CompiledGraph(nn.Module):
         assert out_spec == self._out_spec, "Output spec mismatch."
 
         # capture graph now for a range of batch sizes
-        for bs in self._get_graph_batch_sizes(self.max_batch_size):
+        for bs in self.cuda_graph_batch_sizes:
             ad_logger.info(f"Capturing graph for batch size: {bs}")
 
             # setup args, kwargs
@@ -131,7 +132,8 @@ class CompiledGraph(nn.Module):
 class TorchOptCompiler(BackendCompiler):
     @torch.inference_mode()
     def compile(self) -> CompiledGraph:
-        compiled_gm = CompiledGraph(self.gm, max_batch_size=self.max_batch_size)
+        cuda_graph_batch_sizes = self.kwargs.get("cuda_graph_batch_sizes", None)
+        compiled_gm = CompiledGraph(self.gm, max_batch_size=self.max_batch_size, cuda_graph_batch_sizes=cuda_graph_batch_sizes)
 
         # try capturing cudagraph
         if self.args is not None or self.kwargs is not None:
