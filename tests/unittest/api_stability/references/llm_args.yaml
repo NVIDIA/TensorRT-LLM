@@ -1,64 +1,62 @@
 methods:
   __init__:
     parameters:
+      # Parallelism
+      cp_config:
+        annotation: Optional[dict]
+        default: null
       auto_parallel:
         annotation: bool
         default: false
       auto_parallel_world_size:
         annotation: int
         default: 1
-      backend:
-        annotation: Optional[str]
-        default: null
-      batched_logits_processor:
-        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
-        default: null
-      batching_type:
-        annotation: Optional[tensorrt_llm.bindings.executor.BatchingType]
-        default: null
+      embedding_parallel_mode:
+        annotation: str
+        default: SHARDING_ALONG_VOCAB
+      # Engine building
       build_config:
         annotation: Optional[tensorrt_llm.builder.BuildConfig]
         default: null
-      calib_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_utils.CalibConfig]
+      enable_build_cache:
+        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
+        default: false
+      fast_build:
+        annotation: bool
+        default: false
+      # Bindings and mirrored configs
+      batching_type:
+        annotation: Optional[tensorrt_llm.bindings.executor.BatchingType]
         default: null
-      context_parallel_size:
-        annotation: int
-        default: 1
-      cp_config:
-        annotation: Optional[dict]
+      kv_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        default: null
+      peft_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
+        default: null
+      scheduler_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        default: null
+      extended_runtime_perf_knob_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig]
         default: null
       decoding_config:
         annotation: Optional[tensorrt_llm.bindings.executor.DecodingConfig]
         default: null
-      dtype:
-        annotation: str
-        default: auto
-      embedding_parallel_mode:
-        annotation: str
-        default: SHARDING_ALONG_VOCAB
+      # Misc
+      backend:
+        annotation: Optional[str]
+        default: null
+      max_batch_size:
+        annotation: Optional[int]
+        default: null
+      max_num_tokens:
+        annotation: Optional[int]
+        default: null
       enable_attention_dp:
         annotation: bool
         default: false
-      enable_build_cache:
-        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
-        default: false
-      enable_chunked_prefill:
-        annotation: bool
-        default: false
-      enable_lora:
-        annotation: bool
-        default: false
-      enable_prompt_adapter:
-        annotation: bool
-        default: false
-      enable_tqdm:
-        annotation: bool
-        default: false
-      extended_runtime_perf_knob_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig]
-        default: null
-      fast_build:
+      normalize_log_probs:
         annotation: bool
         default: false
       gather_generation_logits:
@@ -67,89 +65,12 @@ methods:
       gpus_per_node:
         annotation: Optional[int]
         default: null
-      guided_decoding_backend:
-        annotation: Optional[str]
-        default: null
       iter_stats_max_iterations:
         annotation: Optional[int]
-        default: null
-      kv_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
-        default: null
-      load_format:
-        annotation: Literal['auto', 'dummy']
-        default: auto
-      max_batch_size:
-        annotation: Optional[int]
-        default: null
-      max_cpu_loras:
-        annotation: int
-        default: 4
-      max_lora_rank:
-        annotation: Optional[int]
-        default: null
-      max_loras:
-        annotation: int
-        default: 4
-      max_num_tokens:
-        annotation: Optional[int]
-        default: null
-      max_prompt_adapter_token:
-        annotation: int
-        default: 0
-      model:
-        annotation: Union[str, pathlib.Path]
-        default: inspect._empty
-      moe_expert_parallel_size:
-        annotation: Optional[int]
-        default: null
-      moe_tensor_parallel_size:
-        annotation: Optional[int]
-        default: null
-      normalize_log_probs:
-        annotation: bool
-        default: false
-      peft_cache_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
-        default: null
-      pipeline_parallel_size:
-        annotation: int
-        default: 1
-      quant_config:
-        annotation: Optional[tensorrt_llm.models.modeling_utils.QuantConfig]
         default: null
       request_stats_max_iterations:
         annotation: Optional[int]
         default: null
-      revision:
-        annotation: Optional[str]
-        default: null
-      scheduler_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
-        default: null
-      skip_tokenizer_init:
-        annotation: bool
-        default: false
-      speculative_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
-        default: null
-      tensor_parallel_size:
-        annotation: int
-        default: 1
-      tokenizer:
-        annotation: Union[str, pathlib.Path, transformers.tokenization_utils_base.PreTrainedTokenizerBase,
-          tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
-        default: null
-      tokenizer_mode:
-        annotation: Literal['auto', 'slow']
-        default: auto
-      tokenizer_revision:
-        annotation: Optional[str]
-        default: null
-      trust_remote_code:
-        annotation: bool
-        default: false
       workspace:
         annotation: Optional[str]
         default: null

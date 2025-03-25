@@ -1,101 +1,33 @@
 methods:
   __init__:
-    parameters:
-      dtype:
-        annotation: str
-        default: auto
-      kwargs:
-        annotation: Any
-        default: inspect._empty
-      model:
-        annotation: Union[str, pathlib.Path]
-        default: inspect._empty
-      revision:
-        annotation: Optional[str]
-        default: null
-      skip_tokenizer_init:
-        annotation: bool
-        default: false
-      tensor_parallel_size:
-        annotation: int
-        default: 1
-      pipeline_parallel_size:
-        annotation: int
-        default: 1
-      tokenizer:
-        annotation: Union[str, pathlib.Path, transformers.tokenization_utils_base.PreTrainedTokenizerBase,
-          tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
-        default: null
-      tokenizer_mode:
-        annotation: Literal['auto', 'slow']
-        default: auto
-      tokenizer_revision:
-        annotation: Optional[str]
-        default: null
-      trust_remote_code:
-        annotation: bool
-        default: false
+    parameters: {}
     return_annotation: None
   generate:
     parameters:
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
-      inputs:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
-        default: inspect._empty
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      lora_request:
-        annotation: Union[tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest],
-          NoneType]
-        default: null
-      prompt_adapter_request:
-        annotation: Union[tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest],
-          NoneType]
         default: null
       queries:
         annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
           Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]],
           NoneType]
         default: null
-      sampling_params:
-        annotation: Union[tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams],
-          NoneType]
-        default: null
-      use_tqdm:
-        annotation: bool
-        default: true
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
-      inputs:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
-        default: inspect._empty
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
-        default: null
-      lora_request:
-        annotation: Optional[tensorrt_llm.executor.request.LoRARequest]
-        default: null
-      prompt_adapter_request:
-        annotation: Optional[tensorrt_llm.executor.request.PromptAdapterRequest]
         default: null
       queries:
         annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
           NoneType]
         default: null
-      sampling_params:
-        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
-        default: null
-      streaming:
-        annotation: bool
-        default: false
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:
@@ -131,9 +63,6 @@ methods:
     parameters: {}
     return_annotation: None
 properties:
-  tokenizer:
-    annotation: Optional[tensorrt_llm.llmapi.tokenizer.TokenizerBase]
-    default: inspect._empty
   workspace:
     annotation: pathlib.Path
     default: inspect._empty

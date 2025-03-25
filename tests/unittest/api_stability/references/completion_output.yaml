@@ -4,29 +4,11 @@ methods:
       cumulative_logprob:
         annotation: Optional[float]
         default: null
-      disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
-        default: null
-      finish_reason:
-        annotation: Optional[Literal['stop', 'length', 'timeout', 'cancelled']]
-        default: null
-      generation_logits:
-        annotation: Optional[torch.Tensor]
-        default: null
-      index:
-        annotation: int
-        default: inspect._empty
       logprobs:
         annotation: Optional[List[float]]
         default: null
-      stop_reason:
-        annotation: Union[int, str, NoneType]
-        default: null
-      text:
-        annotation: str
-        default: ''
-      token_ids:
-        annotation: Optional[List[int]]
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
     return_annotation: None
 properties:
