@@ -119,19 +119,13 @@ struct AllReduceParams
         int token_num, int hidden_size, AllReduceFusionOp op);
 };
 
-bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type,
+    AllReduceStrategyConfig config);
 
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
 
 void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
-
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
-
-namespace reduce_fusion
-{
-bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
-}
 
 } // namespace tensorrt_llm::kernels

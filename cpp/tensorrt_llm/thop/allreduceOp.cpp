@@ -556,7 +556,7 @@ private:
                 }
             }
 
-            if (!tensorrt_llm::kernels::configurationSupported(strat, messageSize, worldSize, type))
+            if (!tensorrt_llm::kernels::configurationSupported(strat, messageSize, worldSize, type, mStrategy))
             {
                 if (!isAuto)
                 {

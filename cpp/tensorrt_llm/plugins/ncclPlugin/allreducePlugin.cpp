@@ -282,7 +282,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
         }
 
-        if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        if (!kernels::configurationSupported(strat, messageSize, worldSize, type, mStrategy))
         {
             if (!isAuto)
             {
