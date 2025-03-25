@@ -2,7 +2,6 @@ import asyncio
 from typing import Optional
 
 import click
-from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -147,9 +146,7 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
     else:
         llm = LLM(**llm_args)
 
-    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
-
-    server = OpenAIServer(llm=llm, model=model, hf_tokenizer=hf_tokenizer)
+    server = OpenAIServer(llm=llm, model=model)
 
     asyncio.run(server(host, port))
 
