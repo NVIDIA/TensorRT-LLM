@@ -194,7 +194,6 @@ class OpenAIDisaggServer:
             req.stream_options = None
             ctx_response = await self.send_chat_request(ctx_server, req)
 
-            #TODO: Context server should skip de-tokenization and return raw tokens
             choices = ctx_response.choices
             if len(choices) > 1:
                 raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
