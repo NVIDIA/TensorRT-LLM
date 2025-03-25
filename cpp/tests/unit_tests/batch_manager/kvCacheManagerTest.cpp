@@ -2490,6 +2490,12 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
 
     auto const& blockManager = kvCacheManager.getBlockManager();
 
+    auto const allBlocksInPrimaryPools = blockManager.getNumPrimaryBlocks();
+    EXPECT_THAT(allBlocksInPrimaryPools, blocksInPrimaryPool * maxAttentionWindowVec.size());
+
+    ASSERT_EQ(blockManager.isVariableWindow(), true);
+    ASSERT_EQ(blockManager.isVariableGQA(), false);
+
     SizeType32 constexpr maxNewTokens = 4;
 
     // prepare tokens with token[i] = 1000 + i
@@ -2511,21 +2517,31 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1}));
 
-    // add tokens to enable cyclic kv cache
+    auto const assertBlocks
+        = [minAttentionWindow, maxAttentionWindow, beamIdx](GenerationRequest seq,
+              std::initializer_list<int> expectedBlocksMin, std::initializer_list<int> expectedBlocksMax)
+    {
+        auto blocksMin = seq.getCacheBlockIds(minAttentionWindow).at(beamIdx);
+        auto blocksMax = seq.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+        EXPECT_THAT(blocksMin, ::testing::ElementsAreArray(expectedBlocksMin));
+        EXPECT_THAT(blocksMax, ::testing::ElementsAreArray(expectedBlocksMax));
+        return blocksMin.size() + blocksMax.size();
+    };
+
+    assertBlocks(seq0, {0, 1}, {0, 1});
+
+    // add tokens to enable cyclic kv cache for minimum but not maximum
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1017, beamIdx);
     kvCacheManager.addToken(requestId);
-    auto numTokens = llmRequest->getNumTokens(beamIdx);
-    auto numBlocks = seq0.getCacheBlockIds(maxAttentionWindow)[beamIdx].size();
-    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    auto const numBlocks = assertBlocks(seq0, {0, 1}, {0, 1, 2});
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), allBlocksInPrimaryPools - numBlocks);
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
     // no blocks stored because cyclic KV cache was enabled
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), allBlocksInPrimaryPools);
 
     ///////////////////////////////////////////////////////////////////////////
     // add a short request that is between the min and max attention window
@@ -2536,15 +2552,12 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({3, 4, 5}));
-
+    assertBlocks(seq1, {2, 3}, {3, 4, 5});
     llmRequest->addNewToken(1007, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1008, beamIdx);
     kvCacheManager.addToken(requestId);
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = seq1.getCacheBlockIds(maxAttentionWindow)[beamIdx].size();
-    EXPECT_EQ(numBlocks, 3);
+    assertBlocks(seq1, {2, 3}, {3, 4, 5});
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
 
     ///////////////////////////////////////////////////////////////////////////
@@ -2557,11 +2570,10 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({6}));
+    assertBlocks(seq2, {4}, {6});
 
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
-    EXPECT_EQ(numBlocks, 1);
+    auto const numTokens = llmRequest->getNumTokens(beamIdx);
+    EXPECT_EQ(tc::ceilDiv(numTokens, tokensPerBlock), 1);
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
     // store block 6 for reuse
 
@@ -2575,7 +2587,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq3 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 3);
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({6}));
+    assertBlocks(seq3, {4}, {6});
 }
 
 namespace
