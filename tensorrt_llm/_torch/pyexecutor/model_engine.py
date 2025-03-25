@@ -414,7 +414,7 @@ class PyTorchModelEngine(ModelEngine):
 
         def get_torch_compile_warmup_request(batch_size, num_tokens):
             available_blocks = kv_cache_manager.get_num_free_blocks()
-            max_num_draft_tokens = 0
+            max_num_draft_tokens = self.spec_config.max_draft_tokens if self.spec_config is not None else 0
             num_tokens = max(
                 1,
                 min(
@@ -426,6 +426,9 @@ class PyTorchModelEngine(ModelEngine):
                     num_tokens / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
                 is_gen = num_tokens == 1
+                if not is_gen:
+                    max_num_draft_tokens = 0
+
                 requests = kv_cache_manager.add_dummy_requests(
                     list(range(batch_size)), [num_tokens] * batch_size,
                     is_gen=is_gen,
