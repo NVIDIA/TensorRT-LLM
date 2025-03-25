@@ -489,7 +489,7 @@ def _test_llm_multimodal_general(llm_venv,
                 "--image_path",
                 os.path.join(
                     llm_root,
-                    "tests/integration/test_input_files/dummy_image.jpg"),
+                    "tests/integration/test_input_files/excel_table_test.jpg"),
                 "--input_text",
                 "What is the total income? Answer:"
             ])
