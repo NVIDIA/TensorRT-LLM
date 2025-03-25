@@ -87,6 +87,7 @@ class ADEngine(ModelEngine):
         device: DeviceLikeType,
     ):
         """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
+
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
         factory = ModelFactoryRegistry.get("hf")(
@@ -96,9 +97,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(
-            factory=factory, ad_config=ad_config
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         engine = cls(build_and_optimize, seq_info, device)
