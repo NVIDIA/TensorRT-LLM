@@ -368,6 +368,19 @@ def gpt_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
+def gptj_example_root(llm_root, llm_venv):
+    "Get gptj example root"
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "gptj")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
 def chatglm_6b_example_root(llm_root, llm_venv):
     "Get chatglm-6b example root"
     example_root = os.path.join(llm_root, "examples", "chatglm")
