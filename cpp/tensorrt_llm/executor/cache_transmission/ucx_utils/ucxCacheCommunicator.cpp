@@ -99,7 +99,7 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
         {
             std::string error = "Error creating worker and starting progress thread for rank "
                 + std::to_string(mComm->getRank()) + ": " + std::string(e.what());
-            throw std::runtime_error(error);
+            TLLM_THROW(error);
         }
 
         try
@@ -110,7 +110,7 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
         catch (std::exception const& e)
         {
             std::string error = "Error creating listener for rank " + std::to_string(comm->getRank()) + ": " + e.what();
-            throw std::runtime_error(error);
+            TLLM_THROW(error);
         }
 
         // Get local IP address
@@ -191,7 +191,7 @@ UcxConnectionManager::UcxConnectionManager(tensorrt_llm::mpi::MpiComm const* com
     {
         std::string error = "Error in UcxConnectionManager initialization for rank " + std::to_string(comm->getRank())
             + ": " + e.what();
-        throw std::runtime_error(error);
+        TLLM_THROW(error);
     }
 }
 
@@ -227,7 +227,7 @@ uint64_t UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     {
         std::string error
             = "Error in addConnection(connRequest) for rank " + std::to_string(mComm->getRank()) + ": " + e.what();
-        throw std::runtime_error(error);
+        TLLM_THROW(error);
     }
 }
 
@@ -247,7 +247,7 @@ uint64_t UcxConnectionManager::addConnection(std::string ip, uint16_t port)
     catch (std::exception const& e)
     {
         std::string error = "Error in addConnection(ip) for rank " + std::to_string(mComm->getRank()) + ": " + e.what();
-        throw std::runtime_error(error);
+        TLLM_THROW(error);
     }
 }
 
@@ -318,7 +318,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     }
     if (status != UCS_OK)
     {
-        throw std::runtime_error("Error in recvConnect" + std::to_string(status));
+        TLLM_THROW("Error in recvConnect" + std::to_string(status));
     }
     TLLM_LOG_DEBUG("recvConnect2 | rank %d | senderTag: %lu", getLocalGID(), senderTag);
 
@@ -350,7 +350,7 @@ return UcxConnectionManager::create(comm);
     {
         std::string error
             = "Error in makeUcxConnectionManager for rank " + std::to_string(comm->getRank()) + ": " + e.what();
-        throw std::runtime_error(error);
+        TLLM_THROW(error);
     }
 }
 

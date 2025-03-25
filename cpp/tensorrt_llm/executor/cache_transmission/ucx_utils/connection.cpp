@@ -38,22 +38,11 @@ UcxConnection::UcxConnection(
     }
 }
 
-// void UcxConnection::initialize(UcxConnectionManager* manager)
-// {
-//     std::cout << "UcxConnection::initialize" << std::endl;
-//     mManager = manager;
-//     if (mManager)
-//     {
-//         mLocalGID = mManager->getLocalGID();
-//         TLLM_LOG_DEBUG("UcxConnection::initialize | rank %d | local gid: %lu", mManager->getRank(), mLocalGID);
-//     }
-// }
-
 void UcxConnection::sendGID()
 {
     if (mLocalGID == std::numeric_limits<uint64_t>::max())
     {
-        throw std::runtime_error("UcxConnection::sendGID | mLocalGID is not set");
+        TLLM_THROW("UcxConnection::sendGID | mLocalGID is not set");
     }
     std::shared_ptr<ucxx::Request> request
         = mEndpoint->streamSend(reinterpret_cast<void*>(&mLocalGID), sizeof(mLocalGID), false);
@@ -81,8 +70,6 @@ void UcxConnection::initializeEndpointTag(int maxTryTimes)
     ucs_status_t status = ucp_ep_query(mEndpoint->getHandle(), &ep_attr);
     if (status == UCS_OK)
     {
-
-        std::cout << " initializeEndpointTag" << std::endl;
         ucxx::utils::sockaddr_get_ip_port_str(&ep_attr.remote_sockaddr, rIpStr, portStr, INET6_ADDRSTRLEN);
         remotePort = static_cast<ucxx::Tag>(std::stoull(portStr));
 
