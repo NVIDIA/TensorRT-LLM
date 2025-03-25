@@ -548,6 +548,70 @@ class TestVila(unittest.TestCase):
 
     @parameterized.expand([(VILA_1_5_3B_CONFIG, 3), (NVILA_8B_CONFIG, 8)])
     def test_vila_sanity(self, config_dict, param_cnt):
+        model, input_ids, position_ids, past_seen_tokens, attn_metadata, kv_cache_manager = \
+            self._prepare_sanity_test(config_dict, param_cnt)
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = model.forward(input_ids=input_ids,
+                                   position_ids=position_ids,
+                                   attn_metadata=attn_metadata)
+
+        self.assertEqual(len(past_seen_tokens), logits.shape[0])
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = model.forward(input_ids=input_ids,
+                                   position_ids=position_ids,
+                                   attn_metadata=attn_metadata,
+                                   return_context_logits=True)
+        self.assertEqual(input_ids.shape, logits.shape[:-1])
+
+        kv_cache_manager.shutdown()
+
+    def test_vila_fuse_input_embeds(self):
+        config_dict = deepcopy(VILA_1_5_3B_CONFIG)
+        model, _, _, _, _, _ = self._prepare_sanity_test(config_dict, 3)
+
+        device = torch.device('cuda')
+        dtype = model.model_dtype
+
+        input_ids = torch.tensor([
+            1, 319, 13563, 1546, 263, 12758, 5199, 322, 385, 23116, 21082,
+            20255, 29889, 12968, 29901, 29871, 32000, 32001, 32002, 32003,
+            32004, 32005, 32006, 32007, 32008, 32009, 32010, 32011, 32012,
+            32013, 32014, 32015, 32016, 32017, 32018, 32019, 32020, 32021,
+            32022, 32023, 32024, 32025, 32026, 32027, 32028, 32029, 32030,
+            32031, 32032, 32033, 32034, 32035, 32036, 32037, 32038, 32039,
+            32040, 32041, 32042, 32043, 32044, 32045, 32046, 32047, 32048,
+            32049, 32050, 32051, 32052, 32053, 32054, 32055, 32056, 32057,
+            32058, 32059, 32060, 32061, 32062, 32063, 32064, 32065, 32066,
+            32067, 32068, 32069, 32070, 32071, 32072, 32073, 32074, 32075,
+            32076, 32077, 32078, 32079, 32080, 32081, 32082, 32083, 32084,
+            32085, 32086, 32087, 32088, 32089, 32090, 32091, 32092, 32093,
+            32094, 32095, 32096, 32097, 32098, 32099, 32100, 32101, 32102,
+            32103, 32104, 32105, 32106, 32107, 32108, 32109, 32110, 32111,
+            32112, 32113, 32114, 32115, 32116, 32117, 32118, 32119, 32120,
+            32121, 32122, 32123, 32124, 32125, 32126, 32127, 32128, 32129,
+            32130, 32131, 32132, 32133, 32134, 32135, 32136, 32137, 32138,
+            32139, 32140, 32141, 32142, 32143, 32144, 32145, 32146, 32147,
+            32148, 32149, 32150, 32151, 32152, 32153, 32154, 32155, 32156,
+            32157, 32158, 32159, 32160, 32161, 32162, 32163, 32164, 32165,
+            32166, 32167, 32168, 32169, 32170, 32171, 32172, 32173, 32174,
+            32175, 32176, 32177, 32178, 32179, 32180, 32181, 32182, 32183,
+            32184, 32185, 32186, 32187, 32188, 32189, 32190, 32191, 32192,
+            32193, 32194, 32195, 29871, 320, 29876, 20355, 915, 278, 1203, 322,
+            278, 14826, 4195, 297, 278, 1967, 29889, 2277, 29937, 7900, 22137,
+            29901, 450
+        ],
+                                 device=device,
+                                 dtype=torch.int)
+        images = [torch.rand(193, 2560, dtype=dtype, device=device)]
+        input_ids, input_embeds = fuse_input_embeds(model, input_ids, images)
+        self.assertIsNone(input_ids)
+        self.assertEqual(list(input_embeds.shape), [233, 2560])
+
+    def _prepare_sanity_test(self, config_dict, param_cnt):
         config_dict = deepcopy(config_dict)
         # (param_cnt)B * sizeof(float16) plus some extra for activations
         mem_for_full_model = (2 + 1) * param_cnt * 2**(30)
@@ -559,9 +623,9 @@ class TestVila(unittest.TestCase):
 
         model_config = ModelConfig(pretrained_config=vila_config,
                                    quant_config=None)
-        vila = VilaModel(model_config).to(device)
+        model = VilaModel(model_config).to(device)
 
-        dtype = vila.model_dtype
+        dtype = model.model_dtype
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -578,9 +642,9 @@ class TestVila(unittest.TestCase):
 
         num_blocks = 100
         tokens_per_block = 128
-        head_dim = vila.config.hidden_size // vila.config.num_attention_heads
-        num_layers = vila.config.num_hidden_layers
-        num_kv_heads = vila.config.num_key_value_heads
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        num_layers = model.config.num_hidden_layers
+        num_kv_heads = model.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
 
         if dtype == torch.half:
@@ -632,71 +696,4 @@ class TestVila(unittest.TestCase):
             position_ids.append(position_id)
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = vila.forward(input_ids=input_ids,
-                                  position_ids=position_ids,
-                                  attn_metadata=attn_metadata)
-
-        self.assertEqual(len(past_seen_tokens), logits.shape[0])
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = vila.forward(input_ids=input_ids,
-                                  position_ids=position_ids,
-                                  attn_metadata=attn_metadata,
-                                  return_context_logits=True)
-        self.assertEqual(input_ids.shape, logits.shape[:-1])
-
-        kv_cache_manager.shutdown()
-
-    def test_vila_fuse_input_embeds(self):
-        config_dict = deepcopy(VILA_1_5_3B_CONFIG)
-        mem_for_full_model = (2 + 1) * 3 * 2**(30)
-        reduce_vila_config(mem_for_full_model, config_dict)
-        if config_dict['llm_cfg']["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single Llava layer")
-        vila_config = VilaConfig.from_dict(config_dict)
-
-        device = torch.device('cuda')
-
-        model_config = ModelConfig(pretrained_config=vila_config)
-        vila = VilaModel(model_config).to(device)
-
-        dtype = vila.model_dtype
-
-        input_ids = torch.tensor([
-            1, 319, 13563, 1546, 263, 12758, 5199, 322, 385, 23116, 21082,
-            20255, 29889, 12968, 29901, 29871, 32000, 32001, 32002, 32003,
-            32004, 32005, 32006, 32007, 32008, 32009, 32010, 32011, 32012,
-            32013, 32014, 32015, 32016, 32017, 32018, 32019, 32020, 32021,
-            32022, 32023, 32024, 32025, 32026, 32027, 32028, 32029, 32030,
-            32031, 32032, 32033, 32034, 32035, 32036, 32037, 32038, 32039,
-            32040, 32041, 32042, 32043, 32044, 32045, 32046, 32047, 32048,
-            32049, 32050, 32051, 32052, 32053, 32054, 32055, 32056, 32057,
-            32058, 32059, 32060, 32061, 32062, 32063, 32064, 32065, 32066,
-            32067, 32068, 32069, 32070, 32071, 32072, 32073, 32074, 32075,
-            32076, 32077, 32078, 32079, 32080, 32081, 32082, 32083, 32084,
-            32085, 32086, 32087, 32088, 32089, 32090, 32091, 32092, 32093,
-            32094, 32095, 32096, 32097, 32098, 32099, 32100, 32101, 32102,
-            32103, 32104, 32105, 32106, 32107, 32108, 32109, 32110, 32111,
-            32112, 32113, 32114, 32115, 32116, 32117, 32118, 32119, 32120,
-            32121, 32122, 32123, 32124, 32125, 32126, 32127, 32128, 32129,
-            32130, 32131, 32132, 32133, 32134, 32135, 32136, 32137, 32138,
-            32139, 32140, 32141, 32142, 32143, 32144, 32145, 32146, 32147,
-            32148, 32149, 32150, 32151, 32152, 32153, 32154, 32155, 32156,
-            32157, 32158, 32159, 32160, 32161, 32162, 32163, 32164, 32165,
-            32166, 32167, 32168, 32169, 32170, 32171, 32172, 32173, 32174,
-            32175, 32176, 32177, 32178, 32179, 32180, 32181, 32182, 32183,
-            32184, 32185, 32186, 32187, 32188, 32189, 32190, 32191, 32192,
-            32193, 32194, 32195, 29871, 320, 29876, 20355, 915, 278, 1203, 322,
-            278, 14826, 4195, 297, 278, 1967, 29889, 2277, 29937, 7900, 22137,
-            29901, 450
-        ],
-                                 device=device,
-                                 dtype=torch.int)
-        images = [torch.rand(193, 2560, dtype=dtype, device=device)]
-        input_ids, input_embeds = fuse_input_embeds(vila, input_ids, images)
-        self.assertIsNone(input_ids)
-        self.assertEqual(list(input_embeds.shape), [233, 2560])
+        return model, input_ids, position_ids, past_seen_tokens, attn_metadata, kv_cache_manager

@@ -31,7 +31,6 @@ from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModel
-from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
 from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
@@ -573,23 +572,22 @@ def init_llm(
     tokenizer = init_tokenizer(llm_path)
     if llm_cfg.vocab_size != len(tokenizer):
         warnings.warn(
-            "LLM's vocab size does not match tokenizer's vocab size! It is likely this multimodal model has extended the vocabulary with extra special tokens, and have used resize_token_embeddings() (https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings) in the PyTorch implementation. Here, the only way is to refresh the word embedding weight and re-save the checkpoint and update vocab size. This is a one-off operation for a given model. Tokenzier is not re-saved, just the LLM checkpoint."
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
         )
-        warnings.warn(
-            "Please be patient when the checkpoint is being updated...")
-        model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
-                                                          torch_dtype="auto")
-        model_hf.resize_token_embeddings(len(tokenizer))
-        warnings.warn(f"Saving to {llm_path} by overwriting...")
-        try:
-            model_hf.save_pretrained(llm_path)
-        except (OSError, PermissionError):
-            import tempfile
-            llm_path = os.path.join(tempfile.gettempdir(), "vila")
-            warnings.warn(
-                f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
-            )
-            model_hf.save_pretrained(llm_path)
+        # TODO: enable updating the LLM checkpoint automatically
+        # model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
+        #                                                   torch_dtype="auto")
+        # model_hf.resize_token_embeddings(len(tokenizer))
+        # warnings.warn(f"Saving to {llm_path} by overwriting...")
+        # try:
+        #     model_hf.save_pretrained(llm_path)
+        # except (OSError, PermissionError):
+        #     import tempfile
+        #     llm_path = os.path.join(tempfile.gettempdir(), "vila")
+        #     warnings.warn(
+        #         f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
+        #     )
+        #     model_hf.save_pretrained(llm_path)
 
     # Real run
     llm_cfg = AutoConfig.from_pretrained(llm_path)
