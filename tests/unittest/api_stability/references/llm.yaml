@@ -4,6 +4,7 @@ methods:
     return_annotation: None
   generate:
     parameters:
+      # TODO [TRTLLM-3925]
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null

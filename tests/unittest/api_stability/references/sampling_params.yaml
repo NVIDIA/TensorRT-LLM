@@ -8,7 +8,7 @@ methods:
       return_perf_metrics:
         annotation: bool
         default: false
-      # Deprecated arguments
+      # TODO [TRTLLM-3716]: Deprecated arguments
       beam_width:
         annotation: int
         default: 1

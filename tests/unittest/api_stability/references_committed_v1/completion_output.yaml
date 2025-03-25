@@ -19,5 +19,9 @@ methods:
       generation_logits:
         annotation: Optional[torch.Tensor]
         default: null
+      # TODO [TRTLLM-1049]
+      # logprobs:
+      #   annotation: Optional[SampleLogprobs]
+      #   default: null
     return_annotation: None
 properties: {}
