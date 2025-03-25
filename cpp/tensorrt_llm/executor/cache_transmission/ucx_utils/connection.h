@@ -17,6 +17,16 @@
 
 #pragma once
 
+#include "ucxx/api.h"
+#include "ucxx/utils/sockaddr.h"
+#include "ucxx/utils/ucx.h"
+#include <cstdint>
+#if __linux__
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#endif
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include <memory>
 
@@ -29,11 +39,14 @@ class UcxConnection : public Connection
 {
 public:
     UcxConnection() = default;
-    explicit UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint);
+    explicit UcxConnection(
+        uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager);
     // UcxConnection(UcxConnection&& other);
+    void sendGID();
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
-    void initialize(std::shared_ptr<UcxConnectionManager> manager);
+    // void initialize(UcxConnectionManager* manager);
+    friend class UcxConnectionManager;
 
 private:
     void initializeEndpointTag(int maxTryTimes = 10);
@@ -59,8 +72,10 @@ private:
     mutable std::mutex mMtx;
     mutable std::condition_variable mCv;
     uint64_t mConnectionId;
+    uint64_t mLocalGID;
+    uint64_t mRemoteGID;
     std::shared_ptr<ucxx::Endpoint> mEndpoint;
-    std::shared_ptr<UcxConnectionManager> mManager;
+    UcxConnectionManager* mManager;
 };
 
 // class UcxServer
