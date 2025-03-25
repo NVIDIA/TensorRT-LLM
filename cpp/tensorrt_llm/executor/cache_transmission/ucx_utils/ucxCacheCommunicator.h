@@ -63,7 +63,8 @@ public:
     ~UcxConnectionManager();
 
     // Factory function
-    [[nodiscard]] static std::unique_ptr<UcxConnectionManager> create(tensorrt_llm::mpi::MpiComm const* comm)
+    [[nodiscard]] static std::unique_ptr<tensorrt_llm::executor::kv_cache::UcxConnectionManager> create(
+        tensorrt_llm::mpi::MpiComm const* comm)
     {
         return std::make_unique<UcxConnectionManager>(comm);
     }
