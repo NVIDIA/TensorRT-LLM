@@ -13,6 +13,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cacheCommunicator.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h" //TODO: remove when progressing to standalone UCX stack
 
 #include "ucxx/api.h"
