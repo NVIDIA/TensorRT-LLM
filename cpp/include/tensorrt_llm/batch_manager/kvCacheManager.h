@@ -364,11 +364,6 @@ public:
         mCacheBlockIds.at(beamIdx).push_back(blockId);
     }
 
-    void changeCacheBlock(SizeType32 beamIdx, SizeType32 pagedBlockIdx, KVCacheBlock::IdType blockId)
-    {
-        mCacheBlockIds.at(beamIdx).at(pagedBlockIdx) = blockId;
-    }
-
     void clearCacheBlocks()
     {
         for (auto& beamBlockIds : mCacheBlockIds)
@@ -385,6 +380,14 @@ public:
         }
     }
 
+    void removeBlock(SizeType32 const blockIdx)
+    {
+        for (auto& beamBlockIds : mCacheBlockIds)
+        {
+            beamBlockIds.erase(beamBlockIds.begin() + blockIdx);
+        }
+    }
+
     [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
     {
         return mKvCacheRetentionConfig.getDecodeRetentionPriority();
@@ -395,14 +398,14 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    [[nodiscard]] bool getContextRequiresCyclicKvCache() const
+    [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
     {
-        return mContextRequiresCyclicKvCache;
+        return mContextRequiresSlidingWindowKvCache;
     }
 
-    void setContextRequiresCyclicKvCache(bool contextRequiresCyclicKvCache)
+    void setContextRequiresSlidingWindowKvCache(bool contextRequiresSlindigWindowKvCache)
     {
-        mContextRequiresCyclicKvCache = contextRequiresCyclicKvCache;
+        mContextRequiresSlidingWindowKvCache = contextRequiresSlindigWindowKvCache;
     }
 
 private:
@@ -420,7 +423,7 @@ private:
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
 
     // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
-    bool mContextRequiresCyclicKvCache{false};
+    bool mContextRequiresSlidingWindowKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -509,8 +512,6 @@ public:
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams = false);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
     //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
@@ -1253,7 +1254,6 @@ private:
 
     void cacheBlockOffsets(GenerationRequest& seq);
     void cacheNewBlockOffsets(GenerationRequest& seq);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 blockIdx);
     void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
