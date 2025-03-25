@@ -176,6 +176,10 @@ def insert_mha_with_kv_cache(
 def resize_kv_cache(
     egm: GraphModule, cm: CachedSequenceInterface, free_mem_ratio: float = 0.8
 ) -> None:
+    """Inflate the kv cache to occupy the available GPU memory.
+
+    free_mem_ratio specifies the fraction of available memory to occupy.
+    """
     free_mem, total_mem = torch.cuda.mem_get_info()
     ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
     current_cache_size = cm.current_cache_size_bytes()
