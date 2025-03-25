@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
@@ -193,6 +194,16 @@ def is_dist_op(node: Node) -> bool:
     return is_op(node, dist_ops)
 
 
+
+def is_chunk_or_slice_op(node: Node) -> bool:
+    """Check if the node is a chunk or slice op."""
+    target_ops = {
+        torch.ops.aten.slice,
+        torch.ops.aten.chunk,
+    }
+    return is_op(node, target_ops)
+
+
 def get_all_input_output_nodes(graph: Graph) -> Tuple[List[Node], List[Node]]:
     input_nodes: List[Node] = graph.find_nodes(op="placeholder")
     output_nodes: List[Node] = graph.find_nodes(op="output")
@@ -264,3 +275,31 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(output_node)
 
     return boundary_nodes
+
+
+def add_new_parameter_to_submodule(gm, new_submodule_name, new_param_name, new_param, logger=None):
+    """
+    Adds a new parameter to a submodule within gm.
+
+    If the submodule identified by new_submodule_name does not exist,
+    it will be created. Then the new parameter new_param is added to the submodule
+    under the attribute new_param_name.
+
+    Returns:
+        A string representing the full parameter name in the format "new_submodule_name.new_param_name".
+    """
+    try:
+        submodule = gm.get_submodule(new_submodule_name)
+        if logger:
+            logger.debug(f"Found existing submodule '{new_submodule_name}'.")
+    except AttributeError:
+        result = gm.add_submodule(new_submodule_name, nn.Module())
+        if logger:
+            logger.debug(f"Added submodule '{new_submodule_name}' with result: {result}.")
+        submodule = gm.get_submodule(new_submodule_name)
+
+    setattr(submodule, new_param_name, new_param)
+    if logger:
+        logger.debug(f"Set new parameter '{new_param_name}' in submodule '{new_submodule_name}'.")
+
+    return f"{new_submodule_name}.{new_param_name}"

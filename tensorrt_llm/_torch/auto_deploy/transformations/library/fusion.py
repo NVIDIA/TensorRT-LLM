@@ -9,6 +9,7 @@ from torch.fx import GraphModule, Node
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    add_new_parameter_to_submodule,
     extract_param_names_from_lin_node,
     get_op_overload_packet,
     is_linear_op,
@@ -44,7 +45,26 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     quantization_impl = QuantizationImpl.create(linear_nodes[0])
 
     def fuse_weights(tensors: List[torch.Tensor]) -> torch.Tensor:
-        """Fuse weights of linear nodes."""
+        """Fuse weights from multiple linear nodes by concatenation.
+
+        Note:
+            This function may slightly increase CUDA memory usage due to PyTorch's caching allocator behavior,
+            which rounds allocations to reduce fragmentation. Allocations are typically rounded up to powers of two
+            with subdivisions controlled by the environment variable:
+            `CUDA_PYTORCH_CUDA_ALLOC_CONF=roundup_power2_divisions:N`.
+
+            Models with irregular parameter sizes, an odd number of fused weights, or
+            unusual num_ranks sharding across GPUs are more likely to trigger rounding up, increasing memory usage.
+            For example, with `CUDA_PYTORCH_CUDA_ALLOC_CONF=roundup_power2_divisions:8`,
+            4608 * 3072 * 2 bytes = 28311552 bytes = 2^20 * 27 bytes will be rounded to 29360128 = 2^24 * 7
+
+        References:
+            - PyTorch CUDA caching allocator implementation:
+            https://github.com/pytorch/pytorch/blob/main/c10/cuda/CUDACachingAllocator.cpp
+            #L2046 for the rounding algorithm
+            - Overview of the CUDA caching allocator:
+            https://zdevito.github.io/2022/08/04/cuda-caching-allocator.html"""
+        
         return torch.cat(tensors, dim=0)
 
     def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
@@ -76,13 +96,18 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     else:
         param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
 
-    setattr(gm, key_fused, param_fused)
+    weight_key = keys_unfused[0]
+    weight_module_path, _ = weight_key.rsplit(".", 1)
+    new_module_name = f"{weight_module_path}_fused"
+    full_new_param_name = add_new_parameter_to_submodule(
+        gm, new_module_name, key_fused, param_fused, ad_logger
+    )
 
     # Handle fused_kwargs for quantized fused gemm.
     fused_kwargs = dict(linear_nodes[0].kwargs)
 
     with gm.graph.inserting_before(linear_nodes[0]):
-        get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
+        get_param_node = gm.graph.create_node("get_attr", full_new_param_name)
         if quantization_impl:
             for scale_name in quantization_impl.scale_names():
                 # Creates new nodes for the fused scales so the unfused linear ops can be fully erased.
