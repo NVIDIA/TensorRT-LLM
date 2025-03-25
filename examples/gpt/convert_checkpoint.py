@@ -209,7 +209,7 @@ def convert_and_save_hf(args):
     quant_config = args_to_quant_config(args)
     is_prequantized_to_fp8 = quant_config.quant_algo == QuantAlgo.FP8
     if is_prequantized_to_fp8:
-        override_fields.update({'prequantized_ckpt_path': args.model_dir})
+        override_fields.update({'is_prequantized_to_fp8': True})
 
     if args.smoothquant is not None or args.int8_kv_cache:
         mapping = Mapping(world_size=world_size,
@@ -225,14 +225,18 @@ def convert_and_save_hf(args):
             calib_dataset=args.calib_dataset,
             **override_fields)
     else:
-        hf_model = load_hf_gpt(model_dir, load_model_on_cpu)
+        # Defer weight loading if checkpoint is prequantized to fp8.
+        if is_prequantized_to_fp8:
+            hf_model_or_dir = model_dir
+        else:
+            hf_model_or_dir = load_hf_gpt(model_dir, load_model_on_cpu)
 
         def convert_and_save_rank(args, rank):
             mapping = Mapping(world_size=world_size,
                               rank=rank,
                               tp_size=args.tp_size,
                               pp_size=args.pp_size)
-            model = GPTForCausalLM.from_hugging_face(hf_model,
+            model = GPTForCausalLM.from_hugging_face(hf_model_or_dir,
                                                      args.dtype,
                                                      mapping=mapping,
                                                      quant_config=quant_config,

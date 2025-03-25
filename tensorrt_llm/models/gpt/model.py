@@ -302,7 +302,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
-        prequantized_ckpt_path = kwargs.pop('prequantized_ckpt_path', None)
+        is_prequantized_to_fp8 = kwargs.pop('is_prequantized_to_fp8', False)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -319,10 +319,10 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                              mapping=mapping,
                                              quant_config=quant_config,
                                              **kwargs)
-        if prequantized_ckpt_path is not None and os.environ.get(
+        if is_prequantized_to_fp8 and os.environ.get(
                 "TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {'fc': 'up_proj'}
-            loader = ModelWeightsLoader(prequantized_ckpt_path, custom_dict)
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
 
             # This is to account for all layernorms in nemotron variants being NemotronLayerNorm-1P.
