@@ -118,6 +118,7 @@ l0_a10:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestPhi2::test_auto_dtype # 2 mins
+  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - test_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min

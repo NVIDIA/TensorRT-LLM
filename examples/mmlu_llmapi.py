@@ -47,34 +47,23 @@ Example usage:
 """
 
 import argparse
+import math
 import os
 import random
-import time
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
 import tensorrt_llm
+import tensorrt_llm.profiler as profiler
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi import LLM, KvCacheConfig
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-DTYPE_STR_MAPPING = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
-RAND_SEED = 1234
 
 
 def get_choices():
@@ -194,122 +183,25 @@ def gen_prompt(train_df, subject, k=-1):
     return prompt
 
 
-def evaluate(args, subject, pipeline, dev_df, test_df):
-
-    cors = []
-    all_probs = []
-    prompts = []
-    labels = []
-    preds = []
-
-    # prepare prompts and labels
-    for i in range(test_df.shape[0]):
-        if i >= args.max_ite:
-            break
-        # get prompt and make sure it fits
-        k = args.ntrain
-        prompt_end = format_example(test_df, i, include_answer=False)
+def generate_samples(data_dir: str,
+                     subjects: List[str],
+                     k: int = 5,
+                     num_samples_per_subject: Optional[int] = None):
+    for subject in subjects:
+        dev_df = pd.read_csv(f"{data_dir}/dev/{subject}_dev.csv", header=None)
         train_prompt = gen_prompt(dev_df, subject, k)
-        prompt = train_prompt + prompt_end
 
-        while not pipeline.check_valid_length(prompt) and k > 0:
-            k -= 1
-            train_prompt = gen_prompt(dev_df, subject, k)
+        test_df = pd.read_csv(f"{data_dir}/test/{subject}_test.csv",
+                              header=None)
+        if num_samples_per_subject is not None and num_samples_per_subject < test_df.shape[
+                0]:
+            test_df = test_df.sample(num_samples_per_subject)
+
+        for i in range(test_df.shape[0]):
+            prompt_end = format_example(test_df, i, include_answer=False)
             prompt = train_prompt + prompt_end
-
-        label = test_df.iloc[i, test_df.shape[1] - 1]
-
-        prompts.append(prompt)
-        labels.append(label)
-
-    # run batch inference
-    bs = args.batch_size
-    for i in range(0, len(prompts), bs):
-        cur_prompts = prompts[i:min(i + bs, len(prompts))]
-        preds.extend(pipeline(cur_prompts))
-
-    # check result
-    for i in range(len(prompts)):
-        probs = [0 for _ in get_choices()]
-        cor = preds[i].strip().startswith(labels[i])
-        cors.append(cor)
-        all_probs.append(probs)
-
-    acc = np.mean(cors)
-    cors = np.array(cors)
-    all_probs = np.array(all_probs)
-    print("Average accuracy {:.3f} - {}".format(acc, subject))
-
-    return cors, acc, all_probs
-
-
-def get_tokenizer(ckpt_path, max_seq_len):
-    print(f"Initializing tokenizer from {ckpt_path}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        ckpt_path,
-        model_max_length=max_seq_len,
-        padding_side="left",
-        trust_remote_code=True,
-    )
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return tokenizer
-
-
-class Pipeline:
-
-    def __init__(self, model: LLM):
-        """Initialize Pipeline with basic components.
-
-        Args:
-            tokenizer: Tokenizer instance
-            model: The language model instance
-            model_name: Name of the model being used
-        """
-
-        self.model = model
-        # Fixed output length for MMLU-style tasks, use greedy decoding
-        self.sampling_params = SamplingParams(max_tokens=2,
-                                              top_k=1,
-                                              temperature=0.0)
-
-    def __call__(self, prompts: List):
-        """Process the input prompts and generate responses.
-
-        Args:
-            prompt: Input text prompts
-
-        Returns:
-            str: Generated responses with special tokens removed
-        """
-        # Encode and prepare input
-
-        # Generate response
-        batch_outputs = self.model.generate(prompts,
-                                            self.sampling_params,
-                                            use_tqdm=False)
-
-        # Extract generated tokens
-        texts = [output.outputs[0].text for output in batch_outputs]
-
-        # Decode and return response
-        return texts
-
-    def check_valid_length(self, prompt):
-        """Check if prompt length is valid for model.
-
-        Args:
-            prompt: Input text prompt
-
-        Returns:
-            bool: True if the prompt is within valid length
-        """
-        # TODO: Check whether this is needed for LLM API.
-        # input_len = len(self.tokenizer.encode(prompt))
-        # build_config = self.model.args.build_config
-        # return (input_len <= build_config.max_input_len and
-        #             input_len + build_config.max_output_len <= build_config.max_seq_len)
-        return True
+            label = test_df.iloc[i, test_df.shape[1] - 1]
+            yield subject, prompt, label
 
 
 def parse_args():
@@ -355,6 +247,12 @@ def parse_args():
     parser.add_argument('--enable_overlap_scheduler',
                         default=False,
                         action='store_true')
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=0.9,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
 
     # MMLU args
     parser.add_argument(
@@ -365,13 +263,14 @@ def parse_args():
               "download https://people.eecs.berkeley.edu/~hendrycks/data.tar"),
     )
     parser.add_argument("--ntrain", type=int, default=5)
-    parser.add_argument("--max_input_length", type=int, default=2048)
+    parser.add_argument('--max_input_length', type=int, default=4094)
+    parser.add_argument('--output_len', type=int, default=2)
+    parser.add_argument('--num_samples', type=int, default=None)
+    parser.add_argument('--num_samples_per_subject', type=int, default=None)
+    parser.add_argument('--random_seed', type=int, default=0)
     parser.add_argument('--check_accuracy', action='store_true')
-    parser.add_argument('--accuracy_threshold', type=float, default=0.3)
-    parser.add_argument('--max_ite', type=int, default=10000000)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--accuracy_threshold', type=float, default=30)
     args = parser.parse_args()
-
     return args
 
 
@@ -379,27 +278,17 @@ def main():
     args = parse_args()
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.hf_model_dir
-    random.seed(RAND_SEED)
-    np.random.seed(RAND_SEED)
+    if args.engine_dir is not None:
+        args.backend = "tensorrt"
+    if args.num_samples is not None:
+        assert args.num_samples_per_subject is None
+        args.num_samples_per_subject = math.ceil(args.num_samples /
+                                                 len(get_subcategories()))
 
-    os.path.dirname(os.path.abspath(__file__))
-    data_fullpath = os.path.join(args.data_dir, "test")
+    random.seed(args.random_seed)
+    np.random.seed(args.random_seed)
 
-    subjects = sorted([
-        f.split("_test.csv")[0] for f in os.listdir(data_fullpath)
-        if "_test.csv" in f
-    ])
-
-    all_cors = []
-    subcat_cors = {
-        subcat: []
-        for subcat_lists in get_subcategories().values()
-        for subcat in subcat_lists
-    }
-    cat_cors = {cat: [] for cat in get_categories()}
-
-    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
-
+    profiler.start("trtllm init")
     if args.enable_chunked_prefill:
         # Use a small max_num_tokens/tokens_per_block to guarantee
         # that chunked context features get exercised.
@@ -411,61 +300,94 @@ def main():
     else:
         build_config = None
 
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=args.kv_cache_free_gpu_memory_fraction)
+
     if args.backend == "pytorch":
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
         config = PyTorchConfig(
             attn_backend=args.attn_backend,
             enable_overlap_scheduler=args.enable_overlap_scheduler,
             torch_compile_enabled=args.torch_compile)
-        model = tensorrt_llm._torch.LLM(
+        llm = tensorrt_llm._torch.LLM(
             model=args.hf_model_dir,
-            tokenizer=tokenizer,
+            tokenizer=args.tokenizer_dir,
             tensor_parallel_size=args.tp_size,
             moe_expert_parallel_size=args.ep_size,
             pytorch_backend_config=config,
             enable_chunked_prefill=args.enable_chunked_prefill,
             build_config=build_config,
+            kv_cache_config=kv_cache_config,
             enable_attention_dp=args.enable_attention_dp)
     else:
-        model = LLM(model=args.engine_dir or args.hf_model_dir,
-                    tokenizer=tokenizer,
-                    tensor_parallel_size=args.tp_size,
-                    enable_chunked_prefill=args.enable_chunked_prefill,
-                    build_config=build_config)
+        llm = LLM(model=args.engine_dir or args.hf_model_dir,
+                  tokenizer=args.tokenizer_dir,
+                  tensor_parallel_size=args.tp_size,
+                  enable_chunked_prefill=args.enable_chunked_prefill,
+                  build_config=build_config,
+                  kv_cache_config=kv_cache_config)
+    profiler.stop("trtllm init")
+    elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
+    print(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
 
-    pipeline = Pipeline(model)
+    subjects = list(get_subcategories().keys())
+    subcategories = list(
+        set(subcat for subcats in get_subcategories().values()
+            for subcat in subcats))
+    categories = list(get_categories().keys())
 
-    t = time.time()
-    for subject in tqdm(subjects):
-        dev_df = pd.read_csv(os.path.join(args.data_dir, "dev",
-                                          subject + "_dev.csv"),
-                             header=None)[:args.ntrain]
-        test_df = pd.read_csv(os.path.join(args.data_dir, "test",
-                                           subject + "_test.csv"),
-                              header=None)
+    sampling_params = SamplingParams(
+        max_tokens=args.output_len,
+        top_k=1,
+        temperature=0.0,
+        truncate_prompt_tokens=args.max_input_length)
 
-        cors, acc, probs = evaluate(args, subject, pipeline, dev_df, test_df)
-        subcats = get_subcategories()[subject]
-        for subcat in subcats:
-            subcat_cors[subcat].append(cors)
-            for key in get_categories().keys():
-                if subcat in get_categories()[key]:
-                    cat_cors[key].append(cors)
-        all_cors.append(cors)
+    profiler.start("trtllm exec")
+    data = []
+    for subject, prompt, label in tqdm(
+            generate_samples(args.data_dir, subjects, args.ntrain,
+                             args.num_samples_per_subject),
+            "Submitting requests"):
+        output = llm.generate_async(prompt, sampling_params)
+        data.append([subject, prompt, label, output])
 
-    t = time.time() - t
-    print(f"Finished in {t:.3f} seconds")
+    subject_corrections = {key: [] for key in subjects}
+    for subject, prompt, label, output in tqdm(data, "Fetching responses"):
+        output = output.result()
+        correction = output.outputs[0].text.strip().startswith(label)
+        subject_corrections[subject].append(correction)
+    profiler.stop("trtllm exec")
+    elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
+    print(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
 
-    for subcat in subcat_cors:
-        subcat_acc = np.mean(np.concatenate(subcat_cors[subcat]))
-        print("Average accuracy {:.3f} - {}".format(subcat_acc, subcat))
+    subcategory_corrections = {key: [] for key in subcategories}
+    category_corrections = {key: [] for key in categories}
+    all_corrections = []
+    for subject, corrections in subject_corrections.items():
+        for subcat in get_subcategories()[subject]:
+            subcategory_corrections[subcat].extend(corrections)
+            for cat, subcats in get_categories().items():
+                if subcat in subcats:
+                    category_corrections[cat].extend(corrections)
+        all_corrections.extend(corrections)
 
-    for cat in cat_cors:
-        cat_acc = np.mean(np.concatenate(cat_cors[cat]))
-        print("Average accuracy {:.3f} - {}".format(cat_acc, cat))
+    for subject, corrections in subject_corrections.items():
+        acc = np.mean(corrections) * 100
+        print(f"Average accuracy {acc:.2f} ({len(corrections)}) - {subject}")
 
-    weighted_acc = np.mean(np.concatenate(all_cors))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
+    for subcat, corrections in subcategory_corrections.items():
+        acc = np.mean(corrections) * 100
+        print(f"Average accuracy {acc:.2f} ({len(corrections)}) - {subcat}")
+
+    for cat, corrections in category_corrections.items():
+        acc = np.mean(corrections) * 100
+        print(f"Average accuracy {acc:.2f} ({len(corrections)}) - {cat}")
+
+    weighted_acc = np.mean(all_corrections) * 100
+    print(
+        f"MMLU weighted average accuracy: {weighted_acc:.2f} ({len(all_corrections)})"
+    )
+
     if args.check_accuracy:
         assert weighted_acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {weighted_acc}"
     return weighted_acc

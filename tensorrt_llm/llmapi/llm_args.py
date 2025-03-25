@@ -3,7 +3,7 @@ import json
 import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, fields
-from enum import Enum
+from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
                     Tuple, Union)
@@ -16,13 +16,19 @@ from transformers import PreTrainedTokenizerBase
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
-from ..bindings.executor import (BatchingType, DecodingConfig, DecodingMode,
-                                 EagleConfig, ExecutorConfig,
+from ..bindings.executor import BatchingType
+from ..bindings.executor import \
+    CapacitySchedulerPolicy as _CapacitySchedulerPolicy
+from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
+from ..bindings.executor import DecodingConfig, DecodingMode
+from ..bindings.executor import DynamicBatchConfig as _DynamicBatchConfig
+from ..bindings.executor import (EagleConfig, ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig)
 from ..bindings.executor import KvCacheConfig as _KvCacheConfig
 from ..bindings.executor import \
     LookaheadDecodingConfig as _LookaheadDecodingConfig
-from ..bindings.executor import PeftCacheConfig, SchedulerConfig
+from ..bindings.executor import PeftCacheConfig as _PeftCacheConfig
+from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
@@ -239,7 +245,9 @@ class PybindMirror(ABC):
 
     @staticmethod
     def maybe_to_pybind(ins):
-        if isinstance(ins, PybindMirror):
+        if isinstance(
+                ins,
+                PybindMirror) or type(ins).__class__ == PybindMirrorEnumMeta:
             return ins._to_pybind()
         return ins
 
@@ -274,12 +282,192 @@ class PybindMirror(ABC):
         return decorator
 
     @staticmethod
+    def get_pybind_enum_fields(pybind_class):
+        ''' Get all the enum fields from the pybind class. '''
+        return [
+            f for f in pybind_class.__members__.keys()
+            if not f.startswith('_') and not callable(getattr(pybind_class, f))
+        ]
+
+    @staticmethod
+    def mirror_pybind_enum(pybind_class):
+        ''' Mirror the enum fields from the pybind class to the Python class. '''
+
+        def decorator(cls):
+            assert issubclass(cls, Enum)
+            cpp_fields = PybindMirror.get_pybind_enum_fields(pybind_class)
+            python_fields = set(cls.__members__.keys())
+
+            for field in cpp_fields:
+                if field not in python_fields:
+                    raise ValueError(
+                        f"Field {field} is not mirrored in Python class {cls.__name__} from C++ class {pybind_class.__name__}. Please update the class."
+                    )
+            return cls
+
+        return decorator
+
+    @staticmethod
     def get_pybind_variable_fields(config_cls):
         ''' Get all the variable fields from the pybind class. '''
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
         ]
+
+    @staticmethod
+    def pybind_equals(obj0, obj1):
+        ''' Check if two pybind objects are equal. '''
+        assert type(obj0) is type(obj1)
+        for field in PybindMirror.get_pybind_variable_fields(type(obj0)):
+            if getattr(obj0, field) != getattr(obj1, field):
+                return False
+        return True
+
+
+class PybindMirrorMeta(type(PybindMirror)):
+    pass
+
+
+class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
+    """
+    Combined metaclass for Enum and PybindMirror.  This is crucial.
+    """
+
+
+@PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
+class CapacitySchedulerPolicy(str, Enum, metaclass=PybindMirrorEnumMeta):
+    MAX_UTILIZATION = "MAX_UTILIZATION"
+    GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
+    STATIC_BATCH = "STATIC_BATCH"
+
+    def _to_pybind(self):
+        return getattr(_CapacitySchedulerPolicy, self.value)
+
+
+@PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
+class ContextChunkingPolicy(str, Enum, metaclass=PybindMirrorEnumMeta):
+    ''' Context chunking policy. '''
+    FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
+    EQUAL_PROGRESS = "EQUAL_PROGRESS"
+
+    def _to_pybind(self):
+        return getattr(_ContextChunkingPolicy, self.value)
+
+
+@PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
+class DynamicBatchConfig(BaseModel, PybindMirror):
+    """Dynamic batch configuration.
+
+    Controls how batch size and token limits are dynamically adjusted at runtime.
+    """
+    enable_batch_size_tuning: bool = Field(
+        description="Controls if the batch size should be tuned dynamically")
+
+    enable_max_num_tokens_tuning: bool = Field(
+        description="Controls if the max num tokens should be tuned dynamically"
+    )
+
+    dynamic_batch_moving_average_window: int = Field(
+        description=
+        "The window size for moving average of input and output length which is used to calculate dynamic batch size and max num tokens"
+    )
+
+    def _to_pybind(self):
+        return _DynamicBatchConfig(
+            enable_batch_size_tuning=self.enable_batch_size_tuning,
+            enable_max_num_tokens_tuning=self.enable_max_num_tokens_tuning,
+            dynamic_batch_moving_average_window=self.
+            dynamic_batch_moving_average_window)
+
+
+@PybindMirror.mirror_pybind_fields(_SchedulerConfig)
+class SchedulerConfig(BaseModel, PybindMirror):
+    capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
+        default=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        description="The capacity scheduler policy to use")
+
+    context_chunking_policy: Optional[ContextChunkingPolicy] = Field(
+        default=None, description="The context chunking policy to use")
+
+    dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
+        default=None, description="The dynamic batch config to use")
+
+    def _to_pybind(self):
+        return _SchedulerConfig(
+            capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(
+            ),
+            context_chunking_policy=self.context_chunking_policy._to_pybind()
+            if self.context_chunking_policy else None,
+            dynamic_batch_config=self.dynamic_batch_config._to_pybind()
+            if self.dynamic_batch_config else None)
+
+
+@PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
+class PeftCacheConfig(BaseModel, PybindMirror):
+    """
+    Configuration for the PEFT cache.
+    """
+    num_host_module_layer: int = Field(
+        default=0,
+        description=
+        "number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache"
+    )
+    num_device_module_layer: int = Field(
+        default=0,
+        description=
+        "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+    )
+    optimal_adapter_size: int = Field(
+        default=
+        8,  # There are tests to keep the default value consistent with the pybind default value
+        description="optimal adapter size used to set page width")
+    max_adapter_size: int = Field(
+        default=64,
+        description="max supported adapter size. Used to compute minimum")
+    num_put_workers: int = Field(
+        default=1,
+        description=
+        "number of worker threads used to put weights into host cache")
+    num_ensure_workers: int = Field(
+        default=1,
+        description=
+        "number of worker threads used to copy weights from host to device")
+    num_copy_streams: int = Field(
+        default=1,
+        description="number of streams used to copy weights from host to device"
+    )
+    max_pages_per_block_host: int = Field(
+        default=24,
+        description="Number of cache pages per allocation block (host)")
+    max_pages_per_block_device: int = Field(
+        default=8,
+        description="Number of cache pages per allocation block (device)")
+    device_cache_percent: Optional[float] = Field(
+        default=None,
+        description="percent of memory after engine load to use for cache")
+    host_cache_size: Optional[int] = Field(
+        default=None, description="size in bytes to use for host cache")
+    lora_prefetch_dir: Optional[str] = Field(
+        default=None,
+        description=
+        "folder to store the LoRA weights we hope to load during engine initialization"
+    )
+
+    def _to_pybind(self):
+        return _PeftCacheConfig(
+            num_host_module_layer=self.num_host_module_layer,
+            num_device_module_layer=self.num_device_module_layer,
+            optimal_adapter_size=self.optimal_adapter_size,
+            max_adapter_size=self.max_adapter_size,
+            num_put_workers=self.num_put_workers,
+            num_ensure_workers=self.num_ensure_workers,
+            num_copy_streams=self.num_copy_streams,
+            max_pages_per_block_host=self.max_pages_per_block_host,
+            max_pages_per_block_device=self.max_pages_per_block_device,
+            device_cache_percent=self.device_cache_percent,
+            host_cache_size=self.host_cache_size,
+            lora_prefetch_dir=self.lora_prefetch_dir)
 
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
@@ -536,9 +724,9 @@ LLMARGS_IMPLICIT_DOCSTRING = """
 
         enable_build_cache (bool, tensorrt_llm.llmapi.BuildCacheConfig): Whether to enable build caching for the model. Defaults to False.
 
-        peft_cache_config (tensorrt_llm.bindings.executor.PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
+        peft_cache_config (tensorrt_llm.llmapi.llm_args.PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
 
-        scheduler_config (tensorrt_llm.bindings.executor.SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
+        scheduler_config (tensorrt_llm.llmapi.llm_args.SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
 
         speculative_config (tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.MedusaDecodingConfig, tensorrt_llm.llmapi.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, optional): The speculative decoding configuration. Defaults to None.
 
