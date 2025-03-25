@@ -1,4 +1,5 @@
 # autoflake: skip_file
+import copy
 import inspect
 import os
 import pathlib
@@ -132,11 +133,24 @@ class MethodSnapshot:
         d['return_annotation'] = repr_annotation(d['return_annotation'])
         return d
 
+    def merge(self, other: 'MethodSnapshot'):
+        assert self.name == other.name
+        assert self.parameters.keys().isdisjoint(other.parameters.keys())
+        self.parameters.update(copy.deepcopy(other.parameters))
+        assert self.return_annotation == other.return_annotation
+
     def assert_equal(self, other: 'MethodSnapshot'):
         assert self.name == other.name
         assert self.parameters.keys() == other.parameters.keys()
         for name, param in self.parameters.items():
             param.assert_equal(other.parameters[name])
+        assert self.return_annotation == other.return_annotation
+
+    def assert_containing(self, other: 'MethodSnapshot'):
+        assert self.name == other.name
+        for name, param in other.parameters.items():
+            assert name in self.parameters
+            self.parameters[name].assert_equal(param)
         assert self.return_annotation == other.return_annotation
 
 
@@ -210,6 +224,19 @@ class ClassSnapshot:
         }
         return d
 
+    def merge(self, other: 'ClassSnapshot'):
+        for name, method in self.methods.items():
+            if name in other.methods:
+                method.merge(other.methods[name])
+        new_methods = {
+            name: method
+            for name, method in other.methods.items()
+            if name not in self.methods
+        }
+        self.methods.update(copy.deepcopy(new_methods))
+        assert self.properties.keys().isdisjoint(other.properties.keys())
+        self.properties.update(copy.deepcopy(other.properties))
+
     def assert_equal(self, other: 'ClassSnapshot'):
         assert self.methods.keys() == other.methods.keys()
         for name, method in self.methods.items():
@@ -218,30 +245,47 @@ class ClassSnapshot:
         for name, prop in self.properties.items():
             prop.assert_equal(other.properties[name])
 
+    def assert_containing(self, other: 'ClassSnapshot'):
+        for name, method in other.methods.items():
+            assert name in self.methods
+            self.methods[name].assert_containing(method)
+        for name, prop in other.properties.items():
+            assert name in self.properties
+            self.properties[name].assert_equal(prop)
+
 
 class ApiStabilityTestHarness:
     TEST_CLASS = None
+    REFERENCE_COMMITTED_DIR = f"{os.path.dirname(__file__)}/references_v1"
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
     REFERENCE_FILE = None
 
     @classmethod
-    def reference_path(cls):
-        return f"{cls.REFERENCE_DIR}/{cls.REFERENCE_FILE}"
-
-    @classmethod
     def setup_class(cls):
-        with open(cls.reference_path()) as f:
+        with open(f"{cls.REFERENCE_DIR}/{cls.REFERENCE_FILE}") as f:
             cls.reference = ClassSnapshot.from_dict(yaml.safe_load(f))
-        cls.error_msg = (
-            f"API stability validation failed. "
-            f"This is probably because you changed {cls.TEST_CLASS.__name__}'s APIs, please ask for reviews from the code owners."
-        )
+        if os.path.exists(
+                f"{cls.REFERENCE_COMMITTED_DIR}/{cls.REFERENCE_FILE}"):
+            with open(
+                    f"{cls.REFERENCE_COMMITTED_DIR}/{cls.REFERENCE_FILE}") as f:
+                cls.reference_committed = ClassSnapshot.from_dict(
+                    yaml.safe_load(f))
+            cls.reference.merge(cls.reference_committed)
+        else:
+            cls.reference_committed = None
+        cls.error_msg = f"API validation failed because you changed {cls.TEST_CLASS.__name__}'s APIs, please ask for reviews from the code owners."
+        cls.error_msg_committed = f"API validation failed because you changed {cls.TEST_CLASS.__name__}'s committed APIs, please ask for approvals from the project managers."
 
     def create_snapshot_from_inspect(self):
         return ClassSnapshot.from_inspect(self.TEST_CLASS)
 
     def test_signature(self):
         snapshot = self.create_snapshot_from_inspect()
+        if self.reference_committed is not None:
+            try:
+                snapshot.assert_containing(self.reference_committed)
+            except AssertionError as e:
+                raise AssertionError(self.error_msg_committed) from e
         try:
             snapshot.assert_equal(self.reference)
         except AssertionError as e:
@@ -252,6 +296,11 @@ class ApiStabilityTestHarness:
 
     def test_docstring(self):
         snapshot = self.create_snapshot_from_docstring()
+        if self.reference_committed is not None:
+            try:
+                snapshot.assert_containing(self.reference_committed)
+            except AssertionError as e:
+                raise AssertionError(self.error_msg_committed) from e
         try:
             snapshot.assert_equal(self.reference)
         except AssertionError as e:
