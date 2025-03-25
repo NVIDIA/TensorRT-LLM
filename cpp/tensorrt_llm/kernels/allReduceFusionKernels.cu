@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,8 +118,7 @@ public:
             m_flag_value = comm.flag_value;
             int current_rank = rank;
             int target_rank = threadIdx.x;
-            m_target_flag
-                = reinterpret_cast<int*>(comm.barrier_flags[target_rank]) + blockIdx.x * NRanks + current_rank;
+            m_target_flag = reinterpret_cast<int*>(comm.barrier_flags[target_rank]) + current_rank;
             m_current_flag
                 = reinterpret_cast<int*>(comm.barrier_flags[current_rank]) + blockIdx.x * NRanks + target_rank;
         }
@@ -131,7 +130,12 @@ public:
         if (threadIdx.x < NRanks)
         {
             m_flag_value = next_flag(m_flag_value);
-            st_flag(m_target_flag, m_flag_value);
+            // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if the
+            // corresponding CTA has not been launched.
+            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
+            {
+                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+            }
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
             }
@@ -445,7 +449,8 @@ __global__ void allreduce_fusion_kernel_oneshot_sync(AllReduceFusionParams param
 }
 
 template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams params, int begin_token, int token_num)
+__global__ void allreduce_fusion_kernel_twoshot_sync(
+    AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
@@ -459,16 +464,22 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams param
     int tot_access = params.size / kElemsPerAccess;
     cudaGridDependencySynchronize();
     SyncComm<NRanks> comm(params.workspace);
-    for (int idx = access_id; idx < tot_access; idx += access_stride)
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r)
     {
-        float4 val;
-        val = reinterpret_cast<float4*>(params.allreduce_in)[idx];
-        reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] = val;
+        int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess;
+        int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess;
+        for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
+        {
+            reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx]
+                = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+        }
     }
     Barrier<NRanks> barrier(params.rank, comm);
     barrier.sync();
-    int comm_access_id = access_id + begin_token * params.hidden_dim / kElemsPerAccess;
-    int comm_tot_access = (begin_token + token_num) * params.hidden_dim / kElemsPerAccess;
+    int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / kElemsPerAccess;
+    int comm_tot_access
+        = (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / kElemsPerAccess;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
     {
         float4 vals[NRanks];
@@ -485,10 +496,18 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams param
         }
     }
     barrier.sync();
-    for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r)
     {
-        float4 sum_val = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[tot_access + idx];
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+        int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess;
+        int comm_token_id = token_id + begin_tokens[r];
+        int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess;
+        for (int idx = comm_access_id, tidx = comm_token_id; idx < comm_tot_access;
+             idx += access_stride, tidx += token_stride)
+        {
+            float4 sum_val = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[tot_access + idx];
+            fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+        }
     }
     comm.update(barrier.m_flag_value);
     cudaTriggerProgrammaticLaunchCompletion();
@@ -524,11 +543,12 @@ void launch_oneshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t
 }
 
 template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg, int begin_token, int token_num)
+void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg,
+    std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
         allreduce_fusion_kernel_twoshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>, params,
-        begin_token, token_num));
+        begin_tokens, token_num_per_ranks));
 }
 
 bool use_oneshot(int token_num)
@@ -542,21 +562,20 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     int token_num = params.size / params.hidden_dim;
     bool oneshot = use_oneshot(token_num);
     int cluster_num = token_num;
-    int begin_token = 0;
+    std::array<int, NRanks> begin_tokens, token_num_per_ranks;
     if (!oneshot)
     {
         int remaining_token = token_num % NRanks;
-        token_num = token_num / NRanks;
-        cluster_num = token_num;
+        int token_num_per_rank = token_num / NRanks;
+        cluster_num = token_num_per_rank;
         if (remaining_token)
         {
             cluster_num++;
         }
-        begin_token = params.rank * token_num;
-        begin_token += remaining_token > params.rank ? params.rank : remaining_token;
-        if (remaining_token > params.rank)
+        for (int r = 0; r < NRanks; ++r)
         {
-            ++token_num;
+            begin_tokens[r] = r * token_num_per_rank + (remaining_token > r ? r : remaining_token);
+            token_num_per_ranks[r] = token_num_per_rank + (remaining_token > r ? 1 : 0);
         }
     }
     int threads_per_token = params.hidden_dim / kElemsPerAccess;
@@ -566,7 +585,13 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     {
         cluster_size /= 2;
     }
-    int block_size = warps_per_token / cluster_size * 32;
+    int warps_per_block = warps_per_token / cluster_size;
+    while (warps_per_block < 4 && cluster_size >= 2)
+    {
+        warps_per_block *= 2;
+        cluster_size /= 2;
+    }
+    int block_size = warps_per_block * 32;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
@@ -592,15 +617,15 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     else
     {
         launch_twoshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(
-            params, cfg, begin_token, token_num);
+            params, cfg, begin_tokens, token_num_per_ranks);
     }
 }
 
 bool use_fp32_acc()
 {
-    static char* allReduceFusionKernelFp16Acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP16");
-    bool fp32_acc = (allReduceFusionKernelFp16Acc == nullptr);
-    return fp32_acc;
+    // we use fp16 acc type by default due to keep align with nccl
+    static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
+    return fp32_acc != nullptr;
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
