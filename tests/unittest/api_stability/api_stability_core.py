@@ -5,8 +5,8 @@ import os
 import pathlib
 from dataclasses import dataclass, fields
 from types import MethodType, NoneType
-from typing import (Any, Callable, Dict, List, Literal, Optional, Sequence,
-                    Tuple, Union, _type_repr)
+from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
+                    Sequence, Tuple, Union, _type_repr)
 
 import docstring_parser
 import pydantic.main
@@ -25,6 +25,40 @@ from tensorrt_llm.llmapi.llm_utils import LlmArgs
 
 def repr_annotation(field_type: type) -> str:
     return _type_repr(field_type).replace("typing.", "")
+
+
+class StackTrace:
+    ''' Keep track of the symbol stack to the current scope. '''
+    _instance: ClassVar[Optional["StackTrace"]] = None
+
+    def __init__(self):
+        self.stack: List[str] = []
+
+    def push(self, symbol: Optional[str]):
+        if symbol is None: return self
+        self.stack.append(symbol)
+        return self
+
+    def pop(self):
+        if self.stack:
+            self.stack.pop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.pop()
+
+    def get_prefix(self) -> str:
+        if not self.stack:
+            return ""
+        return ".".join(self.stack) + "."
+
+    @staticmethod
+    def instance() -> "StackTrace":
+        if StackTrace._instance is None:
+            StackTrace._instance = StackTrace()
+        return StackTrace._instance
 
 
 @dataclass(slots=True)
@@ -77,18 +111,21 @@ class ParamSnapshot:
         return d
 
     def assert_equal(self, other: 'ParamSnapshot'):
-        assert self.annotation == other.annotation
-        assert self.default == other.default
+        prefix = StackTrace.instance().get_prefix()
+        assert self.annotation == other.annotation, f"{prefix}{self.name} annotation: {self.annotation} != {other.annotation}"
+        assert self.default == other.default, f"{prefix}{self.name} default: {self.default} != {other.default}"
 
 
 @dataclass(slots=True)
 class MethodSnapshot:
     parameters: Dict[str, ParamSnapshot]
     return_annotation: type
+    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, method: MethodType):
         signature = inspect.signature(method)
+        print(f"** signature: {signature}")
         parameters = {}
         for param_name, param in signature.parameters.items():
             if param_name.startswith("_"):
@@ -96,8 +133,10 @@ class MethodSnapshot:
             parameters[param_name] = ParamSnapshot.from_inspect(param)
         return_annotation = signature.return_annotation
         if isinstance(return_annotation, str):
+            if return_annotation == "Self":
+                return_annotation = 'None'
             return_annotation = eval(return_annotation)
-        return cls(parameters, return_annotation)
+        return cls(parameters, return_annotation, name=method.__name__)
 
     @classmethod
     def from_docstring(cls, method: MethodType):
@@ -110,7 +149,7 @@ class MethodSnapshot:
             return_annotation = None
         else:
             return_annotation = eval(doc.returns.type_name)
-        return cls(parameters, return_annotation)
+        return cls(parameters, return_annotation, name=method.__name__)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -136,10 +175,31 @@ class MethodSnapshot:
         assert self.return_annotation == other.return_annotation
 
     def assert_equal(self, other: 'MethodSnapshot'):
-        assert self.parameters.keys() == other.parameters.keys()
-        for name, param in self.parameters.items():
-            param.assert_equal(other.parameters[name])
-        assert self.return_annotation == other.return_annotation
+        prefix = StackTrace.instance().get_prefix()
+
+        with StackTrace.instance().push(self.name):
+            self_only = set(self.parameters.keys()) - set(
+                other.parameters.keys())
+            other_only = set(other.parameters.keys()) - set(
+                self.parameters.keys())
+
+            self_only = list(
+                filter(
+                    lambda x: not x.startswith("_") and x not in
+                    PYDANTIC_FIELDS, self_only))
+            other_only = list(
+                filter(
+                    lambda x: not x.startswith("_") and x not in
+                    PYDANTIC_FIELDS, other_only))
+
+            if self_only or other_only:
+                raise AssertionError(
+                    f"{prefix}{self.name} has different parameters: "
+                    f"adding {self_only}, removing {other_only}")
+            else:
+                for name, param in self.parameters.items():
+                    param.assert_equal(other.parameters[name])
+            assert self.return_annotation == other.return_annotation
 
     def assert_containing(self, other: 'MethodSnapshot'):
         for name, param in other.parameters.items():
@@ -148,28 +208,80 @@ class MethodSnapshot:
         assert self.return_annotation == other.return_annotation
 
 
+PYDANTIC_FIELDS = {
+    'model_json_schema',
+    'from_orm',
+    'json',
+    'model_rebuild',
+    'construct',
+    'model_validate_strings',
+    'model_copy',
+    'parse_file',
+    'validate',
+    'model_dump',
+    'model_parametrized_name',
+    'schema_json',
+    'parse_raw',
+    'parse_obj',
+    'update_forward_refs',
+    'model_post_init',
+    'model_validate',
+    'schema',
+    'copy',
+    'model_validate_json',
+    'dict',
+    'model_construct',
+    'model_dump_json',
+    'model_extra',
+    'model_fields_set',
+    'model_fields',
+}
+
+
 @dataclass(slots=True)
 class ClassSnapshot:
     methods: Dict[str, MethodSnapshot]
     properties: Dict[str, ParamSnapshot]
+    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, snapshot_cls: type):
         inst = snapshot_cls.__new__(snapshot_cls)
+        name = snapshot_cls.__name__
         methods = {}
         for method_name, method in inspect.getmembers(
                 inst, predicate=inspect.ismethod):
             if method_name.startswith("_") and method_name != "__init__":
                 continue
-            methods[method_name] = MethodSnapshot.from_inspect(method)
+            if method_name in PYDANTIC_FIELDS:
+                continue
+            # deal with pydantic __init__
+            if method_name == "__init__" and isinstance(
+                    snapshot_cls, type) and issubclass(snapshot_cls,
+                                                       pydantic.main.BaseModel):
+                # Create a MethodSnapshot for Pydantic model's __init__
+                parameters = {}
+                for field_name, field in snapshot_cls.model_fields.items():
+                    if field_name.startswith("_"):
+                        continue
+                    parameters[field_name] = ParamSnapshot(
+                        annotation=field.annotation,
+                        default=field.default or inspect._empty)
+                methods[method_name] = MethodSnapshot(parameters=parameters,
+                                                      return_annotation=None,
+                                                      name="__init__")
+            else:
+                methods[method_name] = MethodSnapshot.from_inspect(method)
         properties = {}
         for prop_name, prop in inspect.getmembers(
                 snapshot_cls, predicate=lambda x: isinstance(x, property)):
             if prop_name.startswith("_"):
                 continue
+            if prop_name in PYDANTIC_FIELDS:
+                continue
             annotation = inspect.signature(prop.fget).return_annotation
             properties[prop_name] = ParamSnapshot(annotation, inspect._empty)
-        return cls(methods, properties)
+        return cls(methods, properties, name=name)
 
     @classmethod
     def from_docstring(cls, snapshot_cls: type):
@@ -189,7 +301,7 @@ class ClassSnapshot:
         for param in doc.params:
             if param.args[0] == 'attribute':
                 properties[param.arg_name] = ParamSnapshot.from_docstring(param)
-        return cls(methods, properties)
+        return cls(methods, properties, name=snapshot_cls.__name__)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -229,12 +341,34 @@ class ClassSnapshot:
         self.properties.update(copy.deepcopy(other.properties))
 
     def assert_equal(self, other: 'ClassSnapshot'):
-        assert self.methods.keys() == other.methods.keys()
-        for name, method in self.methods.items():
-            method.assert_equal(other.methods[name])
-        assert self.properties.keys() == other.properties.keys()
-        for name, prop in self.properties.items():
-            prop.assert_equal(other.properties[name])
+        prefix = StackTrace.instance().get_prefix()
+        with StackTrace.instance().push(self.name):
+            if self.methods.keys() != other.methods.keys():
+                diff_keys = set(self.methods.keys()) ^ set(other.methods.keys())
+                raise AssertionError(
+                    f"{prefix}{self.name} has different methods: {diff_keys}")
+
+            for name, method in self.methods.items():
+                if self.name == "LLM" and name == "__init__":
+                    # only check the explicit the explicit arglist from LLM.__init__
+                    for param in method.parameters.values():
+                        try:
+                            param.assert_equal(
+                                other.methods[name].parameters[param.name])
+                        except KeyError:
+                            raise AssertionError
+                else:
+                    method.assert_equal(other.methods[name])
+
+            if self.properties.keys() != other.properties.keys():
+                diff_keys = set(self.properties.keys()) ^ set(
+                    other.properties.keys())
+                raise AssertionError(
+                    f"{prefix}{self.name} has different properties: {diff_keys}"
+                )
+
+            for name, prop in self.properties.items():
+                prop.assert_equal(other.properties[name])
 
     def assert_containing(self, other: 'ClassSnapshot'):
         for name, method in other.methods.items():

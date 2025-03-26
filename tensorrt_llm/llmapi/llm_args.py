@@ -676,7 +676,6 @@ class _ModelWrapper:
 class LlmArgs(BaseModel):
     model_config = {
         "arbitrary_types_allowed": True,
-        "underscore_attrs_are_private": True
     }
 
     # Explicit arguments
@@ -688,11 +687,13 @@ class LlmArgs(BaseModel):
     tokenizer: Optional[Union[
         str, Path, TokenizerBase, PreTrainedTokenizerBase]] = Field(
             description=
-            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub."
-        )
+            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub.",
+            default=None)
 
     tokenizer_mode: Literal['auto', 'slow'] = Field(
-        default='auto', description="The mode to initialize the tokenizer.")
+        default='auto',
+        description="The mode to initialize the tokenizer.",
+        json_schema_extra={"type": "Literal['auto', 'slow']"})
 
     skip_tokenizer_init: bool = Field(
         default=False,
@@ -745,7 +746,9 @@ class LlmArgs(BaseModel):
         default=1, description="The world size for auto parallel mode.")
 
     load_format: Literal['auto', 'dummy'] = Field(
-        default='auto', description="The format to load the model.")
+        default='auto',
+        description="The format to load the model.",
+        json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
     enable_tqdm: bool = Field(default=False,
                               description="Enable tqdm for progress bar.")
@@ -817,9 +820,12 @@ class LlmArgs(BaseModel):
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
     # Once set, the model will reuse the build_cache
-    enable_build_cache: Union[BuildCacheConfig,
-                              bool] = Field(default=False,
-                                            description="Enable build cache.")
+    enable_build_cache: Union[BuildCacheConfig, bool] = Field(
+        default=False,
+        description="Enable build cache.",
+        json_schema_extra={
+            "type": f"Union[{get_type_repr(BuildCacheConfig)}, bool]"
+        })
 
     peft_cache_config: Optional[PeftCacheConfig] = Field(
         default=None, description="PEFT cache config.")
