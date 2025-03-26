@@ -30,8 +30,8 @@ from einops import rearrange
 from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModel
-from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
+from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
+                          AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
 from ..._utils import nvtx_range
@@ -559,6 +559,63 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
+def _resize_embeds(old_embeddings, new_num_tokens):
+    # build new embeddings
+    old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+    new_embeddings = nn.Embedding(
+        new_num_tokens,
+        old_embedding_dim,
+        device=old_embeddings.weight.device,
+        dtype=old_embeddings.weight.dtype,
+    )
+
+    # copy weights
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_embeddings.weight.data[:
+                               num_tokens_to_copy, :] = old_embeddings.weight.data[:
+                                                                                   num_tokens_to_copy, :]
+    old_embeddings.weight.data = new_embeddings.weight.data
+    old_embeddings.num_embeddings = new_embeddings.weight.data.shape[0]
+    if hasattr(old_embeddings,
+               "padding_idx") and old_embeddings.padding_idx is not None:
+        if (new_num_tokens - 1) < old_embeddings.padding_idx:
+            old_embeddings.padding_idx = None
+    return old_embeddings
+
+
+def _resize_lm_head(old_lm_head, new_num_tokens):
+    # build new lm head
+    old_num_tokens, old_lm_head_dim = old_lm_head.weight.size()
+    new_lm_head_shape = (old_lm_head_dim, new_num_tokens)
+    has_new_lm_head_bias = old_lm_head.bias is not None
+    new_lm_head = nn.Linear(
+        *new_lm_head_shape,
+        bias=has_new_lm_head_bias,
+        device=old_lm_head.weight.device,
+        dtype=old_lm_head.weight.dtype,
+    )
+
+    # copy weights and bias
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_lm_head.weight.data[:
+                            num_tokens_to_copy, :] = old_lm_head.weight.data[:
+                                                                             num_tokens_to_copy, :]
+    old_lm_head.weight.data = new_lm_head.weight.data
+
+    if has_new_lm_head_bias:
+        new_lm_head.bias.data[:
+                              num_tokens_to_copy] = old_lm_head.bias.data[:
+                                                                          num_tokens_to_copy]
+        old_lm_head.bias.data = new_lm_head.bias.data
+    return old_lm_head
+
+
+def _resize_token_embeddings(llm, new_num_tokens: int):
+    _resize_embeds(llm.model.embed_tokens, new_num_tokens)
+    if hasattr(llm, "lm_head"):
+        _resize_lm_head(llm.lm_head, new_num_tokens)
+
+
 def init_llm(
     llm_path: str,
     model_config: ModelConfig[PretrainedConfig],
@@ -567,29 +624,9 @@ def init_llm(
     *args,
     **kwargs,
 ) -> PreTrainedModel:
-    # Pre-run to resize vocab embedding (see: https://github.com/NVlabs/VILA/blob/86e009759a14eee045c669421128d703227da362/llava/model/builder.py#L137)
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     tokenizer = init_tokenizer(llm_path)
-    if llm_cfg.vocab_size != len(tokenizer):
-        warnings.warn(
-            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
-        )
-        # TODO: enable updating the LLM checkpoint automatically
-        # model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
-        #                                                   torch_dtype="auto")
-        # model_hf.resize_token_embeddings(len(tokenizer))
-        # warnings.warn(f"Saving to {llm_path} by overwriting...")
-        # try:
-        #     model_hf.save_pretrained(llm_path)
-        # except (OSError, PermissionError):
-        #     import tempfile
-        #     llm_path = os.path.join(tempfile.gettempdir(), "vila")
-        #     warnings.warn(
-        #         f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
-        #     )
-        #     model_hf.save_pretrained(llm_path)
 
-    # Real run
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     llm_cfg._attn_implementation = attn_implementation
     llm_cfg.model_max_length = model_max_length
@@ -605,6 +642,12 @@ def init_llm(
     llm_model_config = copy.deepcopy(model_config)
     llm_model_config.pretrained_config = llm_cfg
     llm = AutoModelForCausalLM.from_config(llm_model_config)
+    if llm_cfg.vocab_size != len(tokenizer):
+        warnings.warn(
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
+        )
+        _resize_token_embeddings(llm, len(tokenizer))
+        llm_cfg.vocab_size = len(tokenizer)
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
     return tokenizer, llm, llm_path, llm_cfg.vocab_size
