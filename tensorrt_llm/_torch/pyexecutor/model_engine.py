@@ -614,9 +614,11 @@ class PyTorchModelEngine(ModelEngine):
         # Set the dummy request ids starting at (uint64 max value - padding_size - 1) to avoid conflict with
         # active request IDs
         max_req_id = MAX_UINT64 - padding_size - 1
+        max_num_draft_tokens = self.spec_config.max_draft_tokens if self.spec_config is not None else 0
         generation_requests = kv_cache_manager.add_dummy_requests(
-            [max_req_id + i + 1 for i in range(padding_size)], is_gen=True)
-
+            [max_req_id + i + 1 for i in range(padding_size)],
+            is_gen=True,
+            max_num_draft_tokens=max_num_draft_tokens)
         scheduled_requests.generation_requests.extend(generation_requests)
         return generation_requests
 
