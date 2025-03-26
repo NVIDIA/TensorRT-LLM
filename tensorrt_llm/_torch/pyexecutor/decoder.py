@@ -534,14 +534,10 @@ class TRTLLMDecoder(Decoder):
                 self.store["buffer_manager"], self.store["cuda_stream"])
             decoder_finish_event = self.algs.decoder.forward_async(
                 self.decoding_output, decoding_input)
-            self.algs.update_decoder_buffers(self.model_config,
-                                             self.store["decoder_buffers"],
-                                             self.store["buffer_manager"],
-                                             self.algs.decoder, False,
-                                             decoder_finish_event)
-
-            self.decoder_event = torch.cuda.Event()
-            self.decoder_event.record()
+            self.decoder_event = self.algs.update_decoder_buffers(
+                self.model_config, self.store["decoder_buffers"],
+                self.store["buffer_manager"], self.algs.decoder, False,
+                decoder_finish_event)
 
     def update_requests(self, scheduled_requests: ScheduledRequests):
         self.decoder_event.synchronize()
