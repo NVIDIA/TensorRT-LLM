@@ -694,9 +694,9 @@ class SlotManager:
         return slot
 
     def remove_slot(self, request_id: int):
-        assert request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request_id)
-        self.free_slots.add(slot)
+        if request_id in self.slot_mapping:
+            slot = self.slot_mapping.pop(request_id)
+            self.free_slots.add(slot)
 
 
 class ResourceManager:

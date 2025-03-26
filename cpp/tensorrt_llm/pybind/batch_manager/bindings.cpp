@@ -411,10 +411,6 @@ void initBindings(pybind11::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
 
-    py::bind_vector<tb::RequestVector>(m, "RequestVector");
-    // Note: Making an opaque binding out of RequestList would impact any std::vector<unsigned> conversion
-    // PybindUtils::bindList<tb::RequestList>(m, "RequestList");
-
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
             py::arg("max_sequence_idle_microseconds"))
