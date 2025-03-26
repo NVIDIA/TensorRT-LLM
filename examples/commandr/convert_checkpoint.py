@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,7 +9,7 @@ import tensorrt_llm
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import CohereForCausalLM
+from tensorrt_llm.models import CohereForCausalLM, Cohere2ForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -125,19 +126,51 @@ def convert_and_save_hf(args):
     override_fields.update(args_to_build_options(args))
 
     quant_config = args_to_quant_config(args)
+    
+    # Make sure we create the correct model architecture
+    config_path = os.path.join(model_dir, 'config.json')
+
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        architectures = config.get('architectures', [])
+        if not architectures:
+            raise ValueError(f"No 'architectures' field found in {config_path}")
+
+        architecture = architectures[0]
+
+        if architecture != "CohereForCausalLM" and architecture != "Cohere2ForCausalLM":
+            raise ValueError(f"Unsupported model architecture: {architecture}.")
+
+        logger.info(f"Identified model architecture: {architecture}")
+    except FileNotFoundError:
+        raise ValueError(f"Config file not found: {config_path}")
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON in config file: {config_path}")
 
     def convert_and_save_rank(args, rank):
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
-        cohere = CohereForCausalLM.from_hugging_face(
-            model_dir,
-            args.dtype,
-            mapping=mapping,
-            quant_config=quant_config,
-            **override_fields,
-        )
+        if architecture == "Cohere2ForCausalLM":
+            cohere = Cohere2ForCausalLM.from_hugging_face(
+                model_dir,
+                args.dtype,
+                mapping=mapping,
+                quant_config=quant_config,
+                **override_fields,
+            )
+        else:
+            cohere = CohereForCausalLM.from_hugging_face(
+                model_dir,
+                args.dtype,
+                mapping=mapping,
+                quant_config=quant_config,
+                **override_fields,
+            )
+
         cohere.save_checkpoint(args.output_dir, save_config=(rank == 0))
         del cohere
 
