@@ -377,31 +377,41 @@ class MTPWorker(nn.Module):
                                       spec_metadata=spec_metadata,
                                       attn_metadata=attn_metadata)
 
-        # Predict draft tokens
+        # prepare draft layer inputs
+        draft_inputs = self.prepare_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            spec_metadata=spec_metadata,
+            attn_metadata=attn_metadata)
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        # Run MTP layers to predict draft tokens
         next_draft_tokens = []
-        # will not be used in the first MTP, just a placeholder to avoid Nonetype
-        previous_layer_draft_tokens = torch.empty(1,
-                                                  dtype=torch.int,
-                                                  device='cpu')
-        for mtp_layer_idx, mtp_layer in enumerate(mtp_layers):
-            draft_inputs = self.prepare_drafter_inputs(
-                mtp_layer_idx=mtp_layer_idx,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                previous_layer_hidden_states=hidden_states,
-                previous_layer_draft_tokens=previous_layer_draft_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                spec_metadata=spec_metadata,
-                attn_metadata=attn_metadata)
+        for _, mtp_layer in enumerate(mtp_layers):
             hidden_states = mtp_layer(embed_tokens=embed_tokens, **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, lm_head,
                                            attn_metadata).float()
-            previous_layer_draft_tokens = self.draft_sampler(logits)
-            next_draft_tokens.append(previous_layer_draft_tokens)
+            new_draft_token = self.draft_sampler(logits)
+            next_draft_tokens.append(new_draft_token)
 
             input_ids = draft_inputs["input_ids"]
-            position_ids = draft_inputs["position_ids"]
-            attn_metadata = draft_inputs["attn_metadata"]
+            new_input_ids = torch.empty_like(input_ids,
+                                             dtype=torch.int32,
+                                             device="cuda")
+            new_input_ids[:-1].copy_(input_ids[1:])
+            new_input_ids[last_tokens_idx] = new_draft_token
+            draft_inputs = {
+                "input_ids": new_input_ids,
+                "position_ids": draft_inputs["position_ids"],
+                "hidden_states": hidden_states,
+                "attn_metadata": draft_inputs["attn_metadata"],
+                "spec_metadata": draft_inputs["spec_metadata"],
+            }
+
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
         if attn_metadata.is_cuda_graph and attn_metadata is not None:
             self.restore_attn_metadata(attn_metadata=attn_metadata)
@@ -867,11 +877,10 @@ class MTPWorker(nn.Module):
 
     def prepare_drafter_inputs(
         self,
-        mtp_layer_idx: int,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        previous_layer_hidden_states: torch.Tensor,
-        previous_layer_draft_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
         spec_metadata: MTPSpecMetadata,
         attn_metadata: AttentionMetadata,
@@ -880,26 +889,22 @@ class MTPWorker(nn.Module):
         Parepare the input of the draft model.
 
         Args:
-            mtp_layer_idx: int
-                The index number of the current MTP layer.
-
             input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
-                When mtp_layer_idx == 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
-                When mtp_layer_idx > 0: num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
+                num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
 
             position_ids: torch.IntTensor
                 [1][num_tokens]
                 The position id of all requests. Flatten.
 
-            previous_layer_hidden_states: torch.Tensor
+            hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
                 Target model's hidden states.
 
-            previous_layer_draft_tokens: torch.Tensor
-                [batch_size]
-                Privous layer's draft tokens.
+            accepted_tokens: torch.Tensor
+                [batch_size, max_draft_tokens + 1]
+                Accepted token ids. Flattened.
 
             num_accepted_tokens: torch.Tensor
                 [batch_size]
@@ -932,6 +937,7 @@ class MTPWorker(nn.Module):
         '''
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_gens = batch_size - num_contexts
         mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
         mtp_past_tokens_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool
@@ -939,100 +945,58 @@ class MTPWorker(nn.Module):
 
         if self.is_thop:
             # Temporary buffer
-            hidden_size = previous_layer_hidden_states.shape[-1]
+            hidden_size = hidden_states.shape[-1]
 
             # generation requests' golden tokens
-            num_tokens = input_ids.shape[
-                0] - num_gens if mtp_layer_idx == 0 else input_ids.shape[0]
+            num_tokens = input_ids.shape[0] - num_gens
             return_input_ids = torch.empty(num_tokens,
                                            dtype=torch.int,
                                            device="cuda")
 
-            if (mtp_layer_idx == 0):
-                return_hidden_states = torch.empty(
-                    (num_tokens, hidden_size),
-                    dtype=previous_layer_hidden_states.dtype,
-                    device="cuda")
-            else:
-                return_hidden_states = torch.empty(
-                    1, dtype=previous_layer_hidden_states.dtype,
-                    device="cuda")  # Useless, placeholder
+            return_hidden_states = torch.empty((num_tokens, hidden_size),
+                                               dtype=hidden_states.dtype,
+                                               device="cuda")
 
             (return_input_ids, return_hidden_states
              ) = torch.ops.trtllm.mtp_prepare_drafter_inputs_op(
                  input_ids, attn_metadata.seq_lens_cuda,
                  spec_metadata.mtp_hidden_states_ptrs,
-                 spec_metadata.mtp_past_tokens_ptrs,
-                 previous_layer_hidden_states, previous_layer_draft_tokens,
-                 return_input_ids, return_hidden_states, mtp_num_modules,
-                 mtp_layer_idx, batch_size, num_contexts, hidden_size)
+                 spec_metadata.mtp_past_tokens_ptrs, hidden_states, None,
+                 return_input_ids, return_hidden_states, mtp_num_modules, 0,
+                 batch_size, num_contexts, hidden_size)
 
         else:
             return_input_ids_list = []
             return_hidden_states_list = []
-            if mtp_layer_idx == 0:  # The first MTP layer
-                input_ids_offset = 0
-                for bix in range(batch_size):
-                    slot_id_cuda = spec_metadata.slot_ids[bix]
-                    cur_seq_len = attn_metadata.seq_lens_cuda[bix]
-                    past_tokens = torch.index_select(mtp_past_tokens_pool, 0,
-                                                     slot_id_cuda).squeeze(0)
-                    past_hidden_states = torch.index_select(
-                        mtp_past_hidden_states_pool, 0, slot_id_cuda).squeeze(0)
+            # Calculate cumulative sequence lengths for indexing
+            last_tokens_idx = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            # context
+            if num_contexts > 0:
+                hidden_states_ctx = hidden_states[:num_ctx_tokens, :]
+                input_prompt_ids = input_ids[:num_ctx_tokens]
+                input_ids_ctx = torch.empty_like(input_prompt_ids,
+                                                 dtype=torch.int32,
+                                                 device="cuda")
+                input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
+                input_ids_ctx[last_tokens_idx[:num_contexts]] = \
+                    accepted_tokens[:num_contexts, 0]
+                return_input_ids_list.append(input_ids_ctx)
+                return_hidden_states_list.append(hidden_states_ctx)
+            # generation
+            if num_gens > 0:
+                slot_ids = spec_metadata.slot_ids[num_ctx_tokens:batch_size]
+                input_ids_gen = mtp_past_tokens_pool[slot_ids].flatten(0, 1)
+                hidden_states_gen = mtp_past_hidden_states_pool[
+                    slot_ids].flatten(0, 1)
+                return_input_ids_list.append(input_ids_gen)
+                return_hidden_states_list.append(hidden_states_gen)
+            # Concatenate into continuous buffers
+            return_input_ids = torch.concat(return_input_ids_list, dim=0)
+            return_hidden_states = torch.concat(return_hidden_states_list,
+                                                dim=0)
 
-                    if bix < num_contexts:
-                        # Context request
-                        # MTP past tokens
-                        # cuda Graph should not run this part since has context request
-                        prompt_tokens = input_ids[
-                            input_ids_offset:input_ids_offset + cur_seq_len]
-                        cat_tensor = torch.cat(
-                            (prompt_tokens[1:], past_tokens[-1:]), dim=0)
-                        return_input_ids_list.append(cat_tensor)
-
-                        # MTP past hidden states
-                        prompt_hidden_states = previous_layer_hidden_states[
-                            input_ids_offset:input_ids_offset + cur_seq_len]
-                        return_hidden_states_list.append(prompt_hidden_states)
-                    else:
-                        # Generation request
-                        # Directly append
-                        return_input_ids_list.append(past_tokens)
-                        return_hidden_states_list.append(past_hidden_states)
-
-                    # Update offset
-                    input_ids_offset += cur_seq_len
-
-                    # Concat into a continuous buffer
-                return_input_ids = torch.cat(return_input_ids_list, dim=0)
-                return_hidden_states = torch.cat(return_hidden_states_list,
-                                                 dim=0)
-            else:
-                # this else part should be CUDA Graph supported
-                input_ids_offset = 0
-                for bix in range(batch_size):
-                    # For the generation request, the 'cur_seq_len' already been update to 'num_nextn_predict_layers'.
-                    cur_seq_len = attn_metadata.seq_lens_cuda[bix]
-
-                    # The 'input_ids' come from the prvious layer
-                    previous_layer_tokens = input_ids[
-                        input_ids_offset:input_ids_offset + cur_seq_len]
-
-                    # MTP past tokens
-                    previous_draft_tokens = previous_layer_draft_tokens[bix:(
-                        bix + 1)]
-                    cat_tensor = torch.cat(
-                        (previous_layer_tokens, previous_draft_tokens), dim=0)
-                    return_input_ids_list.append(cat_tensor[1:])
-
-                    # Update offset
-                    input_ids_offset += cur_seq_len
-
-                return_input_ids = torch.cat(return_input_ids_list, dim=0)
-                # Directly use previous_layer_hidden_states as this layer's input hidden states
-                return_hidden_states = previous_layer_hidden_states
-
-        if mtp_layer_idx == 0 and attn_metadata is not None:
+        if attn_metadata is not None:
             self.change_attn_metadata(num_accepted_tokens, attn_metadata)
 
         return {
@@ -1208,11 +1172,11 @@ class MTPEagleWorker(MTPWorker):
         num_contexts = attn_metadata.num_contexts
 
         # context
-        input_ctx_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_ctx_ids,
+        input_prompt_ids = input_ids[:attn_metadata.num_ctx_tokens]
+        input_ids_ctx = torch.empty_like(input_prompt_ids,
                                          dtype=torch.int32,
                                          device="cuda")
-        input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
+        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
         input_ids_ctx[
             last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
 
