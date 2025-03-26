@@ -140,7 +140,7 @@ class Linear(nn.Module):
                  is_expert: bool = False,
                  skip_create_weights: bool = False,
                  use_custom_cublas_mm: bool = False):
-        from tensorrt_llm._torch.distributed import AllReduce
+        from ..distributed import AllReduce
 
         super().__init__()
         self.has_bias = bias
@@ -379,7 +379,7 @@ class Linear(nn.Module):
             *,
             all_reduce_params: Optional[AllReduceParams] = None
     ) -> torch.Tensor:
-        from tensorrt_llm._torch.distributed import allgather
+        from ..distributed import allgather
 
         if self.tp_mode == TensorParallelMode.ROW:
             bias = None if (self.tp_rank > 0) else self.bias

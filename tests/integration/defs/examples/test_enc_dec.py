@@ -330,10 +330,8 @@ def test_llm_enc_dec_mmlu(llm_venv, cmodel_dir, engine_dir, data_type,
 
     mmlu_cmd = [
         f"{enc_dec_example_root}/../mmlu.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_ckpt_path}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_ckpt_path}",
         "--test_trt_llm",
         f"--engine_dir={enc_dec_engine_dir}",
         "--kv_cache_free_gpu_memory_fraction=0.45",

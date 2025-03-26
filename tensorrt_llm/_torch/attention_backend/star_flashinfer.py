@@ -1,9 +1,17 @@
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+import flashinfer
 import numpy as np
 import torch
 
+from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.models.modeling_utils import QuantConfig
+
 from ..distributed import allgather
 from ..modules.linear import ParallelConfig
-from .flashinfer import *
+from .flashinfer import FlashInferAttentionMetadata, PlanParams
+from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
 from .vanilla import VanillaAttention
 
 

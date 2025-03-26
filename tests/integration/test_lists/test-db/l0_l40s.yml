@@ -33,14 +33,14 @@ l0_l40s:
   - unittest/attention/test_gpt_attention.py -k "xqa_generic"
   - unittest/quantization # 18 mins
   - unittest/functional # 37 mins
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8_rowwise
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_accuracy.py::TestPhi3Small128kInstruct::test_auto_dtype
   - examples/test_llama.py::test_llm_llama_v2_lora_1gpu[chinese-llama-2-lora-13b-llama-v2-13b-hf-lora_fp16-base_fp16]
   - examples/test_llama.py::test_llm_llama_v3_dora_1gpu[commonsense-llama-v3-8b-dora-r32-llama-v3-8b-hf-base_fp16]
   - examples/test_llama.py::test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table[llama-7b]
-  - examples/test_llama.py::test_llm_llama_v2_1gpu_fp8_summary_and_mmlu[llama-v2-7b-hf-enable_fp8_paged_fmha-disable_mmlu_test]
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-small-128k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
   - examples/test_phi.py::test_llm_phi_lora_1gpu[Phi-3-mini-4k-instruct-ru-lora-Phi-3-mini-4k-instruct-lora_fp16-base_fp16]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
@@ -70,8 +70,9 @@ l0_l40s:
   tests:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[phi-2-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
-  - examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]
+  - accuracy/test_accuracy.py::TestPhi2::test_auto_dtype
+  - accuracy/test_accuracy.py::TestPhi3Small8kInstruct::test_auto_dtype
+  - accuracy/test_accuracy.py::TestQwen1_5MoeA2_7BChat::test_weight_only
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] # 10 mins
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1]
   - examples/test_multimodal.py::test_llm_multimodal_general[cogvlm-chat-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
@@ -91,5 +92,4 @@ l0_l40s:
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-2b-instruct]
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-v3-8b-instruct-hf]
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-small-8k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
   - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora]

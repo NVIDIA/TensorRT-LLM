@@ -2191,8 +2191,8 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100,
-            "FP8 FMHA cannot be enabled except on Ada or Hopper or Blackwell Arch.");
+        TLLM_CHECK_WITH_INFO(
+            mSM == 89 || mSM == 90 || mSM == 100, "FP8 FMHA can only be enabled on sm_89, sm_90 or sm_100.");
     }
 
     // Check requirements for FP4 output.

@@ -1,12 +1,12 @@
 
-## TensorRT-LLM Contribution Rules
+# TensorRT-LLM Contribution Rules
 
-#### Issue Tracking
+## Issue Tracking
 
 * All enhancement, bugfix, or change requests must begin with the creation of a [TensorRT-LLM Issue Request](https://github.com/nvidia/TensorRT-LLM/issues).
   * The issue request must be reviewed by TensorRT-LLM engineers and approved prior to code review.
 
-#### Coding Guidelines
+## Coding Guidelines
 
 * Coding style for TensorRT-LLM can be found [in this document](CODING_GUIDELINES.md).
 
@@ -31,8 +31,52 @@
   * Avoid committing commented-out code.
   * Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.
 
-#### Pull Requests
+## Coding Style
 
+We use `pre-commit` for automatic code formatting and validation. Install the `pre-commit` package in your local
+Python environment.
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+`pre-commit` will be triggered in every commit.
+
+```bash
+git commit -m "fix"
+
+isort....................................................................Passed
+CRLF end-lines remover...................................................Passed
+yapf.....................................................................Failed
+- hook id: yapf
+- files were modified by this hook
+check for added large files..............................................Passed
+check for merge conflicts................................................Passed
+check for broken symlinks............................(no files to check)Skipped
+detect private key.......................................................Passed
+fix end of files.........................................................Passed
+check yaml...............................................................Passed
+trim trailing whitespace.................................................Passed
+check toml...............................................................Passed
+mixed line ending........................................................Passed
+debug statements (python)................................................Passed
+check json...........................................(no files to check)Skipped
+autoflake................................................................Passed
+clang-format.............................................................Passed
+cmake-format.............................................................Passed
+codespell................................................................Passed
+ruff.....................................................................Passed
+ruff-format..............................................................Passed
+mdformat.................................................................Passed
+```
+
+If any files were modified by this hook, you will need to stage and commit them again.
+
+
+## Pull Requests
+
+### Developer workflow
 Developer workflow for code contributions is as follows:
 
 1. Developers must first [fork](https://help.github.com/en/articles/fork-a-repo) the [upstream](https://github.com/nvidia/TensorRT-LLM) TensorRT-LLM OSS repository.
@@ -53,8 +97,29 @@ Developer workflow for code contributions is as follows:
   * Once changes are approved, CI will be launched to validate the change. When CI passes, the reviewer will merge the PR.
   * If CI reports any failures, it's up to the requester to fix any CI failures before requesting another review.
 
+### PR Submission Policies
 
-#### Tests and Code Review for Protected APIs
+The naming of the merge requests in TensorRT-LLM follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If the PR includes an API change that might break user code/API usage, consider adding "BREAKING CHANGE" in the title so that reviewers know what to expect. Additionally, if the PR is not related to any bug and task, consider using "chore" or None as the placeholder.
+
+Good PR Titles Examples:
+* feat: Add support for starcoder-v2 FP8 base + FP16/BF16 LoRA
+* BREAKING CHANGE: Set default max batch size to 2048
+* chore: Remove version from plugins .so
+* None: Stringized enums for better error msgs
+* fix https://github.com/NVIDIA/TensorRT-LLM/issues/700: a Memory leak issue in C++ runtime
+
+This is important for tracking and collecting what has been submitted to which release and makes it easier for others to track the bugs or tasks. It could also be helpful when collecting GitHub publish announcement.
+
+In the PR description, please consider addressing these points:
+
+* Background or motivation for the PR: Why is the change necessary?
+* Summarize the changes in one paragraph, if possible.
+* If the PR is large, explain why it cannot be broken down into multiple PRs.
+* Potential performance or functional impacts of the changes. If there are risks, please inform the reviewers.
+* Link to the related PRs.
+
+
+## Tests and Code Review for Protected APIs
 
 Some APIs are committed to be stable; any breaking changes to these APIs require careful design and review.
 
@@ -75,7 +140,7 @@ tests/api_stability/test_api_stability.py:241: AssertionError
 As the error message suggests, please ask for reviews from the code owners of the corresponding APIs.
 
 
-#### Signing Your Work
+## Signing Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license. Signing off your commit means you accept the terms of the [Developer Certificate of Origin (DCO)](https://developercertificate.org/).
 

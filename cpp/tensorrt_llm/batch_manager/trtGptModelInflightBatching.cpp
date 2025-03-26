@@ -534,6 +534,12 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
             setMaxInputLen(getMaxSequenceLen() - 1);
             TLLM_LOG_WARNING("maxInputLen is reduced to %d", getMaxInputLen());
         }
+
+        // createBuffers depends on:
+        // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
+        // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
+        // if there are different window values for cross+self etc. in encoder+decoder scenario...
+        createBuffers(mDecodingConfig, mAdditionalOutputNames);
     }
 }
 
@@ -575,8 +581,10 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         adjustMaxAttentionWindow(blocksInPrimaryPool, tokensPerBlock);
     }
 
-    auto const maxKvCacheLength
-        = kvCacheType == KvCacheType::kSELF ? getMaxAttentionWindow() : mModelConfig.getMaxEncoderLen();
+    auto const& maxAttentionWindowVec = kvCacheType == KvCacheType::kSELF
+        ? getMaxAttentionWindowVec()
+        : std::vector<SizeType32>{mModelConfig.getMaxEncoderLen()};
+
     // Only needed when sliding window attention + paged context fmha are used together.
     // In that case, a temporary kv cache buffer with maximum chunk size (maxNumTokens) is needed.
     // TODO: There are several things that can be improved later.
@@ -599,7 +607,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const enableBlockReuse = kvCacheType == KvCacheType::kSELF ? kvCacheConfig.enableBlockReuse : false;
 
     auto kvCacheManager = std::make_shared<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxKvCacheLength,
+        blocksInPrimaryPool, blocksInSecondaryPool, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec,
         temporaryKvCacheLength, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
         kvCacheConfig.onboardBlocks, kvCacheType, kvCacheConfig.secondaryOffloadMinPriority,
         kvCacheConfig.eventBufferMaxSize > 0

@@ -990,19 +990,18 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
     threshold_score = 21
     mmlu_score = None
     if "0.5B" in llm_qwen_model_root:
-        mmlu_score = 0.460
+        mmlu_score = 46.0
     elif "1.5B" in llm_qwen_model_root:
-        mmlu_score = 0.585
+        mmlu_score = 58.5
     elif "7B" in llm_qwen_model_root:
-        mmlu_score = 0.715
+        mmlu_score = 71.5
     # Install custom jinja to overcome ImportError from transformers library.
     # ImportError: apply_chat_template requires jinja2>=3.1.0 to be installed.
     llm_venv.run_cmd(['-m', 'pip', 'install', 'jinja2==3.1.0'])
     # Run MMLU for Qwen 2.5 models.
     if '2.5' in llm_qwen_model_root:
         summary_cmd = [
-            f"{qwen_example_root}/../mmlu.py",
-            "--test_trt_llm",
+            f"{qwen_example_root}/../mmlu_llmapi.py",
             f"--hf_model_dir={llm_qwen_model_root}",
             f"--engine_dir={engine_dir}",
             f"--data_dir={llm_datasets_root}/mmlu",

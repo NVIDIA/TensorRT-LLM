@@ -103,14 +103,12 @@ def test_llm_mixtral_4gpus_fp8_mmlu_llmapi(
     print("Run MMLU test")
     mmlu_cmd = [
         f"{llmapi_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=tensorrt",
         "--check_accuracy",
         "--tp_size=4",
-        f"--accuracy_threshold=0.695",
+        "--accuracy_threshold=69.5",
     ]
 
     venv_check_call(llm_venv, mmlu_cmd)
@@ -186,13 +184,10 @@ def test_llm_mixtral_fp8_4gpus_summary(llama_example_root,
     mmlu_cmd = generate_mmlu_cmd(llama_example_root,
                                  tokenizer_dir=llm_mixtral_model_root,
                                  engine_dir=engine_dir,
-                                 accuracy_threshold=0.70,
-                                 num_beams=num_beams,
+                                 accuracy_threshold=70,
                                  data_dir=f"{llm_datasets_root}/mmlu")
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        mmlu_cmd)
+    venv_check_call(llm_venv, mmlu_cmd)
 
 
 @pytest.mark.skip_less_device(4)
@@ -254,13 +249,9 @@ def test_llm_mixtral_fp8_managed_weights_4gpus_summary(llama_example_root,
     mmlu_cmd = generate_mmlu_cmd(llama_example_root,
                                  tokenizer_dir=llm_mixtral_model_root,
                                  engine_dir=engine_dir,
-                                 accuracy_threshold=0.70,
-                                 num_beams=1,
+                                 accuracy_threshold=70,
                                  data_dir=f"{llm_datasets_root}/mmlu")
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        mmlu_cmd)
+    venv_check_call(llm_venv, mmlu_cmd)
 
 
 @pytest.mark.skip_less_device(4)
@@ -860,14 +851,11 @@ def test_llm_mixtral_1gpu_fp4(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     print("Run MMLU test")
-    acc_thres = 0.680
+    acc_thres = 68.0
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{llm_mixtral_model_root}",
-        "--test_trt_llm",
+        f"{llama_example_root}/../mmlu_llmapi.py",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={llm_mixtral_model_root}",
         f"--engine_dir={engine_dir}",
         "--check_accuracy",
         f"--accuracy_threshold={acc_thres}",
@@ -890,13 +878,11 @@ def test_llm_mixtral_1gpu_fp4_llmapi(
     print("Run MMLU test")
     mmlu_cmd = [
         f"{llmapi_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=tensorrt",
         "--check_accuracy",
-        f"--accuracy_threshold=0.680",
+        f"--accuracy_threshold=68.0",
     ]
 
     venv_check_call(llm_venv, mmlu_cmd)

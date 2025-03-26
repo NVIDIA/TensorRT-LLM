@@ -128,6 +128,9 @@ class MPIDist(Distributed):
     def tp_allgather(self, obj):
         return self.tp_comm.allgather(obj)
 
+    def tp_gather(self, obj):
+        return self.tp_comm.gather(obj)
+
     def tp_broadcast(self, obj, root=0):
         return self.tp_comm.bcast(obj, root)
 

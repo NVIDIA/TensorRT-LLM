@@ -26,15 +26,13 @@ def test_llm_llama_1gpu(
 
     print("Run MMLU test")
     accuracy_map = {
-        'llama-3.1-8b': 0.61,
+        'llama-3.1-8b': 61,
     }
     acc_thres = accuracy_map[model_name]
     mmlu_cmd = [
         f"{llama_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=pytorch",
         "--check_accuracy",
         "--enable_chunked_prefill",
@@ -72,18 +70,17 @@ def test_llm_deepseek_1gpu(
 
     print("Run MMLU test")
     accuracy_map = {
-        'deepseek-v3-lite': 0.68,
+        'deepseek-v3-lite': 68,
     }
     acc_thres = accuracy_map[model_name]
     mmlu_cmd = [
         f"{llama_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=pytorch",
         "--check_accuracy",
         "--enable_overlap_scheduler",
+        "--kv_cache_free_gpu_memory_fraction=0.8",
         f"--accuracy_threshold={acc_thres}",
     ]
 
@@ -107,16 +104,14 @@ def test_mmlu_llmapi_4gpus(llm_venv, llama_example_root, mmlu_dataset_root,
 
     print(f"Run MMLU test on {model_name}.")
     accuracy_map = {
-        'Llama-3.3-70B-Instruct-fp8': 0.804,
-        'Llama-3.3-70B-Instruct-fp4': 0.785,
+        'Llama-3.3-70B-Instruct-fp8': 80.4,
+        'Llama-3.3-70B-Instruct-fp4': 78.5,
     }
     acc_thres = accuracy_map[model_name]
     mmlu_cmd = [
         f"{llama_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=pytorch",
         "--check_accuracy",
         "--enable_chunked_prefill",
@@ -144,16 +139,14 @@ def test_mmlu_llmapi_2gpus(llm_venv, llama_example_root, mmlu_dataset_root,
 
     print(f"Run MMLU test on {model_name}.")
     accuracy_map = {
-        'Mixtral-8x7B-Instruct-v0.1-fp8': 0.679,
-        'Mixtral-8x7B-Instruct-v0.1-fp4': 0.669,
+        'Mixtral-8x7B-Instruct-v0.1-fp8': 67.9,
+        'Mixtral-8x7B-Instruct-v0.1-fp4': 66.9,
     }
     acc_thres = accuracy_map[model_name]
     mmlu_cmd = [
         f"{llama_example_root}/../mmlu_llmapi.py",
-        "--data_dir",
-        f"{mmlu_dataset_root}",
-        "--hf_model_dir",
-        f"{model_dir}",
+        f"--data_dir={mmlu_dataset_root}",
+        f"--hf_model_dir={model_dir}",
         "--backend=pytorch",
         "--check_accuracy",
         "--enable_chunked_prefill",

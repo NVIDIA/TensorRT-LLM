@@ -17,6 +17,13 @@ import re
 
 import pandas as pd
 
+metric_regex = {
+    "rouge1": r"(?<=rouge1 : )\d+\.\d+",
+    "perplexity": r"(?<=Per-token perplexity: )\d+\.\d+",
+    "mmlu": r"(?<=MMLU weighted average accuracy: )\d+\.\d+",
+    "passkey": r"(?<=passkey accuracy: )\d+\.\d+"
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log_file", type=str, required=True)
@@ -28,24 +35,28 @@ if __name__ == "__main__":
 
     test_cases = re.search(r"(?<=items in this shard: ).+", log).group()
     test_cases = test_cases.split(", ")
-    test_case_to_score = {case: None for case in test_cases}
+    data = [{} for _ in test_cases]
 
     log = log.split("\n")
     i = -1
     for line in log:
         if i + 1 < len(test_cases) and line.startswith(test_cases[i + 1]):
+            # Advance to next test case
             i += 1
             continue
-        if test_case_to_score[test_cases[i]] is not None:
+        if i < 0:
             continue
-        matched = re.search(r"(?<=rouge1 : )\d+\.\d+", line)
-        if matched:
-            test_case_to_score[test_cases[i]] = float(matched.group())
-            if i >= len(test_cases):
-                break
 
-    test_case_to_score = pd.Series(test_case_to_score)
-    print(test_case_to_score)
+        entry = data[i]
+        for metric, regex in metric_regex.items():
+            if metric in entry:
+                continue
+            matched = re.search(regex, line)
+            if matched:
+                entry[metric] = float(matched.group())
+
+    df = pd.DataFrame(data, index=test_cases)
+    print(df)
 
     if args.output_file:
-        test_case_to_score.to_csv(args.output_file)
+        df.to_csv(args.output_file)

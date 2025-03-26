@@ -99,7 +99,7 @@ def parse_arguments(args=None):
     )  # noqa
     parser.add_argument('--tensorrt_llm_accuracy_threshold',
                         type=float,
-                        default=0.99)
+                        default=99)
     parser = add_common_args(parser)
 
     return parser.parse_args(args=args)
@@ -313,12 +313,13 @@ def main(args):
     profiler.stop('Evaluation')
 
     if runtime_rank == 0:
-        logger.info("Compute the score")
-        acc = compute_scores(preds, args.task)
         logger.info(
             f'Evaluation takes: {profiler.elapsed_time_in_sec("Evaluation")} sec.'
         )
-        logger.info(f"accuracy of {len(preds)} examples: {acc}")
+        logger.info("Compute the score")
+        acc = compute_scores(preds, args.task) * 100
+        logger.info(f"{args.task} accuracy: {acc:.2f} ({len(preds)})")
+
         if args.tensorrt_llm_accuracy_threshold is not None:
             assert acc >= args.tensorrt_llm_accuracy_threshold, f"acc ({acc}) < tensorrt_llm_accuracy_threshold ({args.tensorrt_llm_accuracy_threshold})"
 

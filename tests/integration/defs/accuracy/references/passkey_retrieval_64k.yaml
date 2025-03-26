@@ -1,0 +1,4 @@
+meta-llama/Llama-3.1-8B:
+  - accuracy: 99
+  - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+    accuracy: 99

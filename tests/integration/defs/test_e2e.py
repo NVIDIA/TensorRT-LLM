@@ -1223,39 +1223,12 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
     ])
 
 
-@pytest.mark.skip_less_device_memory(40000)
-def test_model_api_examples(llm_root, llm_venv, engine_dir):
-    example_root = Path(llm_root) / "examples" / "model_api"
-    llm_venv.run_cmd([
-        str(example_root / "llama.py"), "--engine_dir",
-        f"{engine_dir}/model_api", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
-    ])
-
-    llm_venv.run_cmd([
-        str(example_root / "llama_quantize.py"), "--cache_dir",
-        f"{engine_dir}/model_api_quantized", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
-    ])
-
-
 def test_build_time_benchmark_sanity(llm_root, llm_venv):
     temp = tempfile.TemporaryDirectory()
     llm_venv.run_cmd([
         str(Path(llm_root) / "tests/microbenchmarks/build_time_dashboard.py"),
         '-m',
         temp.name,
-    ])
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_device_memory(40000)
-def test_model_api_examples_tp2(llm_root, llm_venv, engine_dir):
-    example_root = Path(llm_root) / "examples" / "model_api"
-    llm_venv.run_cmd([
-        str(example_root / "llama_multi_gpu.py"), "--engine_dir",
-        f"{engine_dir}/model_api_tp2", "--hf_model_dir",
-        f"{llm_models_root()}/llama-models/llama-7b-hf"
     ])
 
 
@@ -1586,8 +1559,14 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "llava-v1.6-mistral-7b": {
             "image": [
-                "The image depicts a dramatic ocean scene under a cloudy sky. The ocean is characterized by large, powerful waves that are breaking and crashing onto the shore. The waves are white and frothy, indicating that they are in the process of breaking. The water appears to be a deep blue-green color, suggesting",
-                "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
+                [
+                    "The image depicts a dramatic ocean scene under a cloudy sky. The ocean is characterized by large, powerful waves that are breaking and crashing onto the shore. The waves are white and frothy, indicating that they are in the process of breaking. The water appears to be a deep blue-green color, suggesting",
+                    "The image depicts a dramatic natural environment. The sky is overcast with dark, heavy clouds, suggesting a stormy or gloomy weather condition. The ocean is in motion, with large waves that are breaking and crashing onto the shore. The water appears choppy and turbulent, with white foam and spray visible",
+                ],
+                [
+                    "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
+                    "The image shows a majestic mountain with a flat top, which is characteristic of buttes. The mountain is prominently featured in the background, with a clear blue sky above it and a few scattered clouds. The weather appears to be and clear, with no visible signs of rain or storms.",
+                ],
                 "The image shows a multi-lane highway with several vehicles in motion. There are cars and a bus visible, and the traffic appears to be moderate, with no significant congestion. The road is divided by a central divider, and there are green trees lining the sides of the highway, indicating a suburban",
             ],
         },

@@ -36,12 +36,16 @@ l0_a30:
   - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-vision-trtllm-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity # 4 mins
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
+  - accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity # 4 mins
+  - accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_medusa_fp8_pre_quantized
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_weight_streaming[0.1]
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-mini-4k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3-mini-128k-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
-  - examples/test_phi.py::test_llm_phi_single_gpu_summary[Phi-3.5-mini-instruct-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_fmha_with_fp32_acc-nb:1]
+  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_accuracy.py::TestPhi3Mini4kInstruct::test_auto_dtype
+  - accuracy/test_accuracy.py::TestPhi3Mini128kInstruct::test_auto_dtype
+  - accuracy/test_accuracy.py::TestPhi3_5MiniInstruct::test_auto_dtype
+  - accuracy/test_accuracy.py::TestQwen2_0_5BInstruct::test_weight_only
+  - accuracy/test_accuracy.py::TestQwen2_5_1_5BInstruct::test_weight_only
   - examples/test_multimodal.py::test_llm_multimodal_general[deplot-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
@@ -49,13 +53,9 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
   - examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] # 5 mins
   - examples/test_llama.py::test_llm_llama_1gpu_batched_beam_search[llama-7b] # 2 mins
-  - examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2-9b-it-other-bfloat16-8]
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-chunked_summarization_long] # 6 mins
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1] # 4 mins
-  - examples/test_medusa.py::test_llm_medusa_fp8_modelOpt_ckpt_1gpu[use_cpp_session-llama3.1-medusa-8b-hf_v0.1-bs1] # 5 mins
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
-  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_0.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]
-  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]
   - examples/test_internlm.py::test_llm_internlm2_7b_1node_1gpu[bfloat16-enable_context_fmha-enable_gemm_plugin-enable_attention_plugin-nb:2] # 5 mins
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min
@@ -98,8 +98,8 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - accuracy/test_accuracy.py::TestLlama7B::test_manage_weights # 2 mins
+  - accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
-  - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
