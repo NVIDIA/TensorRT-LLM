@@ -39,30 +39,30 @@ class UcxConnection : public Connection
 {
 public:
     UcxConnection() = default;
-    explicit UcxConnection(
-        uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager);
-    void sendGID();
+    explicit UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
+        UcxConnectionManager* manager, bool fromRequester);
+    ~UcxConnection();
+    void sendConnectionId(DataContext const& ctx, void const* data, size_t size) const;
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
     friend class UcxConnectionManager;
 
 private:
-    void initializeEndpointTag(int maxTryTimes = 10);
-
-    // a send tag is defined as:
-    // | local port (16 bits) | remote port (16 bits) | truncated request id (16 bits) | UCXComm flags (16 bits) |
-    // a recv tag is defined as:
-    // | remote port (16 bits) | local port (16 bits) | truncated request id (16 bits) | UCXComm flags (16 bits) |
-    ucxx::Tag mSendTag{0};
-    ucxx::Tag mRecvTag{0};
+    uint64_t mSendTagPrefix{0};
+    uint64_t mRecvTagPrefix{0};
 
     mutable std::mutex mMtx;
     mutable std::condition_variable mCv;
     uint64_t mConnectionId;
-    uint64_t mLocalGID;
-    uint64_t mRemoteGID;
+    uint64_t mConnectionIdInPeer;
     std::shared_ptr<ucxx::Endpoint> mEndpoint;
     UcxConnectionManager* mManager;
+    bool mFromRequester;
+
+    bool isFromRequester() const
+    {
+        return mFromRequester;
+    }
 };
 
 } // namespace tensorrt_llm::executor::kv_cache
