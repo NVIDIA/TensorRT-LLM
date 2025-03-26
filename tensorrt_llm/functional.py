@@ -5213,6 +5213,7 @@ def gpt_attention(
     cp_group: List[int] = [0],
     cp_size: int = 1,
     cp_rank: int = 0,
+    num_kv_heads_origin: int = -1,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -5474,6 +5475,9 @@ def gpt_attention(
         skip_attn: Tensor = None,
             A bool tensor on CPU. If it is true, don't run attention plugin, returning directly.
 
+        num_kv_heads_origin: int
+            The origin number of KV heads, without the process of TP
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -5505,6 +5509,9 @@ def gpt_attention(
     else:
         use_logn_scaling = 0
 
+    if num_kv_heads_origin < 1:
+        num_kv_heads_origin = num_kv_heads
+
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5523,6 +5530,9 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
+    num_kv_heads_origin = trt.PluginField(
+        "num_kv_heads_origin", np.array(num_kv_heads_origin, dtype=np.int32),
+        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5714,9 +5724,10 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, attn_logit_softcapping_scale,
-        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
+        num_kv_heads_origin, head_size, unidirectional, q_scaling,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
