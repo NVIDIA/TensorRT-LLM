@@ -122,9 +122,7 @@ public:
         = 0;
 
     //! @brief Disable Lookahead decoding.
-    virtual void disableLookahead(
-        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots)
-        = 0;
+    virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
