@@ -331,10 +331,49 @@ protected:
             std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
             *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
             mConnectionManager = makeUcxConnectionManager();
+            auto commState = mConnectionManager->getCommState();
+            namespace su = tensorrt_llm::executor::serialize_utils;
+
+            if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
+            {
+
+                std::ostringstream oStream;
+                su::serialize(commState, oStream);
+                auto str = oStream.str();
+                std::vector<char> buffer(str.begin(), str.end());
+                int genRank = 1;
+                int64_t bufferSize = buffer.size();
+                TLLM_LOG_DEBUG(
+                    tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d", bufferSize, genRank);
+                tensorrt_llm::mpi::MpiComm::world().send(
+                    &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
+                tensorrt_llm::mpi::MpiComm::world().send(
+                    buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
+                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
+                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
+            }
+            else
+            {
+                int64_t bufferSize;
+                tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+                TLLM_LOG_DEBUG(
+                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
+                std::vector<char> recvBuffer(bufferSize);
+                tensorrt_llm::mpi::MpiComm::world().recv(
+                    recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
+                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
+                std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
+                su::VectorWrapBuf<char> strbuf(recvBuffer);
+                std::istream is(&strbuf);
+                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(
+                    su::deserialize<tensorrt_llm::executor::kv_cache::CommState>(is));
+            }
         }
         else
         {
             mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
+            mContextCommState
+                = std::make_unique<texec::kv_cache::CommState>(texec::kv_cache::CommState{std::vector<int>{0}});
         }
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
@@ -361,7 +400,7 @@ protected:
         // create request with tokens [length, ..., length] (<length> tokens)
         texec::Request request{VecTokens(length, length), maxNewTokens};
         auto state = std::make_unique<texec::DataTransceiverState>();
-        state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
+        state->setCommState(*mContextCommState);
         state->setCacheState(*mCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
         request.setContextPhaseParams(std::move(stats));
@@ -408,6 +447,7 @@ protected:
     std::unique_ptr<DataResponder> mResponder;
     std::unique_ptr<DataRequester> mRequester;
     std::unique_ptr<texec::kv_cache::CacheState> mCacheState;
+    std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::vector<std::future<void>> mFutures;
     std::unique_ptr<texec::kv_cache::ConnectionManager> mConnectionManager;
 };
@@ -714,7 +754,6 @@ protected:
 
             if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
             {
-                // 序列化commState
 
                 std::ostringstream oStream;
                 su::serialize(commState, oStream);
