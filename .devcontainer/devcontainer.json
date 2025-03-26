@@ -3,7 +3,7 @@
     {
       "name": "TRT-LLM clangd Devcontainer",
       "dockerComposeFile": [
-        "../docker-compose.yml"
+        "docker-compose.yml"
       ],
       "service": "tensorrt_llm-dev",
       "remoteUser": "ubuntu",
