@@ -1,46 +1,35 @@
 methods:
   __init__:
-    name: __init__
     parameters:
       calib_batch_size:
         annotation: int
         default: 1
-        name: calib_batch_size
       calib_batches:
         annotation: int
         default: 512
-        name: calib_batches
       calib_dataset:
         annotation: str
         default: cnn_dailymail
-        name: calib_dataset
       calib_max_seq_length:
         annotation: int
         default: 512
-        name: calib_max_seq_length
       device:
         annotation: Literal['cuda', 'cpu']
         default: cuda
-        name: device
       random_seed:
         annotation: int
         default: 1234
-        name: random_seed
       tokenizer_max_seq_length:
         annotation: int
         default: 2048
-        name: tokenizer_max_seq_length
     return_annotation: None
   from_dict:
-    name: from_dict
     parameters:
       config:
         annotation: dict
         default: inspect._empty
-        name: config
     return_annotation: tensorrt_llm.llmapi.llm_utils.CalibConfig
   to_dict:
-    name: to_dict
     parameters: {}
     return_annotation: dict
 properties: {}

@@ -2139,7 +2139,7 @@ __global__ void convertData(Dst* dst, Src const* src, int64_t size, float const*
 
 template <typename T>
 __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize,
-    int64_t partialQHeads, int64_t partialKVHeads, int64_t headSize, int64_t rank)
+    int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank)
 {
     // Do transpose from
     // [partialTokenNum, mNumHeads + 2*mNumKVHeads, headSize]
@@ -2164,12 +2164,12 @@ __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTok
     }
     else if (headIdx < partialQHeads + partialKVHeads)
     {
-        srcHeadIdx = cpSize * partialQHeads + cpIdx * partialKVHeads + (headIdx - partialQHeads);
+        srcHeadIdx = cpSize * partialQHeads + cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads);
     }
     else
     {
-        srcHeadIdx = cpSize * partialQHeads + cpSize * partialKVHeads + cpIdx * partialKVHeads
-            + (headIdx - partialQHeads - partialKVHeads);
+        srcHeadIdx = cpSize * partialQHeads + cpSize / mqaBroadcast * partialKVHeads
+            + cpIdx / mqaBroadcast * partialKVHeads + (headIdx - partialQHeads - partialKVHeads);
     }
 
     if (cpIdx == rank)
@@ -2181,7 +2181,7 @@ __global__ void runCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTok
               + seqIdx * (partialQHeads + 2 * partialKVHeads) + headIdx)
             * headSize);
     VecType const* in = reinterpret_cast<VecType const*>(
-        src + (seqIdx * (partialQHeads + 2 * partialKVHeads) * cpSize + srcHeadIdx) * headSize);
+        src + (seqIdx * (partialQHeads * cpSize + 2 * partialKVHeads * cpSize / mqaBroadcast) + srcHeadIdx) * headSize);
 
     for (int hiddenIdx = threadIdx.x; hiddenIdx < hiddenSize + hiddenRestSize; hiddenIdx += blockDim.x)
     {
@@ -2347,17 +2347,18 @@ INSTANTIATE_invokeConversion(__nv_fp8_e4m3, __nv_bfloat16);
 
 template <typename T>
 void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialTokenNum, int64_t cpSize, int64_t partialQHeads,
-    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank, cudaStream_t stream)
 {
     dim3 grid(partialTokenNum, cpSize, partialQHeads + 2 * partialKVHeads);
     dim3 block(128);
     runCpTranspose<T><<<grid, block, 0, stream>>>(
-        dst, dst2, src, partialTokenNum, cpSize, partialQHeads, partialKVHeads, headSize, rank);
+        dst, dst2, src, partialTokenNum, cpSize, partialQHeads, partialKVHeads, mqaBroadcast, headSize, rank);
 }
 
 #define INSTANTIATE_invokeCpTranspose(T)                                                                               \
     template void invokeCpTranspose<T>(T * dst, T * dst2, T const* src, int64_t partialLength, int64_t cpSize,         \
-        int64_t partialQHeads, int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream)
+        int64_t partialQHeads, int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank,           \
+        cudaStream_t stream)
 INSTANTIATE_invokeCpTranspose(float);
 INSTANTIATE_invokeCpTranspose(half);
 INSTANTIATE_invokeCpTranspose(__nv_bfloat16);

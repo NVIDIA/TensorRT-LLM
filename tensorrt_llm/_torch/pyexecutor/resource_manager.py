@@ -13,7 +13,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest
+from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -303,18 +303,17 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=1,
-                input_tokens=[1] * token_num,
-                sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                    sampling_params._get_sampling_config()),
-                is_streaming=False,
-                encoder_input_tokens=encoder_input_tokens)
+            req = LlmRequest(request_id=req_id,
+                             max_new_tokens=1,
+                             input_tokens=[1] * token_num,
+                             sampling_config=SamplingConfig(
+                                 sampling_params._get_sampling_config()),
+                             is_streaming=False,
+                             encoder_input_tokens=encoder_input_tokens)
             req.paged_kv_block_ids = []
             self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
-                req.state = tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1 + max_num_draft_tokens
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
@@ -325,7 +324,7 @@ class KVCacheManager(BaseResourceManager):
     def update_resources(self, scheduled_batch: ScheduledRequests):
         # rewind kv cache
         for request in scheduled_batch.generation_requests:
-            if request.state != tensorrt_llm.bindings.LlmRequestState.GENERATION_COMPLETE:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
 

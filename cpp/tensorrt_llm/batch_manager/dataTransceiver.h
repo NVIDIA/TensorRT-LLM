@@ -16,13 +16,20 @@
  */
 
 #pragma once
+#include <fstream>
 #include <future>
+#include <map>
+#include <string>
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
@@ -209,6 +216,65 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
+};
+
+class KvCacheTimeHelper
+{
+public:
+    KvCacheTimeHelper(std::string output_path)
+        : mOutputPath(std::move(output_path))
+    {
+    }
+
+    void appendKVCacheTransferTime(LlmRequest::RequestIdType requestId, double duration)
+    {
+        if (mOutputPath.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        mRequestKVCacheTranfserTime[requestId].emplace_back(duration);
+    }
+
+    ~KvCacheTimeHelper()
+    {
+        if (!mRequestKVCacheTranfserTime.empty() && !mOutputPath.empty())
+        {
+            auto rank = mpi::MpiComm::world().getRank();
+            std::string outFilePath = mOutputPath + "rank_" + std::to_string(rank) + ".txt";
+            std::ofstream outFile(outFilePath);
+
+            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
+
+            size_t numTransferTime = mRequestKVCacheTranfserTime.begin()->second.size();
+
+            outFile << "RequestID";
+            for (size_t i = 0; i < numTransferTime; i++)
+            {
+                outFile << ",TimeDuration";
+            }
+            outFile << '\n';
+
+            for (auto const& [requestID, timeDuration] : mRequestKVCacheTranfserTime)
+            {
+                outFile << requestID;
+
+                for (auto const& value : timeDuration)
+                {
+                    outFile << "," << value;
+                }
+                outFile << '\n';
+            }
+
+            outFile.close();
+        }
+    }
+
+private:
+    std::map<LlmRequest::RequestIdType, std::vector<double>> mRequestKVCacheTranfserTime;
+    std::string mOutputPath;
+    std::mutex mMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager

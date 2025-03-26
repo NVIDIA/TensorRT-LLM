@@ -3,11 +3,10 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
-from tensorrt_llm._torch.utils import make_weak_ref
-
+from ..attention_backend.interface import AttentionMetadata
 from ..pipeline_interface import PipelineInterface
+from ..speculative.interface import SpecMetadata
+from ..utils import make_weak_ref
 
 _local = threading.local()
 

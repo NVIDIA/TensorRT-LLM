@@ -67,6 +67,8 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvDisableReceiveKVCacheParallel();
 
+std::string getEnvKVCacheTransferOutputPath();
+
 bool getEnvTryZCopyForKVCacheTransfer();
 
 // Force deterministic behavior for all kernels.

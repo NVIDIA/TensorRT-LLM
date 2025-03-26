@@ -393,6 +393,8 @@ def convert_and_save_meta(args, rank):
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim)
     llama.config.mapping.cp_size = args.cp_size
+    llama.config.mapping.attn_tp_size = -1
+    llama.config.mapping.attn_cp_size = -1
     llama.config.mapping.world_size *= args.cp_size
     llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
 
@@ -511,6 +513,8 @@ def convert_and_save_hf(args):
                 f'Total time of reading and converting: {time.time()-tik:.3f} s'
             )
             llama.config.mapping.cp_size = args.cp_size
+            llama.config.mapping.attn_tp_size = -1
+            llama.config.mapping.attn_cp_size = -1
             llama.config.mapping.world_size *= args.cp_size
             tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))

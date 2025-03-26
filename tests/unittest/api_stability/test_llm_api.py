@@ -66,13 +66,13 @@ class TestLogitsProcessor(ApiStabilityTestHarness):
 
     def create_snapshot_from_inspect(self):
         method_snapshot = MethodSnapshot.from_inspect(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
     def create_snapshot_from_docstring(self):
         method_snapshot = MethodSnapshot.from_docstring(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
@@ -83,13 +83,13 @@ class TestBatchedLogitsProcessor(ApiStabilityTestHarness):
 
     def create_snapshot_from_inspect(self):
         method_snapshot = MethodSnapshot.from_inspect(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
     def create_snapshot_from_docstring(self):
         method_snapshot = MethodSnapshot.from_docstring(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 

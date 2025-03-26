@@ -174,36 +174,6 @@ class TestMinitron4BBase(AccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
-class TestGptJ6B(AccuracyTestHarness):
-    MODEL_NAME = "EleutherAI/gpt-j-6b"
-    MODEL_PATH = f"{llm_models_root()}/gpt-j-6b"
-    EXAMPLE_FOLDER = "models/contrib/gptj"
-
-    def test_auto_dtype(self):
-        # float16
-        self.run(dtype='auto')
-
-    def test_float32(self):
-        self.run(dtype='float32')
-
-    @skip_pre_ada
-    def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
-    def test_cyclic_kv_cache(self):
-        self.run(extra_acc_spec="max_attention_window_size=960",
-                 extra_summarize_args=["--max_attention_window_size=960"])
-
-    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
-    def test_cyclic_kv_cache_beam_search(self):
-        self.run(extra_acc_spec="max_attention_window_size=960;beam_width=4",
-                 extra_build_args=["--max_beam_width=4"],
-                 extra_summarize_args=[
-                     "--max_attention_window_size=960", "--num_beams=4"
-                 ])
-
-
 class TestPhi2(AccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
     MODEL_PATH = f"{llm_models_root()}/phi-2"
@@ -486,6 +456,9 @@ class TestTinyLlama1_1BChat(AccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
+    def test_float32(self):
+        self.run(dtype='float32')
+
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
@@ -767,6 +740,18 @@ class TestLlama3_2_1B(AccuracyTestHarness):
                 break
             self.extra_summarize_args = [f"--gpu_weights_percent={gpu_percent}"]
             self.evaluate()
+
+    def test_cyclic_kv_cache(self):
+        self.run(extra_acc_spec="max_attention_window_size=960",
+                 extra_summarize_args=["--max_attention_window_size=960"])
+
+    @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5166352")
+    def test_cyclic_kv_cache_beam_search(self):
+        self.run(extra_acc_spec="max_attention_window_size=960;beam_width=4",
+                 extra_build_args=["--max_beam_width=4"],
+                 extra_summarize_args=[
+                     "--max_attention_window_size=960", "--num_beams=4"
+                 ])
 
 
 class TestMixtral8x7B(AccuracyTestHarness):

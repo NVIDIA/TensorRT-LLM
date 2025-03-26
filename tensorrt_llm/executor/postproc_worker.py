@@ -158,7 +158,9 @@ class PostprocWorker:
 
         async def handle_single_input(inp: PostprocWorker.Input,
                                       batch: List[PostprocWorker.Output]):
-            assert isinstance(inp, PostprocWorker.Input)
+            assert isinstance(
+                inp, PostprocWorker.Input
+            ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
             is_final = inp.rsp.result.is_final if isinstance(
                 inp.rsp, tllm.Response) else True

@@ -215,6 +215,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             TLLM_CHECK(connections.size() > processIdx);
             TLLM_CHECK(outputSplitCaches.size() > processIdx);
+            auto startTime = std::chrono::steady_clock::now();
             if (processIdx < bufferCoverTargetNum)
             {
                 TransferHelper::sendBuffer(
@@ -246,6 +247,11 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
                     remainSendSize -= sendSize;
                 }
             }
+
+            auto endTime = std::chrono::steady_clock::now();
+            double cacheTransferTime
+                = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
+            kvCacheTimeHelper.appendKVCacheTransferTime(llmRequest.mRequestId, cacheTransferTime);
         };
 
         if (connections.size() > 1)

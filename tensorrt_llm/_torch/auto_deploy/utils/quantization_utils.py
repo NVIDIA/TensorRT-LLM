@@ -15,7 +15,7 @@ from .node_utils import (
 )
 
 try:
-    from tensorrt_llm._torch.quantization.utils import float4_sf_dtype
+    from ...quantization.utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 

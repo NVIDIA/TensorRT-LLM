@@ -15,17 +15,21 @@ import dill  # nosec B403
 import numpy as np
 import torch
 
-import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._utils import global_mpi_rank, nvtx_range
+from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
+                                            IterationStats, KvCacheStats)
+from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+from tensorrt_llm.logger import logger
+from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import global_mpi_rank, nvtx_range
-from ...logger import logger
-from .decoder import *
-from .distributed import *
+from .decoder import Decoder
+from .distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
-from .llm_request import *
-from .model_engine import *
-from .resource_manager import *
-from .scheduler import *
+from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
+                          LlmRequestState, SamplingConfig,
+                          executor_request_to_llm_request)
+from .model_engine import ModelEngine
+from .scheduler import ScheduledRequests
 
 
 def _is_executor_request(req_queue_item) -> bool:
@@ -191,10 +195,8 @@ class PyExecutor:
         # one handle each for metadata and serialized new_reqs buffer
         self.send_new_reqs_handle = [None] * 2
 
-        self.inflight_req_ids = tensorrt_llm.bindings.internal.batch_manager.ReqIdsSet(
-        )
-        self.canceled_req_ids = tensorrt_llm.bindings.internal.batch_manager.ReqIdsSet(
-        )
+        self.inflight_req_ids = ReqIdsSet()
+        self.canceled_req_ids = ReqIdsSet()
 
         self.model_engine.warmup(self.resource_manager)
 
@@ -219,7 +221,7 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self, requests: List[trtllm.Request]):
+    def enqueue_requests(self, requests: List[ExecutorRequest]):
         """
         Enqueue new requests
         """
@@ -241,7 +243,7 @@ class PyExecutor:
         self,
         id: Optional[Union[List[int], int]] = None,
         timeout: Optional[datetime.timedelta] = None,
-    ) -> Union[List[List[trtllm.Response]], List[trtllm.Response]]:
+    ) -> Union[List[List[ExecutorResponse]], List[ExecutorResponse]]:
         """
         Await for ready responses
         Args:
@@ -325,7 +327,7 @@ class PyExecutor:
         self.shutdown_event.wait()
 
     def enqueue_request(self,
-                        request: trtllm.Request,
+                        request: ExecutorRequest,
                         query: Optional[List] = None):
         """
         Enqueue a new request, only used in `StarAttention`.
@@ -385,7 +387,7 @@ class PyExecutor:
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
-        stats = trtllm.IterationStats()
+        stats = IterationStats()
         stats.timestamp = ""
 
         stats.num_new_active_requests = num_new_active_requests
@@ -412,7 +414,7 @@ class PyExecutor:
             "kv_cache_manager")
         if kv_cache_manager is not None:
             kv_stats = kv_cache_manager.get_kv_cache_stats()
-            kv_stats_to_save = trtllm.KvCacheStats()
+            kv_stats_to_save = KvCacheStats()
             kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
             kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
             kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
@@ -424,7 +426,7 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        model_stats = trtllm.InflightBatchingStats()
+        model_stats = InflightBatchingStats()
         model_stats.num_scheduled_requests = len(
             scheduled_batch.context_requests) + len(
                 scheduled_batch.generation_requests)
@@ -1085,7 +1087,7 @@ class PyExecutor:
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
 
-    def _merge_tp_requests(self, new_requests: List[trtllm.Request]):
+    def _merge_tp_requests(self, new_requests: List[ExecutorRequest]):
         got_finish_signal = False
         for request in new_requests:
             # return finish signal and drop all request on shutdown
@@ -1108,7 +1110,7 @@ class PyExecutor:
             request_id=0,
             max_new_tokens=1,
             input_tokens=[1],
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_config=SamplingConfig(
                 sampling_params._get_sampling_config()),
             is_streaming=False,
         )
@@ -1174,7 +1176,7 @@ class PyExecutor:
         return ctx_blocks, position_blocks, padding
 
     def _merge_star_attention_requests(self,
-                                       new_requests: List[trtllm.Request]):
+                                       new_requests: List[ExecutorRequest]):
         got_finish_signal = False
         for request in new_requests:
             # return finish signal and drop all request on shutdown
@@ -1238,7 +1240,7 @@ class PyExecutor:
         return got_finish_signal
 
     @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: List[trtllm.Request]):
+    def _merge_requests(self, new_requests: List[ExecutorRequest]):
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -1490,7 +1492,7 @@ class PyExecutor:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
-                request.finish_by_reason(trtllm.FinishReason.CANCELLED)
+                request.finish_by_reason(FinishReason.CANCELLED)
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
             else:
@@ -1502,7 +1504,7 @@ class PyExecutor:
         self._enqueue_responses(cancelled_responses)
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, trtllm.Response]):
+    def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
         if 0 not in self.dist.mapping.tp_group:
             return
 
@@ -1571,7 +1573,7 @@ class PyExecutor:
 
     def _await_any_response(self,
                             timeout: Union[float, None] = None
-                            ) -> List[trtllm.Response]:
+                            ) -> List[ExecutorResponse]:
 
         def any_responses_ready():
             return len(self.responses) > 0 or self.is_shutdown
@@ -1588,7 +1590,7 @@ class PyExecutor:
     def _await_single_response(
             self,
             id: int,
-            timeout: Union[float, None] = None) -> List[trtllm.Response]:
+            timeout: Union[float, None] = None) -> List[ExecutorResponse]:
         with self.response_cv:
 
             def key_has_response():

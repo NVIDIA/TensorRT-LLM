@@ -9,15 +9,14 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, allgather,
-                                             reducescatter)
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.utils import enable_llm_debug
 
-from ...llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           DeepseekAllReduce, ParallelConfig, allgather,
+                           reducescatter)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -263,7 +262,7 @@ class Deepseekv3MoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  tune_max_num_tokens: int = 8192,
                  model_config: ModelConfig = ModelConfig()):
-        from tensorrt_llm._torch.distributed import AllReduce
+        from ..distributed import AllReduce
 
         super().__init__()
         config = model_config.pretrained_config

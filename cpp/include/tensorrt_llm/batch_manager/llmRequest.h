@@ -1649,6 +1649,16 @@ public:
         mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
     }
 
+    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    {
+        return mPerfMetrics.timingMetrics.kvCacheTransferStart;
+    }
+
+    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    {
+        return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
+    }
+
     [[nodiscard]] double getKvCacheTransferTimeMS() const
     {
         // get max with 0 in case this function is called while end time is not recorded

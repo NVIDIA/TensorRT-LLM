@@ -281,6 +281,8 @@ def convert_and_save_hf(args):
                                                      quant_config=quant_config,
                                                      **override_fields)
             qwen.config.mapping.cp_size = args.cp_size
+            qwen.config.mapping.attn_tp_size = -1
+            qwen.config.mapping.attn_cp_size = -1
             qwen.config.mapping.world_size *= args.cp_size
             qwen.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del qwen
