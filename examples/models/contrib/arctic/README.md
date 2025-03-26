@@ -3,8 +3,8 @@
 This document shows how to build and run a [Arctic](https://huggingface.co/Snowflake/snowflake-arctic-instruct) model in TensorRT-LLM.
 
 The TensorRT-LLM Arctic implementation is based on the LLaMA model, with Mixture of Experts (MoE) enabled. The implementation can
-be found in [llama/model.py](../../tensorrt_llm/models/llama/model.py).
-See the LLaMA example [`examples/llama`](../llama) for details.
+be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
+See the LLaMA example [`examples/llama`](../../../llama) for details.
 
 - [Arctic](#arctic)
   - [Download model checkpoints](#download-model-checkpoints)
@@ -51,7 +51,7 @@ Notes:
 - **due to the large model size and the calibration step (which has to load the HuggingFace model and run forward passes), it is likely that you will need more number of GPUs during quantization step than the number of GPUs for engine building and final deployment. For example, using 16xH100 or 8xH200 for quantization & 8xH100 for deployment.**
 
 ```bash
-python ../quantization/quantize.py --model_dir tmp/hf_checkpoints/${HF_MODEL} \
+python ../../../quantization/quantize.py --model_dir tmp/hf_checkpoints/${HF_MODEL} \
                                    --dtype ${PREC_RAW} \
                                    --qformat ${PREC_QUANT} \
                                    --kv_cache_dtype ${PREC_QUANT} \
@@ -77,10 +77,10 @@ trtllm-build --checkpoint_dir ./tmp/tllm_checkpoints/${ENGINE} \
 Test your engine with the [run.py](../run.py) script:
 
 ```bash
-mpirun -n ${TP} --allow-run-as-root python ../run.py --engine_dir ./tmp/trt_engines/${ENGINE} --tokenizer_dir tmp/hf_checkpoints/${HF_MODEL} --max_output_len 20 --input_text "The future of AI is" |& tee tmp/trt_engines/${ENGINE}_run.log
+mpirun -n ${TP} --allow-run-as-root python ../../../run.py --engine_dir ./tmp/trt_engines/${ENGINE} --tokenizer_dir tmp/hf_checkpoints/${HF_MODEL} --max_output_len 20 --input_text "The future of AI is" |& tee tmp/trt_engines/${ENGINE}_run.log
 ```
 
-For more examples see [`examples/llama/README.md`](../llama/README.md)
+For more examples see [`examples/llama/README.md`](../../../llama/README.md)
 
 
 ### OOTB

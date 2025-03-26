@@ -4,15 +4,15 @@ This document elaborates how to build the [Skywork](https://huggingface.co/Skywo
 
 ## Overview
 The TensorRT-LLM Skywork implementation is based on the LLaMA model. The implementation can
-be found in [tensorrt_llm/models/llama/model.py](../../tensorrt_llm/models/llama/model.py).
-The TensorRT-LLM Skywork example code lies in [`examples/skywork`](./):
+be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
+The TensorRT-LLM Skywork example code lies in [`examples/models/contrib/skywork`](./):
 
 * [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT-LLM checkpoint.
 
-In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
-* [`../run.py`](../run.py) to run the inference on an input text;
-* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../run.py`](../../../run.py) to run the inference on an input text;
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
     * FP16 & BF16
@@ -82,7 +82,7 @@ After building TRT engines, we can use them to perform various tasks. TensorRT-L
 
 ```bash
 # fp16
-python ../summarize.py --hf_model_dir ./Skywork-13B-base \
+python ../../../summarize.py --hf_model_dir ./Skywork-13B-base \
                        --test_hf \
                        --batch_size 32 \
                        --max_input_length 512 \
@@ -94,7 +94,7 @@ python ../summarize.py --hf_model_dir ./Skywork-13B-base \
                        --tensorrt_llm_rouge1_threshold=14
 
 # bf16
-python ../summarize.py --hf_model_dir ./Skywork-13B-base \
+python ../../../summarize.py --hf_model_dir ./Skywork-13B-base \
                        --test_hf \
                        --batch_size 32 \
                        --max_input_length 512 \

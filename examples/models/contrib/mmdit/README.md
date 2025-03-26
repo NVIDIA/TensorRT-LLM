@@ -3,7 +3,7 @@ This document shows how to build and run a [MMDiT](https://github.com/huggingfac
 
 ## Overview
 
-The TensorRT-LLM implementation of MMDiT can be found in [tensorrt_llm/models/sd3/model.py](../../tensorrt_llm/models/mmdit_sd3/model.py). The TensorRT-LLM MMDiT (SD 3/3.5) example code is located in [`examples/mmdit`](./). There are main files to build and run MMDiT with TensorRT-LLM:
+The TensorRT-LLM implementation of MMDiT can be found in [tensorrt_llm/models/sd3/model.py](../../../../tensorrt_llm/models/mmdit_sd3/model.py). The TensorRT-LLM MMDiT (SD 3/3.5) example code is located in [`examples/models/contrib/mmdit`](./). There are main files to build and run MMDiT with TensorRT-LLM:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the MMDiT model into tensorrt-llm checkpoint format.
 * [`sample.py`](./sample.py) to run the [diffusers](https://huggingface.co/docs/diffusers/index) pipeline with TensorRT engine(s) to generate images.
@@ -16,7 +16,7 @@ The TensorRT-LLM implementation of MMDiT can be found in [tensorrt_llm/models/sd
 
 ## Usage
 
-The TensorRT-LLM MMDiT example code locates at [examples/mmdit](./). It takes HuggingFace checkpiont as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT-LLM MMDiT example code locates at [examples/models/contrib/mmdit](./). It takes HuggingFace checkpoint as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build MMDiT TensorRT engine(s)
 
