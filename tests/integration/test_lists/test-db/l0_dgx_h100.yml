@@ -26,7 +26,11 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8]
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_multi_gpu[90]
+  - test_cpp.py::test_multi_gpu_simple[90]
+  - test_cpp.py::test_multi_gpu_t5[90]
+  - test_cpp.py::test_multi_gpu_llama_executor[90]
+  - test_cpp.py::test_multi_gpu_trt_gpt_real_decoder[90]
+  - test_cpp.py::test_multi_gpu_disagg[90]
   # ------------- TRT tests ---------------
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[disable_reduce_fusion-disable_fp8_context_fmha]
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_fp8_tp2[enable_reduce_fusion-enable_fp8_context_fmha]
