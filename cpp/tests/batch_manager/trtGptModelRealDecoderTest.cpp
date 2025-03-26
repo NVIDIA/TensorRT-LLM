@@ -66,6 +66,9 @@ auto constexpr LONG_INPUT_FILE = "input_tokens_long.npy";
 auto constexpr CHATGLM_INPUT_FILE = "input_tokens_chatglm-6b.npy";
 auto constexpr GLM_INPUT_FILE = "input_tokens_glm-10b.npy";
 
+auto constexpr LLAMA_END_ID = 128001;
+auto constexpr LLAMA_PAD_ID = 128001;
+
 struct ModelParams
 {
     char const* baseDir;
@@ -1543,7 +1546,7 @@ INSTANTIATE_TEST_SUITE_P(RecurrentGemmaTests, ParamTest,
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTests, ParamTest,
-    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
+    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {LLAMA_END_ID, LLAMA_PAD_ID}}),
         testing::Values(
             //
             ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}
@@ -1682,7 +1685,7 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(LlamaLookaheadDecodingTests, ParamTest,
-    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
+    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {LLAMA_END_ID, LLAMA_PAD_ID}}),
         testing::Values(
             //
             ModelSpec{INPUT_LLAMA_FILE, nvinfer1::DataType::kHALF}

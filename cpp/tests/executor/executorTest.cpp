@@ -3513,11 +3513,11 @@ TEST_P(GuidedDecodingParamsTest, All)
     }
     else // llama
     {
-        expectedOutputTokens.push_back({13, 13, 28956, 13, 29912, 13, 1678, 376, 29896, 1115});
-        expectedOutputTokens.push_back({6377, 29896, 1115, 376, 29896, 613, 376, 29896, 29974, 29896});
-        expectedOutputTokens.push_back({6377, 12011, 1115, 29871, 29896, 29913});
-        expectedOutputTokens.push_back({29896});
-        expectedOutputTokens.push_back({29896});
+        expectedOutputTokens.push_back({916, 25, 220, 16, 13, 16, 13, 16, 13, 16});
+        expectedOutputTokens.push_back({90, 220, 220, 197, 1, 1985, 1, 551, 330, 1985});
+        expectedOutputTokens.push_back({90, 220, 220, 197, 1, 276, 2332, 261, 794, 220});
+        expectedOutputTokens.push_back({17});
+        expectedOutputTokens.push_back({17});
     }
 
     if (executor.canEnqueueRequests())
@@ -4396,7 +4396,7 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
         = Request(finishedTokens, maxNewTokens, false, tensorrt_llm::executor::SamplingConfig(beamWidth));
     finishedRequest.setAllottedTimeMs(std::chrono::milliseconds(5000));
     std::vector<std::vector<int>> finishedReponse
-        = {{101, 102, 103, 104, 1, 17607, 1711, 29889, 13}, {101, 102, 103, 104, 1, 17607, 1711, 310, 278}};
+        = {{101, 102, 103, 104, 49849, 225, 49849, 232, 55742}, {101, 102, 103, 104, 49849, 225, 49849, 232, 29082}};
 
     // assume responses will come in FIFO order
     std::vector<BeamTokens> refResponses = {immediateCancelResponse, oneForwardResponse, finishedReponse};

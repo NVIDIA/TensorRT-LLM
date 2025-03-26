@@ -61,6 +61,9 @@ auto const CHATGLM_INPUT_FILE = "input_tokens_chatglm-6b.npy";
 auto const CHATGLM2_INPUT_FILE = "input_tokens_chatglm2-6b.npy";
 auto const CHATGLM3_INPUT_FILE = "input_tokens_chatglm3-6b.npy";
 
+auto constexpr LLAMA_END_ID = 128001;
+auto constexpr LLAMA_PAD_ID = 128001;
+
 // Engines need to be generated using cpp/tests/resources/scripts/build_*_engines.py.
 auto const FP32_GPT_DIR = "fp32-default";
 auto const FP32_GPT_ATTENTION_DIR = "fp32-plugin";
@@ -604,7 +607,7 @@ INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
     generateTestName);
 
 INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
-    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {2, 2}}),
+    testing::Combine(testing::Values(ModelParams{LLAMA_MODEL_DIR, {LLAMA_END_ID, LLAMA_PAD_ID}}),
         testing::Values(
             // single decoder
             ModelSpec{LLAMA_INPUT_FILE, nvinfer1::DataType::kHALF}
