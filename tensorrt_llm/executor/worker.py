@@ -803,10 +803,10 @@ class AwaitResponseHelper:
 
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
-                if len(batch) > 0:
+                if batch:
                     self.worker.postproc_queues[wid].put(batch)
 
-        if rsp_batch and len(rsp_batch) > 0:
+        if rsp_batch:
             self.worker.result_queue.put(rsp_batch)
 
 
