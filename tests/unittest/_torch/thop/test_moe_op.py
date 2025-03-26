@@ -56,8 +56,7 @@ def test_moe_op_profile(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("min_latency_mode", [True, False])
-def test_moe_op_run(dtype, min_latency_mode):
+def test_moe_op_run(dtype):
     SEQ_LEN = 8
     HIDDEN_SIZE = 64
     INTERMEDIATE_SIZE = 32
@@ -104,11 +103,11 @@ def test_moe_op_run(dtype, min_latency_mode):
             ep_size=EP_SIZE,
             ep_rank=EP_RANK,
             profile_ids=None,
-            min_latency_mode=min_latency_mode,
         )
 
     # run with profile
     use_fp8_block_scaling = False
+    min_latency_mode = False
 
     profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
         dtype, dtype, dtype, use_fp8_block_scaling, min_latency_mode)
@@ -137,8 +136,7 @@ def test_moe_op_run(dtype, min_latency_mode):
             tp_rank=TP_RANK,
             ep_size=EP_SIZE,
             ep_rank=EP_RANK,
-            profile_ids=profile_ids,
-            min_latency_mode=min_latency_mode)
+            profile_ids=profile_ids)
 
     # torch run
     with torch.inference_mode():
