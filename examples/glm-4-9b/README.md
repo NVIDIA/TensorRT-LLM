@@ -113,8 +113,6 @@ The `trtllm-build` command builds TensorRT-LLM engines from TensorRT-LLM checkpo
 
 Normally, the `trtllm-build` command only requires a single GPU, but you can enable parallel building by passing the number of GPUs to the `--workers` argument.
 
-Using ChatGLM2-6B-32K / ChatGLM3-6B-32K models, we need to guarantee `max_batch_size * max_beam_width * max_seq_len <= 78398 = 2^31 / (13696 * 2)` due to constrain of TensorRT. For example, we will fail to build engine while using default max_batch_size (8) and adding arguments `--max_beam_width=4 --max_input_len=20000 --max_seq_len=20100`.
-
 ```bash
 # GLM-4-9B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/fp16/1-gpu \
@@ -165,7 +163,7 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
 #### Single node, multi GPU
 
 ```bash
-# Run the Tensor Parallel 2 engine of ChatGLM3-6B on two GPU, other model name is available if built.
+# Run the Tensor Parallel 2 engine of glm_4_9b on two GPU, other model name is available if built.
 mpirun -n 2 \
     python ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?" \
         --max_output_len 50 \
@@ -187,7 +185,7 @@ Output [Text 0 Beam 0]: "There is no new information provided in the official do
 ### 5. Run summarization task
 
 ```bash
-# Run the summarization of ChatGLM3-6B task, other model name is available if built.
+# Run the summarization of glm_4_9b task, other model name is available if built.
 python3 ../summarize.py --test_trt_llm \
         --hf_model_dir glm_4_9b \
         --engine_dir trt_engines/glm_4_9b/fp16/1-gpu
@@ -198,13 +196,13 @@ python3 ../summarize.py --test_trt_llm \
 Use `--use_weight_only` to enable INT8-Weight-Only quantization, this will significantly lower the latency and memory footprint. Furthermore, use `--weight_only_precision int8` or `--weight_only_precision int4` to configure the data type of the weights.
 
 ```bash
-# ChatGLM3-6B: single gpu, int8 weight only quantization
+# glm_4_9b: single gpu, int8 weight only quantization
 python3 convert_checkpoint.py --model_dir glm_4_9b \
         --use_weight_only \
         --weight_only_precision int8 \
         --output_dir trt_ckpt/glm_4_9b/int8_wo/1-gpu
 
-# ChatGLM3-6B: single-gpu engine with int8 weight only quantization, GPT Attention plugin, Gemm plugin
+# glm_4_9b: single-gpu engine with int8 weight only quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/int8_wo/1-gpu \
         --gemm_plugin float16 \
         --output_dir trt_engines/glm_4_9b/int8_wo/1-gpu
@@ -221,14 +219,14 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
 Use `--smoothquant` to enable smooth quantization.
 
 ```bash
-# ChatGLM3-6B: single gpu, int8 smooth quantization
+# glm_4_9b: single gpu, int8 smooth quantization
 python3 convert_checkpoint.py --model_dir glm_4_9b \
         --smoothquant 0.5 \
         --per_channel \
         --per_token \
         --output_dir trt_ckpt/glm_4_9b/sq/1-gpu
 
-# ChatGLM3-6B: single-gpu engine with int8 smooth quantization, GPT Attention plugin, Gemm plugin
+# glm_4_9b: single-gpu engine with int8 smooth quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/sq/1-gpu \
         --gemm_plugin float16 \
         --output_dir trt_engines/glm_4_9b/sq/1-gpu
@@ -245,13 +243,13 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
 The [`../quantization/quantize.py`](../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
 
 ```bash
-# ChatGLM3-6B: single gpu, int4 awq quantization
+# glm_4_9b: single gpu, int4 awq quantization
 python ../quantization/quantize.py --model_dir glm_4_9b \
         --dtype float16 \
         --qformat int4_awq \
         --output_dir trt_ckpt/glm_4_9b/int4_awq/1-gpu
 
-# ChatGLM3-6B: single-gpu engine with int4 awq quantization, GPT Attention plugin, Gemm plugin
+# glm_4_9b: single-gpu engine with int4 awq quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/int4_awq/1-gpu \
         --gemm_plugin float16 \
         --output_dir trt_engines/glm_4_9b/int4_awq/1-gpu
@@ -268,14 +266,14 @@ python3 ../run.py --input_text "What's new between ChatGLM3-6B and ChatGLM2-6B?"
 The [`../quantization/quantize.py`](../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
 
 ```bash
-# ChatGLM3-6B: single gpu, fp8 quantization
+# glm_4_9b: single gpu, fp8 quantization
 python ../quantization/quantize.py --model_dir glm_4_9b \
         --dtype float16 \
         --qformat fp8 \
         --kv_cache_dtype fp8 \
         --output_dir trt_ckpt/glm_4_9b/fp8/1-gpu
 
-# ChatGLM3-6B: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
+# glm_4_9b: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/fp8/1-gpu \
         --gemm_plugin float16 \
         --output_dir trt_engines/glm_4_9b/fp8/1-gpu
