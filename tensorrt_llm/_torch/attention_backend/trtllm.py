@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-
 from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.logger import logger
