@@ -300,7 +300,7 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenerationRequest(LlmRequest::RequestIdType requestId, SizeType32 numTokens, SizeType32 beamWidth,
-        SizeType32 maxBlocks, SizeType32 cyclicThreshold, SizeType32 numPools = 1,
+        SizeType32 maxBlocks, SizeType32 numPools = 1,
         executor::KvCacheRetentionConfig kvCacheRetentionConfig = executor::KvCacheRetentionConfig())
         : mRequestId(requestId)
         , mNumTokens(numTokens)
@@ -310,7 +310,6 @@ public:
               runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
               runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mCyclicThreshold(cyclicThreshold)
     {
         auto cacheBlockIdsRange = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices);
         std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
@@ -399,14 +398,6 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    // @brief Check whether the sequence uses cyclic KV cache.
-    // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
-    // @details If `true`, we cannot store the sequence's KV cache for reuse.
-    [[nodiscard]] bool isCyclic() const
-    {
-        return mNumTokens >= mCyclicThreshold;
-    }
-
     [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
     {
         return mContextRequiresSlidingWindowKvCache;
@@ -430,9 +421,6 @@ private:
     runtime::ITensor::SharedPtr mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
-
-    // Number of tokens at which the KV Cache begins sliding
-    SizeType32 mCyclicThreshold;
 
     // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
     bool mContextRequiresSlidingWindowKvCache{false};
