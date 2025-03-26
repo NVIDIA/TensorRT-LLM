@@ -31,8 +31,6 @@ def test_cache_sanity(
     llm_gpt2_starcoder_model_root,
     llm_gpt2_starcoder2_model_root,
     llm_gpt2_next_8b_model_root,
-    llm_chatglm_6b_model_root,
-    llm_glm_10b_model_root,
     llm_qwen_7b_model_root,
 ):
     # use this test to be a placeholder to trigger the execution of all the test fixture

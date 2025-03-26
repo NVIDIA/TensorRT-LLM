@@ -88,7 +88,6 @@ l0_h100:
       stage: post_merge
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[fp8-chatglm-90]
   - test_cpp.py::test_model[bart-90]
   - test_cpp.py::test_benchmarks[bart-90]
   # ------------- TRT tests ---------------
@@ -97,10 +96,8 @@ l0_h100:
   - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins
   - examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[cogvlm-chat-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[cogvlm-chat-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]

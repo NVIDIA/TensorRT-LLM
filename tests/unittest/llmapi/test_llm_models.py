@@ -17,7 +17,6 @@ phi_3_mini_4k_model_path = get_model_path('Phi-3/Phi-3-mini-4k-instruct')
 phi_3_small_8k_model_path = get_model_path('Phi-3/Phi-3-small-8k-instruct')
 phi_3_medium_4k_model_path = get_model_path('Phi-3/Phi-3-medium-4k-instruct')
 gemma_2_9b_it_model_path = get_model_path('gemma/gemma-2-9b-it')
-glm_model_path = get_model_path('chatglm3-6b')
 qwen2_model_path = get_model_path('Qwen2-7B-Instruct')
 qwen2_5_model_path = get_model_path('Qwen2.5-0.5B-Instruct')
 mamba2_370m_model_path = get_model_path('mamba2/mamba2-370m')
@@ -144,15 +143,6 @@ def test_llm_gemma_2_9b_it():
     reason=
     "Require further transformers update https://github.com/THUDM/ChatGLM3/issues/1324"
 )
-def test_llm_glm():
-    print('test GLM....')
-    llm_test_harness(glm_model_path,
-                     inputs=['A B C'],
-                     references=['D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     trust_remote_code=True)
-
-
 def test_llm_qwen2():
     build_config = BuildConfig()
     build_config.max_batch_size = 512
