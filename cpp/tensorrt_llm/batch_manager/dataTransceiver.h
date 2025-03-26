@@ -251,7 +251,7 @@ public:
             size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
 
             outFile << "RequestID";
-            for (size_t i = 0; i < numTransferTime; i++)
+            for (size_t i = 0; i < numTransferMeasure; i++)
             {
                 outFile << ",TimeDuration,Bandwidth";
             }
