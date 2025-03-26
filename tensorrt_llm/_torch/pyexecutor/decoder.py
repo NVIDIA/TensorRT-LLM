@@ -474,6 +474,8 @@ class TRTLLMDecoder(Decoder):
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
+        self.algs.update_decoder_buffers = tllm.internal.algorithms.UpdateDecoderBuffers(
+        )
 
     def setup_decoder(self, scheduled_requests: ScheduledRequests,
                       model_outputs):
@@ -530,8 +532,13 @@ class TRTLLMDecoder(Decoder):
                 self.store["decoder_input_buffers"], self.model_config,
                 self.max_num_sequences, self.beam_width,
                 self.store["buffer_manager"], self.store["cuda_stream"])
-            self.algs.decoder.forward_async(self.decoding_output,
-                                            decoding_input)
+            decoder_finish_event = self.algs.decoder.forward_async(
+                self.decoding_output, decoding_input)
+            self.algs.update_decoder_buffers(self.model_config,
+                                             self.store["decoder_buffers"],
+                                             self.store["buffer_manager"],
+                                             self.algs.decoder, False,
+                                             decoder_finish_event)
 
             self.decoder_event = torch.cuda.Event()
             self.decoder_event.record()
@@ -539,18 +546,11 @@ class TRTLLMDecoder(Decoder):
     def update_requests(self, scheduled_requests: ScheduledRequests):
         self.decoder_event.synchronize()
 
-        # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
-        new_tokens_host = self.algs.decoder.all_new_tokens.to('cpu',
-                                                              non_blocking=True)
-        finished_sum_host = self.algs.decoder.finished_sum.to('cpu',
-                                                              non_blocking=True)
-        finish_reasons_host = self.algs.decoder.finish_reasons.to(
-            'cpu', non_blocking=True)
+        new_tokens_host = self.store["decoder_buffers"].new_output_tokens_host
+        finished_sum_host = self.store["decoder_buffers"].finished_sum_host
+        finish_reasons_host = self.store["decoder_buffers"].finish_reasons_host
         sequence_lengths_host_data = self.store[
-            "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
-
-        self.decoder_event.record()
-        self.decoder_event.synchronize()
+            "decoder_buffers"].sequence_lengths_host
 
         for request in itertools.chain(scheduled_requests.context_requests,
                                        scheduled_requests.generation_requests):

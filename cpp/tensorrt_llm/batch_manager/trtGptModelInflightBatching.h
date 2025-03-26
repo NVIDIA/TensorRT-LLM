@@ -80,6 +80,7 @@ class GenerateRequestOptions;
 class LogitsPostProcessor;
 class MakeDecodingBatchInputOutput;
 class CreateNewDecoderRequests;
+class UpdateDecoderBuffers;
 
 namespace utils
 {
@@ -286,7 +287,6 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, DecoderFinishedEventPtr decoderFinishEvent);
 
-    DecoderFinishedEventPtr updateDecoderBuffers(bool returnLogProbs, DecoderFinishedEventPtr decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -550,6 +550,7 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::LogitsPostProcessor const> mLogitsPostProcessor;
     std::unique_ptr<tensorrt_llm::batch_manager::MakeDecodingBatchInputOutput const> mMakeDecodingBatchInputOutput;
     std::unique_ptr<tensorrt_llm::batch_manager::CreateNewDecoderRequests const> mCreateNewDecoderRequests;
+    std::unique_ptr<tensorrt_llm::batch_manager::UpdateDecoderBuffers const> mUpdateDecoderBuffers;
 };
 
 } // namespace tensorrt_llm::batch_manager

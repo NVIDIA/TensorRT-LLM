@@ -18,6 +18,7 @@
 #include "bindings.h"
 #include "tensorrt_llm/kernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -323,7 +324,7 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::DecodingInput>(m, "DecodingInput");
     py::class_<tr::DecodingOutput>(m, "DecodingOutput");
 
-    py::class_<tr::decoder_batch::DecoderFinishedEvent>(m, "Token")
+    py::classh<tr::decoder_batch::DecoderFinishedEvent>(m, "DecoderFinishedEvent")
         .def(py::init(
             [](CudaStreamPtr stream, std::vector<bool> const& active)
             {
