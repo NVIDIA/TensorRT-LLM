@@ -1,4 +1,5 @@
 import os
+import weakref
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Optional
 
@@ -170,9 +171,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
-            extra_attrs["attention_metadata"] = self
+            extra_attrs["attention_metadata"] = weakref.ref(self)
         else:
-            get_global_attrs().attention_metadata = self
+            get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
@@ -438,9 +439,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
-            metadata = extra_attrs.get("attention_metadata", None)
+            metadata = extra_attrs.get("attention_metadata",
+                                       weakref.ref(None))()
         else:
-            metadata = get_global_attrs().attention_metadata
+            metadata = get_global_attrs().attention_metadata()
 
         q = q.view(-1, num_heads, head_dim)
         if k is not None:

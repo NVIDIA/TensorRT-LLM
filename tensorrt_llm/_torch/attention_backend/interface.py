@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
+from weakref import WeakValueDictionary
 
 import torch
 from typing_extensions import Self
@@ -347,7 +348,8 @@ class RopeParams:
 
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
-            cache = extra_attrs.setdefault("rope_const_params", {})
+            cache = extra_attrs.setdefault("rope_const_params",
+                                           WeakValueDictionary())
             rope_const_params = cache.get((self, interleave), None)
             if rope_const_params is not None:
                 return rope_const_params
