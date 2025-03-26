@@ -94,11 +94,25 @@ void initConfigBindings(pybind11::module_& m)
         .def_property_readonly("dynamic_batch_config", &tle::SchedulerConfig::getDynamicBatchConfig)
         .def(py::pickle(schedulerConfigGetstate, schedulerConfigSetstate));
 
+    auto runtimeDefaultsGetstate = [](RuntimeDefaults const& self)
+    {
+        return py::make_tuple(self.maxAttentionWindowVec, self.sinkTokenLength);
+    };
+    auto runtimeDefaultsSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 2)
+        {
+            throw std::runtime_error("Invalid state!");
+        }
+        return RuntimeDefaults(state[0].cast<std::optional<std::vector<SizeType32>>>(),
+            state[1].cast<std::optional<SizeType32>>());
+    };
     py::class_<RuntimeDefaults>(m, "RuntimeDefaults")
         .def(py::init<std::optional<std::vector<SizeType32>>, std::optional<SizeType32>>(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none())
         .def_readonly("max_attention_window", &RuntimeDefaults::maxAttentionWindowVec)
-        .def_readonly("sink_token_length", &RuntimeDefaults::sinkTokenLength);
+        .def_readonly("sink_token_length", &RuntimeDefaults::sinkTokenLength)
+        .def(py::pickle(runtimeDefaultsGetstate, runtimeDefaultsSetstate));
 
     auto kvCacheConfigGetstate = [](tle::KvCacheConfig const& self)
     {
