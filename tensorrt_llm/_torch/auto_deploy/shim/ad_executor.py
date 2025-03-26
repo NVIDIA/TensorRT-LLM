@@ -62,6 +62,7 @@ class _CacheManagerWithFakePool(KVCacheManager):
         # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks
         # just like in the original implementation. However, let's wait for the layer-wise attention
         # implementation before over-optimizing the function here
+        ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
         return self.num_blocks, 0
 
 
@@ -86,6 +87,7 @@ class ADEngine(ModelEngine):
         device: DeviceLikeType,
     ):
         """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
+
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
         factory = ModelFactoryRegistry.get("hf")(
@@ -95,15 +97,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct inference optimizer
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
-        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
-        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
-            compile_backend = "torch-opt"
-        else:
-            compile_backend = "torch-simple"
-        build_and_optimize = InferenceOptimizer(
-            factory=factory, attn_backend=ad_config.attn_backend, compile_backend=compile_backend
-        )
+        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         engine = cls(build_and_optimize, seq_info, device)

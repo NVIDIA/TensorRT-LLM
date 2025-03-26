@@ -6,6 +6,7 @@ object-oriented interface to the high-level runtime via the SequenceInfo datacla
 is also responsible for functionalizing information about the sequence and pass it on the the
 various attention interface. The AttentionDescriptor is the main interface to the attention operator
 and operates on a purely functional paradigm that is compatible with the torch custom op system.
+
 """
 
 from abc import ABC, abstractmethod
@@ -121,7 +122,9 @@ class SequenceInfo:
             self.page_size = self.max_seq_len
         if self.max_num_tokens < 1:
             self.max_num_tokens = self.max_batch_size * self.max_seq_len
-        total_tokens = self.max_batch_size * self.page_size
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
+        # we use the provided max_num_tokens to calculate the number of pages
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
@@ -190,6 +193,12 @@ class SequenceInfo:
     @property
     def num_pages(self) -> int:
         return self._num_pages
+
+    @num_pages.setter
+    def num_pages(self, value):
+        self._num_pages = value
+        # update the cache_loc tensor
+        self.cache_loc.resize_(value)
 
     @property
     def is_paged(self) -> bool:
@@ -306,6 +315,19 @@ class SequenceInfo:
         self.nest_sequences(input_ids)
         self.input_ids = input_ids
 
+    def _set_max_num_tokens_sample(self) -> None:
+        """Set an example sequence with max_num_tokens."""
+        self.reset()
+        seq_len = self.max_num_tokens // self.max_batch_size
+        input_ids = torch.ones(
+            self.max_batch_size,
+            seq_len,
+            dtype=torch.int,
+            device=self.device,
+        )
+        self.pages_per_seq.fill_(seq_len // self.page_size)
+        self.nest_sequences(input_ids)
+
     def _set_generate_only_batch(self) -> None:
         """Set an example sequence for generate-only batch."""
         self.reset()
@@ -319,16 +341,14 @@ class SequenceInfo:
         # set new sequence lengths
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
-        self.seq_len[: len(seq_lens)] = torch.tensor(seq_lens, device=self.device)
+        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
 
         # set new input_ids as new tensor from flattened input_ids
         ids_tnsr_list = [
-            lst.detach().to(self.device)
-            if isinstance(lst, torch.Tensor)
-            else torch.tensor(lst, dtype=torch.int, device=self.device)
+            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
             for lst in input_ids
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0)
+        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens
@@ -362,10 +382,10 @@ class SequenceInfo:
         cache_loc_flat = torch.tensor(
             [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
         )
-        self.cache_loc[: len(cache_loc_flat)] = cache_loc_flat.to(self.device)
+        self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
         pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
-        self.pages_per_seq[: len(pages_per_seq)] = pages_per_seq.to(self.device)
+        self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 
 Constant = Union[int, float, str, None]
