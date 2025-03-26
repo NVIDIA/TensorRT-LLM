@@ -11,7 +11,8 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
     AssignReqSeqSlots, CreateNewDecoderRequests, GenerateRequestOptions,
-    HandleContextLogits, HandleGenerationLogits, MakeDecodingBatchInputOutput)
+    HandleContextLogits, HandleGenerationLogits, MakeDecodingBatchInputOutput,
+    UpdateDecoderBuffers)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers,
                                                           SequenceSlotManager)
@@ -436,8 +437,6 @@ class TRTLLMDecoder(Decoder):
             self.store["torch_stream"].cuda_stream)
         self.store["buffer_manager"] = BufferManager(
             stream=self.store["cuda_stream"])
-        self.store["seq_slot_manager"] = SequenceSlotManager(
-            self.max_num_sequences, self.max_seq_idle_microseconds)
         self.store["decoder_buffers"] = DecoderBuffers(
             self.max_num_sequences, self.executor_config.max_beam_width,
             self.max_attention_window, self.executor_config.max_seq_len,
@@ -464,7 +463,6 @@ class TRTLLMDecoder(Decoder):
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)
-        self.algs.assign_req_seq_slots = AssignReqSeqSlots()
         self.algs.generate_request_options = GenerateRequestOptions(
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
@@ -474,13 +472,12 @@ class TRTLLMDecoder(Decoder):
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
-        self.algs.update_decoder_buffers = tllm.internal.algorithms.UpdateDecoderBuffers(
+        self.algs.update_decoder_buffers = UpdateDecoderBuffers(
         )
 
     def setup_decoder(self, scheduled_requests: ScheduledRequests,
                       model_outputs):
         self.batch_size = scheduled_requests.batch_size
-
         for req in itertools.chain(scheduled_requests.context_requests,
                                    scheduled_requests.generation_requests):
             self.beam_width = req.sampling_config.beam_width
@@ -490,11 +487,6 @@ class TRTLLMDecoder(Decoder):
             (self.batch_size, self.beam_width, -1))
 
         with torch.inference_mode():
-            self.algs.assign_req_seq_slots(
-                self.store["seq_slot_manager"],
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests)
-
             batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
                 self.model_config, self.world_config, self.decoding_config,
                 scheduled_requests.context_requests,
@@ -521,10 +513,12 @@ class TRTLLMDecoder(Decoder):
                 scheduled_requests.context_requests, num_context_logits, logits,
                 self.store["decoder_buffers"], self.model_config,
                 self.store["buffer_manager"], self.store["cuda_stream"])
+
             self.algs.handle_generation_logits(
                 logits_index, scheduled_requests.generation_requests,
                 self.store["decoder_buffers"], self.model_config,
                 self.store["buffer_manager"], logits)
+
             decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
                 scheduled_requests.context_requests,
                 scheduled_requests.generation_requests,
@@ -532,12 +526,18 @@ class TRTLLMDecoder(Decoder):
                 self.store["decoder_input_buffers"], self.model_config,
                 self.max_num_sequences, self.beam_width,
                 self.store["buffer_manager"], self.store["cuda_stream"])
+
             decoder_finish_event = self.algs.decoder.forward_async(
                 self.decoding_output, decoding_input)
+
             self.decoder_event = self.algs.update_decoder_buffers(
                 self.model_config, self.store["decoder_buffers"],
                 self.store["buffer_manager"], self.algs.decoder, False,
                 decoder_finish_event)
+
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
+        pass
 
     def update_requests(self, scheduled_requests: ScheduledRequests):
         self.decoder_event.synchronize()
@@ -584,10 +584,6 @@ class TRTLLMDecoder(Decoder):
 
             if finished_sum_host[seq_slot] == self.beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
-
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs):
-        pass
 
     def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
         self.update_requests(scheduled_requests)
