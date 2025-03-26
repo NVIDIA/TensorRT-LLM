@@ -597,17 +597,6 @@ def mamba_example_root(llm_root, llm_venv):
     ])
 
 
-@pytest.fixture(scope="module")
-def dbrx_example_root(llm_root, llm_venv):
-    "Get dbrx example root"
-    example_root = os.path.join(llm_root, "examples", "dbrx")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
 
 @pytest.fixture(scope="module")
 def jais_example_root(llm_root, llm_venv):
@@ -1785,15 +1774,6 @@ def llm_qwen_model_root(request, llm_venv):
     assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
 
     return qwen_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_dbrx_model_root(request):
-    models_root = llm_models_root()
-    model_name = request.param
-    dbrx_model_root = os.path.join(models_root, model_name)
-    assert exists(dbrx_model_root), f"{dbrx_model_root} does not exist!"
-    return dbrx_model_root
 
 
 @pytest.fixture(scope="function")
