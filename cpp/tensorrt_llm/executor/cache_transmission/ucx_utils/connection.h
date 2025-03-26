@@ -17,24 +17,52 @@
 
 #pragma once
 
+#include "ucxx/api.h"
+#include "ucxx/utils/sockaddr.h"
+#include "ucxx/utils/ucx.h"
+#include <cstdint>
+#if __linux__
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#endif
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include <memory>
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
+class UcxConnectionManager;
 
-extern "C"
+class UcxConnection : public Connection
 {
-    [[nodiscard]] std::unique_ptr<ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm);
-}
+public:
+    UcxConnection() = default;
+    explicit UcxConnection(
+        uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager);
+    void sendGID();
+    void send(DataContext const& ctx, void const* data, size_t size) const override;
+    void recv(DataContext const& ctx, void* data, size_t size) const override;
+    friend class UcxConnectionManager;
 
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
+private:
+    void initializeEndpointTag(int maxTryTimes = 10);
+
+    // a send tag is defined as:
+    // | local port (16 bits) | remote port (16 bits) | truncated request id (16 bits) | UCXComm flags (16 bits) |
+    // a recv tag is defined as:
+    // | remote port (16 bits) | local port (16 bits) | truncated request id (16 bits) | UCXComm flags (16 bits) |
+    ucxx::Tag mSendTag{0};
+    ucxx::Tag mRecvTag{0};
+
+    mutable std::mutex mMtx;
+    mutable std::condition_variable mCv;
+    uint64_t mConnectionId;
+    uint64_t mLocalGID;
+    uint64_t mRemoteGID;
+    std::shared_ptr<ucxx::Endpoint> mEndpoint;
+    UcxConnectionManager* mManager;
+};
 
 } // namespace tensorrt_llm::executor::kv_cache
