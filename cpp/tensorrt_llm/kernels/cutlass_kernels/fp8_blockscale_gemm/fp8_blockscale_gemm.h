@@ -21,7 +21,7 @@
 #include <vector>
 
 // non-persistent-cooperative GEMM
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 class CutlassFp8BlockScaleGemmRunnerInterface
@@ -127,4 +127,4 @@ private:
     int64_t expected_m_ = 0;
 };
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

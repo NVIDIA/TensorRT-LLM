@@ -152,7 +152,7 @@ __inline__ __device__ uint32_t elect_one_sync([[maybe_unused]] int lane_id)
 
 } // namespace kernel_utils
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 template <typename T>
@@ -1813,4 +1813,4 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
 }
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

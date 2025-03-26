@@ -18,7 +18,7 @@
 #include "fp8_blockscale_gemm_kernel.cuh"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -321,4 +321,4 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

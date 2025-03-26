@@ -22,7 +22,7 @@
 
 #include <optional>
 
-using namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open;
+using namespace tensorrt_llm::kernels::fp8_blockscale_gemm;
 using namespace tensorrt_llm::kernels;
 
 namespace torch_ext
