@@ -381,57 +381,9 @@ def gptj_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def chatglm_6b_example_root(llm_root, llm_venv):
-    "Get chatglm-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def chatglm2_6b_example_root(llm_root, llm_venv):
-    "Get chatglm2-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def chatglm3_6b_example_root(llm_root, llm_venv):
-    "Get chatglm3-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def glm_10b_example_root(llm_root, llm_venv):
-    "Get glm-10b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def glm_4_9b_example_root(llm_root, llm_venv):
     "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
+    example_root = os.path.join(llm_root, "examples", "glm-4-9b")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -1494,46 +1446,6 @@ def llm_gpt2_next_8b_model_root():
     raise RuntimeError("gpt-next 8b must be cached")
 
 
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("chatglm-6b", True)
-def llm_chatglm_6b_model_root(llm_venv):
-    "prepare chatglm-6b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "chatglm-6b")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_chatglm2_6b_model_root(request):
-    "prepare chatglm2_6b models"
-    model_name = request.param
-    models_root = llm_models_root()
-    if model_name == "chatglm2-6b":
-        model_root = os.path.join(models_root, "chatglm2-6b")
-    elif model_name == "chatglm2-6b-32k":
-        model_root = os.path.join(models_root, "chatglm2-6b-32k")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_chatglm3_6b_model_root(request):
-    "prepare chatglm3-6b model & return model path"
-    model_name = request.param
-    models_root = llm_models_root()
-    if model_name == "chatglm3-6b":
-        model_root = os.path.join(models_root, "chatglm3-6b")
-    elif model_name == "chatglm3-6b-32k":
-        model_root = os.path.join(models_root, "chatglm3-6b-32k")
-    elif model_name == "chatglm3-6b-base":
-        model_root = os.path.join(models_root, "chatglm3-6b-base")
-    elif model_name == "chatglm3-6b-128k":
-        model_root = os.path.join(models_root, "chatglm3-6b-128k")
-
-    return model_root
-
-
 @pytest.fixture(scope="function")
 def llm_glm_4_9b_model_root(request):
     "prepare glm-4-9b model & return model path"
@@ -1547,16 +1459,6 @@ def llm_glm_4_9b_model_root(request):
         model_root = os.path.join(models_root, "glm-4-9b-chat-1m")
     elif model_name == "glm-4v-9b":
         model_root = os.path.join(models_root, "glm-4v-9b")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("glm-10b", True)
-def llm_glm_10b_model_root(llm_venv):
-    "prepare glm-10b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "glm-10b")
 
     return model_root
 
