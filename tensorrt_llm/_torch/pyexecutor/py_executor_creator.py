@@ -242,10 +242,12 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         spec_decoder = None
 
+    if mapping.is_last_pp_rank(
+    ) and executor_config.guided_decoding_config is not None and spec_config is not None:
+        raise ValueError(
+            "Guided decoding is not supported with speculative decoding.")
+
     if mapping.is_last_pp_rank():
-        if spec_config is not None:
-            raise ValueError(
-                "Guided decoding does not support with speculative decoding.")
         resources[
             "guided_decoder_resource_manager"] = GuidedDecoderResourceManager(
                 executor_config.max_batch_size)
