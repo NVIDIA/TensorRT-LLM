@@ -29,8 +29,7 @@ class GuidedDecoderResourceManager(BaseResourceManager):
                 self.slot_manager.add_slot(llm_req)
 
     def free_resources(self, request: LlmRequest) -> None:
-        if request.guided_decoding_params is not None:
-            self.slot_manager.remove_slot(request)
+        self.slot_manager.remove_slot(request)
 
 
 class GuidedDecoder:
