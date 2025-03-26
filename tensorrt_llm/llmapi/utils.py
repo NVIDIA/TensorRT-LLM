@@ -522,6 +522,11 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
     }
 
     for field_name, field_info in schema['properties'].items():
+        if field_name.startswith("_"):  # skip private fields
+            continue
+        if field_info.get("deprecated", False):
+            continue
+
         field_type = field_info.get('type', None)
         field_description = field_info.get('description', '')
         field_default = field_info.get('default', None)
@@ -552,8 +557,7 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
         if not field_required or field_default is not None:
             default_str = str(
                 field_default) if field_default is not None else "None"
-            docstring_lines.append(
-                f"{indent}        Defaults to {default_str}.")
+            docstring_lines[-1] += f" Defaults to {default_str}."
 
     if include_annotations:
         docstring_lines.append("")  # Empty line before Returns

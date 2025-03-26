@@ -126,9 +126,9 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
-        print_colored_debug(
-            f"LLM.args._mpi_session: {self.args._mpi_session}\n", "yellow")
-        self.mpi_session = self.args._mpi_session
+        print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
+                            "yellow")
+        self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
             if get_device_count(
@@ -575,8 +575,8 @@ class LLM:
                 self.args.parallel_config.world_size),
             return_logits=return_logits,
             postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args._num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
+                num_postprocess_workers=self.args.num_postprocess_workers,
+                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True)
 

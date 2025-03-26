@@ -1,6 +1,7 @@
 methods:
   __init__:
     parameters:
+      # Explicit arguments
       model:
         annotation: Union[str, pathlib.Path]
         default: inspect._empty
@@ -29,6 +30,7 @@ methods:
       tokenizer_revision:
         annotation: Optional[str]
         default: null
+      # Parallelism
       pipeline_parallel_size:
         annotation: int
         default: 1
@@ -80,6 +82,22 @@ methods:
         annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
           tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
+      # generation constraints
+      max_batch_size:
+        annotation: Optional[int]
+        default: null
+      max_input_len:
+        annotation: int
+        default: 1024
+      max_seq_len:
+        annotation: Optional[int]
+        default: null
+      max_beam_width:
+        annotation: int
+        default: 1
+      max_num_tokens:
+        annotation: Optional[int]
+        default: null
       # Misc
       load_format:
         annotation: Literal['auto', 'dummy']
@@ -90,6 +108,9 @@ methods:
       enable_chunked_prefill:
         annotation: bool
         default: false
+      kv_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        default: null
     return_annotation: None
   generate:
     parameters:

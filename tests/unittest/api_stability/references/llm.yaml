@@ -1,9 +1,67 @@
 methods:
   __init__:
-    kwargs:
-      annotation: Any
-      default: inspect._empty
-    parameters: {}
+    parameters:
+      gpus_per_node:
+        annotation: Optional[int]
+        default: null
+      enable_attention_dp:
+        annotation: bool
+        default: false
+      cp_config:
+        annotation: Optional[dict]
+        default: null
+      auto_parallel:
+        annotation: bool
+        default: false
+      auto_parallel_world_size:
+        annotation: int
+        default: 1
+      build_config:
+        annotation: Optional[tensorrt_llm.BuildConfig]
+        default: null
+      kwargs:
+        annotation: Any
+        default: inspect._empty
+      iter_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      request_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      workspace:
+        annotation: Optional[str]
+        default: null
+      embedding_parallel_mode:
+        annotation: str
+        default: 'SHARDING_ALONG_VOCAB'
+      fast_build:
+        annotation: bool
+        default: false
+      enable_build_cache:
+        annotation: Union[tensorrt_llm.llmapi.llm_utils.BuildCacheConfig, bool]
+        default: false
+      peft_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
+        default: null
+      scheduler_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        default: null
+      batching_type:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
+        default: null
+      normalize_log_probs:
+        annotation: bool
+        default: false
+      gather_generation_logits:
+        annotation: bool
+        default: false
+      extended_runtime_perf_knob_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
+        default: null
+      backend:
+        annotation: Optional[str]
+        default: null
+
     return_annotation: None
   generate:
     parameters:

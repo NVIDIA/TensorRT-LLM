@@ -2,6 +2,7 @@ from types import MethodType
 from typing import Optional
 
 import pytest
+import yaml
 from api_stability_core import (ApiStabilityTestHarness, ClassSnapshot,
                                 MethodSnapshot)
 
@@ -9,7 +10,6 @@ from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput)
-from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
@@ -160,9 +160,43 @@ class TestLLM(ApiStabilityTestHarness):
             self.test_docstring()
 
 
-class TestLlmArgs(ApiStabilityTestHarness):
-    TEST_CLASS = LlmArgs
-    REFERENCE_FILE = "llm_args.yaml"
+class TestLLMFineGrainedError(ApiStabilityTestHarness):
+    TEST_CLASS = LLM
+    ORIGINAL_FILE = "llm.yaml"
+    REFERENCE_FILE = "llm_fine_grained_error.yaml"
+
+    @classmethod
+    def setup_class(cls):
+        # generate a wrong committed yaml file
+        with open(f"{cls.REFERENCE_COMMITTED_DIR}/{cls.ORIGINAL_FILE}") as f:
+            original_yaml = yaml.safe_load(f)
+            # change the dtype of max_batch_size to float
+            original_yaml["methods"]["__init__"]["parameters"][
+                "max_batch_size"]["annotation"] = "float"
+        with open(f"{cls.REFERENCE_COMMITTED_DIR}/{cls.REFERENCE_FILE}",
+                  "w") as f:
+            yaml.dump(original_yaml, f)
+
+        # generate a dummy reference yaml file
+        with open(f"{cls.REFERENCE_DIR}/{cls.ORIGINAL_FILE}") as f:
+            original_yaml = yaml.safe_load(f)
+        with open(f"{cls.REFERENCE_DIR}/{cls.REFERENCE_FILE}", "w") as f:
+            yaml.dump(original_yaml, f)
+
+        super().setup_class()
+
+    def test_modified_init(self, mocker):
+        with pytest.raises(AssertionError) as e:
+            super().test_docstring()
+
+        assert "LLM.max_batch_size annotation: typing.Optional[int] != <class 'float'>" in str(
+            e.value.__cause__)
+
+    def test_docstring(self):
+        pass
+
+    def test_signature(self):
+        pass
 
 
 class TestCompletionOutput(ApiStabilityTestHarness):

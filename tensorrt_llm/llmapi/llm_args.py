@@ -30,7 +30,6 @@ from ..bindings.executor import PeftCacheConfig as _PeftCacheConfig
 from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
-from ..llmapi.mpi_session import MpiSession
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
@@ -39,7 +38,8 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import generate_api_docs_as_docstring, get_type_repr
+from .utils import (generate_api_docs_as_docstring, get_type_repr,
+                    print_traceback_on_error)
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
@@ -677,7 +677,7 @@ class _ModelWrapper:
 class LlmArgs(BaseModel):
     model_config = {
         "arbitrary_types_allowed": True,
-        "underscore_attrs_are_private": True
+        "extra": "allow",
     }
 
     # Explicit arguments
@@ -689,11 +689,13 @@ class LlmArgs(BaseModel):
     tokenizer: Optional[Union[
         str, Path, TokenizerBase, PreTrainedTokenizerBase]] = Field(
             description=
-            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub."
-        )
+            "The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub.",
+            default=None)
 
     tokenizer_mode: Literal['auto', 'slow'] = Field(
-        default='auto', description="The mode to initialize the tokenizer.")
+        default='auto',
+        description="The mode to initialize the tokenizer.",
+        json_schema_extra={"type": "Literal['auto', 'slow']"})
 
     skip_tokenizer_init: bool = Field(
         default=False,
@@ -736,17 +738,19 @@ class LlmArgs(BaseModel):
     enable_attention_dp: bool = Field(
         default=False, description="Enable attention data parallel.")
 
-    cp_config: Optional[dict] = Field(default=None,
+    cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.")
 
     auto_parallel: bool = Field(default=False,
                                 description="Enable auto parallel mode.")
 
-    auto_parallel_world_size: int = Field(
-        default=1, description="The world size for auto parallel mode.")
+    auto_parallel_world_size: Optional[int] = Field(
+        default=None, description="The world size for auto parallel mode.")
 
     load_format: Literal['auto', 'dummy'] = Field(
-        default='auto', description="The format to load the model.")
+        default='auto',
+        description="The format to load the model.",
+        json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
     enable_tqdm: bool = Field(default=False,
                               description="Enable tqdm for progress bar.")
@@ -818,9 +822,12 @@ class LlmArgs(BaseModel):
     fast_build: bool = Field(default=False, description="Enable fast build.")
 
     # Once set, the model will reuse the build_cache
-    enable_build_cache: Union[BuildCacheConfig,
-                              bool] = Field(default=False,
-                                            description="Enable build cache.")
+    enable_build_cache: object = Field(
+        default=False,
+        description="Enable build cache.",
+        json_schema_extra={
+            "type": f"Union[{get_type_repr(BuildCacheConfig)}, bool]"
+        })
 
     peft_cache_config: Optional[PeftCacheConfig] = Field(
         default=None, description="PEFT cache config.")
@@ -854,8 +861,8 @@ class LlmArgs(BaseModel):
     max_input_len: int = Field(default=1024,
                                description="The maximum input length.")
 
-    max_seq_len: int = Field(default=None,
-                             description="The maximum sequence length.")
+    max_seq_len: Optional[int] = Field(
+        default=None, description="The maximum sequence length.")
 
     max_beam_width: int = Field(default=1,
                                 description="The maximum beam width.")
@@ -864,14 +871,10 @@ class LlmArgs(BaseModel):
         default=None, description="The maximum number of tokens.")
 
     backend: Optional[str] = Field(default=None,
-                                   description="The backend to use.")
+                                   description="The backend to use.",
+                                   exclude=True)
 
-    mpi_session: Optional[object] = Field(
-        default=None,
-        description="The optional MPI session to use for this LLM instance.",
-        alias="_mpi_session",
-        json_schema_extra={"type": get_type_repr(MpiSession)})
-
+    # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
         description="The number of postprocess worker processes.",
@@ -882,21 +885,23 @@ class LlmArgs(BaseModel):
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
 
-    def __init__(self,
-                 decoding_config: Optional[DecodingConfig] = None,
-                 **kwargs: Any):
-        super().__init__(**kwargs)
-        self._decoding_config = decoding_config
+    # TODO[Superjomn]: To deprecate this config.
+    decoding_config: Optional[object] = Field(
+        default=None,
+        description="The decoding config.",
+        json_schema_extra={"type": "Optional[DecodingConfig]"},
+        deprecated="Use speculative_config instead.",
+    )
 
-    @property
-    def decoding_config(self) -> Optional[DecodingConfig]:
-        return self._decoding_config
+    mpi_session: Optional[object] = Field(
+        default=None,
+        description="The optional MPI session to use for this LLM instance.",
+        json_schema_extra={"type": "Optional[MpiSession]"},
+        exclude=True,  # exclude from serialization
+        alias="_mpi_session")
 
-    @decoding_config.setter
-    def decoding_config(self, decoding_config: Optional[DecodingConfig]):
-        self._decoding_config = decoding_config
-
-    def __post_init__(self):
+    @print_traceback_on_error
+    def model_post_init(self, __context: Any):
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -923,9 +928,6 @@ class LlmArgs(BaseModel):
 
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
-
-        if self.cp_config is None:
-            self.cp_config = {}
 
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
@@ -992,7 +994,7 @@ class LlmArgs(BaseModel):
                                     if not attr.startswith('_')
                                     and callable(getattr(ExecutorConfig, attr)))
         executor_config_attrs -= black_list
-        llm_args_attr = set([f.name for f in fields(LlmArgs)])
+        llm_args_attr = set(LlmArgs.model_fields.keys())
         # NOTE: When cpp ExecutorConfig add new options, please add the new options into `_LlmArgs` with docs as well
         # ASK chunweiy for help if you are not sure about the new options.
         assert executor_config_attrs.issubset(
@@ -1008,8 +1010,8 @@ class LlmArgs(BaseModel):
             ]:
                 build_val = getattr(kwargs_dict["build_config"], field_name,
                                     None)
-                llmargs_val = kwargs_dict.get(field_name) or getattr(
-                    LlmArgs, field_name)
+                llmargs_val = kwargs_dict.get(
+                    field_name) or LlmArgs.model_fields[field_name]
 
                 if build_val != llmargs_val:
                     logger.warning(
