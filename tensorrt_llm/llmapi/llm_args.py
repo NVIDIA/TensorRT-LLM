@@ -2068,6 +2068,7 @@ class BaseLlmArgs(StrictBaseModel):
                         "The build_config is ignored for model format of TLLM_ENGINE."
                     )
                 self._load_config_from_engine(model_obj.model_dir)
+
                 runtime_defaults = self._pretrained_config.runtime_defaults
                 if runtime_defaults:
                     self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
