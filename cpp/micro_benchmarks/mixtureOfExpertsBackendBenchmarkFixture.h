@@ -625,7 +625,7 @@ public:
         GemmProfilerBackend profiler;
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
             typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
-            mUseLora, parallelism_config);
+            mUseLora, /*min_latency_mode=*/false, parallelism_config);
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 
@@ -729,11 +729,12 @@ public:
     void runMoEPermute(MOEParallelismConfig parallelism_config)
     {
         auto stream = streamPtr->get();
+        MoeMinLatencyParams min_latency_params;
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExperts, mUseFinalScale ? mScaleProbs : nullptr,
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
             parallelism_config, mUseLora, mLoraParams,
-            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, stream);
+            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
     }
 
     void runBenchmark(benchmark::State& state);

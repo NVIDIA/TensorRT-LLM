@@ -415,6 +415,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             config.num_hidden_layers)[0]
         global_layer_idx = pp_layer_offset + layer_idx
 
+        self.is_nvfp4 = model_config.quant_config.layer_quant_mode.has_nvfp4()
+
         if (config.n_routed_experts is not None
                 and global_layer_idx >= config.first_k_dense_replace
                 and global_layer_idx % config.moe_layer_freq == 0):
@@ -447,8 +449,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     gpus_per_node,  # Avoid costly inter-node TP
                 )
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and model_config.quant_config.layer_quant_mode.has_nvfp4(
-            ) and not self.enable_attention_dp
+            ) and self.is_nvfp4 and not self.enable_attention_dp
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not self.enable_attention_dp and not model_config.mapping.has_pp(
             )
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
@@ -498,7 +499,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             0) > 128
 
         min_latency_mode = True if hidden_states.size(
-            0) <= 128 and self.fusion_config.POST_MOE_FUSION else False
+            0
+        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -755,7 +757,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Fully Connected
         hidden_states = self.mlp(
             hidden_states,
-            spec_metadata.all_rank_num_tokens,
+            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION or self.parallel_config.
                 tensor_parallel_size == 1 or self.enable_attention_dp)),
