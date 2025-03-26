@@ -108,6 +108,8 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
+    void resetKvCache(kv_cache_manager::BaseKVCacheManager* cacheManager);
+
 private:
     void initializeCommState();
 
@@ -129,6 +131,8 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    bool mIsMLA{false};
+    SizeType32 mRank{0};
 };
 
 } // namespace tensorrt_llm::batch_manager
