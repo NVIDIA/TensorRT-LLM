@@ -229,10 +229,18 @@ public:
         EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
     template <typename T>
-    int ulyssesGenerationPreprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, T*& input, cudaStream_t stream);
+    int ulyssesContextPreprocess(T const* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
 
     template <typename T>
-    int ulyssesGenerationPostprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, void* output, cudaStream_t stream);
+    int ulyssesContextPostprocess(T* input, T* output, T* buffer, EnqueueContextParams<T> const& params,
+        int const* cu_q_seqlens, int const* cu_cp_partial_seqlens, cudaStream_t stream);
+
+    template <typename T>
+    int ulyssesGenerationPreprocess(T const* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
+
+    template <typename T>
+    int ulyssesGenerationPostprocess(T* input, T* output, T* buffer, int32_t batch_beam, cudaStream_t stream);
 
     [[nodiscard]] bool isRelativePosition() const
     {
@@ -374,6 +382,16 @@ public:
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCpGroup = {};
+    // These parameters are used to specifically configure the attention attributes when cp/tp_size are different
+    // between Attention and FFN(such as Ulysses)
+    int mNumAttnHeads = -1;
+    int mNumAttnKVHeads = -1;
+    int mNumKVHeadsOrigin = -1;
+    int mAttnTpSize = -1;
+    int mAttnTpRank = 0;
+    int mAttnCpSize = -1;
+    int mAttnCpRank = 0;
+    int mUlyssesMQABroadcast = 1;
 
     // fmha runner (enabled by default)
     // flag: disabled = 0, enabled = 1, enabled with fp32 accumulation = 2
@@ -403,8 +421,9 @@ public:
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
             mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mUseFlashMLA, mMLAParams.data(), mCpSize, mCpRank,
-            mCpGroup, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn,
-            mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize,
+            mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA,
+            mUseKVCache, mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
     };
 
 private:

@@ -123,9 +123,6 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_cuda_graph # 1 min
   - accuracy/test_accuracy.py::TestGpt2::test_context_fmha_disabled # 1 min
   - accuracy/test_accuracy.py::TestGptNext::test_auto_dtype # 1.5 mins
-  - accuracy/test_accuracy.py::TestGptJ6B::test_float32 # 4 mins
-  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache
-  - accuracy/test_accuracy.py::TestGptJ6B::test_cyclic_kv_cache_beam_search
   - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_accuracy.py::TestMamba130M::test_auto_dtype # 1 min
   - accuracy/test_accuracy.py::TestVicuna7B::test_lookahead # 5 mins
@@ -139,11 +136,14 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
+  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_float32
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context_ppl
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_autoq
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache
+  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
