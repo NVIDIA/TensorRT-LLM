@@ -341,16 +341,14 @@ class SequenceInfo:
         # set new sequence lengths
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
-        self.seq_len[: len(seq_lens)] = torch.tensor(seq_lens, device=self.device)
+        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
 
         # set new input_ids as new tensor from flattened input_ids
         ids_tnsr_list = [
-            lst.detach().to(self.device)
-            if isinstance(lst, torch.Tensor)
-            else torch.tensor(lst, dtype=torch.int, device=self.device)
+            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
             for lst in input_ids
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0)
+        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens
@@ -384,10 +382,10 @@ class SequenceInfo:
         cache_loc_flat = torch.tensor(
             [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
         )
-        self.cache_loc[: len(cache_loc_flat)] = cache_loc_flat.to(self.device)
+        self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
         pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
-        self.pages_per_seq[: len(pages_per_seq)] = pages_per_seq.to(self.device)
+        self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 
 Constant = Union[int, float, str, None]
