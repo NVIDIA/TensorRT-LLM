@@ -46,12 +46,6 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using SharedConstPtr = ITensor::SharedConstPtr;
 
-    enum class ForwardType
-    {
-        kASYNC,
-        kSYNC
-    };
-
     GptDecoderBatched(
         CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
 
@@ -99,13 +93,10 @@ private:
     void setEagleInputs(decoder_batch::Input const& input);
 
     //! @brief Calls decoders for tokens per engine step
-    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input);
 
     //! @brief Prepare Input and Output for decoder step
     void prepareForward(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input);
-
-    //! @brief Calls decoder for whole batch
-    void forwardDecoder(DecodingOutput& output, DecodingInput const& input, ForwardType forwardType);
 
 private:
     CudaStreamPtr mRuntimeStream;

@@ -1,0 +1,27 @@
+methods:
+  __init__:
+    parameters:
+      index:
+        annotation: int
+        default: inspect._empty
+      text:
+        annotation: str
+        default: ''
+      token_ids:
+        annotation: Optional[List[int]]
+        default: null
+      finish_reason:
+        annotation: Optional[Literal['stop', 'length', 'timeout', 'cancelled']]
+        default: null
+      stop_reason:
+        annotation: Union[int, str, NoneType]
+        default: null
+      generation_logits:
+        annotation: Optional[torch.Tensor]
+        default: null
+      # TODO [TRTLLM-1049]
+      # logprobs:
+      #   annotation: Optional[SampleLogprobs]
+      #   default: null
+    return_annotation: None
+properties: {}

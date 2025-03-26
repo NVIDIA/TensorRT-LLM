@@ -82,8 +82,7 @@ public:
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig)
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
