@@ -51,11 +51,11 @@ else
 fi
 
 mpirun --allow-run-as-root -n ${NUM_RANKS} python3 ${EXAMPLE_DIR}/launch_disaggregated_workers.py -c ${CONFIG_FILE} &> output_workers &
-python3 ${EXAMPLE_DIR}/launch_disaggregated_server.py -c ${CONFIG_FILE}  &> output_disagg &
+python3 ${EXAMPLE_DIR}/launch_disaggregated_server.py  --server_start_timeout 900 -c ${CONFIG_FILE} &> output_disagg &
 
 for i in $(seq 1 ${NUM_ITERS}); do
-    python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 180
-    python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 180 --streaming -o output_streaming.json
+    python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950
+    python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950 --streaming -o output_streaming.json
 done
 
 echo "------------------"
