@@ -724,24 +724,25 @@ protected:
                 for (int genRank = mContextRankSize; genRank < mContextRankSize + mGenRankSize; genRank++)
                 {
                     int64_t bufferSize = buffer.size();
-                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
+                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
                         bufferSize, genRank);
                     tensorrt_llm::mpi::MpiComm::world().send(
                         &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
                     tensorrt_llm::mpi::MpiComm::world().send(
                         buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
-                    TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
+                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
                 }
             }
             if (mIsGeneration)
             {
                 int64_t bufferSize;
                 tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
-                TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
+                TLLM_LOG_DEBUG(
+                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
                 std::vector<char> recvBuffer(bufferSize);
                 tensorrt_llm::mpi::MpiComm::world().recv(
                     recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
-                TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
+                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
                 std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
                 su::VectorWrapBuf<char> strbuf(recvBuffer);
                 std::istream is(&strbuf);

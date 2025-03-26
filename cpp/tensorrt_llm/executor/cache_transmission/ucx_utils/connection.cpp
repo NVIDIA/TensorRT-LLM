@@ -64,7 +64,7 @@ UcxConnection::UcxConnection(
     mSendTagPrefix = mConnectionIdInPeer;
     mRecvTagPrefix = mConnectionId;
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "UcxConnection::UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -72,7 +72,7 @@ UcxConnection::UcxConnection(
 UcxConnection::~UcxConnection()
 {
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     // if(mFromRequester)
@@ -86,14 +86,14 @@ UcxConnection::~UcxConnection()
 
     // std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "END UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
 
 void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, size_t size) const
 {
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
     auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
@@ -108,7 +108,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     std::unique_lock<std::mutex> lk(mMtx);
     mCv.wait(lk, [&req]() { return req->isCompleted(); });
     req->checkError();
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
@@ -120,7 +120,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
         sendConnectionId(ctx, data, size);
         return;
     }
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 
@@ -133,7 +133,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     mCv.wait(lk, [&req]() { return req->isCompleted(); });
     // throw if there is error
     req->checkError();
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
@@ -141,7 +141,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
     // Guard to ensure CUDA context is initialized for UCX ops
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
@@ -152,7 +152,7 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     mCv.wait(lk, [&req]() { return req->isCompleted(); });
     // throw if there is error
     req->checkError();
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
 }
