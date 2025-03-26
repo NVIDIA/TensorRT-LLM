@@ -3,14 +3,15 @@ import os
 import subprocess
 import sys
 
-from tensorrt_llm.llmapi.disagg_utils import parse_disagg_config_file
+from tensorrt_llm.llmapi.disagg_utils import (get_server_configs_dict,
+                                              parse_disagg_config_file)
 
 
 def get_cmd(server_configs, args):
 
     if args.communication_protocol == "mpi":
-        #Total number of ranks parse on config file
-        total_ranks = sum(cfg.instance_num_ranks for cfg in server_configs)
+        #Get total number of ranks from config file
+        [total_ranks, _] = get_server_configs_dict(server_configs)
 
         cmd = "mpirun --allow-run-as-root"
         cmd += ' -n ' + str(

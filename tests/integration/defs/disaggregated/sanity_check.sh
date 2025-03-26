@@ -17,34 +17,24 @@ CLIENT_DIR=${EXAMPLE_DIR}/clients
 
 CONFIG_FILE=""
 if [[ "${TEST_DESC}" == "2_ranks" ]]; then
-  NUM_RANKS=2
   CONFIG_FILE=${EXAMPLE_DIR}/disagg_config.yaml
 elif [[ "${TEST_DESC}" == "cuda_graph" ]]; then
-  NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_cuda_graph_padding.yaml
 elif [[ "${TEST_DESC}" == "mixed" ]]; then
-  NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_mixed.yaml
 elif [[ "${TEST_DESC}" == "overlap" ]]; then
-  NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_overlap.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp_8_overlap_dp" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_overlap_dp.yaml
 elif [[ "${TEST_DESC}" == "4_ranks" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp1.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp_one" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp_one_mtp" ]]; then
-  NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one_mtp.yaml
 else
   echo "Invalid test description: ${TEST_DESC}"
