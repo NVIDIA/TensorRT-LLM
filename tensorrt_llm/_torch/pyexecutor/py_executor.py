@@ -833,7 +833,7 @@ class PyExecutor:
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
@@ -959,7 +959,7 @@ class PyExecutor:
                             "num_fitting_reqs =0 and fitting_disagg_gen_init_requests is empty , may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
@@ -1543,7 +1543,7 @@ class PyExecutor:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
 
-        self.kv_cache_transceiver.check_context_transfer_status(False)
+        self.kv_cache_transceiver.check_context_transfer_status(0)
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
