@@ -379,14 +379,6 @@ void initBindings(pybind11::module_& m)
             [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getFinishReasons()); });
 
     m.def(
-        "lamport_initialize_all",
-        [](intptr_t buffer_0, intptr_t buffer_1, intptr_t buffer_2, size_t size)
-        {
-            tr::lamportInitializeAll(reinterpret_cast<void*>(buffer_0), reinterpret_cast<void*>(buffer_1),
-                reinterpret_cast<void*>(buffer_2), size);
-        },
-        "Lamport initialize all buffers");
-    m.def(
         "lamport_initialize",
         [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },

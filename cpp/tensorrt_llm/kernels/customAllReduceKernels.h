@@ -31,7 +31,7 @@ constexpr size_t WARP_SIZE = 32;
 constexpr size_t MAX_ALL_REDUCE_BLOCKS = 24;
 // Use max modules to avoid overflow and ABA problem when the block num changes for barrier_flag
 // Not a perfect solution, but it has large chance that it is correct
-constexpr size_t MAX_ALL_REDUCE_MODULES = std::numeric_limits<uint32_t>::max() / 6 * 6;
+constexpr size_t MAX_ALL_REDUCE_MODULUS = std::numeric_limits<uint32_t>::max() / 6 * 6;
 constexpr size_t MAX_RANKS_PER_NODE = 16;
 constexpr size_t DEFAULT_BLOCK_SIZE = 512;
 
@@ -94,7 +94,6 @@ struct AllReduceFusionParams
     float eps;
     // new residual
     void* intermediate_buffer;
-    void* lamport_peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 3];
 };
 
 struct AllReduceParams
@@ -107,20 +106,18 @@ struct AllReduceParams
     size_t local_rank;
     uint32_t* barrier_flag_ptr;
     uint32_t* barrier_flag_counter_ptr;
-    uint32_t* peer_barrier_ptrs_in[MAX_RANKS_PER_NODE];
-    uint32_t* peer_barrier_ptrs_out[MAX_RANKS_PER_NODE];
+    uint32_t* peer_barrier_ptrs[MAX_RANKS_PER_NODE];
     void* peer_comm_buffer_ptrs[MAX_RANKS_PER_NODE * 2];
     void* local_output_buffer_ptr;
     void const* local_input_buffer_ptr;
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
-        int token_num, int hidden_size, AllReduceFusionOp op);
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank);
 };
 
 bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type,
-    AllReduceStrategyConfig config);
+    AllReduceStrategyType strategy);
 
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);

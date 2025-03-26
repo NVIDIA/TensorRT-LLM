@@ -207,7 +207,7 @@ __inline__ __device__ void update_barrier_flag(
     }
     if (thread0() && block0())
     {
-        *barrier_flag_ptr = ((*barrier_flag_ptr) + 1) % MAX_ALL_REDUCE_MODULES;
+        *barrier_flag_ptr = ((*barrier_flag_ptr) + 1) % MAX_ALL_REDUCE_MODULUS;
     }
 }
 
@@ -667,7 +667,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
         *reinterpret_cast<int4*>(&local_shared_buffer[offset])
             = *reinterpret_cast<int4 const*>(&local_input_buffer[offset]);
     }
-    block_barrier(params.peer_barrier_ptrs_in, barrier_flag, params.local_rank, RanksPerNode, tid, bid);
+    block_barrier(params.peer_barrier_ptrs, barrier_flag, params.local_rank, RanksPerNode, tid, bid);
     for (int norm_idx = 0; norm_idx < norm_this_block; ++norm_idx)
     {
         int norm_offset = norm_idx * params.fusion_params.hidden_size;
@@ -733,13 +733,13 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
 }
 }; // namespace reduce_fusion
 
-bool configurationSupported(
-    AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type, AllReduceStrategyType config)
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type,
+    AllReduceStrategyType strategy)
 {
     size_t elts_per_thread = 16 / common::getDTypeSize(type);
     int const msg_align = elts_per_thread;
     bool supported_algo = algo == AllReduceStrategyType::ONESHOT;
-    bool supported_strategy = config == AllReduceStrategyType::ONESHOT;
+    bool supported_strategy = strategy == AllReduceStrategyType::ONESHOT;
     return supported_algo && supported_strategy && (msg_size % msg_align == 0);
 }
 
@@ -750,21 +750,20 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
     TLLM_CHECK_WITH_INFO(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM, "Unsupported AllReduceFusionOp: %d",
         static_cast<int>(fusionOp));
 
-    int token_num = params.elts_total / params.fusion_params.hidden_size;
-
     TLLM_CHECK(params.fusion_params.hidden_size <= 8192);
 
-    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    static constexpr int kPackedSize = reduce_fusion::details::kBytesPerAccess / sizeof(T);
     TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
     int need_threads = params.fusion_params.hidden_size / kPackedSize;
     int cta_size;
-    if (need_threads <= details::kMaxCtaSize)
+    if (need_threads <= reduce_fusion::details::kMaxCtaSize)
     {
-        cta_size = (need_threads + details::kWarpSize - 1) / details::kWarpSize * details::kWarpSize;
+        cta_size = (need_threads + reduce_fusion::details::kWarpSize - 1) / reduce_fusion::details::kWarpSize
+            * reduce_fusion::details::kWarpSize;
     }
     else
     {
-        cta_size = details::kMaxCtaSize;
+        cta_size = reduce_fusion::details::kMaxCtaSize;
     }
     int norm_num = params.elts_total / params.fusion_params.hidden_size;
     int cta_num = std::min(norm_num, static_cast<int>(MAX_ALL_REDUCE_BLOCKS));
@@ -787,8 +786,8 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
 
     TLLM_CHECK(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM);
 
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RANKS_PER_NODE, Bias, Affine>, params));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig,
+        reduce_fusion::one_shot_prenorm_all_reduce_norm_kernel<T, RANKS_PER_NODE, Bias, Affine>, params));
 }
 
 template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false>
@@ -857,22 +856,11 @@ void AllReduceDispatchType(AllReduceParams& params, AllReduceStrategyType strat,
     }
 }
 
-AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
-    int token_num, int hidden_size, AllReduceFusionOp op)
+AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, size_t tpRank)
 {
     void* const* buffer_ptrs = reinterpret_cast<void* const*>(buffer);
-    int flag_offset;
-    if (op == AllReduceFusionOp::RESIDUAL_RMS_NORM
-        && reduce_fusion::is_lamport_supported(dataType, token_num, hidden_size))
-    {
-        flag_offset = 0;
-    }
-    else
-    {
-        flag_offset = 1;
-    }
-    auto const flag_ptr
-        = buffer[tensorrt_llm::utils::customAllReduceUtils::NUM_POINTERS_PER_RANK * tpSize + flag_offset];
+    auto const flag_ptr = reinterpret_cast<uint32_t*>(
+        buffer[tensorrt_llm::utils::customAllReduceUtils::NUM_POINTERS_PER_RANK * tpSize]);
     AllReduceParams params;
 
     for (int i = 0; i < tpSize * 2; ++i)
@@ -881,15 +869,10 @@ AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, siz
     }
     for (int i = 0; i < tpSize; ++i)
     {
-        params.peer_barrier_ptrs_in[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
+        params.peer_barrier_ptrs[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[2 * tpSize + i]);
     }
-    for (int i = 0; i < tpSize; ++i)
-    {
-        params.peer_barrier_ptrs_out[i] = reinterpret_cast<uint32_t*>(buffer_ptrs[3 * tpSize + i]);
-    }
-    params.barrier_flag_ptr = reinterpret_cast<uint32_t*>(flag_ptr);
-    params.barrier_flag_counter_ptr = reinterpret_cast<uint32_t*>(
-        buffer[tensorrt_llm::utils::customAllReduceUtils::NUM_POINTERS_PER_RANK * tpSize + 2]);
+    params.barrier_flag_ptr = flag_ptr + 1;
+    params.barrier_flag_counter_ptr = flag_ptr;
     params.ranks_per_node = tpSize;
     params.local_rank = tpRank;
 
@@ -899,7 +882,7 @@ AllReduceParams AllReduceParams::deserialize(int64_t* buffer, size_t tpSize, siz
 void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType, config),
+    TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType, strat),
         "Custom all-reduce configuration unsupported");
 
     sync_check_cuda_error(stream);

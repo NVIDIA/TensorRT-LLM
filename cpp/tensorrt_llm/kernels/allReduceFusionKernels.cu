@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/allReduceFusionKernels.h"
@@ -26,13 +27,14 @@ struct SyncComm
 {
     __device__ __forceinline__ SyncComm(void** workspace)
     {
-        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
-        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[1];
+        counter_ptr = &reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[0];
+        flag_ptr = &reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[1];
         flag_value = *flag_ptr;
+        auto comm_offset = flag_value % 2 ? 0 : NRanks;
         for (int r = 0; r < NRanks; ++r)
         {
-            comm_bufs[r] = workspace[r];
-            barrier_flags[r] = workspace[NRanks + r];
+            comm_bufs[r] = workspace[r + comm_offset];
+            barrier_flags[r] = workspace[NRanks * 2 + r];
         }
         __syncthreads();
         if (threadIdx.x == 0)
@@ -53,8 +55,8 @@ struct SyncComm
         }
     }
 
-    int* counter_ptr;
-    int* flag_ptr;
+    uint32_t* counter_ptr;
+    uint32_t* flag_ptr;
     void* comm_bufs[NRanks];
     void* barrier_flags[NRanks];
     int flag_value;
@@ -65,19 +67,19 @@ struct LamportComm
 {
     __device__ __forceinline__ LamportComm(void** workspace, int rank)
     {
-        counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
-        flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        counter_ptr = &reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[0];
+        flag_ptr = &reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[2];
+        clear_ptr = &reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[4];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        int comm_size = reinterpret_cast<uint32_t*>(workspace[NRanks * 4])[3];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
         for (int r = 0; r < NRanks; ++r)
         {
-            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + r]) + data_offset * comm_size;
+            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[3 * NRanks + r]) + data_offset * comm_size;
         }
-        clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
+        clear_buf = reinterpret_cast<uint8_t*>(workspace[3 * NRanks + rank]) + clear_offset * comm_size;
         __syncthreads();
         if (threadIdx.x == 0)
         {
@@ -98,13 +100,13 @@ struct LamportComm
         }
     }
 
-    int* counter_ptr;
-    int* flag_ptr;
-    int* clear_ptr;
+    uint32_t* counter_ptr;
+    uint32_t* flag_ptr;
+    uint32_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
-    int flag_value;
+    uint32_t clear_size;
+    uint32_t flag_value;
 };
 
 template <int NRanks>
@@ -154,12 +156,13 @@ protected:
 
     __device__ __forceinline__ int next_flag(int flag)
     {
-        return flag == 2 ? 0 : flag + 1;
+        return (flag + 1) % tensorrt_llm::kernels::MAX_ALL_REDUCE_MODULUS;
     }
 
     __device__ __forceinline__ int prev_flag(int flag)
     {
-        return flag == 0 ? 2 : flag - 1;
+        return (flag - 1 + tensorrt_llm::kernels::MAX_ALL_REDUCE_MODULUS)
+            % tensorrt_llm::kernels::MAX_ALL_REDUCE_MODULUS;
     }
 
 public:
@@ -677,68 +680,5 @@ __global__ void lamport_initialize_kernel(float* ptr, int size)
 void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
 {
     lamport_initialize_kernel<<<bytes / 128, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
-}
-
-Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
-    std::shared_ptr<tensorrt_llm::runtime::CudaStream> stream_ptr)
-    : m_world_config(tp_size, 1, 1, rank, tp_size)
-    , m_cuda_stream(stream_ptr)
-{
-    bool p2p_supported = tensorrt_llm::runtime::canAccessPeer(m_world_config);
-    TLLM_CHECK(p2p_supported);
-    int device_id;
-    TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    m_buffer_mgr = std::make_shared<tensorrt_llm::runtime::BufferManager>(m_cuda_stream);
-    int buffer_size = tp_size * max_token_num * hidden_dim * sizeof(half);
-    int flag_size = tp_size * kBarrierFlagCount * sizeof(int);
-    int lamport_comm_size = tp_size * std::max(kOneShotMaxToken, max_token_num) * hidden_dim * sizeof(half);
-    int lamport_buffer_size = 3 * lamport_comm_size;
-    for (auto size : {buffer_size, flag_size, lamport_buffer_size})
-    {
-        m_ipc_mem_handles.emplace_back(size, *m_buffer_mgr, m_world_config, p2p_supported);
-    }
-    std::vector<void*> workspace;
-    for (auto& ipc_mem_handle : m_ipc_mem_handles)
-    {
-        for (int r = 0; r < tp_size; ++r)
-        {
-            workspace.push_back(ipc_mem_handle.getCommPtrs()[r]);
-        }
-    }
-    // atomic flag read counter
-    // kernel_flag_ptr[0] = 0;
-    // non-lamport flag
-    // kernel_flag_ptr[1] = 0;
-    // lamport flag
-    // kernel_flag_ptr[2] = 0;
-    // lamport triple buffer offset
-    // kernel_flag_ptr[3] = lamport_comm_size;
-    // lamport clear size
-    // kernel_flag_ptr[4] = 0;
-    TLLM_CUDA_CHECK(cudaMalloc(&m_flag_d_ptr, 5 * sizeof(int)));
-    std::vector<int> h_data{0, 0, 0, lamport_comm_size, 0};
-    TLLM_CUDA_CHECK(cudaMemcpy(m_flag_d_ptr, h_data.data(), 5 * sizeof(int), cudaMemcpyHostToDevice));
-    workspace.push_back(m_flag_d_ptr);
-    TLLM_CUDA_CHECK(cudaMalloc(&m_workspace, workspace.size() * sizeof(void*)));
-    TLLM_CUDA_CHECK(
-        cudaMemcpy(m_workspace, workspace.data(), workspace.size() * sizeof(void*), cudaMemcpyHostToDevice));
-    lamport_initialize(m_ipc_mem_handles[2].getCommPtrs()[rank], lamport_buffer_size, 0);
-}
-
-Workspace::~Workspace()
-{
-    if (m_flag_d_ptr)
-    {
-        TLLM_CUDA_CHECK(cudaFree(m_flag_d_ptr));
-    }
-    if (m_workspace)
-    {
-        TLLM_CUDA_CHECK(cudaFree(m_workspace));
-    }
-}
-
-void** Workspace::get_workspace()
-{
-    return reinterpret_cast<void**>(m_workspace);
 }
 }; // namespace tensorrt_llm::kernels::ar_fusion
