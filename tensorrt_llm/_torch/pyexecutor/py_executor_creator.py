@@ -242,8 +242,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         spec_decoder = None
 
-    if mapping.is_last_pp_rank(
-    ) and executor_config.guided_decoding_config is not None:
+    if mapping.is_last_pp_rank():
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding does not support with speculative decoding.")
