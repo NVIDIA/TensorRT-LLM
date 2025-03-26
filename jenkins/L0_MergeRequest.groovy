@@ -92,6 +92,8 @@ def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
+@Field
+def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
@@ -103,6 +105,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
+    (ONLY_PYTORCH_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -294,7 +297,9 @@ def setupPipelineEnvironment(pipeline, testFilter)
         }
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter)
+        def changedFileList = getMergeRequestChangedFileList(pipeline)
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, changedFileList)
+        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, changedFileList)
     })
 }
 
@@ -367,33 +372,65 @@ def launchReleaseCheck(pipeline)
 def getMergeRequestChangedFileList(pipeline) {
     def changedFileList = []
     def pageId = 0
-    withCredentials([
+    try {
+        withCredentials([
         usernamePassword(
-            credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-            usernameVariable: 'GITLAB_API_USER',
-            passwordVariable: 'GITLAB_API_TOKEN'
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_API_USER',
+                passwordVariable: 'GITLAB_API_TOKEN'
         ),
         string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
-    ]) {
-        while(true) {
-            pageId += 1
-            def rawDataJson = pipeline.sh(
+        ]) {
+            while(true) {
+                pageId += 1
+                def rawDataJson = pipeline.sh(
                 script: "curl --header \"PRIVATE-TOKEN: $GITLAB_API_TOKEN\" --url \"https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20\"",
                 returnStdout: true
             )
-            def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                changedFileList += [rawData.get("old_path"), rawData.get("new_path")]
+                def rawDataList = readJSON text: rawDataJson, returnPojo: true
+                rawDataList.each { rawData ->
+                    changedFileList += [rawData.get("old_path"), rawData.get("new_path")]
+                }
+                if (!rawDataList) { break }
             }
-            if (!rawDataList) { break }
         }
+        def changedFileListStr = changedFileList.join(",\n")
+        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+    catch (InterruptedException e) {
+        throw e
+    }
+    catch (Exception e) {
+        pipeline.echo("getMergeRequestChangedFileList failed execution.")
+    }
     return changedFileList
 }
 
-def getMultiGpuFileChanged(pipeline, testFilter)
+def getOnlyPytorchFileChanged(pipeline, testFilter, changedFileList) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
+        return false
+    }
+    def onlyPytorchFileChanged = false
+    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+
+    if (!changedFileList) {
+        return false
+    }
+
+    onlyPytorchFileChanged = true
+    for (def file : changedFileList) {
+        if (!(file =~ pytorchOnlyPattern)) {
+            onlyPytorchFileChanged = false
+            break
+        }
+    }
+
+    return onlyPytorchFileChanged
+}
+
+def getMultiGpuFileChanged(pipeline, testFilter, changedFileList)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         pipeline.echo("Force not run multi-GPU testing.")
@@ -456,23 +493,13 @@ def getMultiGpuFileChanged(pipeline, testFilter)
         "jenkins/L0_Test.groovy",
     ]
 
-    def changedFileList = ","
-    def relatedFileChanged = false
-    try {
-        changedFileList = getMergeRequestChangedFileList(pipeline).join(", ")
-        relatedFileChanged = relatedFileList.any { it ->
-            if (changedFileList.contains(it)) {
-                return true
-            }
-        }
+    if (!changedFileList) {
+        return false
     }
-    catch (InterruptedException e)
-    {
-        throw e
-    }
-    catch (Exception e)
-    {
-        pipeline.echo("getMultiGpuFileChanged failed execution.")
+
+    def changedFileStr = changedFileList.join(", ")
+    def relatedFileChanged = relatedFileList.any { relatedFile ->
+        changedFileStr.contains(relatedFile)
     }
     if (relatedFileChanged) {
         pipeline.echo("Detect multi-GPU related files changed.")
