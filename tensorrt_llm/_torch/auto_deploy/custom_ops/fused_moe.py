@@ -3,7 +3,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.fused_moe import FusedMoE  # noqa: F401
+from ...modules.fused_moe import FusedMoE  # noqa: F401
 
 
 @torch.library.custom_op("moe::torch_moe", mutates_args=())

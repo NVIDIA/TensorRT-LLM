@@ -4,11 +4,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.distributed import ParallelConfig, allgather
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import ParallelConfig, allgather
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
