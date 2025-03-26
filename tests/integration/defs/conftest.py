@@ -569,18 +569,6 @@ def eagle_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def skywork_example_root(llm_root, llm_venv):
-    "Get skywork example root"
-    example_root = os.path.join(llm_root, "examples", "skywork")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
     example_root = os.path.join(llm_root, "examples", "mamba")
@@ -595,19 +583,6 @@ def mamba_example_root(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(llm_root, "requirements.txt")
     ])
-
-
-
-@pytest.fixture(scope="module")
-def jais_example_root(llm_root, llm_venv):
-    "Get jais example root"
-    example_root = os.path.join(llm_root, "examples", "jais")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
 
 
 @pytest.fixture(scope="module")
@@ -655,17 +630,6 @@ def commandr_example_root(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
     ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def sdxl_example_root(llm_root, llm_venv):
-    "Get stable diffusion example root"
-    example_root = os.path.join(llm_root, "examples", "sdxl")
-
-    llm_venv.run_cmd(
-        ["-m", "pip", "install", "numpy", "pillow", "torchmetrics"])
 
     return example_root
 
@@ -1256,25 +1220,6 @@ def eagle_model_roots(request):
 
 
 @pytest.fixture(scope="function")
-def skywork_model_root(request):
-    models_root = llm_models_root()
-
-    skywork_model_root = None
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "Skywork-13B-base":
-        skywork_model_root = os.path.join(models_root, "Skywork-13B-base")
-    elif request.param == "Skywork-13B-Math":
-        skywork_model_root = os.path.join(models_root, "Skywork-13B-Math")
-    else:
-        raise NotImplementedError("The model is not yet supported in Skywork")
-
-    assert os.path.exists(
-        skywork_model_root,
-    ), f"{skywork_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return skywork_model_root
-
-
-@pytest.fixture(scope="function")
 def mamba_model_root(request):
     "get mamba model data"
     models_root = llm_models_root()
@@ -1361,45 +1306,6 @@ def nemotron_nas_model_root(request):
         nemotron_nas_model_root), f"{nemotron_nas_model_root} doesn't exist!"
 
     return nemotron_nas_model_root
-
-
-@pytest.fixture(scope='module')
-def smaug_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    smaug_model_root = os.path.join(models_root, "Smaug-72B-v0.1")
-    assert os.path.exists(
-        smaug_model_root
-    ), f"{smaug_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return smaug_model_root
-
-
-@pytest.fixture(scope="function")
-def jais_model_root(request):
-    models_root = llm_models_root()
-
-    jais_model_root = None
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    supported_models = [
-        "jais-13b",
-        "jais-13b-chat",
-        "jais-30b-v1",
-        "jais-30b-chat-v1",
-        "jais-30b-v3",
-        "jais-30b-chat-v3",
-    ]
-    for model_name in supported_models:
-        if request.param == model_name:
-            jais_model_root = os.path.join(models_root, model_name)
-            break
-    else:
-        raise NotImplementedError("The model is not yet supported in jais")
-
-    assert os.path.exists(
-        jais_model_root,
-    ), f"{jais_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return jais_model_root
 
 
 @pytest.fixture(scope="function")
@@ -1930,51 +1836,6 @@ def evaltool_root(llm_venv):
     ]
     call(" ".join(evaltool_setup_cmd), shell=True)
     return clone_dir
-
-
-@pytest.fixture(scope='module')
-def grok_model_root():
-    "get grok model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    model_root = os.path.join(models_root, "grok-1")
-
-    return model_root
-
-
-@pytest.fixture(scope='module')
-def grok_code_root(llm_venv):
-    "get grok model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    workspace = llm_venv.get_working_directory()
-    code_root_src = os.path.join(models_root, "grok-github")
-    code_root = os.path.join(workspace, "grok-github")
-    shutil.copytree(code_root_src, code_root, dirs_exist_ok=True)
-
-    ckpt_file = os.path.join(code_root, "checkpoint.py")
-    assert exists(ckpt_file)
-
-    with open(ckpt_file, 'r', encoding='UTF-8') as file:
-        filedata = file.read()
-
-    filedata = filedata.replace('/dev/shm', workspace)
-
-    with open(ckpt_file, 'w', encoding='UTF-8') as file:
-        file.write(filedata)
-
-    return code_root
-
-
-@pytest.fixture(scope="function")
-def sdxl_model_root(request):
-    "return Stable Diffusion XL model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    return os.path.join(models_root, "stable-diffusion-xl-base-1.0")
 
 
 @pytest.fixture(scope="function")
