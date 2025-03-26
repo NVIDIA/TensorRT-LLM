@@ -118,6 +118,19 @@ def _cli_evaluate_with_mocks(args):
                 pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416; timeout")
             ],
         ),
+        param_with_device_count(
+            2,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+                    "microsoft/Phi-3-mini-4k-instruct",
+                ),
+                "compile_backend": "torch-opt",
+            },
+            ["gsm8k", "mmlu"],
+            ["exact_match,strict-match", "acc,none"],
+            [0.80, 0.70],
+        ),
     ],
 )
 def test_lm_eval(world_size: int, model_args, tasks, score_keys, scores, tmp_path):
