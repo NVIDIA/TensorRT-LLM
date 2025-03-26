@@ -37,7 +37,6 @@
 
 // Opaque bindings
 PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
-PYBIND11_MAKE_OPAQUE(tensorrt_llm::batch_manager::RequestVector)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
 PYBIND11_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)

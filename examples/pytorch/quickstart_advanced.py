@@ -51,6 +51,9 @@ def add_llm_args(parser):
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
+    parser.add_argument('--enable_trtllm_decoder',
+                        default=False,
+                        action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
@@ -107,6 +110,7 @@ def setup_llm(args):
         use_cuda_graph=args.use_cuda_graph,
         load_format=args.load_format,
         print_iter_log=args.print_iter_log,
+        enable_trtllm_decoder=args.enable_trtllm_decoder,
     )
 
     kv_cache_config = KvCacheConfig(
