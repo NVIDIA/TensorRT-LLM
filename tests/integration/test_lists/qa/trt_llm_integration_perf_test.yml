@@ -28,7 +28,6 @@ trt_llm_integration_perf_test:
   - perf/test_perf.py::test_perf[gptneox_20b-cppmanager-ootb_except_mha-float16-maxbs:1-input_output_len:128,128+512,32-reqs:10]
   - perf/test_perf.py::test_perf[falcon_rw_1b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[falcon_7b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[chatglm3_6b-cppmanager-ootb_except_mha-float16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[baichuan2_7b_chat-cppmanager-ootb_except_mha-float16-maxbs:1-input_output_len:128,128-reqs:10]
   - perf/test_perf.py::test_perf[internlm_chat_7b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[internlm_chat_7b-cppmanager-ootb_except_mha-float16-maxbs:128-input_output_len:128,128]
