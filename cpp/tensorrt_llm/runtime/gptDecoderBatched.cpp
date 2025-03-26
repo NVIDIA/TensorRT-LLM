@@ -183,8 +183,7 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxDecodingEngineTokens
-        = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
+    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
 
     for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
@@ -264,7 +263,7 @@ void GptDecoderBatched::prepareForward(
     std::vector<SharedConstPtr> logitsVec;
     for (SizeType32 bi = 0; bi < mDecoderState->getActualBatchSize(); ++bi)
     {
-        if (!input.active.at(bi) || step >= mDecoderState->getJointDecodingInput().numDecodingEngineTokens.at(bi))
+        if (!input.active.at(bi) || step >= mDecoderState->getNumDecodingEngineTokens(bi))
         {
             continue;
         }
@@ -280,8 +279,7 @@ void GptDecoderBatched::prepareForward(
     dInput.batchSize = localBatchDecoderIdx;
     dInput.logitsVec = logitsVec;
 
-    auto const maxDecodingEngineTokens
-        = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
+    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
 
     TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput

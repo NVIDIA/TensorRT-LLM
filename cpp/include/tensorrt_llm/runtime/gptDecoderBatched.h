@@ -64,7 +64,12 @@ public:
     [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
         SamplingConfig const& samplingConfig, bool streaming) const override;
 
-    decoder::DecoderState& getDecoderState() const
+    decoder::DecoderState& getDecoderState()
+    {
+        return *mDecoderState;
+    }
+
+    decoder::DecoderState const& getDecoderState() const
     {
         return *mDecoderState;
     }
