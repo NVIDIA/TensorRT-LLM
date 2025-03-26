@@ -677,9 +677,10 @@ class PyExecutor:
                             "_handle_new_tokens_inter_pp")
                         _, previous_new_tensors_host, _ = previous_batch
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor(previous_new_tensors_host,
-                                              src=self.dist.prev_pp_rank,
-                                              tag=prev_microbatch_id)
+                        self.dist.recv_tensor(
+                            previous_new_tensors_host["new_tokens_host"],
+                            src=self.dist.prev_pp_rank,
+                            tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         _, previous_new_tensors_host, previous_decoder_event = previous_batch
@@ -692,7 +693,7 @@ class PyExecutor:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_tensor(
-                                previous_new_tensors_host,
+                                previous_new_tensors_host["new_tokens_host"],
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -801,12 +802,12 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
-                    self._update_requests(scheduled_batch, new_tensors_host,
-                                          decoder_event)
-
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
+
+                    self._update_requests(scheduled_batch, new_tensors_host,
+                                          decoder_event)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -938,7 +939,7 @@ class PyExecutor:
                         self._finish_dummy_request(scheduled_batch)
 
                     self._update_request_states(scheduled_batch)
-                    
+
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
@@ -1007,7 +1008,7 @@ class PyExecutor:
                                         prev_microbatch_id):
         # Receive tokens from prev pp rank w.r.t model forward direction
         self.dist.recv_tensor(
-            previous_new_tensors_host,
+            previous_new_tensors_host["new_tokens_host"],
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -1018,7 +1019,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor(
-                tensor=previous_new_tensors_host,
+                tensor=previous_new_tensors_host["new_tokens_host"],
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
@@ -1035,9 +1036,9 @@ class PyExecutor:
         decoder_event.synchronize()
 
         self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            new_tensors_host, dest=self.dist.next_pp_rank, tag=microbatch_id)
-
-        return new_tensors_host
+            new_tensors_host["new_tokens_host"],
+            dest=self.dist.next_pp_rank,
+            tag=microbatch_id)
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -1471,7 +1472,8 @@ class PyExecutor:
         for req in scheduled_ctx_requests:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
-                self.resource_manager["guided_decoder_resource_manager"].free_resources(req)
+                self.resource_manager.resource_managers[
+                    "guided_decoder_resource_manager"].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(False)
 
@@ -1550,9 +1552,10 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, scheduled_requests: ScheduledRequests,
+    def _update_requests(self,
+                         scheduled_requests: ScheduledRequests,
                          new_tensors_host: Dict[str, torch.tensor],
-                         event: torch.cuda.Event):
+                         event: torch.cuda.Event or None = None):
         try:
             self.decoder.update_requests(scheduled_requests, new_tensors_host,
                                          event)

@@ -33,9 +33,10 @@ class Decoder(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, scheduled_requests: ScheduledRequests,
+    def update_requests(self,
+                        scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.tensor],
-                        decoder_event: torch.cuda.Event):
+                        decoder_event: torch.cuda.Event or None = None):
         raise NotImplementedError
 
 
@@ -45,8 +46,10 @@ class DummyDecoder(Decoder):
                      model_outputs):
         return None, None, None
 
-    def update_requests(self, scheduled_requests, new_tensors_host,
-                        decoder_event):
+    def update_requests(self,
+                        scheduled_requests,
+                        new_tensors_host,
+                        decoder_event: torch.cuda.Event or None = None):
         for request in scheduled_requests.context_requests:
             request.add_new_token(500, 0)
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -71,8 +74,10 @@ class EarlyStopDecoder(Decoder):
             request.context_logits = model_outputs['logits'][idx]
         return None, None, None
 
-    def update_requests(self, scheduled_requests, new_tensors_host,
-                        decoder_event):
+    def update_requests(self,
+                        scheduled_requests,
+                        new_tensors_host,
+                        decoder_event: torch.cuda.Event or None = None):
         assert (not scheduled_requests.generation_requests)
         for request in scheduled_requests.context_requests:
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -223,9 +228,10 @@ class TorchDecoder(Decoder):
 
         return False
 
-    def update_requests(self, scheduled_requests: ScheduledRequests,
+    def update_requests(self,
+                        scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.tensor],
-                        decoder_event: torch.cuda.Event):
+                        decoder_event: torch.cuda.Event or None = None):
         if decoder_event:
             decoder_event.synchronize()
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
@@ -522,24 +528,33 @@ class TRTLLMDecoder(Decoder):
                 self.store["buffer_manager"], self.algs.decoder, False,
                 decoder_finish_event)
 
-        return None, self.store["decoder_buffers"], decoder_event
+        new_tokens_device = {
+            "new_tokens_device": self.store["decoder_buffers"].new_output_tokens
+        }
+        new_tokens_host = {
+            "new_tokens_host":
+            self.store["decoder_buffers"].new_output_tokens_host,
+            "finished_sum_host":
+            self.store["decoder_buffers"].finished_sum_host,
+            "finish_reasons_host":
+            self.store["decoder_buffers"].finish_reasons_host,
+            "sequence_lengths_host":
+            self.store["decoder_buffers"].sequence_lengths_host
+        }
+
+        return new_tokens_device, new_tokens_host, decoder_event
 
     def update_requests(
             self, scheduled_requests: ScheduledRequests,
-            decoder_buffers: tllm.internal.batch_manager.DecoderBuffers,
-            decoder_event: tllm.internal.runtime.DecoderFinishedEvent):
+            new_tensors_host: Dict[str, torch.tensor],
+            decoder_event: tllm.internal.runtime.DecoderFinishedEvent or None):
         if decoder_event:
             decoder_event.synchronize()
 
-        # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
-        new_tokens_host = self.algs.decoder.decoder_state.all_new_tokens.to(
-            'cpu', non_blocking=True)
-        finished_sum_host = self.algs.decoder.decoder_state.finished_sum.to(
-            'cpu', non_blocking=True)
-        finish_reasons_host = self.algs.decoder.decoder_state.finish_reasons.to(
-            'cpu', non_blocking=True)
-        sequence_lengths_host_data = self.store[
-            "decoder_buffers"].sequence_lengths_host
+        new_tokens_host = new_tensors_host["new_tokens_host"]
+        finished_sum_host = new_tensors_host["finished_sum_host"]
+        finish_reasons_host = new_tensors_host["finish_reasons_host"]
+        sequence_lengths_host_data = new_tensors_host["sequence_lengths_host"]
 
         for request in itertools.chain(scheduled_requests.context_requests,
                                        scheduled_requests.generation_requests):

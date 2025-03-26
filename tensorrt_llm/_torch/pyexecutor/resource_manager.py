@@ -516,18 +516,17 @@ class SlotManager:
             else:
                 raise ValueError(f"Request {request.request_id} has no slot id")
 
-    def add_slot(self, request: LlmRequest):
+    def add_slot(self, request_id: int):
         if len(self.free_slots) == 0:
             raise ValueError("No free slots")
         slot = self.free_slots.pop()
-        self.slot_mapping[request.request_id] = slot
-        request.seq_slot = slot
+        self.slot_mapping[request_id] = slot
         return slot
 
-    def remove_slot(self, request: LlmRequest):
-        assert request.request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request.request_id)
-        self.free_slots.add(slot)
+    def remove_slot(self, request_id: int):
+        if request_id in self.slot_mapping:
+            slot = self.slot_mapping.pop(request_id)
+            self.free_slots.add(slot)
 
 
 class ResourceManager:
