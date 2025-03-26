@@ -20,8 +20,6 @@ from tensorrt_llm.mapping import Mapping
 
 from .resource_manager import KVCacheManager
 
-GB = 1 << 30
-
 
 def is_mla(config):
     if hasattr(config, "kv_lora_rank"):
@@ -50,6 +48,7 @@ def check_flash_mla_config(config):
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping, kv_tokens: int, alloc_kv_tokens: int):
+    GB = 1 << 30
     mem_per_token = 2
     quant_config = model_config.quant_config
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
@@ -93,21 +92,17 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
     return max_tokens
 
 
-def create_dummy_context_requests(max_seq_len: int, input_len: int,
+def create_dummy_context_requests(max_num_tokens: int, max_seq_len: int,
                                   vocab_size: int):
     requests = []
-    input_len = min(max_seq_len, input_len)
+    max_seq_len = min(max_num_tokens, max_seq_len)
     import math
-    batch_size = math.ceil(max_seq_len / input_len)
+    batch_size = math.ceil(max_num_tokens / max_seq_len)
     for idx in range(batch_size):
         input_tokens = [
-            random.randint(0, vocab_size - 1) for _ in range(input_len)
+            random.randint(0, vocab_size - 1) for _ in range(max_seq_len)
         ]
         output_config = trtllm.OutputConfig()
-        output_config.exclude_input_from_output = True
-        output_config.return_log_probs = False
-        output_config.return_generation_logits = False
-        output_config.return_context_logits = False
         request = trtllm.Request(input_tokens,
                                  max_tokens=1,
                                  streaming=False,
@@ -127,10 +122,11 @@ def get_token_num_for_estimation(executor_config):
                    executor_config.max_num_tokens, executor_config.max_seq_len)
 
 
-def estimate_max_kv_cache_tokens_maybe_update_executor(
-        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
-        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
-        resources: dict, ctx_chunk_config):
+def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
+                                 model_engine: PyTorchModelEngine,
+                                 executor_config: ExecutorConfig,
+                                 mapping: Mapping, origin_seq_len: int,
+                                 resources: dict, ctx_chunk_config):
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
         return
@@ -223,6 +219,8 @@ def estimate_max_kv_cache_tokens_maybe_update_executor(
         # mpi_barrier() always hang here.
         # sync all ranks after setting new kv_cache_manager
         mpi_allgather(0)
+
+    return py_executor
 
 
 def create_kv_cache_manager(executor_config: ExecutorConfig, mapping,

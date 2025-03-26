@@ -108,6 +108,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(
         cacheStateModelCfg, worldConfig, dataType, attentionType, kvFactor);
 
+    mRank = worldConfig.getRank();
     if (mCacheState->getParallelConfig().mEnableAttenionDP)
     {
         int TPSizeInDPGroup
@@ -127,28 +128,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
                 mMpiGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
         }
     }
-    bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI)
-    {
-        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-        mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
-        mDataResponder = isMLA
-            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        mDataRequester = isMLA
-            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-    }
-    else
-    {
-        TLLM_THROW("Unsupported communication type.");
-    }
-    initializeCommState();
+
+    mIsMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
+    setKvCacheManager(cacheManager);
 }
 
 CacheTransceiver::~CacheTransceiver()
@@ -244,20 +226,38 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
-void CacheTransceiver::resetKvCache(kv_cache_manager::BaseKVCacheManager* cacheManager)
+void CacheTransceiver::setKvCacheManager(kv_cache_manager::BaseKVCacheManager* cacheManager)
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
-    auto tmpDataResponser = mIsMLA ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                                mManager.get(), *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
-                                   : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mManager.get(),
-                                       *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
-    auto tmpDataRequester = mIsMLA ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                                mManager.get(), *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
-                                   : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mManager.get(),
-                                       *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
-    mDataResponder.reset(tmpDataResponser.release());
-    mDataRequester.reset(tmpDataRequester.release());
+
+    if (mCommType == CommType::MPI)
+    {
+        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
+        if (!mMpiWorldComm)
+        {
+            mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+        }
+
+        if (!mManager)
+        {
+            mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+        }
+
+        mDataResponder = mIsMLA ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mManager.get(),
+                                  *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
+                                     : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mManager.get(),
+                                         *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
+        mDataRequester = mIsMLA
+            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
+            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
+    }
+    else
+    {
+        TLLM_THROW("Unsupported communication type.");
+    }
     initializeCommState();
 }
 

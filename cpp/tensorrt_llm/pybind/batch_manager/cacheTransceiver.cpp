@@ -95,5 +95,5 @@ void tb::CacheTransceiverBindings::initBindings(py::module_& m)
                  executor::kv_cache::CacheState::AttentionType>(),
             py::arg("cache_manager"), py::arg("comm_type"), py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"),
             py::arg("tokens_per_block"), py::arg("world_config"), py::arg("dtype"), py::arg("attention_type"))
-        .def("reset_kv_cache", &tb::CacheTransceiver::resetKvCache);
+        .def("set_kv_cache_manager", &tb::CacheTransceiver::setKvCacheManager);
 }

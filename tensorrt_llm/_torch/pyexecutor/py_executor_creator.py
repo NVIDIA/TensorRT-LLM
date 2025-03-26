@@ -27,8 +27,7 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ._util import (create_kv_cache_manager,
-                    estimate_max_kv_cache_tokens_maybe_update_executor,
+from ._util import (create_kv_cache_manager, estimate_max_kv_cache_tokens,
                     get_token_num_for_estimation, is_mla)
 
 
@@ -119,11 +118,9 @@ def create_py_executor(executor_config: ExecutorConfig,
     config = model_engine.model.model_config.pretrained_config
 
     kv_cache_manager = None
-    use_kv_cache_manager = model_engine.model.model_config.is_generation and executor_config.pytorch_backend_config.use_kv_cache
     origin_executor_config = copy.deepcopy(executor_config)
-    if use_kv_cache_manager:
+    if executor_config.pytorch_backend_config.use_kv_cache:
         # Don't change kv_cache_config.max_tokens for CP because it will impact kv cache tokens and
-        # it doesn't accept None to set its value.
         if 'cp_type' not in mapping.cp_config:
             executor_config.kv_cache_config.max_tokens = get_token_num_for_estimation(
                 executor_config)
@@ -219,9 +216,10 @@ def create_py_executor(executor_config: ExecutorConfig,
                              max_batch_size=executor_config.max_batch_size,
                              kv_cache_transceiver=kv_cache_transceiver)
 
-    if use_kv_cache_manager:
-        estimate_max_kv_cache_tokens_maybe_update_executor(
-            py_executor, model_engine, origin_executor_config, mapping,
-            origin_seq_len, resources, ctx_chunk_config)
+    if executor_config.pytorch_backend_config.use_kv_cache:
+        py_executor = estimate_max_kv_cache_tokens(py_executor, model_engine,
+                                                   origin_executor_config,
+                                                   mapping, origin_seq_len,
+                                                   resources, ctx_chunk_config)
 
     return py_executor
