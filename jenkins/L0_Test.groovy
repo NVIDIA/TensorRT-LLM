@@ -493,7 +493,7 @@ def launchTestListCheck(pipeline)
         println "llmPath: ${llmPath}"
         def llmSrc = "${llmPath}/TensorRT-LLM/src"
         def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
-        def testList = "${LLMllmSllmSrcrc_ROOT}/l0_test.txt"
+        def testList = "${llmSrc}/l0_test.txt"
         // Remove perf test from test list since they are dynamical generated
         sh """
             touch ${testList}
