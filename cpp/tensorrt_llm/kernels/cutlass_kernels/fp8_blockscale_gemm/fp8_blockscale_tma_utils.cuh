@@ -24,7 +24,7 @@
 #include <cuda/barrier>
 #include <cute/arch/util.hpp>
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 template <class T>
@@ -142,4 +142,4 @@ __device__ uint64_t mbarrier_arrive_1_expect_tx_cta(void* smem_ptr, uint32_t tx_
     return state;
 }
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

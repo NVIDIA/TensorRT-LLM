@@ -18,7 +18,7 @@
 #include <cuda.h>
 #include <cute/arch/util.hpp>
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 struct SM90_64x16x32_F32E4M3E4M3_SS
@@ -610,4 +610,4 @@ struct Fp8MmaSelector
     using Type = decltype(select_type());
 };
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm::open
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
