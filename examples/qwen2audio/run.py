@@ -498,7 +498,7 @@ class QWenInfer(object):
             fake_prompt_id = torch.arange(vocab_size,
                                           vocab_size + num_audio_tokens.sum(),
                                           device=device)
-            
+
             input_ids[batch_indices, audio_indices] = fake_prompt_id
             input_lengths = torch.tensor(input_ids.size(1),
                                          dtype=torch.int32,
@@ -537,8 +537,7 @@ class QWenInfer(object):
 
         # print(f"extra_ids: {extra_ids}")
         output_ids, Qwen_time = self.generate_for_qwen_audio(
-            input_ids, args, prompt_table, extra_ids,
-            run_time)
+            input_ids, args, prompt_table, extra_ids, run_time)
 
         runtime_rank = tensorrt_llm.mpi_rank()
         input_lengths = torch.tensor([input_ids.size(1)],
