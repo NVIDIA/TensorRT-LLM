@@ -754,7 +754,9 @@ class TestFunctional(unittest.TestCase):
                 precision=dtype,
                 int8=int8_trt_flag,
                 quant_mode=quant_mode)
-
+            # Reuce the TRT engine build time by setting the max allowed number of tactics in builder tactic profiling.
+            if builder_config.trt_builder_config.max_num_tactics == -1:
+                builder_config.trt_builder_config.max_num_tactics = 30
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(

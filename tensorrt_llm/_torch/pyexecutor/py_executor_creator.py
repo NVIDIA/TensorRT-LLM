@@ -2,35 +2,27 @@ import copy
 
 import tensorrt_llm
 import tensorrt_llm.bindings as tllm
-from tensorrt_llm._torch.attention_backend.interface import \
-    AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.decoder import (EarlyStopDecoder,
-                                                    TorchDecoder,
-                                                    TorchStarAttentionDecoder,
-                                                    TRTLLMDecoder)
-from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
-from tensorrt_llm._torch.pyexecutor.guided_decoder import \
-    GuidedDecoderResourceManager
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver)
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             ResourceManager)
-from tensorrt_llm._torch.pyexecutor.scheduler import (BindCapacityScheduler,
-                                                      BindMicroBatchScheduler,
-                                                      SimpleScheduler)
-from tensorrt_llm._torch.speculative import (get_num_spec_layers,
-                                             get_spec_decoder,
-                                             get_spec_resource_manager)
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..speculative import (get_num_spec_layers, get_spec_decoder,
+                           get_spec_resource_manager)
 from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
+from .config import PyTorchConfig
+from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
+                      TRTLLMDecoder)
+from .distributed import MPIDist
+from .guided_decoder import GuidedDecoderResourceManager
+from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .model_engine import PyTorchModelEngine
+from .py_executor import PyExecutor
+from .resource_manager import KVCacheManager, ResourceManager
+from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
+                        SimpleScheduler)
 
 
 def create_py_executor(executor_config: ExecutorConfig,
