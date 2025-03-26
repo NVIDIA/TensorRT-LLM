@@ -497,7 +497,7 @@ public:
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, {}, mUseLora, /*use_fp8_block_scaling=*/false, mUsePrequantScale);
+            mActType, {}, mUseLora, /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, mUsePrequantScale);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -733,7 +733,7 @@ public:
             mExpertWeight1, mExpertBias1, mActType, mExpertWeight2, mExpertBias2, mQuantParams, mTotalTokens,
             mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
             parallelism_config, mUseLora, mLoraParams,
-            /*use_fp8_block_scaling=*/false, stream);
+            /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, stream);
     }
 
     void runBenchmark(benchmark::State& state);

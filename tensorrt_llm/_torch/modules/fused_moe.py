@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
@@ -7,7 +7,9 @@ from torch import nn
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather
 from ..model_config import ModelConfig
-from ..utils import disable_fp4_allgather, is_torch_compiling, reswizzle_sf
+from ..utils import (Fp4QuantizedTensor, disable_fp4_allgather,
+                     get_power_of_2_num_tokens_buckets, is_torch_compiling,
+                     next_positive_power_of_2, reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -17,24 +19,6 @@ FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
-
-
-def next_positive_power_of_2(x: int) -> int:
-    if x < 1:
-        return 1
-
-    return 1 << (x - 1).bit_length()
-
-
-def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
-    max_num_tokens = next_positive_power_of_2(max_num_tokens)
-    num_token_buckets = []
-    m = 1
-    while m <= max_num_tokens:
-        num_token_buckets.append(m)
-        m *= 2
-
-    return num_token_buckets
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -258,6 +242,7 @@ class FusedMoE(nn.Module):
 
         self.tune_max_num_tokens = tune_max_num_tokens
         self.has_been_profiled = False
+        self.has_been_profiled_min_latency = False
 
         self._weights_created = False
         if not model_config.skip_create_weights:
@@ -484,12 +469,30 @@ class FusedMoE(nn.Module):
             outputs.append(output)
         return outputs
 
+    def _run_profiler(self, x, output_dtype, use_fp8_block_scaling,
+                      min_latency_mode):
+        profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
+            x.dtype, self.w3_w1_weight.dtype, output_dtype,
+            use_fp8_block_scaling, min_latency_mode)
+        profiler.run_profile(
+            self.w2_weight, self.routing_method.experts_per_token, self.tp_size,
+            self.tp_rank, self.ep_size, self.ep_rank,
+            get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
+        return profiler
+
     def forward(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        min_latency_mode: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
+
+        if isinstance(x, Fp4QuantizedTensor):
+            assert output_dtype is not None
+            output_dtype = output_dtype
+        else:
+            output_dtype = x.dtype
 
         use_fp8_block_scaling = False
 
@@ -509,12 +512,18 @@ class FusedMoE(nn.Module):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nv_fp4:
-                x_row = x.shape[0]
-                x_col = x.shape[1]
                 if not disable_fp4_allgather():
-                    x, x_sf = torch.ops.trtllm.fp4_quantize(
-                        x, self.fc31_input_scale, self.scaling_vector_size,
-                        False)
+                    if isinstance(x, Fp4QuantizedTensor):
+                        x, x_sf = x.fp4_tensor, x.scaling_factor
+                        x_row = x.shape[0]
+                        # note: we use uint8 to store 2 fp4 values
+                        x_col = x.shape[1] * 2
+                    else:
+                        x_row = x.shape[0]
+                        x_col = x.shape[1]
+                        x, x_sf = torch.ops.trtllm.fp4_quantize(
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False)
 
             elif self.has_fp8_block_scales:
                 use_fp8_block_scaling = True
@@ -540,20 +549,23 @@ class FusedMoE(nn.Module):
             profile_ids = None
         else:
             if not self.has_been_profiled:
-                self.profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-                    x.dtype, self.w3_w1_weight.dtype, output_dtype,
-                    use_fp8_block_scaling)
-                self.profiler.run_profile(
-                    self.w2_weight, self.routing_method.experts_per_token,
-                    self.tp_size, self.tp_rank, self.ep_size, self.ep_rank,
-                    get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
+                self.profiler = self._run_profiler(x, output_dtype,
+                                                   use_fp8_block_scaling, False)
                 self.has_been_profiled = True
 
-            profile_ids = self.profiler.get_profile_ids(
+            if not self.has_been_profiled_min_latency and min_latency_mode:
+                self.profiler_min_latency = self._run_profiler(
+                    x, output_dtype, use_fp8_block_scaling, False)
+                self.has_been_profiled_min_latency = True
+
+            profiler = self.profiler_min_latency if min_latency_mode else self.profiler
+
+            profile_ids = profiler.get_profile_ids(
                 next_positive_power_of_2(x.shape[0]), self.w2_weight,
                 self.routing_method.experts_per_token, self.num_experts)
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
+        fused_moe_op = torch.ops.trtllm.fused_moe_min_latency if min_latency_mode else torch.ops.trtllm.fused_moe
+        outputs = fused_moe_op(
             x,
             token_selected_experts,
             token_final_scales,
@@ -570,6 +582,11 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
         )
 
+        if min_latency_mode:
+            assert not self.reduce_results
+            return outputs
+
+        final_hidden_states = outputs
         if self.reduce_results and self.parallel_size > 1:
             final_hidden_states = self.all_reduce(final_hidden_states)
 

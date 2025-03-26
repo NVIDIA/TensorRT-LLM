@@ -741,4 +741,288 @@ void** Workspace::get_workspace()
 {
     return reinterpret_cast<void**>(m_workspace);
 }
+
+/////////////////////////////////////////////////////////////////
+//                  * MoE Reduction Fusion *                   //
+/////////////////////////////////////////////////////////////////
+
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+__global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAllReduceFusionParams params)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    cg::grid_group grid = cg::this_grid();
+
+    // Each token is handled by one cluster
+    // which token is handled by current cluster
+    int token_id = grid.cluster_rank();
+    // total number of token
+    int num_token = params.size / params.hidden_dim;
+    // Each thread handle kElemsPerAccess num elem in token. Total cluster.num_threads() to handle one token
+    // For current token, which kElemsPerAccess is handled by current thread (in unit of kElemsPerAccess)
+    int access_id_in_token = cluster.thread_rank();
+    // Across all token, which kElemsPerAccess is handled by current thread (in unit of kElemsPerAccess)
+    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
+    // Persistent kernel
+    // stride to next token handled by current cta
+    int token_stride = grid.num_clusters();
+    // stride in unit of kElemsPerAccess
+    int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
+    // Total number of access in unit of kElemsPerAccess to handle (token_num * hidden_dim)
+    // This is within one rank
+    int tot_access = params.size / kElemsPerAccess;
+    float4 clear_vec = get_neg_zero();
+
+    cudaGridDependencySynchronize();
+    LamportComm<NRanks> comm(params.workspace, params.rank);
+    int clear_access = comm.clear_size / kElemsPerAccess;
+
+    // * MoE related
+    int threadid_in_cluster = cluster.thread_rank();
+    // Start Offset within one token's hidden_size of element
+    // Current thread handle token[thread_offset_within_token : thread_offset_within_token + kElemsPerAccess]
+    int thread_offset_within_token = threadid_in_cluster * kElemsPerAccess;
+
+    union ACC_TYPE
+    {
+        float4 packed;
+        DType unpacked[kElemsPerAccess];
+    };
+
+    // Persistent Kernel
+    // Each cluster iterate through all token it need to handle
+    for (int token_id = grid.cluster_rank(); token_id < num_token; token_id += grid.num_clusters())
+    {
+        if (thread_offset_within_token >= params.hidden_dim)
+        {
+            break;
+        }
+
+        // * MoE Reduce
+        // Offset within (num_token, hidden_size) in unit of element
+        int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
+
+        ACC_TYPE accumulator;
+#pragma unroll
+        for (int i = 0; i < kElemsPerAccess; ++i)
+        {
+            accumulator.unpacked[i] = static_cast<DType>(0);
+        }
+
+        // * Iterate through all active expert
+        int num_actexp = *(params.moe_reduction_device_num_experts);
+        for (int actexp_i = 0; actexp_i < num_actexp; ++actexp_i)
+        {
+            // * Load active expert i's token j's partial data
+            // Offset within (num_act_exp, num_token, hidden_size) in unit of element
+            int thread_offset_across_actexp_token
+                = actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
+            ACC_TYPE actexp_i_data;
+            actexp_i_data.packed = reinterpret_cast<float4 const*>(
+                params.moe_reduction_active_experts_token_input)[thread_offset_across_actexp_token / kElemsPerAccess];
+
+            // * Load active expert i's token j's scale
+            int thread_offset_scale = actexp_i * num_token + token_id;
+            float actexp_i_token_j_scale
+                = reinterpret_cast<float const*>(params.moe_reduction_scale_input)[thread_offset_scale];
+
+            // * acc += scale(data)
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess; ++i)
+            {
+                // assume computation is done in ScaleType
+                accumulator.unpacked[i]
+                    += static_cast<DType>((static_cast<float>(actexp_i_data.unpacked[i]) * actexp_i_token_j_scale));
+            }
+        }
+
+        // * FC2 + reduced(gGEMM2)
+        ACC_TYPE fc2_data;
+        fc2_data.packed = reinterpret_cast<float4 const*>(
+            params.moe_reduction_token_input)[thread_offset_across_token / kElemsPerAccess];
+#pragma unroll
+        for (int i = 0; i < kElemsPerAccess; ++i)
+        {
+            accumulator.unpacked[i] += fc2_data.unpacked[i];
+        }
+
+        // * AR Store
+        int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
+        int idx = access_id;
+        float val[4] = {accumulator.packed.x, accumulator.packed.y, accumulator.packed.z, accumulator.packed.w};
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            // Handle two bf16/fp16 at one time
+            if (is_neg_zero(val[i]))
+            {
+                val[i] = 0.f;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r)
+        {
+            // STG.128 to remote rank
+            reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
+                = *reinterpret_cast<float4*>(val);
+        }
+    }
+
+    // * Clear previous buffer
+    for (int idx = access_id; idx < clear_access; idx += access_stride)
+    {
+        reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    }
+
+    // * AR Load + Fusion
+    for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
+    {
+        // * AR Load
+        float4 vals[NRanks];
+        bool done = false;
+        while (!done)
+        {
+            done = true;
+#pragma unroll
+            for (int r = 0; r < NRanks; ++r)
+            {
+                // LDG.128 from local rank
+                vals[r]
+                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[r * tot_access + idx]);
+                done &= !is_neg_zero(vals[r]);
+            }
+        }
+        float4 sum_val = vals[0];
+#pragma unroll
+        for (int r = 1; r < NRanks; ++r)
+        {
+            sum_val = add128<DType>(sum_val, vals[r]);
+        }
+
+        // * Fuse
+        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+    }
+    comm.update(params.size * NRanks);
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+void launch_oneshot_moereduce_lamport(MoeReductionAllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
+{
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+        moereduce_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut>, params));
+}
+
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut>
+void moereduction_allreduce_fusion_kernel_launcher(MoeReductionAllReduceFusionParams const& params)
+{
+    int token_num = params.size / params.hidden_dim;
+    bool oneshot = use_oneshot(token_num);
+    // Only support one shot
+    TLLM_CHECK(oneshot);
+    // Each token is handled by one cluster
+    int cluster_num = token_num;
+    // Total number of threads (within one cluster) that's need to handle one token
+    // given that each thread handle kElemsPerAccess
+    int threads_per_token = params.hidden_dim / kElemsPerAccess;
+    // Total number of warp (within one cluster) that's need to handle one token
+    // given that each thread handle kElemsPerAccess
+    int warps_per_token = (threads_per_token + 31) / 32;
+    int cluster_size = 8;
+    while (warps_per_token % cluster_size != 0)
+    {
+        cluster_size /= 2;
+    }
+    int block_size = warps_per_token / cluster_size * 32;
+    TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
+    int sm_count = get_sm_count();
+    int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+    cudaLaunchConfig_t cfg;
+    cudaLaunchAttribute attribute[2];
+    cfg.gridDim = grid_size;
+    cfg.blockDim = block_size;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = params.stream;
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[1].id = cudaLaunchAttributeClusterDimension;
+    attribute[1].val.clusterDim.x = cluster_size;
+    attribute[1].val.clusterDim.y = 1;
+    attribute[1].val.clusterDim.z = 1;
+    cfg.attrs = attribute;
+    cfg.numAttrs = 2;
+    if (oneshot)
+    {
+        launch_oneshot_moereduce_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut>(params, cfg);
+    }
+}
+
+void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& params)
+{
+#define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
+    return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
+#define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
+    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF)                                          \
+    {                                                                                                                  \
+        MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
+    }                                                                                                                  \
+    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    {                                                                                                                  \
+        MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
+    }
+
+    TLLM_CHECK(params.residual_in && params.rms_gamma);
+    TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
+        && params.moe_reduction_token_input);
+    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
+    if (params.residual_out && not params.norm_out && params.quant_out)
+    {
+        // pattern1: AR+Add_RMS+Quant
+        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
+        // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
+        MOE_DISPATCH0(2, true, false, true);
+        MOE_DISPATCH0(4, true, false, true);
+        MOE_DISPATCH0(8, true, false, true);
+        MOE_DISPATCH0(16, true, false, true);
+    }
+    else if (not params.residual_out && params.norm_out && not params.quant_out)
+    {
+        // pattern2: AR+AddRMS
+        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
+        // [m, 7168] bf16 norm_out
+        MOE_DISPATCH0(2, false, true, false);
+        MOE_DISPATCH0(4, false, true, false);
+        MOE_DISPATCH0(8, false, true, false);
+        MOE_DISPATCH0(16, false, true, false);
+    }
+    else if (params.residual_out && params.norm_out && not params.quant_out)
+    {
+        MOE_DISPATCH0(2, true, true, false);
+        MOE_DISPATCH0(4, true, true, false);
+        MOE_DISPATCH0(8, true, true, false);
+        MOE_DISPATCH0(16, true, true, false);
+    }
+    else if (params.residual_out && params.norm_out && params.quant_out)
+    {
+        // for test
+        MOE_DISPATCH0(2, true, true, true);
+        MOE_DISPATCH0(4, true, true, true);
+        MOE_DISPATCH0(8, true, true, true);
+        MOE_DISPATCH0(16, true, true, true);
+    }
+    TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");
+}
+
 }; // namespace tensorrt_llm::kernels::ar_fusion
