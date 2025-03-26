@@ -413,9 +413,17 @@ class PyTorchModelEngine(ModelEngine):
                     num_tokens / kv_cache_manager.tokens_per_block):
                 # Should only need (at most) one more page per request.
                 is_gen = num_tokens == 1
-                requests = kv_cache_manager.add_dummy_requests(list(
-                    range(batch_size)), [num_tokens] * batch_size,
-                                                               is_gen=is_gen)
+                max_num_draft_tokens = self.spec_config.max_draft_tokens if self.spec_config is not None and is_gen else 0
+
+                requests = kv_cache_manager.add_dummy_requests(
+                    list(range(batch_size)), [num_tokens] * batch_size,
+                    is_gen=is_gen,
+                    max_num_draft_tokens=max_num_draft_tokens)
+
+                if spec_resource_manager is not None:
+                    spec_resource_manager.add_dummy_requests(
+                        request_ids=list(range(batch_size)))
+
                 result = ScheduledRequests()
                 result.context_requests = []
                 result.generation_requests = []
