@@ -5,7 +5,7 @@ import logging
 import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Union
+from typing import List, Optional, Union
 
 import aiohttp
 import uvicorn
@@ -42,7 +42,7 @@ class OpenAIDisaggServer:
             raise ValueError("At least one context server and one generation server must be provided")
 
         # Session will be initialized in lifespan
-        self.session: aiohttp.ClientSession = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
