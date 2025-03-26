@@ -42,6 +42,7 @@
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
+#include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/debugUtils.h"
 #include "tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
@@ -1917,7 +1918,8 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     runtime::CudaEvent decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
-    decoderFinishEvent = updateDecoderBuffers(returnLogProbs, std::move(decoderFinishEvent));
+    decoderFinishEvent = (*mUpdateDecoderBuffers)(mModelConfig, *mDecoderBuffers, mRuntime->getBufferManager(),
+        *mDecoder, returnLogProbs, std::move(decoderFinishEvent));
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return decoderFinishEvent;
@@ -1978,67 +1980,6 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
             *copySizesDeviceSlice, maxCopySize, manager.getStream());
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
-    bool returnLogProbs, runtime::CudaEvent decoderFinishEvent)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    NVTX3_SCOPED_RANGE(updateDecoderBuffers);
-
-    // Chain copy after decoder event, using a different stream
-    mCopyBufferManager.getStream().wait(decoderFinishEvent);
-
-    mDecoderBuffers->newOutputTokens = mDecoder->getDecoderState().getAllNewTokens();
-
-    mCopyBufferManager.copy(*mDecoderBuffers->newOutputTokens, *mDecoderBuffers->newOutputTokensHost);
-    mCopyBufferManager.copy(*mDecoderBuffers->sequenceLengths, *mDecoderBuffers->sequenceLengthsHost);
-
-    auto const finishedSumDevice = mDecoder->getDecoderState().getFinishedSum();
-    mCopyBufferManager.copy(*finishedSumDevice, *mDecoderBuffers->finishedSumHost);
-    auto const finishReasonsDevice = mDecoder->getDecoderState().getFinishReasons();
-    mCopyBufferManager.copy(*finishReasonsDevice, *mDecoderBuffers->finishReasonsHost);
-
-    if (returnLogProbs)
-    {
-        mDecoderBuffers->cumLogProbs = mDecoder->getDecoderState().getCumLogProbs();
-        mDecoderBuffers->logProbs = mDecoder->getDecoderState().getLogProbs();
-        mCopyBufferManager.copy(*mDecoderBuffers->cumLogProbs, *mDecoderBuffers->cumLogProbsHost);
-        mCopyBufferManager.copy(*mDecoderBuffers->logProbs, *mDecoderBuffers->logProbsHost);
-    }
-
-    if (mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
-    {
-        // TODO(rkobus): keep data on device for next iteration
-        mDecoderBuffers->draftBuffers.nextDraftTokensDevice = mDecoder->getDecoderState().getNextDraftTokens();
-        mCopyBufferManager.copy(
-            *mDecoderBuffers->draftBuffers.nextDraftTokensDevice, *mDecoderBuffers->draftBuffers.nextDraftTokensHost);
-
-        if (mModelConfig.getSpeculativeDecodingMode().variableDraftLength())
-        {
-            mDecoderBuffers->draftBuffers.nextDraftTokensLengthsDevice
-                = mDecoder->getDecoderState().getNextDraftTokensLengths();
-            mDecoderBuffers->draftBuffers.prevDraftTokensLengthsDevice
-                = mDecoder->getDecoderState().getPrevDraftTokensLengths();
-            mCopyBufferManager.copy(*mDecoderBuffers->draftBuffers.nextDraftTokensLengthsDevice,
-                *mDecoderBuffers->draftBuffers.nextDraftTokensLengthsHost);
-            mCopyBufferManager.copy(*mDecoderBuffers->draftBuffers.prevDraftTokensLengthsDevice,
-                *mDecoderBuffers->draftBuffers.prevDraftTokensLengthsHost);
-        }
-    }
-
-    if (mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
-    {
-        mDecoderBuffers->draftBuffers.acceptedLengthsCumSumDevice
-            = mDecoder->getDecoderState().getAcceptedLengthsCumSum();
-        mDecoderBuffers->draftBuffers.acceptedPackedPathsDevice = mDecoder->getDecoderState().getAcceptedPackedPaths();
-    }
-
-    runtime::CudaEvent copyEvent{};
-    mCopyBufferManager.getStream().record(copyEvent);
-    // Store the event for later sync. Sync stream before calling next decoder. Sync host before updating requests.
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return copyEvent;
 }
 
 std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::communicateDecoderBuffers(
