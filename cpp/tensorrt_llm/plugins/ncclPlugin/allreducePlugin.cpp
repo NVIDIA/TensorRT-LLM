@@ -282,7 +282,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
         }
 
-        if (!kernels::configurationSupported(strat, messageSize, worldSize, type))
+        if (!kernels::configurationSupported(strat, messageSize, worldSize, type, mStrategy))
         {
             if (!isAuto)
             {
@@ -482,8 +482,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         int token_num = size / inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
         int hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
         auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank, mType, token_num, hidden_size,
-            mOp);
+            reinterpret_cast<int64_t*>(const_cast<void*>(inputs[1])), tpSize, tpRank);
 
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
@@ -498,18 +497,8 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         params.fusion_params.hidden_size = hidden_size;
         params.fusion_params.eps = mEps;
         params.fusion_params.intermediate_buffer = outputs[1];
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
-        {
-            for (size_t i = 0; i < tpSize; ++i)
-            {
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 4 + i];
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 5 + i];
-                params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE * 2]
-                    = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 6 + i];
-            }
-        }
+        TLLM_CHECK_WITH_INFO(mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM,
+            "Only RESIDUAL_RMS_PREPOST_NORM is supported for custom allreduce");
         TLLM_LOG_DEBUG("customAllReduce called");
         tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
     }
