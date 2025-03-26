@@ -7,7 +7,9 @@ See the LLaMA example [`examples/llama`](../llama) for details.
 
 - [EXAONE](#exaone)
   - [Support Matrix](#support-matrix)
-  - [Download model checkpoints](#download-model-checkpoints)
+  - [Supported Models](#supported-models)
+    - [EXAONE-3.0](#exaone-30)
+    - [EXAONE-Deep](#exaone-deep)
   - [Usage](#usage)
     - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
     - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
@@ -25,12 +27,23 @@ See the LLaMA example [`examples/llama`](../llama) for details.
   * INT8 SmoothQuant
   * INT4 AWQ & W4A8 AWQ
 
-## Download model checkpoints
+## Supported Models
+### EXAONE-3.0
 
-First, download the HuggingFace FP32 checkpoints of EXAONE model.
+Download the HuggingFace FP32 checkpoints of EXAONE-3.0 model. We support EXAONE-3.0 families but here, we only use the `EXAONE-3.0-7.8B-Instruct` model for the example.
 
 ```bash
-git clone https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct hf_models/exaone
+export HF_MODEL_DIR=hf_models/exaone
+git clone https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct $HF_MODEL_DIR
+```
+
+### EXAONE-Deep
+
+Download the HuggingFace BF16 checkpoints of EXAONE-Deep model. Here, we only use the `EXAONE-Deep-2.4B` model for the example. We can use the same procedure as EXAONE-3.0 to convert the weights and build the TensorRT engine.
+
+```bash
+export HF_MODEL_DIR=hf_models/exaone_deep
+git clone https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-2.4B $HF_MODEL_DIR
 ```
 
 ## Usage
@@ -43,7 +56,7 @@ The next section describe how to convert the weights from the [HuggingFace (HF) 
 
 # Build the EXAONE model using a single GPU and FP16.
 python ../llama/convert_checkpoint.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/fp16/1-gpu \
     --dtype float16
 
@@ -54,7 +67,7 @@ trtllm-build \
 
 # Build the EXAONE model using a single GPU and and apply INT8 weight-only quantization.
 python ../llama/convert_checkpoint.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/int8_wq/1-gpu \
     --use_weight_only \
     --weight_only_precision int8 \
@@ -67,7 +80,7 @@ trtllm-build \
 
 # Build the EXAONE model using a single GPU and and apply INT4 weight-only quantization.
 python ../llama/convert_checkpoint.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/int4_wq/1-gpu \
     --use_weight_only \
     --weight_only_precision int4 \
@@ -78,9 +91,9 @@ trtllm-build \
     --output_dir trt_engines/exaone/int4_wq/1-gpu \
     --gemm_plugin auto
 
-# Build the EXAONE model using using 2-way tensor parallelism and FP16.
+# Build the EXAONE model using 2-way tensor parallelism and FP16.
 python ../llama/convert_checkpoint.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --output_dir trt_models/exaone/fp16/2-gpu \
     --tp_size 2 \
     --dtype float16
@@ -101,7 +114,7 @@ First make sure Modelopt toolkit is installed (see [examples/quantization/README
 ```bash
 # Build the EXAONE model using a single GPU and and apply FP8 quantization.
 python ../quantization/quantize.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --dtype float16 \
     --qformat fp8 \
     --kv_cache_dtype fp8 \
@@ -122,7 +135,7 @@ First make sure Modelopt toolkit is installed (see [examples/quantization/README
 ```bash
 # Build the EXAONE model using a single GPU and and apply INT8 SmoothQuant.
 python ../quantization/quantize.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --dtype float16 \
     --qformat int8_sq \
     --output_dir trt_models/exaone/int8_sq/1-gpu
@@ -142,7 +155,7 @@ First make sure Modelopt toolkit is installed (see [examples/quantization/README
 ```bash
 # Build the EXAONE model using a single GPU and and apply INT4 AWQ.
 python ../quantization/quantize.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --dtype float16 \
     --qformat int4_awq \
     --output_dir trt_models/exaone/int4_awq/1-gpu
@@ -161,7 +174,7 @@ Please make sure your system contains a Hopper GPU before trying the commands be
 ```bash
 # Build the EXAONE model using a single GPU and and apply W4A8 AWQ.
 python ../quantization/quantize.py \
-    --model_dir hf_models/exaone \
+    --model_dir $HF_MODEL_DIR \
     --dtype float16 \
     --qformat w4a8_awq \
     --output_dir trt_models/exaone/w4a8_awq/1-gpu
@@ -180,7 +193,7 @@ Test your engine with the [run.py](../run.py) script:
 python3 ../run.py \
     --input_text "When did the first world war end?" \
     --max_output_len=100 \
-    --tokenizer_dir hf_models/exaone \
+    --tokenizer_dir $HF_MODEL_DIR \
     --engine_dir trt_engines/exaone/fp16/1-gpu
 
 # Run with 2 GPUs
@@ -188,13 +201,13 @@ mpirun -n 2 --allow-run-as-root \
     python3 ../run.py \
     --input_text "When did the first world war end?" \
     --max_output_len=100 \
-    --tokenizer_dir hf_models/exaone \
+    --tokenizer_dir $HF_MODEL_DIR \
     --engine_dir trt_engines/exaone/fp16/2-gpu
 
 python ../summarize.py \
     --test_trt_llm \
     --data_type fp16 \
-    --hf_model_dir hf_models/exaone \
+    --hf_model_dir $HF_MODEL_DIR \
     --engine_dir trt_engines/exaone/fp16/1-gpu
 ```
 

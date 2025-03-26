@@ -8,7 +8,8 @@ from torch._inductor.pattern_matcher import (CallFunction, Ignored, KeywordArg,
                                              register_replacement)
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceStrategy
+
+from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping

@@ -56,6 +56,12 @@ def test_deepseek(model_name, backend, quant, tp_size, pp_size, ep_size,
     is_fp8 = quant == "fp8"
     is_fp4 = quant == "fp4"
 
+    if (not enable_overlap_scheduler and enable_cuda_graph and not enable_dp
+            and mtp_nextn == 0 and ep_size == 1 and pp_size == 4
+            and tp_size == 1 and is_fp8):
+
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5189673")
+
     if ep_size > tp_size:
         pytest.skip(
             f"Expert parallel size {ep_size} must be less than or equal to tensor parallel size {tp_size}"

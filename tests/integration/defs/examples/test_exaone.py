@@ -23,7 +23,9 @@ from defs.trt_test_alternative import check_call
 @pytest.mark.parametrize("num_beams", [1, 2, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
-@pytest.mark.parametrize("llm_exaone_model_root", ['exaone'], indirect=True)
+@pytest.mark.parametrize("llm_exaone_model_root",
+                         ['exaone_3.0_7.8b_instruct', 'exaone_deep_2.4b'],
+                         indirect=True)
 @pytest.mark.parametrize("use_weight_only", [True, False],
                          ids=["enable_weight_only", "disable_weight_only"])
 def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
@@ -44,13 +46,11 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
         data_type=data_type,
         use_weight_only=use_weight_only)
 
-    # TODO: Should we add use_weight_only_groupwise_quant_matmul_plugin?
-
     build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}", f"--max_beam_width={num_beams}",
-        "--max_batch_size=256"
+        "trtllm-build",
+        f"--checkpoint_dir={model_dir}",
+        f"--output_dir={engine_dir}",
+        f"--max_beam_width={num_beams}",
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
@@ -80,7 +80,9 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("data_type", ['float16'])
-@pytest.mark.parametrize("llm_exaone_model_root", ['exaone'], indirect=True)
+@pytest.mark.parametrize("llm_exaone_model_root",
+                         ['exaone_3.0_7.8b_instruct', 'exaone_deep_2.4b'],
+                         indirect=True)
 def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
                          llm_venv, cmodel_dir, engine_dir, num_beams):
@@ -102,8 +104,7 @@ def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
 
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}", f"--max_beam_width={num_beams}"
+        f"--output_dir={engine_dir}", f"--max_beam_width={num_beams}"
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 

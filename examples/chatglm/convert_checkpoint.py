@@ -236,6 +236,8 @@ def convert_and_save_hf(args):
                 load_model_on_cpu=args.load_model_on_cpu,
                 **override_fields)
             glm.config.mapping.cp_size = args.cp_size
+            glm.config.mapping.attn_tp_size = -1
+            glm.config.mapping.attn_cp_size = -1
             glm.config.mapping.world_size *= args.cp_size
             glm.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del glm

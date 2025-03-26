@@ -4,12 +4,8 @@ from .common import ReduceOp, get_rank_world_size, is_ompi
 
 # use trtllm distributed ops to improve TP performance if possible
 try:
-    from tensorrt_llm._torch.distributed import AllReduce, allgather
-    from tensorrt_llm._torch.modules.linear import (
-        AllReduceFusionOp,
-        AllReduceParams,
-        ParallelConfig,
-    )
+    from ...distributed import AllReduce, allgather
+    from ...modules.linear import AllReduceFusionOp, AllReduceParams, ParallelConfig
 
     def trtllm_allgather(tensor, dim):
         rank, world_size = get_rank_world_size()

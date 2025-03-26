@@ -32,7 +32,7 @@ namespace tensorrt_llm::layers
 
 #define GET_INFO_STAGE1(nPBM)                                                                                          \
     {                                                                                                                  \
-        int constexpr nBlock = (nPBM < 16) ? ((nPBM < 8) ? nThreadForSmallBeamWidth : 128) : 64;                       \
+        int constexpr nBlock = (nPBM < 16) ? ((nPBM < 8) ? kThreadForSmallBeamWidth : 128) : 64;                       \
         TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(                                                 \
             &nMaxActiveBlock, beamStage1Kernel<T, 2 * nPBM, nBlock>, nBlock, 0));                                      \
         TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, 2 * nPBM, nBlock>));                          \
@@ -76,8 +76,8 @@ BeamSearchLayer<T>::BeamSearchLayer(DecoderDomain const& decoderDomain, std::sha
     SizeType32 const nBS{mDecoderDomain.getBatchSize()};
     SizeType32 const nBM{mDecoderDomain.getBeamWidth()};
     SizeType32 const nV{mDecoderDomain.getVocabSize()};
-    TLLM_CHECK_WITH_INFO(nBM <= nMaxBeamWidth, "Beam width is larger than the maximum supported (%d > %d)", int(nBM),
-        int(nMaxBeamWidth));
+    TLLM_CHECK_WITH_INFO(nBM <= kMaxBeamWidth, "Beam width is larger than the maximum supported (%d > %d)", int(nBM),
+        int(kMaxBeamWidth));
 
     allocateBuffer();
     configureBeamSearchLayer();
@@ -122,7 +122,7 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
     this->mByteMaxSharedMemoryPerBlock = nByteMaxSharedMemoryPerBlock;
     int const nByteReservedSharedMemoryPerBlock = nByteMaxSharedMemoryPerSM - nByteMaxSharedMemoryPerBlock;
 
-    if (nBM <= nMaxBeamWidthForV1) // Use V1 kernels for small beam width
+    if (nBM <= kMaxBeamWidthForV1) // Use V1 kernels for small beam width
     {
         // Stage 1
         int nMaxActiveBlock = -1;
@@ -137,13 +137,13 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         int nByteStaticSharedMemory = attr.sharedSizeBytes;
         int nByteMaxDynamicSharedMemoryPerBlock = nByteMaxSharedMemoryPerBlock - nByteStaticSharedMemory;
         // Find the maximum of `nBlock` (maximum of `nVPart`, minimum of `nByteDynamicSharedMemoryStage1`), s.t.
-        // `nVPart <= nMaxVPartStage1 && nByteDynamicSharedMemoryStage1 * nVPart >= sizeof(T) * nV`
-        TLLM_CHECK_WITH_INFO(nByteMaxDynamicSharedMemoryPerBlock * nMaxVPartStage1 >= sizeof(T) * nV,
+        // `nVPart <= kMaxVPartStage1 && nByteDynamicSharedMemoryStage1 * nVPart >= sizeof(T) * nV`
+        TLLM_CHECK_WITH_INFO(nByteMaxDynamicSharedMemoryPerBlock * kMaxVPartStage1 >= sizeof(T) * nV,
             "vocab_size is too large for Beam search.");
         int nByteExtralSharedMemory = nByteReservedSharedMemoryPerBlock + nByteStaticSharedMemory;
         int nBlock = nMaxActiveBlock;
-        int nVPart = nMaxVPartStage1 + 1;
-        for (; nBlock > 0 && nVPart > nMaxVPartStage1; --nBlock)
+        int nVPart = kMaxVPartStage1 + 1;
+        for (; nBlock > 0 && nVPart > kMaxVPartStage1; --nBlock)
         {
             int nByteDynamicSharedMemoryStage1 = nByteMaxSharedMemoryPerSM / nBlock - nByteExtralSharedMemory;
             nByteDynamicSharedMemoryStage1 -= nByteDynamicSharedMemoryStage1 % sizeof(T);
@@ -199,7 +199,7 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         // C for stage 2 if `bUseGlobalMemoryStage2 == true`, can be reuse for stage 3
         // D for stage 3 if `bUseGlobalMemoryStage3 == true`
         size_t const nByteA = common::roundUp(sizeof(T) * nBS * nPBM * nPBM * 4, 4);
-        size_t const nByteB = common::roundUp(sizeof(T) * nBS * nPBM * nMaxVPartStage1 * nPBM * 4, 4);
+        size_t const nByteB = common::roundUp(sizeof(T) * nBS * nPBM * kMaxVPartStage1 * nPBM * 4, 4);
         size_t const nByteC = (bUseGlobalMemoryStage2) ? nByteDynamicSharedMemoryStage2 : 0;
         size_t const nByteD = (bUseGlobalMemoryStage3) ? nByteDynamicSharedMemoryStage3 : 0;
         this->mWorkspaceSize = nByteA + std::max(nByteB + nByteC, nByteD);

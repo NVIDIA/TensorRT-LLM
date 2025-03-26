@@ -453,10 +453,13 @@ def llm_exaone_model_root(request) -> str:
     "Get EXAONE model root"
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert request.param == "exaone", "Is the name of model root is exaone?"
 
-    exaone_model_root = os.path.join(models_root, request.param)
-    assert exists(exaone_model_root), f"{exaone_model_root} does not exist!"
+    exaone_model_root = os.path.join(models_root, "exaone")
+    if hasattr(request, "param"):
+        if request.param == "exaone_3.0_7.8b_instruct":
+            exaone_model_root = os.path.join(models_root, "exaone")
+        elif request.param == "exaone_deep_2.4b":
+            exaone_model_root = os.path.join(models_root, "EXAONE-Deep-2.4B")
 
     return exaone_model_root
 

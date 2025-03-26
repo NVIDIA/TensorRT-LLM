@@ -201,7 +201,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                  pad_token="<pad>",
                  unk_token="<unk>",
                  num_image_tokens=20000,
-                 **kwargs) -> None:  # wili, fix for new transformers
+                 **kwargs) -> None:  # Fix for new transformers
 
         self.do_lower_case = do_lower_case
         self.remove_space = remove_space
@@ -217,7 +217,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                                         num_image_tokens=num_image_tokens)
 
         super().__init__(
-            do_lower_case=do_lower_case,  # wili, fix for new transformers
+            do_lower_case=do_lower_case,  # Fix for new transformers
             remove_space=remove_space,
             padding_side=padding_side,
             bos_token=bos_token,
@@ -363,7 +363,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
             padding_strategy: PaddingStrategy = PaddingStrategy.DO_NOT_PAD,
             pad_to_multiple_of: Optional[int] = None,
             return_attention_mask: Optional[bool] = None,
-            padding_side: str = "left",  # wili, fix for new transformers
+            padding_side: str = "left",  # Fix for new transformers
     ) -> dict:
         """
         Pad encoded inputs (on left/right and up to predefined length or max length in the batch)

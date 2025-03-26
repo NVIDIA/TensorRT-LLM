@@ -41,9 +41,6 @@ def test_llm_qwen2audio_single_gpu(qwen2audio_example_root, llm_qwen_model_root,
     "Build & run qwen2audio on 1 gpu."
     workspace = llm_venv.get_working_directory()
 
-    # https://nvbugs/5136784
-    llm_venv.run_cmd(['-m', 'pip', 'install', 'transformers==4.47.1'])
-
     print("Generate audio engine...")
     audio_engine_dir = f"{engine_dir}/audio"
     audio_cmd = [

@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from transformers import BertConfig
 
-from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
@@ -14,6 +13,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.linear import Linear
 from .modeling_utils import register_auto_model
 
 

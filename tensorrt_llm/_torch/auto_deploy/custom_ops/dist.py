@@ -2,8 +2,8 @@
 
 import torch
 
-import tensorrt_llm._torch.auto_deploy.distributed.common as dist
-import tensorrt_llm._torch.auto_deploy.distributed.trtllm as trtllm_dist
+from ..distributed import common as dist
+from ..distributed import trtllm as trtllm_dist
 
 
 @torch.library.custom_op("dist::all_gather", mutates_args=(), device_types="cuda")
