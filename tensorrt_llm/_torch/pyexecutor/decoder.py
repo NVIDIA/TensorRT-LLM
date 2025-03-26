@@ -43,6 +43,10 @@ class DummyDecoder(Decoder):
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
+        return None, None, None
+
+    def update_requests(self, scheduled_requests, new_tensors_host,
+                        decoder_event):
         for request in scheduled_requests.context_requests:
             request.add_new_token(500, 0)
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -51,10 +55,6 @@ class DummyDecoder(Decoder):
                 request.add_new_token(request.get_num_tokens(0) + 1000, 0)
             else:
                 request.state = LlmRequestState.GENERATION_COMPLETE
-
-    def update_requests(self, scheduled_requests, new_tensors_host,
-                        decoder_event):
-        pass
 
 
 class EarlyStopDecoder(Decoder):
@@ -65,16 +65,17 @@ class EarlyStopDecoder(Decoder):
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
-        assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
             #NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             request.context_logits = model_outputs['logits'][idx]
+        return None, None, None
 
     def update_requests(self, scheduled_requests, new_tensors_host,
                         decoder_event):
-        pass
+        assert (not scheduled_requests.generation_requests)
+        for request in scheduled_requests.context_requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
 
 
 def top_k_sampling_batch(logits, top_k=50):
