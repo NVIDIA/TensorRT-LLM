@@ -407,7 +407,7 @@ void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __res
 
 template <typename T>
 void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialLength, int64_t cpSize, int64_t partialQHeads,
-    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+    int64_t partialKVHeads, int64_t mqaBroadcast, int64_t headSize, int64_t rank, cudaStream_t stream);
 
 template <typename T>
 void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
