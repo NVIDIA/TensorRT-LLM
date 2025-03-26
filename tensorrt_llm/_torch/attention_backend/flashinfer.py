@@ -439,8 +439,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
-            metadata = extra_attrs.get("attention_metadata",
-                                       weakref.ref(None))()
+            metadata_ref = extra_attrs.get("attention_metadata", None)
+            metadata = metadata_ref() if metadata_ref is not None else None
         else:
             metadata = get_global_attrs().attention_metadata()
 

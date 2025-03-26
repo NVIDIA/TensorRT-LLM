@@ -1,9 +1,10 @@
 import copy
+import weakref
+from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
-from weakref import WeakValueDictionary
 
 import torch
 from typing_extensions import Self
@@ -346,13 +347,18 @@ class RopeParams:
         if self.dim == 0:
             return None, None
 
+        RopeConstParams = namedtuple("RopeConstParams", ["inv_freq", "cos_sin"])
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
-            cache = extra_attrs.setdefault("rope_const_params",
-                                           WeakValueDictionary())
+            cache = extra_attrs.setdefault("rope_const_params", {})
             rope_const_params = cache.get((self, interleave), None)
-            if rope_const_params is not None:
-                return rope_const_params
+            if rope_const_params is not None and rope_const_params.cos_sin(
+            ) is not None:
+                return (
+                    rope_const_params.inv_freq()
+                    if rope_const_params.inv_freq is not None else None,
+                    rope_const_params.cos_sin(),
+                )
 
         assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
         if self.scale_type == RotaryScalingType.yarn:
@@ -398,7 +404,11 @@ class RopeParams:
             device='cuda',
         )
         if extra_attrs is not None:
-            cache[(self, interleave)] = (rope_inv_freq, rope_cos_sin)
+            cache[(self, interleave)] = RopeConstParams(
+                weakref.ref(rope_inv_freq)
+                if rope_inv_freq is not None else None,
+                weakref.ref(rope_cos_sin),
+            )
         return rope_inv_freq, rope_cos_sin
 
 
