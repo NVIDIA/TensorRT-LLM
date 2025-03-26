@@ -3,7 +3,7 @@ This document shows how to build and run a [DiT](https://arxiv.org/abs/2212.0974
 
 ## Overview
 
-The TensorRT-LLM DiT implementation can be found in [tensorrt_llm/models/dit/model.py](../../tensorrt_llm/models/dit/model.py). The TensorRT-LLM DiT example code is located in [`examples/dit`](./). There are main files to build and run DiT with TensorRT-LLM:
+The TensorRT-LLM DiT implementation can be found in [tensorrt_llm/models/dit/model.py](../../../../tensorrt_llm/models/dit/model.py). The TensorRT-LLM DiT example code is located in [`examples/dit`](./). There are main files to build and run DiT with TensorRT-LLM:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the DiT model into tensorrt-llm checkpoint format.
 * [`sample.py`](./sample.py) to generate images with TensorRT engine(s).

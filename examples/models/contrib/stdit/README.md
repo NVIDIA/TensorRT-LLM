@@ -3,7 +3,7 @@ This document shows how to build and run a STDiT in [OpenSoRA](https://github.co
 
 ## Overview
 
-The TensorRT-LLM implementation of STDiT can be found in [tensorrt_llm/models/stdit/model.py](../../tensorrt_llm/models/stdit/model.py). The TensorRT-LLM STDiT (OpenSoRA) example code is located in [`examples/stdit`](./). There are main files to build and run STDiT with TensorRT-LLM:
+The TensorRT-LLM implementation of STDiT can be found in [tensorrt_llm/models/stdit/model.py](../../../../tensorrt_llm/models/stdit/model.py). The TensorRT-LLM STDiT (OpenSoRA) example code is located in [`examples/models/contrib/stdit`](./). There are main files to build and run STDiT with TensorRT-LLM:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the STDiT model into tensorrt-llm checkpoint format.
 * [`sample.py`](./sample.py) to run the pipeline with TensorRT engine(s) to generate videos.
@@ -16,7 +16,7 @@ The TensorRT-LLM implementation of STDiT can be found in [tensorrt_llm/models/st
 
 ## Usage
 
-The TensorRT-LLM STDiT example code locates at [examples/stdit](./). It takes HuggingFace checkpiont as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT-LLM STDiT example code locates at [examples/models/contrib/stdit](./). It takes HuggingFace checkpoint as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Requirements
 

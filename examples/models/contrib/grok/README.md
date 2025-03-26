@@ -22,14 +22,14 @@ The grok-1 model requires a node with 8x80GB GPU memory(at least).
 
 ## Overview
 
-The TensorRT-LLM Grok-1 implementation can be found in [tensorrt_llm/models/grok/model.py](../../tensorrt_llm/models/grok/model.py). The TensorRT-LLM Grok-1 example code is located in [`examples/grok`](./). There is one main file:
+The TensorRT-LLM Grok-1 implementation can be found in [tensorrt_llm/models/grok/model.py](../../../../tensorrt_llm/models/grok/model.py). The TensorRT-LLM Grok-1 example code is located in [`examples/grok`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Grok-1 model into tensorrt-llm checkpoint format.
 
-In addition, there are two shared files in the parent folder [`examples`](../) for inference and evaluation:
+In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
-* [`../run.py`](../run.py) to run the inference on an input text;
-* [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`../../../run.py`](../../../run.py) to run the inference on an input text;
+* [`../../../summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
   * INT8 Weight-Only
@@ -78,7 +78,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpus_bf16 \
 
 # Run Grok-1 with 8 GPUs
 mpirun -n 8 --allow-run-as-root \
-    python ../run.py \
+    python ../../../run.py \
     --input_text "The answer to life the universe and everything is of course" \
     --engine_dir ./tmp/grok-1/trt_engines/bf16/8-gpus \
     --max_output_len 50 --top_p 1 --top_k 8 --temperature 0.3 \

@@ -14,7 +14,7 @@ This document shows how to build and run a DBRX model in TensorRT-LLM. DBRX is a
 
 ## Overview
 
-The TensorRT-LLM DBRX implementation can be found in [tensorrt_llm/models/dbrx/model.py](../../tensorrt_llm/models/dbrx/model.py).
+The TensorRT-LLM DBRX implementation can be found in [tensorrt_llm/models/dbrx/model.py](../../../../tensorrt_llm/models/dbrx/model.py).
 
 ## Support Matrix
   * BF16
@@ -191,7 +191,7 @@ trtllm-build --checkpoint_dir dbrx/trt_ckpt/int8kv/tp4 \
 
 ### Run inference
 
-You can test your engines with the [run.py](../run.py) script:
+You can test your engines with the [run.py](../../../run.py) script:
 
 ```bash
 mpirun -n 8 \
@@ -210,7 +210,7 @@ AGI stands for"
 ```
 
 
-You can also evaluate with the [summarize.py](../summarize.py) script:
+You can also evaluate with the [summarize.py](../../../summarize.py) script:
 ```bash
 mpirun -n 8 \
     python ../summarize.py --engine_dir dbrx/trt_engines/bf16/tp8 \
