@@ -796,10 +796,6 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     _, new_tensors_host, decoder_event = self._decode_async(
                         scheduled_batch, batch_outputs)
 
@@ -807,6 +803,10 @@ class PyExecutor:
 
                     self._update_requests(scheduled_batch, new_tensors_host,
                                           decoder_event)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -1471,6 +1471,7 @@ class PyExecutor:
         for req in scheduled_ctx_requests:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
+                self.resource_manager["guided_decoder_resource_manager"].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(False)
 
