@@ -931,10 +931,6 @@ class PyExecutor:
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_new_tensors_device)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
                         scheduled_batch, batch_outputs)
 
@@ -942,6 +938,10 @@ class PyExecutor:
                         self._finish_dummy_request(scheduled_batch)
 
                     self._update_request_states(scheduled_batch)
+                    
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
 
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
