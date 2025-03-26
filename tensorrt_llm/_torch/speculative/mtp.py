@@ -918,6 +918,7 @@ class MTPEagleWorker(MTPWorker):
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -969,6 +970,11 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.num_contexts = 0
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
+            if i == 0 and num_contexts > 0:
+                # for mtp eagle mode, mtp_layer_idx == 0: context attn; mtp_layer_idx > 0: generation attn
+                if attn_metadata.kv_cache_manager is not None:
+                    attn_metadata.update_block_ids_per_seq_for_mtp(
+                        num_contexts, num_generations)
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
@@ -984,6 +990,7 @@ class MTPEagleWorker(MTPWorker):
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
             attn_metadata.num_contexts = num_contexts
+            attn_metadata.num_generations = num_generations
             attn_metadata._seq_lens[:batch_size].copy_(seq_len)
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
