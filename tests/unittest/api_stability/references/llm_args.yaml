@@ -1,220 +1,87 @@
 methods:
   __init__:
-    name: __init__
     parameters:
-      auto_parallel:
-        annotation: bool
-        default: false
-        name: auto_parallel
-      auto_parallel_world_size:
-        annotation: int
-        default: 1
-        name: auto_parallel_world_size
-      backend:
-        annotation: Optional[str]
-        default: null
-        name: backend
-      batched_logits_processor:
-        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
-        default: null
-        name: batched_logits_processor
-      batching_type:
-        annotation: Optional[tensorrt_llm.bindings.executor.BatchingType]
-        default: null
-        name: batching_type
-      build_config:
-        annotation: Optional[tensorrt_llm.builder.BuildConfig]
-        default: null
-        name: build_config
-      calib_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_utils.CalibConfig]
-        default: null
-        name: calib_config
-      context_parallel_size:
-        annotation: int
-        default: 1
-        name: context_parallel_size
+      # Parallelism
       cp_config:
         annotation: Optional[dict]
         default: null
-        name: cp_config
-      decoding_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.DecodingConfig]
-        default: null
-        name: decoding_config
-      dtype:
-        annotation: str
-        default: auto
-        name: dtype
+      auto_parallel:
+        annotation: bool
+        default: false
+      auto_parallel_world_size:
+        annotation: int
+        default: 1
       embedding_parallel_mode:
         annotation: str
         default: SHARDING_ALONG_VOCAB
-        name: embedding_parallel_mode
-      enable_attention_dp:
-        annotation: bool
-        default: false
-        name: enable_attention_dp
+      # Engine building
+      build_config:
+        annotation: Optional[tensorrt_llm.builder.BuildConfig]
+        default: null
       enable_build_cache:
         annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
         default: false
-        name: enable_build_cache
-      enable_chunked_prefill:
-        annotation: bool
-        default: false
-        name: enable_chunked_prefill
-      enable_lora:
-        annotation: bool
-        default: false
-        name: enable_lora
-      enable_prompt_adapter:
-        annotation: bool
-        default: false
-        name: enable_prompt_adapter
-      enable_tqdm:
-        annotation: bool
-        default: false
-        name: enable_tqdm
-      extended_runtime_perf_knob_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig]
-        default: null
-        name: extended_runtime_perf_knob_config
       fast_build:
         annotation: bool
         default: false
-        name: fast_build
-      gather_generation_logits:
-        annotation: bool
-        default: false
-        name: gather_generation_logits
-      gpus_per_node:
-        annotation: Optional[int]
+      # Bindings and mirrored configs
+      batching_type:
+        annotation: Optional[tensorrt_llm.bindings.executor.BatchingType]
         default: null
-        name: gpus_per_node
-      guided_decoding_backend:
-        annotation: Optional[str]
-        default: null
-        name: guided_decoding_backend
-      iter_stats_max_iterations:
-        annotation: Optional[int]
-        default: null
-        name: iter_stats_max_iterations
       kv_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
         default: null
-        name: kv_cache_config
-      load_format:
-        annotation: Literal['auto', 'dummy']
-        default: auto
-        name: load_format
-      max_batch_size:
-        annotation: Optional[int]
-        default: null
-        name: max_batch_size
-      max_cpu_loras:
-        annotation: int
-        default: 4
-        name: max_cpu_loras
-      max_lora_rank:
-        annotation: Optional[int]
-        default: null
-        name: max_lora_rank
-      max_loras:
-        annotation: int
-        default: 4
-        name: max_loras
-      max_num_tokens:
-        annotation: Optional[int]
-        default: null
-        name: max_num_tokens
-      max_prompt_adapter_token:
-        annotation: int
-        default: 0
-        name: max_prompt_adapter_token
-      model:
-        annotation: Union[str, pathlib.Path]
-        default: inspect._empty
-        name: model
-      moe_expert_parallel_size:
-        annotation: Optional[int]
-        default: null
-        name: moe_expert_parallel_size
-      moe_tensor_parallel_size:
-        annotation: Optional[int]
-        default: null
-        name: moe_tensor_parallel_size
-      normalize_log_probs:
-        annotation: bool
-        default: false
-        name: normalize_log_probs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
-        name: peft_cache_config
-      pipeline_parallel_size:
-        annotation: int
-        default: 1
-        name: pipeline_parallel_size
-      quant_config:
-        annotation: Optional[tensorrt_llm.models.modeling_utils.QuantConfig]
-        default: null
-        name: quant_config
-      request_stats_max_iterations:
-        annotation: Optional[int]
-        default: null
-        name: request_stats_max_iterations
-      revision:
-        annotation: Optional[str]
-        default: null
-        name: revision
       scheduler_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
         default: null
-        name: scheduler_config
-      skip_tokenizer_init:
-        annotation: bool
-        default: false
-        name: skip_tokenizer_init
-      speculative_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
+      extended_runtime_perf_knob_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig]
         default: null
-        name: speculative_config
-      tensor_parallel_size:
-        annotation: int
-        default: 1
-        name: tensor_parallel_size
-      tokenizer:
-        annotation: Union[str, pathlib.Path, transformers.tokenization_utils_base.PreTrainedTokenizerBase,
-          tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
+      decoding_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.DecodingConfig]
         default: null
-        name: tokenizer
-      tokenizer_mode:
-        annotation: Literal['auto', 'slow']
-        default: auto
-        name: tokenizer_mode
-      tokenizer_revision:
+      # Misc
+      backend:
         annotation: Optional[str]
         default: null
-        name: tokenizer_revision
-      trust_remote_code:
+      max_batch_size:
+        annotation: Optional[int]
+        default: null
+      max_num_tokens:
+        annotation: Optional[int]
+        default: null
+      enable_attention_dp:
         annotation: bool
         default: false
-        name: trust_remote_code
+      normalize_log_probs:
+        annotation: bool
+        default: false
+      gather_generation_logits:
+        annotation: bool
+        default: false
+      gpus_per_node:
+        annotation: Optional[int]
+        default: null
+      iter_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      request_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
       workspace:
         annotation: Optional[str]
         default: null
-        name: workspace
     return_annotation: None
   from_kwargs:
-    name: from_kwargs
     parameters:
       kwargs:
         annotation: Any
         default: inspect._empty
-        name: kwargs
     return_annotation: tensorrt_llm.llmapi.llm_utils.LlmArgs
   to_dict:
-    name: to_dict
     parameters: {}
     return_annotation: dict
 properties: {}
