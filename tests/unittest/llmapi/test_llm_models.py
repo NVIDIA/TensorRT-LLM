@@ -143,7 +143,6 @@ def test_llm_gemma_2_9b_it():
     reason=
     "Require further transformers update https://github.com/THUDM/ChatGLM3/issues/1324"
 )
-
 def test_llm_qwen2():
     build_config = BuildConfig()
     build_config.max_batch_size = 512

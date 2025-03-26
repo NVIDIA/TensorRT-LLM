@@ -17,9 +17,9 @@ import os
 import shutil
 
 import pytest
-from defs.common import (convert_weights, 
-                         venv_check_call)
+from defs.common import convert_weights, venv_check_call
 from defs.trt_test_alternative import check_call, exists
+
 
 # TODO: add more test case for input_padding, paged_kv_cache, num_beams
 @pytest.mark.skip_less_device_memory(24000)
