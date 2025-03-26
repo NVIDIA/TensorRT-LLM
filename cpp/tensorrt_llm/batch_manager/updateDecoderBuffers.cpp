@@ -65,8 +65,10 @@ runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& 
 
         if (modelConfig.getSpeculativeDecodingMode().variableDraftLength())
         {
-            decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice = decoder.getDecoderState().getNextDraftTokensLengths();
-            decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice = decoder.getDecoderState().getPrevDraftTokensLengths();
+            decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice
+                = decoder.getDecoderState().getNextDraftTokensLengths();
+            decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice
+                = decoder.getDecoderState().getPrevDraftTokensLengths();
             copyBufferManager.copy(*decoderBuffers.draftBuffers.nextDraftTokensLengthsDevice,
                 *decoderBuffers.draftBuffers.nextDraftTokensLengthsHost);
             copyBufferManager.copy(*decoderBuffers.draftBuffers.prevDraftTokensLengthsDevice,
