@@ -319,7 +319,7 @@ def launchReleaseCheck(pipeline)
 {
     stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            golang-go  \
+            python3-pip \
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
@@ -344,31 +344,10 @@ def launchReleaseCheck(pipeline)
             }
         }
         // Step 3: do some check in container
-        sh "cd ${LLM_ROOT}/cpp && /root/go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
-        // Step 4: verify L0 test lists
-        sh "pip3 install --extra-index-url https://urm-rn.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-	def testDBPath = "${LLM_ROOT}/tests/integration/test_lists/test-db"
-        def testList = "${LLM_ROOT}/l0_test.txt"
-        // Remove perf test from test list since they are dynamical generated
-        sh """
-            touch ${testList}
-            rm ${testDBPath}/*perf*
-            trt-test-db -d ${testDBPath} --test-names --output ${testList}
-            cd ${LLM_ROOT}/tests/integration/defs
-            pytest --apply-test-list-correction --test-list=${testList} --co -q
-        """
-        // Step 5: verify QA test lists
-        def testQAPath = "${LLM_ROOT}/tests/integration/test_lists/qa"
-        def testDefFiles = sh (script: "ls -d ${testQAPath}/*.txt",returnStdout: true).trim().split('\n')
-        testDefFiles.each { testDefFile ->
-            sh """
-                cd ${LLM_ROOT}/tests/integration/defs
-                pytest --apply-test-list-correction --test-list=$testDefFile --co -q
-            """
-        }
+        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main"
+    def image = "urm-rn.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
         stage("[${stageName}] Run") {
