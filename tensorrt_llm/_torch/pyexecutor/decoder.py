@@ -527,7 +527,8 @@ class TRTLLMDecoder(Decoder):
             self, scheduled_requests: ScheduledRequests,
             decoder_buffers: tllm.internal.batch_manager.DecoderBuffers,
             decoder_event: tllm.internal.runtime.DecoderFinishedEvent):
-        decoder_event.synchronize()
+        if decoder_event:
+            decoder_event.synchronize()
 
         # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
         new_tokens_host = self.algs.decoder.decoder_state.all_new_tokens.to(
