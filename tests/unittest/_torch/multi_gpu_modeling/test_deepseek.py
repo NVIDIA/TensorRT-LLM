@@ -75,8 +75,8 @@ def test_deepseek(model_name, backend, quant, tp_size, pp_size, ep_size,
     if is_fp4 and mtp_nextn > 0:
         pytest.skip(f"FP4 checkpoint has no MTP weights")
 
-    if mtp_nextn > 0 and getSMVersion() < 100:
-        pytest.skip(f"Only Blackwell MLA kernel can support MTP now")
+    if mtp_nextn > 0 and getSMVersion() < 90:
+        pytest.skip(f"Only Hopper and Blackwell MLA kernel can support MTP now")
 
     if pp_size > 1 and mtp_nextn > 0:
         pytest.skip(
