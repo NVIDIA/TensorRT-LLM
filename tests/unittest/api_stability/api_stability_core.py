@@ -247,7 +247,7 @@ class ClassSnapshot:
 
 class ApiStabilityTestHarness:
     TEST_CLASS = None
-    REFERENCE_COMMITTED_DIR = f"{os.path.dirname(__file__)}/references_committed_v1"
+    REFERENCE_COMMITTED_DIR = f"{os.path.dirname(__file__)}/references_committed"
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
     REFERENCE_FILE = None
 
@@ -265,7 +265,7 @@ class ApiStabilityTestHarness:
         else:
             cls.reference_committed = None
         cls.error_msg = f"API validation failed because you changed {cls.TEST_CLASS.__name__}'s APIs, please ask for reviews from the code owners."
-        cls.error_msg_committed = f"API validation failed because you changed {cls.TEST_CLASS.__name__}'s committed APIs, please ask for approvals from the project managers."
+        cls.error_msg_committed = f"API validation failed because you changed {cls.TEST_CLASS.__name__}'s committed APIs, please ask for approval."
 
     def create_snapshot_from_inspect(self):
         return ClassSnapshot.from_inspect(self.TEST_CLASS)
