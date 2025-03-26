@@ -380,7 +380,10 @@ def getMergeRequestChangedFileListGitlab(pipeline) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
-                script: "curl --header \"PRIVATE-TOKEN: $GITLAB_API_TOKEN\" --url \"https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20\"",
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
                 returnStdout: true
             )
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
@@ -407,7 +410,10 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
-                script: "curl --header \"Authorization: Bearer $GITHUB_API_TOKEN\" --url \"${githubPrApiUrl}/files?page=${pageId}&per_page=20\"",
+                script: """
+                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                         --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
+                """,
                 returnStdout: true
             )
             echo "rawDataJson: ${rawDataJson}"
@@ -432,7 +438,7 @@ def getMergeRequestChangedFileList(pipeline, githubPrApiUrl) {
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        pipeline.echo("Get merge request changed file list failed.")
+        pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         return []
     }
 }
@@ -516,7 +522,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
     }
     catch (Exception e)
     {
-        pipeline.echo("getMultiGpuFileChanged failed execution.")
+        pipeline.echo("getMultiGpuFileChanged failed execution. Error: ${e.toString()}")
     }
     if (relatedFileChanged) {
         pipeline.echo("Detect multi-GPU related files changed.")
