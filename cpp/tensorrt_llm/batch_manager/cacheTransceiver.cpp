@@ -159,10 +159,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
                     "built with UCX support, please rebuild in UCX-enabled environment.");
                 return ret;
             };
-            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)(
-                mpi::MpiComm const* comm);
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
             *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
-            mManager = makeUcxConnectionManager(mMpiWorldComm);
+            mManager = makeUcxConnectionManager();
         }
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
         mDataResponder = isMLA
