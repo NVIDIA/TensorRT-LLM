@@ -489,8 +489,7 @@ def launchTestListCheck(pipeline)
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         sh "pip3 install --extra-index-url https://urm-rn.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
         // Verify L0 test lists
-        def llmPath = sh (script: "realpath .", returnStdout: true).trim()
-        def llmSrc = "${llmPath}/TensorRT-LLM/src"
+        def llmSrc = "${pwd()}/TensorRT-LLM/src"
         def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
         def testList = "${LLMllmSllmSrcrc_ROOT}/l0_test.txt"
         // Remove perf test from test list since they are dynamical generated
