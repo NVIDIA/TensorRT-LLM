@@ -291,6 +291,7 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
     ):
         beam_width = 1
@@ -311,7 +312,8 @@ class KVCacheManager(BaseResourceManager):
                              is_streaming=False,
                              encoder_input_tokens=encoder_input_tokens)
             req.paged_kv_block_ids = []
-            self.impl.add_sequence(req_id, token_num, beam_width, req)
+            if prepare_resource:
+                self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1 + max_num_draft_tokens
