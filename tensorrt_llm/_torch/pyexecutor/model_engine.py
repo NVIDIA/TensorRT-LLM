@@ -243,11 +243,18 @@ class PyTorchModelEngine(ModelEngine):
         # The config object is not a frozen data class, so it's
         # possible the user changed it after initialization.
         pytorch_backend_config._convert_load_format()
+        if pytorch_backend_config.moe_max_num_tokens is None:
+            moe_max_num_tokens = max_num_tokens
+            if mapping.enable_attention_dp:
+                moe_max_num_tokens *= mapping.world_size
+        else:
+            moe_max_num_tokens = pytorch_backend_config.moe_max_num_tokens
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
             attn_backend=attn_backend,
             load_format=pytorch_backend_config.load_format,
+            moe_max_num_tokens=moe_max_num_tokens,
         )
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -712,11 +719,12 @@ class PyTorchModelEngine(ModelEngine):
         torch.cuda.empty_cache()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
-                    **kwargs):
+                    moe_max_num_tokens: int, **kwargs):
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
         config.spec_config = self.spec_config
+        config.moe_max_num_tokens = moe_max_num_tokens
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
@@ -1556,6 +1564,7 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
+            inputs['use_cuda_graph'] = maybe_graph is not None
             self.iter_counter += 1
 
             if maybe_graph is None:
