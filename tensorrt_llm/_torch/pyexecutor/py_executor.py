@@ -630,6 +630,7 @@ class PyExecutor:
                         batch_outputs = self._forward_step(scheduled_batch)
                         new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
                             scheduled_batch, batch_outputs)
+                        self._update_request_states(scheduled_batch)
                         torch.cuda.nvtx.range_pop()
 
                     if num_dummy_request > 0:
@@ -777,7 +778,13 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    self._decode(scheduled_batch, batch_outputs)
+                    _, new_tensors_host, decoder_event = self._decode_async(
+                        scheduled_batch, batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
+
+                    self._update_requests(scheduled_batch, new_tensors_host,
+                                          decoder_event)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -911,6 +918,9 @@ class PyExecutor:
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
+
+                    self._update_request_states(scheduled_batch)
+
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
                         self._process_previous_batch()
@@ -995,6 +1005,8 @@ class PyExecutor:
         batch_outputs = self._forward_step(scheduled_batch)
         _, new_tensors_host, decoder_event = self._decode_async(
             scheduled_batch, batch_outputs)
+
+        self._update_request_states(scheduled_batch)
 
         if self.send_handles[microbatch_id] is not None:
             self.send_handles[microbatch_id].Wait()
@@ -1450,8 +1462,6 @@ class PyExecutor:
         try:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device)
-            self._setup_decoder(scheduled_requests, outputs)
-            self._update_request_states(scheduled_requests)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1490,27 +1500,6 @@ class PyExecutor:
                 assert False, f'Unsupport cp_type {cp_type}'
         else:
             self._update_request_states_tp(scheduled_requests)
-
-    @nvtx_range("_decode")
-    def _decode(self, scheduled_batch, batch_outputs):
-        try:
-            if batch_outputs is not None:
-                self.decoder.decode(scheduled_batch, batch_outputs)
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_setup_decoder")
-    def _setup_decoder(self, scheduled_batch, batch_outputs):
-        try:
-            self.decoder.setup_decoder(scheduled_batch, batch_outputs)
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in setup_decoder: {error_msg}")
-            self._handle_errors(error_msg)
 
     @nvtx_range("_decode_async")
     def _decode_async(self, scheduled_batch, batch_outputs):
