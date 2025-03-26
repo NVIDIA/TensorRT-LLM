@@ -185,6 +185,9 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     mMaxBeamWidth = maxBeamWidth;
     mMaxSequenceLength = maxSequenceLength;
 
+    mNumDecodingEngineTokens.clear();
+    mNumDecodingEngineTokens.resize(mMaxBatchSize, 0);
+
     // setup input
     auto& dInput = *mJointDecodingInput;
     dInput.maxLength = mMaxSequenceLength;
@@ -207,9 +210,6 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
 
     dInput.beamWidths.clear();
     dInput.beamWidths.resize(mMaxBatchSize, 0);
-
-    dInput.numDecodingEngineTokens.clear();
-    dInput.numDecodingEngineTokens.resize(mMaxBatchSize, 0);
 
     auto const jointOutputIdsShape = ITensor::makeShape({mActualBatchSize, mMaxBeamWidth, mMaxSequenceLength});
 
@@ -406,7 +406,10 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
 
     for (auto const& llmReq : genRequests)
     {
-        mJointDecodingInput->numDecodingEngineTokens.at(llmReq->mSeqSlot.value()) = 1;
+        if (llmReq->mSeqSlot)
+        {
+            setNumDecodingEngineTokens(llmReq->mSeqSlot.value(), 1);
+        }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -554,6 +557,25 @@ SizeType32 DecoderState::getMaxDecodingEngineTokens() const
 SpeculativeDecodingMode DecoderState::getSpeculativeDecodingMode() const
 {
     return mSpeculativeDecodingMode;
+}
+
+std::vector<SizeType32> const& DecoderState::getNumDecodingEngineTokens() const
+{
+    return mNumDecodingEngineTokens;
+}
+
+SizeType32 DecoderState::getNumDecodingEngineTokens(SizeType32 batchIdx) const
+{
+    TLLM_CHECK_WITH_INFO(
+        batchIdx < mActualBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mActualBatchSize);
+    return mNumDecodingEngineTokens[batchIdx];
+}
+
+void DecoderState::setNumDecodingEngineTokens(SizeType32 batchIdx, SizeType32 numTokens)
+{
+    TLLM_CHECK_WITH_INFO(
+        batchIdx < mActualBatchSize, "Batch index %d out of bounds (max %d)", batchIdx, mActualBatchSize);
+    mNumDecodingEngineTokens[batchIdx] = numTokens;
 }
 
 BeamSearchBuffers const& DecoderState::getBeamSearchBuffers() const
