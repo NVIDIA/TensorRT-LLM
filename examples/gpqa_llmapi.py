@@ -36,7 +36,6 @@
 """A duplication of examples/mmlu_llmapi.py and tensorrt_llm/bench/benchmark/utils/asynchronous.py, but targeting GPQA task.
 The duplication is used to get a quick GPQA score in the CI test.
 TODO: Should be merged with examples/mmlu_llmapi.py
-
 Example usage:
     python gpqa.py --hf_model_dir <HF model path> --data_dir <GPQA csv data path>
 or with more optimizations:
@@ -51,7 +50,7 @@ import os
 import random
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import List, Optional, Set, Tuple
 
 import numpy as np
@@ -68,15 +67,10 @@ from tensorrt_llm.llmapi import MTPDecodingConfig
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Set a random seed for reproducibility
-RAND_SEED = 42
-
 # Template for multiple choice questions
 QUERY_TEMPLATE_MULTICHOICE = """
 Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
-
 {Question}
-
 A) {A}
 B) {B}
 C) {C}
@@ -87,42 +81,45 @@ D) {D}
 ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[ \t]*([A-D])"
 
 
-def format_multichoice_question(row: dict) -> str:
-    return QUERY_TEMPLATE_MULTICHOICE.format(**row)
+class RandomSeedGenerator:
+    """A deterministic seed generator for reproducible random number generation.
+
+    This implementation guarantees consistent results across different machines,
+    Python versions, and platforms by using integer-based seed generation.
+    """
+
+    def __init__(self, initial_seed: int = 42):
+        self.initial_seed = initial_seed
+        self.random_generator = random.Random(initial_seed)
+
+    def gen_seed(self, idx: int, sub_idx: Optional[int] = None) -> int:
+        # This ensures consistent behavior across platforms
+        if sub_idx is not None:
+            # Combine seeds using prime numbers and bit operations
+            # to minimize collisions and maintain reproducibility
+            complex_seed = self.initial_seed
+            complex_seed = (complex_seed * 2147483647) + idx  # Use prime number
+            complex_seed = (complex_seed * 2147483647) + (sub_idx if sub_idx
+                                                          is not None else 0)
+        else:
+            complex_seed = (self.initial_seed * 2147483647) + idx
+
+        self.random_generator.seed(complex_seed)
+        return self.random_generator.randint(0, 2**32 - 1)
 
 
-def load_data(data_dir: str, limit: Optional[float] = None) -> List[dict]:
-    assert data_dir.endswith('.csv'), "The provided file is not a CSV file."
-    df = pd.read_csv(data_dir)
-    dataset = [row.to_dict() for _, row in df.iterrows()]
-    if limit is not None:
-        dataset = dataset[:int(len(dataset) * limit) + 1]
-    return dataset
+class DataShuffle:
+    '''
+    A class to shuffle the data with fixed seed.
+    '''
 
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+        self.random_generator = random.Random(self.seed)
 
-# Function to generate a prompt and the correct answer
-def gen_prompt(row: dict, tokenizer: AutoTokenizer) -> Tuple[str, str]:
-    choices = [
-        row["Correct Answer"],
-        row["Incorrect Answer 1"],
-        row["Incorrect Answer 2"],
-        row["Incorrect Answer 3"],
-    ]
-    correct_index = choices.index(row["Correct Answer"])
-    answer = "ABCD"[correct_index]
-    choices_dict = dict(A=choices[0],
-                        B=choices[1],
-                        C=choices[2],
-                        D=choices[3],
-                        Question=row["Question"])
-    msg = [{
-        "role": "user",
-        "content": str(format_multichoice_question(choices_dict))
-    }]
-    prompt = tokenizer.apply_chat_template(msg,
-                                           tokenize=False,
-                                           add_generation_prompt=True)
-    return prompt, answer
+    def shuffle(self, data: List[dict]) -> List[dict]:
+        self.random_generator.shuffle(data)
+        return data
 
 
 # Class to manage tasks for processing requests
@@ -193,6 +190,51 @@ class TaskManager:
         await self._inbox.put((idx, request, answer, sampling_params))
 
 
+def format_multichoice_question(row: dict) -> str:
+    return QUERY_TEMPLATE_MULTICHOICE.format(**row)
+
+
+def load_data(data_dir: str,
+              dataset_shuffle: DataShuffle,
+              limit: Optional[float] = None,
+              num_runs: int = 1) -> List[List[dict]]:
+    assert data_dir.endswith('.csv'), "The provided file is not a CSV file."
+    df = pd.read_csv(data_dir)
+    dataset = [row.to_dict() for _, row in df.iterrows()]
+    if limit is not None:
+        dataset = dataset[:int(len(dataset) * limit) + 1]
+    shuffled_datasets = []
+    for _ in range(num_runs):
+        shuffled_datasets.append(dataset_shuffle.shuffle(dataset.copy()))
+    return shuffled_datasets
+
+
+# Function to generate a prompt and the correct answer
+def gen_prompt(row: dict, tokenizer: AutoTokenizer,
+               dataset_shuffle: DataShuffle) -> Tuple[str, str]:
+    choices = dataset_shuffle.shuffle([
+        row["Correct Answer"],
+        row["Incorrect Answer 1"],
+        row["Incorrect Answer 2"],
+        row["Incorrect Answer 3"],
+    ])
+    correct_index = choices.index(row["Correct Answer"])
+    answer = "ABCD"[correct_index]
+    choices_dict = dict(A=choices[0],
+                        B=choices[1],
+                        C=choices[2],
+                        D=choices[3],
+                        Question=row["Question"])
+    msg = [{
+        "role": "user",
+        "content": str(format_multichoice_question(choices_dict))
+    }]
+    prompt = tokenizer.apply_chat_template(msg,
+                                           tokenize=False,
+                                           add_generation_prompt=True)
+    return prompt, answer
+
+
 # Async context manager for semaphore
 @asynccontextmanager
 async def semaphore_guard(semaphore: Optional[asyncio.Semaphore] = None):
@@ -209,9 +251,13 @@ async def semaphore_guard(semaphore: Optional[asyncio.Semaphore] = None):
 async def enqueue_messages(backend: TaskManager, dataset: List[dict],
                            tokenizer: AutoTokenizer,
                            sampling_params: SamplingParams,
-                           submit_finished: asyncio.Event) -> None:
+                           submit_finished: asyncio.Event,
+                           seed_generator: RandomSeedGenerator,
+                           dataset_shuffle: DataShuffle) -> None:
     for idx, row in enumerate(dataset):
-        prompt, answer = gen_prompt(row, tokenizer)
+        prompt, answer = gen_prompt(row, tokenizer, dataset_shuffle)
+        idx_seed = seed_generator.gen_seed(idx=idx)
+        sampling_params.seed = idx_seed
         await backend.enqueue(idx, prompt, answer, sampling_params)
     submit_finished.set()
 
@@ -222,6 +268,8 @@ async def async_benchmark(
     sampling_params: SamplingParams,
     dataset: List[dict],
     tokenizer: AutoTokenizer,
+    seed_generator: RandomSeedGenerator,
+    dataset_shuffle: DataShuffle,
     concurrency: int = -1,
 ) -> List[float]:
     outbox = asyncio.Queue()
@@ -235,7 +283,7 @@ async def async_benchmark(
         num_requests = len(dataset)
         enqueue_task = asyncio.create_task(
             enqueue_messages(backend, dataset, tokenizer, sampling_params,
-                             submit_finished))
+                             submit_finished, seed_generator, dataset_shuffle))
 
         with tqdm(total=num_requests, desc="Processing requests") as pbar:
             while not submit_finished.is_set() or not outbox.empty() or len(
@@ -374,6 +422,9 @@ def parse_args():
                         help="Limit the number of samples to run")
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--accuracy_threshold', type=float, default=0.67)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--out_dir', type=str, default=None)
+    parser.add_argument('--num_runs', type=int, default=1)
 
     args = parser.parse_args()
 
@@ -384,8 +435,8 @@ def main():
     args = parse_args()
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.hf_model_dir
-    random.seed(RAND_SEED)
-    np.random.seed(RAND_SEED)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_dir)
@@ -428,17 +479,28 @@ def main():
                                      pad_id=tokenizer.pad_token_id)
 
     # Load the dataset
-    dataset = load_data(args.data_dir, limit=args.limit)
-
+    seed_generator = RandomSeedGenerator(initial_seed=args.seed)
+    dataset_shuffle = DataShuffle(seed=args.seed)
+    datasets = load_data(args.data_dir,
+                         dataset_shuffle,
+                         limit=args.limit,
+                         num_runs=args.num_runs)
+    
     t = time.time()
     try:
         # Run the benchmark
-        results = asyncio.run(
-            async_benchmark(model,
-                            sampling_params,
-                            dataset,
-                            tokenizer,
-                            concurrency=args.concurrency))
+        results = []
+        for i in range(args.num_runs):
+            dataset = datasets[i]
+            result = asyncio.run(
+                async_benchmark(model,
+                                sampling_params,
+                                dataset,
+                                tokenizer,
+                                seed_generator,
+                                dataset_shuffle,
+                                concurrency=args.concurrency))
+            results.append(result)
     finally:
         if model is not None:
             model.__exit__(None, None, None)
@@ -446,8 +508,10 @@ def main():
     print(f"Finished in {t:.3f} seconds")
 
     # Calculate and print the accuracy
-    acc = np.mean([result[1] for result in results])
-    print("Average accuracy: {:.3f}".format(acc))
+    acc = [np.mean([res[1] for res in result]) for result in results]
+    for i in range(args.num_runs):
+        print(f"Run {i+1} accuracy: {acc[i]:.3f}")
+    print("Average accuracy: {:.3f}".format(np.mean(acc)))
     if args.check_accuracy:
         assert acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {acc}"
 
