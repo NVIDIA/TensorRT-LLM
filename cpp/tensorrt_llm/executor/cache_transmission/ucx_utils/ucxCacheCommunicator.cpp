@@ -72,6 +72,7 @@ static std::string getLocalIp()
             continue;
 
         // Check if the address family is AF_INET (IPv4)
+        // TODO: USER CAN SPECIFY THE IP ADDRESS
         if (ifa->ifa_addr->sa_family == AF_INET)
         {
             addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
@@ -85,7 +86,8 @@ static std::string getLocalIp()
             //     std::string(address_buffer).find("192.168.") == 0)
             //     continue;
 
-            TLLM_LOG_INFO(" ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name, address_buffer);
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
+                address_buffer);
             ip = address_buffer;
             break;
         }
@@ -166,7 +168,7 @@ UcxConnectionManager::UcxConnectionManager()
                 su::VectorWrapBuf<char> strbuf(serBuffer);
                 std::istream is(&strbuf);
                 socketStates[i] = su::deserialize<executor::kv_cache::SocketState>(is);
-                TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), " recv  socketStates[%d]: %s", i,
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " recv  socketStates[%d]: %s", i,
                     socketStates[i].toString().c_str());
             }
         }
@@ -175,7 +177,7 @@ UcxConnectionManager::UcxConnectionManager()
             socketStates[0] = socketState;
         }
         mCommState = CommState(socketStates, mpi::MpiComm::session().getRank());
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), " ***** UCX    mCommState: %s", mCommState.toString().c_str());
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    mCommState: %s", mCommState.toString().c_str());
 
         mHandleConnectionThread = std::thread(&UcxConnectionManager::handleReciveConnection, this);
     }
@@ -188,7 +190,7 @@ UcxConnectionManager::UcxConnectionManager()
 
 UcxConnectionManager::~UcxConnectionManager()
 {
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "UcxConnectionManager::~UcxConnectionManager");
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "UcxConnectionManager::~UcxConnectionManager");
     mTerminated = true;
     mHandleConnectionCv.notify_all();
     mHandleConnectionThread.join();
@@ -198,7 +200,7 @@ UcxConnectionManager::~UcxConnectionManager()
     {
         worker->stopProgressThread();
     }
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "END UcxConnectionManager::~UcxConnectionManager");
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "END UcxConnectionManager::~UcxConnectionManager");
 }
 
 void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
@@ -268,7 +270,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
 
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
         *reinterpret_cast<uint64_t*>(buffer.data()));
 
     // worker to handle

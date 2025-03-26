@@ -43,7 +43,7 @@ MpiConnectionManager::MpiConnectionManager(mpi::MpiComm const* comm)
     TLLM_CHECK(mComm);
     mCommState = CommState{
         tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), mpi::MpiComm::session().getRank()};
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "MpiConnectionManager::MpiConnectionManager, commState:%s",
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "MpiConnectionManager::MpiConnectionManager, commState:%s",
         mCommState.toString().c_str());
 }
 

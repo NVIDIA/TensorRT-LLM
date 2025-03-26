@@ -41,7 +41,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
 {
     NVTX3_SCOPED_RANGE(formatOutput);
-    TLLM_LOG_INFO(
+    TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
@@ -305,7 +305,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             mConcurrenceSendResource.mSendbuffersCV.notify_one();
         }
     }
-    TLLM_LOG_INFO(
+    TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
@@ -314,7 +314,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
 {
     NVTX3_SCOPED_RANGE(formatInput);
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
     TLLM_CHECK(!connections.empty());
@@ -656,7 +656,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         }
     }
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
 }
