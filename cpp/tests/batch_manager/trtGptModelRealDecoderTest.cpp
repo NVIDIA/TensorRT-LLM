@@ -48,7 +48,7 @@ using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
 
 auto constexpr GPT_MODEL_DIR = "gpt2";
 auto constexpr GPTJ_MODEL_DIR = "gpt-j-6b";
-auto constexpr LLAMA_MODEL_DIR = "TinyLlama-1.1B-Chat-v1.0";
+auto constexpr LLAMA_MODEL_DIR = "Llama-3.2-1B";
 auto constexpr MEDUSA_MODEL_DIR = "vicuna-7b-medusa";
 auto constexpr EAGLE_MODEL_DIR = "vicuna-7b-eagle";
 auto constexpr MAMBA_MODEL_DIR = "mamba-2.8b-hf";

@@ -50,7 +50,7 @@ auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
 
 auto const GPT_MODEL_DIR = "gpt2";
 auto const GPTJ_MODEL_DIR = "gpt-j-6b";
-auto const LLAMA_MODEL_DIR = "TinyLlama-1.1B-Chat-v1.0";
+auto const LLAMA_MODEL_DIR = "Llama-3.2-1B";
 auto const CHATGLM_MODEL_DIR = "chatglm-6b";
 auto const CHATGLM2_MODEL_DIR = "chatglm2-6b";
 auto const CHATGLM3_MODEL_DIR = "chatglm3-6b";

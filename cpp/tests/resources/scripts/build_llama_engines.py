@@ -61,11 +61,12 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
 def build_engines(model_cache: str, only_multi_gpu: bool):
     resources_dir = _pl.Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    model_name = 'TinyLlama-1.1B-Chat-v1.0'
+    model_name = 'Llama-3.2-1B'
 
     if model_cache:
         print("Copy model from model_cache")
-        model_cache_dir = _pl.Path(model_cache) / 'llama-models-v2' / model_name
+        model_cache_dir = _pl.Path(
+            model_cache) / 'llama-3.2-models' / model_name
         assert (model_cache_dir.is_dir()), model_cache_dir
 
         if _pf.system() == "Windows":

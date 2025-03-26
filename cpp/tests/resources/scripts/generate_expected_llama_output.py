@@ -37,7 +37,7 @@ def generate_output(engine: str,
                     cp_size: int = 1,
                     max_output_len: int = 8):
 
-    model = 'TinyLlama-1.1B-Chat-v1.0'
+    model = 'Llama-3.2-1B'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
