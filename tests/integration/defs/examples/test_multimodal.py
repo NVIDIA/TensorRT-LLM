@@ -85,7 +85,7 @@ def _test_llm_multimodal_general(llm_venv,
     # ckpt from llm_models/<model_name> --> cmodels/<model_name>/<dtype>
     model_name = tllm_model_name
     model_name = "pix2struct" if model_name == "deplot" else model_name
-    opt_example_root = multimodal_example_root + "/../opt"
+    opt_example_root = multimodal_example_root + "/../models/contrib/opt"
     enc_dec_example_root = multimodal_example_root + "/../enc_dec"
     llama_example_root = multimodal_example_root + "/../llama"
     cogvlm_example_root = multimodal_example_root + "/../cogvlm"
@@ -478,8 +478,23 @@ def _test_llm_multimodal_general(llm_venv,
                 "If I had to write a haiku for this one"
             ])
 
-            print("Run mllama vision test...")
+            print("Run mllama vision test in with example image ...")
             _call_run_cmd(llm_venv, llm_root, run_cmd_vision, world_size)
+
+            print("multimodal_example_root: ", multimodal_example_root)
+            print("llm_root: ", llm_root)
+            run_cmd_vision = run_cmd.copy()
+            run_cmd_vision.extend([
+                "--cross_kv_cache_fraction=0.5",  # mllama uses cross attention
+                "--image_path",
+                os.path.join(
+                    llm_root,
+                    "tests/integration/test_input_files/excel_table_test.jpg"),
+                "--input_text",
+                "What is the total income? Answer:"
+            ])
+
+            print("Run mllama vision test with random image ...")
 
             run_cmd_text = run_cmd.copy()
             run_cmd_text.extend([

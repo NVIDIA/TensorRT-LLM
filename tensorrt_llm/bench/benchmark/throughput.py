@@ -141,13 +141,6 @@ from tensorrt_llm.sampling_params import SamplingParams
                 cls=MutuallyExclusiveOptionGroup,
                 help="Limits how requests are loaded.")
 @optgroup.option(
-    "--request_rate",
-    type=int,
-    default=-1,
-    help="Desired input request rate (number of messages per second).",
-    hidden=True,
-)
-@optgroup.option(
     "--concurrency",
     type=int,
     default=-1,
@@ -184,7 +177,6 @@ def throughput_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.pop("dataset")
-    request_rate: int = params.pop("request_rate")
     warmup: int = params.get("warmup")
     num_requests: int = params.pop("num_requests")
     max_seq_len: int = params.pop("max_seq_len")

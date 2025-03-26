@@ -1,58 +1,26 @@
 methods:
   __init__:
-    name: __init__
     parameters:
       cumulative_logprob:
         annotation: Optional[float]
         default: null
-        name: cumulative_logprob
-      disaggregated_params:
-        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
-        default: null
-        name: disaggregated_params
-      finish_reason:
-        annotation: Optional[Literal['stop', 'length', 'timeout', 'cancelled']]
-        default: null
-        name: finish_reason
-      generation_logits:
-        annotation: Optional[torch.Tensor]
-        default: null
-        name: generation_logits
-      index:
-        annotation: int
-        default: inspect._empty
-        name: index
       logprobs:
         annotation: Optional[List[float]]
         default: null
-        name: logprobs
-      stop_reason:
-        annotation: Union[int, str, NoneType]
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
-        name: stop_reason
-      text:
-        annotation: str
-        default: ''
-        name: text
-      token_ids:
-        annotation: Optional[List[int]]
-        default: null
-        name: token_ids
     return_annotation: None
 properties:
   length:
     annotation: int
     default: inspect._empty
-    name: length
   logprobs_diff:
     annotation: List[float]
     default: inspect._empty
-    name: logprobs_diff
   text_diff:
     annotation: str
     default: inspect._empty
-    name: text_diff
   token_ids_diff:
     annotation: List[int]
     default: inspect._empty
-    name: token_ids_diff

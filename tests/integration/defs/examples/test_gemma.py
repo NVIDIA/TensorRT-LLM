@@ -308,8 +308,7 @@ def test_llm_gemma_1gpu_mmlu(batch_size, data_type, gemma_model_root, llm_venv,
     print("Run mmlu...")
     summary_cmd = generate_mmlu_cmd(gemma_example_root,
                                     engine_dir=engine_dir,
-                                    max_ite=20,
-                                    accuracy_threshold=0.37,
+                                    accuracy_threshold=37,
                                     data_dir=f"{llm_datasets_root}/mmlu")
 
     if ckpt_type == "hf":

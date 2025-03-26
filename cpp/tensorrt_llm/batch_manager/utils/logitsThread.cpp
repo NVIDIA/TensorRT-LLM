@@ -17,6 +17,8 @@
 
 #include "logitsThread.h"
 
+namespace tc = tensorrt_llm::common;
+
 namespace tensorrt_llm::batch_manager::utils
 {
 
@@ -152,7 +154,8 @@ std::optional<GenerateRequestOptions::TensorPtr> targetModelReceiveLogits(
 
     MPICHECK(MPI_Get_count(&status, MPI_UINT8_T, &count));
 
-    TLLM_CHECK((uint64_t) count == dims[0] * dims[1] * sizeof(nvinfer1::DataType::kFLOAT));
+    uint64_t const expectedSize = static_cast<uint64_t>(dims[0]) * dims[1] * tc::getDTypeSize(logitsDtype);
+    TLLM_CHECK((uint64_t) count == expectedSize);
 
     MPICHECK(MPI_Mrecv(tensor->data(), count, MPI_UINT8_T, &msg, &status));
 

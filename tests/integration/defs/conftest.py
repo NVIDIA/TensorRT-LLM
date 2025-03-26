@@ -31,6 +31,8 @@ import psutil
 import pytest
 import yaml
 
+from tensorrt_llm.bindings import ipc_nvls_supported
+
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
@@ -217,7 +219,8 @@ def whisper_example_root(llm_root, llm_venv):
 def opt_example_root(llm_root, llm_venv):
     "Get opt example root"
 
-    example_root = os.path.join(llm_root, "examples", "opt")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "opt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -365,6 +368,19 @@ def gpt_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
+def gptj_example_root(llm_root, llm_venv):
+    "Get gptj example root"
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "gptj")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
 def chatglm_6b_example_root(llm_root, llm_venv):
     "Get chatglm-6b example root"
     example_root = os.path.join(llm_root, "examples", "chatglm")
@@ -437,10 +453,13 @@ def llm_exaone_model_root(request) -> str:
     "Get EXAONE model root"
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert request.param == "exaone", "Is the name of model root is exaone?"
 
-    exaone_model_root = os.path.join(models_root, request.param)
-    assert exists(exaone_model_root), f"{exaone_model_root} does not exist!"
+    exaone_model_root = os.path.join(models_root, "exaone")
+    if hasattr(request, "param"):
+        if request.param == "exaone_3.0_7.8b_instruct":
+            exaone_model_root = os.path.join(models_root, "exaone")
+        elif request.param == "exaone_deep_2.4b":
+            exaone_model_root = os.path.join(models_root, "EXAONE-Deep-2.4B")
 
     return exaone_model_root
 
@@ -448,7 +467,8 @@ def llm_exaone_model_root(request) -> str:
 @pytest.fixture(scope="module")
 def falcon_example_root(llm_root, llm_venv):
     "Get falcon example root"
-    example_root = os.path.join(llm_root, "examples", "falcon")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "falcon")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -664,7 +684,8 @@ def sdxl_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def deepseek_v2_example_root(llm_root, llm_venv):
     "Get deepseek v2 example root"
-    example_root = os.path.join(llm_root, "examples", "deepseek_v2")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "deepseek_v2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -2175,6 +2196,9 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
+                                  reason="NVLS is not supported")
+
 
 def skip_fp8_pre_ada(use_fp8):
     "skip fp8 tests if sm version less than 8.9"
@@ -2186,14 +2210,6 @@ def skip_fp4_pre_blackwell(use_fp4):
     "skip fp4 tests if sm version less than 10.0"
     if use_fp4 and get_sm_version() < 100:
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
-
-
-def skip_if_no_nvls(llm_venv):
-    output_str = llm_venv.run_output(
-        "from tensorrt_llm.bindings import ipc_nvls_supported; print('NVLS supported' if ipc_nvls_supported() else 'False')"
-    )
-    if 'NVLS supported' not in output_str:
-        pytest.skip("NVLS is not supported")
 
 
 @pytest.fixture(autouse=True)
