@@ -66,13 +66,12 @@ namespace
 template <typename T>
 void safeInsert(th::optional<th::Tensor>& tensor, std::optional<std::vector<T>>& arg)
 {
-    using valueType = T;
     if (tensor.has_value())
     {
-        auto ptr = get_ptr<valueType>(tensor.value());
         auto shape = convert_shape(tensor.value());
         size_t const size = tensorrt_llm::runtime::ITensor::volume(shape);
-        arg = std::vector<valueType>(ptr, ptr + size);
+        auto ptr = get_ptr<T>(tensor.value());
+        arg = std::vector<T>(ptr, ptr + size);
     }
 }
 
