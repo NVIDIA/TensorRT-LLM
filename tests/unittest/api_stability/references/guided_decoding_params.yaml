@@ -1,22 +1,17 @@
 methods:
   __init__:
-    name: __init__
     parameters:
       grammar:
         annotation: Optional[str]
         default: null
-        name: grammar
       json:
         annotation: Union[str, pydantic.main.BaseModel, dict, NoneType]
         default: null
-        name: json
       json_object:
         annotation: bool
         default: false
-        name: json_object
       regex:
         annotation: Optional[str]
         default: null
-        name: regex
     return_annotation: None
 properties: {}
