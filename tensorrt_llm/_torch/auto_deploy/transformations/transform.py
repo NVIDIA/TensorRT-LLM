@@ -24,6 +24,7 @@ from .library import (
     insert_mha_with_kv_cache,
     match_moe_pattern,
     quantize,
+    resize_kv_cache,
 )
 
 
@@ -149,7 +150,7 @@ class InferenceOptimizer:
         # RESIZE CACHE
         ############################################################################################
         # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph capture.
-        # resize_kv_cache(egm, cm, free_mem_ratio=0.8)
+        resize_kv_cache(egm, cm, free_mem_ratio=0.8)
 
         ############################################################################################
         # COMPILE MODEL

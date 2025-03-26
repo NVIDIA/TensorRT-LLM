@@ -208,3 +208,6 @@ def resize_kv_cache(
         ad_logger.warning(
             f"Error encountered while resizing kv cache: {e}.\nSkipping cache resize."
         )
+
+    # Free memory
+    torch.cuda.empty_cache()
