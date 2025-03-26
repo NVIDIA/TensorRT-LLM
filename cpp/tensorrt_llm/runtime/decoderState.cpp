@@ -389,7 +389,7 @@ void DecoderState::setupEagle(EagleBuffers::Inputs eagleBuffers) const
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests)
+void DecoderState::disableLookahead(RequestVector const& genRequests)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -398,14 +398,15 @@ void DecoderState::disableLookahead(SizeType32 maxBatchSize, RequestVector const
     mMaxDecodingEngineTokens = 1;
     mMaxDecodingDecoderTokens = 1;
     mJointDecodingInput->lookaheadInputs.reset();
-    mJointDecodingOutput->newTokensSteps->reshape(ITensor::makeShape({1, maxBatchSize, 1}));
-    mFinishedSteps->reshape(ITensor::makeShape({1, maxBatchSize, 1}));
-    mJointDecodingInput->numDecodingEngineTokens.clear();
-    mJointDecodingInput->numDecodingEngineTokens.resize(maxBatchSize, 0);
+
+    auto const maxTokensPerStepXmaxBatchSizeXmaxBeamWidth
+        = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
+    mJointDecodingOutput->newTokensSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
+    mFinishedSteps->reshape(maxTokensPerStepXmaxBatchSizeXmaxBeamWidth);
 
     for (auto const& llmReq : genRequests)
     {
-        mJointDecodingInput->numDecodingEngineTokens[llmReq->mSeqSlot.value()] = 1;
+        mJointDecodingInput->numDecodingEngineTokens.at(llmReq->mSeqSlot.value()) = 1;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

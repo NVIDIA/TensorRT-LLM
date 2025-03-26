@@ -53,12 +53,11 @@ GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream,
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::disableLookahead(
-    SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots)
+void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mDecoderState->disableLookahead(maxBatchSize, genRequests);
+    mDecoderState->disableLookahead(genRequests);
 
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(genRequests.size());

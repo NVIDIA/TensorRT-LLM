@@ -73,7 +73,7 @@ public:
     void setupEagle(EagleBuffers::Inputs eagleBuffers) const;
 
     //! @brief Disable lookahead decoding.
-    void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests);
+    void disableLookahead(RequestVector const& genRequests);
 
     //! @returns [batchSize], number of finished sequences per request, on gpu
     [[nodiscard]] TensorPtr getFinishedSum() const;
