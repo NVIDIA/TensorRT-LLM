@@ -3904,6 +3904,8 @@ class AllReduceFusionOp(IntFlag):
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 6
+    RESIDUAL_RMS_NORM_AND_QUANT_NVFP4 = 7
 
 
 class AllReduceParams():
@@ -6496,7 +6498,6 @@ ACT2FN = {
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
     'sigmoid': sigmoid,
-    'quick_gelu': quick_gelu,
 }
 
 GATED_ACT_2_ACT = {

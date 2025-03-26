@@ -981,11 +981,12 @@ protected:
 
         LoraParams lora_params;
         bool const useFp8BlockScales = false;
+        bool const minLatencyMode = false;
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, stream);
+            useFp8BlockScales, minLatencyMode, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }

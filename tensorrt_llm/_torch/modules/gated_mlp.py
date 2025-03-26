@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,7 @@ from torch import nn
 from ..custom_ops import IS_FLASHINFER_AVAIABLE
 from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
+from ..utils import Fp4QuantizedTensor
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 
 
@@ -88,9 +89,10 @@ class GatedMLP(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens=None,
-        final_all_reduce_params: Optional[AllReduceParams] = None
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         if self.activation == F.silu:
             return self.down_proj(swiglu(self.gate_up_proj(x)),
