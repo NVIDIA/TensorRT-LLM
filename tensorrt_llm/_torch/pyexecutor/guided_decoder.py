@@ -26,10 +26,11 @@ class GuidedDecoderResourceManager(BaseResourceManager):
         for llm_req in itertools.chain(scheduled_batch.context_requests,
                                        scheduled_batch.generation_requests):
             if llm_req.is_context_init_state and not llm_req.seq_slot:
-                self.slot_manager.add_slot(llm_req)
+                llm_req.seq_slot = self.slot_manager.add_slot(
+                    llm_req.request_id)
 
     def free_resources(self, request: LlmRequest) -> None:
-        self.slot_manager.remove_slot(request)
+        self.slot_manager.remove_slot(request.request_id)
 
 
 class GuidedDecoder:

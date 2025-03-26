@@ -242,15 +242,15 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         spec_decoder = None
 
-    if mapping.is_last_pp_rank(
-    ) and executor_config.guided_decoding_config is not None and spec_config is not None:
-        raise ValueError(
-            "Guided decoding is not supported with speculative decoding.")
-
     if mapping.is_last_pp_rank():
+        if executor_config.guided_decoding_config is not None and spec_config is not None:
+            raise ValueError(
+                "Guided decoding is not supported with speculative decoding.")
+
         resources[
             "guided_decoder_resource_manager"] = GuidedDecoderResourceManager(
-                executor_config.max_batch_size)
+                executor_config.max_batch_size +
+                pytorch_backend_config.enable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
