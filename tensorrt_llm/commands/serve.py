@@ -286,7 +286,7 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
     else:
         raise RuntimeError("Could not determine rank from environment")
     device_id = env_global_rank % device_count()
-    print(
+    logger.info(
         f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
     )
     torch.cuda.set_device(device_id)
