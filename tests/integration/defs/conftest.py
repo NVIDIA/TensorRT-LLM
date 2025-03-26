@@ -1969,58 +1969,6 @@ def grok_code_root(llm_venv):
 
 
 @pytest.fixture(scope="function")
-def llm_dit_model_root(request):
-    "return dit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if 'fp8' in request.param and '512' in request.param:
-        dit_model_root = os.path.join(models_root,
-                                      "DiT-XL-2-512x512.FP8.Linear.pt")
-    else:
-        if '512' in request.param:
-            dit_model_root = os.path.join(models_root, "DiT-XL-2-512x512.pt")
-        else:
-            dit_model_root = os.path.join(models_root, "DiT-XL-2-256x256.pt")
-
-    assert os.path.exists(
-        dit_model_root
-    ), f"{dit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return dit_model_root
-
-
-@pytest.fixture(scope="function")
-def mmdit_model_root(request):
-    "return mmdit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    mmdit_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        mmdit_model_root
-    ), f"{mmdit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return mmdit_model_root
-
-
-@pytest.fixture(scope="function")
-def stdit_model_root(request):
-    "return stdit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    stdit_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        stdit_model_root
-    ), f"{stdit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return stdit_model_root
-
-
-@pytest.fixture(scope="function")
 def sdxl_model_root(request):
     "return Stable Diffusion XL model root"
     models_root = llm_models_root()

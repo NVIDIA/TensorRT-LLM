@@ -2,8 +2,6 @@ examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padd
 examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-chat-enable_weight_only]
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weight_only]
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[enable_weight_only]
-examples/test_dit.py::test_llm_dit_multiple_gpus[dit-xl-2-256x256-tp1]
-examples/test_dit.py::test_llm_dit_multiple_gpus[dit-xl-2-512x512-fp8-linear-tp4]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-llama_v2-use_cpp_session-use_logits-draft_len_8-float16-bs1]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-llama_v2-use_cpp_session-use_tokens-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2]
