@@ -1,6 +1,6 @@
 import itertools
 from abc import ABC, abstractmethod
-from typing import Dict
+from collections import OrderedDict
 
 import torch
 
@@ -35,7 +35,7 @@ class Decoder(ABC):
     @abstractmethod
     def update_requests(self,
                         scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
+                        new_tensors_host: OrderedDict[str, torch.tensor],
                         decoder_event: torch.cuda.Event or None = None):
         raise NotImplementedError
 
@@ -230,7 +230,7 @@ class TorchDecoder(Decoder):
 
     def update_requests(self,
                         scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
+                        new_tensors_host: OrderedDict[str, torch.tensor],
                         decoder_event: torch.cuda.Event or None = None):
         if decoder_event:
             decoder_event.synchronize()
@@ -335,8 +335,9 @@ class TorchDecoder(Decoder):
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
+        new_tensors_device = OrderedDict(
+            {"new_tokens_device": new_tokens_device})
+        new_tensors_host = OrderedDict({"new_tokens_host": new_tokens_host})
         decoder_event = torch.cuda.Event()
         decoder_event.record()
         return new_tensors_device, new_tensors_host, decoder_event
@@ -352,7 +353,7 @@ class TorchDecoder(Decoder):
 class TorchStarAttentionDecoder(TorchDecoder):
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
+                        new_tensors_host: OrderedDict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
         if decoder_event:
             decoder_event.synchronize()
@@ -531,7 +532,7 @@ class TRTLLMDecoder(Decoder):
         new_tokens_device = {
             "new_tokens_device": self.store["decoder_buffers"].new_output_tokens
         }
-        new_tokens_host = {
+        new_tokens_host = OrderedDict({
             "new_tokens_host":
             self.store["decoder_buffers"].new_output_tokens_host,
             "finished_sum_host":
@@ -540,13 +541,13 @@ class TRTLLMDecoder(Decoder):
             self.store["decoder_buffers"].finish_reasons_host,
             "sequence_lengths_host":
             self.store["decoder_buffers"].sequence_lengths_host
-        }
+        })
 
         return new_tokens_device, new_tokens_host, decoder_event
 
     def update_requests(
             self, scheduled_requests: ScheduledRequests,
-            new_tensors_host: Dict[str, torch.tensor],
+            new_tensors_host: OrderedDict[str, torch.tensor],
             decoder_event: tllm.internal.runtime.DecoderFinishedEvent or None):
         if decoder_event:
             decoder_event.synchronize()

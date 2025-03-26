@@ -121,6 +121,23 @@ class MPIDist(Distributed):
     def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
         return self.recv(tensor.numpy(), src, tag)
 
+    def isend_tensor_list(self, tensor_list: list[torch.Tensor], dest, tag=0):
+        return self.isend(
+            np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
+
+    def recv_tensor_list(self, tensor_list: list[torch.Tensor], src, tag=0):
+        # Prepare buffer to receive tensor_list
+        recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
+                               dtype=np.uint8)
+        # Receive tensors
+        self.recv(recv_buffer, src, tag)
+        # Assign to tensor_list
+        offset = 0
+        for t in tensor_list:
+            t.copy_(torch.from_numpy(recv_buffer[offset:offset + t.numel()]))
+            offset += t.numel()
+        return None
+
     def create_tp_comm(self):
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
         self.tp_comm = mpi_comm().Create_group(new_group)
