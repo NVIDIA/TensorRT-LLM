@@ -75,7 +75,8 @@ public:
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
         std::optional<SizeType32> const& numReturnSequences = std::nullopt,
-        std::optional<FloatType> const& minP = std::nullopt);
+        std::optional<FloatType> const& minP = std::nullopt,
+        std::optional<std::vector<SizeType32>> const& beamWidthArray = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
@@ -100,6 +101,7 @@ public:
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
     [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const;
     [[nodiscard]] std::optional<FloatType> getMinP() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> getBeamWidthArray() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -121,6 +123,7 @@ public:
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     void setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences);
     void setMinP(std::optional<FloatType> const& minP);
+    void setBeamWidthArray(std::optional<std::vector<SizeType32>> const& beamWidthArray);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -130,15 +133,18 @@ private:
     static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
-    static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
     static std::optional<SizeType32> const& checkMinTokens(std::optional<SizeType32> const& minTokens);
-    static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
+    static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& repetitionpenalty);
+    static std::optional<FloatType> const& checkLengthPenalty(std::optional<FloatType> const& lengthPenalty);
+    static std::optional<SizeType32> const& checkEarlyStopping(std::optional<SizeType32> const& earlyStopping);
+    static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
     static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
-
+    static std::optional<std::vector<SizeType32>> const& checkBeamWidthArray(
+        std::optional<std::vector<SizeType32>> const& beamWidthArray, std::optional<SizeType32> const beamWidth);
     void updateNumReturnBeams();
 
     friend class Serialization;
@@ -188,6 +194,8 @@ private:
     /// @brief Controls the min_p scaling for sampling.
     /// It masks x which P_x < min_p * P_max, where P_x is probability of candidate x. Default is 0.f
     std::optional<FloatType> mMinP;
+    /// @brief Controls the beam width for each step for Variable-Beam-Width-Search.
+    std::optional<std::vector<SizeType32>> mBeamWidthArray;
 };
 
 /// @brief Configuration that controls the outputs of a Result

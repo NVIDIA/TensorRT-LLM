@@ -128,6 +128,11 @@ public:
     {
         return 0.0f;
     }
+
+    [[nodiscard]] static std::vector<runtime::SizeType32> getBeamWidthArray()
+    {
+        return std::vector<runtime::SizeType32>{1};
+    }
 };
 } // namespace layers
 } // namespace tensorrt_llm

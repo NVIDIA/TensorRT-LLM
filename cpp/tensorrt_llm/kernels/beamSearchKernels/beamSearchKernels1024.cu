@@ -22,7 +22,7 @@ namespace kernels
 {
 
 #ifndef FAST_BUILD // Skip beam_width larger than 16
-// Skip V1 kernels if beam_width > nMaxBeamWidthForV1
+// Skip V1 kernels if beam_width > kMaxBeamWidthForV1
 INSTANTIATE_BEAM_SEARCH(float, 1024, true);
 INSTANTIATE_BEAM_SEARCH(half, 1024, true);
 #endif // FAST_BUILD

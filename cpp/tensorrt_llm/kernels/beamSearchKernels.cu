@@ -59,7 +59,7 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
 #endif // FAST_BUILD
         }
     }
-    else // V1, only use kernels of `beam_width <= nMaxBeamWidthForV1`
+    else // V1, only use kernels of `beam_width <= kMaxBeamWidthForV1`
     {
         switch (nPadBeamWidth)
         {
