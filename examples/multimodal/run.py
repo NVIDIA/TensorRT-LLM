@@ -52,6 +52,10 @@ def print_result(model, input_text, output_text, args):
                     ref_1 = ", it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a cozy little house.\\nHe's a very good rabbit.\\"
                     ref_2 = "Here is a haiku for the image:\n\n"
 
+                elif "Answer:" in input_text:
+                    ref_1 = "2,173. <OCR/> A 1 2 3 4 5 6 Date Income 2005-12-17"
+                    ref_2 = "Answer: 2,173. <OCR/> 1 2 3 4 5 6 Date Income 2005-12-17"
+
                 elif "The key to life is" in input_text:
                     ref_1 = "to find your passion and pursue it with all your heart. For me, that passion is photography. I love capturing the beauty of the world around me"
                     ref_2 = "not to be found in the external world,"
