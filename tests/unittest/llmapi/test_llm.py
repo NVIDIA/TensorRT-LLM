@@ -1757,6 +1757,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     # test that IterationResult()._done is properly set
     _ = llm.generate(prompts, sampling_params=sampling_params)
     assert llm.get_stats(2)
+    del llm
 
 
 @pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
@@ -1824,6 +1825,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             await asyncio.gather(task0(), task1())
 
     asyncio.run(main())
+    del llm
 
 
 @pytest.mark.parametrize(
@@ -2062,7 +2064,8 @@ def test_llm_reward_model_pytorch():
 
     sampling_params = SamplingParams(return_context_logits=True)
 
-    outputs = llm.generate(prompts, sampling_params)
+    with llm:
+        outputs = llm.generate(prompts, sampling_params)
     scores = outputs[0].context_logits
 
     print(scores)

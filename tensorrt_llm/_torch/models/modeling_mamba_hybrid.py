@@ -76,7 +76,6 @@ class TransformerLayer(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=None,
             pos_embd_params=None,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,

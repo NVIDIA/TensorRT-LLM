@@ -122,7 +122,7 @@ class MpiPoolSession(MpiSession):
 
     def shutdown(self):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=False)
+            self.mpi_pool.shutdown(wait=True)
             self.mpi_pool = None
 
     def _start_mpi_pool(self):
@@ -200,8 +200,11 @@ class MpiCommSession(MpiSession):
 
     def shutdown(self):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=False)
+            self.mpi_pool.shutdown(wait=True)
             self.mpi_pool = None
+        if self.thread_pool is not None:
+            self.thread_pool.shutdown(wait=True)
+            self.thread_pool = None
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
