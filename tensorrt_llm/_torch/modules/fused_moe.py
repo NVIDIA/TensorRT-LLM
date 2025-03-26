@@ -216,7 +216,7 @@ class FusedMoE(nn.Module):
             tune_max_num_tokens: int = 8192,
             model_config: ModelConfig = ModelConfig(),
     ):
-        from tensorrt_llm._torch.distributed import AllReduce
+        from ..distributed import AllReduce
 
         super().__init__()
         self.routing_method = routing_method
