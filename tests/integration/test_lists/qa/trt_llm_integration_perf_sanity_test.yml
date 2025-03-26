@@ -1,5 +1,5 @@
 version: 0.0.1
-llm_trt_integration_perf_sanity_test:
+trt_llm_integration_perf_sanity_test:
 - condition:
     ranges:
       system_gpu_count:

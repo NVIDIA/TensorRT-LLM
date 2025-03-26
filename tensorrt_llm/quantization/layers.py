@@ -1850,6 +1850,7 @@ class Fp8RowwiseAttention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
+        self.num_kv_heads = num_kv_heads
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
@@ -2010,6 +2011,7 @@ class Fp8RowwiseAttention(Module):
             layer_idx=self.local_layer_idx,
             num_heads=self.num_attention_heads,
             num_kv_heads=self.num_attention_kv_heads,
+            num_kv_heads_origin=self.num_kv_heads,
             hidden_size_per_head=self.attention_head_size,
             q_scaling=self.q_scaling,
             rotary_embedding_dim=self.rotary_embedding_dim,
@@ -2467,6 +2469,7 @@ class SmoothQuantAttention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
+        self.num_kv_heads = num_kv_heads
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
@@ -2634,6 +2637,7 @@ class SmoothQuantAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                num_kv_heads_origin=self.num_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -2987,6 +2991,7 @@ class QServeAttention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_attention_heads = num_attention_heads // tp_size
+        self.num_kv_heads = num_kv_heads
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
@@ -3154,6 +3159,7 @@ class QServeAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                num_kv_heads_origin=self.num_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,

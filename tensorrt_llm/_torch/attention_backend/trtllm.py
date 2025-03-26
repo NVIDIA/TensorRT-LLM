@@ -5,14 +5,15 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend, AttentionMask, AttentionMetadata, MLAParams,
-    PositionalEmbeddingParams, PredefinedAttentionMask, RopeParams)
-from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
+                        MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams)
+from .vanilla import VanillaAttention
 
 
 # The type of requests in qkv passed to attention
