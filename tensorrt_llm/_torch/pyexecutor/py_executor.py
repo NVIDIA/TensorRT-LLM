@@ -653,10 +653,10 @@ class PyExecutor:
                             "_handle_new_tokens_inter_pp")
                         _, previous_new_tensors_host, _ = previous_batch
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor(
-                            previous_new_tensors_host["new_tokens_host"],
-                            src=self.dist.prev_pp_rank,
-                            tag=prev_microbatch_id)
+                        self.dist.recv_tensor_list(tensor_list=list(
+                            previous_new_tensors_host.values()),
+                                                   src=self.dist.prev_pp_rank,
+                                                   tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         _, previous_new_tensors_host, previous_decoder_event = previous_batch
@@ -668,8 +668,9 @@ class PyExecutor:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_tensor(
-                                previous_new_tensors_host["new_tokens_host"],
+                            prev_microbatch_id] = self.dist.isend_tensor_list(
+                                tensor_list=list(
+                                    previous_new_tensors_host.values()),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -977,15 +978,15 @@ class PyExecutor:
                                       dtype=torch.int64,
                                       device='cpu',
                                       pin_memory=True)
-        return {"new_tokens_host": new_tokens_host}
+        return OrderedDict({"new_tokens_host": new_tokens_host})
 
     @nvtx_range("_handle_previous_batch_inter_pp")
     def _handle_previous_batch_inter_pp(self, previous_scheduled_batch,
                                         previous_new_tensors_host,
                                         prev_microbatch_id):
         # Receive tokens from prev pp rank w.r.t model forward direction
-        self.dist.recv_tensor(
-            previous_new_tensors_host["new_tokens_host"],
+        self.dist.recv_tensor_list(
+            tensor_list=list(previous_new_tensors_host.values()),
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -995,8 +996,8 @@ class PyExecutor:
         if not self.dist.is_second_last_pp_rank:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
-            self.send_handles[prev_microbatch_id] = self.dist.isend_tensor(
-                tensor=previous_new_tensors_host["new_tokens_host"],
+            self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
+                tensor_list=list(previous_new_tensors_host.values()),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
@@ -1012,8 +1013,8 @@ class PyExecutor:
             self.send_handles[microbatch_id].Wait()
         decoder_event.synchronize()
 
-        self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            new_tensors_host["new_tokens_host"],
+        self.send_handles[microbatch_id] = self.dist.isend_tensor_list(
+            tensor_list=list(new_tensors_host.values()),
             dest=self.dist.next_pp_rank,
             tag=microbatch_id)
 
