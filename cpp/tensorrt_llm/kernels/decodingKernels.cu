@@ -458,7 +458,6 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     }
     else
     {
-        // TODO, wili: use CUB to sort for large nCBA
         for (int i = 0; i < nBM; ++i)
         {
             float maxScore = -FLT_MAX;
