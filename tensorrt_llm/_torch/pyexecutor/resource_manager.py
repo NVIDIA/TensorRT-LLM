@@ -191,6 +191,7 @@ class KVCacheManager(BaseResourceManager):
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
             'max_attention_window_vec': [self.max_attention_window],
+            'temp_attention_window_inputs': None,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,

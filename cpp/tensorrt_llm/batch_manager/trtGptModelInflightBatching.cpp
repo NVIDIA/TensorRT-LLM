@@ -610,7 +610,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
     tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
     tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens();
+    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
 
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.enableBlockReuse)
     {

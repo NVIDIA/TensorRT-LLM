@@ -73,7 +73,7 @@ struct TempAttentionWindowInputs
 {
     bool pagedContextFMHA;
     SizeType32 maxInputLen;
-    std::optional<SizeType32> maxNumTokens;
+    SizeType32 maxNumTokens;
 };
 
 struct WindowSizeMetadata
@@ -734,7 +734,7 @@ public:
 
         if (inputs && inputs->pagedContextFMHA && (inputs->maxInputLen > mWindowSize))
         {
-            auto window = std::min(inputs->maxNumTokens.value(), inputs->maxInputLen - mWindowSize);
+            auto window = std::min(inputs->maxNumTokens, inputs->maxInputLen - mWindowSize);
             window = std::max(window, 0); // clamp negative values to 0
             return window;
         }
