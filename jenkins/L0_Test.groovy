@@ -473,6 +473,67 @@ def runLLMDocBuild(pipeline, config)
     )
 }
 
+def launchTestListCheck(pipeline)
+{
+    stages = {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
+            golang-go  \
+            libffi-dev \
+            -y""")
+        sh "nvidia-smi -q"
+        // download TRT-LLM tarfile
+        def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
+        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && wget -nv ${llmTarfile}")
+        sh "cd ${llmPath} && tar -zxf ${tarName}"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+        sh "pip3 install --extra-index-url https://urm-rn.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+        // Verify L0 test lists
+            def testDBPath = "${LLM_ROOT}/tests/integration/test_lists/test-db"
+        def testList = "${LLM_ROOT}/l0_test.txt"
+        // Remove perf test from test list since they are dynamical generated
+        sh """
+            touch ${testList}
+            rm ${testDBPath}/*perf*
+            trt-test-db -d ${testDBPath} --test-names --output ${testList}
+            cd ${LLM_ROOT}/tests/integration/defs
+            pytest --apply-test-list-correction --test-list=${testList} --co -q
+        """
+        //Verify QA test lists
+        def testQAPath = "${LLM_ROOT}/tests/integration/test_lists/qa"
+        def testDefFiles = sh (script: "ls -d ${testQAPath}/*.txt",returnStdout: true).trim().split('\n')
+        testDefFiles.each { testDefFile ->
+            sh """
+                cd ${LLM_ROOT}/tests/integration/defs
+                pytest --apply-test-list-correction --test-list=$testDefFile --co -q
+            """
+        }
+    }
+
+    stageName = "Test List Check"
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
+        stage("[${stageName}] Run") {
+            try {
+                echoNodeAndGpuInfo(pipeline, stageName)
+                stages()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                if (RELESE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                    catchError(
+                        buildResult: 'SUCCESS',
+                        stageResult: 'FAILURE') {
+                        error "Release Check failed but ignored due to Jenkins configuration"
+                    }
+                } else {
+                    throw e
+                }
+            }
+        }
+    })
+}
+
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
     String resultFiles = sh(script: "cd ${stageName} && ls -l ${resultPath} | wc -l", returnStdout: true).trim()
     echo "${resultFiles}"
@@ -1563,6 +1624,15 @@ pipeline {
                         }
                     }
                     println testFilter
+                }
+            }
+        }
+        stage("Check Test Lists")
+        {
+            steps
+            {
+                script {
+                    launchTestListCheck(this)
                 }
             }
         }
