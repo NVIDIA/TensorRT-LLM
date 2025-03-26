@@ -616,7 +616,7 @@ class PyExecutor:
                         _, previous_new_tensors_host, _ = previous_batch
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
                         self.dist.recv_tensor(
-                            previous_new_tensors_host["new_tokens_host"],
+                            previous_new_tensors_host,
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id)
                     else:
@@ -631,7 +631,7 @@ class PyExecutor:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_tensor(
-                                previous_new_tensors_host["new_tokens_host"],
+                                previous_new_tensors_host,
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -928,7 +928,7 @@ class PyExecutor:
                                         prev_microbatch_id):
         # Receive tokens from prev pp rank w.r.t model forward direction
         self.dist.recv_tensor(
-            previous_new_tensors_host["new_tokens_host"],
+            previous_new_tensors_host,
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -939,7 +939,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor(
-                tensor=previous_new_tensors_host["new_tokens_host"],
+                tensor=previous_new_tensors_host,
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
@@ -963,7 +963,7 @@ class PyExecutor:
         decoder_event.synchronize()
 
         self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            new_tensors_host["new_tokens_host"],
+            new_tensors_host,
             dest=self.dist.next_pp_rank,
             tag=microbatch_id)
 

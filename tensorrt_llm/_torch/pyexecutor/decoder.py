@@ -516,7 +516,8 @@ class TRTLLMDecoder(Decoder):
             self, scheduled_requests: ScheduledRequests,
             decoder_buffers: tllm.internal.batch_manager.DecoderBuffers,
             decoder_event: tllm.internal.runtime.DecoderFinishedEvent):
-        decoder_event.synchronize()
+        if decoder_event:
+            decoder_event.synchronize()
 
         new_tokens_host = decoder_buffers.new_output_tokens_host
         finished_sum_host = decoder_buffers.finished_sum_host
