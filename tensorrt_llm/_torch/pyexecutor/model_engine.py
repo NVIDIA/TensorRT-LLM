@@ -581,9 +581,8 @@ class PyTorchModelEngine(ModelEngine):
         batch_size = scheduled_requests.batch_size
         new_batch_size = batch_size
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            graph_batch_size = self.dist.allgather(
+            graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            graph_batch_size = self._post_allgather_pp(graph_batch_size)
             all_can_graph = all(graph_batch[0]
                                 for graph_batch in graph_batch_size)
             if all_can_graph:
@@ -666,9 +665,8 @@ class PyTorchModelEngine(ModelEngine):
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.allgather(
+            all_can_graph_batch = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
-            all_can_graph_batch = self._post_allgather_pp(all_can_graph_batch)
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
             all_batch_size_equal = all(
@@ -1097,14 +1095,6 @@ class PyTorchModelEngine(ModelEngine):
             'mrope_config': mrope_config
         }
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
-
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
             if len(draft_tokens) > 0:
@@ -1124,12 +1114,10 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -1141,11 +1129,17 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        if self.mapping.has_pp():
+            pipeline_interface = None
+            if self.mapping.pp_rank > 0:
+                pipeline_interface = self.model.create_pipeline_interface(
+                    inputs['input_ids'].shape[0])
+                pipeline_interface.recv()
+            inputs['pipeline_interface'] = pipeline_interface
 
         num_generation_tokens = len(generation_requests) + len(
             extend_requests) + sum(draft_lens)
@@ -1220,14 +1214,6 @@ class PyTorchModelEngine(ModelEngine):
             'multi_modal_data': multi_modal_data
         }
 
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
-
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
@@ -1243,12 +1229,10 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.allgather([
+                all_rank_num_tokens = self.dist.tp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths)
                 ])
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -1260,11 +1244,18 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
                 spec_metadata.all_rank_num_seqs = all_rank_num_seqs
             else:
-                all_rank_num_tokens = self.dist.allgather(
+                all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
-                all_rank_num_tokens = self._post_allgather_pp(
-                    all_rank_num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        if self.mapping.has_pp():
+            pipeline_interface = None
+            if self.mapping.pp_rank > 0:
+                pipeline_interface = self.model.create_pipeline_interface(
+                    inputs['input_ids'].shape[0])
+                pipeline_interface.recv()
+            inputs['pipeline_interface'] = pipeline_interface
+
         return inputs, None
 
     def _prepare_star_attention_inputs(self,
@@ -1477,8 +1468,8 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
         if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
-            all_rank_num_tokens = self._post_allgather_pp(all_rank_num_tokens)
+            all_rank_num_tokens = self.dist.tp_allgather(
+                attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return {
@@ -1656,12 +1647,6 @@ class PyTorchModelEngine(ModelEngine):
             return {'hidden_states': hidden_states[gather_ids]}
         else:
             return {'hidden_states': hidden_states}
-
-    def _post_allgather_pp(self, allgather_result):
-        if self.mapping.has_pp():
-            return [allgather_result[rank] for rank in self.mapping.tp_group]
-        else:
-            return allgather_result
 
     def _init_userbuffers(self, hidden_size, quant_config, dtype):
         # No quant, do not allow UB

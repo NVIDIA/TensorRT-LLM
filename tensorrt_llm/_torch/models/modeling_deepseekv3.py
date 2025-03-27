@@ -834,11 +834,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-        assert not (
-            model_config.mapping.has_pp()
-            and model_config.mapping.enable_attention_dp
-        ), "Pipeline parallelism and attention DP cannot be used together"
-
         self.model_nextn = 0
         if model_config.spec_config is not None:
             model_nextn = model_config.spec_config.num_nextn_predict_layers

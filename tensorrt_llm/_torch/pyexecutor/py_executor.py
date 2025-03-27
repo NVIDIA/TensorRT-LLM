@@ -185,7 +185,7 @@ class PyExecutor:
         self.active_requests = []
         self.all_ranks_num_active_requests = [
             0
-        ] * self.dist.world_size if self.enable_attention_dp else []
+        ] * self.dist.tp_size if self.enable_attention_dp else []
         self.expected_num_active_requests = 0
         self.has_context_request = False
         self.ctx_in_transmission_requests = []
@@ -490,8 +490,17 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
                 scheduled_batch, _, _ = self._schedule()
 
-                if scheduled_batch.batch_size == 0:
-                    assert len(self.inflight_req_ids) > 0, (
+                if self.enable_attention_dp:
+                    tp_batch_sizes = self.dist.tp_allgather(
+                        scheduled_batch.batch_size)
+                    can_queue = 0 not in tp_batch_sizes
+                else:
+                    can_queue = scheduled_batch.batch_size > 0
+
+                if not can_queue:
+                    assert self.enable_attention_dp or len(
+                        self.inflight_req_ids
+                    ) > 0, (
                         "fail to schedule any pending request, probably run out of resource"
                     )
                     self.micro_batches[microbatch_id] = None
@@ -517,6 +526,7 @@ class PyExecutor:
                 prev_microbatch_id = (microbatch_id +
                                       1) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
+
                 # Stage 2: Handle previous batch that only processed forward_step
                 if previous_batch is not None:
                     previous_scheduled_batch, previous_new_tensors_host = previous_batch
@@ -529,6 +539,8 @@ class PyExecutor:
                     self._remove_inflight_ids(
                         previous_scheduled_batch)  # unlock inflight requests
                 microbatch_id = prev_microbatch_id
+
+                self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats:
                     iter_end_time = time.time()
@@ -575,8 +587,18 @@ class PyExecutor:
                     self._merge_dummy_request(num_dummy_request)
 
                 scheduled_batch, _, _ = self._schedule()
-                if scheduled_batch.batch_size == 0:
-                    assert len(self.inflight_req_ids) > 0, (
+
+                if self.enable_attention_dp:
+                    tp_batch_sizes = self.dist.tp_allgather(
+                        scheduled_batch.batch_size)
+                    can_queue = 0 not in tp_batch_sizes
+                else:
+                    can_queue = scheduled_batch.batch_size > 0
+
+                if not can_queue:
+                    assert self.enable_attention_dp or len(
+                        self.inflight_req_ids
+                    ) > 0, (
                         "fail to schedule any pending request, probably run out of resource"
                     )
                     self.micro_batches[microbatch_id] = None
@@ -656,6 +678,8 @@ class PyExecutor:
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
+
+                self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats:
                     iter_end_time = time.time()
@@ -1035,7 +1059,7 @@ class PyExecutor:
     @nvtx_range("_fetch_adp_new_requests")
     def _fetch_adp_new_requests(self):
         total_num_active_requests = sum(self.all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.world_size * self.max_num_active_requests
+        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
         timeout = None if total_num_active_requests == 0 else datetime.timedelta(
             0)
         new_requests = []
@@ -1048,14 +1072,14 @@ class PyExecutor:
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
-             self.dist.world_size - 1) // self.dist.world_size,
+             self.dist.tp_size - 1) // self.dist.tp_size,
             max(self.all_ranks_num_active_requests),
         )
         self.has_context_request = False
         new_requests_cur_rank = []
         if new_requests != [] and new_requests[
                 0] != None and self.expected_num_active_requests > self.all_ranks_num_active_requests[
-                    self.dist.rank]:
+                    self.dist.tp_rank]:
             # Balance context tokens across ranks
             HeapVal = namedtuple(
                 'HeapVal',
@@ -1071,7 +1095,7 @@ class PyExecutor:
                 for idx, val in enumerate(self.all_ranks_num_active_requests)
             ]
             new_requests_cur_rank = all_ranks_new_requests_heap[
-                self.dist.rank].request_list
+                self.dist.tp_rank].request_list
             all_ranks_new_requests_heap = [
                 val for val in all_ranks_new_requests_heap
                 if val.num_requests > 0
@@ -1111,8 +1135,8 @@ class PyExecutor:
     def _gather_dp_requests_num(self):
         if self.enable_attention_dp:
             gather_active_requests = []
-            resonses_list = self.dist.allgather(len(self.active_requests))
-            for num_active_requests in resonses_list:
+            responses_list = self.dist.tp_allgather(len(self.active_requests))
+            for num_active_requests in responses_list:
                 gather_active_requests.append(num_active_requests)
             self.all_ranks_num_active_requests = gather_active_requests
 
