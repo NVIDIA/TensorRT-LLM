@@ -1124,7 +1124,11 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self.dist.broadcast(new_requests, root=0)
+        if self.dist.has_pp:
+            new_requests = self._broadcast_new_requests_pp(new_requests)
+        else:
+            new_requests = self.dist.broadcast(new_requests, root=0)
+
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
