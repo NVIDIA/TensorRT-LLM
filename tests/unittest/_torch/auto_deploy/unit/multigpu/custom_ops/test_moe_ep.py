@@ -1,18 +1,13 @@
-import os
-import sys
 from functools import partial
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from _dist_test_utils import get_device_counts
+from _torch.helpers import reference_moe_torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
-from _dist_test_utils import get_device_counts
-from helpers import reference_moe_torch
-
 from tensorrt_llm._torch.auto_deploy.distributed.common import spawn_multiprocess_job
 
 

@@ -90,16 +90,13 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
 
     print(parallel_dict)
 
-    import shlex
-    arg_list = shlex.split(case)
-    name = "_".join(arg_list)
-    cur_key = (gpu_name, name)
+    cur_key = (gpu_name, case)
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]
         num_workers = min(num_workers, 8)
     else:
         print(
-            f'unittest {name} on "{gpu_name}" is not recorded in parallel config. Need to profile.'
+            f'unittest {case} on "{gpu_name}" is not recorded in parallel config. Need to profile.'
         )
 
     num_workers = max(1, num_workers)
@@ -111,7 +108,13 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
 
     ignore_opt = f"--ignore={test_root}/integration"
 
-    output_xml = os.path.join(output_dir, f'sub-results-unittests-{name}.xml')
+    import shlex
+    arg_list = shlex.split(case)
+    case_fn = case.replace('/', '-')
+    if len(case_fn) > 80:
+        case_fn = case_fn[:80]
+    output_xml = os.path.join(output_dir,
+                              f'sub-results-unittests-{case_fn}.xml')
 
     command = [
         '-m',
@@ -143,7 +146,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
         # Avoid .xml extension to prevent CI from reading failures from it
         parallel_output_xml = os.path.join(
             output_dir,
-            f'parallel-sub-results-unittests-{name}.xml.intermediate')
+            f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
             "-n", f"{num_workers}", '--reruns', '3',
             f"--junitxml={parallel_output_xml}"
@@ -160,7 +163,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
             # Avoid .xml extension to prevent CI from reading failures from it
             retry_output_xml = os.path.join(
                 output_dir,
-                f'retry-sub-results-unittests-{name}.xml.intermediate')
+                f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
             # Run failed case sequentially.
             command = [
                 '-m', 'pytest', "-p", "no:xdist", ignore_opt, "-v", '--lf',

@@ -1,12 +1,11 @@
 import math
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 import flashinfer
 import pytest
 import torch
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (AttentionBackend,
@@ -20,9 +19,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

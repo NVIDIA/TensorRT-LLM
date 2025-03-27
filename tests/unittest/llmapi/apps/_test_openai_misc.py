@@ -1,15 +1,11 @@
-import os
-import sys
-
 import openai
 import pytest
 import requests
-from openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
 
 from tensorrt_llm.version import __version__ as VERSION
+
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module")

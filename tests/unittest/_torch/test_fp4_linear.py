@@ -1,6 +1,3 @@
-import os
-import sys
-
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
@@ -8,8 +5,6 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 scaling_vector_size = 16
 

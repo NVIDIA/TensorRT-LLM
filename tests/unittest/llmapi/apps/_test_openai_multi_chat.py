@@ -3,28 +3,24 @@ import asyncio
 import os
 import re
 import string
-import sys
 from tempfile import TemporaryDirectory
 
 import openai
 import pytest
-from openai_server import RemoteOpenAIServer
+from utils.util import (similar, skip_gpu_memory_less_than_40gb, skip_pre_ada,
+                        skip_single_gpu)
 
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import (similar, skip_gpu_memory_less_than_40gb, skip_pre_ada,
-                        skip_single_gpu)
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 try:
     from .test_llm import cnn_dailymail_path
 except ImportError:
-    from test_llm import cnn_dailymail_path
+    from ..test_llm import cnn_dailymail_path
 
 
 @pytest.fixture(scope="module")

@@ -30,10 +30,10 @@ l0_h100:
   - test_cpp.py::test_model[encoder-90]
   - test_cpp.py::test_model[enc_dec_language_adapter-90]
   # ------------- TRT tests ---------------
-  - unittest/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/functional/test_moe.py
-  - unittest/quantization/test_weight_only_quant_matmul.py
-  - unittest/quantization/test_weight_only_groupwise_quant_matmul.py
+  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
+  - unittest/trt/functional/test_moe.py
+  - unittest/trt/quantization/test_weight_only_quant_matmul.py
+  - unittest/trt/quantization/test_weight_only_groupwise_quant_matmul.py
   - test_e2e.py::test_trtllm_bench_sanity[extra_config-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_sanity[extra_config-non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_sanity[streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
@@ -48,19 +48,19 @@ l0_h100:
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.2-1b]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
-  - unittest/model_api/test_model_level_api.py # 9 mins on H100
-  - unittest/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100
-  - unittest/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
-  - unittest/model/eagle # 1 mins on H100
+  - unittest/trt/model_api/test_model_level_api.py # 9 mins on H100
+  - unittest/trt/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100
+  - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
+  - unittest/trt/model/eagle # 1 mins on H100
   - unittest/test_model_runner_cpp.py
   - test_cache.py::test_cache_sanity # 1 sec
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - test_e2e.py::test_llmapi_quickstart_atexit
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
   - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
-  - unittest/attention/test_gpt_attention_IFB.py
-  - unittest/attention/test_gpt_attention_no_cache.py
-  - unittest/model/test_mamba.py # 3 mins
+  - unittest/trt/attention/test_gpt_attention_IFB.py
+  - unittest/trt/attention/test_gpt_attention_no_cache.py
+  - unittest/trt/model/test_mamba.py # 3 mins
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
   - accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_fp8_pre_quantized
@@ -109,7 +109,7 @@ l0_h100:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] # 13 mins
   - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
-  - unittest/attention/test_bert_attention.py # 12 mins
+  - unittest/trt/attention/test_bert_attention.py # 12 mins
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
@@ -147,7 +147,7 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b]
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
-  - unittest/model_api/test_model_quantization.py # 20 mins on H100
+  - unittest/trt/model_api/test_model_quantization.py # 20 mins on H100
   - test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b] # 55.77s H100 only
   - test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m] # 34.07s H100 only
   - unittest/bindings # 8 mins on H100

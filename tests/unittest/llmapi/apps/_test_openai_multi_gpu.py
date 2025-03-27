@@ -1,17 +1,13 @@
 import os
-import sys
 import tempfile
 
 import openai
 import pytest
 import yaml
-from openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path, prompts
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from utils.util import skip_single_gpu
+
+from ..test_llm import get_model_path, prompts
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module")

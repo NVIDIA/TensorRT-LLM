@@ -56,7 +56,7 @@ l0_dgx_h100:
   - test_e2e.py::test_llmapi_exit_multi_gpu
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B]
   - test_e2e.py::test_llmapi_example_distributed_tp2
-  - unittest/functional/test_allreduce_norm.py
+  - unittest/trt/functional/test_allreduce_norm.py
   - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - deterministic/test_mixtral_deterministic.py::test_llm_mixtral_4gpus_deterministic[Mixtral-8x7B-Instruct-v0.1-float16]
 - condition:

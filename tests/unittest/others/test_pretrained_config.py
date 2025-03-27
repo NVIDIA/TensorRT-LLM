@@ -13,13 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 from tensorrt_llm.models.modeling_utils import PretrainedConfig
-
-sys.path.append(os.path.dirname(__file__))
-from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_pretrained_config_parses_runtime_defaults_correctly():
