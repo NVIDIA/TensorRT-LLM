@@ -310,6 +310,7 @@ def run_simple_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                 env=new_env,
                 timeout=600)
 
+
 def run_llama_executor_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests"
     cpp_env = {**_os.environ}

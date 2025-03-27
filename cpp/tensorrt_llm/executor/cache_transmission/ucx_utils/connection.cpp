@@ -75,16 +75,7 @@ UcxConnection::~UcxConnection()
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
-    // if(mFromRequester)
-    // {
-    // std::shared_ptr<ucxx::Request> request = mEndpoint->close();
-    // while (!request->isCompleted())
-    //     ;
-    // request->checkError();
-
-    // }
-
-    // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // TODO: how to close the endpoint safely?
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "END UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",

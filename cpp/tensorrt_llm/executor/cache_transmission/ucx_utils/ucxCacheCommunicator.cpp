@@ -120,8 +120,6 @@ UcxConnectionManager::UcxConnectionManager()
 
         try
         {
-            // TLLM_LOG_DEBUG("rank %d | creating listener on port %d", mComm->getRank(), listenerPort +
-            // mComm->getRank());
 
             mListener = mWorkersPool.front()->createListener(0, listenerCallback, this);
         }
@@ -250,7 +248,6 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
-    // Guard to ensure CUDA context is initialized for UCX ops
     std::vector<char> buffer(size + sizeof(uint64_t));
     auto completionCallback
         = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCvForWorker.notify_all(); };
@@ -298,7 +295,6 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
         TLLM_CHECK(mAddressToConnectionId.find(address) != mAddressToConnectionId.end());
         TLLM_CHECK(mConnections.find(mAddressToConnectionId[address]) != mConnections.end());
         TLLM_CHECK(mConnections[mAddressToConnectionId[address]]->isFromRequester());
-        // TODO: check if the connection is from requester or not
 
         ret.emplace_back(mConnections[mAddressToConnectionId[address]].get());
     }
