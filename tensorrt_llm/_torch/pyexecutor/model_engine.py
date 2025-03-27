@@ -322,6 +322,10 @@ class PyTorchModelEngine(ModelEngine):
         ]
         self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
 
+        # Reverse the order of the cuda graph batch sizes to make smaller batch sizes could use larger batch size info
+        self._cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
+                                              reverse=True)
+
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
                                                        device='cuda')
