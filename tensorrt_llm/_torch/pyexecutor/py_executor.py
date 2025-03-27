@@ -1348,7 +1348,7 @@ class PyExecutor:
 
     @nvtx_range("_get_num_dummy_request")
     def _get_num_dummy_request(self):
-        if self.enable_attention_dp and self.dist.pp_size > 1:
+        if self.enable_attention_dp:
             assert self.expected_num_active_requests >= len(
                 self.active_requests)
             if self.kv_cache_transceiver is None:
