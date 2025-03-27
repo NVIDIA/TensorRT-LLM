@@ -80,6 +80,23 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --mtp_nextn N
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
+### Run evaluation on GPQA dataset
+Download the dataset first
+1. Sign up a huggingface account and request the access to the gpqa dataset: https://huggingface.co/datasets/Idavidrein/gpqa
+2. Download the csv file from https://huggingface.co/datasets/Idavidrein/gpqa/blob/main/gpqa_diamond.csv
+
+Evaluate on GPQA dataset.
+```
+python examples/gpqa_llmapi.py \
+  --hf_model_dir <YOUR_MODEL_DIR> \
+  --data_dir <DATASET_PATH> \
+  --tp_size 8 \
+  --use_cuda_graph \
+  --enable_overlap_scheduler \
+  --concurrency 32 \
+  --batch_size 32 \
+  --max_num_tokens 4096
+```
 
 ## Preparing the Dataset & Configuration for Benchmark
 
