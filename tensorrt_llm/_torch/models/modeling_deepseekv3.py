@@ -766,7 +766,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Fully Connected
         hidden_states = self.mlp(
             hidden_states,
-            spec_metadata.all_rank_num_tokens,
+            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION or self.parallel_config.
                 tensor_parallel_size == 1 or self.enable_attention_dp)),
