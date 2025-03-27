@@ -322,7 +322,7 @@ class PyTorchModelEngine(ModelEngine):
         ]
         self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
 
-        # Reverse the order of the cuda graph batch sizes to make smaller batch sizes could use larger batch size info
+        # Reverse the order of the cuda graph batch sizes to make smaller batch sizes could reuse larger batch size memory
         self._cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                               reverse=True)
 
