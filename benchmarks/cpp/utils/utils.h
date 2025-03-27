@@ -214,8 +214,7 @@ struct RecordBwMetric
     std::vector<std::string> genHeaders() const
     {
         std::string tpTag = mTag + "(Gb/sec)";
-        return {
-            "avg_" + tpTag, "max_" + tpTag, "min_" + tpTag, "p99" + tpTag, "p90" + tpTag, "p50" + tpTag};
+        return {"avg_" + tpTag, "max_" + tpTag, "min_" + tpTag, "p99" + tpTag, "p90" + tpTag, "p50" + tpTag};
     }
 };
 

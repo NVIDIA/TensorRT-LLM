@@ -226,7 +226,8 @@ public:
     {
     }
 
-    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size) {
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size)
+    {
         auto bandwidth = size * 8 / (duration / 1000) / 1e9;
         if (mOutputPath.empty())
         {
@@ -236,7 +237,6 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
     }
-
 
     ~KvCacheMeasureHelper()
     {
@@ -257,10 +257,12 @@ public:
             }
             outFile << '\n';
 
-            for (const auto& [requestID, measures]: mRequestKVCacheTranfserMeasure) {
+            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
+            {
                 outFile << requestID;
 
-                for (const auto& [time, bandwidth] : measures) {
+                for (auto const& [time, bandwidth] : measures)
+                {
                     outFile << "," << time << "," << bandwidth;
                 }
                 outFile << '\n';

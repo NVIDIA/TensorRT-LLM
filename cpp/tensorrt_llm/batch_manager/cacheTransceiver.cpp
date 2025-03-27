@@ -300,7 +300,8 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
     mpiComm.allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
 
     std::size_t totalKVCacheSize = 0;
-    for (int rank = 0; rank < worldSize; rank++) {
+    for (int rank = 0; rank < worldSize; rank++)
+    {
         totalKVCacheSize += allKVCacheSizes[rank];
     }
 

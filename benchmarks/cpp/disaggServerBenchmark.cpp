@@ -111,8 +111,7 @@ public:
 
     void recordKvCacheThroughput(std::vector<float> const& throughputs)
     {
-        mKvCacheThroughput.mDataTps.insert(
-            mKvCacheThroughput.mDataTps.end(), throughputs.begin(), throughputs.end());
+        mKvCacheThroughput.mDataTps.insert(mKvCacheThroughput.mDataTps.end(), throughputs.begin(), throughputs.end());
     }
 
     void recordContextStart(SizeType32 inputLength, SizeType32 maxNewTokens, uint64_t requestId,
@@ -887,8 +886,8 @@ public:
                             {
                                 kvCacheTransferMs.push_back(
                                     static_cast<float>(requestStat.disServingStats->kvCacheTransferMS));
-                                kvCacheThroughput.push_back(static_cast<float>(requestStat.disServingStats->kvCacheSize) * 8
-                                    / (static_cast<float>(requestStat.disServingStats->kvCacheTransferMS) / 1000)
+                                kvCacheThroughput.push_back(static_cast<float>(requestStat.disServingStats->kvCacheSize)
+                                    * 8 / (static_cast<float>(requestStat.disServingStats->kvCacheTransferMS) / 1000)
                                     / 1e9f);
                             }
                         }

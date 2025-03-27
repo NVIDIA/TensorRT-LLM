@@ -76,8 +76,8 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
     auto lastIter = su::deserialize<std::optional<IterationType>>(is);
     auto iter = su::deserialize<std::optional<IterationType>>(is);
 
-    RequestPerfMetrics::TimingMetrics timingMetrics{
-        arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime, kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize};
+    RequestPerfMetrics::TimingMetrics timingMetrics{arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime,
+        kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize};
     RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{
         numTotalAllocatedBlocks, numNewAllocatedBlocks, numReusedBlocks, numMissedBlocks, kvCacheHitRate};
     RequestPerfMetrics::SpeculativeDecodingMetrics specDecMetrics{
