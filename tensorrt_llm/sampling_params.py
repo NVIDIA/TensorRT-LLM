@@ -146,6 +146,7 @@ class SamplingParams:
         early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
         no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
+        beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
         return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
@@ -220,6 +221,7 @@ class SamplingParams:
     early_stopping: Optional[int] = None
     no_repeat_ngram_size: Optional[int] = None
     min_p: Optional[float] = None
+    beam_width_array: Optional[List[int]] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
     return_log_probs: bool = False

@@ -20,7 +20,7 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-// Skip V1 kernels if beam_width > nMaxBeamWidthForV1
+// Skip V1 kernels if beam_width > kMaxBeamWidthForV1
 INSTANTIATE_BEAM_SEARCH(float, 16, true);
 INSTANTIATE_BEAM_SEARCH(half, 16, true);
 } // namespace kernels

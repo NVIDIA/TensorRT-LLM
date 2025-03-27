@@ -9,6 +9,7 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.auto_deploy.shim import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
@@ -29,7 +30,7 @@ class RuntimeConfig(BaseModel):
     world_config: ExecutorWorldConfig
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
-    backend: Literal["pytorch", None] = None
+    backend: Literal["pytorch", "autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
 
     def get_llm_args(self) -> Dict:
@@ -68,9 +69,14 @@ class RuntimeConfig(BaseModel):
             self.settings_config.max_num_tokens,
         }
 
-        if self.backend == "pytorch":
-            llm_args["pytorch_backend_config"] = \
-                self.performance_options.get_pytorch_perf_config()
+        backend_config_map = {
+            "pytorch": self.performance_options.get_pytorch_perf_config,
+            "autodeploy": self.performance_options.get_autodeploy_perf_config
+        }
+
+        if self.backend in backend_config_map:
+            llm_args["pytorch_backend_config"] = backend_config_map[
+                self.backend]()
 
         return update_llm_args_with_extra_options(llm_args,
                                                   self.extra_llm_api_options)
@@ -98,6 +104,13 @@ class PerformanceOptions:
 
     def get_pytorch_perf_config(self) -> PyTorchConfig:
         return PyTorchConfig(**self.pytorch_config)
+
+    def get_autodeploy_perf_config(self) -> AutoDeployConfig:
+        ad_config = AutoDeployConfig(**self.pytorch_config)
+        ad_config.attn_backend = "FlashInfer"
+        ad_config.torch_compile_enabled = True
+        ad_config.skip_loading_weights = True
+        return ad_config
 
 
 class DecodingConfig(BaseModel):

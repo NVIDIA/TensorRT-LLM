@@ -180,18 +180,9 @@ T maxOfActiveSlots(std::vector<T> const& values, std::vector<bool> const& active
 }
 } // namespace
 
-void GptDecoderBatched::forwardDispatch(
-    decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType)
+void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
-    auto eventStart = CudaEvent{};
-    mRuntimeStream->record(eventStart);
-
-    bool const async = forwardType == ForwardType::kASYNC;
-
-    if (async)
-    {
-        mDecoderStream->wait(eventStart.get());
-    }
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const maxDecodingEngineTokens
         = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
@@ -199,15 +190,14 @@ void GptDecoderBatched::forwardDispatch(
     for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
         prepareForward(si, output, input);
-        forwardDecoder(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput(), forwardType);
+
+        if (mDecoderState->getJointDecodingInput().batchSize > 0)
+        {
+            mDecoder->forwardAsync(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput());
+        }
     }
 
-    if (async)
-    {
-        CudaEvent event{};
-        mDecoderStream->record(event);
-        mRuntimeStream->wait(event);
-    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
@@ -215,7 +205,15 @@ GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    forwardDispatch(output, input, ForwardType::kASYNC);
+    auto eventStart = CudaEvent{};
+    mRuntimeStream->record(eventStart);
+    mDecoderStream->wait(eventStart.get());
+
+    forwardDispatch(output, input);
+
+    CudaEvent event{};
+    mDecoderStream->record(event);
+    mRuntimeStream->wait(event);
 
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
@@ -328,29 +326,6 @@ void GptDecoderBatched::prepareForward(
     dOutput.newTokens = newTokensStepView;
     dOutput.finishReasons = finishedStepsOutput;
     dOutput.lengths = sequenceLengths;
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void GptDecoderBatched::forwardDecoder(DecodingOutput& output, DecodingInput const& input, ForwardType forwardType)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (input.batchSize > 0)
-    {
-        if (forwardType == ForwardType::kASYNC)
-        {
-            mDecoder->forwardAsync(output, input);
-        }
-        else if (forwardType == ForwardType::kSYNC)
-        {
-            mDecoder->forwardSync(output, input);
-        }
-        else
-        {
-            TLLM_THROW("Unknown ForwardType");
-        }
-    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

@@ -20,12 +20,27 @@ class TestSamplingParams(ApiStabilityTestHarness):
 
     def test_get_sampling_config(self):
         expected_fields = {
-            "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-            "top_p_decay", "seed", "random_seed", "temperature", "min_tokens",
-            "min_length", "beam_search_diversity_rate", "repetition_penalty",
-            "presence_penalty", "frequency_penalty", "length_penalty",
-            "early_stopping", "no_repeat_ngram_size", "num_return_sequences",
-            "min_p"
+            "beam_width",
+            "top_k",
+            "top_p",
+            "top_p_min",
+            "top_p_reset_ids",
+            "top_p_decay",
+            "seed",
+            "random_seed",
+            "temperature",
+            "min_tokens",
+            "min_length",
+            "beam_search_diversity_rate",
+            "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+            "length_penalty",
+            "early_stopping",
+            "no_repeat_ngram_size",
+            "num_return_sequences",
+            "min_p",
+            "beam_width_array",
         }
         found_fields = {
             f
@@ -66,13 +81,13 @@ class TestLogitsProcessor(ApiStabilityTestHarness):
 
     def create_snapshot_from_inspect(self):
         method_snapshot = MethodSnapshot.from_inspect(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
     def create_snapshot_from_docstring(self):
         method_snapshot = MethodSnapshot.from_docstring(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
@@ -83,13 +98,13 @@ class TestBatchedLogitsProcessor(ApiStabilityTestHarness):
 
     def create_snapshot_from_inspect(self):
         method_snapshot = MethodSnapshot.from_inspect(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 
     def create_snapshot_from_docstring(self):
         method_snapshot = MethodSnapshot.from_docstring(
-            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+            MethodType(self.TEST_CLASS.__call__, object()))
         return ClassSnapshot(methods={"__call__": method_snapshot},
                              properties={})
 

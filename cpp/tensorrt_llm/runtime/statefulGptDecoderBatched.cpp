@@ -70,10 +70,9 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
 
 } // namespace
 
-StatefulGptDecoderBatched::StatefulGptDecoderBatched(
-    CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
+StatefulGptDecoderBatched::StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype)
 {
-    mDecoder = std::make_unique<GptDecoderBatched>(stream, speculativeDecodingMode, dtype);
+    mDecoder = std::make_unique<GptDecoderBatched>(stream, SpeculativeDecodingMode::None(), dtype);
 
     auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
 
@@ -86,11 +85,11 @@ StatefulGptDecoderBatched::StatefulGptDecoderBatched(
 
 StatefulGptDecoderBatched::~StatefulGptDecoderBatched() = default;
 
-void StatefulGptDecoderBatched::setup(tensorrt_llm::executor::DecodingMode const& mode, SizeType32 maxBatchSize,
+void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize,
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
+    constexpr SizeType32 maxTokensPerStep = 1;
     mDecoder->setup(mode, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength,
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
