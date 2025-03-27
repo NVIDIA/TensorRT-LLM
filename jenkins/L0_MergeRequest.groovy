@@ -326,13 +326,7 @@ def launchReleaseCheck(pipeline)
         // Step 1: cloning tekit source code
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep pre-commit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep bandit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit install")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run -a --show-diff-on-failure || (git restore . && false)")
-        sh "cd ${LLM_ROOT} && bandit --configfile scripts/bandit.yaml -r tensorrt_llm | tee /tmp/bandit.log"
-        sh "cat /tmp/bandit.log | grep -q 'Total lines skipped (#nosec): 0' && exit 0 || exit 1"
-        sh "cat /tmp/bandit.log | grep -q 'Issue:' && exit 1 || exit 0"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
         // Step 2: build tools
         withEnv(['GONOSUMDB=*.nvidia.com']) {
