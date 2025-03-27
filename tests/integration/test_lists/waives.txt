@@ -394,7 +394,6 @@ examples/test_qwen.py::test_llm_qwen_moe_multi_gpu_summary[qwen2_57b_a14b-tp2pp2
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora] SKIP (https://nvbugs/5064768)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugspro.nvidia.com/bug/5075538)
 examples/test_chatglm.py::test_llm_chatglm3_6b_long_context_ppl[SlimPajama-6B-chatglm3-6b-128k] SKIP (https://nvbugspro.nvidia.com/bug/5051783)
-unittest/_torch/modeling -k "modeling_vila" SKIP (https://nvbugs/5087143)
 examples/test_qwen.py::test_llm_qwen_7b_int8_kv_1node_1gpus[qwen2_vl_7b_instruct-enable_gemm_plugin-enable_weight_only] SKIP (https://nvbugs/5094621)
 examples/test_qwen.py::test_llm_qwen_int4_single_gpu_summary[qwen2.5_14b_instruct_int4-nb:4] SKIP (https://nvbugs/5094690)
 examples/test_qwen.py::test_llm_hf_qwen_quantization_1gpu[qwen2.5_7b_instruct-fp8-float16] SKIP (https://nvbugs/5094690)
