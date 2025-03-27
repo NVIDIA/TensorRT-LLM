@@ -24,8 +24,9 @@ def test_moe_op_profile(dtype):
                             dtype=dtype).cuda()
 
     use_fp8_block_scaling = False
+    min_latency_mode = False
     profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-        dtype, dtype, dtype, use_fp8_block_scaling)
+        dtype, dtype, dtype, use_fp8_block_scaling, min_latency_mode)
 
     # profile
     profiler.run_profile(
@@ -106,8 +107,10 @@ def test_moe_op_run(dtype):
 
     # run with profile
     use_fp8_block_scaling = False
+    min_latency_mode = False
+
     profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-        dtype, dtype, dtype, use_fp8_block_scaling)
+        dtype, dtype, dtype, use_fp8_block_scaling, min_latency_mode)
     profiler.run_profile(
         w2_weight,
         TOP_K,
@@ -133,8 +136,7 @@ def test_moe_op_run(dtype):
             tp_rank=TP_RANK,
             ep_size=EP_SIZE,
             ep_rank=EP_RANK,
-            profile_ids=profile_ids,
-        )
+            profile_ids=profile_ids)
 
     # torch run
     with torch.inference_mode():
