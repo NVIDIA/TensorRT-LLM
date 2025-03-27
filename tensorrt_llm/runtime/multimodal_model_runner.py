@@ -1492,6 +1492,40 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
+    def get_embeddings(self, key_input, other_inputs, input_names, output_names, precision, encoder_session, stream, mode="vision"):
+        features = {
+            input_names[0]:
+            key_input.to(str_dtype_to_torch(precision)),
+        }
+        for key, tensor in other_inputs.items():
+            features.update({key: tensor})
+
+        tensor_info = [
+            TensorInfo(input_names[0],
+                       str_dtype_to_trt(precision), key_input.shape),
+        ]
+        for key, tensor in other_inputs.items():
+            tensor_info.append(
+                TensorInfo(key, torch_dtype_to_trt(tensor.dtype), tensor.shape))
+
+        output_info = encoder_session.infer_shapes(tensor_info)
+        encoder_session.set_shapes(features)
+        outputs = {
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device=key_input.device)
+            for t in output_info
+        }
+
+        ok = encoder_session.run(features, outputs,
+                                            stream.cuda_stream)
+        assert ok, f"Runtime execution failed for {mode} encoder session"
+        stream.synchronize()
+
+        embeds = outputs[output_names[0]]
+        return embeds
+
     def get_visual_features(self, image, other_vision_inputs):
         visual_features = {
             self.vision_input_names[0]:
