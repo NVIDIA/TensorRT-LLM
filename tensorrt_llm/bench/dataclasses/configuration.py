@@ -146,13 +146,16 @@ class DecodingConfig(BaseModel):
 class ExecutorWorldConfig(BaseModel):
     pp_size: int = 1
     tp_size: int = 1
-    world_size: int = 1
-    gpus_per_node: int = 8
+    # None to make LLM-API deduce it with a rule.
+    gpus_per_node: Optional[int] = None
     leader_mode: bool = False
     ep_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:
+        if self.gpus_per_node is None:
+            return self
+
         parallel_world = self.pp_size * self.tp_size
         num_gpus = self.world_size * self.gpus_per_node
         valid_world = bool(num_gpus >= parallel_world)
