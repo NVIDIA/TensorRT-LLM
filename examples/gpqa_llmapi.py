@@ -510,11 +510,12 @@ def main():
 
     # Calculate and print the accuracy
     acc = [np.mean([res[1] for res in result]) for result in results]
+    acc_mean = np.mean(acc)
     for i in range(args.num_runs):
         print(f"Run {i+1} accuracy: {acc[i]:.3f}")
-    print("Average accuracy: {:.3f}".format(np.mean(acc)))
+    print("Average accuracy: {:.3f}".format(acc_mean))
     if args.check_accuracy:
-        assert acc >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {acc}"
+        assert acc_mean >= args.accuracy_threshold, f"Expected accuracy >= {args.accuracy_threshold} while got {acc_mean}"
 
     return acc
 
