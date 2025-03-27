@@ -50,7 +50,7 @@ import os
 import random
 import re
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from typing import List, Optional, Set, Tuple
 
 import numpy as np
@@ -374,10 +374,11 @@ def parse_args():
                         type=str,
                         default='auto',
                         help='KV cache dtype')
-    parser.add_argument('--kv_cache_enable_block_reuse',
-                        default=True,
-                        action='store_false',
-                        help='Enable block reuse for KV cache')
+    parser.add_argument('--kv_cache_disable_block_reuse',
+                        default=False,
+                        action='store_true',
+                        help='Disable block reuse for KV cache')
+
     # TODO: change the default value back to 0.95
     parser.add_argument("--kv_cache_fraction",
                         type=float,
@@ -456,7 +457,7 @@ def main():
         # and it will be fixed in the near future
         autotuner_enabled=False)
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=args.kv_cache_enable_block_reuse,
+        enable_block_reuse=not args.kv_cache_disable_block_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction)
     mtp_config = MTPDecodingConfig(
         num_nextn_predict_layers=args.mtp_nextn) if args.mtp_nextn > 0 else None
@@ -485,7 +486,7 @@ def main():
                          dataset_shuffle,
                          limit=args.limit,
                          num_runs=args.num_runs)
-    
+
     t = time.time()
     try:
         # Run the benchmark
