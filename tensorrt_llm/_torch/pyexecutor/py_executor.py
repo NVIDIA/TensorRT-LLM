@@ -1246,17 +1246,6 @@ class PyExecutor:
                 self._terminate_request(req)
                 self.active_requests.remove(req)
 
-    def _remove_dummy_request(self, scheduled_requests):
-        for request in scheduled_requests.context_requests[:]:
-            if request.is_dummy:
-                scheduled_requests.context_requests.remove(request)
-        for request in scheduled_requests.generation_requests[:]:
-            if request.is_dummy:
-                scheduled_requests.generation_requests.remove(request)
-        for request in self.active_requests[:]:
-            if request.is_dummy:
-                self.active_requests.remove(request)
-
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
         ctx_len = ctx_ids.shape[-1]
