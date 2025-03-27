@@ -11,7 +11,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        MLAParams, PositionalEmbeddingParams,
+                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams)
 from .vanilla import VanillaAttention
 

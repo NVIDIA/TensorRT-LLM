@@ -20,7 +20,9 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            AttentionRuntimeFeatures)
+from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..attention_backend.utils import get_attention_backend
+from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..metadata import KVCacheParams
