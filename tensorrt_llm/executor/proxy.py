@@ -268,10 +268,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
 
-        print_colored_debug("MPI barrier\n", "red")
-        self.mpi_session.barrier()
-        print_colored_debug("MPI barrier done\n", "red")
-
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,

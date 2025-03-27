@@ -3,6 +3,7 @@ import itertools
 import os
 import socket
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -11,14 +12,14 @@ import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
-from .._utils import global_mpi_rank, mpi_comm
+from .._utils import global_mpi_rank
 from .utils import print_colored_debug
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
-    from tensorrt_llm._utils import global_mpi_size, mpi_rank, mpi_world_size
+    from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
 
@@ -92,10 +93,6 @@ class MpiSession(abc.ABC):
     def shutdown(self):
         raise NotImplementedError()
 
-    @abc.abstractmethod
-    def barrier(self):
-        raise NotImplementedError()
-
 
 class MpiPoolSession(MpiSession):
 
@@ -115,10 +112,6 @@ class MpiPoolSession(MpiSession):
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers)
         ]
-
-    def barrier(self):
-        # MPIPoolExecutor does not need a barrier, all the MPI processes are spawned by the same mpirun command
-        pass
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         futures = [
@@ -162,7 +155,7 @@ class MpiCommSession(MpiSession):
 
         if ENABLE_MULTI_DEVICE:
             if not self.comm:
-                self.comm = mpi_comm()
+                self.comm = mpi4py.MPI.COMM_WORLD
 
             if self.comm.Get_rank() != 0:
                 raise RuntimeError(
@@ -194,19 +187,12 @@ class MpiCommSession(MpiSession):
             for i in range(self.n_workers - 1)
         ]
 
+        # A trick to wait for rank0 to be ready, or the collective tasks will hang
+        # TODO[chunweiy]: Remove this trick
+        time.sleep(10)
+
         rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
-
-    @staticmethod
-    def _mpi_barrier():
-        print_colored_debug("MPI barrier\n", "yellow")
-        mpi_comm().Barrier()
-        print_colored_debug("MPI barrier done\n", "yellow")
-
-    def barrier(self):
-        # Wait until the MPI processes are ready
-        assert mpi_rank() == 0, 'Barrier should be called by rank0'
-        self.submit_sync(MpiCommSession._mpi_barrier)
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         futures = self.submit(task, *args, **kwargs)
@@ -232,7 +218,7 @@ class MpiCommSession(MpiSession):
 
 
 class RemoteTask(NamedTuple):
-    task: Callable[..., T] | str  # str for special tasks like barrier
+    task: Callable[..., T]
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
 
@@ -251,9 +237,6 @@ class RemoteMpiCommSessionClient():
         self.socket.connect(addr)
         self._is_shutdown = False
 
-    def barrier(self):
-        self.socket.send_pyobj(RemoteTask(MpiCommSession._mpi_barrier, (), {}))
-
     def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
         if self._is_shutdown:
             print_colored_debug(
@@ -264,9 +247,6 @@ class RemoteMpiCommSessionClient():
             "yellow")
         self.socket.send_pyobj(RemoteTask(task, args, kwargs))
         return []
-
-    def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> list:
-        return self.submit(task, *args, **kwargs)
 
     def shutdown(self):
         if self._is_shutdown:
@@ -324,14 +304,9 @@ class RemoteMpiCommSessionServer():
                 self.session.shutdown()
                 break
             else:
-                if message.task == MpiCommSession._mpi_barrier:
-                    # This will block the server until the barrier is done
-                    self.session.submit_sync(message.task, *message.args,
-                                             **message.kwargs)
-                else:
-                    print_colored_debug(
-                        f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task from {self.addr}\n",
-                        "green")
+                print_colored_debug(
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task from {self.addr}\n",
+                    "green")
                 self.session.submit(message.task, *message.args,
                                     **message.kwargs)
 
