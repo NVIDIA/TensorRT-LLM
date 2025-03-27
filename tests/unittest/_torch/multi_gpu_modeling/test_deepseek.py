@@ -78,9 +78,9 @@ def test_deepseek(model_name, backend, quant, tp_size, pp_size, ep_size,
     if mtp_nextn > 0 and getSMVersion() < 100:
         pytest.skip(f"Only Blackwell MLA kernel can support MTP now")
 
-    if pp_size > 1 and (enable_dp or mtp_nextn > 0):
+    if pp_size > 1 and mtp_nextn > 0:
         pytest.skip(
-            "Hang issue with DP attention / MTP + PP: https://nvbugspro.nvidia.com/bug/5170160"
+            "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
         )
     if pp_size > 2 and enable_cuda_graph and enable_overlap_scheduler:
         pytest.skip(
