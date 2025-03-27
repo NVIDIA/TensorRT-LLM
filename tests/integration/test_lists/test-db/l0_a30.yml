@@ -26,12 +26,12 @@ l0_a30:
   - test_cpp.py::test_model[gpt-80]
   - test_cpp.py::test_benchmarks[gpt-80]
   # ------------- TRT tests ---------------
-  - unittest/model/test_nemotron_nas.py -k "not fp8"
-  - unittest/model/test_gpt.py -k "partition0" # 10 mins
-  - unittest/model/test_gpt.py -k "partition1" # 10 mins
-  - unittest/model/test_gpt.py -k "partition2" # 10 mins
-  - unittest/model/test_gpt.py -k "partition3" # 10 mins
-  - unittest/model/test_gpt.py -k "other" # 1 mins
+  - unittest/trt/model/test_nemotron_nas.py -k "not fp8"
+  - unittest/trt/model/test_gpt.py -k "partition0" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition1" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition2" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition3" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "other" # 1 mins
   - examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]
   - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]

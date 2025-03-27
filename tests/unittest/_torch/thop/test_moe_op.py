@@ -1,16 +1,12 @@
-import os
-import sys
-
 import pytest
 import torch
+from _torch.helpers import (calc_diff, ceil_div, per_block_cast_to_fp8,
+                            reference_block_scale_moe_torch,
+                            reference_moe_torch)
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.modules.fused_moe import (
     FusedMoEQuantScalesFP8BlockScales, RenormalizeMoeRoutingMethod)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from helpers import (calc_diff, ceil_div, per_block_cast_to_fp8,
-                     reference_block_scale_moe_torch, reference_moe_torch)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

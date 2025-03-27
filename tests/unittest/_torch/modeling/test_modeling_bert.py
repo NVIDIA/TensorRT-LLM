@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -15,8 +13,6 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_bert import \
     BertForSequenceClassification
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 BERT_CONFIG = {
     "architectures": ["BertForSequenceClassification"],

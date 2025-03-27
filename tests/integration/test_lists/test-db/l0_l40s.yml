@@ -26,13 +26,13 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video]
   - test_e2e.py::test_ptp_quickstart_bert[BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   # ------------- TRT tests ---------------
-  - unittest/attention/test_gpt_attention.py -k "partition0"
-  - unittest/attention/test_gpt_attention.py -k "partition1"
-  - unittest/attention/test_gpt_attention.py -k "partition2"
-  - unittest/attention/test_gpt_attention.py -k "partition3"
-  - unittest/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/quantization # 18 mins
-  - unittest/functional # 37 mins
+  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
+  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
+  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
+  - unittest/trt/quantization # 18 mins
+  - unittest/trt/functional # 37 mins
   - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8_rowwise
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe
@@ -82,7 +82,7 @@ l0_l40s:
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
-  - unittest/attention/test_bert_attention.py # 12 mins
+  - unittest/trt/attention/test_bert_attention.py # 12 mins
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]

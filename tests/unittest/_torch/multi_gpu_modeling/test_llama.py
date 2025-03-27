@@ -1,9 +1,9 @@
-import os
-import sys
 from difflib import SequenceMatcher
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
@@ -11,10 +11,6 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, CalibConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
 
 MAX_SEQ_LEN = 2048
 

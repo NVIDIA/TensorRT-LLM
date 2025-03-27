@@ -1,12 +1,12 @@
 import json
 import os
-import sys
 
 import modelopt.torch.quantization as mtq
 import pytest
 import torch
 from modelopt.torch.export import export_hf_checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import BuildConfig, SamplingParams, logger
 from tensorrt_llm._torch import LLM
@@ -15,9 +15,6 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.quantize_by_modelopt import get_calib_dataloader
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.llm_data import llm_models_root
 
 MAX_SEQ_LEN = 4096 + 1024
 

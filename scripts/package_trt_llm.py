@@ -19,7 +19,7 @@ def _clean_files(src_dir: PathLike, extend_files: str) -> None:
         "scripts/package_trt_llm.py",
         "scripts/git_replace.py",
         "tests/integration",
-        "tests/unittest/model/test_unet.py",
+        "tests/unittest/trt/model/test_unet.py",
         "tests/microbenchmarks/",
         "tests/README.md",
     ] #yapf: disable

@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 from itertools import product
 
@@ -21,14 +19,11 @@ import pytest
 import torch
 from einops import rearrange, repeat
 from parameterized import parameterized
+from utils.torch_ref import (selective_scan_ref, selective_state_update_ref,
+                             ssd_chunk_scan_combined_ref)
+from utils.util import unittest_name_func
 
 import tensorrt_llm
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from functional.torch_ref import (selective_scan_ref,
-                                  selective_state_update_ref,
-                                  ssd_chunk_scan_combined_ref)
-from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):

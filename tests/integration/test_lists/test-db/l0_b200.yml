@@ -34,6 +34,6 @@ l0_b200:
   - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_auto_dtype
   - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_fp8
   - accuracy/test_accuracy.py::TestMixtral8x7B::test_nvfp4_pre_quantized
-  - unittest/attention/test_gpt_attention.py -k "trtllm_gen"
+  - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - unittest/functional/test_fp4_gemm.py # 3 mins on B200
+  - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200

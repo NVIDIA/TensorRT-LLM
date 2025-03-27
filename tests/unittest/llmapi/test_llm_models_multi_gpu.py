@@ -1,5 +1,6 @@
-from test_llm_models import llm_test_harness, qwen2_model_path, sampling_params
 from utils.util import skip_single_gpu
+
+from .test_llm_models import llm_test_harness, qwen2_model_path, sampling_params
 
 
 @skip_single_gpu

@@ -1,11 +1,10 @@
-import os
-import sys
 from itertools import product
 from typing import Dict, List, Optional
 
 import pytest
 import torch
 import torch.nn as nn
+from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
@@ -14,9 +13,6 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    RenormalizeMoeRoutingMethod)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 
 @pytest.mark.parametrize(

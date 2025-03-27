@@ -13,18 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
 import unittest
 
 import pytest
 import torch
 from parameterized import parameterized
+from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.

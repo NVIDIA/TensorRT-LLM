@@ -17,7 +17,7 @@ from typing import List, Tuple
 
 import pytest
 import torch
-from helpers import calc_diff, ceil_div, per_block_cast_to_fp8
+from _torch.helpers import calc_diff, ceil_div, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
 

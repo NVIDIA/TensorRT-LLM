@@ -1,4 +1,3 @@
-import os
 import pickle
 import sys
 import traceback
@@ -9,6 +8,7 @@ import torch
 import torch.nn as nn
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
@@ -22,9 +22,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.util import skip_pre_blackwell_unittest
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(

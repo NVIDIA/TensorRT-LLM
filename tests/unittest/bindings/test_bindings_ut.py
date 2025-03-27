@@ -1,19 +1,15 @@
 import json
-import os
 import pickle
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_quant_mode():
