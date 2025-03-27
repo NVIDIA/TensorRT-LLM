@@ -536,6 +536,8 @@ class PyExecutor:
                     else:
                         new_tensors_host = self._forward_step_inter_pp(
                             scheduled_batch)
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
                     self.micro_batches[microbatch_id] = (scheduled_batch,
                                                          new_tensors_host)
 
@@ -635,6 +637,8 @@ class PyExecutor:
                             scheduled_batch, batch_outputs)
                         torch.cuda.nvtx.range_pop()
 
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
                     self.micro_batches[microbatch_id] = (scheduled_batch,
                                                          new_tensors_host,
                                                          decoder_event)
@@ -1143,8 +1147,9 @@ class PyExecutor:
                 ],
             )
             all_ranks_new_requests_heap = [
-                HeapVal(0, self.expected_num_active_requests - val, idx, [])
-                for idx, val in enumerate(self.all_ranks_num_active_requests)
+                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
+                for tp_rank, val in enumerate(
+                    self.all_ranks_num_active_requests)
             ]
             new_requests_cur_rank = all_ranks_new_requests_heap[
                 self.dist.tp_rank].request_list
@@ -1165,7 +1170,7 @@ class PyExecutor:
                 val.request_list.append(request)
                 if val.num_requests > 0:
                     heapq.heappush(all_ranks_new_requests_heap, val)
-                elif val.rank == self.dist.rank:
+                elif val.rank == self.dist.tp_rank:
                     break
             self.has_context_request = len(new_requests_cur_rank) > 0
             now = time.time()
@@ -1237,6 +1242,7 @@ class PyExecutor:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in self.active_requests[:]:
             if req.is_dummy:
+                self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
 
