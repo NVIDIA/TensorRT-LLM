@@ -67,7 +67,8 @@ def test_deepseek_gpqa_llmapi(llmapi_example_root, llm_datasets_root, llm_venv,
         f"--hf_model_dir={model_dir}", f"--data_dir={gpqa_data_path}",
         f"--tp_size={tp_size}", f"--ep_size={ep_size}", "--concurrency=8",
         f"--mtp_nextn={mtp_nextn}", "--print_iter_log", "--batch_size=32",
-        "--max_num_tokens=4096", "--check_accuracy", "--accuracy_threshold=0.65"
+        "--max_num_tokens=4096", "--check_accuracy",
+        "--accuracy_threshold=0.65", "--num_runs=3"
     ]
     if enable_cuda_graph:
         gpqa_cmd.append("--use_cuda_graph")
