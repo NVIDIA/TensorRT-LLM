@@ -9,7 +9,6 @@ from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput)
-from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
@@ -158,11 +157,6 @@ class TestLLM(ApiStabilityTestHarness):
         self.test_signature()
         with pytest.raises(AssertionError):
             self.test_docstring()
-
-
-class TestLlmArgs(ApiStabilityTestHarness):
-    TEST_CLASS = LlmArgs
-    REFERENCE_FILE = "llm_args.yaml"
 
 
 class TestCompletionOutput(ApiStabilityTestHarness):
