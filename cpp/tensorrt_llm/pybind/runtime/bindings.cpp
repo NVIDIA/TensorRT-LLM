@@ -368,16 +368,6 @@ void initBindings(pybind11::module_& m)
             "joint_decoding_input", [](tr::decoder::DecoderState& self) { return self.getJointDecodingInput(); })
         .def_property_readonly(
             "joint_decoding_output", [](tr::decoder::DecoderState& self) { return self.getJointDecodingOutput(); })
-        .def(
-            "new_tokens",
-            [](tr::decoder::DecoderState& self, int iter = 0)
-            {
-                auto allNewTokens = self.getAllNewTokens();
-                auto newTokensView = std::shared_ptr<tr::ITensor>(tr::ITensor::slice(allNewTokens, iter, 1));
-                newTokensView->squeeze(0);
-                return tr::Torch::tensor(tr::ITensor::slice(newTokensView, 0, self.getActualBatchSize()));
-            },
-            py::arg("iter") = 0)
         .def_property_readonly(
             "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
         .def_property_readonly(
