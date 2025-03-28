@@ -332,6 +332,7 @@ void BaseSamplingLayerTest<T>::runTest(
     if (params.beamWidth > 1)
     {
         mBeamWidth = params.beamWidth;
+        mMaxSeed = 1;
         mComputeProbs = true;
     }
     initLayer(params);
