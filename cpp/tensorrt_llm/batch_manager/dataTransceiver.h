@@ -218,28 +218,29 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-class KvCacheTimeHelper
+class KvCacheMeasureHelper
 {
 public:
-    KvCacheTimeHelper(std::string output_path)
+    KvCacheMeasureHelper(std::string output_path)
         : mOutputPath(std::move(output_path))
     {
     }
 
-    void appendKVCacheTransferTime(LlmRequest::RequestIdType requestId, double duration)
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size)
     {
+        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
         if (mOutputPath.empty())
         {
             return;
         }
 
         std::lock_guard<std::mutex> lock(mMutex);
-        mRequestKVCacheTranfserTime[requestId].emplace_back(duration);
+        mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
     }
 
-    ~KvCacheTimeHelper()
+    ~KvCacheMeasureHelper()
     {
-        if (!mRequestKVCacheTranfserTime.empty() && !mOutputPath.empty())
+        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
         {
             auto rank = mpi::MpiComm::world().getRank();
             std::string outFilePath = mOutputPath + "rank_" + std::to_string(rank) + ".txt";
@@ -247,22 +248,22 @@ public:
 
             TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
 
-            size_t numTransferTime = mRequestKVCacheTranfserTime.begin()->second.size();
+            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
 
             outFile << "RequestID";
-            for (size_t i = 0; i < numTransferTime; i++)
+            for (size_t i = 0; i < numTransferMeasure; i++)
             {
-                outFile << ",TimeDuration";
+                outFile << ",TimeDuration,Bandwidth";
             }
             outFile << '\n';
 
-            for (auto const& [requestID, timeDuration] : mRequestKVCacheTranfserTime)
+            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
             {
                 outFile << requestID;
 
-                for (auto const& value : timeDuration)
+                for (auto const& [time, bandwidth] : measures)
                 {
-                    outFile << "," << value;
+                    outFile << "," << time << "," << bandwidth;
                 }
                 outFile << '\n';
             }
@@ -272,7 +273,7 @@ public:
     }
 
 private:
-    std::map<LlmRequest::RequestIdType, std::vector<double>> mRequestKVCacheTranfserTime;
+    std::map<LlmRequest::RequestIdType, std::vector<std::pair<double, double>>> mRequestKVCacheTranfserMeasure;
     std::string mOutputPath;
     std::mutex mMutex;
 };
