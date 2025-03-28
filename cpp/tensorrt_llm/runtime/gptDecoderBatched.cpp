@@ -200,8 +200,7 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
-    decoder_batch::Output& output, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -218,7 +217,7 @@ GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_unique<decoder_batch::DecoderFinishedEvent>(std::move(eventStop), input.active);
+    return eventStop;
 }
 
 // TODO(rkobus): produce new input and output
@@ -334,7 +333,7 @@ void GptDecoderBatched::forward(decoder_batch::Output& output, decoder_batch::In
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto decoderFinishEvent = forwardAsync(output, input);
-    decoderFinishEvent->event.synchronize();
+    decoderFinishEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -391,20 +390,17 @@ std::pair<DecodingInput, DecodingOutput> prepareGatherTree(
 } // namespace
 
 // TODO call this at the end of forward if mFinished[i] changes from false to true?
-CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const
+CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+    SamplingConfig const& samplingConfig, bool streaming) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto& stream = mRuntimeStream;
-    auto manager = BufferManager{stream};
+    auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
-    auto [dInput, dOutput] = prepareGatherTree(*mDecoderState, batchSlot, streaming, *stream);
-
-    kernels::gatherTree(dOutput, dInput, manager, samplingConfig);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
 
     CudaEvent event{};
-    stream->record(event);
-    mRuntimeStream->wait(event);
+    mRuntimeStream->record(event);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return event;
 }
