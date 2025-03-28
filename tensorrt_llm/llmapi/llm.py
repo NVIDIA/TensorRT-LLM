@@ -19,7 +19,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.utils import create_mpi_comm_session
+from ..executor.utils import (create_mpi_comm_session,
+                              get_spawn_proxy_process_env)
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -125,6 +126,8 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
+        print_colored_debug(
+            f"LLM.args._mpi_session: {self.args._mpi_session}\n", "yellow")
         self.mpi_session = self.args._mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
@@ -138,11 +141,15 @@ class LLM:
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
             if not self.mpi_session:
-                if not external_mpi_comm_available(
-                        self.args.parallel_config.world_size):
+                mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+                if not mpi_process_pre_spawned:
+                    print_colored_debug(f"LLM create MpiPoolSession\n",
+                                        "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
+                    print_colored_debug(f"LLM create MpiCommSession\n",
+                                        "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
 
