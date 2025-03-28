@@ -62,8 +62,8 @@ public:
 
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(
-        SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const override;
+    [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+        SamplingConfig const& samplingConfig, bool streaming) const override;
 
     decoder::DecoderState& getDecoderState() const
     {

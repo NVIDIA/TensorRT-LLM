@@ -364,8 +364,7 @@ void StatefulGptDecoder::finalize(SamplingConfig const& samplingConfig) const
     // TODO (rkobus) can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
-    kernels::gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager, samplingConfig);
+    kernels::gatherTree(*mDecodingOutput, *mDecodingInput, samplingConfig, mBufferManager.getStream());
     mBufferManager.copy(*(mDecodingOutput->gatheredIds), *outputIds);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return;
 }

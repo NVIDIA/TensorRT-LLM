@@ -262,7 +262,7 @@ void StatefulGptDecoderBatched::finalize(SamplingConfig const& samplingConfig) c
     {
         auto slot = batchSlots[batchIdx];
         auto requestSamplingConfig = extractSamplingConfig(samplingConfig, slot);
-        auto event = mDecoder->finalize(slot, requestSamplingConfig, /*streaming*/ false);
+        auto event = mDecoder->finalize(mDecoder->getDecoderState(), slot, requestSamplingConfig, /*streaming*/ false);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
