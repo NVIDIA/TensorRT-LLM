@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
@@ -52,12 +53,8 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
-    assert fused_moe.has_been_profiled == False
-    with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
-    assert fused_moe.has_been_profiled
-
-    # torch run
+    with torch.inference_mode(), autotune():
+        fused_moe.forward(x, router_logits)
 
     ref_fused_moe = RefGatedMLPFusedMoE(num_experts=NUM_EXPERTS,
                                         routing_method=routing_method,
@@ -67,15 +64,21 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
                                         model_config=ModelConfig())
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
-    with torch.inference_mode():
-        ref_output = ref_fused_moe.forward(x, router_logits)
 
-    # with torch.inference_mode():
-    #     ref_output = reference_moe_torch(x, router_logits, TOP_K, weights)
+    # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
+    m = SEQ_LEN
+    while m >= 2:
+        x = torch.randn((m, HIDDEN_SIZE), dtype=dtype).cuda()
+        router_logits = torch.randn((m, NUM_EXPERTS), dtype=dtype).cuda()
 
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        # Evaluate outputs
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, ref_output, rtol=0.2, atol=0.2)
+        m //= 2
 
 
 @skip_pre_hopper
@@ -140,10 +143,8 @@ def test_fused_moe_fp8(dtype):
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
-    assert fused_moe.has_been_profiled == False
-    with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
-    assert fused_moe.has_been_profiled
+    with torch.inference_mode(), autotune():
+        fused_moe.forward(x, router_logits)
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -155,6 +156,7 @@ def test_fused_moe_fp8(dtype):
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
     with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
@@ -243,11 +245,7 @@ def test_fused_moe_nvfp4(dtype):
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
-    assert fused_moe.has_been_profiled == False
-    with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
-    assert fused_moe.has_been_profiled
-
+    # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
@@ -257,7 +255,12 @@ def test_fused_moe_nvfp4(dtype):
         model_config=ModelConfig(quant_config=quant_config))
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
+
+    with torch.inference_mode(), autotune():
+        fused_moe.forward(x, router_logits)
+
     with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare

@@ -156,26 +156,6 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
-    @torch.library.register_fake("trtllm::fused_moe")
-    def _(
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc2_expert_weights,
-        output_dtype,
-        quant_scales=None,
-        input_sf=None,
-        tp_size=1,
-        tp_rank=0,
-        ep_size=1,
-        ep_rank=0,
-        profile_ids=None,
-        use_fp8_block_scaling=False,
-    ):
-        output_shape = [input.shape[0], fc2_expert_weights.shape[1]]
-        return input.new_empty(output_shape, dtype=output_dtype)
-
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)

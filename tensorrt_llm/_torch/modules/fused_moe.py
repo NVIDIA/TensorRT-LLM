@@ -5,10 +5,11 @@ import torch
 from torch import nn
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
+from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                     get_power_of_2_num_tokens_buckets, is_torch_compiling,
+                     get_power_of_2_num_tokens_buckets,
                      next_positive_power_of_2, reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
@@ -19,6 +20,176 @@ FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
+
+
+class MoERunner(TunableRunner):
+    # avoid overhead of creating a new runner in forward pass
+    _runner_dict: Dict[str, torch.classes.trtllm.FusedMoeRunner] = dict()
+
+    def __init__(
+        self,
+        x_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        top_k: int,
+        tp_size: int,
+        tp_rank: int,
+        ep_size: int,
+        ep_rank: int,
+        use_fp8_block_scaling: bool,
+        min_latency_mode: bool,
+    ):
+        self.x_dtype = x_dtype
+        self.weight_dtype = weight_dtype
+        self.output_dtype = output_dtype
+        self.top_k = top_k
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.use_fp8_block_scaling = use_fp8_block_scaling
+        self._min_latency_mode = min_latency_mode
+
+        instance_key = (x_dtype, weight_dtype, output_dtype,
+                        use_fp8_block_scaling)
+
+        if instance_key not in MoERunner._runner_dict:
+            MoERunner._runner_dict[
+                instance_key] = torch.classes.trtllm.FusedMoeRunner(
+                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling,
+                    min_latency_mode)
+        self._fused_moe_runner = MoERunner._runner_dict[instance_key]
+
+    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
+        x, fc2_expert_weights = inputs
+        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
+                self.top_k, self.ep_size)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        *args,
+        **kwargs,
+    ) -> List[int]:
+        return list(range(self._fused_moe_runner.get_tactic_num()))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        gemm_idx: int = 0,
+        tactic: int = -1,
+        do_preparation: bool = False,
+    ):
+        x, fc2_expert_weights = inputs
+        # determine if we should use min latency mode according to the profiled seq len
+        min_latency_mode = self._min_latency_mode and (x.shape[0] <= 128)
+        self._fused_moe_runner.run_gemm_profile(
+            x,
+            fc2_expert_weights,
+            self.top_k,
+            self.tp_size,
+            self.tp_rank,
+            self.ep_size,
+            self.ep_rank,
+            min_latency_mode,
+            gemm_idx,
+            tactic,
+            do_preparation,
+        )
+
+
+@torch.library.custom_op("trtllm::fused_moe", mutates_args=())
+def fused_moe(
+    input: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales: List[torch.Tensor],
+    input_sf: Optional[torch.Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    use_fp8_block_scaling: bool = False,
+    min_latency_mode: bool = False,
+) -> torch.Tensor:
+
+    tuner = AutoTuner.get()
+
+    tuning_config = TuningConfig(dynamic_tensors={
+        0: {
+            0: ([16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
+                 2, 1], next_positive_power_of_2),
+        },
+    }, )
+
+    # allocate workspace for profiling
+    moe_runner = MoERunner(
+        x_dtype=input.dtype,
+        weight_dtype=fc1_expert_weights.dtype,
+        output_dtype=output_dtype,
+        top_k=token_selected_experts.size(1),
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        use_fp8_block_scaling=use_fp8_block_scaling,
+        min_latency_mode=min_latency_mode,
+    )
+
+    _, gemm_tactic_1 = tuner.choose_one(
+        "trtllm::fused_moe::gemm1",
+        [moe_runner],
+        tuning_config,
+        [input, fc2_expert_weights],
+        gemm_idx=1,
+    )
+
+    _, gemm_tactic_2 = tuner.choose_one(
+        "trtllm::fused_moe::gemm2",
+        [moe_runner],
+        tuning_config,
+        [input, fc2_expert_weights],
+        gemm_idx=2,
+    )
+
+    run_moe = moe_runner._fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner._fused_moe_runner.run_moe
+    return run_moe(
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        quant_scales,
+        input_sf,
+        tp_size,
+        tp_rank,
+        ep_size,
+        ep_rank,
+        [gemm_tactic_1, gemm_tactic_2],
+    )
+
+
+@torch.library.register_fake("trtllm::fused_moe")
+def _(
+    input: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales: List[torch.Tensor],
+    input_sf: Optional[torch.Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    use_fp8_block_scaling: bool = False,
+):
+    output_shape = [input.shape[0], fc2_expert_weights.shape[1]]
+    return input.new_empty(output_shape, dtype=output_dtype)
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -305,7 +476,7 @@ class FusedMoE(nn.Module):
             self.intermediate_size_per_partition,
         )
 
-        self.quant_scales = None
+        self.quant_scales = []
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
@@ -573,27 +744,7 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if is_torch_compiling():
-            profile_ids = None
-        else:
-            if not self.has_been_profiled:
-                self.profiler = self._run_profiler(x, output_dtype,
-                                                   use_fp8_block_scaling, False)
-                self.has_been_profiled = True
-
-            if not self.has_been_profiled_min_latency and min_latency_mode:
-                self.profiler_min_latency = self._run_profiler(
-                    x, output_dtype, use_fp8_block_scaling, False)
-                self.has_been_profiled_min_latency = True
-
-            profiler = self.profiler_min_latency if min_latency_mode else self.profiler
-
-            profile_ids = profiler.get_profile_ids(
-                next_positive_power_of_2(x.shape[0]), self.w2_weight,
-                self.routing_method.experts_per_token, self.num_experts)
-
-        fused_moe_op = torch.ops.trtllm.fused_moe_min_latency if min_latency_mode else torch.ops.trtllm.fused_moe
-        final_hidden_states = fused_moe_op(
+        final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
@@ -606,8 +757,8 @@ class FusedMoE(nn.Module):
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            profile_ids=profile_ids,
             use_fp8_block_scaling=use_fp8_block_scaling,
+            min_latency_mode=min_latency_mode,
         )
 
         return final_hidden_states
