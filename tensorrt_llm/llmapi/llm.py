@@ -540,7 +540,7 @@ class LLM:
 
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
-        executor_config.max_beam_width = self.args.build_config.max_beam_width
+        executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
 
@@ -553,7 +553,9 @@ class LLM:
             build_config=self.args.build_config,
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
-            trt_engine_dir=self._engine_dir)
+            trt_engine_dir=self._engine_dir,
+            max_input_len=self.args.max_input_len,
+            max_seq_len=self.args.max_seq_len)
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
             self.args.build_config

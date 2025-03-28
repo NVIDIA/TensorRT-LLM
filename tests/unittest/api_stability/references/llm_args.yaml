@@ -47,6 +47,15 @@ methods:
       backend:
         annotation: Optional[str]
         default: null
+      max_input_len:
+        annotation: int
+        default: 1024
+      max_seq_len:
+        annotation: int
+        default: null
+      max_beam_width:
+        annotation: int
+        default: 1
       max_batch_size:
         annotation: Optional[int]
         default: null
