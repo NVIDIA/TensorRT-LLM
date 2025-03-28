@@ -327,10 +327,6 @@ class AutoTuner:
                 logger.debug(f"[AutoTunner]: Using fallback tactic")
                 assert runner == runners[0] \
                     and tactic == -1, f"Should use fallback runner {runners[0]} and tactic {-1}, but got runner {runner} and tactic {tactic}"
-
-            logger.debug(
-                f"[AutoTuner]: Using {runner} {tactic} for profile:{stored_profile}"
-            )
             return runner, tactic
 
         profiles = self._optimization_profiles(tuning_config.dynamic_tensors,
@@ -340,10 +336,7 @@ class AutoTuner:
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
         for p in profiles:
-            tensors = [
-                self._create_tensor_like(orig_tensor, dims)
-                for dims, orig_tensor in zip(p.shapes, inputs)
-            ]
+            tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, runner, tactic, stored_profile = self.search_cache(
                 custom_op, runners, p)
             if not is_cache_hit:
@@ -577,6 +570,18 @@ class AutoTuner:
         # One solution is to manituplate the tensor content to make it more like the real data
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         return torch.zeros(shapes, dtype=dtype, device=device)
+
+    def _prepare_input_tensors(
+            self, profile: OptimizationProfile,
+            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        tensors = []
+        for i, p in enumerate(profile.shapes):
+            if any(isinstance(d, DynamicDim) for d in p):
+                tensor = self._create_tensor_like(inputs[i], p)
+            else:
+                tensor = inputs[i]
+            tensors.append(tensor)
+        return tensors
 
     def get_cache_key(
             self, custom_op: str, runner: TunableRunner,
