@@ -89,6 +89,7 @@ struct TestSamplingParams
     std::vector<float> minTopP;
     std::vector<int32_t> topPResetIds;
     int32_t batchSize = 6;
+    int32_t beamWidth = 1;
     bool useBias = false;
     bool isExternalDraftTokensLayerTest = false;
     bool useDraftLogits = false;
@@ -106,9 +107,9 @@ protected:
 
     int32_t seed = 0;
     int32_t mBatchSize = -1; // setup by runTest
+    int32_t mBeamWidth = 1;
     static int32_t constexpr mBatchSizeBadPad = 512;
-    static uint64_t constexpr mMaxSeed = 32;
-    int32_t const mBeamWidth = 1;
+    uint64_t mMaxSeed = 32;
     int32_t const mVocabSize = 8;
     int32_t const mVocabSizePadded = mVocabSize;
 
@@ -137,6 +138,21 @@ protected:
 
     TensorPtr mCurandStatesDevice;
     TensorPtr mPenaltyWorkspaceDevice;
+
+    // For Beam Search
+    TensorPtr mSrcCacheIndirection;
+    TensorPtr mTgtCacheIndirection;
+    TensorPtr mParentIds;
+    TensorPtr mOutputIdsCBA;
+    TensorPtr mLogProbsCBA;
+    TensorPtr mSequenceLengthsCBA;
+    TensorPtr mCumLogProbsCBA;
+    TensorPtr mNormedScoresCBA;
+    TensorPtr mNumBeamsCBA;
+    TensorPtr mMinNormedScoresCBA;
+    TensorPtr mBatchDones;
+    TensorPtr mOutputIdsPtr;
+    TensorPtr mParentIdsPtr;
 
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
