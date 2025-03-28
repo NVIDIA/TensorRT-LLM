@@ -60,6 +60,8 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
     auto kvCacheTransferStart = su::deserialize<RequestPerfMetrics::TimePoint>(is);
     auto kvCacheTransferEnd = su::deserialize<RequestPerfMetrics::TimePoint>(is);
 
+    auto kvCacheSize = su::deserialize<size_t>(is);
+
     auto numTotalAllocatedBlocks = su::deserialize<SizeType32>(is);
     auto numNewAllocatedBlocks = su::deserialize<SizeType32>(is);
     auto numReusedBlocks = su::deserialize<SizeType32>(is);
@@ -74,8 +76,8 @@ RequestPerfMetrics Serialization::deserializeRequestPerfMetrics(std::istream& is
     auto lastIter = su::deserialize<std::optional<IterationType>>(is);
     auto iter = su::deserialize<std::optional<IterationType>>(is);
 
-    RequestPerfMetrics::TimingMetrics timingMetrics{
-        arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime, kvCacheTransferStart, kvCacheTransferEnd};
+    RequestPerfMetrics::TimingMetrics timingMetrics{arrivalTime, firstScheduledTime, firstTokenTime, lastTokenTime,
+        kvCacheTransferStart, kvCacheTransferEnd, kvCacheSize};
     RequestPerfMetrics::KvCacheMetrics kvCacheMetrics{
         numTotalAllocatedBlocks, numNewAllocatedBlocks, numReusedBlocks, numMissedBlocks, kvCacheHitRate};
     RequestPerfMetrics::SpeculativeDecodingMetrics specDecMetrics{
@@ -91,6 +93,8 @@ void Serialization::serialize(RequestPerfMetrics const& metrics, std::ostream& o
     su::serialize(metrics.timingMetrics.lastTokenTime, os);
     su::serialize(metrics.timingMetrics.kvCacheTransferStart, os);
     su::serialize(metrics.timingMetrics.kvCacheTransferEnd, os);
+
+    su::serialize(metrics.timingMetrics.kvCacheSize, os);
 
     su::serialize(metrics.kvCacheMetrics.numTotalAllocatedBlocks, os);
     su::serialize(metrics.kvCacheMetrics.numNewAllocatedBlocks, os);
@@ -117,6 +121,8 @@ size_t Serialization::serializedSize(RequestPerfMetrics const& metrics)
     totalSize += su::serializedSize(metrics.timingMetrics.lastTokenTime);
     totalSize += su::serializedSize(metrics.timingMetrics.kvCacheTransferStart);
     totalSize += su::serializedSize(metrics.timingMetrics.kvCacheTransferEnd);
+
+    totalSize += su::serializedSize(metrics.timingMetrics.kvCacheSize);
 
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numTotalAllocatedBlocks);
     totalSize += su::serializedSize(metrics.kvCacheMetrics.numNewAllocatedBlocks);
@@ -1834,18 +1840,21 @@ std::vector<char> Serialization::serialize(std::vector<IterationStats> const& it
 DisServingRequestStats Serialization::deserializeDisServingRequestStats(std::istream& is)
 {
     auto kvCacheTransferMs = su::deserialize<double>(is);
-    return DisServingRequestStats{kvCacheTransferMs};
+    auto kvCacheSize = su::deserialize<size_t>(is);
+    return DisServingRequestStats{kvCacheTransferMs, kvCacheSize};
 }
 
 void Serialization::serialize(DisServingRequestStats const& stats, std::ostream& os)
 {
     su::serialize(stats.kvCacheTransferMS, os);
+    su::serialize(stats.kvCacheSize, os);
 }
 
 size_t Serialization::serializedSize(DisServingRequestStats const& disServingRequestStats)
 {
     size_t totalSize = 0;
     totalSize += su::serializedSize(disServingRequestStats.kvCacheTransferMS);
+    totalSize += su::serializedSize(disServingRequestStats.kvCacheSize);
     return totalSize;
 }
 
