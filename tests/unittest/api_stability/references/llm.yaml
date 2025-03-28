@@ -28,9 +28,6 @@ methods:
       cp_config:
         annotation: Optional[dict]
         default: null
-      dtype:
-        annotation: str
-        default: auto
       embedding_parallel_mode:
         annotation: str
         default: SHARDING_ALONG_VOCAB
@@ -94,9 +91,6 @@ methods:
       max_prompt_adapter_token:
         annotation: int
         default: 0
-      model:
-        annotation: Union[str, pathlib.Path]
-        default: inspect._empty
       moe_expert_parallel_size:
         annotation: Optional[int]
         default: null
@@ -118,35 +112,13 @@ methods:
       request_stats_max_iterations:
         annotation: Optional[int]
         default: null
-      revision:
-        annotation: Optional[str]
-        default: null
       scheduler_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
         default: null
-      skip_tokenizer_init:
-        annotation: bool
-        default: false
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
           tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
-      tensor_parallel_size:
-        annotation: int
-        default: 1
-      tokenizer:
-        annotation: Union[str, pathlib.Path, transformers.tokenization_utils_base.PreTrainedTokenizerBase,
-          tensorrt_llm.llmapi.tokenizer.TokenizerBase, NoneType]
-        default: None
-      tokenizer_mode:
-        annotation: Literal['auto', 'slow']
-        default: auto
-      tokenizer_revision:
-        annotation: Optional[str]
-        default: null
-      trust_remote_code:
-        annotation: bool
-        default: false
       workspace:
         annotation: Optional[str]
         default: null

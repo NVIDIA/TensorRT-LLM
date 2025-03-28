@@ -29,9 +29,6 @@ methods:
       tokenizer_revision:
         annotation: Optional[str]
         default: null
-      kwargs:
-        annotation: Any
-        default: inspect._empty
     return_annotation: None
   generate:
     parameters:

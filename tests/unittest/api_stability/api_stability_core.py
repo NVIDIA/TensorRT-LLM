@@ -65,10 +65,11 @@ class StackTrace:
 class ParamSnapshot:
     annotation: type
     default: Any = None
+    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
-        return cls(param.annotation, param.default)
+        return cls(param.annotation, param.default, name=param.name)
 
     @classmethod
     def from_docstring(cls, param: docstring_parser.common.DocstringParam):
@@ -91,7 +92,7 @@ class ParamSnapshot:
             except (NameError, SyntaxError):
                 default = param.default
 
-        return cls(annotation, default)
+        return cls(annotation, default, name=param.arg_name)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -125,7 +126,6 @@ class MethodSnapshot:
     @classmethod
     def from_inspect(cls, method: MethodType):
         signature = inspect.signature(method)
-        print(f"** signature: {signature}")
         parameters = {}
         for param_name, param in signature.parameters.items():
             if param_name.startswith("_"):
@@ -170,7 +170,9 @@ class MethodSnapshot:
         return d
 
     def merge(self, other: 'MethodSnapshot'):
-        assert self.parameters.keys().isdisjoint(other.parameters.keys())
+        overlapped_keys = set(self.parameters.keys()) & set(
+            other.parameters.keys())
+        assert not overlapped_keys, f"Overlapped parameters: {overlapped_keys}"
         self.parameters.update(copy.deepcopy(other.parameters))
         assert self.return_annotation == other.return_annotation
 
@@ -291,11 +293,27 @@ class ClassSnapshot:
                 inst, predicate=inspect.ismethod):
             if method_name.startswith("_") and method_name != "__init__":
                 continue
+            if method_name in PYDANTIC_FIELDS:  # ignore Pydantic methods
+                continue
             if method_name == "__init__":
-                methods["__init__"] = MethodSnapshot.from_docstring(
-                    snapshot_cls)
+                if isinstance(snapshot_cls, type) and issubclass(
+                        snapshot_cls, pydantic.main.BaseModel):
+                    parameters = {}
+                    for field_name, field in snapshot_cls.model_fields.items():
+                        if field_name.startswith("_"):
+                            continue
+                        parameters[field_name] = ParamSnapshot(
+                            annotation=field.annotation,
+                            default=field.default or inspect._empty)
+                    methods["__init__"] = MethodSnapshot(parameters=parameters,
+                                                         return_annotation=None,
+                                                         name="__init__")
+                else:
+                    methods["__init__"] = MethodSnapshot.from_docstring(
+                        snapshot_cls)
             else:
                 methods[method_name] = MethodSnapshot.from_docstring(method)
+
         properties = {}
         doc = docstring_parser.parse(snapshot_cls.__doc__)
         for param in doc.params:
