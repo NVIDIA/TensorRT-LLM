@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/externalDraftTokensLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
@@ -26,6 +27,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
