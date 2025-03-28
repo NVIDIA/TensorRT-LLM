@@ -51,6 +51,7 @@ set(SRCS
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp
     trtGptModelV1.cpp
+    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp

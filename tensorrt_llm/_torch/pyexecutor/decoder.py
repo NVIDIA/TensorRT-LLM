@@ -1,6 +1,6 @@
 import itertools
 from abc import ABC, abstractmethod
-from typing import Dict
+from collections import OrderedDict
 
 import torch
 
@@ -11,7 +11,8 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
     AssignReqSeqSlots, CreateNewDecoderRequests, GenerateRequestOptions,
-    HandleContextLogits, HandleGenerationLogits, MakeDecodingBatchInputOutput)
+    HandleContextLogits, HandleGenerationLogits, MakeDecodingBatchInputOutput,
+    UpdateDecoderBuffers)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers,
                                                           SequenceSlotManager)
@@ -27,33 +28,28 @@ from .scheduler import ScheduledRequests
 class Decoder(ABC):
 
     @abstractmethod
-    def setup_decoder(self, scheduled_requests: ScheduledRequests,
-                      model_outputs):
-        raise NotImplementedError
-
-    @abstractmethod
-    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        raise NotImplementedError
-
-    @abstractmethod
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
         raise NotImplementedError
 
     @abstractmethod
-    def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
-                        decoder_event: torch.cuda.Event):
+    def update_requests(self,
+                        scheduled_requests: ScheduledRequests,
+                        new_tensors_host: OrderedDict[str, torch.tensor],
+                        decoder_event: torch.cuda.Event or None = None):
         raise NotImplementedError
 
 
 class DummyDecoder(Decoder):
 
-    def setup_decoder(self, scheduled_requests: ScheduledRequests,
-                      model_outputs):
-        pass
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
+        return None, None, None
 
-    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
+    def update_requests(self,
+                        scheduled_requests,
+                        new_tensors_host,
+                        decoder_event: torch.cuda.Event or None = None):
         for request in scheduled_requests.context_requests:
             request.add_new_token(500, 0)
             request.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -70,25 +66,21 @@ class EarlyStopDecoder(Decoder):
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
-    def setup_decoder(self, scheduled_requests: ScheduledRequests,
-                      model_outputs):
-        pass
-
-    def decode_async(self, model_outputs):
-        pass
-
-    def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tokens_host: torch.tensor,
-                        decoder_event: torch.cuda.Event):
-        pass
-
-    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        assert (not scheduled_requests.generation_requests)
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
         for idx, request in enumerate(scheduled_requests.context_requests):
-            request.state = LlmRequestState.GENERATION_COMPLETE
             #NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             request.context_logits = model_outputs['logits'][idx]
+        return None, None, None
+
+    def update_requests(self,
+                        scheduled_requests,
+                        new_tensors_host,
+                        decoder_event: torch.cuda.Event or None = None):
+        assert (not scheduled_requests.generation_requests)
+        for request in scheduled_requests.context_requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -190,10 +182,6 @@ class TorchDecoder(Decoder):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
 
-    def setup_decoder(self, scheduled_requests: ScheduledRequests,
-                      model_outputs):
-        pass
-
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
 
@@ -240,9 +228,10 @@ class TorchDecoder(Decoder):
 
         return False
 
-    def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
-                        decoder_event: torch.cuda.Event):
+    def update_requests(self,
+                        scheduled_requests: ScheduledRequests,
+                        new_tensors_host: OrderedDict[str, torch.tensor],
+                        decoder_event: torch.cuda.Event or None = None):
         if decoder_event:
             decoder_event.synchronize()
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
@@ -339,8 +328,9 @@ class TorchDecoder(Decoder):
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
-        new_tensors_device = {"new_tokens_device": new_tokens_device}
-        new_tensors_host = {"new_tokens_host": new_tokens_host}
+        new_tensors_device = OrderedDict(
+            {"new_tokens_device": new_tokens_device})
+        new_tensors_host = OrderedDict({"new_tokens_host": new_tokens_host})
         decoder_event = torch.cuda.Event()
         decoder_event.record()
         return new_tensors_device, new_tensors_host, decoder_event
@@ -352,17 +342,11 @@ class TorchDecoder(Decoder):
         else:
             return self._batch_decode(scheduled_requests, model_outputs)
 
-    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        _, new_tensors_host, decoder_event = self.decode_async(
-            scheduled_requests, model_outputs)
-        self.update_requests(scheduled_requests, new_tensors_host,
-                             decoder_event)
-
 
 class TorchStarAttentionDecoder(TorchDecoder):
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.tensor],
+                        new_tensors_host: OrderedDict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
         if decoder_event:
             decoder_event.synchronize()
@@ -436,8 +420,6 @@ class TRTLLMDecoder(Decoder):
             self.store["torch_stream"].cuda_stream)
         self.store["buffer_manager"] = BufferManager(
             stream=self.store["cuda_stream"])
-        self.store["seq_slot_manager"] = SequenceSlotManager(
-            self.max_num_sequences, self.max_seq_idle_microseconds)
         self.store["decoder_buffers"] = DecoderBuffers(
             self.max_num_sequences, self.executor_config.max_beam_width,
             self.max_attention_window, self.executor_config.max_seq_len,
@@ -464,7 +446,6 @@ class TRTLLMDecoder(Decoder):
             dtype=self.logits_datatype,
             model_config=self.model_config,
             world_config=self.world_config)
-        self.algs.assign_req_seq_slots = AssignReqSeqSlots()
         self.algs.generate_request_options = GenerateRequestOptions(
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
@@ -474,11 +455,12 @@ class TRTLLMDecoder(Decoder):
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
+        self.algs.update_decoder_buffers = UpdateDecoderBuffers(
+        )
 
-    def setup_decoder(self, scheduled_requests: ScheduledRequests,
-                      model_outputs):
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
         self.batch_size = scheduled_requests.batch_size
-
         for req in itertools.chain(scheduled_requests.context_requests,
                                    scheduled_requests.generation_requests):
             self.beam_width = req.sampling_config.beam_width
@@ -488,11 +470,6 @@ class TRTLLMDecoder(Decoder):
             (self.batch_size, self.beam_width, -1))
 
         with torch.inference_mode():
-            self.algs.assign_req_seq_slots(
-                self.store["seq_slot_manager"],
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests)
-
             batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
                 self.model_config, self.world_config, self.decoding_config,
                 scheduled_requests.context_requests,
@@ -519,10 +496,12 @@ class TRTLLMDecoder(Decoder):
                 scheduled_requests.context_requests, num_context_logits, logits,
                 self.store["decoder_buffers"], self.model_config,
                 self.store["buffer_manager"], self.store["cuda_stream"])
+
             self.algs.handle_generation_logits(
                 logits_index, scheduled_requests.generation_requests,
                 self.store["decoder_buffers"], self.model_config,
                 self.store["buffer_manager"], logits)
+
             decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
                 scheduled_requests.context_requests,
                 scheduled_requests.generation_requests,
@@ -530,27 +509,42 @@ class TRTLLMDecoder(Decoder):
                 self.store["decoder_input_buffers"], self.model_config,
                 self.max_num_sequences, self.beam_width,
                 self.store["buffer_manager"], self.store["cuda_stream"])
-            self.algs.decoder.forward_async(self.decoding_output,
-                                            decoding_input)
 
-            self.decoder_event = torch.cuda.Event()
-            self.decoder_event.record()
+            decoder_finish_event = self.algs.decoder.forward_async(
+                self.decoding_output, decoding_input)
 
-    def update_requests(self, scheduled_requests: ScheduledRequests):
-        self.decoder_event.synchronize()
+            decoder_event = self.algs.update_decoder_buffers(
+                self.model_config, self.store["decoder_buffers"],
+                self.store["buffer_manager"], self.algs.decoder, False,
+                decoder_finish_event)
 
-        # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
-        new_tokens_host = self.algs.decoder.all_new_tokens.to('cpu',
-                                                              non_blocking=True)
-        finished_sum_host = self.algs.decoder.finished_sum.to('cpu',
-                                                              non_blocking=True)
-        finish_reasons_host = self.algs.decoder.finish_reasons.to(
-            'cpu', non_blocking=True)
-        sequence_lengths_host_data = self.store[
-            "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
+        new_tokens_device = {
+            "new_tokens_device": self.store["decoder_buffers"].new_output_tokens
+        }
+        new_tokens_host = OrderedDict({
+            "new_tokens_host":
+            self.store["decoder_buffers"].new_output_tokens_host,
+            "finished_sum_host":
+            self.store["decoder_buffers"].finished_sum_host,
+            "finish_reasons_host":
+            self.store["decoder_buffers"].finish_reasons_host,
+            "sequence_lengths_host":
+            self.store["decoder_buffers"].sequence_lengths_host
+        })
 
-        self.decoder_event.record()
-        self.decoder_event.synchronize()
+        return new_tokens_device, new_tokens_host, decoder_event
+
+    def update_requests(
+            self, scheduled_requests: ScheduledRequests,
+            new_tensors_host: OrderedDict[str, torch.tensor],
+            decoder_event: tllm.internal.runtime.DecoderFinishedEvent or None):
+        if decoder_event:
+            decoder_event.synchronize()
+
+        new_tokens_host = new_tensors_host["new_tokens_host"]
+        finished_sum_host = new_tensors_host["finished_sum_host"]
+        finish_reasons_host = new_tensors_host["finish_reasons_host"]
+        sequence_lengths_host_data = new_tensors_host["sequence_lengths_host"]
 
         for request in itertools.chain(scheduled_requests.context_requests,
                                        scheduled_requests.generation_requests):
@@ -588,10 +582,3 @@ class TRTLLMDecoder(Decoder):
 
             if finished_sum_host[seq_slot] == self.beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
-
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs):
-        pass
-
-    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        self.update_requests(scheduled_requests)
