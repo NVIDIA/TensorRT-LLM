@@ -237,7 +237,7 @@ void StatefulGptDecoderBatched::forwardSync()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mDecoderFinishEvent->event.synchronize();
+    mDecoderFinishEvent.synchronize();
 
     // wait for mFinishedSum to be updated
     mForwardEvent.synchronize();
