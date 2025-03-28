@@ -30,7 +30,6 @@ from ..bindings.executor import PeftCacheConfig as _PeftCacheConfig
 from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
-from ..llmapi.mpi_session import MpiSession
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
@@ -39,7 +38,8 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import generate_api_docs_as_docstring, get_type_repr
+from .utils import (generate_api_docs_as_docstring, get_type_repr,
+                    print_traceback_on_error)
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
@@ -676,6 +676,7 @@ class _ModelWrapper:
 class LlmArgs(BaseModel):
     model_config = {
         "arbitrary_types_allowed": True,
+        "extra": "allow",
     }
 
     # Explicit arguments
@@ -861,12 +862,7 @@ class LlmArgs(BaseModel):
     backend: Optional[str] = Field(default=None,
                                    description="The backend to use.")
 
-    mpi_session: Optional[object] = Field(
-        default=None,
-        description="The optional MPI session to use for this LLM instance.",
-        alias="_mpi_session",
-        json_schema_extra={"type": get_type_repr(MpiSession)})
-
+    # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
         description="The number of postprocess worker processes.",
@@ -877,21 +873,24 @@ class LlmArgs(BaseModel):
         description="The postprocess tokenizer directory.",
         alias="_postprocess_tokenizer_dir")
 
-    def __init__(self,
-                 decoding_config: Optional[DecodingConfig] = None,
-                 **kwargs: Any):
-        super().__init__(**kwargs)
-        self._decoding_config = decoding_config
+    # TODO[Superjomn]: To deprecate this config.
+    decoding_config: Optional[object] = Field(
+        default=None,
+        description="The decoding config.",
+        exclude=True,  # exclude from serialization
+        json_schema_extra={"type": "Optional[DecodingConfig]"},
+        deprecated="Use speculative_config instead.",
+    )
 
-    @property
-    def decoding_config(self) -> Optional[DecodingConfig]:
-        return self._decoding_config
+    mpi_session: Optional[object] = Field(
+        default=None,
+        description="The optional MPI session to use for this LLM instance.",
+        json_schema_extra={"type": "Optional[MpiSession]"},
+        exclude=True,  # exclude from serialization
+        alias="_mpi_session")
 
-    @decoding_config.setter
-    def decoding_config(self, decoding_config: Optional[DecodingConfig]):
-        self._decoding_config = decoding_config
-
-    def __post_init__(self):
+    @print_traceback_on_error
+    def model_post_init(self, __context: Any):
 
         if self.skip_tokenizer_init:
             self.tokenizer = None
@@ -918,9 +917,6 @@ class LlmArgs(BaseModel):
 
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
-
-        if self.cp_config is None:
-            self.co_config = {}
 
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
@@ -986,7 +982,7 @@ class LlmArgs(BaseModel):
                                     if not attr.startswith('_')
                                     and callable(getattr(ExecutorConfig, attr)))
         executor_config_attrs -= black_list
-        llm_args_attr = set([f.name for f in fields(LlmArgs)])
+        llm_args_attr = set(LlmArgs.model_fields.keys())
         # NOTE: When cpp ExecutorConfig add new options, please add the new options into `_LlmArgs` with docs as well
         # ASK chunweiy for help if you are not sure about the new options.
         assert executor_config_attrs.issubset(
