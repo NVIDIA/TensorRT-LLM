@@ -123,11 +123,11 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         test_name = line
         marker = None
         reason = None
-        for marker in kVALID_TEST_LIST_MARKERS:
-            if f" {marker}" in line:
-                test_name, marker, reason_raw = line.partition(f" {marker}")
+        for m in kVALID_TEST_LIST_MARKERS:
+            if f" {m}" in line:
+                test_name, marker, reason_raw = line.partition(f" {m}")
                 test_name = test_name.strip()
-                marker = marker.strip()
+                marker = m
                 if len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
@@ -576,7 +576,7 @@ def parse_and_validate_test_list(
         corrections = get_test_name_corrections_v2(
             set(test_names),
             set(it.nodeid for it in items),
-            TestCorrectionMode.EXACT_MATCH,
+            TestCorrectionMode.SUBSTRING,
         )
 
         if apply_test_list_correction and corrections:
@@ -617,6 +617,12 @@ def modify_by_test_list(test_list, items, config):
     for item in items:
         if item.nodeid in full_test_name_to_marker_dict:
             found_items[item.nodeid] = item
+        elif item.location[0] in full_test_name_to_marker_dict:
+            # This allows for filtering based on file names if needed
+            if item.location[0] in found_items:
+                found_items[item.location[0]].append(item)
+            else:
+                found_items[item.location[0]] = [item]
         else:
             deselected.append(item)
 
@@ -624,14 +630,21 @@ def modify_by_test_list(test_list, items, config):
     selected = []
     for name in all_test_names:
         if name in found_items:
-            item = found_items[name]
-            selected.append(item)
+            item_or_list = found_items[name]
             # Also update the item based on the marker specified in the file
             marker, reason = full_test_name_to_marker_dict[name]
             if marker:
                 mark_func = getattr(pytest.mark, marker.lower())
                 mark = mark_func(reason=reason)
-                item.add_marker(mark)
+            if isinstance(item_or_list, list):
+                selected.extend(item_or_list)
+                if marker:
+                    for item in item_or_list:
+                        item.add_marker(mark)
+            else:
+                if marker:
+                    item_or_list.add_marker(mark)
+                selected.append(item_or_list)
 
     if deselected:
         config.hook.pytest_deselected(items=deselected)
