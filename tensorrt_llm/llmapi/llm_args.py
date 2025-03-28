@@ -738,6 +738,12 @@ LLMARGS_IMPLICIT_DOCSTRING = """
 
         gather_generation_logits (bool): Enable gathering generation logits. Defaults to False.
 
+        max_input_len (int): The maximum input length allowed for the model. Defaults to 1024.
+
+        max_seq_len (int): The maximum sequence length for generation. Defaults to None.
+
+        max_beam_width (int): The maximum beam width used in beam search. Defaults to 1.
+
         max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
 
         max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
@@ -867,7 +873,15 @@ class LlmArgs:
     # TODO: remove this option in the future
     _use_runtime_defaults: bool = True
 
+    # generation constraints
+    max_input_len: int = 1024
+
+    max_seq_len: int = None
+
+    max_beam_width: int = 1
+
     max_batch_size: Optional[int] = None
+
     max_num_tokens: Optional[int] = None
 
     # backend to use
@@ -956,7 +970,7 @@ class LlmArgs:
         Returns:
             tensorrt_llm.llmapi.llm_utils.LlmArgs: The `LlmArgs` instance.
         """
-        LlmArgs._check_executor_config_options_consistency()
+        kwargs = LlmArgs._maybe_update_config_for_consistency(dict(kwargs))
         ret = cls(**kwargs)
         ret._setup()
         return ret
@@ -971,7 +985,8 @@ class LlmArgs:
             (field.name, getattr(self, field.name)) for field in fields(self))
 
     @staticmethod
-    def _check_executor_config_options_consistency():
+    def _maybe_update_config_for_consistency(
+            kwargs_dict: Dict[str, Any]) -> Dict[str, Any]:
         # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
         # generation
         black_list = set(["max_beam_width"])
@@ -985,6 +1000,26 @@ class LlmArgs:
         assert executor_config_attrs.issubset(
             llm_args_attr
         ), f"New options found in underlying ExecutorConfig: {llm_args_attr - executor_config_attrs}"
+
+        # ensure build_config and LlmArgs consistency
+        if kwargs_dict.get("backend") != "pytorch" and kwargs_dict.get(
+                "build_config"):
+            # TODO: move this to _perform_config_arbitration() once it's default-on.
+            for field_name in [
+                    "max_input_len", "max_seq_len", "max_beam_width"
+            ]:
+                build_val = getattr(kwargs_dict["build_config"], field_name,
+                                    None)
+                llmargs_val = kwargs_dict.get(field_name) or getattr(
+                    LlmArgs, field_name)
+
+                if build_val != llmargs_val:
+                    logger.warning(
+                        f"Overriding LlmArgs.{field_name} ({llmargs_val}) with build_config.{field_name} ({build_val})."
+                    )
+                    kwargs_dict[field_name] = build_val
+
+        return kwargs_dict
 
     def _setup(self):
         ''' This method will setup the configs right before building the model.

@@ -178,7 +178,6 @@ class PyExecutor:
             "kv_cache_manager")
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
 
-        # todo: we need pass this by builder config from LLM and LLMargs
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()

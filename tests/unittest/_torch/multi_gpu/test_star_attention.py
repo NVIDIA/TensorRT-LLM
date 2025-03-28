@@ -8,7 +8,7 @@ from modelopt.torch.export import export_hf_checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import BuildConfig, SamplingParams, logger
+from tensorrt_llm import SamplingParams, logger
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig
@@ -179,24 +179,22 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
     }
     max_batch_size = 20
     max_output_tokens = 128
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_input_len=MAX_SEQ_LEN - max_output_tokens,
-                               max_seq_len=MAX_SEQ_LEN,
-                               max_num_tokens=(sa_block_size + sa_anchor_size) *
-                               max_batch_size)
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
     pytorch_backend_config = PyTorchConfig(
         attn_backend='FLASHINFER_STAR_ATTENTION')
 
     llm = LLM(model=model_dir,
               backend=backend,
-              build_config=build_config,
               kv_cache_config=kv_cache_config,
               tensor_parallel_size=1,
               quant_config=quant_config,
               context_parallel_size=sp_size,
               cp_config=cp_config,
-              pytorch_backend_config=pytorch_backend_config)
+              pytorch_backend_config=pytorch_backend_config,
+              max_batch_size=max_batch_size,
+              max_input_len=MAX_SEQ_LEN - max_output_tokens,
+              max_seq_len=MAX_SEQ_LEN,
+              max_num_tokens=(sa_block_size + sa_anchor_size) * max_batch_size)
 
     contexts, queries, references = [], [], []
     current_file = os.path.abspath(__file__)
