@@ -176,7 +176,7 @@ public:
     std::optional<std::vector<float>> lengthPenalty;           // [setupBatchSize] on cpu
     std::optional<std::vector<int>> earlyStopping;             // [setupBatchSize] on cpu
     std::optional<std::vector<std::vector<runtime::SizeType32>>>
-        beamWidthArray; // [setupBatchSize, nMaxBeamWidthArray] on cpu
+        beamWidthArray;                                        // [setupBatchSize, nMaxBeamWidthArray] on cpu
     bool hasDiffRuntimeArgs{false};
 };
 
@@ -515,7 +515,7 @@ public:
     //! Indicator whether the context request last chunk or not.
     TensorConstPtr chunkedContextNextTokens; // [forwardBatchSize]
 
-    TensorConstPtr seqSlots; // [forwardBatchSize], on gpu
+    TensorConstPtr seqSlots;                 // [forwardBatchSize], on gpu
 };
 
 class BaseDecodingOutputs
