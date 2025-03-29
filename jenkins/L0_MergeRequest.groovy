@@ -92,6 +92,8 @@ def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
+@Field
+def DEBUG_MODE = "debug"
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
@@ -103,6 +105,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
+    (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
