@@ -194,8 +194,8 @@ class AccuracyTestHarness:
         else:
             if quant_algo == QuantAlgo.NVFP4:
                 convert_cmd.append("--use_nvfp4")
-            elif quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--use_fp8")
+            # elif quant_algo == QuantAlgo.FP8:
+            #     convert_cmd.append("--use_fp8")
             elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 convert_cmd.append("--use_fp8_rowwise")
             elif quant_config._use_plugin_sq:
@@ -223,8 +223,8 @@ class AccuracyTestHarness:
 
             if kv_cache_quant_algo == QuantAlgo.INT8:
                 convert_cmd.append("--int8_kv_cache")
-            elif kv_cache_quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--fp8_kv_cache")
+            # elif kv_cache_quant_algo == QuantAlgo.FP8:
+            #     convert_cmd.append("--fp8_kv_cache")
 
         if quant_config._requires_calibration:
             convert_cmd.append(
@@ -535,6 +535,13 @@ class TestMinitron4BBase(HumanevalTestHarness):
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_eval_args=["--eval_task=code_completion"])
+
+    @skip_pre_ada
+    def test_fp8_pre_quantized(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export")
+        self.run()
 
 
 class TestGptJ6B(CnnDailymailTestHarness):

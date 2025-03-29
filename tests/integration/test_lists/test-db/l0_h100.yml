@@ -144,6 +144,7 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
+  - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8_pre_quantized
   - accuracy/test_accuracy.py::TestLlama2_7B::test_fp8
   - accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8
   - accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype

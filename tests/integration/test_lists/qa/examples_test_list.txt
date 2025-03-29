@@ -517,6 +517,7 @@ accuracy/test_accuracy.py::TestStarcoder2_15B::test_smooth_quant_ootb
 accuracy/test_accuracy.py::TestGptNext::test_auto_dtype
 accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
 accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
+accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8_pre_quantized
 accuracy/test_accuracy.py::TestGptJ6B::test_auto_dtype
 accuracy/test_accuracy.py::TestGptJ6B::test_float32
 accuracy/test_accuracy.py::TestGptJ6B::test_fp8
