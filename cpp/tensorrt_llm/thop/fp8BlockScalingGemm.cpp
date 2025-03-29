@@ -131,15 +131,8 @@ torch::Tensor fp8_block_scale_gemm_blackwell(torch::Tensor const& mat1, torch::T
     TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
     TORCH_CHECK(k <= std::numeric_limits<int32_t>::max(), "K must be within int32");
 
-    TORCH_CHECK(k % 128 == 0, "K must be a multiple of 128, (K=", k, ")");
-    TORCH_CHECK(n % 128 == 0, "N must be a multiple of 128, (N=", n, ")");
-
-    TORCH_CHECK(mat1Scale.dim() == 2, "mat1Scale must be a matrix");
-    TORCH_CHECK(mat1Scale.sizes()[0] == k / 128, "mat1Scale must have size K/128 x M");
-    TORCH_CHECK(mat1Scale.sizes()[1] == m, "mat1Scale must have size K/128 x M");
-    TORCH_CHECK(mat2Scale.dim() == 2, "mat2Scale must be a matrix");
-    TORCH_CHECK(mat2Scale.sizes()[0] == n / 128, "mat2Scale must have size N/128 x K/128");
-    TORCH_CHECK(mat2Scale.sizes()[1] == k / 128, "mat2Scale must have size N/128 x K/128");
+    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
 
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
 
