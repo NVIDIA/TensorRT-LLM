@@ -14,12 +14,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
-from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
-                                                CompletionResponse,
-                                                DisaggregatedParams,
-                                                ErrorResponse)
-from tensorrt_llm.version import __version__ as VERSION
+from ..executor import CppExecutorError
+from ..version import __version__ as VERSION
+from .openai_protocol import (CompletionRequest, CompletionResponse,
+                              DisaggregatedParams, ErrorResponse)
 
 logging.basicConfig(level=logging.INFO)
 
