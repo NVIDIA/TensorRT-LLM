@@ -53,7 +53,7 @@ public:
 
     [[nodiscard]] __host__ __device__ static constexpr runtime::SizeType32 getMinLength()
     {
-        return 1;
+        return 0;
     }
 
     [[nodiscard]] __host__ __device__ static constexpr uint64_t getSeed()
