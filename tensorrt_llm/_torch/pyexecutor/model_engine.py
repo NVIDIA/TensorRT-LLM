@@ -530,7 +530,12 @@ class PyTorchModelEngine(ModelEngine):
                              resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
-    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+    def _set_up_attn_metadata(self,
+                              kv_cache_manager: KVCacheManager,
+                              is_dummy_forward: bool = False):
+        # is_dummy_forward is used to indicate whether the forward is
+        # a dummy forward for memory estimation OR
+        # a real forward w.o. kv cache
         is_mla = hasattr(self.model.model_config.pretrained_config,
                          "kv_lora_rank")
         if kv_cache_manager is None:
@@ -540,6 +545,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
+                is_dummy_attention=is_dummy_forward,
                 is_mla=is_mla)
 
         if self.attn_metadata is not None:
@@ -1205,6 +1211,18 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        if self.enable_attention_dp:
+            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+        # this is for no cache attention, not for dummy attention
+        if not attn_metadata.is_dummy_attention and attn_metadata.kv_cache_manager is None:
+            assert isinstance(
+                attn_metadata,
+                (VanillaAttentionMetadata, TrtllmAttentionMetadata)
+            ), "Only vanilla and trtllm attention metadata are supported for no cache attention for now"
+            attn_metadata.max_seq_len = self.max_seq_len
+            attn_metadata.request_ids = request_ids
+            attn_metadata.prepare()
 
         inputs = {
             'attn_metadata': attn_metadata,
@@ -1505,12 +1523,14 @@ class PyTorchModelEngine(ModelEngine):
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
+                is_dummy_forward: bool = False):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             'kv_cache_manager')
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
+                                                   is_dummy_forward)
         if self.spec_config is not None:
             spec_resource_manager = resource_manager.get_resource_manager(
                 'spec_resource_manager')
