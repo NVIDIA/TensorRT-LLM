@@ -108,6 +108,8 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
+    void setKvCacheManager(kv_cache_manager::BaseKVCacheManager* cacheManager);
+
 private:
     void initializeCommState();
 
@@ -118,7 +120,7 @@ private:
     std::unique_ptr<DataRequester> mDataRequester;
     std::map<LlmRequest*, std::future<void>> mResponderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
-    mpi::MpiComm const *mMpiGroupComm{}, *mMpiWorldComm{};
+    mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,
         mMpiGroupTPInDPComm;
     executor::kv_cache::CommState const* mCommState;
@@ -129,6 +131,8 @@ private:
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    bool mIsMLA{false};
+    SizeType32 mRank{0};
 };
 
 } // namespace tensorrt_llm::batch_manager

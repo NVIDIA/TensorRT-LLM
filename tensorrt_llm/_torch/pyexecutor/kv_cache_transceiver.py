@@ -102,3 +102,6 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
+
+    def reset_kv_cache_manager(self, kv_cache_manager):
+        self.impl.set_kv_cache_manager(kv_cache_manager.impl)
