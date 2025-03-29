@@ -253,11 +253,11 @@ def test_multiple_runners_different_attributes():
         cache_key_0 = tuner.get_cache_key(
             "test_multiple_runners", runner_0,
             tuner._find_nearest_profile(tuning_config.dynamic_tensors, {},
-                                        [x, w]))
+                                        [x, w]), [x, w])
         cache_key_1 = tuner.get_cache_key(
             "test_multiple_runners", runner_1,
             tuner._find_nearest_profile(tuning_config.dynamic_tensors, {},
-                                        [x, w]))
+                                        [x, w]), [x, w])
 
         assert cache_key_0 != cache_key_1, "Runners with different attributes should have different cache keys"
 
