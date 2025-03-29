@@ -993,10 +993,11 @@ class PyExecutor:
                 self.request_queue, timeout,
                 self.max_num_active_requests - len(self.active_requests))
 
-        if self.dist.has_pp:
-            new_requests = self._broadcast_new_requests_pp(new_requests)
-        else:
-            new_requests = self.dist.broadcast(new_requests, root=0)
+        # TODO: WIP. LP funct can't be brocast via MPI
+        # if self.dist.has_pp:
+        #     new_requests = self._broadcast_new_requests_pp(new_requests)
+        # else:
+        #     new_requests = self.dist.broadcast(new_requests, root=0)
 
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             now = time.time()
