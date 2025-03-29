@@ -36,7 +36,7 @@ from ..parameter import Parameter
 # isort: off
 from .functional import (
     block_double_dequantize, dequantize, dynamic_quantize, fp4_gemm,
-    quantize_to_fp4_tensor, fp8_rowwise_gemm, fp8_rowwise_rms_norm,
+    quantize_to_fp4_tensor, fp8_rowwise_gemm, fp8_rowwise_layer_norm, fp8_rowwise_rms_norm,
     postprocess_fp8_rowwise, postprocess_weight_only,
     postprocess_weight_only_groupwise, quantize, quantize_fp8_per_token,
     quantize_per_token, quantize_tensor, validate_group_size, smooth_quant_gemm,
@@ -506,6 +506,65 @@ class QServeW4A8RowLinear(RowLinear):
             x = x + self.bias.value
 
         return x
+
+
+class Fp8RowwiseLayerNorm(Module):
+
+    def __init__(
+            self,
+            normalized_shape,
+            eps=1e-06,
+            elementwise_affine=True,
+            dtype=None,
+            quant_mode=QuantMode(0),
+            bias=False,
+            clamp_val=None,
+    ):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape, )
+        if not quant_mode.has_fp8_rowwise():
+            raise ValueError(
+                "Fp8 Rowwise Layer norm has to have some quantization mode set")
+        self.normalized_shape = tuple(normalized_shape)
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = Parameter(shape=self.normalized_shape, dtype=dtype)
+        else:
+            self.register_parameter('weight', None)
+
+        if bias:
+            self.bias = Parameter(shape=self.normalized_shape, dtype=dtype)
+        else:
+            self.register_parameter('bias', None)
+
+        if clamp_val:
+            if not (isinstance(clamp_val, list) and len(clamp_val) == 2):
+                raise ValueError(f'unsupported clamp_val {clamp_val}')
+            self.clamp_val = Parameter(np.array(clamp_val, dtype=np.float32),
+                                       dtype='float32',
+                                       is_buffer=True)
+        else:
+            self.register_parameter('clamp_val', None)
+
+        self.eps = eps
+        self.dtype = dtype
+        self.quant_mode = quant_mode
+
+    def forward(self, x):
+        weight = None if self.weight is None else self.weight.value
+        bias = None if self.bias is None else self.bias.value
+        scale = None
+        clamp_val = None if self.clamp_val is None else self.clamp_val.value
+        return fp8_rowwise_layer_norm(
+            x,
+            self.normalized_shape,
+            weight,
+            bias,
+            scale,
+            clamp_val,
+            self.eps,
+            dynamic_act_scaling=self.quant_mode.has_fp8_rowwise())
 
 
 class Fp8RowwiseRmsNorm(Module):
