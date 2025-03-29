@@ -496,7 +496,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             padded_tensor = torch.nn.utils.rnn.pad_sequence(
                 block_ids_per_seq_tensors, batch_first=True, padding_value=0)
             self.block_table_cuda[:padded_tensor.shape[0], :padded_tensor.
-                                  shape[1]].copy_(padded_tensor,
+                                  shape[1]].copy_(padded_tensor.pin_memory(),
                                                   non_blocking=True)
             self.block_ids_per_seq = self.block_table_cuda[
                 self.num_contexts:self.num_contexts +
@@ -508,8 +508,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(kv_lens[:self.num_seqs],
-                                                non_blocking=True)
+        self.kv_lens_cuda[:self.num_seqs].copy_(
+            kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
