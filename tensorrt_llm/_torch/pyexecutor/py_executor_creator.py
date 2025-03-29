@@ -274,7 +274,9 @@ def create_py_executor(executor_config: ExecutorConfig,
                              dist=dist,
                              enable_overlap_scheduler=pytorch_backend_config.
                              enable_overlap_scheduler,
-                             max_batch_size=executor_config.max_batch_size,
                              max_input_len=executor_config.max_input_len,
+                             max_batch_size=executor_config.max_batch_size,
+                             max_draft_tokens=spec_config.max_draft_tokens
+                             if spec_config is not None else 0,
                              kv_cache_transceiver=kv_cache_transceiver)
     return py_executor
