@@ -29,9 +29,6 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
-static void listenerCallback(ucp_conn_request_h connRequest, void* arg);
-static std::string getLocalIp();
-
 static void listenerCallback(ucp_conn_request_h connRequest, void* arg)
 {
     TLLM_LOG_DEBUG("listenerCallback");
@@ -176,8 +173,6 @@ UcxConnectionManager::UcxConnectionManager()
         }
         mCommState = CommState(socketStates, mpi::MpiComm::session().getRank());
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    mCommState: %s", mCommState.toString().c_str());
-
-        mHandleConnectionThread = std::thread(&UcxConnectionManager::handleReciveConnection, this);
     }
     catch (std::exception const& e)
     {
@@ -189,9 +184,6 @@ UcxConnectionManager::UcxConnectionManager()
 UcxConnectionManager::~UcxConnectionManager()
 {
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "UcxConnectionManager::~UcxConnectionManager");
-    mTerminated = true;
-    mHandleConnectionCv.notify_all();
-    mHandleConnectionThread.join();
 
     // mConnections.clear();
     for (auto& worker : mWorkersPool)
@@ -206,11 +198,19 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     try
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mListener->createEndpointFromConnRequest(connRequest, true);
-        {
-            std::unique_lock<std::mutex> lock(mHandleConnectionMutex);
-            mIncomingConnections.emplace_back(getNewConnectionId(newEp), newEp);
-        }
-        mHandleConnectionCv.notify_one();
+
+        uint64_t connectionId = getNewConnectionId(newEp);
+        std::scoped_lock lock(mConnectionFuturesMutex);
+
+        std::future<void> future = std::async(std::launch::async,
+            [this, connectionId, newEp]()
+            {
+                std::scoped_lock lock(mConnectionsMutex);
+                std::shared_ptr<UcxConnection> connection
+                    = std::make_shared<UcxConnection>(connectionId, newEp, this, false);
+                mConnections.emplace(connectionId, connection);
+            });
+        mConnectionFutures.emplace(connectionId, std::move(future));
     }
     catch (std::exception const& e)
     {
@@ -260,7 +260,15 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
 
     memcpy(data, buffer.data(), size);
     uint64_t connectionId = *reinterpret_cast<uint64_t*>(buffer.data() + size);
-    std::scoped_lock lock(mConnectionsMutex);
+    std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
+    TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
+        "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId,
+        mpi::MpiComm::world().getRank());
+    if (mConnectionFutures.at(connectionId).valid())
+    {
+        // wait for the connection to be created
+        mConnectionFutures.at(connectionId).get();
+    }
     TLLM_CHECK_WITH_INFO(mConnections.find(connectionId) != mConnections.end(),
         "Connection not found In recvConnect connectionId: %lu , worldRank: %d", connectionId,
         mpi::MpiComm::world().getRank());
@@ -299,37 +307,6 @@ std::vector<Connection const*> UcxConnectionManager::getConnections(CommState co
         ret.emplace_back(mConnections[mAddressToConnectionId[address]].get());
     }
     return ret;
-}
-
-void UcxConnectionManager::handleReciveConnection()
-{
-    TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
-    while (!mTerminated)
-
-    {
-        std::vector<std::pair<uint64_t, std::shared_ptr<ucxx::Endpoint>>> handleConnections;
-        {
-            std::unique_lock<std::mutex> lk(mHandleConnectionMutex);
-            mHandleConnectionCv.wait(lk, [this]() { return !mIncomingConnections.empty() || mTerminated; });
-            handleConnections = std::move(mIncomingConnections);
-            mIncomingConnections.clear();
-        }
-        if (mTerminated)
-        {
-            break;
-        }
-        {
-
-            for (auto&& [connectionId, endpoint] : handleConnections)
-            {
-                std::scoped_lock lock(mConnectionsMutex); // to ensure the connection and empalce is atomic
-
-                std::shared_ptr<UcxConnection> connection
-                    = std::make_shared<UcxConnection>(connectionId, endpoint, this, false);
-                mConnections.emplace(connectionId, connection);
-            }
-        }
-    }
 }
 
 CommState const& UcxConnectionManager::getCommState() const

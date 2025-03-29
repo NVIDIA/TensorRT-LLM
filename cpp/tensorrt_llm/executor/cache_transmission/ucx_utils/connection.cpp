@@ -54,7 +54,6 @@ UcxConnection::UcxConnection(
         while (!request->isCompleted())
             ;
         request->checkError();
-
         request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
         while (!request->isCompleted())
             ;

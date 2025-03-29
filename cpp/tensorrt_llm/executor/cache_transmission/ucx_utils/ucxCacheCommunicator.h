@@ -46,29 +46,22 @@ private:
     std::shared_ptr<ucxx::Context> mUcxCtx;
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
     std::map<uint64_t, std::shared_ptr<UcxConnection>> mConnections;
+    std::map<uint64_t, std::future<void>> mConnectionFutures;
     std::mutex mConnectionsMutex;
+    std::mutex mConnectionFuturesMutex;
     std::unordered_map<std::string, uint64_t> mAddressToConnectionId;
     std::mutex mAddressToConnectionIdMutex;
     std::shared_ptr<ucxx::Listener> mListener;
     CommState mCommState;
     std::string bindAddress;
     int mDevice;
-    std::mutex mHandleConnectionMutex;
-    std::condition_variable mHandleConnectionCv;
-    std::vector<std::pair<uint64_t, std::shared_ptr<ucxx::Endpoint>>> mIncomingConnections;
-    std::atomic<bool> mTerminated{false};
-    std::atomic<int> mConnectionIdCounter{1};
-    std::thread mHandleConnectionThread;
+    std::atomic<uint64_t> mConnectionIdCounter{1};
 
     mutable std::mutex mMtxForWorker;
     mutable std::condition_variable mCvForWorker;
 
     uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     uint64_t addConnection(std::string const& ip, uint16_t port);
-    // void initializeConnections();
-    void updateGIDToConnectionIdMap(std::shared_ptr<ucxx::Endpoint> const& newEp);
-
-    void handleReciveConnection();
 
 public:
     explicit UcxConnectionManager();
