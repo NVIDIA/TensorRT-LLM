@@ -185,11 +185,10 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         with open(hf_quant_config_file, 'r') as f:
             hf_quant_config = json.load(f)
         if hf_quant_config.get("producer", {}).get("name") == "modelopt":
-            if hf_quant_config.get("quantization",
-                                   {}).get("quant_algo") == "FP8":
+            modelopt_quant_config = hf_quant_config.get("quantization", {})
+            if modelopt_quant_config.get("quant_algo", None) == "FP8":
                 quant_config.quant_algo = QuantAlgo.FP8
-            if hf_quant_config.get("quantization",
-                                   {}).get("kv_cache_quant_algo") == "FP8":
+            if modelopt_quant_config.get("kv_cache_quant_algo", None) == "FP8":
                 quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
     return quant_config
