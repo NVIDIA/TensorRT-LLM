@@ -258,7 +258,7 @@ class Deepseekv3MoE(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  shared_expert_intermediate_size: int,
-                 aux_stream: torch.cuda.Stream,
+                 aux_stream: List[torch.cuda.Stream],
                  dtype: Optional[torch.dtype] = None,
                  tune_max_num_tokens: int = 8192,
                  model_config: ModelConfig = ModelConfig()):
@@ -315,7 +315,7 @@ class Deepseekv3MoE(nn.Module):
             parallel_rank=model_config.mapping.rank)
         self.all_reduce = AllReduce(self.parallel_config)
         self.aux_stream = aux_stream
-        self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
+        self.moe_event = [torch.cuda.Event() for _ in range(3)]
 
     def reduce_scatter(self, input_tensor, all_rank_num_tokens):
         world_size = self.parallel_config.tensor_parallel_size
@@ -327,7 +327,8 @@ class Deepseekv3MoE(nn.Module):
         depad_tensors = outputs[:all_rank_num_tokens[rank]]
         return depad_tensors
 
-    def compute_routed_output(self, hidden_states, all_rank_num_tokens):
+    def compute_routed_output(self, hidden_states, all_rank_num_tokens,
+                              use_cuda_graph):
         if self.use_dp and self.parallel_config.tensor_parallel_size > 1:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
@@ -337,18 +338,75 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states = allgather(hidden_states,
                                           self.parallel_config,
                                           gather_dim=0)
-        router_logits = self.gate(hidden_states)
-        routed_output = self.experts(hidden_states, router_logits)
-        if self.use_dp:
-            routed_output = self.reduce_scatter(routed_output,
-                                                all_rank_num_tokens)
+            router_logits = self.gate(hidden_states)
+            max_chunk_size = self.experts.tune_max_num_tokens // len(
+                all_rank_num_tokens)
+            num_chunks = (hidden_states.shape[0] + max_chunk_size -
+                          1) // max_chunk_size
+            if use_cuda_graph or num_chunks == 1:
+                routed_output = self.experts(hidden_states, router_logits)
+                routed_output = self.reduce_scatter(routed_output,
+                                                    all_rank_num_tokens)
+            else:
+                val_div = hidden_states.shape[0] // num_chunks
+                val_mod = hidden_states.shape[0] % num_chunks
+                split_list = [val_div + 1
+                              ] * val_mod + [val_div] * (num_chunks - val_mod)
+                hidden_states_list = hidden_states.split(split_list)
+                router_logits_list = router_logits.split(split_list)
+                routed_output_list = []
+                self.moe_event[2].record()
+                with torch.cuda.stream(self.aux_stream[1]):
+                    self.moe_event[2].wait()
+                # Postpone reduce-scatter to the next iteration to achieve better overlap
+                for idx_split, (hidden_states, router_logits) in enumerate(
+                        zip(hidden_states_list, router_logits_list)):
+                    if idx_split % 2 == 0:
+                        with torch.cuda.stream(self.aux_stream[1]):
+                            routed_output = self.experts(
+                                hidden_states, router_logits)
+                        if idx_split > 0:
+                            routed_output_list[-1] = reducescatter(
+                                routed_output_list[-1],
+                                self.parallel_config,
+                                scatter_dim=0)
+                    else:
+                        routed_output = self.experts(hidden_states,
+                                                     router_logits)
+                        with torch.cuda.stream(self.aux_stream[1]):
+                            routed_output_list[-1] = reducescatter(
+                                routed_output_list[-1],
+                                self.parallel_config,
+                                scatter_dim=0)
+                    routed_output_list.append(routed_output)
+                if num_chunks % 2 == 0:
+                    routed_output_list[-1] = reducescatter(
+                        routed_output_list[-1],
+                        self.parallel_config,
+                        scatter_dim=0)
+                else:
+                    with torch.cuda.stream(self.aux_stream[1]):
+                        routed_output_list[-1] = reducescatter(
+                            routed_output_list[-1],
+                            self.parallel_config,
+                            scatter_dim=0)
+                with torch.cuda.stream(self.aux_stream[1]):
+                    self.moe_event[2].record()
+                self.moe_event[2].wait()
+                routed_output = torch.cat(
+                    routed_output_list)[:all_rank_num_tokens[
+                        self.parallel_config.tensor_parallel_rank]]
+        else:
+            router_logits = self.gate(hidden_states)
+            routed_output = self.experts(hidden_states, router_logits)
         return routed_output
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens=None,
-        final_all_reduce_params: Optional[AllReduceParams] = None
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        use_cuda_graph: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
@@ -359,15 +417,16 @@ class Deepseekv3MoE(nn.Module):
         if self.shared_output_scale is not None:
             shared_output *= self.shared_output_scale
         if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
+            with torch.cuda.stream(self.aux_stream[0]):
                 self.moe_event[0].wait()
                 routed_output = self.compute_routed_output(
-                    hidden_states, all_rank_num_tokens)
+                    hidden_states, all_rank_num_tokens, use_cuda_graph)
                 self.moe_event[1].record()
             self.moe_event[1].wait()
         else:
             routed_output = self.compute_routed_output(hidden_states,
-                                                       all_rank_num_tokens)
+                                                       all_rank_num_tokens,
+                                                       use_cuda_graph)
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
@@ -381,7 +440,7 @@ class Deepseekv3MoE(nn.Module):
 class DeepseekV3DecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream: torch.cuda.Stream):
+                 layer_idx: int, aux_stream: List[torch.cuda.Stream]):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
@@ -392,7 +451,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.self_attn = DeepseekV3Attention(model_config,
                                              layer_idx=layer_idx,
-                                             aux_stream=aux_stream)
+                                             aux_stream=aux_stream[0])
         self.fusion_config = EagerFusionConfig()
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mlp_tp_size = model_config.mapping.tp_size
@@ -420,7 +479,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 shared_expert_intermediate_size=self.moe_intermediate_size *
                 self.num_shared_experts,
                 dtype=config.torch_dtype,
-                tune_max_num_tokens=config.max_position_embeddings // 4,
+                tune_max_num_tokens=model_config.moe_max_num_tokens,
                 model_config=model_config,
                 aux_stream=aux_stream)
         else:
@@ -480,6 +539,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        use_cuda_graph: bool,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -549,13 +609,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.mlp(
-            hidden_states,
-            attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+        mlp_extra_args = {
+            'final_all_reduce_params':
+            AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
                 or self.fusion_config.POST_MLP_FUSION or self.mlp_tp_size == 1
                 or self.enable_attention_dp)),
+        }
+        if isinstance(self.mlp, Deepseekv3MoE):
+            mlp_extra_args['use_cuda_graph'] = use_cuda_graph
+        hidden_states = self.mlp(
+            hidden_states,
+            attn_metadata.all_rank_num_tokens,
+            **mlp_extra_args,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -735,7 +801,7 @@ class DeepseekV3Model(DecoderModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        self.aux_stream = torch.cuda.Stream()
+        self.aux_stream = [torch.cuda.Stream() for _ in range(2)]
 
         self.embed_tokens = nn.Embedding(config.vocab_size,
                                          config.hidden_size,
@@ -755,6 +821,7 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cuda_graph: Optional[bool] = False,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -769,10 +836,12 @@ class DeepseekV3Model(DecoderModel):
 
         hidden_states = self.layers[0].input_layernorm(hidden_states)
         for decoder_layer in self.layers[:self.num_hidden_layers]:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                use_cuda_graph=use_cuda_graph)
 
         return hidden_states
 
@@ -882,7 +951,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[MTPSpecMetadata] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
-        return_context_logits: bool = False,
+        use_cuda_graph: Optional[bool] = False,
+        return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
@@ -893,6 +963,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 pipeline_interface=pipeline_interface,
+                use_cuda_graph=use_cuda_graph,
             )
 
             # No need to compute logits for non-last PP ranks
@@ -906,6 +977,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
+                use_cuda_graph=use_cuda_graph,
             )
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
