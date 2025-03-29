@@ -58,10 +58,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
+                print_colored_debug('create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
             else:
+                print_colored_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            print_colored_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
