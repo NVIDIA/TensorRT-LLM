@@ -31,14 +31,6 @@ class ModelConfig(Generic[TConfig]):
             self.is_generation = self.is_generation_model(
                 self.pretrained_config.architectures)
 
-    @property
-    def fuse_pos_embd(self):
-        if self.attn_backend == 'TRTLLM':
-            return True
-        elif self.attn_backend == 'FLASHINFER':
-            return False
-        return False
-
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
         if name is None or self.per_layer_quant_configs is None:
             return self.quant_config

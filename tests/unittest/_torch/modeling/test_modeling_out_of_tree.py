@@ -36,6 +36,7 @@ class TestOutOfTree(unittest.TestCase):
                 llm = LLM(model=model_dir,
                           kv_cache_config=kv_cache_config,
                           max_num_tokens=2048)
+                del llm
             return
 
         llm = LLM(model=model_dir,
@@ -57,7 +58,8 @@ class TestOutOfTree(unittest.TestCase):
         ]
 
         sampling_params = SamplingParams(max_tokens=10)
-        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        with llm:
+            outputs = llm.generate(prompts, sampling_params=sampling_params)
 
         for output, ref in zip(outputs, references):
             assert similar(output.outputs[0].text, ref)

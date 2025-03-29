@@ -1,7 +1,6 @@
 import unittest
 from copy import deepcopy
 from typing import Any
-from unittest.mock import patch
 
 import torch
 from parameterized import parameterized
@@ -279,11 +278,6 @@ def reduce_vila_config(mem_for_full_model: int, config_dict: dict[str, Any]):
 class TestVila(unittest.TestCase):
 
     @parameterized.expand([None])
-    # rms_norm in flashinfer needs the following fix to work
-    # https://github.com/flashinfer-ai/flashinfer/pull/646
-    # temporarily disable it for testing
-    @patch('tensorrt_llm._torch.modules.rms_norm.IS_FLASHINFER_AVAIABLE',
-           new=False)
     def test_vila_sanity(self, quant_algo):
         config_dict = deepcopy(VILA_1_5_3B_CONFIG)
         mem_for_full_model = (2 + 1) * 3 * 2**(30)

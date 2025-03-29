@@ -11,7 +11,7 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, release_gc
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -29,7 +29,7 @@ from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
-from ..utils import set_torch_compiling
+from ..utils import model_extra_attrs, set_torch_compiling
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .distributed import MPIDist
@@ -249,6 +249,8 @@ class PyTorchModelEngine(ModelEngine):
             attn_backend=attn_backend,
             load_format=pytorch_backend_config.load_format,
         )
+        if not hasattr(self.model, 'extra_attrs'):
+            self.model.extra_attrs = {}
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -709,7 +711,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.ub_buffers:
             for u in self.ub_buffers:
                 ub.ub_deallocate(u)
-        torch.cuda.empty_cache()
+        release_gc()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
                     **kwargs):
@@ -1521,18 +1523,19 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = None
 
         if kv_cache_manager is None:
-            inputs, gather_ids = self._prepare_tp_inputs_no_cache(
-                scheduled_requests, attn_metadata, spec_metadata)
-            if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
-                pp_interface = self._forward_step_intermediate(inputs)
-                pp_interface.send()
-                return self._post_forward_intermediate(inputs, pp_interface,
-                                                       gather_ids)
-            else:
-                return self._forward_step(inputs, gather_ids)
+            with model_extra_attrs(self.model.extra_attrs):
+                inputs, gather_ids = self._prepare_tp_inputs_no_cache(
+                    scheduled_requests, attn_metadata, spec_metadata)
+                if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
+                    pp_interface = self._forward_step_intermediate(inputs)
+                    pp_interface.send()
+                    return self._post_forward_intermediate(
+                        inputs, pp_interface, gather_ids)
+                else:
+                    return self._forward_step(inputs, gather_ids)
 
-        with self._maybe_pad_batch(scheduled_requests,
-                                   kv_cache_manager) as scheduled_requests:
+        with model_extra_attrs(self.model.extra_attrs), self._maybe_pad_batch(
+                scheduled_requests, kv_cache_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(
                 scheduled_requests, spec_config=self.spec_config)
             if maybe_graph is not None:
@@ -1606,9 +1609,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        logits = self.model.forward(**inputs,
-                                    return_context_logits=gather_ids
-                                    is not None)
+        logits = self.model.forward(
+            **inputs,
+            return_context_logits=gather_ids is not None,
+        )
         if gather_ids is not None:
             return {'logits': logits[gather_ids]}
         else:

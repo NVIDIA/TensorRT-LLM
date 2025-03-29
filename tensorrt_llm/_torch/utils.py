@@ -1,6 +1,8 @@
+import contextlib
 import os
+import threading
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 import torch
 
@@ -19,6 +21,30 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+_global_attrs = threading.local()
+
+
+def get_global_attrs():
+    return _global_attrs
+
+
+_model_extra_attrs = threading.local()
+
+
+def get_model_extra_attrs():
+    return getattr(_model_extra_attrs, 'attrs', None)
+
+
+@contextlib.contextmanager
+def model_extra_attrs(attrs: Dict):
+    old_attrs = getattr(_model_extra_attrs, 'attrs', None)
+    _model_extra_attrs.attrs = attrs
+    try:
+        yield
+    finally:
+        _model_extra_attrs.attrs = old_attrs
 
 
 def make_weak_ref(x):
