@@ -319,8 +319,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                              mapping=mapping,
                                              quant_config=quant_config,
                                              **kwargs)
-        if is_prequantized_to_fp8 and os.environ.get(
-                "TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+        if is_prequantized_to_fp8:
             custom_dict = {'fc': 'up_proj'}
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
