@@ -14,6 +14,7 @@ from tqdm import tqdm
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
+from ..metadata import LogitsProcessorMetadata
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
@@ -468,7 +469,8 @@ class DecoderModelForCausalLM(nn.Module,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
-        return_context_logits: bool = False,
+        return_context_logits: Optional[bool] = False,
+        logits_processor_metadata: Optional[LogitsProcessorMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -492,12 +494,14 @@ class DecoderModelForCausalLM(nn.Module,
                 inputs_embeds=inputs_embeds,
             )
 
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+        # TODO WIP
+        lp_args = {"input_ids", input_ids} if logits_processor_metadata else {}
+
+        return self.logits_processor.forward(output, self.lm_head,
+                                             attn_metadata,
+                                             return_context_logits,
+                                             logits_processor_metadata,
+                                             **lp_args)
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size

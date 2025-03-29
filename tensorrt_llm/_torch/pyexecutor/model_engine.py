@@ -27,6 +27,7 @@ from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
+from ..metadata import LogitsProcessorMetadata
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
 from ..utils import set_torch_compiling
@@ -825,6 +826,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            logits_processor_metadata: Optional[LogitsProcessorMetadata] = None,
             new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
         """
         Prepare inputs for Pytorch Model.
@@ -981,6 +983,15 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices.append(request.py_batch_idx)
 
             request.py_batch_idx = batch_idx
+
+            logits_processors = getattr(request, "logits_post_processors", None)
+            if logits_processors:
+                logits_processor_metadata = logits_processor_metadata or LogitsProcessorMetadata(
+                )
+                logits_processor_metadata.update_seq_group(
+                    logits_processors, request.py_batch_idx,
+                    request.py_request_id)
+
             batch_idx += 1
 
         num_tokens = len(input_ids)
@@ -1110,6 +1121,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+
+        if logits_processor_metadata is not None:
+            logits_processor_metadata.prepare()
+            inputs['logits_processor_metadata'] = logits_processor_metadata
 
         # support attention dp
         if self.enable_attention_dp:
