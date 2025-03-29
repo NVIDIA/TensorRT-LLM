@@ -4,7 +4,7 @@ from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import MTPDecodingConfig
+from tensorrt_llm.llmapi import EagleDecodingConfig, MTPDecodingConfig
 
 example_prompts = [
     "Hello, my name is",
@@ -84,7 +84,10 @@ def add_llm_args(parser):
     parser.add_argument('--load_format', type=str, default='auto')
 
     # Speculative decoding
-    parser.add_argument('--mtp_nextn', type=int, default=0)
+    parser.add_argument('--spec_decode_algo', type=str, default=None)
+    parser.add_argument('--spec_decode_nextn', type=int, default=1)
+    parser.add_argument('--eagle_model_dir', type=str, default=None)
+
     return parser
 
 
@@ -111,8 +114,18 @@ def setup_llm(args):
         free_gpu_memory_fraction=args.kv_cache_fraction,
     )
 
-    mtp_config = MTPDecodingConfig(
-        num_nextn_predict_layers=args.mtp_nextn) if args.mtp_nextn > 0 else None
+    spec_decode_algo = args.spec_decode_algo.upper(
+    ) if args.spec_decode_algo is not None else None
+
+    if spec_decode_algo == 'MTP':
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=args.spec_decode_nextn)
+    elif spec_decode_algo == "EAGLE3":
+        spec_config = EagleDecodingConfig(
+            max_draft_len=args.spec_decode_nextn,
+            pytorch_eagle_weights_path=args.eagle_model_dir)
+    else:
+        spec_config = None
 
     llm = LLM(model=args.model_dir,
               max_seq_len=args.max_seq_len,
@@ -126,7 +139,7 @@ def setup_llm(args):
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
-              speculative_config=mtp_config)
+              speculative_config=spec_config)
 
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,

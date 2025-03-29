@@ -210,6 +210,7 @@ class KVCacheManager(BaseResourceManager):
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
+        self.enable_block_reuse = kv_cache_config.enable_block_reuse
 
     def shutdown(self):
         self.impl.release_pools()

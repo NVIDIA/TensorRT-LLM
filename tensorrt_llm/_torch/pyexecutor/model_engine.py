@@ -50,8 +50,9 @@ class ModelEngine(ABC):
 
     @abstractmethod
     def forward(self, scheduled_requests: ScheduledRequests,
+                resource_manager: ResourceManager,
                 new_tensors_device: Optional[Dict[str, torch.Tensor]],
-                resource_manager: ResourceManager):
+                extra_model_inputs: Optional[Dict[str, Any]]):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -207,6 +208,10 @@ def initialize_dummy_weights(
             param.uniform_(low, high, generator=generator)
 
 
+KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
+DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -233,6 +238,10 @@ class PyTorchModelEngine(ModelEngine):
         self.dist = dist
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
+        # We keep a reference to the last used spec metadata to
+        # accommodate certain target/draft model use cases. See
+        # py_executor.py for how this is used.
+        self.last_spec_metadata = None
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -347,9 +356,14 @@ class PyTorchModelEngine(ModelEngine):
             self.max_draft_len = 0
         self.iter_counter = 0
 
+        # We look up this key in resource_manager during forward to find the
+        # kv cache manager. Can be changed to support multiple model engines
+        # with different KV cache managers.
+        self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
+
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
-            'kv_cache_manager')
+            self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
             'spec_resource_manager')
         if kv_cache_manager is None:
@@ -462,6 +476,11 @@ class PyTorchModelEngine(ModelEngine):
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type == 'star_attention':
+            return
+
+        # TODO: CUDA graph support with eagle.
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.is_eagle3(
+        ):
             return
 
         if self._torch_compile_enabled:
@@ -817,6 +836,7 @@ class PyTorchModelEngine(ModelEngine):
                 inputs['attn_metadata'].kv_lens_cuda[
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+
         return inputs
 
     def _prepare_tp_inputs(
@@ -918,6 +938,7 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 position_ids.append(past_seen_token_num)
                 draft_lens.append(num_draft_tokens)
+                prompt_lengths.append(num_draft_tokens + 1)
                 # draft tokens
                 input_ids.extend(request.py_draft_tokens)
                 gather_ids.extend(
@@ -955,9 +976,9 @@ class PyTorchModelEngine(ModelEngine):
                                             (1 + self.max_draft_len))
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
+                prompt_lengths.append(request.py_prompt_len)
 
             request_ids.append(request.py_request_id)
-            prompt_lengths.append(request.py_prompt_len)
 
         sequence_lengths.extend([1] * len(generation_requests))
         gather_ids.extend(
@@ -1075,6 +1096,9 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.extend_ctx(
+        ):
+            attn_metadata.num_contexts += len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
@@ -1108,6 +1132,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -1223,6 +1248,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
+            spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -1505,10 +1531,11 @@ class PyTorchModelEngine(ModelEngine):
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
-                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+                new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
+                extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            'kv_cache_manager')
+            self.kv_cache_manager_key)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.spec_config is not None:
@@ -1523,6 +1550,10 @@ class PyTorchModelEngine(ModelEngine):
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
+            if extra_model_inputs is not None:
+                inputs.update(extra_model_inputs)
+            self.last_spec_metadata = spec_metadata
+
             if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
                 pp_interface = self._forward_step_intermediate(inputs)
                 pp_interface.send()
@@ -1549,6 +1580,10 @@ class PyTorchModelEngine(ModelEngine):
                                                       attn_metadata,
                                                       spec_metadata,
                                                       new_tensors_device)
+            if extra_model_inputs is not None:
+                inputs.update(extra_model_inputs)
+            self.last_spec_metadata = spec_metadata
+
             self.iter_counter += 1
 
             if maybe_graph is None:

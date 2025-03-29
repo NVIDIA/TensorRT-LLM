@@ -9,7 +9,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..speculative import (get_num_spec_layers, get_spec_decoder,
+from ..speculative import (Eagle3Config, get_num_spec_layers, get_spec_decoder,
                            get_spec_resource_manager)
 from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
 from .config import PyTorchConfig
@@ -18,11 +18,74 @@ from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
 from .distributed import MPIDist
 from .guided_decoder import GuidedDecoderResourceManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .model_engine import PyTorchModelEngine
+from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
+                           PyTorchModelEngine)
 from .py_executor import PyExecutor
 from .resource_manager import KVCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
+
+
+def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
+                             executor_config: ExecutorConfig) -> KVCacheManager:
+
+    config = model_engine.model.model_config.pretrained_config
+    quant_config = model_engine.model.model_config.quant_config
+    spec_config = executor_config.speculative_config
+
+    hidden_size = config.hidden_size
+    num_attention_heads = config.num_attention_heads
+    num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                  num_attention_heads)
+    head_dim = hidden_size // num_attention_heads
+
+    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
+    else:
+        kv_cache_dtype = str_dtype_to_binding(
+            torch_dtype_to_str(model_engine.dtype))
+
+    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
+    if config.architectures[0] == "Nemotron5ForCausalLM":
+        # attention layers are derived from configuration (hybrid_override_pattern)
+        num_hidden_layers = config.hybrid_override_pattern.count("*")
+
+    if is_mla(config):
+        if spec_config is not None:
+            num_hidden_layers += get_num_spec_layers(spec_config)
+
+        return KVCacheManager(
+            executor_config.kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=num_hidden_layers,
+            num_kv_heads=1,
+            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            num_extra_kv_tokens=0
+            if spec_config is None else spec_config.num_extra_kv_tokens,
+        )
+    else:
+        if spec_config is not None:
+            num_hidden_layers += get_num_spec_layers(spec_config)
+        return KVCacheManager(
+            executor_config.kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_hidden_layers,
+            num_kv_heads=num_key_value_heads,
+            head_dim=head_dim,
+            tokens_per_block=executor_config.tokens_per_block,
+            max_seq_len=executor_config.max_seq_len,
+            max_batch_size=executor_config.max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            num_extra_kv_tokens=0
+            if spec_config is None else spec_config.num_extra_kv_tokens,
+        )
 
 
 def create_py_executor(executor_config: ExecutorConfig,
@@ -32,7 +95,6 @@ def create_py_executor(executor_config: ExecutorConfig,
         executor_config.pytorch_backend_config = PyTorchConfig()
 
     pytorch_backend_config = executor_config.pytorch_backend_config
-    spec_config = executor_config.speculative_config
 
     if executor_config.mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -65,9 +127,13 @@ def create_py_executor(executor_config: ExecutorConfig,
         executor_config.max_num_tokens = 8192
     dist = MPIDist(mapping=mapping)
 
+    spec_config = executor_config.speculative_config
+    has_draft_model_engine = isinstance(spec_config, Eagle3Config)
+
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
+        has_speculative_draft_tokens=has_draft_model_engine,
     )
 
     model_engine = PyTorchModelEngine(
@@ -82,6 +148,23 @@ def create_py_executor(executor_config: ExecutorConfig,
         spec_config=spec_config,
         guided_decoding_config=executor_config.guided_decoding_config,
     )
+
+    if has_draft_model_engine:
+        draft_model_engine = PyTorchModelEngine(
+            spec_config.eagle_weights_path,
+            pytorch_backend_config,
+            batch_size=executor_config.max_batch_size,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_seq_len=executor_config.max_seq_len,
+            mapping=mapping,
+            attn_runtime_features=attn_runtime_features,
+            dist=dist,
+            spec_config=copy.copy(spec_config),
+        )
+        draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+    else:
+        draft_model_engine = None
+
     # PyTorchModelEngine modifies these fields, update them to executor_config
     if pytorch_backend_config.enable_overlap_scheduler:
         max_seq_len = model_engine.max_seq_len + 1
@@ -97,19 +180,6 @@ def create_py_executor(executor_config: ExecutorConfig,
     if not model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
         executor_config.pytorch_backend_config.use_kv_cache = False
-
-    hidden_size = model_engine.model.config.hidden_size
-    num_attention_heads = model_engine.model.config.num_attention_heads
-    num_key_value_heads = getattr(model_engine.model.config,
-                                  'num_key_value_heads', num_attention_heads)
-    head_dim = hidden_size // num_attention_heads
-
-    quant_config = model_engine.model.model_config.quant_config
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
-    else:
-        kv_cache_dtype = str_dtype_to_binding(
-            torch_dtype_to_str(model_engine.dtype))
 
     kv_cache_max_tokens = None
     if model_engine.model.model_config.is_generation:
@@ -131,69 +201,36 @@ def create_py_executor(executor_config: ExecutorConfig,
         ctx_chunk_config = None
 
     config = model_engine.model.model_config.pretrained_config
-    # kv cache manager selection
+    if is_mla(config):
+        if check_flash_mla_config(config):
+            executor_config.tokens_per_block = 64
+            logger.info(
+                f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
+            )
+        executor_config.kv_cache_config.enable_block_reuse = False
+        executor_config.enable_chunked_context = False
+
     if executor_config.pytorch_backend_config.use_kv_cache:
-        num_hidden_layers = len(
-            mapping.pp_layers_torch(
-                model_engine.model.config.num_hidden_layers))
-        # has kv cache
-        if is_mla(config):
-            if check_flash_mla_config(config):
-                executor_config.tokens_per_block = 64
-                logger.info(
-                    f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
-                )
-            executor_config.kv_cache_config.enable_block_reuse = False
-            executor_config.enable_chunked_context = False
-            if spec_config is not None:
-                num_hidden_layers += get_num_spec_layers(spec_config)
-            kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
-                tensorrt_llm.bindings.internal.batch_manager.CacheType.
-                SELFKONLY,
-                num_layers=num_hidden_layers,
-                num_kv_heads=1,
-                head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
-                mapping=mapping,
-                dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
-            )
-        else:
-            # the number of layers using attention in Nemotron5 is lower from the number of hidden layers
-            if model_engine.model.config.architectures[
-                    0] == "Nemotron5ForCausalLM":
-                # attention layers are derived from configuration (hybrid_override_pattern)
-                num_hidden_layers = model_engine.model.config.hybrid_override_pattern.count(
-                    "*")
-            kv_cache_manager = KVCacheManager(
-                executor_config.kv_cache_config,
-                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-                num_layers=num_hidden_layers,
-                num_kv_heads=num_key_value_heads,
-                head_dim=head_dim,
-                tokens_per_block=executor_config.tokens_per_block,
-                max_seq_len=executor_config.max_seq_len,
-                max_batch_size=executor_config.max_batch_size,
-                mapping=mapping,
-                dtype=kv_cache_dtype,
-                num_extra_kv_tokens=0
-                if spec_config is None else spec_config.num_extra_kv_tokens,
-            )
+        kv_cache_manager = _create_kv_cache_manager(model_engine, mapping,
+                                                    executor_config)
+
+        draft_kv_cache_manager = _create_kv_cache_manager(
+            draft_model_engine, mapping,
+            executor_config) if draft_model_engine is not None else None
     else:
-        # no kv cache
         kv_cache_manager = None
+        draft_kv_cache_manager = None
 
     # KVCacheManager modifies these fields, update them to executor_config
     if kv_cache_manager is not None:
         executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
     resources = {
-        "kv_cache_manager": kv_cache_manager
+        KV_CACHE_MANAGER_KEY: kv_cache_manager
     } if kv_cache_manager is not None else {}
+
+    if draft_kv_cache_manager is not None:
+        resources[DRAFT_KV_CACHE_MANAGER_KEY] = draft_kv_cache_manager
 
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
@@ -225,10 +262,11 @@ def create_py_executor(executor_config: ExecutorConfig,
         resources[key] = value
 
     resource_manager = ResourceManager(resources)
+
     # Make sure the kv cache manager is always invoked last as it could
     # depend on the results of other resource managers.
     if kv_cache_manager is not None:
-        resource_manager.resource_managers.move_to_end("kv_cache_manager",
+        resource_manager.resource_managers.move_to_end(KV_CACHE_MANAGER_KEY,
                                                        last=True)
 
     num_micro_batches = 1
@@ -276,5 +314,6 @@ def create_py_executor(executor_config: ExecutorConfig,
                              enable_overlap_scheduler,
                              max_batch_size=executor_config.max_batch_size,
                              max_input_len=executor_config.max_input_len,
-                             kv_cache_transceiver=kv_cache_transceiver)
+                             kv_cache_transceiver=kv_cache_transceiver,
+                             draft_model_engine=draft_model_engine)
     return py_executor

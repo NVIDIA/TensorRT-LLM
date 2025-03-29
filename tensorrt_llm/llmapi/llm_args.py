@@ -216,6 +216,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     dynamic_tree_max_topK: Optional[int] = None
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
+    pytorch_eagle_weights_path: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1145,15 +1146,23 @@ class LlmArgs:
 
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
-                eagle_config = EagleConfig(
-                    self.speculative_config.eagle_choices,
-                    self.speculative_config.greedy_sampling,
-                    self.speculative_config.posterior_threshold,
-                    self.speculative_config.use_dynamic_tree,
-                    self.speculative_config.dynamic_tree_max_topK)
-                self.decoding_config = DecodingConfig(
-                    decoding_mode=DecodingMode.Eagle(),
-                    eagle_config=eagle_config)
+                if self.backend != 'pytorch':
+                    eagle_config = EagleConfig(
+                        self.speculative_config.eagle_choices,
+                        self.speculative_config.greedy_sampling,
+                        self.speculative_config.posterior_threshold,
+                        self.speculative_config.use_dynamic_tree,
+                        self.speculative_config.dynamic_tree_max_topK)
+                    self.decoding_config = DecodingConfig(
+                        decoding_mode=DecodingMode.Eagle(),
+                        eagle_config=eagle_config)
+                else:
+                    from tensorrt_llm._torch.speculative import Eagle3Config
+                    self.speculative_config = Eagle3Config(
+                        max_draft_tokens=self.speculative_config.max_draft_len,
+                        eagle_weights_path=self.speculative_config.
+                        pytorch_eagle_weights_path)
+
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig
                 self.speculative_config = MTPConfig(
