@@ -879,11 +879,11 @@ def test_multi_lora_support(
     venv_check_call(llm_venv, run_cmd)
 
 
-def generate_dummy_medusa(hf_model_dir,
-                          save_dir,
-                          mode='medusa',
-                          num_heads=4,
-                          num_layers=1):
+def get_dummy_spec_decoding_heads(hf_model_dir,
+                                  save_dir,
+                                  mode='medusa',
+                                  num_heads=4,
+                                  num_layers=1):
 
     import os
 
@@ -902,7 +902,11 @@ def generate_dummy_medusa(hf_model_dir,
             "medusa_num_layers": num_layers,
         }
     elif mode == "eagle":
-        config = {"eagle_num_layers": num_layers}
+        config = {
+            "eagle_num_layers": num_layers,
+            "use_input_layernorm_in_first_layer": True,
+            "use_last_layernorm": False,
+        }
     else:
         raise NotImplementedError(f"Unknown mode {mode}.")
     mtsp.convert(model, [(mode, config)])
