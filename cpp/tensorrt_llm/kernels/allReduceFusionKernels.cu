@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,8 +118,7 @@ public:
             m_flag_value = comm.flag_value;
             int current_rank = rank;
             int target_rank = threadIdx.x;
-            m_target_flag
-                = reinterpret_cast<int*>(comm.barrier_flags[target_rank]) + blockIdx.x * NRanks + current_rank;
+            m_target_flag = reinterpret_cast<int*>(comm.barrier_flags[target_rank]) + current_rank;
             m_current_flag
                 = reinterpret_cast<int*>(comm.barrier_flags[current_rank]) + blockIdx.x * NRanks + target_rank;
         }
@@ -131,7 +130,12 @@ public:
         if (threadIdx.x < NRanks)
         {
             m_flag_value = next_flag(m_flag_value);
-            st_flag(m_target_flag, m_flag_value);
+            // To avoid the ABA problem, we need to synchronize the correct flag value to all barrier_flags, even if the
+            // corresponding CTA has not been launched.
+            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount; flag_idx += gridDim.x)
+            {
+                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
+            }
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
             }
@@ -183,80 +187,143 @@ __device__ __forceinline__ PackedType add128(PackedType const& a, PackedType con
     return c;
 }
 
-template <typename DType, typename PackedType>
-__device__ __forceinline__ PackedType rms_norm(
-    PackedType const& residual, PackedType const& gamma, float const eps, int hidden_dim)
+template <AllReduceFusionPattern Pattern, typename DType>
+class FusedOp
 {
-    static constexpr int kMathCount = sizeof(PackedType) / sizeof(DType);
-    __shared__ float s_val;
-    PackedType norm_out;
-    cg::cluster_group cluster = cg::this_cluster();
-    float acc = 0.f;
-#pragma unroll
-    for (int i = 0; i < kMathCount; ++i)
+    using RMSNormRetType = std::conditional_t<GetQuantType<Pattern> == QuantType::kFP8, __nv_fp8_e4m3, DType>;
+    using RMSNormRetTypePacked = std::conditional_t<GetQuantType<Pattern> == QuantType::kFP8, float2, float4>;
+
+public:
+    __device__ __forceinline__ FusedOp(AllReduceFusionParams const& params, int access_id, int access_id_in_token)
+        : m_params(params)
+        , m_access_id(access_id)
+        , m_access_id_in_token(access_id_in_token)
     {
-        float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
-        acc += v * v;
-    }
-    tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
-    if (cluster.num_blocks() > 1)
-    {
-        if (threadIdx.x == 0)
+        if constexpr (HasRMSNorm<Pattern>)
         {
-            s_val = acc;
-            acc = 0.f;
+            m_gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[m_access_id_in_token];
         }
-        cluster.sync();
-        if (threadIdx.x == 0)
+        if constexpr (HasResidual<Pattern>)
         {
-            for (int i = 0; i < cluster.num_blocks(); ++i)
+            m_residual_val = reinterpret_cast<float4*>(params.residual_in)[m_access_id];
+        }
+        if constexpr (GetQuantType<Pattern> != QuantType::kNone)
+        {
+            m_scale_factor = *params.scale_factor;
+        }
+    }
+
+    __device__ __forceinline__ void prefetch(int access_id)
+    {
+        if constexpr (HasResidual<Pattern>)
+        {
+            if (m_access_id != access_id)
             {
-                acc += *cluster.map_shared_rank(&s_val, i);
+                m_access_id = access_id;
+                m_residual_val = reinterpret_cast<float4*>(m_params.residual_in)[m_access_id];
             }
         }
-        cluster.sync();
     }
-    if (threadIdx.x == 0)
-    {
-        s_val = rsqrtf(acc / hidden_dim + eps);
-    }
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < kMathCount; ++i)
-    {
-        reinterpret_cast<DType*>(&norm_out)[i]
-            = static_cast<DType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
-                * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
-    }
-    return norm_out;
-}
 
-template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typename PackedType>
-__device__ __forceinline__ void fused_op(
-    PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
-{
-    float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
-    float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-    residual_val = add128<DType>(val, residual_val);
-    if constexpr (ResidualOut)
+    __device__ __forceinline__ void operator()(float4 val, int token_id)
     {
-        reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+        RMSNormRetTypePacked ret;
+        if constexpr (HasResidual<Pattern>)
+        {
+            val = add128<DType>(val, m_residual_val);
+            reinterpret_cast<float4*>(m_params.residual_out)[m_access_id] = val;
+        }
+        if constexpr (HasRMSNorm<Pattern>)
+        {
+            ret = rms_norm(val, m_gamma_val);
+            if constexpr (GetQuantType<Pattern> == QuantType::kNone)
+            {
+                reinterpret_cast<float4*>(m_params.norm_out)[m_access_id] = ret;
+            }
+        }
+        if constexpr (GetQuantType<Pattern> == QuantType::kFP4)
+        {
+            PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&ret);
+            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_id,
+                m_access_id_in_token, std::nullopt /* numRows */, m_params.hidden_dim,
+                reinterpret_cast<uint32_t*>(m_params.scale_out));
+            reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
+                = cvt_warp_fp16_to_fp4(pack_val, m_scale_factor, sf_out);
+        }
+        else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
+        {
+            reinterpret_cast<float2*>(m_params.quant_out)[m_access_id] = ret;
+        }
+        else
+        {
+            static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
+        }
     }
-    float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
-    if constexpr (NormOut)
+
+protected:
+    __device__ __forceinline__ RMSNormRetTypePacked rms_norm(float4 const& residual, float4 const& gamma)
     {
-        reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
+        static constexpr int kMathCount = sizeof(float4) / sizeof(DType);
+        __shared__ float s_val;
+        RMSNormRetTypePacked norm_out;
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMathCount; ++i)
+        {
+            float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
+            acc += v * v;
+        }
+        tensorrt_llm::common::blockReduceSumV2<float, 1>(&acc);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cg::cluster_group cluster = cg::this_cluster();
+        if (cluster.num_blocks() > 1)
+        {
+            if (threadIdx.x == 0)
+            {
+                s_val = acc;
+                acc = 0.f;
+            }
+            cluster.sync();
+            if (threadIdx.x == 0)
+            {
+                for (int i = 0; i < cluster.num_blocks(); ++i)
+                {
+                    acc += *cluster.map_shared_rank(&s_val, i);
+                }
+            }
+            cluster.sync();
+        }
+#endif
+        if (threadIdx.x == 0)
+        {
+            if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
+            {
+                s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps) / m_scale_factor;
+            }
+            else
+            {
+                s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kMathCount; ++i)
+        {
+            reinterpret_cast<RMSNormRetType*>(&norm_out)[i]
+                = static_cast<RMSNormRetType>(static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]) * s_val
+                    * static_cast<float>(reinterpret_cast<DType const*>(&gamma)[i]));
+        }
+        return norm_out;
     }
-    if constexpr (QuantOut)
-    {
-        PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
-        auto sf_out
-            = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_id, access_id_in_token,
-                std::nullopt /* numRows */, params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out));
-        reinterpret_cast<uint32_t*>(params.quant_out)[access_id]
-            = cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
-    }
-}
+
+private:
+    AllReduceFusionParams const& m_params;
+    int m_access_id;
+    int m_access_id_in_token;
+    float m_scale_factor;
+    float4 m_residual_val;
+    float4 m_gamma_val;
+};
 
 __device__ __forceinline__ bool is_neg_zero(float v)
 {
@@ -293,9 +360,10 @@ __device__ __forceinline__ float4 allreduce_sum(float4* vals)
 {
     if constexpr (Fp32Acc)
     {
-        float acc_f32[8];
+        static_assert(!std::is_same_v<DType, float>);
+        float acc_f32[kElemsPerAccess<DType>];
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < kElemsPerAccess<DType>; ++i)
         {
             acc_f32[i] = static_cast<float>(reinterpret_cast<DType*>(&vals[0])[i]);
         }
@@ -303,14 +371,14 @@ __device__ __forceinline__ float4 allreduce_sum(float4* vals)
         for (int r = 1; r < NRanks; ++r)
         {
 #pragma unroll
-            for (int i = 0; i < 8; ++i)
+            for (int i = 0; i < kElemsPerAccess<DType>; ++i)
             {
                 acc_f32[i] += static_cast<float>(reinterpret_cast<DType*>(&vals[r])[i]);
             }
         }
         float4 acc;
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < kElemsPerAccess<DType>; ++i)
         {
             reinterpret_cast<DType*>(&acc)[i] = static_cast<DType>(acc_f32[i]);
         }
@@ -328,33 +396,61 @@ __device__ __forceinline__ float4 allreduce_sum(float4* vals)
     }
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
+template <typename DType>
+class IndexHelper
+{
+public:
+    __device__ __forceinline__ IndexHelper(AllReduceFusionParams const& params)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        namespace cg = cooperative_groups;
+        cg::cluster_group cluster = cg::this_cluster();
+        cg::grid_group grid = cg::this_grid();
+        token_id = grid.cluster_rank();
+        access_id_in_token = cluster.thread_rank();
+        token_stride = grid.num_clusters();
+#else
+        token_id = blockIdx.x;
+        access_id_in_token = threadIdx.x;
+        token_stride = gridDim.x;
+#endif
+        access_id = token_id * params.hidden_dim / kElemsPerAccess<DType> + access_id_in_token;
+        access_stride = token_stride * params.hidden_dim / kElemsPerAccess<DType>;
+        tot_access = params.size / kElemsPerAccess<DType>;
+    }
+
+    int token_id;
+    int access_id_in_token;
+    int token_stride;
+    int access_id;
+    int access_stride;
+    int tot_access;
+};
+
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
 __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams params)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-    cg::grid_group grid = cg::this_grid();
-    int token_id = grid.cluster_rank();
-    int access_id_in_token = cluster.thread_rank();
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int token_stride = grid.num_clusters();
-    int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
-    int tot_access = params.size / kElemsPerAccess;
+    IndexHelper<DType> index_helper(params);
+    int token_id = index_helper.token_id;
+    int access_id_in_token = index_helper.access_id_in_token;
+    int token_stride = index_helper.token_stride;
+    int access_id = index_helper.access_id;
+    int access_stride = index_helper.access_stride;
+    int tot_access = index_helper.tot_access;
     float4 clear_vec = get_neg_zero();
+    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+#endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = comm.clear_size / kElemsPerAccess;
+    int clear_access = comm.clear_size / kElemsPerAccess<DType>;
 
-    // Persistent Kernel
-    // Each cluster iterate through all token it need to handle
     for (int idx = access_id; idx < tot_access; idx += access_stride)
     {
-        // LDG.128
         float val[4];
         *reinterpret_cast<float4*>(val) = reinterpret_cast<float4*>(params.allreduce_in)[idx];
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kElemsPerAccess<DType> / sizeof(float); ++i)
         {
             if (is_neg_zero(val[i]))
             {
@@ -364,21 +460,20 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
 #pragma unroll
         for (int r = 0; r < NRanks; ++r)
         {
-            // STG.128 to remote rank
+            // Push data to other ranks
             reinterpret_cast<float4*>(comm.data_bufs[r])[params.rank * tot_access + idx]
                 = *reinterpret_cast<float4*>(val);
         }
     }
     for (int idx = access_id; idx < clear_access; idx += access_stride)
     {
-        // Clear previous buffer
+        // Clear comm buffer that previous kernel used
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
 
-    // Persistent Kernel
-    // Each cluster iterate through all token it need to handle
     for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
     {
+        fused_op.prefetch(idx);
         float4 vals[NRanks];
         bool done = false;
         while (!done)
@@ -394,81 +489,46 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
             }
         }
         float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+        fused_op(sum_val, tidx);
     }
     comm.update(params.size * NRanks);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_oneshot_sync(AllReduceFusionParams params)
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+__global__ void allreduce_fusion_kernel_twoshot_sync(
+    AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
+    IndexHelper<DType> index_helper(params);
+    int token_id = index_helper.token_id;
+    int access_id_in_token = index_helper.access_id_in_token;
+    int token_stride = index_helper.token_stride;
+    int access_id = index_helper.access_id;
+    int access_stride = index_helper.access_stride;
+    int tot_access = index_helper.tot_access;
+    FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-
-    int token_id = blockIdx.x / cluster.num_blocks();
-    int access_id_in_token = cluster.block_rank() * blockDim.x + threadIdx.x;
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int token_stride = gridDim.x / cluster.num_blocks();
-    int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
-    int tot_access = params.size / kElemsPerAccess;
     cudaGridDependencySynchronize();
-    SyncComm<NRanks> comm(params.workspace);
-    for (int idx = access_id; idx < tot_access; idx += access_stride)
-    {
-        float4 val;
-        val = reinterpret_cast<float4*>(params.allreduce_in)[idx];
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r)
-        {
-            reinterpret_cast<float4*>(comm.comm_bufs[r])[params.rank * tot_access + idx] = val;
-        }
-    }
-    Barrier<NRanks> barrier(params.rank, comm);
-    barrier.sync();
-    for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
-    {
-        float4 vals[NRanks];
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r)
-        {
-            vals[r] = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[r * tot_access + idx];
-        }
-        float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
-    }
-    comm.update(barrier.m_flag_value);
-    cudaTriggerProgrammaticLaunchCompletion();
 #endif
-}
-
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams params, int begin_token, int token_num)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-
-    int token_id = blockIdx.x / cluster.num_blocks();
-    int access_id_in_token = cluster.block_rank() * blockDim.x + threadIdx.x;
-    int access_id = token_id * params.hidden_dim / kElemsPerAccess + access_id_in_token;
-    int token_stride = gridDim.x / cluster.num_blocks();
-    int access_stride = token_stride * params.hidden_dim / kElemsPerAccess;
-    int tot_access = params.size / kElemsPerAccess;
-    cudaGridDependencySynchronize();
     SyncComm<NRanks> comm(params.workspace);
-    for (int idx = access_id; idx < tot_access; idx += access_stride)
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r)
     {
-        float4 val;
-        val = reinterpret_cast<float4*>(params.allreduce_in)[idx];
-        reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] = val;
+        int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess<DType>;
+        int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess<DType>;
+        for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
+        {
+            reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx]
+                = reinterpret_cast<float4*>(params.allreduce_in)[idx];
+        }
     }
     Barrier<NRanks> barrier(params.rank, comm);
     barrier.sync();
-    int comm_access_id = access_id + begin_token * params.hidden_dim / kElemsPerAccess;
-    int comm_tot_access = (begin_token + token_num) * params.hidden_dim / kElemsPerAccess;
+    int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / kElemsPerAccess<DType>;
+    int comm_tot_access
+        = (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / kElemsPerAccess<DType>;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride)
     {
         float4 vals[NRanks];
@@ -485,12 +545,22 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams param
         }
     }
     barrier.sync();
-    for (int idx = access_id, tidx = token_id; idx < tot_access; idx += access_stride, tidx += token_stride)
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r)
     {
-        float4 sum_val = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[tot_access + idx];
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+        int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / kElemsPerAccess<DType>;
+        int comm_token_id = token_id + begin_tokens[r];
+        int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / kElemsPerAccess<DType>;
+        for (int idx = comm_access_id, tidx = comm_token_id; idx < comm_tot_access;
+             idx += access_stride, tidx += token_stride)
+        {
+            fused_op.prefetch(idx);
+            float4 sum_val = reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[tot_access + idx];
+            fused_op(sum_val, tidx);
+        }
     }
     comm.update(barrier.m_flag_value);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -509,26 +579,19 @@ int get_sm_count()
     return sm_count;
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
 void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &cfg, allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>, params));
+    TLLM_CUDA_CHECK(
+        cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>, params));
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-void launch_oneshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg,
+    std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &cfg, allreduce_fusion_kernel_oneshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>, params));
-}
-
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
-void launch_twoshot_sync(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg, int begin_token, int token_num)
-{
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
-        allreduce_fusion_kernel_twoshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>, params,
-        begin_token, token_num));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_twoshot_sync<Pattern, DType, NRanks, Fp32Acc>,
+        params, begin_tokens, token_num_per_ranks));
 }
 
 bool use_oneshot(int token_num)
@@ -536,37 +599,51 @@ bool use_oneshot(int token_num)
     return token_num <= kOneShotMaxToken;
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
 void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 {
+    static int SM = tensorrt_llm::common::getSMVersion();
     int token_num = params.size / params.hidden_dim;
     bool oneshot = use_oneshot(token_num);
     int cluster_num = token_num;
-    int begin_token = 0;
+    std::array<int, NRanks> begin_tokens, token_num_per_ranks;
     if (!oneshot)
     {
         int remaining_token = token_num % NRanks;
-        token_num = token_num / NRanks;
-        cluster_num = token_num;
+        int token_num_per_rank = token_num / NRanks;
+        cluster_num = token_num_per_rank;
         if (remaining_token)
         {
             cluster_num++;
         }
-        begin_token = params.rank * token_num;
-        begin_token += remaining_token > params.rank ? params.rank : remaining_token;
-        if (remaining_token > params.rank)
+        for (int r = 0; r < NRanks; ++r)
         {
-            ++token_num;
+            begin_tokens[r] = r * token_num_per_rank + (remaining_token > r ? r : remaining_token);
+            token_num_per_ranks[r] = token_num_per_rank + (remaining_token > r ? 1 : 0);
         }
     }
-    int threads_per_token = params.hidden_dim / kElemsPerAccess;
+    int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
     int warps_per_token = (threads_per_token + 31) / 32;
-    int cluster_size = 8;
-    while (warps_per_token % cluster_size != 0)
+    int cluster_size;
+    if (SM >= 90)
+    {
+        cluster_size = 8;
+    }
+    else
+    {
+        cluster_size = 1;
+    }
+    while (warps_per_token % cluster_size != 0 && cluster_size > 1)
     {
         cluster_size /= 2;
     }
-    int block_size = warps_per_token / cluster_size * 32;
+    int warps_per_block = warps_per_token / cluster_size;
+    while (warps_per_block < 4 && cluster_size >= 2)
+    {
+        warps_per_block *= 2;
+        cluster_size /= 2;
+    }
+    int block_size = warps_per_block * 32;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
@@ -583,87 +660,106 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     attribute[1].val.clusterDim.y = 1;
     attribute[1].val.clusterDim.z = 1;
     cfg.attrs = attribute;
-    cfg.numAttrs = 2;
+    cfg.numAttrs = SM >= 90 ? 2 : 0;
     if (oneshot)
     {
-        launch_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(params, cfg);
-        // launch_oneshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(params, cfg);
+        launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>(params, cfg);
     }
     else
     {
-        launch_twoshot_sync<DType, NRanks, ResidualOut, NormOut, QuantOut, Fp32Acc>(
-            params, cfg, begin_token, token_num);
+        launch_twoshot_sync<Pattern, DType, NRanks, Fp32Acc>(params, cfg, begin_tokens, token_num_per_ranks);
     }
 }
 
 bool use_fp32_acc()
 {
-    static char* allReduceFusionKernelFp16Acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP16");
-    bool fp32_acc = (allReduceFusionKernelFp16Acc == nullptr);
-    return fp32_acc;
+    // we use fp16 acc type by default due to keep align with nccl
+    static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
+    return fp32_acc != nullptr;
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
 {
-#define DISPATCH1(DType, NRanks, ResidualOut, NormOut, QuantOut)                                                       \
-    if (fp32_acc)                                                                                                      \
+#define DISPATCH_ACC_TYPE(DType, Pattern, NRanks)                                                                      \
+    if constexpr (std::is_same_v<DType, float>)                                                                        \
     {                                                                                                                  \
-        return allreduce_fusion_kernel_launcher<DType, NRanks, ResidualOut, NormOut, QuantOut, true>(params);          \
+        return allreduce_fusion_kernel_launcher<Pattern, DType, NRanks, false>(params);                                \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        return allreduce_fusion_kernel_launcher<DType, NRanks, ResidualOut, NormOut, QuantOut, false>(params);         \
+        if (fp32_acc)                                                                                                  \
+        {                                                                                                              \
+            return allreduce_fusion_kernel_launcher<Pattern, DType, NRanks, true>(params);                             \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            return allreduce_fusion_kernel_launcher<Pattern, DType, NRanks, false>(params);                            \
+        }                                                                                                              \
     }
 
-#define DISPATCH0(NRanks, ResidualOut, NormOut, QuantOut)                                                              \
-    if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kHALF)                                          \
+#define DISPATCH_PATTERN(DType, NRanks)                                                                                \
+    if (params.pattern == AllReduceFusionPattern::kAllReduce)                                                          \
     {                                                                                                                  \
-        DISPATCH1(half, NRanks, ResidualOut, NormOut, QuantOut);                                                       \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                                          \
     }                                                                                                                  \
-    else if (params.nranks == NRanks && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNorm)                                             \
     {                                                                                                                  \
-        DISPATCH1(__nv_bfloat16, NRanks, ResidualOut, NormOut, QuantOut);                                              \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNorm, NRanks);                                  \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP8Quant)                                     \
+    {                                                                                                                  \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP8Quant, NRanks);                          \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormFP4Quant)                                     \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<DType, float>)                                                                   \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormFP4Quant, NRanks);                      \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false,                                                                                \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormFP4Quant can not work with "        \
+                "DType=float!");                                                                                       \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \
+    }
+
+#define DISPATCH_DTYPE(NRanks)                                                                                         \
+    if (params.dtype == nvinfer1::DataType::kHALF)                                                                     \
+    {                                                                                                                  \
+        DISPATCH_PATTERN(half, NRanks);                                                                                \
+    }                                                                                                                  \
+    else if (params.dtype == nvinfer1::DataType::kBF16)                                                                \
+    {                                                                                                                  \
+        DISPATCH_PATTERN(__nv_bfloat16, NRanks);                                                                       \
+    }                                                                                                                  \
+    else if (params.dtype == nvinfer1::DataType::kFLOAT)                                                               \
+    {                                                                                                                  \
+        DISPATCH_PATTERN(float, NRanks);                                                                               \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported dtype!");                                    \
+    }
+
+#define DISPATCH_RANKS(NRanks)                                                                                         \
+    if (params.nranks == NRanks)                                                                                       \
+    {                                                                                                                  \
+        DISPATCH_DTYPE(NRanks);                                                                                        \
     }
 
     TLLM_CHECK(params.allreduce_in && params.residual_in && params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     bool fp32_acc = use_fp32_acc();
-    if (params.residual_out && !params.norm_out && params.quant_out)
-    {
-        // pattern1: AR+Add_RMS+Quant
-        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-        // [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-        DISPATCH0(2, true, false, true);
-        DISPATCH0(4, true, false, true);
-        DISPATCH0(8, true, false, true);
-        DISPATCH0(16, true, false, true);
-    }
-    else if (!params.residual_out && params.norm_out && !params.quant_out)
-    {
-        // pattern2: AR+AddRMS
-        // [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-        // [m, 7168] bf16 norm_out
-        DISPATCH0(2, false, true, false);
-        DISPATCH0(4, false, true, false);
-        DISPATCH0(8, false, true, false);
-        DISPATCH0(16, false, true, false);
-    }
-    else if (params.residual_out && params.norm_out && !params.quant_out)
-    {
-        DISPATCH0(2, true, true, false);
-        DISPATCH0(4, true, true, false);
-        DISPATCH0(8, true, true, false);
-        DISPATCH0(16, true, true, false);
-    }
-    else if (params.residual_out && params.norm_out && params.quant_out)
-    {
-        // for test
-        DISPATCH0(2, true, true, true);
-        DISPATCH0(4, true, true, true);
-        DISPATCH0(8, true, true, true);
-        DISPATCH0(16, true, true, true);
-    }
-    TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");
+    DISPATCH_RANKS(2);
+    DISPATCH_RANKS(4);
+    DISPATCH_RANKS(8);
+    DISPATCH_RANKS(16);
+    TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
 
 __global__ void lamport_initialize_kernel(float* ptr, int size)

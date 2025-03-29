@@ -25,17 +25,72 @@
 
 namespace tensorrt_llm::kernels::ar_fusion
 {
-static constexpr int kElemsPerAccess = 8;
+template <typename DType>
+struct ElemsPerAccess;
+
+template <>
+struct ElemsPerAccess<half>
+{
+    static constexpr int value = 8;
+};
+
+template <>
+struct ElemsPerAccess<nv_bfloat16>
+{
+    static constexpr int value = 8;
+};
+
+template <>
+struct ElemsPerAccess<float>
+{
+    static constexpr int value = 4;
+};
+
+template <typename DType>
+static constexpr int kElemsPerAccess = ElemsPerAccess<DType>::value;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 
-// DS R1
-// pattern1: AR+Add_RMS+Quant
-// [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-// [m, 7168] bf16 residual_out, [m, 7168] fp4 quant_out
-// pattern2: AR+AddRMS
-// [m, 7168] bf16 allreduce_in, [m, 7168] bf16 residual_in
-// [m, 7168] bf16 norm_out
+enum class AllReduceFusionPattern : int
+{
+    kAllReduce = 0,
+    kARResidualRMSNorm = 1,
+    kARResidualRMSNormFP8Quant = 2,
+    kARResidualRMSNormFP4Quant = 3,
+};
+
+enum class QuantType : int
+{
+    kNone = 0,
+    kFP8 = 1,
+    kFP4 = 2,
+};
+
+template <AllReduceFusionPattern Pattern>
+struct FusionPatternTraits;
+
+#define DEFINE_FUSION_PATTERN_TRAITS(pattern, hasResidual, hasRMSNorm, quantType)                                      \
+    template <>                                                                                                        \
+    struct FusionPatternTraits<pattern>                                                                                \
+    {                                                                                                                  \
+        static constexpr bool kHasResidual = hasResidual;                                                              \
+        static constexpr bool kHasRMSNorm = hasRMSNorm;                                                                \
+        static constexpr QuantType kQuantType = quantType;                                                             \
+    };
+
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduce, false, false, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNorm, true, true, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP8Quant, true, true, QuantType::kFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP4Quant, true, true, QuantType::kFP4);
+#undef DEFINE_FUSION_PATTERN_TRAITS
+
+template <AllReduceFusionPattern Pattern>
+constexpr bool HasResidual = FusionPatternTraits<Pattern>::kHasResidual;
+template <AllReduceFusionPattern Pattern>
+constexpr bool HasRMSNorm = FusionPatternTraits<Pattern>::kHasRMSNorm;
+template <AllReduceFusionPattern Pattern>
+constexpr QuantType GetQuantType = FusionPatternTraits<Pattern>::kQuantType;
+
 struct AllReduceFusionParams
 {
     int nranks;
@@ -54,6 +109,7 @@ struct AllReduceFusionParams
     float rms_eps;
     float* scale_factor;
     cudaStream_t stream;
+    AllReduceFusionPattern pattern;
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
