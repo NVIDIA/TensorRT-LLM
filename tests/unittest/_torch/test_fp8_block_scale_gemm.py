@@ -32,7 +32,7 @@ from utils.util import getSMVersion
 )
 @pytest.mark.parametrize(
     "m",
-    [64, 128, 4096],
+    [7, 64, 128, 4096],
 )
 @pytest.mark.parametrize(
     "dtype",
