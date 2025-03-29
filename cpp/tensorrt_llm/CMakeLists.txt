@@ -299,63 +299,15 @@ else()
   add_custom_target(check_symbol_executor)
 endif()
 
-set(NVRTC_WRAPPER_TARGET tensorrt_llm_nvrtc_wrapper)
-set(NVRTC_WRAPPER_TARGET_ARCH ${TARGET_ARCH})
-
-if(BUILD_NVRTC_WRAPPER)
-  add_subdirectory(
-    kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper)
-else()
-  add_library(${NVRTC_WRAPPER_TARGET} SHARED IMPORTED)
-  if(NOT WIN32) # Linux
-    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/libtensorrt_llm_nvrtc_wrapper.so"
-    )
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
-    )
-  else()
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_DIR
-        "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
-    )
-    set(NVRTC_WRAPPER_DLL_NAME "tensorrt_llm_nvrtc_wrapper.dll")
-    set(NVRTC_WRAPPER_LIB_NAME "tensorrt_llm_nvrtc_wrapper.lib")
-
-    set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_DLL_NAME}"
-    )
-    set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_DLL_NAME}")
-    set(NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_LIB_NAME}"
-    )
-    set(NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC
-        "${NVRTC_WRAPPER_LIB_BINARY_REL_DIR}/${NVRTC_WRAPPER_LIB_NAME}")
-  endif()
-  set(NVRTC_WRAPPER_LIB_LOC
-      "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}")
-  # Copy the .so to build directory, which is needed in build_wheel.py.
-  configure_file(${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}
-                 ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
-  set_property(TARGET ${NVRTC_WRAPPER_TARGET} PROPERTY IMPORTED_LOCATION
-                                                       ${NVRTC_WRAPPER_LIB_LOC})
-  if(WIN32)
-    set(NVRTC_WRAPPER_IMPLIB_LOC
-        "${CMAKE_CURRENT_SOURCE_DIR}/${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}")
-    configure_file(${NVRTC_WRAPPER_IMPLIB_SOURCE_REL_LOC}
-                   ${NVRTC_WRAPPER_IMPLIB_BINARY_REL_LOC} COPYONLY)
-    set_property(TARGET ${NVRTC_WRAPPER_TARGET}
-                 PROPERTY IMPORTED_IMPLIB ${NVRTC_WRAPPER_IMPLIB_LOC})
-  endif()
-
-  file(SIZE ${NVRTC_WRAPPER_LIB_LOC} NVRTC_WRAPPER_LIB_SIZE)
-  if(NVRTC_WRAPPER_LIB_SIZE LESS 1024)
-    message(
-      FATAL_ERROR
-        "The nvrtc wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
-    )
-  endif()
-endif()
+set(NVRTC_WRAPPER_LIB_SOURCE_REL_LOC
+    "${tensorrt_llm_nvrtc_wrapper_PACKAGE_FOLDER_RELEASE}/lib/libtensorrt_llm_nvrtc_wrapper.so"
+)
+set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
+    "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
+)
+# Copy the .so to build directory, which is needed in build_wheel.py.
+configure_file(${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}
+               ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
 
 set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
@@ -449,7 +401,9 @@ if(NOT WIN32)
                                                     "-Wl,-rpath='$ORIGIN'")
 endif()
 
-target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
+target_link_libraries(
+  ${SHARED_TARGET}
+  PUBLIC tensorrt_llm_nvrtc_wrapper::tensorrt_llm_nvrtc_wrapper)
 
 add_dependencies(${SHARED_TARGET} check_symbol)
 add_dependencies(${SHARED_TARGET} check_symbol_executor)
