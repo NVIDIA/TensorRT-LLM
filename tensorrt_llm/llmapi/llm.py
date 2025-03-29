@@ -510,6 +510,9 @@ class LLM:
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
+            if self.args._pretrained_config.runtime_defaults is not None:
+                executor_config.kv_cache_config.fill_empty_fields_from_runtime_defaults(
+                    self.args._pretrained_config.runtime_defaults)
         if self.args.peft_cache_config is not None:
             executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
