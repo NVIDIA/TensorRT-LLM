@@ -59,7 +59,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     auto const& decoderStream = decoder.getDecoderStream();
     BufferManager manager{decoderStream};
 
-    auto const& decoderState = decoder.getDecoderState();
+    auto& decoderState = decoder.getDecoderState();
 
     auto const& jointOutputIdsShape = decoderState.getJointDecodingOutput().ids->getShape();
     auto const batchSize = jointOutputIdsShape.d[0];
@@ -87,7 +87,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     auto& dJointInput = decoderState.getJointDecodingInput();
 
     dJointInput.beamWidths.at(batchSlot) = beamWidth;
-    dJointInput.numDecodingEngineTokens.at(batchSlot) = numDecodingEngineTokens;
+    decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, *decoderStream);
