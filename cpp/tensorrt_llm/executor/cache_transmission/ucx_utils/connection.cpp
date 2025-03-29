@@ -15,26 +15,137 @@
  * limitations under the License.
  */
 
+#include "ucxCacheCommunicator.h"
 #if ENABLE_UCX
 
+#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-
-std::unique_ptr<ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm)
+UcxConnection::UcxConnection(
+    uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager, bool fromRequester)
+    : mConnectionId(connectionId)
+    , mEndpoint(std::move(endpoint))
+    , mManager(manager)
+    , mFromRequester(fromRequester)
 {
-    return nullptr;
+
+    if (mFromRequester)
+    {
+        std::shared_ptr<ucxx::Request> request
+            = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
+        while (!request->isCompleted())
+            ;
+        request->checkError();
+
+        request
+            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
+        while (!request->isCompleted())
+            ;
+        request->checkError();
+    }
+    else
+    {
+        std::shared_ptr<ucxx::Request> request
+            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
+        while (!request->isCompleted())
+            ;
+        request->checkError();
+        request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
+        while (!request->isCompleted())
+            ;
+        request->checkError();
+    }
+
+    mSendTagPrefix = mConnectionIdInPeer;
+    mRecvTagPrefix = mConnectionId;
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "UcxConnection::UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
 }
 
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
+UcxConnection::~UcxConnection()
+{
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+    // TODO: how to close the endpoint safely?
+
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "END UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
+        mConnectionId, mConnectionIdInPeer, mFromRequester);
+}
+
+void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, size_t size) const
+{
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
+        mConnectionId, mConnectionIdInPeer, mFromRequester);
+    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+
+    uint64_t tag
+        = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | static_cast<uint64_t>(batch_manager::TransceiverTag::kID_TAG);
+    // uint64_t data = mConnectionIdInPeer;
+    std::vector<char> buffer(size + sizeof(uint64_t));
+    memcpy(buffer.data(), data, size);
+    memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
+    auto req = mEndpoint->tagSend(buffer.data(), buffer.size(), ucxx::Tag(tag), false, completionCallback);
+    std::unique_lock<std::mutex> lk(mMtx);
+    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    req->checkError();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "end UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
+        mConnectionId, mConnectionIdInPeer, mFromRequester);
+}
+
+void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
+{
+    if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
+    {
+        sendConnectionId(ctx, data, size);
+        return;
+    }
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+
+    TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
+    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
+
+    auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
+    std::unique_lock<std::mutex> lk(mMtx);
+    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    // throw if there is error
+    req->checkError();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+}
+
+void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
+{
+    // Guard to ensure CUDA context is initialized for UCX ops
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+    TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
+    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
+    auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
+    std::unique_lock<std::mutex> lk(mMtx);
+    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    // throw if there is error
+    req->checkError();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+}
 
 } // namespace tensorrt_llm::executor::kv_cache
 

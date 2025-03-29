@@ -144,6 +144,37 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
                 mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
     }
+    else if (mCommType == CommType::UCX)
+    {
+        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+        {
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
+            *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
+            mManager = makeUcxConnectionManager();
+        }
+        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
+        mDataResponder = isMLA
+            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
+            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
+        mDataRequester = isMLA
+            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
+            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
+    }
     else
     {
         TLLM_THROW("Unsupported communication type.");
