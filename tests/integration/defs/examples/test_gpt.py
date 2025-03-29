@@ -1579,6 +1579,62 @@ def test_llm_minitron(gpt_example_root, minitron_model_root, llm_datasets_root,
             ])
 
 
+@pytest.mark.parametrize("nemotron_mini_4b_model_root",
+                         ["nemotron_mini_4b_prequantized_fp8_bfloat16"],
+                         indirect=True)
+def test_llm_nemotron_mini_4b_model_root(gpt_example_root,
+                                         nemotron_mini_4b_model_root,
+                                         llm_datasets_root,
+                                         llm_rouge_root,
+                                         llm_venv,
+                                         cmodel_dir,
+                                         engine_dir,
+                                         dtype='bfloat16',
+                                         qformat='fp8'):
+    skip_fp8_pre_ada(qformat == 'fp8')
+    "Build & Run GPT2 variant Nemotron Mini on single gpu"
+
+    print(f"Converting checkpoint...")
+    ckpt_dir = convert_weights(llm_venv=llm_venv,
+                               example_root=gpt_example_root,
+                               cmodel_dir=cmodel_dir,
+                               model="gpt2-minitron",
+                               model_path=nemotron_mini_4b_model_root,
+                               data_type=dtype,
+                               gpus=1,
+                               tp_size=1)
+
+    print("Building engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={ckpt_dir}",
+        f"--output_dir={engine_dir}",
+        f"--max_batch_size={1}",
+        f"--max_input_len={1024}",
+        f"--max_seq_len={1024}",
+        f"--gpt_attention_plugin={dtype}",
+        "--context_fmha=enable",
+        f"--gemm_plugin={dtype}",
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+
+    print('Run Nemotron Mini...')
+    venv_mpi_check_call(
+        llm_venv,
+        parse_mpi_cmd(
+            ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "1"]), [
+                f"{gpt_example_root}/../summarize.py", "--batch_size=1",
+                f"--engine_dir={engine_dir}", "--test_trt_llm",
+                "--check_accuracy", "--eval_task", "code_completion",
+                "--hf_model_dir", nemotron_mini_4b_model_root,
+                "--no_add_special_tokens", "--max_attention_window_size=4096",
+                "--tensorrt_llm_rouge1_threshold=29",
+                f"--dataset_dir={llm_datasets_root}",
+                f"--rouge_dir={llm_rouge_root}"
+            ])
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("embedding_sharding_dim", [0, 1])
 @pytest.mark.parametrize("dtype", ["float16"])
