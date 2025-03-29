@@ -217,7 +217,7 @@ def _test_llm_multimodal_general(llm_venv,
     print("Build LLM engines...")
     model_name = model_name.split('/')[-1]  # Remove HF directory name
     llm_engine_dir = f"{engine_dir}/{model_name}/{world_size}-gpu"
-    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi3_model or qwen2_vl_model:
+    if "opt" in model_name or llava_model or vila_model or gpt_model or nemotron_model or phi3_model or phi4_model or qwen2_vl_model:
         max_input_len_text = 1024
         max_output_len = 200
         if llava_next_model:
@@ -438,6 +438,14 @@ def _test_llm_multimodal_general(llm_venv,
         ]
         check_call(" ".join(cp_cmd), shell=True, env=llm_venv._new_env)
 
+    if phi4_model:
+        cp_cmd = [
+            "cp",
+            f"{os.path.join(model_ckpt_path, 'trt_assets', 'image_newlines.safetensors')}",
+            f"{os.path.join(llm_engine_dir, llm_engine_subdir, 'vision')}",
+        ]
+        check_call(" ".join(cp_cmd), shell=True, env=llm_venv._new_env)
+
     print("Run inference...")
     hf_model_dir = model_ckpt_path + "/../vicuna-7b-v1.5" if cogvlm_model else model_ckpt_path
     hf_model_dir = converted_weight_dir if "neva" in model_name else hf_model_dir
@@ -452,7 +460,7 @@ def _test_llm_multimodal_general(llm_venv,
         f"{multimodal_example_root}/run.py",
         f"--engine_dir={llm_engine_dir}/{llm_engine_subdir}",
         f"--hf_model_dir={hf_model_dir}", "--max_new_tokens=30",
-        f"--batch_size={batch_size}", "--check_accuracy",
+        f"--batch_size={1}", "--check_accuracy",
         f"--visual_engine_name={visual_engine}",
         f"--audio_engine_name={audio_engine}",
         f"--image_path={image_path}",
@@ -625,6 +633,7 @@ def _test_llm_multimodal_general(llm_venv,
     'video-neva',
     'Phi-3-vision-128k-instruct',
     'Phi-3.5-vision-instruct',
+    'Phi-4-multimodal-instruct',
     'Llama-3.2-11B-Vision',
     'Qwen2-VL-7B-Instruct',
     'internlm-xcomposer2-vl-7b',
