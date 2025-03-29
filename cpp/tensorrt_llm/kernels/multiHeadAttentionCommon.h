@@ -24,6 +24,8 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+
+// Change to this enum must sync with nvrtcWrapper.cpp in internal kernel repo
 enum Data_type
 {
     DATA_TYPE_BOOL,
