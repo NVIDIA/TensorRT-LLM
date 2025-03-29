@@ -261,11 +261,11 @@ public:
                 TLLM_CHECK(mAffine);
                 TLLM_CHECK(!mBias);
                 TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
-                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_launcher(ub_buffer0.handle, 0, size,
-                    hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle,
+                    0, size, hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
                 auto dt = input.scalar_type();
                 finalOutput = torch::from_blob(
-                    ub_buffer0.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
+                    ub_buffer1.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
             }
         }
         else if (runtimeStrategy == AllReduceStrategyType::NCCL)

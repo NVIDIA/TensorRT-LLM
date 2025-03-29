@@ -142,8 +142,9 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             residual=c,
             norm_weight=gamma,
             eps=eps)
-        res, residual = ar.forward(hidden, all_reduce_params=ar_params)
-        residual = userbuffers_allreduce_finalize(residual, True)
+        res_ub, residual = ar.forward(hidden, all_reduce_params=ar_params)
+        res = res_ub.clone()
+        residual = userbuffers_allreduce_finalize(residual, False)
 
         torch.cuda.synchronize()
         if rank == 0:
