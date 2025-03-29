@@ -107,6 +107,8 @@ def testFilter = [
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
+String githubPrApiUrl = gitlabParamsFromBot.get('github_pr_api_url', null)
+
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
@@ -276,7 +278,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def setupPipelineEnvironment(pipeline, testFilter)
+def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl)
 {
     setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
@@ -294,7 +296,7 @@ def setupPipelineEnvironment(pipeline, testFilter)
         }
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter)
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
     })
 }
 
@@ -364,7 +366,7 @@ def launchReleaseCheck(pipeline)
     })
 }
 
-def getMergeRequestChangedFileList(pipeline) {
+def getMergeRequestChangedFileListGitlab(pipeline) {
     def changedFileList = []
     def pageId = 0
     withCredentials([
@@ -378,7 +380,10 @@ def getMergeRequestChangedFileList(pipeline) {
         while(true) {
             pageId += 1
             def rawDataJson = pipeline.sh(
-                script: "curl --header \"PRIVATE-TOKEN: $GITLAB_API_TOKEN\" --url \"https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20\"",
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
                 returnStdout: true
             )
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
@@ -393,7 +398,52 @@ def getMergeRequestChangedFileList(pipeline) {
     return changedFileList
 }
 
-def getMultiGpuFileChanged(pipeline, testFilter)
+def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
+    def changedFileList = []
+    def pageId = 0
+    withCredentials([
+        string(
+            credentialsId: 'github-token-trtllm-ci',
+            variable: 'GITHUB_API_TOKEN'
+        ),
+    ]) {
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "Authorization: Bearer $GITHUB_API_TOKEN" \
+                         --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            echo "rawDataJson: ${rawDataJson}"
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            rawDataList.each { rawData ->
+                changedFileList += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+            }
+            if (!rawDataList) { break }
+        }
+    }
+    def changedFileListStr = changedFileList.join(",\n")
+    pipeline.echo("The changeset of this PR is: ${changedFileListStr}.")
+    return changedFileList
+}
+
+def getMergeRequestChangedFileList(pipeline, githubPrApiUrl) {
+    try {
+        if (githubPrApiUrl != null) {
+            return getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+        }
+        return getMergeRequestChangedFileListGitlab(pipeline)
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
+        return []
+    }
+}
+
+def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         pipeline.echo("Force not run multi-GPU testing.")
@@ -459,7 +509,7 @@ def getMultiGpuFileChanged(pipeline, testFilter)
     def changedFileList = ","
     def relatedFileChanged = false
     try {
-        changedFileList = getMergeRequestChangedFileList(pipeline).join(", ")
+        changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl).join(", ")
         relatedFileChanged = relatedFileList.any { it ->
             if (changedFileList.contains(it)) {
                 return true
@@ -472,7 +522,7 @@ def getMultiGpuFileChanged(pipeline, testFilter)
     }
     catch (Exception e)
     {
-        pipeline.echo("getMultiGpuFileChanged failed execution.")
+        pipeline.echo("getMultiGpuFileChanged failed execution. Error: ${e.toString()}")
     }
     if (relatedFileChanged) {
         pipeline.echo("Detect multi-GPU related files changed.")
@@ -829,7 +879,7 @@ pipeline {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter)
+                    setupPipelineEnvironment(this, testFilter, githubPrApiUrl)
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
