@@ -65,6 +65,10 @@ class MoERunner(TunableRunner):
         return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
                 self.top_k, self.ep_size)
 
+    def get_specific_profile(self, inputs: List[torch.Tensor]):
+        x, fc2_expert_weights = inputs
+        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape, self.top_k, self.ep_size)
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],

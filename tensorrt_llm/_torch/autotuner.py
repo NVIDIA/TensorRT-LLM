@@ -191,7 +191,7 @@ class AutoTunerStatistics:
         tuned_op_successful_configs (Dict[str, int]): Successful configurations per operation
     """
     cache_misses: int = 0
-    cache_miss_config_collection: Dict[str, Set[OptimizationProfile]] = field(
+    cache_miss_config_collection: Dict[str, Set[tuple]] = field(
         default_factory=dict)
     failed_profiling_count: Dict[str, Set[Tuple[str, TunableRunner,
                                                 OptimizationProfile]]] = field(
@@ -265,16 +265,22 @@ class AutoTuner:
 
     def search_cache(
         self, custom_op: str, runners: List[TunableRunner],
-        profile: OptimizationProfile
+        profile: OptimizationProfile, inputs: List[torch.Tensor],
+        tuning_config: TuningConfig
     ) -> Tuple[bool, TunableRunner, int, OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
         """
         for r in runners:
-            cache_key = self.get_cache_key(custom_op, r, profile)
+            if not hasattr(r, "get_specific_profile"):
+                found_profile = self._find_nearest_profile(tuning_config.dynamic_tensors, tuning_config.constraints, inputs)
+                cache_key = self.get_cache_key(custom_op, r, found_profile, inputs)
+            else:
+                cache_key = self.get_cache_key(custom_op, r, None, inputs)
+
             if cache_key in self.profiling_cache:
                 return True, *self.profiling_cache[cache_key]
 
-        return False, runners[0], -1, profile
+        return False, runners[0], -1, None
 
     def choose_one(self, custom_op: str, runners: List[TunableRunner],
                    tuning_config: TuningConfig, inputs: List[torch.Tensor],
@@ -300,18 +306,10 @@ class AutoTuner:
             Although runners[0] with tactic=-1 is always treated as the fallback runner.
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
-
-        assert len(runners) > 0, "At least one runner is required"
-        assert all([isinstance(r, TunableRunner) for r in runners]), \
-            "All Given runners must be subclass of TunableRunner"
-
-        profile = self._find_nearest_profile(tuning_config.dynamic_tensors,
-                                             tuning_config.constraints, inputs)
-
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
             is_cache_hit, runner, tactic, stored_profile = self.search_cache(
-                custom_op, runners, profile)
+                custom_op, runners, None, inputs, tuning_config)
 
             # TODO: check the stored runner and tactic can implement this shape here
             # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
@@ -322,13 +320,18 @@ class AutoTuner:
                 self.stats.cache_misses += 1
                 if custom_op not in self.stats.cache_miss_config_collection:
                     self.stats.cache_miss_config_collection[custom_op] = set()
-                self.stats.cache_miss_config_collection[custom_op].add(
-                    profile.get_hash_key())
+                missed_profile = stored_profile.get_hash_key() if stored_profile else tuple(t.shape for t in inputs)
+                self.stats.cache_miss_config_collection[custom_op].add(missed_profile)
+
                 logger.debug(f"[AutoTunner]: Using fallback tactic")
                 assert runner == runners[0] \
                     and tactic == -1, f"Should use fallback runner {runners[0]} and tactic {-1}, but got runner {runner} and tactic {tactic}"
             return runner, tactic
 
+        assert len(runners) > 0, "At least one runner is required"
+        assert all([isinstance(r, TunableRunner) for r in runners]), \
+            "All Given runners must be subclass of TunableRunner"
+        
         profiles = self._optimization_profiles(tuning_config.dynamic_tensors,
                                                tuning_config.constraints,
                                                inputs)
@@ -338,7 +341,7 @@ class AutoTuner:
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, runner, tactic, stored_profile = self.search_cache(
-                custom_op, runners, p)
+                custom_op, runners, p, tensors, tuning_config)
             if not is_cache_hit:
                 min_time = float('inf')
                 # Initialize runner and tactic as None in case of no valid tactic or runners are found
@@ -367,7 +370,7 @@ class AutoTuner:
                                 self.stats.failed_profiling_count[
                                     custom_op] = set()
                             self.stats.failed_profiling_count[custom_op].add(
-                                self.get_cache_key(custom_op, r, p))
+                                self.get_cache_key(custom_op, r, p, tensors))
 
                             # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                             # or some runtime error occurs during profiling.
@@ -377,7 +380,7 @@ class AutoTuner:
                             runner, tactic = r, tac
                 if runner is not None:
                     # At least one valid (runner, tactic) pair is found
-                    cache_key = self.get_cache_key(custom_op, runner, p)
+                    cache_key = self.get_cache_key(custom_op, runner, p, tensors)
                     self.profiling_cache[cache_key] = (runner, tactic, p)
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
@@ -388,7 +391,7 @@ class AutoTuner:
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner, tactic, _ = self.search_cache(custom_op, runners, profile)
+        _, runner, tactic, _ = self.search_cache(custom_op, runners, None, inputs, tuning_config)
 
         return runner, tactic
 
@@ -585,7 +588,7 @@ class AutoTuner:
 
     def get_cache_key(
             self, custom_op: str, runner: TunableRunner,
-            profile: OptimizationProfile) -> Tuple[str, str, Tuple, Tuple]:
+            profile: OptimizationProfile, inputs: List[torch.Tensor]) -> Tuple:
         """Generate a unique cache key for the given custom operation, runner, inputs, and profile.
 
         Args:
@@ -602,6 +605,10 @@ class AutoTuner:
         """
         # TODO: Eliminate the overhead of the cache key creation. env_key has not been added to the cache key yet.
         # NOTE: Attribute names affect the hash order
+
+        if hasattr(runner, "get_specific_profile"):
+            return (custom_op, runner.__class__.__name__, runner.get_specific_profile(inputs))
+
         attributes = {
             k: v
             for k, v in runner.__dict__.items()

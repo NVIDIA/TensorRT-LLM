@@ -64,6 +64,8 @@ def test_fp4_linear(dtype):
     with torch.inference_mode(), autotune():
         output = l_fp4.forward(x)
 
+    output_ref = l_fp4.forward(x)
+
     # ref linear
     with torch.inference_mode():
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
