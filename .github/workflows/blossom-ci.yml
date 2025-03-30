@@ -27,10 +27,6 @@ on:
             description: 'argument'
             required: false
 
-concurrency:
-  group: blossom-${{ github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   Authorization:
     name: Authorization
