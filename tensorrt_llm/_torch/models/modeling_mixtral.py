@@ -8,7 +8,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import ParallelConfig, allgather
+from ..distributed import ParallelConfig
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
@@ -23,13 +23,18 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
 
 class MixtralMoE(nn.Module):
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        aux_stream: torch.cuda.Stream,
+    ):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         # moe gate (linear layer) only runs in half/full precision for now
         self.gate = Linear(self.hidden_dim,
@@ -45,19 +50,26 @@ class MixtralMoE(nn.Module):
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
+            aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            tune_max_num_tokens=config.max_position_embeddings // 4,
             model_config=model_config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.shape[-1] == self.hidden_dim
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
+            max_num_token = max(all_rank_num_tokens)
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
-        return final_hidden_states.view(orig_shape), router_logits
+        final_hidden_states = self.experts(hidden_states, router_logits,
+                                           all_rank_num_tokens)
+        return final_hidden_states
 
 
 class MixtralRotaryEmbedding(RotaryEmbedding):
@@ -105,14 +117,14 @@ class MixtralAttention(Attention):
 class MixtralDecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int):
+                 layer_idx: int, aux_stream: torch.cuda.Stream):
         super().__init__()
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config)
+        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -121,33 +133,12 @@ class MixtralDecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.enable_attention_dp = model_config.mapping.enable_attention_dp
         # TODO: add pipeline parallel config
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size,
             gpus_per_node=model_config.mapping.gpus_per_node)
         self.layer_idx = layer_idx
-
-    def all_gather(self, input_tensor, attn_metadata):
-        rank = self.parallel_config.tensor_parallel_rank
-        world_size = self.parallel_config.tensor_parallel_size
-        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        max_num_token = max(all_rank_num_tokens)
-        if world_size == 1:
-            return input_tensor, 0, max_num_token
-
-        pad_tensor = torch.nn.functional.pad(
-            input_tensor, (0, 0, 0, max_num_token - input_tensor.shape[0]))
-        outputs = allgather(pad_tensor, self.parallel_config, gather_dim=0)
-        depad_tensors = torch.concat([
-            outputs[i * max_num_token:i * max_num_token +
-                    all_rank_num_tokens[i]] for i in range(world_size)
-        ])
-
-        cur_rank_start = 0 if rank == 0 else sum(all_rank_num_tokens[:rank])
-        cur_rank_end = cur_rank_start + all_rank_num_tokens[rank]
-        return depad_tensors, cur_rank_start, cur_rank_end
 
     def forward(
         self,
@@ -175,12 +166,7 @@ class MixtralDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        if self.enable_attention_dp:
-            hidden_states, cur_rank_start, cur_rank_end = self.all_gather(
-                hidden_states, attn_metadata)
-        hidden_states, _router_logits = self.block_sparse_moe(hidden_states)
-        if self.enable_attention_dp:
-            hidden_states = hidden_states[cur_rank_start:cur_rank_end]
+        hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
         return hidden_states, residual
 
 
@@ -191,6 +177,7 @@ class MixtralModel(DecoderModel):
         config = model_config.pretrained_config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = nn.Embedding(config.vocab_size,
                                          config.hidden_size,
@@ -198,7 +185,7 @@ class MixtralModel(DecoderModel):
                                          dtype=config.torch_dtype)
 
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(model_config, layer_idx)
+            MixtralDecoderLayer(model_config, layer_idx, self.aux_stream)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
