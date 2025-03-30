@@ -2,7 +2,8 @@
 
 This guide walks you through the complete process of running the DeepSeek‑v3 model using NVIDIA's TensorRT-LLM framework with the PyTorch backend. It covers everything from downloading the model weights, preparing the dataset and configuration files, to running the throughput benchmark.
 
-> **Note:** This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and docker image.
+> [!NOTE]
+> This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and docker image.
 
 ---
 
@@ -139,7 +140,8 @@ This command writes the dataset to `/workspace/dataset.txt`.
    echo -e "{\"quantization\": {\"quant_algo\": \"FP8_BLOCK_SCALES\", \"kv_cache_quant_algo\": null}}" > <YOUR_MODEL_DIR>/hf_quant_config.json
    ```
 
-> **Tip:** Ensure that the quotes and formatting in the configuration files are correct to avoid issues during runtime.
+> [!TIP]
+> Ensure that the quotes and formatting in the configuration files are correct to avoid issues during runtime.
 
 ---
 
