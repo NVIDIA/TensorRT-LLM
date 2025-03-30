@@ -31,9 +31,6 @@ jobs:
   Authorization:
     name: Authorization
     runs-on: blossom
-    concurrency:
-      group: blossom-${{ github.event.issue.number }}
-      cancel-in-progress: true
     outputs:
       args: ${{ env.args }}
 
