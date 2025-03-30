@@ -26,12 +26,12 @@ l0_a30:
   - test_cpp.py::test_model[gpt-80]
   - test_cpp.py::test_benchmarks[gpt-80]
   # ------------- TRT tests ---------------
-  - unittest/model/test_nemotron_nas.py -k "not fp8"
-  - unittest/model/test_gpt.py -k "partition0" # 10 mins
-  - unittest/model/test_gpt.py -k "partition1" # 10 mins
-  - unittest/model/test_gpt.py -k "partition2" # 10 mins
-  - unittest/model/test_gpt.py -k "partition3" # 10 mins
-  - unittest/model/test_gpt.py -k "other" # 1 mins
+  - unittest/trt/model/test_nemotron_nas.py -k "not fp8"
+  - unittest/trt/model/test_gpt.py -k "partition0" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition1" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition2" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "partition3" # 10 mins
+  - unittest/trt/model/test_gpt.py -k "other" # 1 mins
   - examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]
   - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
@@ -103,9 +103,10 @@ l0_a30:
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
-  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:1] # ? mins
-  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:4] # ? mins
-  - examples/test_exaone.py::test_llm_exaone_2gpu[exaone-float16-nb:1] # ? mins
+  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:1] # ? mins
+  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4] # ? mins
+  - examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_deep_2.4b-float16-nb:4]
+  - examples/test_exaone.py::test_llm_exaone_2gpu[exaone_3.0_7.8b_instruct-float16-nb:1] # ? mins
   - examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] # 5 mins
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs2] # 1 min
   - examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2] # 1 min

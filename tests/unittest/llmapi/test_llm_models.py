@@ -7,7 +7,7 @@ from tensorrt_llm import BuildConfig, SamplingParams
 from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
 # isort: off
-from test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
+from .test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
 from utils.util import (force_ampere, skip_pre_hopper)
 # isort: on
 

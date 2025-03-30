@@ -180,18 +180,9 @@ T maxOfActiveSlots(std::vector<T> const& values, std::vector<bool> const& active
 }
 } // namespace
 
-void GptDecoderBatched::forwardDispatch(
-    decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType)
+void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
-    auto eventStart = CudaEvent{};
-    mRuntimeStream->record(eventStart);
-
-    bool const async = forwardType == ForwardType::kASYNC;
-
-    if (async)
-    {
-        mDecoderStream->wait(eventStart.get());
-    }
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const maxDecodingEngineTokens
         = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
@@ -199,28 +190,34 @@ void GptDecoderBatched::forwardDispatch(
     for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
         prepareForward(si, output, input);
-        forwardDecoder(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput(), forwardType);
+
+        if (mDecoderState->getJointDecodingInput().batchSize > 0)
+        {
+            mDecoder->forwardAsync(mDecoderState->getJointDecodingOutput(), mDecoderState->getJointDecodingInput());
+        }
     }
 
-    if (async)
-    {
-        CudaEvent event{};
-        mDecoderStream->record(event);
-        mRuntimeStream->wait(event);
-    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-GptDecoderBatched::DecoderFinishedEventPtr GptDecoderBatched::forwardAsync(
-    decoder_batch::Output& output, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    forwardDispatch(output, input, ForwardType::kASYNC);
+    auto eventStart = CudaEvent{};
+    mRuntimeStream->record(eventStart);
+    mDecoderStream->wait(eventStart.get());
+
+    forwardDispatch(output, input);
+
+    CudaEvent event{};
+    mDecoderStream->record(event);
+    mRuntimeStream->wait(event);
 
     CudaEvent eventStop{};
     mRuntimeStream->record(eventStop);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_unique<decoder_batch::DecoderFinishedEvent>(std::move(eventStop), input.active);
+    return eventStop;
 }
 
 // TODO(rkobus): produce new input and output
@@ -332,34 +329,11 @@ void GptDecoderBatched::prepareForward(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::forwardDecoder(DecodingOutput& output, DecodingInput const& input, ForwardType forwardType)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (input.batchSize > 0)
-    {
-        if (forwardType == ForwardType::kASYNC)
-        {
-            mDecoder->forwardAsync(output, input);
-        }
-        else if (forwardType == ForwardType::kSYNC)
-        {
-            mDecoder->forwardSync(output, input);
-        }
-        else
-        {
-            TLLM_THROW("Unknown ForwardType");
-        }
-    }
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
 void GptDecoderBatched::forward(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto decoderFinishEvent = forwardAsync(output, input);
-    decoderFinishEvent->event.synchronize();
+    decoderFinishEvent.synchronize();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -416,20 +390,17 @@ std::pair<DecodingInput, DecodingOutput> prepareGatherTree(
 } // namespace
 
 // TODO call this at the end of forward if mFinished[i] changes from false to true?
-CudaEvent GptDecoderBatched::finalize(SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const
+CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+    SamplingConfig const& samplingConfig, bool streaming) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto& stream = mRuntimeStream;
-    auto manager = BufferManager{stream};
+    auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
-    auto [dInput, dOutput] = prepareGatherTree(*mDecoderState, batchSlot, streaming, *stream);
-
-    kernels::gatherTree(dOutput, dInput, manager, samplingConfig);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
 
     CudaEvent event{};
-    stream->record(event);
-    mRuntimeStream->wait(event);
+    mRuntimeStream->record(event);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return event;
 }

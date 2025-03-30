@@ -9,15 +9,14 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, allgather,
-                                             reducescatter)
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.utils import enable_llm_debug
 
-from ...llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           DeepseekAllReduce, ParallelConfig, allgather,
+                           reducescatter)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -263,7 +262,7 @@ class Deepseekv3MoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  tune_max_num_tokens: int = 8192,
                  model_config: ModelConfig = ModelConfig()):
-        from tensorrt_llm._torch.distributed import AllReduce
+        from ..distributed import AllReduce
 
         super().__init__()
         config = model_config.pretrained_config
@@ -484,9 +483,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        # deepseek allreduce kernel is better when m < 512
+        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
-            0) >= 512
+            0) > 128
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -834,11 +833,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-        assert not (
-            model_config.mapping.has_pp()
-            and model_config.mapping.enable_attention_dp
-        ), "Pipeline parallelism and attention DP cannot be used together"
 
         self.model_nextn = 0
         if model_config.spec_config is not None:

@@ -1,13 +1,14 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
 
+from tensorrt_llm.bindings.executor import FinishReason
+
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.decoder import TorchDecoder
-from ..pyexecutor.llm_request import *
-from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
@@ -179,8 +180,7 @@ class MTPDecoder(TorchDecoder):
         if self._meet_max_token_stop_criteria(request,
                                               num_tokens + self.draft_len):
             request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(tllm_executor.FinishReason.LENGTH,
-                                        beam_idx)
+            request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.Tensor],

@@ -41,7 +41,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch"]),
+                 type=click.Choice(["pytorch", "autodeploy"]),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -209,7 +209,7 @@ def throughput_command(
     logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() == "pytorch":
+    if backend and backend.lower() in ["pytorch", "autodeploy"]:
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
@@ -262,6 +262,8 @@ def throughput_command(
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
+        kwargs['backend'] = backend
+
         if runtime_config.backend == 'pytorch':
             llm = PyTorchLLM(**kwargs)
         else:

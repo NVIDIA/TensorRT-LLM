@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from typing import Any
@@ -7,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 from parameterized import parameterized
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -18,9 +17,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import getSMVersion
 
 VILA_1_5_3B_CONFIG = {
     "_name_or_path": "Efficient-Large-Model/VILA1.5-3b",

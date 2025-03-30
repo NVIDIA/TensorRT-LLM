@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -9,6 +7,7 @@ import torch
 from parameterized import parameterized
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.generation.utils import NEED_SETUP_CACHE_CLASSES_MAPPING
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -18,9 +17,6 @@ from tensorrt_llm._torch.models.modeling_nvsmall import NVSmallForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.llm_data import llm_models_root
 
 NVSMALL_MINI_CONFIG = {
     "architectures": ["DeciLMForCausalLM"],

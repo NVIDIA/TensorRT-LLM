@@ -467,6 +467,27 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     check_call(benchmark_cmd, shell=True)
 
 
+def test_trtllm_bench_mgmn(llm_root, llm_venv):
+    model_name = "meta-llama/Llama-3.1-8B"
+    llama_model_dir = Path(
+        llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
+    dataset_path = trtllm_bench_prolog(llm_root,
+                                       llm_venv,
+                                       engine_dir=None,
+                                       model_subdir=llama_model_dir,
+                                       model_name=model_name,
+                                       quant=None,
+                                       streaming=False,
+                                       skip_engine_build=True)
+    benchmark_cmd = \
+        f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
+        f"--model_path {llama_model_dir} " \
+        f"throughput " \
+        f"--dataset {dataset_path} --backend pytorch --tp 2"
+
+    check_call(benchmark_cmd, shell=True)
+
+
 @pytest.mark.parametrize("model_subdir", [
     "llama-3.1-model/Meta-Llama-3.1-8B",
 ],
@@ -1419,10 +1440,34 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         str(example_root / "quickstart_advanced.py"),
         "--enable_overlap_scheduler",
         "--use_cuda_graph",
-        "--mtp_nextn",
+        "--spec_decode_nextn",
         "1",  # test 1 MTP module
+        "--spec_decode_algo",
+        "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
+     "EAGLE3-LLaMA3.1-Instruct-8B"),
+])
+def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
+                                        model_path, eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--spec_decode_nextn",
+        "4",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--eagle_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--kv_cache_enable_block_reuse",
     ])
 
 
@@ -1559,8 +1604,14 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "llava-v1.6-mistral-7b": {
             "image": [
-                "The image depicts a dramatic ocean scene under a cloudy sky. The ocean is characterized by large, powerful waves that are breaking and crashing onto the shore. The waves are white and frothy, indicating that they are in the process of breaking. The water appears to be a deep blue-green color, suggesting",
-                "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
+                [
+                    "The image depicts a dramatic ocean scene under a cloudy sky. The ocean is characterized by large, powerful waves that are breaking and crashing onto the shore. The waves are white and frothy, indicating that they are in the process of breaking. The water appears to be a deep blue-green color, suggesting",
+                    "The image depicts a dramatic natural environment. The sky is overcast with dark, heavy clouds, suggesting a stormy or gloomy weather condition. The ocean is in motion, with large waves that are breaking and crashing onto the shore. The water appears choppy and turbulent, with white foam and spray visible",
+                ],
+                [
+                    "The image shows a scenic landscape with a prominent rock formation, which appears to be a large, flat-topped mountain or butte. The rock formation is rugged and has a smooth, flat top, suggesting it could be a natural landmark or a geological feature. The sky is clear with a few",
+                    "The image shows a majestic mountain with a flat top, which is characteristic of buttes. The mountain is prominently featured in the background, with a clear blue sky above it and a few scattered clouds. The weather appears to be and clear, with no visible signs of rain or storms.",
+                ],
                 "The image shows a multi-lane highway with several vehicles in motion. There are cars and a bus visible, and the traffic appears to be moderate, with no significant congestion. The road is divided by a central divider, and there are green trees lining the sides of the highway, indicating a suburban",
             ],
         },

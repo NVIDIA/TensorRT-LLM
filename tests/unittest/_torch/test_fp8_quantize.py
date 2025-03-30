@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import os
-import sys
 
 import pytest
 import torch
 from utils.util import getSMVersion
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def _dequant_fp8(input, scale, transpose_scale, block_m, block_n):

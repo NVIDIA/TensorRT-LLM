@@ -13,15 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import sys
 from warnings import warn
 
 import numpy as np
 import pytest
 import torch
 from utils.util import getSMVersion
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.skipif(

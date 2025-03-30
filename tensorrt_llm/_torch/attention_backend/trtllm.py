@@ -5,14 +5,15 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend, AttentionMask, AttentionMetadata, MLAParams,
-    PositionalEmbeddingParams, PredefinedAttentionMask, RopeParams)
-from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
+                        MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams)
+from .vanilla import VanillaAttention
 
 
 # The type of requests in qkv passed to attention
@@ -629,8 +630,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
-        use_paged_context_fmha = (metadata.runtime_features.chunked_prefill
-                                  or metadata.runtime_features.cache_reuse)
+        use_paged_context_fmha = (
+            metadata.runtime_features.chunked_prefill
+            or metadata.runtime_features.cache_reuse
+            or metadata.runtime_features.has_speculative_draft_tokens)
 
         if use_paged_context_fmha and self.has_fp8_kv_cache:
             # NOTE: W4A8_AWQ can be included too, exclude for now since

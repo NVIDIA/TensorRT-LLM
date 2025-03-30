@@ -8,7 +8,7 @@ from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
 
 # isort: off
-from test_llm import llama_model_path
+from .test_llm import llama_model_path
 # isort: on
 
 

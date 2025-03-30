@@ -3,14 +3,13 @@ from collections.abc import Iterable
 
 import torch
 
-import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import get_spec_resource_manager
-from .llm_request import LlmRequest
+from .llm_request import LlmRequest, SamplingConfig
+from .model_engine import PyTorchModelEngine
 from .resource_manager import ResourceManager
 from .scheduler import ScheduledRequests
 
@@ -42,6 +41,7 @@ def check_flash_mla_config(config):
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping):
+    # TODO: take space occupied by draft KV cache manager into account.
     mem_per_token = 2
     quant_config = model_config.quant_config
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
@@ -96,8 +96,7 @@ def _create_dummy_context(req_id: int, input_len: int, vocab_size: int):
             random.randint(0, vocab_size - 1) for _ in range(input_len)
         ],
         position_ids=list(range(input_len)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
         is_streaming=False,
     )
     result.paged_kv_block_ids = []

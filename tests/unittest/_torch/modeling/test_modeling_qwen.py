@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -26,7 +24,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 # isort: on

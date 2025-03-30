@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -8,6 +6,7 @@ import torch
 from parameterized import parameterized
 from transformers import MixtralConfig
 from transformers import MixtralForCausalLM as HFMixtralForCausalLM
+from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -20,9 +19,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import getSMVersion
 
 MIXTRAL_8X7B_CONFIG = {
     "architectures": ["MixtralForCausalLM"],

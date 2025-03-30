@@ -56,10 +56,11 @@ enum class MessageID : uint64_t
 {
     PENDING_CONTEXT_REQUEST = 1,
     PENDING_GENERATION_REQUEST = 2,
-    CONTEXT_RESPONSE = 3,
-    GENERATION_RESPONSE = 4,
+    PENDING_FULL_REQUEST = 3,
+    CONTEXT_RESPONSE = 4,
+    GENERATION_RESPONSE = 5,
 
-    TERMINATION = 5,
+    TERMINATION = 6,
 };
 
 enum DisaggRole : uint32_t
@@ -261,6 +262,7 @@ public:
         }
 
         std::vector<RequestWithId> requestWithIds;
+        std::vector<RequestWithId> requestWithIdsFull; // full request, not disaggregated
         std::vector<IdType> reqIds;
         for (auto const& req : llmRequests)
         {
@@ -268,16 +270,29 @@ public:
             reqIds.push_back(id);
 
             RequestWithId reqWithId{req, id};
-            reqWithId.req.setRequestType(RequestType::REQUEST_TYPE_CONTEXT_ONLY);
-
-            requestWithIds.push_back(std::move(reqWithId));
+            if (req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_ONLY)
+            {
+                requestWithIds.push_back(std::move(reqWithId));
+            }
+            else
+            {
+                TLLM_CHECK(req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION);
+                requestWithIdsFull.push_back(std::move(reqWithId));
+            }
 
             mRequestMap.insert(std::make_pair(id, req));
         }
 
-        Message message{MessageID::PENDING_CONTEXT_REQUEST, MessageData{RequestsData{requestWithIds}}};
-
-        mControllerSendQueue.push(std::move(message));
+        if (!requestWithIds.empty())
+        {
+            Message message{MessageID::PENDING_CONTEXT_REQUEST, MessageData{RequestsData{requestWithIds}}};
+            mControllerSendQueue.push(std::move(message));
+        }
+        if (!requestWithIdsFull.empty())
+        {
+            Message message{MessageID::PENDING_FULL_REQUEST, MessageData{RequestsData{requestWithIdsFull}}};
+            mControllerSendQueue.push(std::move(message));
+        }
 
         return reqIds;
     }
@@ -547,7 +562,8 @@ private:
                 mWorldComm.send(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, contextRank,
                     kM_CONTROLLER_DATA_TAG);
             }
-            else if (message.id == MessageID::PENDING_GENERATION_REQUEST)
+            else if (message.id == MessageID::PENDING_GENERATION_REQUEST
+                || message.id == MessageID::PENDING_FULL_REQUEST)
             {
 
                 auto& reqWithIds = std::get<RequestsData>(message.data);
@@ -713,7 +729,8 @@ private:
                 shutDown();
                 break;
             }
-            if (messageId == MessageID::PENDING_CONTEXT_REQUEST || messageId == MessageID::PENDING_GENERATION_REQUEST)
+            if (messageId == MessageID::PENDING_CONTEXT_REQUEST || messageId == MessageID::PENDING_GENERATION_REQUEST
+                || messageId == MessageID::PENDING_FULL_REQUEST)
             {
                 mWorldComm.mprobe(sourceRank, kM_CONTROLLER_DATA_TAG, &msg, &status);
                 MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));
@@ -728,13 +745,22 @@ private:
                     {
                         TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_ONLY);
                     }
-                    else if (isGenerationRank() && messageId == MessageID::PENDING_GENERATION_REQUEST)
+                    else if (isGenerationRank()
+                        && (messageId == MessageID::PENDING_GENERATION_REQUEST
+                            || messageId == MessageID::PENDING_FULL_REQUEST))
                     {
-                        TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_GENERATION_ONLY);
+                        if (messageId == MessageID::PENDING_GENERATION_REQUEST)
+                        {
+                            TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_GENERATION_ONLY);
+                        }
+                        else // PENDING_FULL_REQUEST
+                        {
+                            TLLM_CHECK(
+                                requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION);
+                        }
                     }
                     else
                     {
-                        // TODO: support full request (aggregagted)
                         TLLM_THROW("rank:%d, size:%d InstanceLeaderRecvThread recv Invalid message id:%ld",
                             mWorldComm.getRank(), mWorldComm.getSize(), static_cast<uint64_t>(messageId));
                     }

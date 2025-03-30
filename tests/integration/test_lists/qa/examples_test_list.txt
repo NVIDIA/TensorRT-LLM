@@ -38,10 +38,11 @@ examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-e
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-disable_fp8]
-examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:1]
-examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone-float16-nb:4]
-examples/test_exaone.py::test_llm_exaone_1gpu[enable_weight_only-exaone-float16-nb:1]
-examples/test_exaone.py::test_llm_exaone_2gpu[exaone-float16-nb:1]
+examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:1]
+examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4]
+examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4]
+examples/test_exaone.py::test_llm_exaone_1gpu[enable_weight_only-exaone_deep_2.4b-float16-nb:1]
+examples/test_exaone.py::test_llm_exaone_2gpu[exaone_3.0_7.8b_instruct-float16-nb:1]
 examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2-27b-it-other-bfloat16-8]
 examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-2-27b-it-fp8-bfloat16-8]
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it]
@@ -323,6 +324,10 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-int8-float16-nb:1-use_cpp_runtime]
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-int4-float16-nb:1-use_cpp_runtime]
+examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep4-pp1-tp8-fp4-deepseek_r1]
+examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep4-pp1-tp8-fp4-deepseek_r1]
+examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep8-pp1-tp8-fp4-deepseek_r1]
+examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep8-pp1-tp8-fp4-deepseek_r1]
 
 # Accuracy test list
 accuracy/test_accuracy.py::TestGpt2::test_auto_dtype
@@ -485,6 +490,7 @@ test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Ins
 test_e2e.py::test_ptp_quickstart_bert[BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-hf-nvfp4-False-False]
+test_e2e.py::test_trtllm_bench_mgmn
 test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
 examples/test_pytorch.py::test_mmlu_llmapi_4gpus[Llama-3.3-70B-Instruct-fp8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
 examples/test_pytorch.py::test_mmlu_llmapi_4gpus[Llama-3.3-70B-Instruct-fp4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
