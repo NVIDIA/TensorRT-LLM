@@ -192,6 +192,7 @@ class AllReduce(nn.Module):
                 gpus_per_node=self.gpus_per_node,
             )
             # NCCL does not require workspace
+            # TODO: Unify the workspace allocation for different strategies
             if self.strategy != AllReduceStrategy.UB and self.strategy != AllReduceStrategy.NCCL:
                 # TODO: Requires further unificiation
                 if deepseek_allreduce:
@@ -205,7 +206,7 @@ class AllReduce(nn.Module):
         input: torch.Tensor,
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         '''
         The input tensors in the different ranks must have the same shape.
         The output tensor will have that same shape with the input tensor.
@@ -241,8 +242,6 @@ class AllReduce(nn.Module):
         # TODO: This is confusing, we should use a better way to handle a arbitrary number of inputs
         # [has_bias,    residual,   has_affine,     has_scale]
         # [bias,        residual,   norm_weight,    scale]
-        # TODO: The order is not guaranteed at this momenet and not aligned with unpacking order
-        # of the inputs in the allreduce op under different fusion patterns and strategies.
         if is_fused:
             if all_reduce_params.has_bias() == 1:
                 reduce_fusion_inputs.append(all_reduce_params.bias)
@@ -265,6 +264,11 @@ class AllReduce(nn.Module):
             all_reduce_params.has_bias(),
             all_reduce_params.has_scale(),
         )
+
+        if len(output) == 1:
+            return output[0]
+        else:
+            return output
 
 
 class PPComm:

@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
-#include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/allReduceFusionKernels.h"
@@ -154,12 +153,7 @@ public:
     std::vector<torch::Tensor> run(
         torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        torch::Tensor output;
-        torch::Tensor finalOutput;
-        torch::Tensor scaleOutput;
         size_t size = input.numel();
-        int hidden_size = input.size(-1);
 
         // If strategy is set to UB, UB must be used as UB impl output is special and cannot be used
         // by others.
@@ -167,230 +161,21 @@ public:
 
         // Log runtime strategy
         auto const rank = COMM_SESSION.getRank();
-        LogRunTimeStrategy(runtimeStrategy, rank);
+        logRunTimeStrategy(runtimeStrategy, rank);
 
         // Dispatch to different allreduce implementations
         // (runtime strategy, fusion type) -> implementation
-        if (runtimeStrategy == AllReduceStrategyType::UB)
+        switch (runtimeStrategy)
         {
-            output = torch::empty_like(input);
-            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
-                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
-                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
-            TLLM_CHECK_WITH_INFO(
-                tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
-            auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
-            TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
-            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
-            auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
-            int m = size / hidden_size;
-            int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
-            void* residual = reduce_fusion_inputs[0].data_ptr();
-            void* gamma = reduce_fusion_inputs[1].data_ptr();
-            float* scale = nullptr;
-            if (mScale)
-            {
-                scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
-            }
-
-            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
-            {
-                TLLM_CHECK(mScale);
-                TLLM_CHECK(mAffine);
-                TLLM_CHECK(!mBias);
-
-                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
-                    ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
-                    mType, ub_comm, stream);
-                finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
-                    torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
-            }
-            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
-            {
-                TLLM_CHECK(mScale);
-                TLLM_CHECK(mAffine);
-                TLLM_CHECK(!mBias);
-                auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
-                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
-                    ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
-                    residual, output.data_ptr(), mType, ub_comm, stream);
-                scaleOutput = torch::from_blob(
-                    ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
-                auto output_shape = input.sizes().vec();
-                output_shape.back() /= 2;
-                auto output_strides = input.strides().vec();
-                for (size_t i = 0; i < output_shape.size() - 1; i++)
-                {
-                    output_strides[i] /= 2;
-                }
-                finalOutput = torch::from_blob(
-                    ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
-
-                return {finalOutput, output};
-            }
-            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
-            {
-                TLLM_CHECK(mAffine);
-                TLLM_CHECK(!mBias);
-                TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
-                tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle,
-                    0, size, hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
-                auto dt = input.scalar_type();
-                finalOutput = torch::from_blob(
-                    ub_buffer0.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
-
-                return {finalOutput, scaleOutput, output};
-            }
-        }
-        else if (runtimeStrategy == AllReduceStrategyType::NCCL)
-        {
-            output = torch::empty_like(input);
-            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
-            {
-                finalOutput = torch::empty_like(input);
-
-                NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                    ncclSum, *mNcclComm, stream));
-                tensorrt_llm::kernels::AllReduceParams params;
-                int fusion_ptr_idx = 0;
-                params.fusion_params.bias_buffer = mBias ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
-                params.fusion_params.residual_buffer = reduce_fusion_inputs[fusion_ptr_idx++].data_ptr();
-                params.fusion_params.weight_buffer
-                    = mAffine ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
-                params.local_output_buffer_ptr = finalOutput.mutable_data_ptr();
-                params.elts_total = size;
-
-                params.fusion_params.hidden_size = hidden_size;
-                params.fusion_params.eps = mEps;
-                params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
-                tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
-                return {finalOutput, output};
-            }
-            else
-            // TODO: non fusion allreduce?
-            {
-                NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                    ncclSum, *mNcclComm, stream));
-                return {output};
-            }
-        }
-        else
-        {
-            // Should handle only Lamport implementation
-            auto const tpSize = mGroup.size();
-            int tpRank = 0;
-
-            // Use cleaner output assigning
-            torch::Tensor reduce_out;
-            torch::Tensor residual_out;
-            torch::Tensor norm_out;
-            torch::Tensor quant_out;
-            torch::Tensor scale_out;
-
-            if (isPostNormFusion())
-            {
-                // TODO: Requires further unificiation for different fusion patterns and strategies.
-                tensorrt_llm::kernels::ar_fusion::AllReduceFusionParams allreduce_fusion_params;
-
-                allreduce_fusion_params.quant_out = nullptr;
-                allreduce_fusion_params.scale_out = nullptr;
-                allreduce_fusion_params.residual_out = nullptr;
-                allreduce_fusion_params.norm_out = nullptr;
-
-                if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
-                {
-                    TORCH_CHECK(reduce_fusion_inputs.size() == 3, "Pre-MLP fusion should have 3 inputs.");
-
-                    int64_t sfVecSize = 16;
-                    int64_t m = 1;
-                    auto const& inputShape = input.sizes();
-                    auto const& r = inputShape.size();
-                    TORCH_CHECK(r >= 2, "Input should be >=2D tensor.");
-                    for (size_t i = 0; i < r - 1; i++)
-                    {
-                        m *= inputShape[i];
-                    }
-                    auto const k = inputShape[r - 1];
-                    TORCH_CHECK(k % sfVecSize == 0, "Input should be divisible by sfVecSize.");
-                    std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-                    outputShape[r - 1] = k / 2;
-
-                    quant_out = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-                    scale_out = at::detail::empty_cuda(
-                        {tensorrt_llm::computeSFSize(m, k / sfVecSize)}, SF_DTYPE, input.device(), std::nullopt);
-                    residual_out = torch::empty_like(reduce_fusion_inputs[0]);
-
-                    allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
-                    allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
-                    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
-                }
-                else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
-                {
-                    norm_out = torch::empty_like(input);
-                    residual_out = torch::empty_like(reduce_fusion_inputs[0]);
-
-                    allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
-                    allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
-                }
-                else
-                {
-                    // TODO: should not reach here
-                    TORCH_CHECK(false, "Invalid fusion op");
-                }
-
-                allreduce_fusion_params.nranks = tpSize;
-                allreduce_fusion_params.rank = rank;
-                allreduce_fusion_params.dtype = mType;
-                allreduce_fusion_params.size = size;
-                allreduce_fusion_params.hidden_dim = hidden_size;
-                allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.value().mutable_data_ptr());
-                allreduce_fusion_params.allreduce_in = input.data_ptr();
-                allreduce_fusion_params.residual_in = reduce_fusion_inputs[0].data_ptr();
-                allreduce_fusion_params.rms_gamma = reduce_fusion_inputs[1].data_ptr();
-                allreduce_fusion_params.rms_eps = mEps;
-
-                tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(allreduce_fusion_params);
-
-                // Pack output tensors
-                if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
-                {
-                    return {quant_out, scale_out, residual_out};
-                }
-                else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
-                {
-                    return {norm_out, residual_out};
-                }
-                else
-                {
-                    // TODO: should not reach here
-                    TORCH_CHECK(false, "Invalid fusion op");
-                }
-            }
-            else
-            {
-                // TODO: non fusion / prenorm fusion allreduce?
-                reduce_out = torch::empty_like(input);
-                for (auto const& currentRank : mGroup)
-                {
-                    if (rank == currentRank)
-                        break;
-                    ++tpRank;
-                }
-                int token_num = size / input.size(-1);
-                auto workspace_ptr = workspace.value().mutable_data_ptr();
-                auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-                    reinterpret_cast<int64_t*>(workspace_ptr), tpSize, tpRank, mType, token_num, hidden_size, mOp);
-
-                params.local_input_buffer_ptr = input.data_ptr();
-                params.elts_total = size;
-                params.local_output_buffer_ptr = reduce_out.mutable_data_ptr();
-                tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
-
-                return {reduce_out};
-            }
+            case AllReduceStrategyType::UB:
+                return runUBAllReduce(input, workspace, reduce_fusion_inputs);
+            case AllReduceStrategyType::NCCL:
+                return runNCCLAllReduce(input, workspace, reduce_fusion_inputs);
+            default:
+                return runFusionAllReduce(input, workspace, reduce_fusion_inputs, runtimeStrategy);
         }
 
-        return {};
+        TORCH_CHECK(false, "Invalid runtime strategy");
     }
 
     int initialize() noexcept
@@ -407,6 +192,241 @@ public:
     }
 
 private:
+
+    std::vector<torch::Tensor> runUBAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
+    {
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        int hidden_size = input.size(-1);
+
+        torch::Tensor finalOutput;
+        torch::Tensor output = torch::empty_like(input);
+
+        TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
+        TLLM_CHECK_WITH_INFO(
+            tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+        auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
+        TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
+        auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
+        auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
+        int m = size / hidden_size;
+        int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
+        void* residual = reduce_fusion_inputs[0].data_ptr();
+        void* gamma = reduce_fusion_inputs[1].data_ptr();
+        float* scale = nullptr;
+        if (mScale)
+        {
+            scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+        }
+
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+        {
+            TLLM_CHECK(mScale);
+            TLLM_CHECK(mAffine);
+            TLLM_CHECK(!mBias);
+
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
+                ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
+                mType, ub_comm, stream);
+            finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
+                torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            TLLM_CHECK(mScale);
+            TLLM_CHECK(mAffine);
+            TLLM_CHECK(!mBias);
+            auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
+                ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
+                residual, output.data_ptr(), mType, ub_comm, stream);
+            torch::Tensor scaleOutput = torch::from_blob(
+                ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
+            auto output_shape = input.sizes().vec();
+            output_shape.back() /= 2;
+            auto output_strides = input.strides().vec();
+            for (size_t i = 0; i < output_shape.size() - 1; i++)
+            {
+                output_strides[i] /= 2;
+            }
+            finalOutput = torch::from_blob(
+                ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
+
+            return {finalOutput, scaleOutput, output};
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        {
+            TLLM_CHECK(mAffine);
+            TLLM_CHECK(!mBias);
+            TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_launcher(ub_buffer0.handle, 0, size,
+                hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
+            auto dt = input.scalar_type();
+            finalOutput = torch::from_blob(
+                ub_buffer0.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
+
+            return {finalOutput, output};
+        }
+
+        TORCH_CHECK(false, "Invalid allreduce op");
+    }
+
+    std::vector<torch::Tensor> runNCCLAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
+    {
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        int hidden_size = input.size(-1);
+
+        torch::Tensor output = torch::empty_like(input);
+        
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        {
+            torch::Tensor finalOutput = torch::empty_like(input);
+
+            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+                ncclSum, *mNcclComm, stream));
+            tensorrt_llm::kernels::AllReduceParams params;
+            int fusion_ptr_idx = 0;
+            params.fusion_params.bias_buffer = mBias ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
+            params.fusion_params.residual_buffer = reduce_fusion_inputs[fusion_ptr_idx++].data_ptr();
+            params.fusion_params.weight_buffer
+                = mAffine ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
+            params.local_output_buffer_ptr = finalOutput.mutable_data_ptr();
+            params.elts_total = size;
+
+            params.fusion_params.hidden_size = hidden_size;
+            params.fusion_params.eps = mEps;
+            params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
+            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
+            return {finalOutput, output};
+        }
+        else
+        {
+            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
+                ncclSum, *mNcclComm, stream));
+            return {output};
+        }
+    }
+
+    std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs, AllReduceStrategyType runtimeStrategy) noexcept
+    {
+        // Should handle only Lamport implementation
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        int hidden_size = input.size(-1);
+
+        auto const tpSize = mGroup.size();
+        int tpRank = 0;
+        auto const rank = COMM_SESSION.getRank();
+
+        // Use cleaner output assigning
+        torch::Tensor reduce_out;
+        torch::Tensor residual_out;
+        torch::Tensor norm_out;
+        torch::Tensor quant_out;
+        torch::Tensor scale_out;
+
+        if (isPostNormFusion())
+        {
+            // TODO: Requires further unificiation for different fusion patterns and strategies.
+            tensorrt_llm::kernels::ar_fusion::AllReduceFusionParams allreduce_fusion_params;
+
+            allreduce_fusion_params.quant_out = nullptr;
+            allreduce_fusion_params.scale_out = nullptr;
+            allreduce_fusion_params.residual_out = nullptr;
+            allreduce_fusion_params.norm_out = nullptr;
+
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                TORCH_CHECK(reduce_fusion_inputs.size() == 3, "Pre-MLP fusion should have 3 inputs.");
+
+                int64_t sfVecSize = 16;
+                int64_t m = 1;
+                auto const& inputShape = input.sizes();
+                auto const& r = inputShape.size();
+                TORCH_CHECK(r >= 2, "Input should be >=2D tensor.");
+                for (size_t i = 0; i < r - 1; i++)
+                {
+                    m *= inputShape[i];
+                }
+                auto const k = inputShape[r - 1];
+                TORCH_CHECK(k % sfVecSize == 0, "Input should be divisible by sfVecSize.");
+                std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+                outputShape[r - 1] = k / 2;
+
+                quant_out = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+                scale_out = at::detail::empty_cuda(
+                    {tensorrt_llm::computeSFSize(m, k / sfVecSize)}, SF_DTYPE, input.device(), std::nullopt);
+                residual_out = torch::empty_like(reduce_fusion_inputs[0]);
+
+                allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+                allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+                allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            }
+            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                norm_out = torch::empty_like(input);
+                residual_out = torch::empty_like(reduce_fusion_inputs[0]);
+
+                allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+                allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            }
+            else
+            {
+                TORCH_CHECK(false, "Invalid fusion op");
+            }
+
+            allreduce_fusion_params.nranks = tpSize;
+            allreduce_fusion_params.rank = rank;
+            allreduce_fusion_params.dtype = mType;
+            allreduce_fusion_params.size = size;
+            allreduce_fusion_params.hidden_dim = hidden_size;
+            allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.value().mutable_data_ptr());
+            allreduce_fusion_params.allreduce_in = input.data_ptr();
+            allreduce_fusion_params.residual_in = reduce_fusion_inputs[0].data_ptr();
+            allreduce_fusion_params.rms_gamma = reduce_fusion_inputs[1].data_ptr();
+            allreduce_fusion_params.rms_eps = mEps;
+
+            tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(allreduce_fusion_params);
+
+            // Pack output tensors
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                return {quant_out, scale_out, residual_out};
+            }
+            else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                return {norm_out, residual_out};
+            }
+            else
+            {
+                TORCH_CHECK(false, "Invalid fusion op");
+            }
+        }
+        else
+        {
+            reduce_out = torch::empty_like(input);
+            for (auto const& currentRank : mGroup)
+            {
+                if (rank == currentRank)
+                    break;
+                ++tpRank;
+            }
+            int token_num = size / input.size(-1);
+            auto workspace_ptr = workspace.value().mutable_data_ptr();
+            auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
+                reinterpret_cast<int64_t*>(workspace_ptr), tpSize, tpRank, mType, token_num, hidden_size, mOp);
+
+            params.local_input_buffer_ptr = input.data_ptr();
+            params.elts_total = size;
+            params.local_output_buffer_ptr = reduce_out.mutable_data_ptr();
+            tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
+
+            return {reduce_out};
+        }
+    }
 
     AllReduceStrategyType getRuntimeStrategy(size_t size) noexcept
     {
@@ -428,7 +448,7 @@ private:
         return runtimeStrategy;
     }
 
-    void LogRunTimeStrategy(AllReduceStrategyType strategy, int rank) noexcept
+    void logRunTimeStrategy(AllReduceStrategyType strategy, int rank) noexcept
     {
         switch (strategy)
         {
