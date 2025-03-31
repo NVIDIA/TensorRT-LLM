@@ -14,6 +14,8 @@
 # limitations under the License.
 import unittest
 
+import pytest
+
 # isort: off
 import torch
 # isort: on
@@ -54,6 +56,9 @@ class TestMnnvlMemory(unittest.TestCase):
         align_size = 2 * 1024 * 1024
         return (size + align_size - 1) // align_size * align_size
 
+    @pytest.mark.skipif(not tllm.MnnvlMemory.supports_mnnvl(),
+                        reason="Mnnvl memory is not supported on this platform"
+                        )  # Skip tests on unsupported platform
     def test_mnnvl_memory(self):
         # allocate un-aligned memory
         allocate0_size = 4 * 1024 * 1024 - 3 * 1024

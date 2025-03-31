@@ -39,6 +39,7 @@ from ._common import _init, default_net, default_trtnet, precision
 # Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
 # but may be called in dependencies (such as examples)
 from ._mnnvl_utils import MnnvlMemory  # NOQA
+from ._mnnvl_utils import MnnvlMoe  # NOQA
 from ._utils import mpi_barrier  # NOQA
 from ._utils import mpi_comm  # NOQA
 from ._utils import str_dtype_to_torch  # NOQA

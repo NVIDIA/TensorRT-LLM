@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import platform
 import sys
 
+import pynvml
 import torch
 from cuda import cuda
 
@@ -41,6 +43,8 @@ def _check_cu_result(cu_func_ret):
 
 
 class MnnvlMemory:
+    initialized: bool = False
+
     current_mem_offset: int = 0
     current_rank_stride: int = 0  # stride for ranks and also address space size.
     current_start_address: int = 0
@@ -77,8 +81,15 @@ class MnnvlMemory:
 
     @staticmethod
     def initialize():
-        # use a dummy torch CUDA tensor to trigger CUDA context initialization
-        _ = torch.empty(1, device='cuda')
+        if not MnnvlMemory.initialized:
+            # use a dummy torch CUDA tensor to trigger CUDA context initialization
+            _ = torch.empty(1, device='cuda')
+            # ensure nvml is initialized.
+            try:
+                pynvml.nvmlDeviceGetCount()
+            except pynvml.NVMLError_Uninitialized:
+                pynvml.nvmlInit()
+            MnnvlMemory.initialized = True
 
     @staticmethod
     def get_comm(mapping: Mapping):
@@ -229,3 +240,149 @@ class MnnvlMemory:
                 MnnvlMemory.current_start_address = 0
                 MnnvlMemory.current_rank_stride = 0
                 MnnvlMemory.current_mem_offset = 0
+
+    @staticmethod
+    def support_nvlink(need_all_up: bool = True):
+        dev_id = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+        link_count = pynvml.NVML_NVLINK_MAX_LINKS
+        active_links = 0
+        available_links = 0
+        for link_idx in range(link_count):
+            try:
+                if pynvml.nvmlDeviceGetNvLinkCapability(
+                        handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED):
+                    available_links += 1
+                    is_active = pynvml.nvmlDeviceGetNvLinkState(
+                        handle, link_idx)
+                    if is_active:
+                        active_links += 1
+            except pynvml.NVMLError_NotSupported:
+                continue
+        return active_links == available_links and available_links > 0 if need_all_up else available_links > 0
+
+    @staticmethod
+    def supports_mnnvl() -> bool:
+        # TODO:
+        # We check if it is an aarch64 platform and has all NVLink up now.
+        # But it is not equivalent to MNNVL support.
+        # May need better support check.
+        arch = platform.machine().lower()
+        is_on_aarch64 = 'aarch64' in arch
+        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
+        return is_on_aarch64 and support_nvlink_and_all_up
+
+
+class MnnvlMoe:
+    moe_workspace: MnnvlMemory = None
+    moe_workspace_tensor: torch.Tensor = None
+    moe_mapping: Mapping = None
+
+    @staticmethod
+    def get_moe_workspaces(mapping: Mapping):
+        if MnnvlMoe.moe_workspace is not None:
+            assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
+            return MnnvlMoe.moe_workspace_tensor
+
+        MnnvlMoe.moe_mapping = mapping
+        workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
+            mapping.tp_size)
+        MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
+            torch.uint64)
+        return MnnvlMoe.moe_workspace_tensor
+
+    @staticmethod
+    def compute_target_rank_id(token_selected_experts: torch.Tensor,
+                               expert_count: int, ep_size: int):
+        assert expert_count % ep_size == 0, "expert_count should be divisible by ep_size"
+        expert_per_rank = expert_count // ep_size
+        token_target_rank_ids = token_selected_experts // expert_per_rank
+        return token_target_rank_ids
+
+    @staticmethod
+    def mnnvl_moe_alltoallv_prepare(gathered_target_rank_ids: torch.Tensor,
+                                    real_rank_token_count_cumsum: torch.Tensor,
+                                    gathered_expert_ids: torch.Tensor,
+                                    gathered_scales: torch.Tensor,
+                                    max_token_count_per_rank: int,
+                                    expert_count: int,
+                                    top_k: int,
+                                    ep_rank: int,
+                                    ep_size: int,
+                                    use_real_size=False):
+        local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
+        recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices = \
+            torch.ops.trtllm.moe_comm_prepare_indices(gathered_target_rank_ids, real_rank_token_count_cumsum,
+                                                      max_token_count_per_rank, expert_count, top_k, ep_rank, ep_size)
+
+        local_token_allocation_count = max_token_count_per_rank * ep_size
+        if use_real_size:
+            local_token_allocation_count = recv_rank_count_cumsum[-1].cpu(
+            ).item()
+            # at least one token for padding
+            local_token_allocation_count = max(local_token_allocation_count, 1)
+            local_gather_indices = local_gather_indices[:
+                                                        local_token_allocation_count]
+
+        local_expert_ids = torch.empty(local_token_allocation_count,
+                                       top_k,
+                                       dtype=torch.int32,
+                                       device=torch.device('cuda'))
+        local_scales = torch.empty(local_token_allocation_count,
+                                   top_k,
+                                   dtype=torch.float32,
+                                   device=torch.device('cuda'))
+
+        torch.ops.trtllm.moe_local_gather(recv_rank_count_cumsum,
+                                          local_gather_indices,
+                                          gathered_expert_ids, gathered_scales,
+                                          local_expert_ids, local_scales,
+                                          max_token_count_per_rank,
+                                          expert_count, top_k, ep_rank, ep_size)
+
+        return local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
+            recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
+            local_expert_ids, local_scales, local_token_allocation_count
+
+    @staticmethod
+    def mnnvl_moe_alltoallv(x: torch.Tensor,
+                            send_rank_count_cumsum: torch.Tensor,
+                            send_rank_local_indices: torch.Tensor,
+                            recv_rank_count_cumsum: torch.Tensor,
+                            recv_rank_local_indices: torch.Tensor,
+                            workspace: torch.Tensor, ep_rank: int, ep_size: int,
+                            local_token_allocation_count: int):
+        assert x.dim() == 2, "only 2D tensor supported, please reshape."
+        output_tensor = torch.empty(local_token_allocation_count,
+                                    x.shape[1],
+                                    dtype=x.dtype,
+                                    device=torch.device('cuda'))
+        torch.ops.trtllm.moe_comm(x, send_rank_count_cumsum,
+                                  send_rank_local_indices, output_tensor,
+                                  recv_rank_count_cumsum,
+                                  recv_rank_local_indices, workspace, ep_rank,
+                                  ep_size)
+        return output_tensor
+
+    @staticmethod
+    def mnnvl_moe_alltoallv_combine(
+            x: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
+            recv_rank_local_indices: torch.Tensor,
+            send_rank_count_cumsum: torch.Tensor,
+            backward_recv_rank_local_indices: torch.Tensor,
+            workspace: torch.Tensor, ep_rank: int, ep_size: int, top_k: int,
+            token_count: int):
+        assert x.dim() == 2, "2D tensor supported, please reshape."
+        output_tensor = torch.zeros(token_count * top_k,
+                                    x.shape[1],
+                                    dtype=x.dtype,
+                                    device=torch.device('cuda'))
+        torch.ops.trtllm.moe_comm(x, recv_rank_count_cumsum,
+                                  recv_rank_local_indices, output_tensor,
+                                  send_rank_count_cumsum,
+                                  backward_recv_rank_local_indices, workspace,
+                                  ep_rank, ep_size)
+        return torch.sum(output_tensor.reshape(token_count, top_k, x.shape[1]),
+                         dim=1,
+                         keepdim=False)
