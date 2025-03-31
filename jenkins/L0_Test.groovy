@@ -1382,7 +1382,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade pip || true")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade 'setuptools<77.0.1' || true")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade 'setuptools' || true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                     }
