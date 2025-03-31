@@ -15,11 +15,14 @@ jobs:
         uses: actions/checkout@v2
         with:
           ref: main
-          fetch-depth: 10 # Increase if you have more commits
+          fetch-depth: 0
 
       - name: Rebase upstream changes
-        uses: imba-tjd/rebase-upstream-action@master
-        with:
-          upstream: 'NVIDIA/TensorRT-LLM'
-          branch: main
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git remote add upstream https://github.com/NVIDIA/TensorRT-LLM.git
+          git fetch upstream
+          git rebase upstream/main
+          git push -f origin main
 
