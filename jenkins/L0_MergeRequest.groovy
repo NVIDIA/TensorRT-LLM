@@ -92,6 +92,9 @@ def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
+@Field
+def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
     (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
@@ -103,6 +106,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
+    (ONLY_PYTORCH_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -297,6 +301,7 @@ def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl)
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
+        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl)
     })
 }
 
@@ -429,17 +434,25 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
     return changedFileList
 }
 
+def cachedChangedFileList = null
+
 def getMergeRequestChangedFileList(pipeline, githubPrApiUrl) {
+    if (cachedChangedFileList != null) {
+        return cachedChangedFileList
+    }
     try {
         if (githubPrApiUrl != null) {
-            return getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+            cachedChangedFileList = getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+        } else {
+            cachedChangedFileList = getMergeRequestChangedFileListGitlab(pipeline)
         }
-        return getMergeRequestChangedFileListGitlab(pipeline)
+        return cachedChangedFileList
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
-        return []
+        cachedChangedFileList = []
+        return cachedChangedFileList
     }
 }
 
@@ -506,12 +519,16 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
         "jenkins/L0_Test.groovy",
     ]
 
-    def changedFileList = ","
+    if (!changedFileList) {
+        return false
+    }
+
+    def changedFileListStr = ","
     def relatedFileChanged = false
     try {
-        changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl).join(", ")
+        changedFileListStr = getMergeRequestChangedFileList(pipeline, githubPrApiUrl).join(", ")
         relatedFileChanged = relatedFileList.any { it ->
-            if (changedFileList.contains(it)) {
+            if (changedFileListStr.contains(it)) {
                 return true
             }
         }
@@ -528,6 +545,32 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
         pipeline.echo("Detect multi-GPU related files changed.")
     }
     return relatedFileChanged
+}
+
+def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
+        return false
+    }
+    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl)
+
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def result = changedFileList.every { file ->
+        def isPytorchFile = file =~ pytorchOnlyPattern
+        if (!isPytorchFile) {
+            pipeline.echo("Found non-pytorch file: ${file}")
+        }
+        return isPytorchFile
+    }
+
+    pipeline.echo("Only PyTorch files changed: ${result}")
+    return result
 }
 
 def collectTestResults(pipeline, testFilter)
