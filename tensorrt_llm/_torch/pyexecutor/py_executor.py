@@ -211,8 +211,9 @@ class PyExecutor:
         self.canceled_req_ids = ReqIdsSet()
 
         self.model_engine.warmup(self.resource_manager)
-        if self.draft_model_engine is not None:
-            self.draft_model_engine.warmup(self.resource_manager)
+        # TODO: fix the warmup issues. Need to move hidden_states to spec_metadata...
+        # if self.draft_model_engine is not None:
+        #     self.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
 
@@ -1702,10 +1703,12 @@ class PyExecutor:
                 extra_model_inputs[
                     'embed_tokens'] = self.model_engine.model.model.embed_tokens
 
-            outputs = self.draft_model_engine.forward(
-                draft_batch,
-                self.resource_manager,
-                extra_model_inputs=extra_model_inputs)
+            # TODO: fix CUDA graph for this case
+            with self.draft_model_engine.disable_cuda_graph():
+                outputs = self.draft_model_engine.forward(
+                    draft_batch,
+                    self.resource_manager,
+                    extra_model_inputs=extra_model_inputs)
 
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
