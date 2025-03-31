@@ -136,9 +136,14 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
 setup_cuda_compiler()
-setup_cuda_architectures()
 
 enable_language(C CXX CUDA)
+
+# Configure CUDA Architectures after enabling CUDA.
+
+# Old CMake rejects family conditional architectures during enable_language, But
+# after that CMake handles it just fine.
+setup_cuda_architectures()
 
 find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
                                                   cublas cublasLt curand nvml)
@@ -350,15 +355,6 @@ if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
 endif()
 
 if(BUILD_PYT)
-  # Build TORCH_CUDA_ARCH_LIST
-  set(TORCH_CUDA_ARCH_LIST "")
-  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
-                         ${CUDA_ARCH})
-    list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
-  endforeach()
-
-  message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
   # ignore values passed from the environment
   if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
     message(
@@ -367,6 +363,9 @@ if(BUILD_PYT)
     )
   endif()
   unset(ENV{TORCH_CUDA_ARCH_LIST})
+  # Placeholder.
+  message(STATUS "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\".")
+  set(TORCH_CUDA_ARCH_LIST "8.0")
 
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
   message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
@@ -396,7 +395,12 @@ print(os.path.dirname(torch.__file__),end='');"
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
   set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS
+                 "${CMAKE_CUDA_FLAGS}")
+
   add_compile_definitions(TORCH_CUDA=1)
 
   if(DEFINED TORCH_CXX_FLAGS)

@@ -314,6 +314,15 @@ namespace cutlass_kernels
     return file_content
 
 
+def clean_leftover_files(output_dir, generated_files):
+    """Remove leftover generated files that weren't created in this run."""
+    for root, dirs, files in os.walk(output_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if file_path not in generated_files:
+                os.remove(file_path)
+
+
 def write_file(launcher_inl_files, operations, output_file):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     # Avoid changing modified time if file content is up to date
@@ -846,14 +855,17 @@ if __name__ == "__main__":
 
     file_list = []
     for key, value in op_groups.items():
-        gemm_kind, _, _, _, is_mixed = key
+        gemm_kind, arch, m, block_scale, is_mixed = key
         for i, op_sub_group in enumerate(value):
             out_file = os.path.join(
-                output_dir, GemmKindNames[gemm_kind],
-                f"cutlass_kernel_file_{key[0]}_sm{key[1]}_M{key[2]}_BS{key[3]}_Mixed{key[4]}_group{i}.generated.cu"
+                output_dir, GemmKindNames[gemm_kind], str(arch),
+                f"cutlass_kernel_file_{gemm_kind}_M{m}_BS{block_scale}_Mixed{is_mixed}_group{i}.generated.cu"
             )
             inl_file = [moe_mixed_gemm_inl] if is_mixed else inl_map[key[:2]]
             write_file(inl_file, op_sub_group, out_file)
             file_list.append(out_file)
 
     print(";".join(file_list))
+
+    # Clean up any leftover files from previous runs
+    clean_leftover_files(output_dir, set(file_list))

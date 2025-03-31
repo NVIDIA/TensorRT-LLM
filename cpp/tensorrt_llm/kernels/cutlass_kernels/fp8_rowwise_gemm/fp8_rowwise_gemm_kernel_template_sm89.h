@@ -29,6 +29,8 @@
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 // clang-format on
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
@@ -96,11 +98,30 @@ struct DeviceGemmFp8RowwiseSm89
 
     using EpilogueOp = EpilogueStore;
 
-    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<ElementA, LayoutA,
+    template <typename Base>
+    struct Sm89_12xOnly : Base
+    {
+        using typename Base::Params;
+
+        CUTLASS_DEVICE
+        void operator()(Params const& params, char* smem_buf)
+        {
+            if constexpr (tensorrt_llm::kernels::arch::is_match_v<89> || tensorrt_llm::kernels::arch::is_major_v<12>)
+            {
+                this->Base::operator()(params, smem_buf);
+            }
+            else
+            {
+                printf("ERROR : This kernel shall only run on SM90 devices.\n");
+            }
+        }
+    };
+
+    using GemmKernel = Sm89_12xOnly<typename cutlass::gemm::kernel::DefaultGemmWithVisitor<ElementA, LayoutA,
         cutlass::ComplexTransform::kNone, AlignmentA, ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
         ElementC, LayoutC, AlignmentC, ElementAccumulator, ElementComputeEpilogue, OperatorClass, ArchTag, CtaShape,
         WarpShape, InstructionShape, EpilogueOp, cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages,
-        cutlass::arch::OpMultiplyAdd, EVTEpilogueStages>::GemmKernel;
+        cutlass::arch::OpMultiplyAdd, EVTEpilogueStages>::GemmKernel>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };

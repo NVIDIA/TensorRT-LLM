@@ -35,6 +35,8 @@
 
 #include "cute/tensor.hpp"
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel
@@ -306,13 +308,21 @@ public:
     CUTLASS_DEVICE
     void operator()(Params const& params, char* smem_buf)
     {
+        if constexpr (tensorrt_llm::kernels::arch::is_match_v<90>)
+        {
+            _invoke(params, smem_buf);
+        }
+        else
+        {
+            printf("ERROR : This kernel shall only run on SM90 devices.\n");
+        }
+    }
+
+    CUTLASS_DEVICE
+    void _invoke(Params const& params, char* smem_buf)
+    {
         using namespace cute;
         using X = Underscore;
-
-// Any Tensor Op MMA Atom in the WGMMA ISA is arch conditional to sm90a.
-#if !defined(__CUDA_ARCH_FEAT_SM90_ALL)
-        printf("ERROR : Arch conditional MMA instruction used without targeting sm90a compute capability. Aborting.\n");
-#else
 
         // Preconditions
         static_assert(cute::rank(StrideA{}) == 3,
@@ -673,7 +683,6 @@ public:
             }
 
         } // Consumer Warp Groups End
-#endif
     }
 };
 

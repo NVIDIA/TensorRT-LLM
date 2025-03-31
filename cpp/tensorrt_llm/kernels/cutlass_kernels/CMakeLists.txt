@@ -15,6 +15,9 @@
 # the License.
 #
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 # The Python executable will only be defined if building with Torch support. If
 # not, we need to find it here.
 if(NOT Python3_EXECUTABLE)
@@ -46,10 +49,8 @@ set(INSTANTIATION_GENERATION_DIR
 
 execute_process(
   WORKING_DIRECTORY ${GENERATE_KERNELS_SCRIPT_DIR}
-  COMMAND
-    ${Python3_EXECUTABLE} generate_kernels.py -a
-    "${CMAKE_CUDA_ARCHITECTURES_ORIG};${CMAKE_CUDA_ARCHITECTURES_NATIVE}" -o
-    ${INSTANTIATION_GENERATION_DIR}
+  COMMAND ${Python3_EXECUTABLE} generate_kernels.py -a
+          "${CMAKE_CUDA_ARCHITECTURES_ORIG}" -o ${INSTANTIATION_GENERATION_DIR}
   OUTPUT_VARIABLE _KERNEL_GEN_OUTPUT
   RESULT_VARIABLE _KERNEL_GEN_SUCCESS)
 
@@ -81,117 +82,7 @@ endif()
 file(GLOB_RECURSE INSTANTIATIONS_GENERATED ${INSTANTIATION_GENERATION_DIR}/*.cu)
 string(STRIP "${_KERNEL_GEN_OUTPUT}" _KERNEL_GEN_OUTPUT)
 
-# Get the sources for Mixed Input GEMM launchers
-file(GLOB_RECURSE MIXED_CU_INSTANTIATIONS
-     ${INSTANTIATION_GENERATION_DIR}/gemm/*.cu)
-file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
-file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
-
-# Get the sources for MOE Grouped GEMM launchers
-file(GLOB_RECURSE GROUPED_CU_INSTANTIATIONS
-     ${INSTANTIATION_GENERATION_DIR}/gemm_grouped/*.cu)
-file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
-file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
-
-# Get the sources for FP8 Rowwise GEMM launchers
-file(GLOB_RECURSE FBGEMM_CU_INSTANTIATIONS
-     ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm/*.cu)
-file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
-
-# Get the sources for FP8 Blockwise GEMM launchers
-file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
-
-# Get the sources for FP4 GEMM launchers
-file(GLOB_RECURSE FP4_CU_INSTANTIATIONS
-     ${INSTANTIATION_GENERATION_DIR}/gemm_fp4/*.cu)
-file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
-
-# Get the sources for AllReduce GEMM
-file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
-
-# Get the sources for all the remaining sources
-file(GLOB_RECURSE SRC_CPP *.cpp)
-file(GLOB_RECURSE SRC_CU *.cu)
-set(ALL_SRCS ${SRC_CPP};${SRC_CU})
-list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
-list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
-list(REMOVE_ITEM ALL_SRCS
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
-
-message(
-  VERBOSE
-  "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
-message(
-  VERBOSE
-  "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
-)
-message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
-message(VERBOSE "FP8 Blockscale GEMM srcs ${FP8_BLOCKSCALE_GEMM_SRC_CU}")
-message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
-message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
-message(VERBOSE "All srcs ${ALL_SRCS}")
-
-add_library(cutlass_src STATIC ${ALL_SRCS})
-set_property(TARGET cutlass_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET cutlass_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-
-add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
-                                     ${MIXED_CU_INSTANTIATIONS})
-# WARNING: Building with `-G` flag may generate invalid results for this target
-# add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
-# ${GROUPED_CU_INSTANTIATIONS})
-add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
-add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-
-set(GEMM_SWIGLU_SM90_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
-add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
-
-if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
-  file(GLOB LOW_LATENCY_GEMM_SRC_CU
-       "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
-  add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
-  target_include_directories(low_latency_gemm_src
-                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
-  set_property(TARGET low_latency_gemm_src PROPERTY POSITION_INDEPENDENT_CODE
-                                                    ON)
-endif()
-
-if(USING_OSS_CUTLASS_FP4_GEMM)
-  file(GLOB FP4_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/fp4_gemm/*.cu")
-  add_library(fp4_gemm_src STATIC ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS})
-  set_property(TARGET fp4_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif()
-
-if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
-  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP}
-                                  ${GROUPED_CU_INSTANTIATIONS})
-  target_include_directories(
-    moe_gemm_src
-    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
-  set_property(TARGET moe_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif()
-
-if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-  add_library(
-    ar_gemm_src STATIC
-    ${ARGEMM_SRC_CU}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
-  target_include_directories(
-    ar_gemm_src
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
-  set_property(TARGET ar_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-endif()
-
 function(process_target target_name enable_hopper enable_blackwell)
-  set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
-  set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   if(${enable_hopper} AND "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
     # No kernels should be parsed, unless hopper is specified. This is a build
@@ -228,6 +119,156 @@ function(process_target target_name enable_hopper enable_blackwell)
   endif()
 
 endfunction()
+
+function(add_instantiations library base_dir)
+  macro(glob_src_create_target ARCH BUILD_ARCHS)
+    file(GLOB_RECURSE INSTANTIATIONS_GENERATED_${ARCH} ${base_dir}/${ARCH}/*.cu)
+    list(LENGTH INSTANTIATIONS_GENERATED_${ARCH} n)
+    if(${n} GREATER 0)
+      set(TARGET_NAME "_${library}_instantiations_${ARCH}")
+      add_library(${TARGET_NAME} OBJECT ${INSTANTIATIONS_GENERATED_${ARCH}})
+      target_link_libraries(${library} PRIVATE ${TARGET_NAME})
+      set_cuda_architectures(${TARGET_NAME} ${BUILD_ARCHS})
+
+      if(${ARCH} EQUAL 90)
+        process_target(${TARGET_NAME} true false)
+      elseif(${ARCH} EQUAL 100)
+        process_target(${TARGET_NAME} false true)
+      endif()
+    endif()
+  endmacro()
+
+  glob_src_create_target(80 "80;86")
+  glob_src_create_target(90 90)
+  glob_src_create_target(100 100f)
+  glob_src_create_target(120 120f)
+endfunction()
+
+# Get the sources for Mixed Input GEMM launchers
+file(GLOB_RECURSE MIXED_SRC_CPP fpA_intB_gemm/*.cpp)
+file(GLOB_RECURSE MIXED_SRC_CU fpA_intB_gemm/*.cu)
+
+# Get the sources for MOE Grouped GEMM launchers
+file(GLOB_RECURSE GROUPED_SRC_CPP moe_gemm/*.cpp)
+file(GLOB_RECURSE GROUPED_SRC_CU moe_gemm/*.cu)
+
+# Get the sources for FP8 Rowwise GEMM launchers
+file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
+
+# Get the sources for FP8 Blockwise GEMM launchers
+file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
+
+# Get the sources for FP4 GEMM launchers
+file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
+
+# Get the sources for AllReduce GEMM
+file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
+
+# Get the sources for all the remaining sources
+file(GLOB_RECURSE SRC_CPP *.cpp)
+file(GLOB_RECURSE SRC_CU *.cu)
+set(ALL_SRCS ${SRC_CPP};${SRC_CU})
+list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
+list(REMOVE_ITEM ALL_SRCS
+     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
+
+message(
+  VERBOSE
+  "Mixed srcs ${MIXED_SRC_CPP} ${MIXED_SRC_CU} ${MIXED_CU_INSTANTIATIONS}")
+message(
+  VERBOSE
+  "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
+)
+message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
+message(VERBOSE "FP8 Blockscale GEMM srcs ${FP8_BLOCKSCALE_GEMM_SRC_CU}")
+message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
+message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
+message(VERBOSE "All srcs ${ALL_SRCS}")
+
+add_library(cutlass_src STATIC ${ALL_SRCS})
+
+add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
+add_cuda_architectures(fpA_intB_gemm_src 89)
+add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
+
+add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
+set_cuda_architectures(fb_gemm_src 89 90 120f)
+# add_instantiations(fb_gemm_src
+# ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
+
+add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
+set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
+
+set(GEMM_SWIGLU_SM90_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
+add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+set_cuda_architectures(gemm_swiglu_sm90_src 90)
+
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  file(GLOB LOW_LATENCY_GEMM_SRC_CU
+       "${CMAKE_CURRENT_SOURCE_DIR}/low_latency_gemm/*.cu")
+  add_library(low_latency_gemm_src STATIC ${LOW_LATENCY_GEMM_SRC_CU})
+  set_cuda_architectures(low_latency_gemm_src 90)
+  target_include_directories(low_latency_gemm_src
+                             PRIVATE ${3RDPARTY_DIR}/cutlass/examples)
+endif()
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  file(GLOB FP4_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/fp4_gemm/*.cu")
+  add_library(fp4_gemm_src STATIC ${FP4_SRC_CU})
+  set_cuda_architectures(fp4_gemm_src 100f 120f)
+  # add_instantiations(fp4_gemm_src ${INSTANTIATION_GENERATION_DIR}/fp4_gemm)
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  file(GLOB MOE_GEMM_SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/moe_gemm/*.cu")
+  set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
+  list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
+  list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
+  set(MOE_GEMM_SRC_CU_FP4 ${MOE_GEMM_SRC_CU})
+  list(FILTER MOE_GEMM_SRC_CU_FP4 INCLUDE REGEX ".*fp4.*")
+  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp4.*")
+  set(MOE_GEMM_SRC_CU_FP8 ${MOE_GEMM_SRC_CU})
+  list(FILTER MOE_GEMM_SRC_CU_FP8 INCLUDE REGEX ".*fp8.*")
+  list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
+
+  add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
+
+  add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
+  add_cuda_architectures(_moe_gemm_launcher 89)
+
+  add_library(_moe_gemm_fp4 OBJECT ${MOE_GEMM_SRC_CU_FP4})
+  set_cuda_architectures(_moe_gemm_fp4 100f 120f)
+  process_target(_moe_gemm_fp4 false true)
+
+  add_library(_moe_gemm_fp8 OBJECT ${MOE_GEMM_SRC_CU_FP8})
+  set_cuda_architectures(_moe_gemm_fp8 89 90 100f 120f)
+  process_target(_moe_gemm_fp8 true true)
+
+  add_instantiations(moe_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm_grouped)
+  target_link_libraries(moe_gemm_src PRIVATE _moe_gemm_launcher _moe_gemm_fp4
+                                             _moe_gemm_fp8)
+  target_include_directories(
+    moe_gemm_src
+    PUBLIC ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  add_library(
+    ar_gemm_src STATIC
+    ${ARGEMM_SRC_CU}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
+  target_include_directories(
+    ar_gemm_src
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
+  set_cuda_architectures(ar_gemm_src 90 100f)
+endif()
 
 set(ALL_KERNELS_LIB)
 

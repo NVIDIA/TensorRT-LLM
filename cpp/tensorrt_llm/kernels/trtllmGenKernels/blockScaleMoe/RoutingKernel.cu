@@ -26,12 +26,16 @@
 
 #include <type_traits>
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace moe::dev
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static constexpr bool TLLM_GEN_HAS_FAST_REDUX = tensorrt_llm::kernels::arch::is_major_v<10>;
 
 namespace routing
 {
@@ -53,10 +57,6 @@ static constexpr int MaxNumTopGroups = 4;
 
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -119,12 +119,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -1345,10 +1340,6 @@ static constexpr int WarpKernelMaxNumTokens = 4;
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename TypeExpW_>
@@ -1410,12 +1401,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
@@ -2598,10 +2584,6 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL))
-#define TLLM_GEN_ENABLE_FAST_REDUX
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename TypeExpW_>
@@ -2663,12 +2645,7 @@ struct TopKRedType
 
     __device__ inline TypeCmp reduce(cg::thread_block_tile<WarpSize> const& warp)
     {
-#if defined(TLLM_GEN_ENABLE_FAST_REDUX)
-        static constexpr bool UseCg = false;
-#else
-        static constexpr bool UseCg = true;
-#endif
-        if constexpr (UseCg || sizeof(TypeExpW) >= 4)
+        if constexpr (!TLLM_GEN_HAS_FAST_REDUX || sizeof(TypeExpW) >= 4)
         {
             return cg::reduce(warp, compVal, cg::greater<TypeCmp>{});
         }
