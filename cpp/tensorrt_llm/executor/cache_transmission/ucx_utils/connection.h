@@ -38,8 +38,10 @@ class UcxConnectionManager;
 class UcxConnection : public Connection
 {
 public:
+    using ConnectionIdType = uint64_t;
+
     UcxConnection() = default;
-    explicit UcxConnection(uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
+    explicit UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
         UcxConnectionManager* manager, bool fromRequester);
     ~UcxConnection();
     void sendConnectionId(DataContext const& ctx, void const* data, size_t size) const;
@@ -51,8 +53,8 @@ private:
     uint64_t mSendTagPrefix{0};
     uint64_t mRecvTagPrefix{0};
 
-    uint64_t mConnectionId;
-    uint64_t mConnectionIdInPeer;
+    ConnectionIdType mConnectionId;
+    ConnectionIdType mConnectionIdInPeer;
     std::shared_ptr<ucxx::Endpoint> mEndpoint;
     UcxConnectionManager* mManager;
     bool mFromRequester;

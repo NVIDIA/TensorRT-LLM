@@ -198,7 +198,7 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mListener->createEndpointFromConnRequest(connRequest, true);
 
-        uint64_t connectionId = getNewConnectionId(newEp);
+        UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
         std::scoped_lock lock(mConnectionFuturesMutex);
 
         std::future<void> future = std::async(std::launch::async,
@@ -219,12 +219,12 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
     }
 }
 
-uint64_t UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
+UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
 {
     try
     {
         std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
-        uint64_t connectionId = getNewConnectionId(newEp);
+        UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
         std::shared_ptr<UcxConnection> connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
         std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
         mConnections.emplace(connectionId, connection);
@@ -240,14 +240,14 @@ uint64_t UcxConnectionManager::addConnection(std::string const& ip, uint16_t por
     }
 }
 
-uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp)
+UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp)
 {
     return mConnectionIdCounter++;
 }
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
-    std::vector<char> buffer(size + sizeof(uint64_t));
+    std::vector<char> buffer(size + sizeof(UcxConnection::ConnectionIdType));
     std::promise<void> promise;
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
@@ -262,7 +262,8 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     req->checkError();
 
     memcpy(data, buffer.data(), size);
-    uint64_t connectionId = *reinterpret_cast<uint64_t*>(buffer.data() + size);
+    UcxConnection::ConnectionIdType connectionId
+        = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
     std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
     TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
         "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId,

@@ -45,8 +45,8 @@ class UcxConnectionManager : public ConnectionManager, public std::enable_shared
 private:
     std::shared_ptr<ucxx::Context> mUcxCtx;
     std::vector<std::shared_ptr<ucxx::Worker>> mWorkersPool;
-    std::map<uint64_t, std::shared_ptr<UcxConnection>> mConnections;
-    std::map<uint64_t, std::future<void>> mConnectionFutures;
+    std::map<UcxConnection::ConnectionIdType, std::shared_ptr<UcxConnection>> mConnections;
+    std::map<UcxConnection::ConnectionIdType, std::future<void>> mConnectionFutures;
     std::mutex mConnectionsMutex;
     std::mutex mConnectionFuturesMutex;
     std::unordered_map<std::string, uint64_t> mAddressToConnectionId;
@@ -54,10 +54,10 @@ private:
     std::shared_ptr<ucxx::Listener> mListener;
     CommState mCommState;
     int mDevice;
-    std::atomic<uint64_t> mConnectionIdCounter{1};
+    std::atomic<UcxConnection::ConnectionIdType> mConnectionIdCounter{1};
 
-    uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
-    uint64_t addConnection(std::string const& ip, uint16_t port);
+    UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
+    UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
 
 public:
     explicit UcxConnectionManager();

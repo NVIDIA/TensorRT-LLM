@@ -25,8 +25,8 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
-UcxConnection::UcxConnection(
-    uint64_t connectionId, std::shared_ptr<ucxx::Endpoint> endpoint, UcxConnectionManager* manager, bool fromRequester)
+UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
+    UcxConnectionManager* manager, bool fromRequester)
     : mConnectionId(connectionId)
     , mEndpoint(std::move(endpoint))
     , mManager(manager)
@@ -75,10 +75,6 @@ UcxConnection::~UcxConnection()
         "UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     // TODO: how to close the endpoint safely?
-
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "END UcxConnection::~UcxConnection, mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
-        mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
 
 void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, size_t size) const
@@ -94,7 +90,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
 
     uint64_t tag
         = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | static_cast<uint64_t>(batch_manager::TransceiverTag::kID_TAG);
-    std::vector<char> buffer(size + sizeof(uint64_t));
+    std::vector<char> buffer(size + sizeof(mConnectionId));
     memcpy(buffer.data(), data, size);
     memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
     auto req = mEndpoint->tagSend(buffer.data(), buffer.size(), ucxx::Tag(tag), false, completionCallback);
@@ -124,7 +120,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     std::promise<void> promise;
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
+    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
 
     auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
     if (!req->isCompleted())
@@ -149,7 +145,7 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     std::promise<void> promise;
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
+    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
     auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
     if (!req->isCompleted())
     {
