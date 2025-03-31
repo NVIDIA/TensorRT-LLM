@@ -70,9 +70,7 @@ struct MlaParams
     int32_t q_pe_ld;
     int32_t q_pe_stride;
     MlaMetaParams meta;
-<<<<<<< HEAD
     int const* block_ids_per_seq;
-=======
     KvCacheDataType cache_type;
     // Scales for mla quantization
     float* bmm1_scale;
@@ -83,7 +81,6 @@ struct MlaParams
     float const* dequant_scale_q;
     float const* dequant_scale_kv;
     float host_bmm1_scale;
->>>>>>> fa90490bde (fp8 kv + bf16 ctx MLA + fp8 gen MLA)
 };
 
 template <typename T, typename KVCacheBuffer>

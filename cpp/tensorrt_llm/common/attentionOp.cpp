@@ -780,26 +780,10 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t fmha_scheduler_counter = sizeof(uint32_t);
 
-<<<<<<< HEAD
-        int const NUM_BUFFERS = 7;
-        size_t workspaces[NUM_BUFFERS];
-        workspaces[0] = cu_seqlens_size; // cu_q_len
-        workspaces[1] = cu_seqlens_size; // cu_kv_len
-        workspaces[2] = fmha_scheduler_counter;
-        // The multiCtasKvMode buffers. Each CTA at most handles 256 rows.
-        // And the seqLenKv is split into at most mMultiProcessorCount tiles.
-        workspaces[3] = size * 256 * mMultiProcessorCount * mMLAParams.kv_lora_rank;
-        // The partialSum size.
-        workspaces[4] = sizeof(float) * 256 * mMultiProcessorCount;
-        // The partialMax size.
-        workspaces[5] = sizeof(float) * 256 * mMultiProcessorCount;
-
-        workspaces[6] = flash_mla_workspace_size;
-=======
         // The head dim.
         int headDim = (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
 
-        int const NUM_BUFFERS = 9;
+        int const NUM_BUFFERS = 10;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = cu_seqlens_size;                                                      // cu_q_len
         workspaces[1] = cu_seqlens_size;                                                      // cu_kv_len
@@ -816,7 +800,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[8] = sizeof(float) * 256 * mMultiProcessorCount;
         // TLLM_LOG_ERROR("czq q buffer size: %d, %d %d %d %d", workspaces[5],
         //     max_num_seq, mNumHeads, mMLAParams.kv_lora_rank, mMLAParams.qk_rope_head_dim);
->>>>>>> fa90490bde (fp8 kv + bf16 ctx MLA + fp8 gen MLA)
+        workspaces[9] = flash_mla_workspace_size;
 
         return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -888,16 +872,10 @@ int AttentionOp::mlaGeneration(
     int const num_kv_heads = 1;
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
-<<<<<<< HEAD
-    // The element size of the KV cache.
-    int elemSize = sizeof(T);
-    auto const sizePerToken = num_kv_heads * head_size * elemSize;
-=======
 
     auto const elemSize = mKVCacheQuantMode.hasFp8KvCache() ? sizeof(__nv_fp8_e4m3) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
->>>>>>> fa90490bde (fp8 kv + bf16 ctx MLA + fp8 gen MLA)
 
     auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
         sizePerToken, generation_params.cyclic_attention_window_size,
@@ -920,15 +898,12 @@ int AttentionOp::mlaGeneration(
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
-<<<<<<< HEAD
-=======
     float* mla_bmm1_scale_ptr
         = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, mla_bmm1_scale_size));
     float* mla_bmm2_scale_ptr
         = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, mla_bmm2_scale_size));
     void* quant_q_buffer_ptr
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, quant_q_buffer_size));
->>>>>>> fa90490bde (fp8 kv + bf16 ctx MLA + fp8 gen MLA)
     void* scratch_ptr = nextWorkspacePtr(workspace_byte_ptr, offset);
 
     params.seqQOffset = cu_q_seqlens;
