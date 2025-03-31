@@ -185,7 +185,6 @@ UcxConnectionManager::~UcxConnectionManager()
 {
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "UcxConnectionManager::~UcxConnectionManager");
 
-    // mConnections.clear();
     for (auto& worker : mWorkersPool)
     {
         worker->stopProgressThread();
@@ -249,13 +248,17 @@ uint64_t UcxConnectionManager::getNewConnectionId(std::shared_ptr<ucxx::Endpoint
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
     std::vector<char> buffer(size + sizeof(uint64_t));
-    auto completionCallback
-        = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCvForWorker.notify_all(); };
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
 
     std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(
         buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
-    std::unique_lock<std::mutex> lk(mMtxForWorker);
-    mCvForWorker.wait(lk, [&req]() { return req->isCompleted(); });
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
     req->checkError();
 
     memcpy(data, buffer.data(), size);
@@ -277,8 +280,6 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
         *reinterpret_cast<uint64_t*>(buffer.data()));
-
-    // worker to handle
 
     return mConnections[connectionId].get();
 }

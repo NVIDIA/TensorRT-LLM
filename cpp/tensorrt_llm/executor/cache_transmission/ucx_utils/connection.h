@@ -51,8 +51,6 @@ private:
     uint64_t mSendTagPrefix{0};
     uint64_t mRecvTagPrefix{0};
 
-    mutable std::mutex mMtx;
-    mutable std::condition_variable mCv;
     uint64_t mConnectionId;
     uint64_t mConnectionIdInPeer;
     std::shared_ptr<ucxx::Endpoint> mEndpoint;

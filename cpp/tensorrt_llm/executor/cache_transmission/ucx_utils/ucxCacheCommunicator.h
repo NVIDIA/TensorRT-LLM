@@ -53,12 +53,8 @@ private:
     std::mutex mAddressToConnectionIdMutex;
     std::shared_ptr<ucxx::Listener> mListener;
     CommState mCommState;
-    std::string bindAddress;
     int mDevice;
     std::atomic<uint64_t> mConnectionIdCounter{1};
-
-    mutable std::mutex mMtxForWorker;
-    mutable std::condition_variable mCvForWorker;
 
     uint64_t getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     uint64_t addConnection(std::string const& ip, uint16_t port);

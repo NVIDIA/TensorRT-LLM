@@ -86,17 +86,23 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
-    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+
+    std::promise<void> promise;
+
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
 
     uint64_t tag
         = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | static_cast<uint64_t>(batch_manager::TransceiverTag::kID_TAG);
-    // uint64_t data = mConnectionIdInPeer;
     std::vector<char> buffer(size + sizeof(uint64_t));
     memcpy(buffer.data(), data, size);
     memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
     auto req = mEndpoint->tagSend(buffer.data(), buffer.size(), ucxx::Tag(tag), false, completionCallback);
-    std::unique_lock<std::mutex> lk(mMtx);
-    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "end UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
@@ -115,12 +121,17 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
         mConnectionIdInPeer, mFromRequester);
 
     TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
-    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
     uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
 
     auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
-    std::unique_lock<std::mutex> lk(mMtx);
-    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     // throw if there is error
     req->checkError();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -135,11 +146,16 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
-    auto completionCallback = [this](ucs_status_t, ucxx::RequestCallbackUserData) -> void { mCv.notify_all(); };
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
     uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (ctx.getTag() & 0xFFFFFFFF);
     auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
-    std::unique_lock<std::mutex> lk(mMtx);
-    mCv.wait(lk, [&req]() { return req->isCompleted(); });
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     // throw if there is error
     req->checkError();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
