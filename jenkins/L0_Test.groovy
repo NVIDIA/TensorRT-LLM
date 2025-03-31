@@ -846,7 +846,7 @@ def runLLMBuildFromPackage(pipeline, cpu_arch, reinstall_dependencies=false, whe
 
         # Folders and their allowed files
         declare -A ALLOWED=(
-            ["./tensorrt_llm/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/src"]="internal_cutlass_type_conversion.h"
+            ["./tensorrt_llm/cpp/tensorrt_llm/kernels/internal_cutlass_kernels/src"]=""
             ["./tensorrt_llm/cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src"]=""
         )
 
