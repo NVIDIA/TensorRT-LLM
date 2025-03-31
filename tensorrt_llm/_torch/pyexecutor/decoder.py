@@ -10,12 +10,10 @@ from tensorrt_llm.bindings import (DataType, ModelConfig, WorldConfig,
 from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
-    AssignReqSeqSlots, CreateNewDecoderRequests, GenerateRequestOptions,
-    HandleContextLogits, HandleGenerationLogits, MakeDecodingBatchInputOutput,
-    UpdateDecoderBuffers)
+    CreateNewDecoderRequests, GenerateRequestOptions, HandleContextLogits,
+    HandleGenerationLogits, MakeDecodingBatchInputOutput, UpdateDecoderBuffers)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
-                                                          DecoderInputBuffers,
-                                                          SequenceSlotManager)
+                                                          DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
@@ -465,8 +463,7 @@ class TRTLLMDecoder(Decoder):
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
-        self.algs.update_decoder_buffers = UpdateDecoderBuffers(
-        )
+        self.algs.update_decoder_buffers = UpdateDecoderBuffers()
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
