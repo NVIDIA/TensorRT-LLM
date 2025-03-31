@@ -279,6 +279,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
+        **kwargs,
     ) -> torch.Tensor:
         # unpack pp_interface or embedding lookup for the input
         if self.pp_rank != 0:
