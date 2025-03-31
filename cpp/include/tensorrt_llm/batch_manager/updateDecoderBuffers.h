@@ -40,7 +40,7 @@ public:
 
     runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderBuffers& decoderBuffers,
         runtime::BufferManager const& copyBufferManager, runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
-        runtime::CudaEvent decoderFinishEvent) const;
+        runtime::CudaEvent const& decoderFinishEvent) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

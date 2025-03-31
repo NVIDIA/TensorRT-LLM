@@ -338,14 +338,8 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::DecodingOutput>(m, "DecodingOutput");
 
     py::class_<tr::CudaEvent>(m, "CudaEvent")
-        .def(py::init(
-            [](CudaStreamPtr stream)
-            {
-                tr::CudaEvent eventStop{};
-                stream->record(eventStop);
-                return eventStop;
-            }))
-        .def("synchronize", [](tr::CudaEvent& self) { self.synchronize(); });
+        .def(py::init<unsigned int>(), py::arg("flags") = cudaEventDisableTiming)
+        .def("synchronize", &tr::CudaEvent::synchronize);
 
     py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
         .def(
