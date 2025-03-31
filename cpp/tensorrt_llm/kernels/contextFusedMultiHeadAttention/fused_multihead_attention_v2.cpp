@@ -252,7 +252,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
                << std::dec << "\n\n";
         }
 
-        TLLM_CHECK_WITH_INFO(false, ss.str().c_str());
+        TLLM_CHECK_WITH_INFO(false, "%s", ss.str().c_str());
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
@@ -459,7 +459,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::getStepSize(uint32_t& out_step_q, uint
                << std::dec << "\n\n";
         }
 
-        TLLM_CHECK_WITH_INFO(false, ss.str().c_str());
+        TLLM_CHECK_WITH_INFO(false, "%s", ss.str().c_str());
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
