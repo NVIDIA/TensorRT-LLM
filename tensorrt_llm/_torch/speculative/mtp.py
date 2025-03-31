@@ -970,8 +970,9 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.num_contexts = 0
                 if i == 0 and num_contexts > 0 and attn_metadata.enable_flash_mla:
                     reorder_block_ids_per_seq = torch.cat([
-                        self.kv_block_ids_per_seq[num_contexts:batch_size],
-                        self.kv_block_ids_per_seq[:num_contexts]
+                        attn_metadata.
+                        kv_block_ids_per_seq[num_contexts:batch_size],
+                        attn_metadata.kv_block_ids_per_seq[:num_contexts]
                     ])
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)

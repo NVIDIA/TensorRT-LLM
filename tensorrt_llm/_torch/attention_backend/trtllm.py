@@ -468,7 +468,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
-                self.kv_block_ids_per_seq = torch.empty(
+                self.kv_block_ids_per_seq = torch.zeros(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
