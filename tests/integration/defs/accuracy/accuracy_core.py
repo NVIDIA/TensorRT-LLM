@@ -133,7 +133,8 @@ class AccuracyTask:
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
-                 extra_acc_spec: Optional[str] = None):
+                 extra_acc_spec: Optional[str] = None,
+                 extra_evaluator_kwargs: Optional[dict] = None):
         spec_dec_algo = None
         if llm.args.speculative_config is not None:
             spec_dec_algo = llm.args.speculative_config.decoding_type
@@ -148,7 +149,10 @@ class AccuracyTask:
         sampling_params = SamplingParams(
             max_tokens=self.MAX_OUTPUT_LEN,
             truncate_prompt_tokens=self.MAX_INPUT_LEN)
-        evaluator = self.create_evaluator(num_samples=num_samples)
+        if extra_evaluator_kwargs is None:
+            extra_evaluator_kwargs = {}
+        evaluator = self.create_evaluator(num_samples=num_samples,
+                                          **extra_evaluator_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"

@@ -48,3 +48,29 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
+
+    def test_auto_dtype(self):
+        extra_evaluator_kwargs = dict(
+            apply_chat_template=True,
+            system_prompt=
+            "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
+        )
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
+
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        extra_evaluator_kwargs = dict(
+            apply_chat_template=True,
+            system_prompt=
+            "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
+        )
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
