@@ -5,7 +5,6 @@ from typing import Dict, Optional
 import pytest
 from _dist_test_utils import param_with_device_count
 from _model_test_utils import _hf_model_dir_or_hub_id
-from _torch_test_utils import fp8_compatible
 from build_and_run_ad import main
 from simple_config import SimpleConfig
 from utils.llm_data import llm_models_root
@@ -94,7 +93,7 @@ from utils.llm_data import llm_models_root
                 "attn_backend": "FlashInfer",
             },
             marks_extra=[
-                pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5178508"),
             ],
         ),
         # full NVSmall (Llama-3.1-Nemotron-51B) with torch-opt backend + simple runtime
@@ -124,7 +123,6 @@ from utils.llm_data import llm_models_root
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
-    pytest.skip("https://nvbugs/5178508")
     simple_config = SimpleConfig(**config)
     simple_config.world_size = world_size
     main(simple_config)

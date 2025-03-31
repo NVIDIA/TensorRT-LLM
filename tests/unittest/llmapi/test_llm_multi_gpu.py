@@ -15,7 +15,7 @@ from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 # isort: off
-from test_llm import (
+from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, default_model_name, get_model_path,
@@ -27,7 +27,7 @@ from test_llm import (
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
-from test_llm_kv_cache_events import create_llm
+from .test_llm_kv_cache_events import create_llm
 from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
                         unittest_name_func, force_ampere)
 # isort: on

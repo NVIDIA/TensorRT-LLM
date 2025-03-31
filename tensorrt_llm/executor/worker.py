@@ -435,12 +435,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._client_id_to_request_id.pop(client_id, None)
 
     def shutdown(self):
-        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.doing_shutdown:
             return
         else:
             self.doing_shutdown = True
+
+        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
@@ -500,6 +501,10 @@ def worker_main(
         is_llm_executor: Optional[
             bool] = True,  # whether it's the main executor instance
 ) -> None:
+    mpi_comm().barrier()
+    print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
+                        "green")
+
     pid = os.getpid()
     cpus = os.sched_getaffinity(pid)
     if cpus:
@@ -607,6 +612,10 @@ def worker_main(
     #      b) For system error, the error will be raised in the MPI process
     #         and handled by future.done_callback, that will propagate the
     #         error to the error_queue in the main thread.
+
+    mpi_comm().barrier()
+    print_colored_debug(f"Worker {mpi_rank()} ready to setup backend...\n",
+                        "green")
 
     try:
         worker: ExecutorBindingsWorker = worker_cls(

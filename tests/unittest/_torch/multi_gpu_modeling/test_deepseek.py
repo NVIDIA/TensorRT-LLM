@@ -1,10 +1,11 @@
 import asyncio
-import os
-import sys
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
@@ -12,12 +13,6 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from pathlib import Path
-
-from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
 
 MAX_SEQ_LEN = 2048
 
@@ -83,9 +78,9 @@ def test_deepseek(model_name, backend, quant, tp_size, pp_size, ep_size,
     if mtp_nextn > 0 and getSMVersion() < 100:
         pytest.skip(f"Only Blackwell MLA kernel can support MTP now")
 
-    if pp_size > 1 and (enable_dp or mtp_nextn > 0):
+    if pp_size > 1 and mtp_nextn > 0:
         pytest.skip(
-            "Hang issue with DP attention / MTP + PP: https://nvbugspro.nvidia.com/bug/5170160"
+            "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
         )
     if pp_size > 2 and enable_cuda_graph and enable_overlap_scheduler:
         pytest.skip(

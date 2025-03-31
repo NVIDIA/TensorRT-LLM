@@ -1,19 +1,15 @@
 import json
-import os
 import pickle
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_quant_mode():
@@ -510,20 +506,26 @@ def test_Mpicomm():
 
 def test_SamplingConfig_pickle():
     config = _tb.SamplingConfig()
-    config.beam_width = 2
-    config.temperature = [1.0, 2.0]
+    config.beam_width = 5
+    config.num_return_sequences = 1
     config.top_k = [1, 2]
     config.top_p = [0.1, 0.2]
+    config.top_p_min = [1.0, 2.0]
+    config.top_p_reset_ids = [1, 2]
+    config.top_p_decay = [1.0, 2.0]
     config.random_seed = [1, 2]
+    config.temperature = [1.0, 2.0]
+    config.min_length = [32, 64]
+    config.beam_search_diversity_rate = [1.0, 2.0]
     config.repetition_penalty = [1.0, 2.0]
     config.presence_penalty = [1.0, 2.0]
     config.frequency_penalty = [1.0, 2.0]
     config.length_penalty = [1.0, 2.0]
     config.early_stopping = [1, 2]
-    config.top_p_decay = [1.0, 2.0]
-    config.top_p_min = [1.0, 2.0]
-    config.top_p_reset_ids = [1, 2]
-    config.beam_search_diversity_rate = [1.0, 2.0]
+    config.no_repeat_ngram_size = [4, 6]
+    config.num_return_sequences = 1
+    config.min_p = [0.5, 0.5]
+    config.beam_width_array = [[2, 3, 4, 5]]
 
     config1 = pickle.loads(pickle.dumps(config))
 

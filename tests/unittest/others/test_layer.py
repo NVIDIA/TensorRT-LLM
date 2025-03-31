@@ -23,14 +23,14 @@ import pytest
 import torch
 import tensorrt as trt
 # isort: on
-from functional.torch_ref import (attention_qkvpacked_ref, group_rms_norm_ref,
-                                  mamba2_ref, mamba_ref, recurrent_ref)
 from parameterized import parameterized
 from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
                                     TrtRunner)
 from transformers.models.bloom.modeling_bloom import build_alibi_tensor
 from transformers.models.llama.modeling_llama import (LlamaConfig, LlamaMLP,
                                                       LlamaRMSNorm)
+from utils.torch_ref import (attention_qkvpacked_ref, group_rms_norm_ref,
+                             mamba2_ref, mamba_ref, recurrent_ref)
 from utils.util import skip_fp8_pre_ada, unittest_name_func
 
 import tensorrt_llm

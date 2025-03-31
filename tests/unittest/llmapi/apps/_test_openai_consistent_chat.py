@@ -2,22 +2,18 @@
 import asyncio
 import os
 import re
-import sys
 from tempfile import TemporaryDirectory
 
 import openai
 import pytest
-from openai_server import RemoteOpenAIServer
+from utils.util import (skip_gpu_memory_less_than_40gb, skip_num_gpus_less_than,
+                        skip_nvlink_inactive)
 
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-from utils.util import (skip_gpu_memory_less_than_40gb, skip_num_gpus_less_than,
-                        skip_nvlink_inactive)
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 MESSAGES = [{
     "role": "user",

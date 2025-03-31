@@ -635,7 +635,7 @@ void beamSearchKernelLauncher(
         pStage3 = reinterpret_cast<float*>(pStage2LogProbs + offset);
 
         // Stage 1
-        size_t constexpr nThreadStage1 = (PBM < 16) ? ((PBM < 8) ? nThreadForSmallBeamWidth : 128) : 64;
+        size_t constexpr nThreadStage1 = (PBM < 16) ? ((PBM < 8) ? kThreadForSmallBeamWidth : 128) : 64;
         dim3 grid(nBS, nBM, bh.nVPart);
         beamStage1Kernel<T, PBM, nThreadStage1><<<grid, nThreadStage1, bh.nByteSharedMemoryStage1, stream>>>(
             logProbs, bias, pStage3, bh.endIds, bh.finished, nV, bh.batchSlots);
@@ -656,7 +656,7 @@ void beamSearchKernelLauncher(
         else if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock)
         {
             BEAM_STAGE2_KERNEL(128, true)
-            // No branch with larger `N_VOCAB_PART` since nVPart <= nMaxVPartStage1 == 128
+            // No branch with larger `N_VOCAB_PART` since nVPart <= kMaxVPartStage1 == 128
         }
         else
         {

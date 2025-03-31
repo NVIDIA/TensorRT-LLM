@@ -26,130 +26,304 @@ using ::testing::Invoke;
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
 
-TEST(SamplingConfigTest, validInputs)
-{
-    {
-        auto samplingConfig = SamplingConfig(1);
-    }
-    {
-        auto samplingConfig = SamplingConfig(4);
-    }
+static std::nullopt_t constexpr no = std::nullopt;
 
-    // TopK
-    {
-        auto samplingConfig = SamplingConfig(4, 1);
-    }
-    // TopP
-    {
-        auto samplingConfig = SamplingConfig(4, std::nullopt, 0.8);
-    }
-    // Temperature
-    {
-        auto samplingConfig
-            = SamplingConfig(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, 0.9);
-    }
-}
-
-void testInvalid(SizeType32 beamWidth, std::optional<SizeType32> topK = std::nullopt,
-    std::optional<FloatType> topP = std::nullopt, std::optional<FloatType> topPMin = std::nullopt,
-    std::optional<FloatType> topPDecay = std::nullopt, std::optional<TokenIdType> topPResetIds = std::nullopt,
-    std::optional<RandomSeedType> randomSeed = std::nullopt, std::optional<FloatType> temperature = std::nullopt,
-    std::optional<SizeType32> minLength = std::nullopt, std::optional<FloatType> beamSearchDiversityRate = std::nullopt,
-    std::optional<FloatType> repetitionPenalty = std::nullopt, std::optional<FloatType> presencePenalty = std::nullopt,
-    std::optional<FloatType> frequencePenalty = std::nullopt, std::optional<FloatType> lengthPenalty = std::nullopt,
-    std::optional<SizeType32> earlyStopping = std::nullopt, std::optional<SizeType32> noRepeatNgramSize = std::nullopt,
-    std::optional<FloatType> minP = std::nullopt)
+void test(bool const isTestValid, SizeType32 beamWidth = 1, std::optional<SizeType32> topK = no,
+    std::optional<FloatType> topP = no, std::optional<FloatType> topPMin = no,
+    std::optional<TokenIdType> topPResetIds = no, std::optional<FloatType> topPDecay = no,
+    std::optional<RandomSeedType> randomSeed = no, std::optional<FloatType> temperature = no,
+    std::optional<SizeType32> minLength = no, std::optional<FloatType> beamSearchDiversityRate = no,
+    std::optional<FloatType> repetitionPenalty = no, std::optional<FloatType> presencePenalty = no,
+    std::optional<FloatType> frequencyPenalty = no, std::optional<FloatType> lengthPenalty = no,
+    std::optional<SizeType32> earlyStopping = no, std::optional<SizeType32> noRepeatNgramSize = no,
+    std::optional<SizeType32> numReturnSequences = no, std::optional<FloatType> minP = no,
+    std::optional<std::vector<SizeType32>> beamWidthArray = no)
 {
+    // 19 parameters for SamplingConfig, from `beamWidth` to `beamWidthArray`
     try
     {
-        auto samplingConfig = SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed,
-            temperature, minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencePenalty,
-            lengthPenalty, earlyStopping, noRepeatNgramSize, minP);
-        FAIL() << "Expected TllmException";
+        auto sc = SamplingConfig(beamWidth, topK, topP, topPMin, topPResetIds, topPDecay, randomSeed, temperature,
+            minLength, beamSearchDiversityRate, repetitionPenalty, presencePenalty, frequencyPenalty, lengthPenalty,
+            earlyStopping, noRepeatNgramSize, numReturnSequences, minP, beamWidthArray);
+
+        // Come here if `sc` is valid
+        if (!isTestValid)
+        {
+            // Failed in `invalidInputs` tests
+            FAIL() << "Expected TllmException";
+        }
     }
     catch (TllmException& e)
     {
-        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
+        // Come here if `sc` is invalid and caught
+        if (isTestValid)
+        {
+            // Failed in `validInputs` tests
+            FAIL() << "Expected TllmException";
+        }
+        else
+        {
+            // Succeeded in `invalidInputs` tests
+            EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
+        }
     }
     catch (std::exception const& e)
     {
+        // Come here if `sc` is invalid but not caught
         FAIL() << "Expected TllmException";
     }
+}
+
+TEST(SamplingConfigTest, validInputs)
+{
+    // Auto
+    test(true, 1);
+    // TopK
+    test(true, 1, 2);
+    // TopP
+    test(true, 1, no, 0.5f);
+    // TopPMin
+    test(true, 1, no, no, 0.5f);
+    // TopP reset ids
+    test(true, 1, no, no, no, 0);
+    // TopP decay
+    test(true, 1, no, no, no, no, 0.5f);
+    // Seed
+    test(true, 1, no, no, no, no, no, 65536);
+    // Temperature
+    test(true, 1, no, no, no, no, no, no, 0.5f);
+    // Min token
+    test(true, 1, no, no, no, no, no, no, no, 64);
+    // Beam divirsity rate
+    test(true, 2, no, no, no, no, no, no, no, no, 0.5f);
+    // Repetition penalty
+    test(true, 1, no, no, no, no, no, no, no, no, no, 1.f);
+    // Presence penalty
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Frequency penalty
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Length penalty
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // Early stopping
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, 1.f);
+    // No repeat ngram size
+    test(true, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    // NumReturnSequences
+    test(true, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 2);
+    // MinP
+    test(true, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0.5f);
+    // BeamWidthArray
+    test(true, 5, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+        std::vector<SizeType32>{2, 3, 4, 5});
 }
 
 TEST(SamplingConfigTest, invalidInputs)
 {
-    // TODO: Add more validation
-    // TODO: If adding setters, test setters
-
-    // BeamWidth
-    testInvalid(-1);
+    // Neg or zero beamWidth
+    test(false, 0);
 
     // Neg topK
-    testInvalid(1, -1);
+    test(false, 1, -1);
 
-    // Neg topP
-    testInvalid(1, std::nullopt, -1.0f);
+    // Neg / large topP
+    test(false, 1, no, -1.f);
+    test(false, 1, no, +2.f);
 
-    // Neg TopP min
-    testInvalid(4, std::nullopt, std::nullopt, -1.0f);
+    // Neg / large TopPMin
+    test(false, 1, no, no, -1.f);
+    test(false, 1, no, no, +2.f);
 
-    // Large TopP min
-    testInvalid(4, std::nullopt, std::nullopt, 2.0f);
+    // Neg topP reset ids
+    test(false, 1, no, no, no, -1);
 
-    // Neg TopP decay
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, -1.0f);
+    // Neg / large TopP decay
+    test(false, 1, no, no, no, no, -1.f);
+    test(false, 1, no, no, no, no, +2.f);
 
-    // Large TopP decay
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, 2.0f);
-
-    // Neg TopP reset ids
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, -1);
+    // Skip seed, no test
 
     // Neg temperature
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, -0.9f);
+    test(false, 1, no, no, no, no, no, no, -0.9f);
 
     // Neg min length
-    testInvalid(
-        4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, -1);
+    test(false, 1, no, no, no, no, no, no, no, -1);
 
     // Neg beam divirsity rate
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, -1.0f);
+    test(false, 2, no, no, no, no, no, no, no, no, -1.f);
 
-    // Zero repetition penalty
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, 0.0f);
+    // Neg or zero repetition penalty
+    test(false, 1, no, no, no, no, no, no, no, no, no, 0.f);
 
-    // Neg repetition penalty
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, -1.0f);
+    // Skip presence penalty, frequency penalty, no test
 
-    // Zero no repeat ngram size
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, 0);
+    // Neg length penalty
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, -1);
+
+    // Neg early stopping
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, -1);
 
     // Neg no repeat ngram size
-    testInvalid(4, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, -1);
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1);
 
-    // min_p = 0.5 under top_p 0.9
-    testInvalid(1, std::nullopt, 0.9, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        0.5);
+    // Neg or zero numReturnSequences
+    test(false, 1, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 0);
+
+    // numReturnSequences > beamWidth
+    test(false, 2, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, 4);
+
+    // Neg minP
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
+
+    // Neg / Large minP
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, -1.f);
+    test(false, 1, no, 0.9, no, no, no, no, no, no, no, no, no, no, no, no, no, no, +2.f);
+
+    // BeamWidthArray with neg / large beamWidth
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+        std::vector<SizeType32>{2, 3, 4, -1});
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+        std::vector<SizeType32>{2, 3, 4, 65536});
+
+    // max(beamWidthArray) != beamWidth
+    test(false, 4, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no, no,
+        std::vector<SizeType32>{2, 3, 4, 5});
+}
+
+TEST(SamplingConfigTest, getterSetter)
+{
+    // Auto
+    {
+        auto sc = SamplingConfig();
+        sc.setBeamWidth(2);
+        EXPECT_EQ(sc.getBeamWidth(), 2);
+    }
+    // TopK
+    {
+        auto sc = SamplingConfig();
+        sc.setTopK(2);
+        EXPECT_EQ(sc.getTopK(), 2);
+    }
+    // TopP
+    {
+        auto sc = SamplingConfig();
+        sc.setTopP(0.5f);
+        EXPECT_EQ(sc.getTopP(), 0.5f);
+    }
+    // TopPMin
+    {
+        auto sc = SamplingConfig();
+        sc.setTopPMin(0.5f);
+        EXPECT_EQ(sc.getTopPMin(), 0.5f);
+    }
+    // TopP reset ids
+    {
+        auto sc = SamplingConfig();
+        sc.setTopPResetIds(0);
+        EXPECT_EQ(sc.getTopPResetIds(), 0);
+    }
+    // TopP decay
+    {
+        auto sc = SamplingConfig();
+        sc.setTopPDecay(0.5f);
+        EXPECT_EQ(sc.getTopPDecay(), 0.5f);
+    }
+    // Seed
+    {
+        auto sc = SamplingConfig();
+        sc.setSeed(65536);
+        EXPECT_EQ(sc.getSeed(), 65536);
+    }
+    // Temperature
+    {
+        auto sc = SamplingConfig();
+        sc.setTemperature(0.5f);
+        EXPECT_EQ(sc.getTemperature(), 0.5f);
+    }
+    // Min token
+    {
+        auto sc = SamplingConfig();
+        sc.setMinTokens(64);
+        EXPECT_EQ(sc.getMinTokens(), 64);
+    }
+    // Beam divirsity rate
+    {
+        auto sc = SamplingConfig();
+        sc.setBeamSearchDiversityRate(0.5f);
+        EXPECT_EQ(sc.getBeamSearchDiversityRate(), 0.5f);
+    }
+    // Repetition penalty
+    {
+        auto sc = SamplingConfig();
+        sc.setRepetitionPenalty(1.f);
+        EXPECT_EQ(sc.getRepetitionPenalty(), 1.f);
+    }
+    // Presence penalty
+    {
+        auto sc = SamplingConfig();
+        sc.setPresencePenalty(0.5f);
+        EXPECT_EQ(sc.getPresencePenalty(), 0.5f);
+    }
+    // Frequency penalty
+    {
+        auto sc = SamplingConfig();
+        sc.setFrequencyPenalty(0.5f);
+        EXPECT_EQ(sc.getFrequencyPenalty(), 0.5f);
+    }
+    // Length penalty
+    {
+        auto sc = SamplingConfig();
+        sc.setLengthPenalty(0.5f);
+        EXPECT_EQ(sc.getLengthPenalty(), 0.5f);
+    }
+    // Early stopping
+    {
+        auto sc = SamplingConfig();
+        sc.setEarlyStopping(1);
+        EXPECT_EQ(sc.getEarlyStopping(), 1);
+    }
+    // No repeat ngram size
+    {
+        auto sc = SamplingConfig();
+        sc.setNoRepeatNgramSize(2);
+        EXPECT_EQ(sc.getNoRepeatNgramSize(), 2);
+    }
+    // NumReturnSequences
+    {
+        auto sc = SamplingConfig(2);
+        sc.setNumReturnSequences(2);
+        EXPECT_EQ(sc.getNumReturnSequences(), 2);
+    }
+    // MinP
+    {
+        auto sc = SamplingConfig(1, no, 0.9f);
+        sc.setMinP(0.5f);
+        EXPECT_EQ(sc.getMinP(), 0.5f);
+    }
+    // BeamWidthArray
+    {
+        auto sc = SamplingConfig();
+        std::vector<SizeType32> beamWidthArray{2, 3, 4, 5};
+        sc.setBeamWidthArray(beamWidthArray);
+        auto const beamWidthArrayReturn = sc.getBeamWidthArray().value();
+        EXPECT_EQ(beamWidthArrayReturn.size(), beamWidthArray.size());
+        for (int i = 0; i < (int) beamWidthArrayReturn.size(); ++i)
+        {
+            EXPECT_EQ(beamWidthArrayReturn[i], beamWidthArray[i]);
+        }
+    }
 }
 
 TEST(SamplingConfigTest, serializeDeserialize)
 {
-    auto samplingConfig = SamplingConfig(1, 10, 0.77, std::nullopt, std::nullopt, std::nullopt, 999, 0.1);
-    auto serializedSize = Serialization::serializedSize(samplingConfig);
+    auto sc = SamplingConfig(1, 10, 0.77, no, no, no, 999, 0.1);
+    auto serializedSize = Serialization::serializedSize(sc);
 
     std::ostringstream os;
-    Serialization::serialize(samplingConfig, os);
+    Serialization::serialize(sc, os);
     EXPECT_EQ(os.str().size(), serializedSize);
 
     std::istringstream is(os.str());
     auto newSamplingConfig = Serialization::deserializeSamplingConfig(is);
 
-    EXPECT_EQ(newSamplingConfig, samplingConfig);
+    EXPECT_EQ(newSamplingConfig, sc);
 }

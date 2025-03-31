@@ -10,7 +10,7 @@ l0_a100:
       - '*a100*'
       linux_distribution_name: ubuntu*
   tests:
-  - unittest/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/model/redrafter unittest/model/test_phi.py unittest/model/test_unet.py unittest/python_plugin unittest/tools unittest/utils unittest/others
+  - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
   - unittest/llmapi/test_llm_models.py -m "part1"
   - unittest/llmapi/test_llm_models.py -m "not (part0 or part1)"
   - unittest/llmapi/test_llm.py -m "part0"
@@ -44,11 +44,11 @@ l0_a100:
   - accuracy/test_accuracy.py::TestGptNext::test_auto_dtype # 1.5 mins
   - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_accuracy.py::TestGpt2::test_weight_only[int8] # 1 min
-  - unittest/model_api/test_model_level_api.py
-  - unittest/model_api/test_model_quantization.py
-  - unittest/model_api/test_model_api_multi_gpu.py
-  - unittest/model/test_gpt_e2e.py
-  - unittest/model/eagle
+  - unittest/trt/model_api/test_model_level_api.py
+  - unittest/trt/model_api/test_model_quantization.py
+  - unittest/trt/model_api/test_model_api_multi_gpu.py
+  - unittest/trt/model/test_gpt_e2e.py
+  - unittest/trt/model/eagle
   - unittest/llmapi/test_llm_models.py -m "part0"
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]

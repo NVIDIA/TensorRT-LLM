@@ -222,7 +222,7 @@ class ReportUtility:
         }
 
         # Engine/Backend details
-        if self.rt_cfg.backend != 'pytorch':
+        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -392,7 +392,7 @@ class ReportUtility:
         decoding = stats_dict.get("decoding_stats", None)
 
         backend_info = ""
-        if self.rt_cfg.backend != "pytorch":
+        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)

@@ -2,7 +2,6 @@ import asyncio
 import time
 
 import pytest
-from test_llm import get_model_path
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -12,6 +11,8 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi import LLM, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
+
+from .test_llm import get_model_path
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 llama_model_path = get_model_path(default_model_name)

@@ -65,13 +65,13 @@ class ProposerWorker(Worker):
             max_num_tokens=max_num_tokens)
         executor_config.kv_cache_config = kv_cache_config
         build_config = BuildConfig()
-        build_config.max_seq_len = max_seq_len
 
         update_executor_config(
             executor_config,
             backend='pytorch',
             pytorch_backend_config=self.pytorch_backend_config,
             build_config=build_config,
+            max_seq_len=max_seq_len,
             hf_model_dir=model_dir,
             trt_engine_dir=None,
         )

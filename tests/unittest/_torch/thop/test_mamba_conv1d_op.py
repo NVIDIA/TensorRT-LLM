@@ -1,17 +1,13 @@
-import os
-import sys
 import unittest
 from itertools import product
 
 import pytest
 import torch
 from parameterized import parameterized
+from utils.torch_ref import mamba_conv1d_ref
+from utils.util import unittest_name_func
 
 import tensorrt_llm
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
-from functional.torch_ref import mamba_conv1d_ref
-from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):

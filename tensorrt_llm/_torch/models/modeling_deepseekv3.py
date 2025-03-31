@@ -483,9 +483,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
 
-        # deepseek allreduce kernel is better when m < 512
+        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
-            0) >= 512
+            0) > 128
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -833,11 +833,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-        assert not (
-            model_config.mapping.has_pp()
-            and model_config.mapping.enable_attention_dp
-        ), "Pipeline parallelism and attention DP cannot be used together"
 
         self.model_nextn = 0
         if model_config.spec_config is not None:
