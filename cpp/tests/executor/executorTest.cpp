@@ -3475,7 +3475,7 @@ TEST_P(GuidedDecodingParamsTest, All)
     else // llama
     {
         inputTokens = {
-            1, 1724, 338, 29871, 29896, 29974, 29896, 29973, 673, 20917, 297, 263, 9657, 297, 4390, 3402, 29901, 29871};
+            128000, 62, 3923, 7037, 62, 16, 10, 16, 30, 62, 16533, 87710, 1265, 4404, 5356, 1265, 9643, 9132, 25, 62};
     }
     SizeType32 maxNewTokens = 10;
     SamplingConfig samplingConfig{};
@@ -3513,11 +3513,11 @@ TEST_P(GuidedDecodingParamsTest, All)
     }
     else // llama
     {
-        expectedOutputTokens.push_back({916, 25, 220, 16, 13, 16, 13, 16, 13, 16});
-        expectedOutputTokens.push_back({90, 220, 220, 197, 1, 1985, 1, 551, 330, 1985});
-        expectedOutputTokens.push_back({90, 220, 220, 197, 1, 276, 2332, 261, 794, 220});
-        expectedOutputTokens.push_back({17});
-        expectedOutputTokens.push_back({17});
+        expectedOutputTokens.push_back({16, 10, 16, 28, 17, 198, 62, 3923, 7037, 62});
+        expectedOutputTokens.push_back({5018, 16, 794, 330, 16, 498, 330, 17, 794, 330});
+        expectedOutputTokens.push_back({5018, 9399, 794, 16, 92});
+        expectedOutputTokens.push_back({16});
+        expectedOutputTokens.push_back({16});
     }
 
     if (executor.canEnqueueRequests())
