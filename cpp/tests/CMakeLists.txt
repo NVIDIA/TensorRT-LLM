@@ -23,15 +23,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
-# On Windows major version is appended to nvinfer libs.
-if(WIN32)
-  set(ONNX_PARSER_LIB_NAME nvonnxparser_10)
-else()
-  set(ONNX_PARSER_LIB_NAME nvonnxparser)
-endif()
-find_library_create_target(nvonnxparser ${ONNX_PARSER_LIB_NAME} SHARED
-                           ${TRT_OUT_DIR} ${TRT_LIB_DIR})
-
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
   ${PROJECT_SOURCE_DIR}/include
@@ -50,7 +41,7 @@ function(add_gtest test_name test_src)
                         ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(${test_name} PUBLIC gmock_main nvonnxparser)
+  target_link_libraries(${test_name} PUBLIC gmock_main TensorRT::OnnxParser)
   if(NOT ARGS_NO_GTEST_MAIN)
     target_link_libraries(${test_name} PUBLIC gtest_main)
   endif()
