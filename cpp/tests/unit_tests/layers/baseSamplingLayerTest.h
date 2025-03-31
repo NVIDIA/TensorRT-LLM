@@ -114,7 +114,7 @@ protected:
     int32_t const mVocabSizePadded = mVocabSize;
 
     int32_t const mMaxInputLen = 0; // has no effect.
-    int32_t const mMaxOutputLen = 4;
+    static int32_t constexpr mMaxOutputLen = 4;
     int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
     int32_t const mMaxTokensPerEngineStep = mMaxOutputLen;
 

@@ -34,7 +34,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
     // clang-format off
 
-    // prob = (0.4, 0.3, 0.2, 0.1)
+    // logits = (-0.9163, -1.2040, -1.6094, -2.3026) -> prob = (0.4, 0.3, 0.2, 0.1)
     std::vector<T> testLogits = {
                 -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, // step 0
                 -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 1
@@ -63,7 +63,8 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
     if (mComputeProbs)
     {
-        computeProb(mTestLogitsInit.data(), mTestLogitsInit.data(), 4 * params.beamWidth, mVocabSize);
+        computeProb(mTestLogitsInit.data(), mTestLogitsInit.data(),
+            BaseSamplingLayerTest::mMaxOutputLen * params.beamWidth, mVocabSize);
     }
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
@@ -154,7 +155,6 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     {
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
     }
-
     if (mBeamWidth > 1)
     {
         auto outputIdsPtr = bufferCast<int*>(*mOutputIdsPtr);
