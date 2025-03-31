@@ -27,7 +27,7 @@ jobs:
         upstream_repository: NVIDIA/TensorRT-LLM
         upstream_branch: main
         target_branch: main
-        #git_pull_args: --ff-only                    # optional arg use, defaults to simple 'pull'
+        git_pull_args: 'rebase'                   # optional arg use, defaults to simple 'pull'
         # github_token: ${{ secrets.GITHUB_TOKEN }}   # optional, for accessing repos that require authentication
 
     # Step 3: Display a message if 'sync' step had new commits (simple test)
