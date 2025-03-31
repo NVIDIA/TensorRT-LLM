@@ -21,10 +21,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm-rn.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_SBSA_DOCKER_IMAGE = "urm-rn.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-aarch64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm-rn.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm-rn.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-aarch64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
 
 LLM_ROCKYLINUX8_DOCKER_IMAGE = LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE
 
@@ -160,7 +160,7 @@ def createKubernetesPodConfig(image, type)
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm-rn.nvidia.com/docker/alpine:latest
+                    image: urm.nvidia.com/docker/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -246,7 +246,7 @@ def createKubernetesPodConfig(image, type)
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm-rn.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
@@ -336,7 +336,7 @@ def launchReleaseCheck(pipeline)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm-rn.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
         stage("[${stageName}] Run") {
