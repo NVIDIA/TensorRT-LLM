@@ -474,7 +474,7 @@ class PyExecutor:
             self._update_iter_stats(iter_stats, iter_latency_ms,
                                     len(finished_requests), scheduled_batch))
 
-    def _common_executor_loop_cleanup(self):
+    def _executor_loop_cleanup(self):
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -572,7 +572,7 @@ class PyExecutor:
                                                 len(finished_requests),
                                                 scheduled_batch))
                     iter_start_time = iter_end_time
-        self._common_executor_loop_cleanup()
+        self._executor_loop_cleanup()
 
     def _executor_loop_pp_overlap(self):
         torch.cuda.set_device(self.device_id)
@@ -707,7 +707,7 @@ class PyExecutor:
                                                 len(finished_requests),
                                                 scheduled_batch))
                     iter_start_time = iter_end_time
-        self._common_executor_loop_cleanup()
+        self._executor_loop_cleanup()
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -804,7 +804,7 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests, scheduled_batch,
                                              iter_start_time, iter_stats)
 
-        self._common_executor_loop_cleanup()
+        self._executor_loop_cleanup()
 
     def _prepare_draft_requests(self):
         try:
@@ -944,7 +944,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
-        self._common_executor_loop_cleanup()
+        self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
         previous_scheduled_batch, _, previous_new_tensors_host, previous_decoder_event, previous_iter_start_time, previous_iter_stats, previous_ctx_transmission_reqs = self.previous_batch
