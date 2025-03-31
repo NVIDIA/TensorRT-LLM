@@ -458,10 +458,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=True,
             )
             self.block_ids_per_seq = None
-            self.block_ids_per_seq_generation = None
-            self.block_ids_per_seq_mtp = None
+            self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq_generation = torch.empty(
+                self.block_ids_per_seq = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.kv_block_ids_per_seq = torch.empty(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -514,41 +521,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids)
-
-        self.block_ids_per_seq_generation[:self.num_generations, :
-                                          block_ids_per_seq.shape[1]].copy_(
-                                              block_ids_per_seq[
-                                                  self.num_contexts:self.
-                                                  num_generations +
-                                                  self.num_contexts],
-                                              non_blocking=True)
-        self.block_ids_per_seq = self.block_ids_per_seq_generation
-
-    def update_block_ids_per_seq_for_mtp(self, num_contexts: int,
-                                         num_generations: int) -> None:
-        if self.enable_flash_mla:
-            block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
-                self.request_ids)
-            reorder_block_ids_per_seq = torch.cat([
-                block_ids_per_seq[num_contexts:num_contexts + num_generations],
-                block_ids_per_seq[:num_contexts]
-            ],
-                                                  dim=0)
-
-            self.block_ids_per_seq_mtp = torch.zeros(
-                [
-                    self.kv_cache_manager.max_batch_size,
-                    self.kv_cache_manager.max_blocks_per_seq
-                ],
-                dtype=torch.int32,
-                device='cuda',
-            )
-            self.block_ids_per_seq_mtp[:num_contexts +
-                                       num_generations, :block_ids_per_seq.
-                                       shape[1]].copy_(
-                                           reorder_block_ids_per_seq,
-                                           non_blocking=True)
-            self.block_ids_per_seq = self.block_ids_per_seq_mtp
+        num_blocks = block_ids_per_seq.shape[1]
+        self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
+            block_ids_per_seq, non_blocking=True)
+        self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
+            block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):

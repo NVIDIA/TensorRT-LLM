@@ -968,13 +968,15 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.host_request_types[:attn_metadata.
                                                  num_contexts].fill_(1)
                 attn_metadata.num_contexts = 0
+                if i == 0 and num_contexts > 0 and attn_metadata.enable_flash_mla:
+                    reorder_block_ids_per_seq = torch.cat([
+                        self.kv_block_ids_per_seq[num_contexts:batch_size],
+                        self.kv_block_ids_per_seq[:num_contexts]
+                    ])
+                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                        reorder_block_ids_per_seq, non_blocking=True)
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
-            if i == 0 and num_contexts > 0:
-                # for mtp eagle mode, mtp_layer_idx == 0: context attn; mtp_layer_idx > 0: generation attn
-                if attn_metadata.kv_cache_manager is not None:
-                    attn_metadata.update_block_ids_per_seq_for_mtp(
-                        num_contexts, num_generations)
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
