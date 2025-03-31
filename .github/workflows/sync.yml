@@ -2,25 +2,39 @@ name: Sync with Upstream
 
 on:
   schedule:
-    - cron: '0 7 * * *' 
-  workflow_dispatch:
+    - cron:  '0 7 * * 1,4'
+    # scheduled at 07:00 every Monday and Thursday
+  workflow_dispatch:  # click the button on Github repo!
+
 jobs:
   sync_with_upstream:
     runs-on: ubuntu-latest
-    name: Sync master with upstream latest
+    name: Sync main with upstream latest
 
     steps:
-      - name: Checkout master
-        uses: actions/checkout@v3
-        with:
-          ref: main
+    # Step 1: run a standard checkout action, provided by github
+    - name: Checkout main
+      uses: actions/checkout@v2
+      with:
+        ref: main
+        submodules: 'recursive'     ### may be needed in your situation
 
-      - name: Pull upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
-        with:
-          upstream_repository: 'NVIDIA/TensorRT-LLM'
-          upstream_branch: main
+    # Step 2: run this sync action - specify the upstream repo, upstream branch to sync with, and target sync branch
+    - name: Pull (Fast-Forward) upstream changes
+      id: sync
+      uses: aormsby/Fork-Sync-With-Upstream-action@v2.1
+      with:
+        upstream_repository: NVIDIA/TensorRT-LLM
+        upstream_branch: main
+        target_branch: main
+        #git_pull_args: --ff-only                    # optional arg use, defaults to simple 'pull'
+        # github_token: ${{ secrets.GITHUB_TOKEN }}   # optional, for accessing repos that require authentication
 
-      - name: Timestamp
-        run: date
+    # Step 3: Display a message if 'sync' step had new commits (simple test)
+    - name: Check for new commits
+      if: steps.sync.outputs.has_new_commits
+      run: echo "There were new commits."
+
+    # Step 4: Print a helpful timestamp for your records (not required, just nice)
+    - name: Timestamp
+      run: date
