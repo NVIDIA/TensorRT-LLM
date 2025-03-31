@@ -15,6 +15,7 @@ context_servers:
   pytorch_backend_config:
     use_cuda_graph: True
     cuda_graph_batch_sizes: [1,3000]
+    enable_overlap_scheduler: False
   urls:
       - "localhost:8001"
 generation_servers:
@@ -29,6 +30,7 @@ generation_servers:
     enable_partial_reuse: False
   pytorch_backend_config:
     use_cuda_graph: True
+    enable_overlap_scheduler: False
     cuda_graph_padding_enabled: True
     cuda_graph_batch_sizes: [1,4,8,16,24,32]
   urls:
