@@ -1080,9 +1080,9 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence)
     sequence.removeLastBlock();
 }
 
-[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks(SizeType32 cacheLevel) const noexcept
+[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks() const noexcept
 {
-    return mEvictionPolicy->getNumFreeBlocks(cacheLevel);
+    return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
 }
 
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const
@@ -1093,8 +1093,6 @@ std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::c
 void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto const requestId = sequence.getRequestId();
-    auto node = mAllocatedBlocksPerSeq.extract(requestId);
-    auto& allocatedBlocks = node.mapped();
 
     // TODO (jdebache): refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
     // can know which blocks to store for reuse and which to just release.
@@ -1124,29 +1122,23 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         // In this case, get all blocks in the sequence by traversing back until nullptr.
         if (blockKeys.size() > cacheBlockIds.size())
         {
-            auto lastBlock = allocatedBlocks.back();
-
             // First count the number of blocks to pre-allocate the vector
-            auto currentBlock = lastBlock;
+            auto const& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+            BlockPtr currentBlock = allocatedBlocks.back();
             size_t blockCount = 0;
-            while (currentBlock != nullptr)
-            {
+            while (currentBlock != nullptr) {
                 blockCount++;
                 currentBlock = currentBlock->getPrevBlockInSeq();
             }
 
             // Pre-allocate the vector with the correct size
             cacheBlockIds.resize(blockCount);
-            allocatedBlocks.resize(blockCount);
 
             // Now traverse backwards and fill from the end
-            currentBlock = lastBlock;
+            currentBlock = allocatedBlocks.back();
             size_t currentIndex = blockCount - 1;
-            while (currentBlock != nullptr)
-            {
-                cacheBlockIds[currentIndex] = currentBlock->getBlockId();
-                allocatedBlocks[currentIndex] = currentBlock;
-                currentIndex--;
+            while (currentBlock != nullptr) {
+                cacheBlockIds[currentIndex--] = currentBlock->getBlockId();
                 currentBlock = currentBlock->getPrevBlockInSeq();
             }
         }
@@ -1154,15 +1146,13 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         storeBlocks(std::move(blockKeys), cacheBlockIds);
     }
 
+    auto node = mAllocatedBlocksPerSeq.extract(requestId);
+    auto& allocatedBlocks = node.mapped();
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
         // Decrease ref count
-        // In case of sliding window attention + reuse, out-of-window blocks have no refs. So check before decreasing ref count.
-        if (block->hasRefs())
-        {
-            block->decRefCount();
-        }
+        block->decRefCount();
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
@@ -1521,44 +1511,39 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
                 auto const requestId = sequence.getRequestId();
                 auto const beamWidth = sequence.getBeamWidth();
                 auto& allocatedBlocks = mBlockManager.mAllocatedBlocksPerSeq.at(requestId);
-                SizeType32 outOfWindowBlockIdx = mSinkBlockTokenLength / getTokensPerBlock();
-
-                auto const storeBlocksForReuse = mEnableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
+                SizeType32 blockToReleaseIdx = mSinkBlockTokenLength / getTokensPerBlock();
 
                 for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
                 {
-                    auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+                    auto blockToRelease = allocatedBlocks.at(blockToReleaseIdx * beamWidth + beamIdx);
 
                     // Decrease ref count
-                    outOfWindowBlock->decRefCount();
+                    blockToRelease->decRefCount();
 
                     // If block has no refs, evict / offload it based on block reuse
-                    if (!outOfWindowBlock->hasRefs())
+                    if (!blockToRelease->hasRefs())
                     {
-                        if (storeBlocksForReuse)
+                        if (mEnableBlockReuse)
                         {
-                            // If possible, offload the out-of-window block to secondary cache to save primary memory.
-                            // Block can be released only after it is added to radix tree for reuse search, which is done after sequence is complete.
-                            // Otherwise, we will create ophaned blocks and/or blocks that can't be freed since they are not leaf blocks.
                             if (mBlockManager.mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
                             {
-                                mBlockManager.offloadBlock(outOfWindowBlock);
+                                mBlockManager.offloadBlock(blockToRelease);
                             }
                         }
                         else
                         {
-                            mBlockManager.mEvictionPolicy->releaseBlock(outOfWindowBlock);
-                            mBlockManager.removeBlockFromHashMap(outOfWindowBlock);
+                            mBlockManager.mEvictionPolicy->releaseBlock(blockToRelease);
+                            mBlockManager.removeBlockFromHashMap(blockToRelease);
                         }
                     }
                 }
 
                 // Disconnect first block from sequence
                 // Remove block from allocated blocks
-                allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
-                    allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
+                allocatedBlocks.erase(allocatedBlocks.begin() + blockToReleaseIdx * beamWidth,
+                    allocatedBlocks.begin() + (blockToReleaseIdx + 1) * beamWidth);
                 // Remove stored block ids in sequence
-                sequence.removeBlock(outOfWindowBlockIdx);
+                sequence.removeBlock(blockToReleaseIdx);
             }
             cacheNewBlockOffsets(sequence);
         }
