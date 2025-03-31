@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -30,6 +31,19 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = Mmlu(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMixtral8x7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
+
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = Mmlu(self.MODEL_NAME)

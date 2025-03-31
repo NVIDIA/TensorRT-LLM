@@ -44,19 +44,22 @@ class CnnDailymail(Evaluator):
         for i, sample in enumerate(self.data):
             if i >= self.num_samples:
                 break
-            prompt = sample["article"].strip().replace(" n't",
-                                                       "n't") + " TL;DR: "
-            reference = sample["highlights"].strip().replace(" n't", "n't")
-            yield prompt, reference
+            prompt = sample["article"] + " TL;DR:"
+            prompt = prompt.strip().replace(" n't", "n't")
+            yield prompt, sample["highlights"]
 
     def compute_score(self, outputs: List[RequestOutput],
                       references: List[str]) -> float:
-        metrics = self.rouge.compute(
-            predictions=[output.outputs[0].text for output in outputs],
-            references=references)
-        for key in metrics.keys():
-            logger.info(f"  {key}: {metrics[key]*100:.3f}")
-        return metrics["rouge1"] * 100
+        for beam_idx in range(len(outputs[0].outputs)):
+            metrics = self.rouge.compute(
+                predictions=[output.outputs[0].text for output in outputs],
+                references=references)
+            logger.info(f"Beam {beam_idx} rouge scores:")
+            for key in metrics.keys():
+                logger.info(f"\t{key}: {metrics[key]*100:.3f}")
+            if beam_idx == 0:
+                rouge1 = metrics["rouge1"] * 100
+        return rouge1
 
     @click.command("cnn_dailymail")
     @click.option("--dataset_path", type=str, default="ccdv/cnn_dailymail")

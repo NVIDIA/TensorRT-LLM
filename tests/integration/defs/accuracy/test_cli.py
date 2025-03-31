@@ -777,7 +777,7 @@ class TestMixtral8x7B(CliAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
+    def test_tp2(self):
         self.run(dtype='auto', tp_size=2)
 
     @skip_pre_ada
