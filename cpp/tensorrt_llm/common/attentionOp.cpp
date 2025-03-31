@@ -1070,7 +1070,9 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.scale_softmax = softmax_scale;
         flashMlaParams.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
 
-        flashMlaParams.q_ptr = const_cast<void*>(reinterpret_cast<void const*>(params.attention_input_buf));
+        flashMlaParams.q_ptr = mFP8GenerationMLA
+            ? const_cast<void*>(reinterpret_cast<void const*>(params.quant_attention_input_buf))
+            : const_cast<void*>(reinterpret_cast<void const*>(params.attention_input_buf));
         flashMlaParams.k_ptr = kv_cache_buffer.mPrimaryPoolPtr;
         flashMlaParams.v_ptr = flashMlaParams.k_ptr;
         flashMlaParams.o_ptr = reinterpret_cast<void*>(params.context_buf);
@@ -1095,6 +1097,9 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.block_table_batch_stride = generation_params.max_blocks_per_sequence;
         flashMlaParams.page_block_size = mTokensPerBlock;
 
+        flashMlaParams.descale_q_ptr = const_cast<float*>(params.dequant_scale_q);
+        flashMlaParams.descale_k_ptr = const_cast<float*>(params.dequant_scale_kv);
+
         flashMlaParams.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
         flashMlaParams.num_sm_parts = num_sm_parts;
         flashMlaParams.num_splits_ptr = num_splits_ptr;
@@ -1104,12 +1109,25 @@ int AttentionOp::mlaGeneration(
 
         if constexpr (std::is_same<T, half>::value)
         {
-            run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(flashMlaParams, stream);
+            if (mFP8GenerationMLA)
+            {
+                TLLM_THROW("FP8 KV cache MLA is only supported for bf16 output");
+            }
+            else
+            {
+                run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(flashMlaParams, stream);
+            }
         }
         else if constexpr (std::is_same<T, __nv_bfloat16>::value)
         {
-
-            run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+            if (mFP8GenerationMLA)
+            {
+                run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+            }
+            else
+            {
+                run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+            }
         }
         else
         {
