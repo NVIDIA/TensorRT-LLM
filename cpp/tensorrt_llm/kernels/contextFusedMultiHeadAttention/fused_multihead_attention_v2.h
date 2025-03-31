@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include "fused_multihead_attention_common.h"
+
 #include "cubin/fmha_cubin.h"
 #include "cuda_runtime_api.h"
-#include "fused_multihead_attention_common.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tmaDescriptor.h"
