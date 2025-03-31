@@ -14,7 +14,8 @@ from tensorrt_llm.bindings.internal.algorithms import (
     HandleGenerationLogits, MakeDecodingBatchInputOutput, UpdateDecoderBuffers)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
-from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
+from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
+                                                    CudaStream,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
 from tensorrt_llm.mapping import Mapping
@@ -542,10 +543,9 @@ class TRTLLMDecoder(Decoder):
 
         return new_tokens_device, new_tokens_host, decoder_event
 
-    def update_requests(
-            self, scheduled_requests: ScheduledRequests,
-            new_tensors_host: OrderedDict[str, torch.tensor],
-            decoder_event: tllm.internal.runtime.DecoderFinishedEvent or None):
+    def update_requests(self, scheduled_requests: ScheduledRequests,
+                        new_tensors_host: OrderedDict[str, torch.tensor],
+                        decoder_event: CudaEvent or None):
         if decoder_event:
             decoder_event.synchronize()
 
