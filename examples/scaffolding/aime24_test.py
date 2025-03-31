@@ -1,12 +1,11 @@
 import argparse
 import json
 
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.scaffolding.controller import (MajorityVoteController,
                                                  NativeGenerationController)
 from tensorrt_llm.scaffolding.math_utils import *
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.worker import ProposerWorker, SamplingParams
+from tensorrt_llm.scaffolding.worker import TRTLLMWorker
 
 
 def parse_arguments():
@@ -38,21 +37,18 @@ def main():
     args = parse_arguments()
     workers = {}
 
-    proposer_worker = ProposerWorker(
-        args.generation_dir,
-        pytorch_backend_config=PyTorchConfig(
-            mixed_decoder=True,
-            enable_overlap_scheduler=True,
-        ),
-        sampling_params=SamplingParams(max_tokens=2048),
-    )
+    llm_worker = TRTLLMWorker.init_with_new_llm(args.generation_dir,
+                                                backend="pytorch",
+                                                max_batch_size=32,
+                                                max_num_tokens=4096,
+                                                temperature=0.9)
 
     prototype_generation_controller = NativeGenerationController(
         custom_sampling_params={
             "max_tokens": 4096,
             "top_p": 0.9,
         })
-    workers[NativeGenerationController.WorkerTag.GENERATION] = proposer_worker
+    workers[NativeGenerationController.WorkerTag.GENERATION] = llm_worker
 
     prototype_majority_vote_controller = MajorityVoteController(
         generation_controller=prototype_generation_controller,
@@ -100,7 +96,7 @@ def main():
         print(f'Accuracy check passed with threshold={args.threshold}')
     print(f'main shutting down...')
     llm.shutdown()
-    proposer_worker.shutdown()
+    llm_worker.shutdown()
     print(f'main shut down done')
 
 
