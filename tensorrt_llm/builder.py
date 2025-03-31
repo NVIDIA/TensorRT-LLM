@@ -828,6 +828,9 @@ def optimize_model_with_config(model: PretrainedModel,
                 f"got: {low_latency_gemm_swiglu_plugin}")
 
     if build_config.plugin_config.lora_plugin is not None:
+        print(
+            f"**************** SMOR **************** lora config from build_config is: {build_config.lora_config} ****************"
+        )
         model.use_lora(build_config.lora_config)
 
     is_enc_dec = model.config.architecture in ["EncoderModel", "DecoderModel"]

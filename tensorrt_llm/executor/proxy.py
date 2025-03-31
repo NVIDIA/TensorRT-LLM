@@ -275,6 +275,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
 
+        print("********SMOR**********  Reached submit of mpi_futures")
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,

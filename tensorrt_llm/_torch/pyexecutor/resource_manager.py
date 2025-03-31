@@ -8,7 +8,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.lora_manager import PeftConfig
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import nvtx_range
@@ -570,7 +570,7 @@ class ResourceManager:
 class PeftCacheManager(BaseResourceManager):
 
     def __init__(self, peft_cache_config: PeftCacheConfig,
-                 model_config: ModelConfig, peft_config: PeftConfig):
+                 model_config: ModelConfig, lora_config: LoraConfig):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -584,6 +584,8 @@ class PeftCacheManager(BaseResourceManager):
             max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
             max_pages_per_block_device=peft_cache_config.
             max_pages_per_block_device,
+            # TODO smor- what are these device cache percent fields? search how they obtained elsewhere
+            # Tomorrow change it to something handcoded for now
             device_cache_percent=(peft_config.device_cache_percent
                                   if peft_config.device_cache_percent else
                                   peft_cache_config.device_cache_percent),
@@ -694,39 +696,6 @@ class PeftCacheManager(BaseResourceManager):
                        in_tp_split_dim=1,
                        out_tp_split_dim=-1),
         ]
-
-        # TODO smor- prettify this
-        # lora_modules = [LoraModule(
-        #         module_type=LoraModuleType.ATTN_QKV,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size * 3,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=0,
-        #     ),
-        #     LoraModule(
-        #         module_type=LoraModuleType.CROSS_ATTN_QKV,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size * 3,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=0,
-        #     ),
-        #     ]
-
-        # for module_type, rank in module_types:
-        #     module_cpp = LoraModule(
-        #         module_type=module_type,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=rank,
-        #     )
-        #     lora_modules.append(module_cpp)
 
         # FIXME
         _model_config.lora_modules = lora_modules

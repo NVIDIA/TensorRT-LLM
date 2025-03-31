@@ -32,6 +32,7 @@ from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
+from ..lora_manager import LoraConfig, PeftConfig
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
@@ -760,6 +761,9 @@ class LlmArgs(BaseModel):
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
+    enable_torch_lora: bool = Field(default=False,
+                                    description="Enable torch LoRA.")
+
     max_lora_rank: Optional[int] = Field(default=None,
                                          description="The maximum LoRA rank.")
 
@@ -875,6 +879,11 @@ class LlmArgs(BaseModel):
     backend: Optional[str] = Field(default=None,
                                    description="The backend to use.",
                                    exclude=True)
+    # configuration of peft model
+    # TODO smor- consider how to combine with peft_cache_config
+    peft_config: Optional[PeftConfig] = None
+
+    lora_config: Optional[LoraConfig] = None
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(

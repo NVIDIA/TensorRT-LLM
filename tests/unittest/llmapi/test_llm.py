@@ -1321,6 +1321,8 @@ def llama_v2_13b_lora_test_harness(**llm_kwargs):
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
 
     # For LoRA checkpoints with finetuned embedding and lm_head, lora_dir must be provided at build time.
+    print(
+        "************* SMOR ************* Beginning of lora test *************")
     build_config = BuildConfig(lora_config=LoraConfig(lora_dir=[hf_lora_dir]))
     llm = LLM(hf_model_dir,
               tokenizer=hf_lora_dir,

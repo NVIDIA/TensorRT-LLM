@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm.logger import logger, set_level
+from tensorrt_llm.lora_manager import LoraConfig
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
@@ -326,6 +327,8 @@ class GenerationExecutor(ABC):
         return_logits: bool = False,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        enable_torch_lora: bool = False,
+        lora_config: Optional[LoraConfig] = None,
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import ExecutorBindingsProxy
@@ -354,6 +357,9 @@ class GenerationExecutor(ABC):
             "batched_logits_processor": batched_logits_processor,
         }
 
+        if enable_torch_lora:
+            worker_kwargs["enable_torch_lora"] = enable_torch_lora
+            worker_kwargs["lora_config"] = lora_config
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)
         # The case where the Python main process utilizes mpi4py to spawn MPI workers

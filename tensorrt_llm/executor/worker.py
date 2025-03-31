@@ -23,7 +23,7 @@ from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, nvtx_range,
                             print_colored_debug, print_traceback_on_error)
-from ..lora_manager import LoraManager
+from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -55,6 +55,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        enable_torch_lora: bool = False,
+        lora_config: Optional[LoraConfig] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -97,26 +99,31 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if not hasattr(executor_config, "backend"):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
-            elif executor_config.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
-            elif executor_config.backend == "autodeploy":
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
             else:
-                raise ValueError(
-                    f"Unsupported backend config: {executor_config.backend}")
+                args = {
+                    "executor_config": executor_config,
+                    "checkpoint_dir": executor_config.hf_model_dir,
+                    "engine_dir": executor_config.trt_engine_dir,
+                }
+                if executor_config.backend == "pytorch":
+                    from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                        create_py_executor
+                    create_executor = create_py_executor
+                    args["lora_config"] = lora_config
+                elif executor_config.backend == "autodeploy":
+                    from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
+                        create_autodeploy_executor
+                    create_executor = create_autodeploy_executor
+                else:
+                    raise ValueError(
+                        f"Unsupported backend config: {executor_config.backend}"
+                    )
 
             device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
-            return create_executor(executor_config=executor_config,
-                                   checkpoint_dir=executor_config.hf_model_dir,
-                                   engine_dir=executor_config.trt_engine_dir)
+            return create_executor(**args)
 
         self.engine = _create_engine()
-
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
@@ -128,10 +135,25 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     f"{engine}/config.json")
             self._runtime_model_config = _engine_config_to_model_config(
                 engine_config)
+
             if engine_config.build_config.plugin_config.lora_plugin:
                 self._lora_manager = LoraManager()
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
+
+        if getattr(executor_config, "backend",
+                   "") == "pytorch" and enable_torch_lora:
+            print("********SMOR**********  in worker, setting LoRAManager")
+            self._lora_manager = LoraManager()
+            # TODO smor - support through py executor creator
+            # raise NotImplementedError("TODO smor - support through py executor creator")
+            # self.lora_config = lora_config
+
+            # self._lora_manager.load_from_ckpt(
+            #     peft_config.lora_manager_prefetch_dir_list,
+            #     model_config=self.peft_config,
+            #     runtime_mapping=None,
+            #     ckpt_source='hf')
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -290,7 +312,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
             [lora_request.path],
-            model_config=self._runtime_model_config,
+            model_config=self._runtime_model_config
+            if self._runtime_model_config else
+            self.engine.model_engine.model.model_config,
             runtime_mapping=None,
             uids=[str(lora_request.adapter_id)])
 
@@ -303,7 +327,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
-        if self._lora_manager is not None and request.lora_request is not None:
+        if self._lora_manager is not None and request.lora_request is not None and int(
+                request.lora_request.adapter_id) >= 0:
             self._load_lora_adapter(request.lora_request)
             uid = str(request.lora_request.adapter_id)
             lora_config = tllm.LoraConfig(
@@ -489,19 +514,22 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
 @print_traceback_on_error
 def worker_main(
-        engine: Path | Engine,
-        worker_queues: WorkerCommIpcAddrs,
-        log_level: str,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
-        worker_cls: type = ExecutorBindingsWorker,
-        tracer_init_kwargs: Optional[dict] = None,
-        _torch_model_class_mapping: Optional[dict] = None,
-        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+    engine: Path | Engine,
+    worker_queues: WorkerCommIpcAddrs,
+    log_level: str,
+    executor_config: Optional[tllm.ExecutorConfig] = None,
+    batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+    worker_cls: type = ExecutorBindingsWorker,
+    tracer_init_kwargs: Optional[dict] = None,
+    _torch_model_class_mapping: Optional[dict] = None,
+    postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+    ready_signal: Optional[str] = None,
+    is_llm_executor: Optional[
+        bool] = True,  # whether it's the main executor instance
+    enable_torch_lora: bool = False,
+    lora_config: Optional[LoraConfig] = None,
 ) -> None:
+    print("********SMOR********** worker_main called")
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
                         "green")
@@ -619,12 +647,16 @@ def worker_main(
                         "green")
 
     try:
+        print("********SMOR**********  Reached init of worker_cls, type: ",
+              type(worker_cls))
         worker: ExecutorBindingsWorker = worker_cls(
             engine,
             executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
-            is_llm_executor=is_llm_executor)
+            is_llm_executor=is_llm_executor,
+            enable_torch_lora=enable_torch_lora,
+            lora_config=lora_config)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

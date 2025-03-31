@@ -6,6 +6,7 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
@@ -21,7 +22,7 @@ from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import KVCacheManager, ResourceManager
+from .resource_manager import KVCacheManager, PeftCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 
@@ -90,7 +91,8 @@ def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
-                       engine_dir: str = None):
+                       engine_dir: str = None,
+                       lora_config: LoraConfig = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -241,6 +243,46 @@ def create_py_executor(executor_config: ExecutorConfig,
             resources["spec_resource_manager"] = spec_resource_manager
     else:
         spec_decoder = None
+
+    if lora_config is not None:
+        # TODO smor- this is duplicated with LoraManager handle new request
+        print("********SMOR**********  in py_executor_creator, loading hf lora")
+        load_torch_hf_lora(lora_config)
+        # peft_config.update_model_config(hidden_size,
+        #                                 torch_dtype_to_str(model_engine.dtype))
+        print(
+            f"********SMOR**********  in py_executor_creator, max_lora_rank: {lora_config.max_lora_rank}"
+        )
+        print(
+            f"********SMOR**********  in py_executor_creator, model_engine.model.model_config type: {type(model_engine.model.model_config)}"
+        )
+        print(
+            f"********SMOR**********  in py_executor_creator, num_hidden_layers: {model_engine.model.model_config.pretrained_config.num_hidden_layers}"
+        )
+        print(
+            f"********SMOR**********  in py_executor_creator, num_lora_modules: {len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)}"
+        )
+        max_lora_rank = lora_config.max_lora_rank
+        num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
+            len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+
+        # TODO smor- this must not be a magic number...
+        max_loras = 4
+        max_cpu_loras = 4
+        executor_config.peft_cache_config = tllm.executor.PeftCacheConfig(
+            num_device_module_layer=max_lora_rank * num_lora_modules *
+            max_loras,
+            num_host_module_layer=max_lora_rank * num_lora_modules *
+            max_cpu_loras,
+        )
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=executor_config.peft_cache_config,
+            model_config=model_engine.model.config,
+            lora_config=lora_config)
+        resources["peft_cache_manager"] = peft_cache_manager
+        print(
+            f"********SMOR**********  in py_executor_creator, peft_cache_manager initiated"
+        )
 
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:

@@ -1130,6 +1130,9 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata.prepare()
 
+        # TODO smor - need to call lora_params = self._get_lora_params_from_requests(scheduled_requests, attn_metadata)
+        # and pass it to the inputs here
+        # raise NotImplementedError("Need to incorporate lora params here")
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:total_num_tokens],

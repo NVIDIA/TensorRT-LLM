@@ -138,7 +138,6 @@ def norm_dora_magnitude(W0: torch.Tensor,
 @dataclass
 class PeftConfig:
     # TODO (smor) check that can we merge it with LoraConfig or not
-    # FIXME Refine this class
     def __init__(self):
         self.lora_target_modules = [
             'attn_q', 'attn_k', 'attn_v', 'attn_qkv', 'attn_dense',
@@ -287,11 +286,46 @@ def get_default_trtllm_modules_to_hf_modules():
     }
 
 
+def load_torch_hf_lora(lora_config: LoraConfig):
+    """"
+    This is a shortned version of load_hf_lora that is used for torch models.
+    Main problem is model.config in legacy code is custom (defined in the legacy code)whereas
+    whereas pivot model config is the transformer's one
+    """
+    # TODO smor- need to figure this out, currently you don't handle the weights adjustment that is done in load_hf_lora
+    trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
+    lora_config.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
+    print(
+        f"********SMOR**********  in load_torch_hf_lora, trtllm_modules_to_hf_modules: {trtllm_modules_to_hf_modules}"
+    )
+
+    lora_loader = HfLoraLoader(lora_config.lora_dir)
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            trtllm_modules_to_hf_modules)
+        print(
+            f"********SMOR**********  in load_torch_hf_lora, lora_config.lora_target_modules: {lora_config.lora_target_modules}"
+        )
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    missing_qkv_modules = LoraManager.get_missing_qkv_modules(
+        lora_config.lora_target_modules)
+    lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
 def load_hf_lora(
     model,
     lora_config: LoraConfig,
     trtllm_modules_to_hf_modules: Dict[str, str] = None,
 ):
+    print(
+        "**************** SMOR **************** start of load_hf_lora ****************"
+    )
     trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules or get_default_trtllm_modules_to_hf_modules(
     )
     lora_config.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
@@ -312,7 +346,11 @@ def load_hf_lora(
     lora_config.lora_target_modules.extend(missing_qkv_modules)
 
     if lora_loader.is_valid:
+        print(f"********SMOR********** model type: {type(model)}")
+        print(f"********SMOR********** model: {model}")
+        print(f"********SMOR********** model config: {model.config}")
         config = model.config
+        print(f"********SMOR**********  in load_hf_lora, config: {config}")
         torch_dtype = str_dtype_to_torch(config.dtype)
         # the lora checkpoint might finetune the embedding
         if lora_loader.vocab_size != 0:
@@ -466,6 +504,10 @@ class LoraManager(object):
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
+        print(
+            "**************** SMOR **************** LoraManager __init__ ****************"
+        )
+        # TODO (smor) - caller: File "/workspaces/tensorrt_llm/tensorrt_llm/executor/worker.py", line 152, in __init__
 
     @staticmethod
     def get_missing_qkv_modules(lora_target_modules):
@@ -490,11 +532,14 @@ class LoraManager(object):
 
     def load_from_ckpt(self,
                        model_dirs_or_files: List[str],
-                       model_config: 'ModelConfig',
+                       model_config: PeftConfig,
                        runtime_mapping: Optional[Mapping] = None,
                        uids: Optional[List[str]] = None,
                        ckpt_source: str = 'hf'):
         if ckpt_source == 'hf':
+            print(
+                f"********SMOR********** LoraManager load_from_ckpt called with ckpt_source: {ckpt_source}"
+            )
             self.load_from_hf(model_dirs=model_dirs_or_files,
                               model_config=model_config,
                               runtime_mapping=runtime_mapping,
@@ -683,6 +728,22 @@ class LoraManager(object):
 
         lora_hf_configs = []
         for model_dir in new_model_dirs:
+            # TODO smor- support
+            # below is BoYang code
+            # if model_dir is not None:
+            #     with open(f"{model_dir}/adapter_config.json", 'r') as f:
+            #         config = json.load(f)
+            #         lora_hf_configs.append(config)
+            # else:
+            #     lora_hf_configs.append({
+            #         "r": 0,
+            #         "use_rslora": False,
+            #         "lora_alpha": 1.0,
+            #     })
+            print(
+                "**************** SMOR **************** load_from_hf ****************"
+            )
+            raise NotImplementedError("SMOR loading not implemented yet")
             with open(f"{model_dir}/adapter_config.json", 'r') as f:
                 config = json.load(f)
                 lora_hf_configs.append(config)
