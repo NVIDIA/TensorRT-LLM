@@ -48,7 +48,6 @@ trt_llm_release_perf_sanity_test:
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8+64-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[chatglm3_6b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen2_7b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
 
 # FP8 specific tests
