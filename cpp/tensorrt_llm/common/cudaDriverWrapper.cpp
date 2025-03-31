@@ -72,6 +72,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     };
 
     *reinterpret_cast<void**>(&_cuGetErrorName) = load_sym(handle, "cuGetErrorName");
+    *reinterpret_cast<void**>(&_cuGetErrorString) = load_sym(handle, "cuGetErrorString");
     *reinterpret_cast<void**>(&_cuFuncSetAttribute) = load_sym(handle, "cuFuncSetAttribute");
     *reinterpret_cast<void**>(&_cuLinkComplete) = load_sym(handle, "cuLinkComplete");
     *reinterpret_cast<void**>(&_cuModuleUnload) = load_sym(handle, "cuModuleUnload");
@@ -98,6 +99,11 @@ CUDADriverWrapper::~CUDADriverWrapper()
 CUresult CUDADriverWrapper::cuGetErrorName(CUresult error, char const** pStr) const
 {
     return (*_cuGetErrorName)(error, pStr);
+}
+
+CUresult CUDADriverWrapper::cuGetErrorString(CUresult error, char const** pStr) const
+{
+    return (*_cuGetErrorString)(error, pStr);
 }
 
 CUresult CUDADriverWrapper::cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const

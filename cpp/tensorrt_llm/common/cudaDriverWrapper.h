@@ -41,6 +41,8 @@ public:
 
     CUresult cuGetErrorName(CUresult error, char const** pStr) const;
 
+    CUresult cuGetErrorString(CUresult error, char const** pStr) const;
+
     CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const;
 
     CUresult cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut) const;
@@ -88,6 +90,7 @@ private:
     CUDADriverWrapper();
 
     CUresult (*_cuGetErrorName)(CUresult, char const**);
+    CUresult (*_cuGetErrorString)(CUresult, char const**);
     CUresult (*_cuFuncSetAttribute)(CUfunction, CUfunction_attribute, int);
     CUresult (*_cuLinkComplete)(CUlinkState, void**, size_t*);
     CUresult (*_cuModuleUnload)(CUmodule);
@@ -120,8 +123,11 @@ void checkDriver(
     if (result)
     {
         char const* errorName = nullptr;
+        char const* errorString = nullptr;
         wrap.cuGetErrorName(result, &errorName);
-        throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s.", func, errorName));
+        wrap.cuGetErrorString(result, &errorString);
+        throw TllmException(
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %s: %s.", func, errorName, errorString));
     }
 }
 
