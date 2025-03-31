@@ -3,6 +3,7 @@ name: Sync with Upstream
 on:
   schedule:
     - cron: '0 7 * * *' 
+  workflow_dispatch:
 jobs:
   sync_with_upstream:
     runs-on: ubuntu-latest
