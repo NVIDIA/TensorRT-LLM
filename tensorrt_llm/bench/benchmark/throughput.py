@@ -322,4 +322,4 @@ def throughput_command(
         logger.info("Keyboard interrupt, exiting benchmark...")
     finally:
         if llm is not None:
-            llm.shutdown(None, None, None)
+            llm.shutdown()
