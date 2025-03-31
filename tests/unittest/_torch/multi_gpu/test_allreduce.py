@@ -28,7 +28,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, ParallelConfig, TensorParallelMode)
+                                             AllReduceParams, ParallelConfig,
+                                             TensorParallelMode)
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -91,7 +92,8 @@ def row_linear_residual_norm_fusion_forward(
         tensor_parallel_size=tensor_parallel_size,
         tensor_parallel_rank=tensor_parallel_rank,
         tensor_parallel_mode=TensorParallelMode.ROW,
-    ), deepseek_allreduce=True).cuda()
+    ),
+                          deepseek_allreduce=True).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
 
@@ -100,9 +102,7 @@ def row_linear_residual_norm_fusion_forward(
         if enable_fusion:
             inter_x = l0(
                 xs[tensor_parallel_rank],
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=False,
-                ),
+                all_reduce_params=AllReduceParams(enable_allreduce=False, ),
             )
             if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
                 hidden_states, residual = allreduce(
@@ -112,27 +112,24 @@ def row_linear_residual_norm_fusion_forward(
                         residual=residual,
                         norm_weight=norm_weight,
                         eps=eps,
-                    )
-                )
+                    ))
                 output = (hidden_states, residual)
 
                 inter_x = l0(
                     xs[tensor_parallel_rank],
-                    all_reduce_params=AllReduceParams(
-                        enable_allreduce=False,
-                    ),
+                    all_reduce_params=AllReduceParams(enable_allreduce=False, ),
                 )
             elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
                 act_fp4, act_sf, residual = allreduce(
                     inter_x,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=norm_weight,
                         scale=scale,
                         eps=eps,
-                    )
-                )
+                    ))
                 output = (act_fp4, act_sf, residual)
         else:
             hidden_states = l0(xs[tensor_parallel_rank])
@@ -207,10 +204,7 @@ def row_linear_residual_norm_fusion_forward(
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
     ],
-    ids=[
-        "residual_rms_norm",
-         "residual_rms_norm_quant_nvfp4"
-        ])
+    ids=["residual_rms_norm", "residual_rms_norm_quant_nvfp4"])
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion_op):
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -223,7 +217,8 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion_op):
             run_single_rank,
             *zip(*[(tensor_parallel_size,
                     row_linear_residual_norm_fusion_forward, x, residual,
-                    [l0_weight], hidden_size, dtype, fusion_op)] * tensor_parallel_size),
+                    [l0_weight], hidden_size, dtype, fusion_op)] *
+                 tensor_parallel_size),
         )
         for r in results:
             assert r is True

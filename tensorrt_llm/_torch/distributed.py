@@ -271,6 +271,61 @@ class AllReduce(nn.Module):
             return output
 
 
+class DeepseekAllReduce(nn.Module):
+
+    def __init__(self, parallel_config: ParallelConfig):
+        super().__init__()
+        self.parallel_config = parallel_config
+        self.tp_size = self.parallel_config.tensor_parallel_size
+        self.tp_rank = self.parallel_config.tensor_parallel_rank
+        self.gpus_per_node = self.parallel_config.gpus_per_node
+        self.rank = self.parallel_config.parallel_rank
+        self.workspace = None
+        if self.tp_size > 1:
+            mapping = Mapping(
+                world_size=self.parallel_config.parallel_size,
+                tp_size=self.tp_size,
+                pp_size=self.parallel_config.pipeline_parallel_size,
+                rank=self.rank,
+                gpus_per_node=self.gpus_per_node,
+            )
+            self.workspace = get_deepseek_allreduce_workspace(mapping)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        reduce_fusion_inputs: List[torch.Tensor],
+        eps: float,
+        fusion_op: AllReduceFusionOp,
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        hidden_states: hidden_states of the model
+        reduce_fusion_inputs: [residual, norm_weight, scale (if using FP4 quantization)]
+        eps: epsilon for RMSNorm
+        fusion_op: AllReduceFusionOp Type, currently supports RMSNorm:
+          * RESIDUAL_RMS_NORM: allreduce + residual + Norm
+          * RESIDUAL_RMS_NORM_QUANT_NVFP4: allreduce + residual + Norm + fp4 quantization
+        output:
+          * [hidden_states, residual] if using RESIDUAL_RMS_NORM fusion_op
+          * [act_fp4, act_sf, residual] if using RESIDUAL_RMS_NORM_QUANT_NVFP4 fusion_op
+        """
+
+        output = torch.ops.trtllm.deepseek_allreduce_fusion(
+            input=hidden_states,
+            workspace=self.workspace,
+            reduce_fusion_inputs=reduce_fusion_inputs,
+            rank=self.parallel_config.tensor_parallel_rank,
+            nranks=self.parallel_config.tensor_parallel_size,
+            eps=eps,
+            fusion_op=fusion_op,
+        )
+
+        if len(output) == 0:
+            raise ValueError(f"Unsupported fusion op: {fusion_op}")
+
+        return output
+
+
 class PPComm:
     # PP communication using torch.distributed with nccl backend
     def __init__(self, global_mapping: Mapping):

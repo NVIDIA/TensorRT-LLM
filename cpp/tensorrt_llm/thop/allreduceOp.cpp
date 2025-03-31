@@ -167,12 +167,9 @@ public:
         // (runtime strategy, fusion type) -> implementation
         switch (runtimeStrategy)
         {
-            case AllReduceStrategyType::UB:
-                return runUBAllReduce(input, workspace, reduce_fusion_inputs);
-            case AllReduceStrategyType::NCCL:
-                return runNCCLAllReduce(input, workspace, reduce_fusion_inputs);
-            default:
-                return runFusionAllReduce(input, workspace, reduce_fusion_inputs, runtimeStrategy);
+        case AllReduceStrategyType::UB: return runUBAllReduce(input, workspace, reduce_fusion_inputs);
+        case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, workspace, reduce_fusion_inputs);
+        default: return runFusionAllReduce(input, workspace, reduce_fusion_inputs, runtimeStrategy);
         }
 
         TORCH_CHECK(false, "Invalid runtime strategy");
@@ -192,8 +189,8 @@ public:
     }
 
 private:
-
-    std::vector<torch::Tensor> runUBAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
+    std::vector<torch::Tensor> runUBAllReduce(
+        torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
@@ -202,11 +199,9 @@ private:
         torch::Tensor finalOutput;
         torch::Tensor output = torch::empty_like(input);
 
-        TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
-            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+        TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
-        TLLM_CHECK_WITH_INFO(
-            tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
         auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
         TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
         auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
@@ -240,10 +235,10 @@ private:
             TLLM_CHECK(!mBias);
             auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
             tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
-                ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
-                residual, output.data_ptr(), mType, ub_comm, stream);
-            torch::Tensor scaleOutput = torch::from_blob(
-                ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
+                ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual,
+                output.data_ptr(), mType, ub_comm, stream);
+            torch::Tensor scaleOutput
+                = torch::from_blob(ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
             auto output_shape = input.sizes().vec();
             output_shape.back() /= 2;
             auto output_strides = input.strides().vec();
@@ -261,11 +256,11 @@ private:
             TLLM_CHECK(mAffine);
             TLLM_CHECK(!mBias);
             TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
-            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_launcher(ub_buffer0.handle, 0, size,
-                hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle, 0,
+                size, hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
             auto dt = input.scalar_type();
             finalOutput = torch::from_blob(
-                ub_buffer0.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
+                ub_buffer1.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
 
             return {finalOutput, output};
         }
@@ -273,26 +268,26 @@ private:
         TORCH_CHECK(false, "Invalid allreduce op");
     }
 
-    std::vector<torch::Tensor> runNCCLAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
+    std::vector<torch::Tensor> runNCCLAllReduce(
+        torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         int hidden_size = input.size(-1);
 
         torch::Tensor output = torch::empty_like(input);
-        
+
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             torch::Tensor finalOutput = torch::empty_like(input);
 
-            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                ncclSum, *mNcclComm, stream));
+            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum,
+                *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
             int fusion_ptr_idx = 0;
             params.fusion_params.bias_buffer = mBias ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
             params.fusion_params.residual_buffer = reduce_fusion_inputs[fusion_ptr_idx++].data_ptr();
-            params.fusion_params.weight_buffer
-                = mAffine ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
+            params.fusion_params.weight_buffer = mAffine ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
             params.local_output_buffer_ptr = finalOutput.mutable_data_ptr();
             params.elts_total = size;
 
@@ -304,13 +299,14 @@ private:
         }
         else
         {
-            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-                ncclSum, *mNcclComm, stream));
+            NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum,
+                *mNcclComm, stream));
             return {output};
         }
     }
 
-    std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs, AllReduceStrategyType runtimeStrategy) noexcept
+    std::vector<torch::Tensor> runFusionAllReduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
+        torch::TensorList reduce_fusion_inputs, AllReduceStrategyType runtimeStrategy) noexcept
     {
         // Should handle only Lamport implementation
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -388,6 +384,16 @@ private:
             allreduce_fusion_params.residual_in = reduce_fusion_inputs[0].data_ptr();
             allreduce_fusion_params.rms_gamma = reduce_fusion_inputs[1].data_ptr();
             allreduce_fusion_params.rms_eps = mEps;
+            allreduce_fusion_params.stream = stream;
+
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                allreduce_fusion_params.scale_factor = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+            }
+            else
+            {
+                allreduce_fusion_params.scale_factor = nullptr;
+            }
 
             tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(allreduce_fusion_params);
 
@@ -567,7 +573,8 @@ private:
                     {
                         // Maybe Two GPUs are connected via nvswitch,
                         // now remotePciInfo represents the pci information of nvswitch,
-                        // determine whether nvlink is supported by whether two GPUs are connected to the same nvswitch.
+                        // determine whether nvlink is supported by whether two GPUs are connected to the same
+                        // nvswitch.
                         nvmlDevice_t secondDevice;
                         NVML_CHECK(nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
 
