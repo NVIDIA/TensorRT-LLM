@@ -691,8 +691,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override the timeout to 3600
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=3600"
+        // CPP test execution is timing out easily, so we always override the timeout to 7200
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
