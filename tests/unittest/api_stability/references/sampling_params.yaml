@@ -24,5 +24,8 @@ methods:
       random_seed:
         annotation: Optional[int]
         default: null
+      beam_width_array:
+        annotation: Optional[List[int]]
+        default: null
     return_annotation: None
 properties: {}
