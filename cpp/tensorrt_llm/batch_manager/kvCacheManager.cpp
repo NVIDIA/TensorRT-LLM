@@ -1080,9 +1080,9 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence)
     sequence.removeLastBlock();
 }
 
-[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks() const noexcept
+[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks(SizeType32 cacheLevel) const noexcept
 {
-    return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+    return mEvictionPolicy->getNumFreeBlocks(cacheLevel);
 }
 
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const

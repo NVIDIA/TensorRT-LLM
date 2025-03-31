@@ -2559,7 +2559,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     // no blocks stored because cyclic KV cache was enabled
     numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
     EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(0), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(1), blocksInSecondaryPool);
     // store blocks 0, 1, 2, 3, 4  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007], [1008,1009,1010,1011],
     // [1012,1013,1014,1015], [1016,1017])
 

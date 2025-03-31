@@ -525,7 +525,7 @@ public:
     //! \brief Release last block in the sequence
     void releaseLastBlock(GenerationRequest& sequence);
 
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 cacheLevel = kPrimaryLevel) const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
