@@ -111,9 +111,14 @@ def testFilter = [
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
-String githubPrApiUrl = gitlabParamsFromBot.get('github_pr_api_url', null)
-
-def cachedChangedFileList = null
+@Field
+def GITLAB_PR_API_URL = "gitlab_pr_api_url"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+def globalVars = [
+    (GITLAB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
+    (CACHED_CHANGED_FILE_LIST): null,
+]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
@@ -284,7 +289,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
+def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
@@ -302,8 +307,8 @@ def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl, cachedChanged
         }
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
     })
 }
 
@@ -436,7 +441,10 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
     return changedFileList
 }
 
-def getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList) {
+def getMergeRequestChangedFileList(pipeline, globalVars) {
+    def githubPrApiUrl = globalVars[GITLAB_PR_API_URL]
+    def cachedChangedFileList = globalVars[CACHED_CHANGED_FILE_LIST]
+
     if (cachedChangedFileList != null) {
         return cachedChangedFileList
     }
@@ -456,7 +464,7 @@ def getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileLi
     }
 }
 
-def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
+def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         pipeline.echo("Force not run multi-GPU testing.")
@@ -519,7 +527,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFi
         "jenkins/L0_Test.groovy",
     ]
 
-    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList)
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList) {
         return false
     }
@@ -548,7 +556,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFi
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList) {
+def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
@@ -556,7 +564,7 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChange
     }
     def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
 
-    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList)
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
 
     if (!changedFileList || changedFileList.isEmpty()) {
         return false
@@ -923,7 +931,7 @@ pipeline {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, githubPrApiUrl, cachedChangedFileList)
+                    setupPipelineEnvironment(this, testFilter, globalVars)
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
