@@ -571,6 +571,13 @@ def run_disagg_multi_gpu_tests(build_dir: _pl.Path):
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
+    xml_output_file = build_dir / "results-multi-gpu-disagg-spawn-asymmetric-orchestrator-executor-1-process.xml"
+    comms = [
+        "executor/disaggExecutorTest",
+        "--gtest_filter=*DisaaggSpawnOrchestrator*"
+    ]
+    run_command(comms, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
 
 def run_spec_dec_tests(build_dir: _pl.Path):
     xml_output_file = build_dir / "results-spec-dec-fast-logits.xml"

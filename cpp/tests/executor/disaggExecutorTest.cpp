@@ -670,6 +670,13 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     {
         GTEST_SKIP() << " need " << processNum << " processes but got " << commSize << " mpi processes, skip test.";
     }
+    bool spawnProcess = false;
+    if (commSize == 1)
+    {
+        spawnProcess = true;
+        ASSERT_TRUE(tensorrt_llm::common::getEnvUseUCXKvCache());
+    }
+
     ASSERT_EQ(participantIdsEachInstance.size(), participantDeviceIdsEachInstance.size());
     SizeType32 instanceNum = participantIdsEachInstance.size();
     ASSERT_EQ(instanceNum, instanceRoles.size());
@@ -828,7 +835,8 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
         KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, 0.2};
 
         tensorrt_llm::executor::ExecutorConfig executorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig);
-        tensorrt_llm::executor::OrchestratorConfig orchestratorConfig{isOrchestrator, "", nullptr, false};
+        tensorrt_llm::executor::OrchestratorConfig orchestratorConfig{
+            isOrchestrator, PathUtil::EXECUTOR_WORKER_PATH(), nullptr, spawnProcess};
         tensorrt_llm::executor::ParallelConfig parallelConfig{tensorrt_llm::executor::CommunicationType::kMPI,
             tensorrt_llm::executor::CommunicationMode::kORCHESTRATOR, participantDeviceIdsEachInstance.at(in),
             participantIdsEachInstance.at(in), orchestratorConfig};
@@ -1239,4 +1247,20 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen1TP2PP2DisaaggOrchestrator, DisaggOrches
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4, 5, 6}}),
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {0, 1, 2, 3}}),
         testing::Values(std::vector<int>{1, 1, 0}), testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+    testing::Combine(testing::Values(1),
+        testing::Values(std::vector<std::string>{"llama_tp2_pp1", "llama_tp2_pp1", "llama_tp1_pp1", "llama_tp1_pp1"}),
+        testing::Values(std::vector<std::vector<int>>{{1, 2}, {3, 4}, {5}, {6}}),
+        testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}, {0}, {1}}),
+        testing::Values(std::vector<int>{1, 1, 0, 0}), testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+    testing::Combine(testing::Values(1),
+        testing::Values(std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp1_pp2", "llama_tp1_pp2"}),
+        testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4}, {5, 6}}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {1}, {3, 2}, {1, 0}}),
+        testing::Values(std::vector<int>{1, 1, 0, 0}), testing::Values(0)),
     generateTestNameDisaggParams);

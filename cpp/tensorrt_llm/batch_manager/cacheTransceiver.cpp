@@ -128,25 +128,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI)
+    if (mCommType == CommType::MPI || mCommType == CommType::UCX)
     {
-        using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-        mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
-        mDataResponder = isMLA
-            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        mDataRequester = isMLA
-            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-    }
-    else if (mCommType == CommType::UCX)
-    {
-        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+        if (mCommType == CommType::UCX)
         {
             std::lock_guard<std::mutex> lock(mDllMutex);
             mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
@@ -163,17 +147,23 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
             mManager = makeUcxConnectionManager();
         }
+        else
+        {
+            mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+            mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+        }
+
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        mDataResponder = isMLA
-            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        mDataRequester = isMLA
-            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
+        auto makeFormatter = [cacheManager, isMLA]() -> std::unique_ptr<IOFormatter>
+        {
+            return isMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(cacheManager))
+                         : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(cacheManager));
+        };
+
+        mDataResponder = std::make_unique<DataResponder>(
+            std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        mDataRequester = std::make_unique<DataRequester>(
+            std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
     }
     else
     {

@@ -679,123 +679,109 @@ protected:
         {
             return;
         }
-        else if (tensorrt_llm::common::getEnvUseMPIKvCache())
+        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
         {
-            TLLM_LOG_INFO("Enable MPI KV cache transport.");
-            mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
+            bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
+            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
 
-            if (mIsContext)
+            if (isUcx)
             {
-                mResponder = mIsMLA
-                    ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
-                    : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
-            }
-            else
-            {
-                mRequester = mIsMLA
-                    ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
-                    : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
-            }
-
-            std::vector<int> contextRankVec(mContextRankSize);
-            for (int i = 0; i < contextRankVec.size(); i++)
-            {
-                contextRankVec[i] = i;
-            }
-            mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
-        }
-        else if (tensorrt_llm::common::getEnvUseUCXKvCache())
-        {
-            TLLM_LOG_INFO("Enable UCX KV cache transport.");
-            std::lock_guard<std::mutex> lock(mDllMutex);
-            void* WrapperLibHandle{nullptr};
-            WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
-            TLLM_CHECK_WITH_INFO(
-                WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: %s", dlerror());
-            auto load_sym = [](void* handle, char const* name)
-            {
-                void* ret = dllGetSym(handle, name);
-                TLLM_CHECK_WITH_INFO(ret != nullptr,
-                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
-                    "built with UCX support, please rebuild in UCX-enabled environment.");
-                return ret;
-            };
-            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
-            *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
-            mConnectionManager = makeUcxConnectionManager();
-            if (mIsContext)
-            {
-                mResponder = mIsMLA
-                    ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
-                    : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
-            }
-            else
-            {
-                mRequester = mIsMLA
-                    ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<MLACacheFormatter>(mManager.get())))
-                    : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
-                        *mCacheState, mRankInInstance, std::make_unique<CacheFormatter>(mManager.get())));
-            }
-
-            std::vector<int> contextRankVec(mContextRankSize);
-            for (int i = 0; i < contextRankVec.size(); i++)
-            {
-                contextRankVec[i] = i;
-            }
-            auto commState = mConnectionManager->getCommState();
-            namespace su = tensorrt_llm::executor::serialize_utils;
-
-            if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
-            {
-
-                std::ostringstream oStream;
-                su::serialize(commState, oStream);
-                auto str = oStream.str();
-                std::vector<char> buffer(str.begin(), str.end());
-
-                for (int genRank = mContextRankSize; genRank < mContextRankSize + mGenRankSize; genRank++)
+                std::lock_guard<std::mutex> lock(mDllMutex);
+                void* WrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+                TLLM_CHECK_WITH_INFO(
+                    WrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. dlerror: %s", dlerror());
+                auto load_sym = [](void* handle, char const* name)
                 {
-                    int64_t bufferSize = buffer.size();
-                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
-                        bufferSize, genRank);
-                    tensorrt_llm::mpi::MpiComm::world().send(
-                        &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
-                    tensorrt_llm::mpi::MpiComm::world().send(
-                        buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
-                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
-                }
+                    void* ret = dllGetSym(handle, name);
+                    TLLM_CHECK_WITH_INFO(ret != nullptr,
+                        "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                        "built with UCX support, please rebuild in UCX-enabled environment.");
+                    return ret;
+                };
+                std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
+                *(void**) (&makeUcxConnectionManager) = load_sym(WrapperLibHandle, "makeUcxConnectionManager");
+                mConnectionManager = makeUcxConnectionManager();
             }
-            if (mIsGeneration)
+            else
             {
-                int64_t bufferSize;
-                tensorrt_llm::mpi::MpiComm::world().recv(&bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
-                TLLM_LOG_DEBUG(
-                    tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
-                std::vector<char> recvBuffer(bufferSize);
-                tensorrt_llm::mpi::MpiComm::world().recv(
-                    recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
-                TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
-                std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
-                su::VectorWrapBuf<char> strbuf(recvBuffer);
-                std::istream is(&strbuf);
-                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(
-                    su::deserialize<tensorrt_llm::executor::kv_cache::CommState>(is));
+                mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
             }
+
+            auto makeFormatter = [this]()
+            {
+                return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
+                              : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(mManager.get()));
+            };
 
             if (mIsContext)
             {
-                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
+                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+            }
+            else
+            {
+                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
 
-            TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "mContextCommState: %s",
-                mContextCommState->toString().c_str());
+            std::vector<int> contextRankVec(mContextRankSize);
+            std::iota(contextRankVec.begin(), contextRankVec.end(), 0);
+
+            if (isUcx)
+            {
+                auto commState = mConnectionManager->getCommState();
+                namespace su = tensorrt_llm::executor::serialize_utils;
+
+                if (tensorrt_llm::mpi::MpiComm::world().getRank() == 0)
+                {
+                    std::ostringstream oStream;
+                    su::serialize(commState, oStream);
+                    auto str = oStream.str();
+                    std::vector<char> buffer(str.begin(), str.end());
+
+                    for (int genRank = mContextRankSize; genRank < mContextRankSize + mGenRankSize; genRank++)
+                    {
+                        int64_t bufferSize = buffer.size();
+                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send bufferSize: %ld to %d",
+                            bufferSize, genRank);
+                        tensorrt_llm::mpi::MpiComm::world().send(
+                            &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, genRank, 0x1F);
+                        tensorrt_llm::mpi::MpiComm::world().send(
+                            buffer.data(), buffer.size(), tensorrt_llm::mpi::MpiType::kCHAR, genRank, 0x2F);
+                        TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "send buffer to %d", genRank);
+                    }
+                }
+
+                if (mIsGeneration)
+                {
+                    int64_t bufferSize;
+                    tensorrt_llm::mpi::MpiComm::world().recv(
+                        &bufferSize, 1, tensorrt_llm::mpi::MpiType::kINT64, 0, 0x1F);
+                    TLLM_LOG_DEBUG(
+                        tensorrt_llm::mpi::MpiComm::world().getRank(), "recv bufferSize: %ld from 0", bufferSize);
+                    std::vector<char> recvBuffer(bufferSize);
+                    tensorrt_llm::mpi::MpiComm::world().recv(
+                        recvBuffer.data(), bufferSize, tensorrt_llm::mpi::MpiType::kCHAR, 0, 0x2F);
+                    TLLM_LOG_DEBUG(tensorrt_llm::mpi::MpiComm::world().getRank(), "recv buffer from 0", bufferSize);
+                    std::istringstream iStream(std::string(recvBuffer.begin(), recvBuffer.end()));
+                    su::VectorWrapBuf<char> strbuf(recvBuffer);
+                    std::istream is(&strbuf);
+                    mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(
+                        su::deserialize<tensorrt_llm::executor::kv_cache::CommState>(is));
+                }
+
+                if (mIsContext)
+                {
+                    mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(commState);
+                }
+
+                TLLM_LOG_INFO(tensorrt_llm::mpi::MpiComm::world().getRank(), "mContextCommState: %s",
+                    mContextCommState->toString().c_str());
+            }
+            else
+            {
+                mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
+            }
         }
         else
         {
