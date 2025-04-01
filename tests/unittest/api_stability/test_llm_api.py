@@ -2,7 +2,6 @@ from types import MethodType
 from typing import Optional
 
 import pytest
-import yaml
 from api_stability_core import (ApiStabilityTestHarness, ClassSnapshot,
                                 MethodSnapshot)
 
@@ -40,7 +39,6 @@ class TestSamplingParams(ApiStabilityTestHarness):
             "no_repeat_ngram_size",
             "num_return_sequences",
             "min_p",
-            "beam_width_array",
         }
         found_fields = {
             f
@@ -159,44 +157,18 @@ class TestLLM(ApiStabilityTestHarness):
         with pytest.raises(AssertionError):
             self.test_docstring()
 
-
-class TestLLMFineGrainedError(ApiStabilityTestHarness):
-    TEST_CLASS = LLM
-    ORIGINAL_FILE = "llm.yaml"
-    REFERENCE_FILE = "llm_fine_grained_error.yaml"
-
-    @classmethod
-    def setup_class(cls):
-        # generate a wrong committed yaml file
-        with open(f"{cls.REFERENCE_COMMITTED_DIR}/{cls.ORIGINAL_FILE}") as f:
-            original_yaml = yaml.safe_load(f)
-            # change the dtype of max_batch_size to float
-            original_yaml["methods"]["__init__"]["parameters"][
-                "max_batch_size"]["annotation"] = "float"
-        with open(f"{cls.REFERENCE_COMMITTED_DIR}/{cls.REFERENCE_FILE}",
-                  "w") as f:
-            yaml.dump(original_yaml, f)
-
-        # generate a dummy reference yaml file
-        with open(f"{cls.REFERENCE_DIR}/{cls.ORIGINAL_FILE}") as f:
-            original_yaml = yaml.safe_load(f)
-        with open(f"{cls.REFERENCE_DIR}/{cls.REFERENCE_FILE}", "w") as f:
-            yaml.dump(original_yaml, f)
-
-        super().setup_class()
-
-    def test_modified_init(self, mocker):
+    def test_fine_grained_error(self):
+        # change the dtype of max_batch_size to float to trigger a fine-grained error
+        self.reference.methods["__init__"].parameters[
+            "max_batch_size"].annotation = "float"
         with pytest.raises(AssertionError) as e:
-            super().test_docstring()
+            self.test_signature()
+            assert "LLM.max_batch_size annotation: typing.Optional[int] != <class 'float'>" in str(
+                e.value.__cause__)
 
-        assert "LLM.max_batch_size annotation: typing.Optional[int] != <class 'float'>" in str(
-            e.value.__cause__)
-
-    def test_docstring(self):
-        pass
-
-    def test_signature(self):
-        pass
+        # restore the original dtype
+        self.reference.methods["__init__"].parameters[
+            "max_batch_size"].annotation = "int"
 
 
 class TestCompletionOutput(ApiStabilityTestHarness):

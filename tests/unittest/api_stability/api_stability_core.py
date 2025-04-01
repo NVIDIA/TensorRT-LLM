@@ -14,6 +14,7 @@ import pytest
 import torch
 import transformers
 import yaml
+from pydantic import BaseModel
 
 import tensorrt_llm
 from tensorrt_llm.executor import GenerationResult
@@ -21,15 +22,15 @@ from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
+from tensorrt_llm.logger import Singleton
 
 
 def repr_annotation(field_type: type) -> str:
     return _type_repr(field_type).replace("typing.", "")
 
 
-class StackTrace:
+class StackTrace(metaclass=Singleton):
     ''' Keep track of the symbol stack to the current scope. '''
-    _instance: ClassVar[Optional["StackTrace"]] = None
 
     def __init__(self):
         self.stack: List[str] = []
@@ -54,22 +55,25 @@ class StackTrace:
             return ""
         return ".".join(self.stack) + "."
 
-    @staticmethod
-    def instance() -> "StackTrace":
-        if StackTrace._instance is None:
-            StackTrace._instance = StackTrace()
-        return StackTrace._instance
+    def get_name(self) -> str:
+        if not self.stack:
+            return ""
+        return self.stack[-1]
+
+    def get_qual_name(self) -> str:
+        if not self.stack:
+            return ""
+        return ".".join(self.stack)
 
 
 @dataclass(slots=True)
 class ParamSnapshot:
     annotation: type
     default: Any = None
-    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
-        return cls(param.annotation, param.default, name=param.name)
+        return cls(param.annotation, param.default)
 
     @classmethod
     def from_docstring(cls, param: docstring_parser.common.DocstringParam):
@@ -92,7 +96,7 @@ class ParamSnapshot:
             except (NameError, SyntaxError):
                 default = param.default
 
-        return cls(annotation, default, name=param.arg_name)
+        return cls(annotation, default)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -112,16 +116,15 @@ class ParamSnapshot:
         return d
 
     def assert_equal(self, other: 'ParamSnapshot'):
-        prefix = StackTrace.instance().get_prefix()
-        assert self.annotation == other.annotation, f"{prefix}{self.name} annotation: {self.annotation} != {other.annotation}"
-        assert self.default == other.default, f"{prefix}{self.name} default: {self.default} != {other.default}"
+        qual_name = StackTrace().get_qual_name()
+        assert self.annotation == other.annotation, f"{qual_name} annotation: {self.annotation} != {other.annotation}"
+        assert self.default == other.default, f"{qual_name} default: {self.default} != {other.default}"
 
 
 @dataclass(slots=True)
 class MethodSnapshot:
     parameters: Dict[str, ParamSnapshot]
     return_annotation: type
-    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, method: MethodType):
@@ -133,10 +136,8 @@ class MethodSnapshot:
             parameters[param_name] = ParamSnapshot.from_inspect(param)
         return_annotation = signature.return_annotation
         if isinstance(return_annotation, str):
-            if return_annotation == "Self":
-                return_annotation = 'None'
             return_annotation = eval(return_annotation)
-        return cls(parameters, return_annotation, name=method.__name__)
+        return cls(parameters, return_annotation)
 
     @classmethod
     def from_docstring(cls, method: MethodType):
@@ -149,7 +150,7 @@ class MethodSnapshot:
             return_annotation = None
         else:
             return_annotation = eval(doc.returns.type_name)
-        return cls(parameters, return_annotation, name=method.__name__)
+        return cls(parameters, return_annotation)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -177,87 +178,57 @@ class MethodSnapshot:
         assert self.return_annotation == other.return_annotation
 
     def assert_equal(self, other: 'MethodSnapshot'):
-        prefix = StackTrace.instance().get_prefix()
+        qual_name = StackTrace().get_qual_name()
 
-        with StackTrace.instance().push(self.name):
-            self_only = set(self.parameters.keys()) - set(
-                other.parameters.keys())
-            other_only = set(other.parameters.keys()) - set(
-                self.parameters.keys())
+        self_only = set(self.parameters.keys()) - set(other.parameters.keys())
+        other_only = set(other.parameters.keys()) - set(self.parameters.keys())
 
-            self_only = list(
-                filter(
-                    lambda x: not x.startswith("_") and x not in
-                    PYDANTIC_FIELDS, self_only))
-            other_only = list(
-                filter(
-                    lambda x: not x.startswith("_") and x not in
-                    PYDANTIC_FIELDS, other_only))
+        self_only = list(
+            filter(lambda x: not x.startswith("_") and x not in PYDANTIC_FIELDS,
+                   self_only))
+        other_only = list(
+            filter(lambda x: not x.startswith("_") and x not in PYDANTIC_FIELDS,
+                   other_only))
 
-            if self_only or other_only:
-                raise AssertionError(
-                    f"{prefix}{self.name} has different parameters: "
-                    f"adding {self_only}, removing {other_only}")
-            else:
-                for name, param in self.parameters.items():
+        if self_only or other_only:
+            raise AssertionError(f"{qual_name} has different parameters: "
+                                 f"adding {self_only}, removing {other_only}")
+        else:
+            for name, param in self.parameters.items():
+                with StackTrace().push(name):
                     param.assert_equal(other.parameters[name])
-            assert self.return_annotation == other.return_annotation
+        assert self.return_annotation == other.return_annotation
 
     def assert_containing(self, other: 'MethodSnapshot'):
-        prefix = StackTrace.instance().get_prefix()
-        if prefix + self.name == "LLM.__init__":
+        qual_name = StackTrace().get_qual_name()
+        if qual_name == "LLM.__init__":
             return  # LLM.__init__'s arglist is just a subset of the reference which is from LlmArgs
 
-        with StackTrace.instance().push(self.name):
-            for name, param in other.parameters.items():
-                assert name in self.parameters, (
-                    f"{prefix}{self.name} missing parameter '{name}' from reference.\n"
-                    f"{prefix}{self.name}'s parameter list is {self.parameters.keys()}"
-                )
+        for name, param in other.parameters.items():
+            assert name in self.parameters, (
+                f"{qual_name} missing parameter '{name}' from reference.\n"
+                f"{qual_name}'s parameter list is {self.parameters.keys()}")
+            with StackTrace().push(name):
                 self.parameters[name].assert_equal(param)
         assert self.return_annotation == other.return_annotation
 
 
-PYDANTIC_FIELDS = {
-    'model_json_schema',
-    'from_orm',
-    'json',
-    'model_rebuild',
-    'construct',
-    'model_validate_strings',
-    'model_copy',
-    'parse_file',
-    'validate',
-    'model_dump',
-    'model_parametrized_name',
-    'schema_json',
-    'parse_raw',
-    'parse_obj',
-    'update_forward_refs',
-    'model_post_init',
-    'model_validate',
-    'schema',
-    'copy',
-    'model_validate_json',
-    'dict',
-    'model_construct',
-    'model_dump_json',
-    'model_extra',
-    'model_fields_set',
-    'model_fields',
-}
+class _DummyModel(BaseModel):
+    pass
+
+
+# get all members of the Pydantic model
+PYDANTIC_FIELDS = set(dir(_DummyModel)) - {"__init__"}
 
 
 @dataclass(slots=True)
 class ClassSnapshot:
     methods: Dict[str, MethodSnapshot]
     properties: Dict[str, ParamSnapshot]
-    name: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, snapshot_cls: type):
         inst = snapshot_cls.__new__(snapshot_cls)
-        name = snapshot_cls.__name__
         methods = {}
         for method_name, method in inspect.getmembers(
                 inst, predicate=inspect.ismethod):
@@ -269,7 +240,8 @@ class ClassSnapshot:
             if method_name == "__init__" and isinstance(
                     snapshot_cls, type) and issubclass(snapshot_cls,
                                                        pydantic.main.BaseModel):
-                # Create a MethodSnapshot for Pydantic model's __init__
+                # Create a MethodSnapshot for Pydantic model's __init__,
+                # the parameters are the fields of the model
                 parameters = {}
                 for field_name, field in snapshot_cls.model_fields.items():
                     if field_name.startswith("_"):
@@ -278,8 +250,7 @@ class ClassSnapshot:
                         annotation=field.annotation,
                         default=field.default or inspect._empty)
                 methods[method_name] = MethodSnapshot(parameters=parameters,
-                                                      return_annotation=None,
-                                                      name="__init__")
+                                                      return_annotation=None)
             else:
                 methods[method_name] = MethodSnapshot.from_inspect(method)
         properties = {}
@@ -291,7 +262,7 @@ class ClassSnapshot:
                 continue
             annotation = inspect.signature(prop.fget).return_annotation
             properties[prop_name] = ParamSnapshot(annotation, inspect._empty)
-        return cls(methods, properties, name=name)
+        return cls(methods, properties)
 
     @classmethod
     def from_docstring(cls, snapshot_cls: type):
@@ -314,8 +285,7 @@ class ClassSnapshot:
                             annotation=field.annotation,
                             default=field.default or inspect._empty)
                     methods["__init__"] = MethodSnapshot(parameters=parameters,
-                                                         return_annotation=None,
-                                                         name="__init__")
+                                                         return_annotation=None)
                 else:
                     methods["__init__"] = MethodSnapshot.from_docstring(
                         snapshot_cls)
@@ -327,7 +297,7 @@ class ClassSnapshot:
         for param in doc.params:
             if param.args[0] == 'attribute':
                 properties[param.arg_name] = ParamSnapshot.from_docstring(param)
-        return cls(methods, properties, name=snapshot_cls.__name__)
+        return cls(methods, properties)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -367,43 +337,47 @@ class ClassSnapshot:
         self.properties.update(copy.deepcopy(other.properties))
 
     def assert_equal(self, other: 'ClassSnapshot'):
-        prefix = StackTrace.instance().get_prefix()
-        with StackTrace.instance().push(self.name):
-            if self.methods.keys() != other.methods.keys():
-                diff_keys = set(self.methods.keys()) ^ set(other.methods.keys())
-                raise AssertionError(
-                    f"{prefix}{self.name} has different methods: {diff_keys}")
+        qual_name = StackTrace().get_qual_name()
+        if self.methods.keys() != other.methods.keys():
+            diff_keys = set(self.methods.keys()) ^ set(other.methods.keys())
+            raise AssertionError(
+                f"{qual_name} has different methods: {diff_keys}")
 
-            for name, method in self.methods.items():
-                if self.name == "LLM" and name == "__init__":
-                    # only check the explicit the explicit arglist from LLM.__init__
-                    for param in method.parameters.values():
-                        if param.name not in other.methods[name].parameters:
-                            raise AssertionError(
-                                f"{prefix}{self.name} doesn't have a parameter '{param.name}' in reference.\n"
-                                f"The reference parameter list is {other.methods[name].parameters.keys()}"
-                            )
+        for name, method in self.methods.items():
+            # LLM.__init__'s arglist is just a subset of the reference which is from LlmArgs, thus we need to
+            # handle it separately
+            if qual_name == "LLM" and name == "__init__":
+                # only check the explicit the explicit arglist from LLM.__init__
+                for param_name, param in method.parameters.items():
+                    if param_name not in other.methods[name].parameters:
+                        raise AssertionError(
+                            f"{qual_name} doesn't have a parameter '{param_name}' in reference.\n"
+                            f"The reference parameter list is {other.methods[name].parameters.keys()}"
+                        )
+                    with StackTrace().push(param_name):
                         param.assert_equal(
-                            other.methods[name].parameters[param.name])
-                else:
+                            other.methods[name].parameters[param_name])
+            else:
+                with StackTrace().push(name):
                     method.assert_equal(other.methods[name])
 
-            if self.properties.keys() != other.properties.keys():
-                diff_keys = set(self.properties.keys()) ^ set(
-                    other.properties.keys())
-                raise AssertionError(
-                    f"{prefix}{self.name} has different properties: {diff_keys}"
-                )
+        if self.properties.keys() != other.properties.keys():
+            diff_keys = set(self.properties.keys()) ^ set(
+                other.properties.keys())
+            raise AssertionError(
+                f"{qual_name} has different properties: {diff_keys}")
 
-            for name, prop in self.properties.items():
+        for name, prop in self.properties.items():
+            with StackTrace().push(name):
                 prop.assert_equal(other.properties[name])
 
     def assert_containing(self, other: 'ClassSnapshot'):
-        with StackTrace.instance().push(self.name):
-            for name, method in other.methods.items():
+        for name, method in other.methods.items():
+            with StackTrace().push(name):
                 assert name in self.methods
                 self.methods[name].assert_containing(method)
-            for name, prop in other.properties.items():
+        for name, prop in other.properties.items():
+            with StackTrace().push(name):
                 assert name in self.properties
                 self.properties[name].assert_equal(prop)
 
@@ -433,29 +407,31 @@ class ApiStabilityTestHarness:
     def create_snapshot_from_inspect(self):
         return ClassSnapshot.from_inspect(self.TEST_CLASS)
 
-    def test_signature(self):
-        snapshot = self.create_snapshot_from_inspect()
-        if self.reference_committed is not None:
-            try:
-                snapshot.assert_containing(self.reference_committed)
-            except AssertionError as e:
-                raise AssertionError(self.error_msg_committed) from e
-        try:
-            snapshot.assert_equal(self.reference)
-        except AssertionError as e:
-            raise AssertionError(self.error_msg) from e
-
     def create_snapshot_from_docstring(self):
         return ClassSnapshot.from_docstring(self.TEST_CLASS)
 
-    def test_docstring(self):
-        snapshot = self.create_snapshot_from_docstring()
-        if self.reference_committed is not None:
+    def test_signature(self):
+        with StackTrace().push(self.TEST_CLASS.__name__):
+            snapshot = self.create_snapshot_from_inspect()
+            if self.reference_committed is not None:
+                try:
+                    snapshot.assert_containing(self.reference_committed)
+                except AssertionError as e:
+                    raise AssertionError(self.error_msg_committed) from e
             try:
-                snapshot.assert_containing(self.reference_committed)
+                snapshot.assert_equal(self.reference)
             except AssertionError as e:
-                raise AssertionError(self.error_msg_committed) from e
-        try:
-            snapshot.assert_equal(self.reference)
-        except AssertionError as e:
-            raise AssertionError(self.error_msg) from e
+                raise AssertionError(self.error_msg) from e
+
+    def test_docstring(self):
+        with StackTrace().push(self.TEST_CLASS.__name__):
+            snapshot = self.create_snapshot_from_docstring()
+            if self.reference_committed is not None:
+                try:
+                    snapshot.assert_containing(self.reference_committed)
+                except AssertionError as e:
+                    raise AssertionError(self.error_msg_committed) from e
+            try:
+                snapshot.assert_equal(self.reference)
+            except AssertionError as e:
+                raise AssertionError(self.error_msg) from e

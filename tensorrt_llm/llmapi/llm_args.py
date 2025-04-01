@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 import torch
 import yaml
 from pydantic import BaseModel, Field, validator
+from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
 from .._utils import mpi_rank
@@ -340,7 +341,7 @@ class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
 
 
 @PybindMirror.mirror_pybind_enum(_BatchingType)
-class BatchingType(str, Enum, metaclass=PybindMirrorEnumMeta):
+class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
     STATIC = "STATIC"
     INFLIGHT = "INFLIGHT"
 
@@ -349,7 +350,7 @@ class BatchingType(str, Enum, metaclass=PybindMirrorEnumMeta):
 
 
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
-class CapacitySchedulerPolicy(str, Enum, metaclass=PybindMirrorEnumMeta):
+class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
     GUARANTEED_NO_EVICT = "GUARANTEED_NO_EVICT"
     STATIC_BATCH = "STATIC_BATCH"
@@ -359,7 +360,7 @@ class CapacitySchedulerPolicy(str, Enum, metaclass=PybindMirrorEnumMeta):
 
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
-class ContextChunkingPolicy(str, Enum, metaclass=PybindMirrorEnumMeta):
+class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
