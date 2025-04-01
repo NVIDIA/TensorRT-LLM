@@ -113,6 +113,8 @@ String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 String githubPrApiUrl = gitlabParamsFromBot.get('github_pr_api_url', null)
 
+def cachedChangedFileList = null
+
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 boolean enableUpdateGitlabStatus =
     !testFilter[ENABLE_SKIP_TEST] &&
@@ -282,7 +284,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl)
+def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
 {
     setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
@@ -300,8 +302,8 @@ def setupPipelineEnvironment(pipeline, testFilter, githubPrApiUrl)
         }
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl)
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
+        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
     })
 }
 
@@ -434,9 +436,7 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
     return changedFileList
 }
 
-def cachedChangedFileList = null
-
-def getMergeRequestChangedFileList(pipeline, githubPrApiUrl) {
+def getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList) {
     if (cachedChangedFileList != null) {
         return cachedChangedFileList
     }
@@ -456,7 +456,7 @@ def getMergeRequestChangedFileList(pipeline, githubPrApiUrl) {
     }
 }
 
-def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
+def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList)
 {
     if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
         pipeline.echo("Force not run multi-GPU testing.")
@@ -519,7 +519,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
         "jenkins/L0_Test.groovy",
     ]
 
-    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl)
+    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList)
     if (!changedFileList) {
         return false
     }
@@ -548,7 +548,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl) {
+def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl, cachedChangedFileList) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
@@ -556,7 +556,7 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, githubPrApiUrl) {
     }
     def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
 
-    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl)
+    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl, cachedChangedFileList)
 
     if (!changedFileList || changedFileList.isEmpty()) {
         return false
@@ -923,7 +923,7 @@ pipeline {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, githubPrApiUrl)
+                    setupPipelineEnvironment(this, testFilter, githubPrApiUrl, cachedChangedFileList)
                     echo "enableFailFast is: ${enableFailFast}"
                     echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
                     println testFilter
