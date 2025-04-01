@@ -522,20 +522,20 @@ class PyExecutor:
                     )
                     self.micro_batches[microbatch_id] = None
                 else:
-                    #TODO: add pause_requests together with inflight_req_ids for pp
-                    self._add_inflight_ids(
-                        scheduled_batch)  # lock inflight requests
-                    # TODO: handle draft_tokens (speculative decoding) and add pause_requests handling
+                    # TODO: add pause_requests together with inflight_req_ids and handle draft_tokens
+                    self._add_inflight_ids(scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # Stage 1: Forward + (decoding) pass ([should be] async)
                     if self.dist.is_last_pp_rank:
-                        scheduled_batch, new_tensors_host, finished_requests = self._forward_step_last_pp(
+                        new_tensors_host = self._forward_step_last_pp(
                             scheduled_batch, microbatch_id)
-                        self.resource_manager.update_resources(scheduled_batch)
                     else:
                         new_tensors_host = self._forward_step_inter_pp(
                             scheduled_batch)
+
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
                     self.micro_batches[microbatch_id] = (scheduled_batch,
                                                          new_tensors_host)
 
@@ -548,15 +548,19 @@ class PyExecutor:
                 if previous_batch is not None:
                     previous_scheduled_batch, previous_new_tensors_host = previous_batch
                     if not self.dist.is_last_pp_rank:
-                        finished_requests = self._handle_previous_batch_inter_pp(
+                        self._handle_previous_batch_inter_pp(
                             previous_scheduled_batch, previous_new_tensors_host,
                             prev_microbatch_id)
-                        self.resource_manager.update_resources(
-                            previous_scheduled_batch)
-                    self._remove_inflight_ids(
-                        previous_scheduled_batch)  # unlock inflight requests
-                microbatch_id = prev_microbatch_id
 
+                    self._update_requests(previous_scheduled_batch,
+                                          previous_new_tensors_host, None)
+                    self._handle_cancelled_requests()
+                    finished_requests = self._handle_responses()
+                    self.resource_manager.update_resources(
+                        previous_scheduled_batch)
+                    self._remove_inflight_ids(previous_scheduled_batch)
+
+                microbatch_id = prev_microbatch_id
                 self._gather_dp_requests_num()
 
                 if self.enable_iter_perf_stats:
@@ -635,6 +639,8 @@ class PyExecutor:
                             scheduled_batch, batch_outputs)
                         torch.cuda.nvtx.range_pop()
 
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
                     self.micro_batches[microbatch_id] = (scheduled_batch,
                                                          new_tensors_host,
                                                          decoder_event)
@@ -1009,13 +1015,6 @@ class PyExecutor:
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
-        # TODO: how to handle draft_tokens (speculative decoding)?
-        self._update_requests(previous_scheduled_batch,
-                              previous_new_tensors_host, None)
-        self._handle_cancelled_requests()
-        finished_requests = self._handle_responses()
-        return finished_requests
-
     @nvtx_range("_forward_step_last_pp")
     def _forward_step_last_pp(self, scheduled_batch, microbatch_id):
         batch_outputs = self._forward_step(scheduled_batch)
@@ -1031,10 +1030,7 @@ class PyExecutor:
             dest=self.dist.next_pp_rank,
             tag=microbatch_id)
 
-        self._update_requests(scheduled_batch, new_tensors_host, None)
-        self._handle_cancelled_requests()
-        finished_requests = self._handle_responses()
-        return scheduled_batch, new_tensors_host, finished_requests
+        return new_tensors_host
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self):
@@ -1120,7 +1116,11 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self.dist.broadcast(new_requests, root=0)
+        if self.dist.has_pp:
+            new_requests = self._broadcast_new_requests_pp(new_requests)
+        else:
+            new_requests = self.dist.broadcast(new_requests, root=0)
+
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
@@ -1143,8 +1143,9 @@ class PyExecutor:
                 ],
             )
             all_ranks_new_requests_heap = [
-                HeapVal(0, self.expected_num_active_requests - val, idx, [])
-                for idx, val in enumerate(self.all_ranks_num_active_requests)
+                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
+                for tp_rank, val in enumerate(
+                    self.all_ranks_num_active_requests)
             ]
             new_requests_cur_rank = all_ranks_new_requests_heap[
                 self.dist.tp_rank].request_list
@@ -1165,7 +1166,7 @@ class PyExecutor:
                 val.request_list.append(request)
                 if val.num_requests > 0:
                     heapq.heappush(all_ranks_new_requests_heap, val)
-                elif val.rank == self.dist.rank:
+                elif val.rank == self.dist.tp_rank:
                     break
             self.has_context_request = len(new_requests_cur_rank) > 0
             now = time.time()
@@ -1237,19 +1238,9 @@ class PyExecutor:
                 req.state = LlmRequestState.GENERATION_COMPLETE
         for req in self.active_requests[:]:
             if req.is_dummy:
+                self.inflight_req_ids.erase(req.request_id)
                 self._terminate_request(req)
                 self.active_requests.remove(req)
-
-    def _remove_dummy_request(self, scheduled_requests):
-        for request in scheduled_requests.context_requests[:]:
-            if request.is_dummy:
-                scheduled_requests.context_requests.remove(request)
-        for request in scheduled_requests.generation_requests[:]:
-            if request.is_dummy:
-                scheduled_requests.generation_requests.remove(request)
-        for request in self.active_requests[:]:
-            if request.is_dummy:
-                self.active_requests.remove(request)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
