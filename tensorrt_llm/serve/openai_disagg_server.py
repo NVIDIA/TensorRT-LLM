@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import copy
+import json
 import logging
 import signal
 from contextlib import asynccontextmanager
@@ -84,8 +85,21 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
-    async def openai_completion(self, req: CompletionRequest) -> Response:
+    async def merge_streaming_responses(self, ctx_response, gen_server, gen_req):
+        # First yield the context response if it's not None
+        if ctx_response is not None:
+            # Remove the disaggregated params from the context response
+            data = ctx_response.model_dump()
+            del data['choices'][0]['disaggregated_params']
+            data = json.dumps(data)
+            yield f"data: {data}\n\n".encode('utf-8')
 
+        # Then yield the generation responses
+        gen_response = await self.send_request(gen_server, gen_req)
+        async for chunk in gen_response.body_iterator:
+            yield chunk
+
+    async def openai_completion(self, req: CompletionRequest) -> Response:
         try:
             gen_req = copy.deepcopy(req)
             if not isinstance(req.prompt, str):
@@ -120,9 +134,16 @@ class OpenAIDisaggServer:
             # Pick a generation server and send request
             gen_server = self.get_next_server(self.gen_servers, "generation")
             logging.info("Sending request to gen server: %s", gen_server)
-            gen_response = await self.send_request(gen_server, gen_req)
 
-            return gen_response
+            if not gen_req.stream:
+                gen_response = await self.send_request(gen_server, gen_req)
+                return gen_response
+            else:
+                # Return a streaming response that combines both context and generation responses
+                return StreamingResponse(
+                    self.merge_streaming_responses(ctx_response, gen_server, gen_req),
+                    media_type="text/event-stream"
+                )
 
         except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
