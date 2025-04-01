@@ -14,6 +14,6 @@
 # limitations under the License.
 
 from .cnn_dailymail import CnnDailymail
-from .mmlu import Mmlu
+from .mmlu import MMLU
 
-__all__ = ["CnnDailymail", "Mmlu"]
+__all__ = ["CnnDailymail", "MMLU"]

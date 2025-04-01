@@ -224,7 +224,7 @@ class SlimPajama6B(AccuracyTask):
     MAX_OUTPUT_LEN = 1
 
 
-class Mmlu(AccuracyTask):
+class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
@@ -238,7 +238,7 @@ class Mmlu(AccuracyTask):
     MAX_OUTPUT_LEN = 2
 
     def create_evaluator(self, **kwargs):
-        return tensorrt_llm.evaluate.Mmlu(dataset_path=self.DATASET_DIR,
+        return tensorrt_llm.evaluate.MMLU(dataset_path=self.DATASET_DIR,
                                           random_seed=0,
                                           **kwargs)
 
@@ -597,7 +597,7 @@ class CliFlowAccuracyTestHarness:
             if isinstance(task,
                           (CnnDailymail, Humaneval, ZeroScrolls, SlimPajama6B)):
                 self.summarize(task)
-            elif isinstance(task, Mmlu):
+            elif isinstance(task, MMLU):
                 self.mmlu(task)
             elif isinstance(task, (PassKeyRetrieval64k, PassKeyRetrieval128k)):
                 self.eval_long_context(task)

@@ -20,9 +20,9 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, skip_no_nvls, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper)
-from .accuracy_core import (CliFlowAccuracyTestHarness, CnnDailymail, Humaneval,
-                            Mmlu, PassKeyRetrieval64k, PassKeyRetrieval128k,
-                            SlimPajama6B, ZeroScrolls)
+from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
+                            Humaneval, PassKeyRetrieval64k,
+                            PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
 
 
 class TestGpt2(CliFlowAccuracyTestHarness):
@@ -398,7 +398,7 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
@@ -521,7 +521,7 @@ class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_nvfp4(self):
-        self.run(tasks=[Mmlu(self.MODEL_NAME)],
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=["--gemm_plugin=disable"])
@@ -542,7 +542,7 @@ class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
             ])
         if norm_quant_fusion:
             extra_build_args.append("--norm_quant_fusion=enable")
-        self.run(tasks=[Mmlu(self.MODEL_NAME)],
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=extra_build_args)
@@ -581,7 +581,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8_rowwise(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
     @skip_pre_ada
@@ -600,7 +600,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             extra_build_args = ["--gemm_allreduce_plugin=bfloat16"]
         self.run(
             tasks=[PassKeyRetrieval64k(self.MODEL_NAME),
-                   Mmlu(self.MODEL_NAME)],
+                   MMLU(self.MODEL_NAME)],
             tp_size=4,
             extra_build_args=extra_build_args)
 
@@ -615,7 +615,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
             extra_build_args = ["--gemm_allreduce_plugin=bfloat16"]
         self.run(
             tasks=[PassKeyRetrieval64k(self.MODEL_NAME),
-                   Mmlu(self.MODEL_NAME)],
+                   MMLU(self.MODEL_NAME)],
             quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
             tp_size=4,
             extra_build_args=extra_build_args)
@@ -623,7 +623,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_autoq(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.MIXED_PRECISION,
                  extra_acc_spec=
                  "autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8",
@@ -793,7 +793,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(40000)
     def test_fp8_tp2pp2(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2,
@@ -804,7 +804,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(40000)
     def test_fp8_tp2pp2_manage_weights(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2,
@@ -816,7 +816,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
-        self.run(tasks=[Mmlu(self.MODEL_NAME)],
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
@@ -887,7 +887,7 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
 
     def test_auto_dtype(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  dtype='auto',
                  extra_convert_args=["--ckpt-type=hf"])
 
@@ -948,7 +948,7 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8)
 
 
@@ -1000,5 +1000,5 @@ class TestQwen2_5_1_5BInstruct(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        Mmlu(self.MODEL_NAME)],
+                        MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8)

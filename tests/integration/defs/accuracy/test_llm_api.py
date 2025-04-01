@@ -19,7 +19,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_ada
-from .accuracy_core import CnnDailymail, LlmapiAccuracyTestHarness, Mmlu
+from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -33,7 +33,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -46,5 +46,5 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

@@ -19,7 +19,7 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_blackwell
-from .accuracy_core import CnnDailymail, LlmapiAccuracyTestHarness, Mmlu
+from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -30,7 +30,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
@@ -41,7 +41,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -56,7 +56,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -68,7 +68,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -81,7 +81,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
@@ -93,7 +93,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(2)
@@ -105,7 +105,7 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -120,7 +120,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
@@ -129,7 +129,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
@@ -138,5 +138,5 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = Mmlu(self.MODEL_NAME)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

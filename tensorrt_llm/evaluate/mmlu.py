@@ -27,7 +27,7 @@ from ..sampling_params import SamplingParams
 from .interface import Evaluator
 
 
-class Mmlu(Evaluator):
+class MMLU(Evaluator):
     CHOICES = ["A", "B", "C", "D"]
     SUBJECT_TO_SUBCATEGORIES = {
         "abstract_algebra": ["math"],
@@ -236,7 +236,7 @@ class Mmlu(Evaluator):
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)
-        evaluator = Mmlu(dataset_path,
+        evaluator = MMLU(dataset_path,
                          num_samples=num_samples,
                          num_train=num_train,
                          random_seed=random_seed)
