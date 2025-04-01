@@ -474,7 +474,11 @@ class PyExecutor:
             self._update_iter_stats(iter_stats, iter_latency_ms,
                                     len(finished_requests), scheduled_batch))
 
-        return
+    def _executor_loop_cleanup(self):
+        with self.response_cv:
+            self.is_shutdown = True
+            self.response_cv.notify_all()
+        self.shutdown_event.set()
 
     def _executor_loop_pp(self):
         torch.cuda.set_device(self.device_id)
@@ -483,7 +487,6 @@ class PyExecutor:
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
-            iter_end_time = iter_start_time
             iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
@@ -515,9 +518,7 @@ class PyExecutor:
                     can_queue = scheduled_batch.batch_size > 0
 
                 if not can_queue:
-                    assert self.enable_attention_dp or len(
-                        self.inflight_req_ids
-                    ) > 0, (
+                    assert len(self.inflight_req_ids) > 0, (
                         "fail to schedule any pending request, probably run out of resource"
                     )
                     self.micro_batches[microbatch_id] = None
@@ -571,11 +572,7 @@ class PyExecutor:
                                                 len(finished_requests),
                                                 scheduled_batch))
                     iter_start_time = iter_end_time
-        # Cleanup
-        with self.response_cv:
-            self.is_shutdown = True
-            self.response_cv.notify_all()
-        self.shutdown_event.set()
+        self._executor_loop_cleanup()
 
     def _executor_loop_pp_overlap(self):
         torch.cuda.set_device(self.device_id)
@@ -617,9 +614,7 @@ class PyExecutor:
                     can_queue = scheduled_batch.batch_size > 0
 
                 if not can_queue:
-                    assert self.enable_attention_dp or len(
-                        self.inflight_req_ids
-                    ) > 0, (
+                    assert len(self.inflight_req_ids) > 0, (
                         "fail to schedule any pending request, probably run out of resource"
                     )
                     self.micro_batches[microbatch_id] = None
@@ -712,12 +707,7 @@ class PyExecutor:
                                                 len(finished_requests),
                                                 scheduled_batch))
                     iter_start_time = iter_end_time
-
-        # Cleanup
-        with self.response_cv:
-            self.is_shutdown = True
-            self.response_cv.notify_all()
-        self.shutdown_event.set()
+        self._executor_loop_cleanup()
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -814,10 +804,7 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests, scheduled_batch,
                                              iter_start_time, iter_stats)
 
-        with self.response_cv:
-            self.is_shutdown = True
-            self.response_cv.notify_all()
-        self.shutdown_event.set()
+        self._executor_loop_cleanup()
 
     def _prepare_draft_requests(self):
         try:
@@ -957,10 +944,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
-        with self.response_cv:
-            self.is_shutdown = True
-            self.response_cv.notify_all()
-        self.shutdown_event.set()
+        self._executor_loop_cleanup()
 
     def _process_previous_batch(self):
         previous_scheduled_batch, _, previous_new_tensors_host, previous_decoder_event, previous_iter_start_time, previous_iter_stats, previous_ctx_transmission_reqs = self.previous_batch
@@ -982,7 +966,6 @@ class PyExecutor:
                                      previous_scheduled_batch,
                                      previous_iter_start_time,
                                      previous_iter_stats)
-        return
 
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch):
@@ -1203,9 +1186,7 @@ class PyExecutor:
         kv_cache_manager.flush_iteration_events()
 
     def _merge_tp_requests(self, new_requests: List[ExecutorRequest]):
-        got_finish_signal = False
         for request in new_requests:
-            # return finish signal and drop all request on shutdown
             if request is None:
                 return True
         for req_item in new_requests:
@@ -1217,7 +1198,7 @@ class PyExecutor:
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
 
-        return got_finish_signal
+        return False
 
     def _merge_dummy_request(self, num_dummy_request: int):
         llm_request_list = self.kv_cache_manager.add_dummy_requests(
@@ -1278,14 +1259,11 @@ class PyExecutor:
             position_block = position_ids_blocks[self.dist.cp_rank][idx]
             ctx_blocks.append(ctx_block.tolist()[0])
             position_blocks.append(position_block.tolist()[0])
-            #(f'rank = {self.dist.cp_rank}, block_id = {idx}, block_size = {ctx_block.shape}, device = {ctx_block.get_device()}')
         return ctx_blocks, position_blocks, padding
 
     def _merge_star_attention_requests(self,
                                        new_requests: List[ExecutorRequest]):
-        got_finish_signal = False
         for request in new_requests:
-            # return finish signal and drop all request on shutdown
             if request is None:
                 return True
         for req_item in new_requests:
@@ -1343,7 +1321,7 @@ class PyExecutor:
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.insert(req_item)
 
-        return got_finish_signal
+        return False
 
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: List[ExecutorRequest]):
