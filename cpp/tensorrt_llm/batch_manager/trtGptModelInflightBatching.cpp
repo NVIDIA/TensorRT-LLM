@@ -769,7 +769,7 @@ void TrtGptModelInflightBatching::forwardSync()
             }
             // Wait for decoding for requests in flight for the current micro batch
             auto& decoderWaitEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-            mDecStepAsyncSndHdls = decoderSync(currRequests, std::move(decoderWaitEvent.value()));
+            mDecStepAsyncSndHdls = decoderSync(currRequests, decoderWaitEvent);
             decoderWaitEvent.reset();
 
             if (!mWorldConfig.isLastPipelineParallelRank())
@@ -1037,7 +1037,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 }
                 // Wait for decoding for requests in flight for the current micro batch
                 auto& decoderFinishedEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-                mDecStepAsyncSndHdls = decoderSync(currRequests, std::move(decoderFinishedEvent.value()));
+                mDecStepAsyncSndHdls = decoderSync(currRequests, decoderFinishedEvent);
                 decoderFinishedEvent.reset();
 
                 mAsyncSendWaitThread->notifyStart();
@@ -2296,14 +2296,14 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 }
 
 std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::decoderSync(
-    ScheduledRequests const& scheduledRequests, runtime::CudaEvent decoderFinishEvent)
+    ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderSync);
 
     if (mWorldConfig.isLastPipelineParallelRank())
     {
-        decoderFinishEvent.synchronize();
+        decoderFinishEvent->synchronize();
     }
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
