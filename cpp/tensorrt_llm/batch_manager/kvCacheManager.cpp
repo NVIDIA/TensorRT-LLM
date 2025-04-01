@@ -1514,7 +1514,10 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
     {
         if (addToken)
         {
-            mBlockManager.allocateBlock(sequence);
+            if (!isCrossKv() || newNumTokens < mMaxTokenNum)
+            {
+                mBlockManager.allocateBlock(sequence);
+            }
             if (newNumTokens > mMaxTokenNum)
             {
                 // Get the block to release from sequence
