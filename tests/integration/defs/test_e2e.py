@@ -283,8 +283,8 @@ def trtllm_bench_prolog(
     if llm_models is None:
         return
 
-    model_path = model_subdir if skip_engine_build else Path(
-        llm_models, model_subdir).absolute()
+    model_path = Path(llm_models, model_subdir).absolute()
+    engine_path = None
     quant_name = quant if quant is not None else "FP16"
     stream_mode = "streaming" if streaming else "non-streaming"
     benchmark_name = f"trtllm-bench-sanity-{quant_name}-{stream_mode}"
@@ -294,6 +294,8 @@ def trtllm_bench_prolog(
     work_dir = Path(tempfile.TemporaryDirectory().name
                     ) if skip_engine_build else Path(engine_dir)
     dataset_path = Path(work_dir, f"{benchmark_name}.txt")
+    # Clean up an existing directory if it exists
+    shutil.rmtree(work_dir, ignore_errors=True)
     # Generate a small dataset to run a test.
     work_dir.mkdir(parents=True)
     dataset_output = llm_venv.run_cmd(
@@ -320,29 +322,25 @@ def trtllm_bench_prolog(
     with open(dataset_path, "w") as dataset:
         dataset.write(dataset_output)
 
-    if skip_engine_build:
-        return dataset_path
+    if not skip_engine_build:
+        build_cmd = \
+            f"trtllm-bench " \
+            f"--model {model_name} " \
+            f"--model_path {model_path} " \
+            f"--workspace {work_dir} " \
+            f"build --tp_size 1"
 
-    build_cmd = \
-        f"trtllm-bench " \
-        f"--model {model_name} " \
-        f"--model_path {model_path} " \
-        f"--workspace {work_dir} " \
-        f"build --tp_size 1"
+        if quant is not None:
+            build_cmd = f"{build_cmd} --quantization {quant}"
 
-    if quant is not None:
-        build_cmd = f"{build_cmd} --quantization {quant}"
+        build_cmd = f"{build_cmd} --dataset {dataset_path}"
+        build_output = check_output(build_cmd, shell=True)
 
-    build_cmd = f"{build_cmd} --dataset {dataset_path}"
-    build_output = check_output(build_cmd, shell=True)
+        for line in build_output.split("\n")[::-1]:
+            if line.startswith("ENGINE SAVED:"):
+                engine_path = Path(line.split(":")[1])
+                break
 
-    engine_path = None
-    for line in build_output.split("\n")[::-1]:
-        if line.startswith("ENGINE SAVED:"):
-            engine_path = Path(line.split(":")[1])
-            break
-
-    assert engine_path is not None
     return model_path, engine_path, dataset_path
 
 
@@ -447,17 +445,17 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     '''
     sanity check on latency benchmark for LLM API with PyTorch backend
     '''
-    dataset_path = trtllm_bench_prolog(llm_root,
-                                       llm_venv,
-                                       None,
-                                       llama_model_root,
-                                       model_name,
-                                       False,
-                                       False,
-                                       skip_engine_build=True)
+    model_path, _, dataset_path = trtllm_bench_prolog(llm_root,
+                                                      llm_venv,
+                                                      None,
+                                                      llama_model_root,
+                                                      model_name,
+                                                      False,
+                                                      False,
+                                                      skip_engine_build=True)
 
     benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {llama_model_root} " \
+        f"trtllm-bench --model {model_name} --model_path {model_path} " \
         f"throughput " \
         f"--dataset {dataset_path} --backend 'pytorch'"
 
@@ -573,6 +571,72 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
         check_call_negative_test(benchmark_cmd, shell=True)
     else:
         check_call(benchmark_cmd, shell=True)
+
+
+@pytest.mark.parametrize("model_subdir", [
+    "llama-3.1-model/Meta-Llama-3.1-8B",
+],
+                         ids=lambda x: x.strip("-"))
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "meta-llama/Llama-3.1-8B",
+    ],
+)
+@pytest.mark.parametrize("streaming", [True, False],
+                         ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize("backend", [None, "pytorch"], ids=["TRT", "PyTorch"])
+def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
+                                    model_subdir, streaming, backend):
+    '''
+    Test the iteration log functionality with necessary options
+    '''
+    iteration_log = None
+    engine_dir = None
+
+    try:
+        skip_engine_build = backend is not None
+        iteration_log = tempfile.mkstemp(dir="/tmp", suffix=".txt")[1]
+        if not skip_engine_build:
+            engine_dir = tempfile.mkdtemp(dir="/tmp")
+
+        model_path, engine_path, dataset_path = trtllm_bench_prolog(
+            llm_root,
+            llm_venv,
+            engine_dir,
+            model_subdir,
+            model_name,
+            quant=None,
+            skip_engine_build=skip_engine_build,
+            streaming=streaming)
+
+        benchmark_cmd = \
+            f"trtllm-bench --model {model_path} throughput " \
+            f"--dataset {dataset_path} --iteration_log {iteration_log}"
+
+        if streaming:
+            benchmark_cmd += " --streaming"
+
+        if skip_engine_build:
+            assert engine_path is None, "Engine path should be None"
+            benchmark_cmd += f" --backend {backend}"
+        else:
+            assert engine_path is not None, "Engine path should not be None"
+            benchmark_cmd += f" --engine_dir {engine_path}"
+
+        check_call(benchmark_cmd, shell=True)
+
+        assert os.path.exists(
+            iteration_log
+        ), f"Iteration log file {iteration_log} was not created."
+        if os.path.getsize(iteration_log) == 0:
+            raise AssertionError(
+                f"Iteration log file {iteration_log} is empty.")
+    finally:
+        if iteration_log:
+            shutil.rmtree(iteration_log, ignore_errors=True)
+        if engine_dir:
+            shutil.rmtree(engine_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("model_name", [
