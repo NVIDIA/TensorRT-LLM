@@ -519,6 +519,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
         "jenkins/L0_Test.groovy",
     ]
 
+    def changedFileList = getMergeRequestChangedFileList(pipeline, githubPrApiUrl)
     if (!changedFileList) {
         return false
     }
@@ -526,7 +527,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, githubPrApiUrl)
     def changedFileListStr = ","
     def relatedFileChanged = false
     try {
-        changedFileListStr = getMergeRequestChangedFileList(pipeline, githubPrApiUrl).join(", ")
+        changedFileListStr = changedFileList.join(", ")
         relatedFileChanged = relatedFileList.any { it ->
             if (changedFileListStr.contains(it)) {
                 return true
