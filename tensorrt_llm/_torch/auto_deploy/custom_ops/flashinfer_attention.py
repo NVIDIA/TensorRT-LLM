@@ -53,6 +53,8 @@ class _FlashInferPlanner:
         self.decode_wrapper = None
         self.cached_decode_wrappers = {}
         self.plan_params = None
+        self.prefill_plan_params = None
+        self.decode_plan_params = None
 
     def _init_decode_wrapper(self):
         assert self.workspace_buffer is not None
@@ -71,7 +73,62 @@ class _FlashInferPlanner:
 
     def reset(self) -> None:
         self.plan_params = None
+        self.prefill_plan_params = None
+        self.decode_plan_params = None
 
+    def plan_prefill(self, 
+                     qo_indptr: torch.Tensor, 
+                     kv_page_indptr: torch.Tensor, 
+                     kv_page_indices: torch.Tensor, 
+                     kv_last_page_len: torch.Tensor, 
+                     plan_params: PlanParams):
+        print("Planning prefill")   
+        if plan_params != self.prefill_plan_params:
+            print("\tPlanning prefill done")   
+            self.prefill_plan_params = plan_params
+            self.prefill_wrapper.plan(
+                            qo_indptr,
+                            kv_page_indptr,
+                            kv_page_indices,
+                            kv_last_page_len,
+                            plan_params.n_heads,  # Q heads
+                            plan_params.n_kv_heads,  # KV heads
+                            plan_params.head_dim,
+                            plan_params.page_size,
+                            causal=plan_params.causal,
+                            pos_encoding_mode=plan_params.pos_embd_mode,
+                            rope_theta=plan_params.rope_theta,
+                            q_data_type=plan_params.q_dtype,
+                            kv_data_type=plan_params.kv_dtype,
+                        )
+        else:
+            print("\tPlanning prefill skipped")
+
+    def plan_decode(self, 
+                    kv_page_indptr: torch.Tensor, 
+                    kv_page_indices: torch.Tensor, 
+                    kv_last_page_len: torch.Tensor, 
+                    plan_params: PlanParams):
+        print("Planning decode")
+        if plan_params != self.decode_plan_params:
+            print("\tPlanning decode done")
+            self.decode_plan_params = plan_params
+            self.decode_wrapper.plan(
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+                plan_params.n_heads,
+                plan_params.n_kv_heads,
+                plan_params.head_dim,
+                plan_params.page_size,
+                pos_encoding_mode=plan_params.pos_embd_mode,
+                rope_theta=plan_params.rope_theta,
+                q_data_type=plan_params.q_dtype,
+                kv_data_type=plan_params.kv_dtype,
+            )
+        else:
+            print("\tPlanning decode skipped")
+        
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -162,7 +219,7 @@ def prepare_flashinfer_metadata(
     # reset the planner
     _GlobalFlashInferPlanner.reset()
 
-    # retrieve sanitzed metadata
+    # retrieve sanitized metadata
     seq_len = SequenceInfo._get_sanitized_seq_len(input_ids, seq_len)
     num_seq = len(seq_len)
 
@@ -181,8 +238,28 @@ def prepare_flashinfer_metadata(
 
     paged_kv_last_page_len = ((offsets + seq_len - 1) % page_size) + 1
 
+    # We need to split the computation into two parts: one for the context requests and one for the generate requests
+    if num_seq == sum(seq_len):
+        # generate only batch
+        num_context_requests = 0
+    else:
+        num_context_requests = torch.where(torch.diff(qo_indptr) != 1)[0].max().item() + 1
+    
+    num_generate_requests = num_seq - num_context_requests
+    
+    # Q index pts for prefill and decode
+    qo_indptr_prefill = qo_indptr[:num_context_requests + 1].clone()
+    qo_indptr_decode = torch.arange(num_generate_requests+1, device=qo_indptr.device, dtype=qo_indptr.dtype)
+    
+    # paged_kv_indptr for prefill and decode
+    paged_kv_indptr_prefill = torch.zeros_like(qo_indptr_prefill)
+    paged_kv_indptr_prefill[1:] = torch.cumsum(pages_per_seq[:num_context_requests], 0)
+  
+    paged_kv_indptr_decode = torch.zeros_like(qo_indptr_decode)
+    paged_kv_indptr_decode[1:] = torch.cumsum(pages_per_seq[num_context_requests:num_seq], 0) + paged_kv_indptr_prefill[-1]
+
     # return metadata
-    return (qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, offsets)
+    return (qo_indptr, qo_indptr_prefill, qo_indptr_decode, paged_kv_indptr, paged_kv_indptr_prefill, paged_kv_indptr_decode, paged_kv_indices, paged_kv_last_page_len, offsets)
 
 
 @prepare_flashinfer_metadata.register_fake
@@ -190,9 +267,18 @@ def prepare_flashinfer_metadata_fake(
     input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
+    qo_indptr_prefill = torch.empty_like(qo_indptr)
+    qo_indptr_decode = torch.empty_like(qo_indptr)
+    paged_kv_indptr = torch.empty_like(qo_indptr)
+    paged_kv_indptr_prefill = torch.empty_like(qo_indptr)
+    paged_kv_indptr_decode = torch.empty_like(qo_indptr)
     return (
         qo_indptr,  # qo_indptr
-        torch.empty_like(qo_indptr),  # paged_kv_indptr
+        qo_indptr_prefill,  
+        qo_indptr_decode,
+        paged_kv_indptr,   # paged_kv_indptr
+        paged_kv_indptr_prefill,
+        paged_kv_indptr_decode,
         torch.empty_like(cache_loc),  # paged_kv_indices
         torch.empty_like(seq_len),  # paged_kv_last_page_len
         torch.empty_like(input_pos),  # offsets
@@ -207,7 +293,11 @@ def flashinfer_mha_with_cache(
     v: torch.Tensor,
     # METADATA
     qo_indptr: torch.Tensor,
+    qo_indptr_prefill: torch.Tensor,
+    qo_indptr_decode: torch.Tensor,
     paged_kv_indptr: torch.Tensor,
+    paged_kv_indptr_prefill: torch.Tensor,
+    paged_kv_indptr_decode: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     offsets: torch.Tensor,
@@ -234,20 +324,6 @@ def flashinfer_mha_with_cache(
     k = k.view(*bs_view, n_kv_heads, head_dim)
     v = v.view(*bs_view, n_kv_heads, head_dim)
 
-    pp = PlanParams(
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        head_dim=head_dim,
-        num_seq=len(qo_indptr) - 1,
-        is_generate=(s == 1),
-        page_size=k_cache.shape[1],
-        q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
-        pos_embd_mode=rope_mode if fuse_rope else None,
-        rope_theta=rope_theta,
-        rope_scale=rope_scale,
-    )
-
     # TODO: Get flashinfer fuse_rope working with fp8 kv cache (https://github.com/flashinfer-ai/flashinfer/issues/661)
     if not fuse_rope:
         if rope_mode == "rope":
@@ -263,10 +339,11 @@ def flashinfer_mha_with_cache(
         k = (k / k_scale).to(torch.float8_e4m3fn)
         v = (v / v_scale).to(torch.float8_e4m3fn)
 
+    page_size = k_cache.shape[1]
     # Append to kv cache
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         qo_indptr,
-        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, pp.page_size),
+        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, page_size),
         bs_view[0],
     )
 
@@ -280,16 +357,55 @@ def flashinfer_mha_with_cache(
         paged_kv_indptr,
         paged_kv_last_page_len,
     )
-
-    # run the flashinfer planner and obtain the correct wrapper
-    wrapper = _GlobalFlashInferPlanner.plan(
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        pp,
-    )
-    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+    
+    # Context
+    y = []
+    if (len(qo_indptr_prefill) > 1):
+        pp = PlanParams(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_seq=len(qo_indptr_prefill) - 1,
+            is_generate=False,
+            page_size=k_cache.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            pos_embd_mode=rope_mode if fuse_rope else None,
+            rope_theta=rope_theta,
+            rope_scale=rope_scale,
+            )
+        _GlobalFlashInferPlanner.plan_prefill(
+            qo_indptr_prefill,
+            paged_kv_indptr_prefill,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            pp,
+        )
+        y.append(_GlobalFlashInferPlanner.prefill_wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale))
+    # generate
+    if (len(qo_indptr_decode) > 1):
+        pp = PlanParams(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            num_seq=len(qo_indptr_decode) - 1,
+            is_generate=True,
+            page_size=k_cache.shape[1],
+            q_dtype=q.dtype,
+            kv_dtype=k_cache.dtype,
+            pos_embd_mode=rope_mode if fuse_rope else None,
+            rope_theta=rope_theta,
+            rope_scale=rope_scale,
+            )
+        _GlobalFlashInferPlanner.plan_decode(
+            paged_kv_indptr_decode,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            pp,
+        )
+        y.append(_GlobalFlashInferPlanner.decode_wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale))
+        
+    y = torch.cat(y, dim=0)
 
     return y.view(b, s, d)  # [b,s,n*h_d]
 
@@ -301,8 +417,12 @@ def flashinfer_mha_with_cache_fake(
     k: torch.Tensor,
     v: torch.Tensor,
     # METADATA
-    qo_indptr: torch.Tensor,
+    qo_indptr: torch.Tensor,    
+    qo_indptr_prefill: torch.Tensor,
+    qo_indptr_decode: torch.Tensor,
     paged_kv_indptr: torch.Tensor,
+    paged_kv_indptr_prefill: torch.Tensor,
+    paged_kv_indptr_decode: torch.Tensor,
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     offsets: torch.Tensor,
@@ -335,7 +455,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_prepare_metadata_op(cls):
-        return torch.ops.attention.prepare_flashinfer_metadata, 5
+        return torch.ops.attention.prepare_flashinfer_metadata, 9
 
     @classmethod
     def get_cache_initializers(cls, get_info):
