@@ -3793,6 +3793,7 @@ struct KvCacheManagerInstantiationParameters
     SizeType32 sizePerHead;
     SizeType32 tokensPerBlock;
     SizeType32 numBlocksInPrimaryPool;
+    SizeType32 numBlocksInSecondaryPool;
     SizeType32 sinkTokenLength;
     SizeType32 maxAttentionWindow;
     SizeType32 maxBeamWidth;
@@ -3822,11 +3823,7 @@ std::shared_ptr<KVCacheManager> createKvCacheManager(
     auto const temporaryKvCacheLength = std::min(kvCacheInstantiationParameters.maxNumTokens,
         maxInputLength - kvCacheInstantiationParameters.maxAttentionWindow);
 
-    auto const numBlocksInSecondaryPool
-        = (kvCacheInstantiationParameters.kvCacheBlockReuse
-              && kvCacheInstantiationParameters.maxNumTokens > kvCacheInstantiationParameters.maxAttentionWindow)
-        ? kvCacheInstantiationParameters.numBlocksInPrimaryPool
-        : 0;
+    auto const numBlocksInSecondaryPool = kvCacheInstantiationParameters.numBlocksInSecondaryPool;
 
     if (std::holds_alternative<SizeType32>(kvCacheInstantiationParameters.numHeadsPerLayer))
     {
@@ -3932,6 +3929,7 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
                 1,
                 4096,
                 0,
+                0,
                 4096,
                 1,
                 4096 * 4,
@@ -3948,6 +3946,7 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
                 1,
                 64,
                 4096,
+                0,
                 0,
                 4096,
                 1,
@@ -3966,6 +3965,7 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
                 64,
                 4096,
                 0,
+                0,
                 128,
                 1,
                 4096 * 4,
@@ -3973,6 +3973,24 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
             },
             1024, 128,
             18, // See `temporaryAttentionWindow` concept.
+        },
+        GetRemainingBlocksToCompletionOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                64,
+                4096,
+                4096,
+                0,
+                4096,
+                1,
+                4096 * 4,
+                false,
+            },
+            1024,
+            128,
+            18,
         }));
 
 class FillKvCacheAndCompleteRequestsTest : public ::testing::TestWithParam<FillKvCacheAndCompleteRequestsParameters>
@@ -4033,6 +4051,7 @@ auto const paramValues = ::testing::Values(
             1,
             4096,
             0,
+            0,
             4096,
             1,
             4096 * 4,
@@ -4048,6 +4067,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096,
+            0,
             0,
             4096,
             1,
@@ -4065,6 +4085,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096,
             0,
+            0,
             4096,
             1,
             4096 * 4,
@@ -4080,6 +4101,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096,
+            0,
             0,
             4096,
             1,
@@ -4096,6 +4118,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096,
+            0,
             0,
             128,
             1,
@@ -4113,6 +4136,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 128,
             0,
+            0,
             4096,
             1,
             4096 * 4,
@@ -4129,6 +4153,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4145,6 +4170,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4159,6 +4185,41 @@ auto const paramValues = ::testing::Values(
             1,
             1,
             64,
+            4096 * 16,
+            4096 * 16,
+            0,
+            2048,
+            1,
+            4096 * 4,
+            true,
+        },
+        5000,
+        500,
+    },
+    FillKvCacheAndCompleteRequestsParameters{
+        KvCacheManagerInstantiationParameters{
+            1,
+            1,
+            1,
+            64,
+            4096 * 16,
+            0,
+            0,
+            2048,
+            1,
+            4096 * 4,
+            true,
+        },
+        500,
+        5000,
+    },
+    FillKvCacheAndCompleteRequestsParameters{
+        KvCacheManagerInstantiationParameters{
+            1,
+            1,
+            1,
+            64,
+            4096 * 16,
             4096 * 16,
             0,
             2048,
@@ -4177,6 +4238,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4192,6 +4254,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096 * 16,
+            0,
             0,
             2048,
             1,
@@ -4209,6 +4272,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4225,6 +4289,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4240,6 +4305,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096 * 16,
+            0,
             0,
             2048,
             1,
@@ -4257,6 +4323,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4272,6 +4339,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096 * 16,
+            0,
             0,
             2048,
             1,
@@ -4289,6 +4357,7 @@ auto const paramValues = ::testing::Values(
             64,
             4096 * 16,
             0,
+            0,
             2048,
             1,
             4096 * 4,
@@ -4304,6 +4373,7 @@ auto const paramValues = ::testing::Values(
             1,
             64,
             4096 * 16,
+            0,
             0,
             2048,
             1,
