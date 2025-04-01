@@ -57,7 +57,7 @@ public:
     void disableLookahead(
         SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
-    CudaEvent forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
     void forward(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
     //! @brief Gather final beam search results for request `batchSlot`.
