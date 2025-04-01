@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -65,6 +66,20 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
     mGemmRunner.fp8CS1x128(
         act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream);
 
+    // Post-process the scale tensor for sm100 gemm/moe kernel
+    if (tensorrt_llm::common::getSMVersion() == 100)
+    {
+        auto const num_n_blocks = (n + 127) / 128;
+        auto const act_scal_elesize = num_n_blocks * m_padded;
+        TORCH_CHECK(act_scal_elesize <= scaleFP8SF.numel(), "Scale tensor size mismatch. Expected at least ",
+            act_scal_elesize, " elements, got ", scaleFP8SF.numel());
+
+        // scaleFP8SF = scaleFP8SF[0:num_n_blocks, 0:m] // no 4-element alignment in blackwell
+        // TODO: This is a hack to use sm90 quantize kernel for sm100; ideally we should have a separate quantize kernel
+        // for sm100.
+        scaleFP8SF
+            = scaleFP8SF.slice(0, 0, act_scal_elesize).view({num_n_blocks, m_padded}).slice(1, 0, m).contiguous();
+    }
     return {valueE4M3.slice(0, 0, m), scaleFP8SF};
 }
 
