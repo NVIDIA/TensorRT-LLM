@@ -171,6 +171,7 @@ def test_llm_generate_mixtral_for_ep2():
 
 @pytest.mark.gpu2
 @pytest.mark.part2
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5194591 hang")
 def test_llm_pp2():
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
@@ -223,6 +224,7 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 @pytest.mark.gpu4
 @pytest.mark.part0
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5194591 hang")
 def test_tinyllama_logits_processor_tp2pp2():
     tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
                                             pipeline_parallel_size=2)
@@ -231,6 +233,7 @@ def test_tinyllama_logits_processor_tp2pp2():
 @pytest.mark.gpu4
 @pytest.mark.part0
 @pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5194591 hang")
 def test_tinyllama_guided_decoding_tp2pp2(backend: str):
     llm_kwargs = {}
     if backend == 'pytorch':
