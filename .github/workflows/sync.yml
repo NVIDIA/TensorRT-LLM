@@ -1,0 +1,28 @@
+name: Sync with Upstream
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  sync_with_upstream:
+    runs-on: ubuntu-latest
+    if: ${{ vars.SYNC_ACTION == 'true' }}
+    name: Rebase master with upstream latest
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Rebase upstream changes
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git remote add upstream https://github.com/NVIDIA/TensorRT-LLM.git
+          git fetch upstream
+          git rebase upstream/main
+          git push -f origin main
