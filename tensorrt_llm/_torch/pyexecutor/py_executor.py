@@ -490,10 +490,7 @@ class PyExecutor:
             iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -585,10 +582,7 @@ class PyExecutor:
             iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -720,10 +714,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -846,10 +837,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -1015,18 +1003,7 @@ class PyExecutor:
 
         return new_tensors_host
 
-    @nvtx_range("_fetch_new_requests")
-    def _fetch_new_requests(self):
-        timeout = None if len(
-            self.active_requests) == 0 else datetime.timedelta(0)
-        new_requests = []
-        if self.dist.rank == 0:
-            new_requests = _get_from_request_queue(
-                self.request_queue, timeout,
-                self.max_num_active_requests - len(self.active_requests))
-
-        new_requests = self._broadcast_new_requests(new_requests)
-
+    def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             now = time.time()
             for req in new_requests:
@@ -1035,8 +1012,6 @@ class PyExecutor:
                     if req_id in self.start_times:
                         self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                             req_id)
-
-        return new_requests
 
     @nvtx_range("_broadcast_new_requests")
     def _broadcast_new_requests(self, new_requests):
@@ -1087,10 +1062,15 @@ class PyExecutor:
 
         return new_requests
 
-    @nvtx_range("_fetch_adp_new_requests")
-    def _fetch_adp_new_requests(self):
-        total_num_active_requests = sum(self.all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+    @nvtx_range("_fetch_new_requests")
+    def _fetch_new_requests(self):
+        if self.enable_attention_dp:
+            total_num_active_requests = sum(self.all_ranks_num_active_requests)
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        else:
+            total_num_active_requests = len(self.active_requests)
+            total_max_num_active_requests = self.max_num_active_requests
+
         timeout = None if total_num_active_requests == 0 else datetime.timedelta(
             0)
         new_requests = []
@@ -1100,6 +1080,10 @@ class PyExecutor:
                 total_max_num_active_requests - total_num_active_requests)
 
         new_requests = self._broadcast_new_requests(new_requests)
+
+        if not self.enable_attention_dp:
+            self._update_new_active_requests_queue_latency(new_requests)
+            return new_requests
 
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
@@ -1149,12 +1133,8 @@ class PyExecutor:
                 elif val.rank == self.dist.tp_rank:
                     break
             self.has_context_request = len(new_requests_cur_rank) > 0
-            now = time.time()
-            if self.enable_iter_perf_stats and self.dist.rank == 0:
-                for request in new_requests_cur_rank:
-                    self.new_active_requests_queue_latency_ms += now - self.start_times[
-                        request[0]]
-                    self.start_times.pop(request[0])
+            self._update_new_active_requests_queue_latency(
+                new_requests_cur_rank)
 
         self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
