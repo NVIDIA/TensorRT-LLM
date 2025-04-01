@@ -177,11 +177,11 @@ Serverless TensorRT-LLM (LLaMA 3 8B) | Modal Docs [➡️ link](https://modal.co
 
 TensorRT-LLM is an open-sourced library for optimizing Large Language Model (LLM) inference. It provides state-of-the-art optimizations, including custom attention kernels, inflight batching, paged KV caching, quantization (FP8, [FP4](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/), INT4 [AWQ](https://arxiv.org/abs/2306.00978), INT8 [SmoothQuant](https://arxiv.org/abs/2211.10438), ...), speculative decoding, and much more, to perform inference efficiently on NVIDIA GPUs.
 
-Recently [re-architected with a **PyTorch backend**](https://nvidia.github.io/TensorRT-LLM/torch.html), TensorRT-LLM now combines peak performance with improved developer efficiency. Previously, it was built on top of the [TensorRT](https://developer.nvidia.com/tensorrt), an ahead-of-time compiler, to build "[Engines](https://docs.nvidia.com/deeplearning/tensorrt/quick-start-guide/index.html#ecosystem)" which are optimized representations of the compiled model containing the entire execution graph for later production-grade deployment.
+Recently [re-architected with a **PyTorch backend**](https://nvidia.github.io/TensorRT-LLM/torch.html), TensorRT-LLM now combines peak performance with a more flexible and developer-friendly workflow. The original [TensorRT](https://developer.nvidia.com/tensorrt)-based backend remains supported and continues to provide an ahead-of-time compilation path for building highly optimized "[Engines](https://docs.nvidia.com/deeplearning/tensorrt/quick-start-guide/index.html#ecosystem)" for deployment. The PyTorch backend complements this by enabling faster development iteration and rapid experimentation.
 
 TensorRT-LLM provides a flexible [**LLM API**](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html#llm-api) to simplify model setup and inference across both PyTorch and TensorRT backends. It supports a wide range of inference use cases from a single GPU to multiple nodes with multiple GPUs using [Tensor Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#tensor-parallelism) and/or [Pipeline Parallelism](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/features/parallelisms.html#pipeline-parallelism). It also includes a [backend](https://github.com/triton-inference-server/tensorrtllm_backend) for integration with the [NVIDIA Triton Inference Server](https://developer.nvidia.com/nvidia-triton-inference-server).
 
-Several popular models are pre-defined and can be easily customized or extended using native PyTorch code (for the PyTorch backend) or a PyTorch-style Python API (for the TensorRT backend).
+Several popular models are pre-defined and can be easily customized or extended using [native PyTorch code](./tensorrt_llm/_torch/models/modeling_deepseekv3.py) (for the PyTorch backend) or a [PyTorch-style Python API](./tensorrt_llm/models/llama/model.py) (for the TensorRT backend).
 
 
 ## Getting Started
@@ -189,7 +189,7 @@ Several popular models are pre-defined and can be easily customized or extended 
 To get started with TensorRT-LLM, visit our documentation:
 
 - [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-    - [Running DeepSeek-V3](./examples/deepseek_v3)
+    - [Running DeepSeek](./examples/deepseek_v3)
 - [Installation Guide for Linux](https://nvidia.github.io/TensorRT-LLM/installation/linux.html)
 - [Installation Guide for Grace Hopper](https://nvidia.github.io/TensorRT-LLM/installation/grace-hopper.html)
 - [Supported Hardware, Models, and other Software](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
@@ -197,6 +197,6 @@ To get started with TensorRT-LLM, visit our documentation:
 - [Release Notes](https://nvidia.github.io/TensorRT-LLM/release-notes.html)
 
 ## Useful Links
-- [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [nvidia/DeepSeek-R1-FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT-LLM.
+- [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT-LLM.
 - [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo): A datacenter scale distributed inference serving framework that works seamlessly with TensorRT-LLM.
 - [AutoDeploy](./examples/auto_deploy/README.md): An experimental backend for TensorRT-LLM to simplify and accelerate the deployment of PyTorch models.
