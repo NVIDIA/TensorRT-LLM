@@ -53,13 +53,13 @@ M = 32
 # add sleep to simulate bad perf
 def gemm_0(x, w):
     if x.shape[0] > M // 2:
-        delay_kernel(1000, torch.cuda.current_stream())
+        delay_kernel(10000, torch.cuda.current_stream())
     return x @ w
 
 
 def gemm_1(x, w):
     if x.shape[0] <= M // 2:
-        delay_kernel(1000, torch.cuda.current_stream())
+        delay_kernel(10000, torch.cuda.current_stream())
     return x @ w
 
 
@@ -70,6 +70,8 @@ def gemm_fallback(x, w) -> torch.Tensor:
 
 
 def check_gemm_tactic_valid(tactic: int, m: int) -> bool:
+    # TODO: CI is not stable for this test. delay_kernel can not guarantee the profiling result.
+    # We need to find a more determinist way to test this.
     if m <= M // 2:
         if tactic != 0:
             logger.warning(
@@ -128,6 +130,7 @@ def test_autotuner_cache_basic():
     w = torch.randn(64, 128)
 
     # tuning with largest M
+    AutoTuner.get().clear_cache()
     with autotune():
         torch.ops.autotuner_test.get_best_gemm_tactic(torch.randn(M, 64), w)
 
@@ -197,6 +200,7 @@ def _(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
 
 def test_recursive_autotuner():
     x, w1, w2 = torch.randn(M, 64), torch.randn(64, 128), torch.randn(64, 128)
+    AutoTuner.get().clear_cache()
     with autotune():
         torch.ops.autotuner_test.recursive_get_best_gemm_tactic(
             torch.randn(M, 64), w1, w2)
@@ -305,6 +309,7 @@ def test_autotuner_statistics():
     x_medium = torch.randn(M, 64)  # Will use tactic 1
 
     # First do tuning with largest input
+    AutoTuner.get().clear_cache()
     with autotune():
         # Only size <= M will be tuned
         torch.ops.autotuner_test.get_best_gemm_tactic(x_medium, w)

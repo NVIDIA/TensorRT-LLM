@@ -338,14 +338,15 @@ public:
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
+        // TODO: support profiling under fp8 block scaling in the future
         if (mUseFp8BlockScaling)
         {
             return;
         }
 
-        int64_t num_rows = input.sizes()[0];
-        int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        int64_t const num_rows = input.sizes()[0];
+        int64_t const hidden_size = fc2_expert_weights.sizes()[1];
+        int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
         // Get specific profile configs according to the profile_id.

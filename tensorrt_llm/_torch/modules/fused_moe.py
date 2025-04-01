@@ -65,15 +65,14 @@ class MoERunner(TunableRunner):
         return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
                 self.top_k, self.ep_size)
 
-    def get_specific_profile(self, inputs: List[torch.Tensor]):
+    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
         x, fc2_expert_weights = inputs
-        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape, self.top_k, self.ep_size)
+        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
+                self.top_k, self.ep_size)
 
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
-        *args,
-        **kwargs,
     ) -> List[int]:
         return list(range(self._fused_moe_runner.get_tactic_num()))
 
@@ -124,8 +123,10 @@ def fused_moe(
 
     tuning_config = TuningConfig(dynamic_tensors={
         0: {
-            0: ([16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                 2, 1], next_positive_power_of_2),
+            0: ([
+                16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
+                2, 1
+            ], next_positive_power_of_2),
         },
     }, )
 
