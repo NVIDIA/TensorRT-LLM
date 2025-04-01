@@ -77,10 +77,10 @@ def generate_examples():
                 title = underline(title_text)
 
             content = (f"{title}\n\n"
-                    f"Source {script_url}.\n\n"
-                    f".. literalinclude:: {include_path}\n"
-                    f"    :language: {language}\n"
-                    "    :linenos:\n")
+                       f"Source {script_url}.\n\n"
+                       f".. literalinclude:: {include_path}\n"
+                       f"    :language: {language}\n"
+                       "    :linenos:\n")
             with open(doc_path, "w+") as f:
                 f.write(content)
 
