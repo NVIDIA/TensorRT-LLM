@@ -137,6 +137,7 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
+  - accuracy/test_accuracy.py::TestNemotronMini4BInstruct::test_fp8_pre_quantized
   - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_float32
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context_ppl
