@@ -55,10 +55,6 @@ class RotaryModel(torch.nn.Module):
         cos = cos.to(q.device)  # [S, D]
         sin = sin.to(q.device)
 
-        # slice them to the actual sequence length
-        cos = cos[:seq]
-        sin = sin[:seq]
-
         q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
         return q_embed + k_embed
 
@@ -67,7 +63,7 @@ class RotaryModel(torch.nn.Module):
 def test_match_rope():
     batch_size, seq_len = 8, 16
     hidden_size = 64
-    max_position_embeddings = 32
+    max_position_embeddings = seq_len
 
     model = RotaryModel(hidden_size, max_position_embeddings).to("cuda", dtype=torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)

@@ -1,11 +1,11 @@
 import operator
-from typing import List, Tuple
+from typing import List
 
 import torch
 from torch.fx import GraphModule
 
 from ...models.factory import PositionalEmbeddingConfig
-from ...utils.node_utils import identify_regions_between_residuals, is_op
+from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
@@ -141,18 +141,18 @@ def match_rope(
         q_node = q_match["raw_input"]
         k_node = k_match["raw_input"]
 
-        if "cos" not in gm._buffers:
-            if not (hasattr(q_node, "meta") and "tensor_meta" in q_node.meta):
-                raise RuntimeError("Missing tensor meta information for query input.")
-            head_dim = q_node.meta["tensor_meta"].shape[-1]
-            cos, sin = _precompute_freqs_cis(max_seq_len, head_dim, pos_embd_config.rope_theta)
-            gm.register_buffer("cos", cos.clone())
-            gm.register_buffer("sin", sin.clone())
+        cos_node = q_match["unsqueeze_cos"].args[0]
+        sin_node = q_match["unsqueeze_sin"].args[0]
+        # Sanity-check: ensure cos_node eventually comes from torch.ops.aten.cos
+        bfs(cos_node, lambda n: is_op(n, torch.ops.aten.cos), attr_next="all_input_nodes")
+        # Sanity-check: ensure sin_node eventually comes from torch.ops.aten.sin
+        bfs(sin_node, lambda n: is_op(n, torch.ops.aten.sin), attr_next="all_input_nodes")
+        # TODO: extract a concrete value and register as buffer to avoid recalculation
 
         with graph.inserting_before(q_match["add_node"]):
             flash_node = graph.call_function(
                 torch.ops.rope.flashinfer,
-                args=(q_node, k_node, graph.get_attr("cos"), graph.get_attr("sin")),
+                args=(q_node, k_node, cos_node, sin_node),
             )
 
         # Unpack the tuple (rotated_query, rotated_key)
@@ -165,22 +165,3 @@ def match_rope(
 
     gm = canonicalize_graph(gm)
     return gm
-
-
-def _precompute_freqs_cis(
-    seq_len: int, head_dim: int, rope_theta: float = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    dtype = torch.float
-    if rope_theta is None:
-        rope_theta = 1e4
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim // 2, dtype=dtype) / (head_dim // 2)))
-    positions_range = torch.arange(seq_len, dtype=dtype)
-    angles = positions_range.unsqueeze(1) * inv_freq.unsqueeze(
-        0
-    )  # Shape: [max_seq_len, head_dim/2]
-    cos_vals = torch.cos(angles)  # Shape: [max_seq_len, head_dim/2]
-    sin_vals = torch.sin(angles)  # Shape: [max_seq_len, head_dim/2]
-    # cos_sin_cache = torch.cat([cos_vals, sin_vals], dim=1)
-    cos = torch.cat([cos_vals, cos_vals], dim=-1)
-    sin = torch.cat([sin_vals, sin_vals], dim=-1)
-    return cos, sin

@@ -1,7 +1,7 @@
 """Common utils for torch fx graph transformation."""
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch._ops import OpOverload, OpOverloadPacket
@@ -287,3 +287,13 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(output_node)
 
     return boundary_nodes
+
+
+def bfs(node: Node, target: Callable, attr_next: str = "users") -> Node:
+    queue = [node]
+    while queue:
+        cur_node = queue.pop(0)
+        if target(cur_node):
+            return cur_node
+        queue.extend(getattr(cur_node, attr_next))
+    raise RuntimeError(f"Could not find node with target condition {target}.")
