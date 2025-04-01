@@ -338,8 +338,11 @@ class Deepseekv3MoE(nn.Module):
                                          min_latency_mode,
                                          output_dtype=hidden_states.dtype)
         else:
-            routed_output = self.experts(hidden_states, router_logits,
-                                         min_latency_mode)
+            routed_output = self.experts(
+                hidden_states,
+                router_logits,
+                min_latency_mode,
+                all_rank_num_tokens=all_rank_num_tokens)
 
         return routed_output
 

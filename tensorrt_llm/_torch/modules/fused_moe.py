@@ -610,14 +610,6 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
         )
 
-        # if min_latency_mode:
-        #     assert not self.reduce_results
-        #     return outputs
-
-        # final_hidden_states = outputs
-        # if self.reduce_results and self.parallel_size > 1:
-        #     final_hidden_states = self.all_reduce(final_hidden_states)
-
         return final_hidden_states
 
     def forward(
@@ -633,7 +625,11 @@ class FusedMoE(nn.Module):
             assert all_rank_num_tokens is not None
             if not disable_fp4_allgather():
                 max_chunk_size //= len(all_rank_num_tokens)
-        num_chunks = (x.shape[0] + max_chunk_size - 1) // max_chunk_size
+        if isinstance(x, Fp4QuantizedTensor):
+            num_rows = x.fp4_tensor.shape[0]
+        else:
+            num_rows = x.shape[0]
+        num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if min_latency_mode:
             assert (num_chunks == 1 and (
