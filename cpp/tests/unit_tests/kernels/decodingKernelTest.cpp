@@ -707,7 +707,7 @@ TEST_F(TestGatherTree, GatherTreeNoSwap)
     createBuffers();
     hardcodeBuffersLen10();
     cudaDeviceSynchronize();
-    kernels::gatherTree(*decodingOutput, *decodingInput, *mBufferManager, mSamplingConfig);
+    kernels::gatherTree(*decodingOutput, *decodingInput, mSamplingConfig, *mStream);
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(checkResult());
@@ -718,7 +718,7 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
     createBuffers();
     hardcodeBuffersLen8();
     cudaDeviceSynchronize();
-    kernels::gatherTree(*decodingOutput, *decodingInput, *mBufferManager, mSamplingConfig);
+    kernels::gatherTree(*decodingOutput, *decodingInput, mSamplingConfig, *mStream);
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(checkResult());

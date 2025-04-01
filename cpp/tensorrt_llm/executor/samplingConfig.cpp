@@ -19,19 +19,24 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 namespace tensorrt_llm::executor
 {
 
-SamplingConfig::SamplingConfig(SizeType32 beamWidth, std::optional<SizeType32> const& topK,
-    std::optional<FloatType> const& topP, std::optional<FloatType> const& topPMin,
-    std::optional<TokenIdType> const& topPResetIds, std::optional<FloatType> const& topPDecay,
-    std::optional<RandomSeedType> const& seed, std::optional<FloatType> const& temperature,
-    std::optional<SizeType32> const& minTokens, std::optional<FloatType> const& beamSearchDiversityRate,
-    std::optional<FloatType> const& repetitionPenalty, std::optional<FloatType> const& presencePenalty,
-    std::optional<FloatType> const& frequencyPenalty, std::optional<FloatType> const& lengthPenalty,
-    std::optional<SizeType32> const& earlyStopping, std::optional<SizeType32> const& noRepeatNgramSize,
-    std::optional<SizeType32> const& numReturnSequences, std::optional<FloatType> const& minP)
+template <typename T>
+using OptVec = std::optional<std::vector<T>>;
+
+using OptSize32 = std::optional<SizeType32>;
+using OptFloat = std::optional<FloatType>;
+
+SamplingConfig::SamplingConfig(SizeType32 beamWidth, OptSize32 const& topK, OptFloat const& topP,
+    OptFloat const& topPMin, std::optional<TokenIdType> const& topPResetIds, OptFloat const& topPDecay,
+    std::optional<RandomSeedType> const& seed, OptFloat const& temperature, OptSize32 const& minTokens,
+    OptFloat const& beamSearchDiversityRate, OptFloat const& repetitionPenalty, OptFloat const& presencePenalty,
+    OptFloat const& frequencyPenalty, OptFloat const& lengthPenalty, OptSize32 const& earlyStopping,
+    OptSize32 const& noRepeatNgramSize, OptSize32 const& numReturnSequences, OptFloat const& minP,
+    OptVec<SizeType32> const& beamWidthArray)
     : mBeamWidth(checkBeamWidth(beamWidth))
     , mTopK(checkTopK(topK))
     , mTopP(checkTopP(topP))
@@ -45,11 +50,12 @@ SamplingConfig::SamplingConfig(SizeType32 beamWidth, std::optional<SizeType32> c
     , mRepetitionPenalty(checkRepetitionPenalty(repetitionPenalty))
     , mPresencePenalty(presencePenalty)
     , mFrequencyPenalty(frequencyPenalty)
-    , mLengthPenalty(lengthPenalty)
-    , mEarlyStopping(earlyStopping)
+    , mLengthPenalty(checkLengthPenalty(lengthPenalty))
+    , mEarlyStopping(checkEarlyStopping(earlyStopping))
     , mNoRepeatNgramSize(checkNoRepeatNgramSize(noRepeatNgramSize))
     , mNumReturnSequences(checkNumReturnSequences(numReturnSequences, beamWidth))
     , mMinP(checkMinP(minP))
+    , mBeamWidthArray(checkBeamWidthArray(beamWidthArray, beamWidth))
 {
     updateNumReturnBeams();
 }
@@ -63,9 +69,10 @@ bool SamplingConfig::operator==(SamplingConfig const& other) const
         && mPresencePenalty == other.mPresencePenalty && mFrequencyPenalty == other.mFrequencyPenalty
         && mLengthPenalty == other.mLengthPenalty && mEarlyStopping == other.mEarlyStopping
         && mNoRepeatNgramSize == other.mNoRepeatNgramSize && mNumReturnSequences == other.mNumReturnSequences
-        && mMinP == other.mMinP;
+        && mMinP == other.mMinP && mBeamWidthArray == other.mBeamWidthArray;
 }
 
+// Getters
 SizeType32 SamplingConfig::getBeamWidth() const
 {
     return mBeamWidth;
@@ -76,27 +83,27 @@ SizeType32 SamplingConfig::getNumReturnBeams() const
     return mNumReturnBeams;
 }
 
-std::optional<SizeType32> SamplingConfig::getTopK() const
+OptSize32 SamplingConfig::getTopK() const
 {
     return mTopK;
 }
 
-std::optional<FloatType> SamplingConfig::getTopP() const
+OptFloat SamplingConfig::getTopP() const
 {
     return mTopP;
 }
 
-std::optional<FloatType> SamplingConfig::getTopPMin() const
+OptFloat SamplingConfig::getTopPMin() const
 {
     return mTopPMin;
 }
 
-std::optional<SizeType32> SamplingConfig::getTopPResetIds() const
+OptSize32 SamplingConfig::getTopPResetIds() const
 {
     return mTopPResetIds;
 }
 
-std::optional<FloatType> SamplingConfig::getTopPDecay() const
+OptFloat SamplingConfig::getTopPDecay() const
 {
     return mTopPDecay;
 }
@@ -112,58 +119,58 @@ std::optional<RandomSeedType> SamplingConfig::getRandomSeed() const
     return mSeed;
 }
 
-std::optional<FloatType> SamplingConfig::getTemperature() const
+OptFloat SamplingConfig::getTemperature() const
 {
     return mTemperature;
 }
 
-std::optional<SizeType32> SamplingConfig::getMinTokens() const
+OptSize32 SamplingConfig::getMinTokens() const
 {
     return mMinTokens;
 }
 
-std::optional<SizeType32> SamplingConfig::getMinLength() const
+OptSize32 SamplingConfig::getMinLength() const
 {
     TLLM_LOG_WARNING("getMinLength is being deprecated; please use getMinTokens instead.");
     return mMinTokens;
 }
 
-std::optional<FloatType> SamplingConfig::getBeamSearchDiversityRate() const
+OptFloat SamplingConfig::getBeamSearchDiversityRate() const
 {
     return mBeamSearchDiversityRate;
 }
 
-std::optional<FloatType> SamplingConfig::getRepetitionPenalty() const
+OptFloat SamplingConfig::getRepetitionPenalty() const
 {
     return mRepetitionPenalty;
 }
 
-std::optional<FloatType> SamplingConfig::getPresencePenalty() const
+OptFloat SamplingConfig::getPresencePenalty() const
 {
     return mPresencePenalty;
 }
 
-std::optional<FloatType> SamplingConfig::getFrequencyPenalty() const
+OptFloat SamplingConfig::getFrequencyPenalty() const
 {
     return mFrequencyPenalty;
 }
 
-std::optional<FloatType> SamplingConfig::getLengthPenalty() const
+OptFloat SamplingConfig::getLengthPenalty() const
 {
     return mLengthPenalty;
 }
 
-std::optional<SizeType32> SamplingConfig::getEarlyStopping() const
+OptSize32 SamplingConfig::getEarlyStopping() const
 {
     return mEarlyStopping;
 }
 
-std::optional<SizeType32> SamplingConfig::getNoRepeatNgramSize() const
+OptSize32 SamplingConfig::getNoRepeatNgramSize() const
 {
     return mNoRepeatNgramSize;
 }
 
-std::optional<SizeType32> SamplingConfig::getNumReturnSequences() const
+OptSize32 SamplingConfig::getNumReturnSequences() const
 {
     return mNumReturnSequences;
 }
@@ -173,25 +180,29 @@ std::optional<FloatType> SamplingConfig::getMinP() const
     return mMinP;
 }
 
-// the setters
+OptVec<SizeType32> SamplingConfig::getBeamWidthArray() const
+{
+    return mBeamWidthArray;
+}
 
+// Setters
 void SamplingConfig::setBeamWidth(SizeType32 beamWidth)
 {
     mBeamWidth = checkBeamWidth(beamWidth);
     updateNumReturnBeams();
 }
 
-void SamplingConfig::setTopK(std::optional<SizeType32> const& topK)
+void SamplingConfig::setTopK(OptSize32 const& topK)
 {
     mTopK = checkTopK(topK);
 }
 
-void SamplingConfig::setTopP(std::optional<FloatType> const& topP)
+void SamplingConfig::setTopP(OptFloat const& topP)
 {
     mTopP = checkTopP(topP);
 }
 
-void SamplingConfig::setTopPMin(std::optional<FloatType> const& topPMin)
+void SamplingConfig::setTopPMin(OptFloat const& topPMin)
 {
     mTopPMin = checkTopPMin(topPMin);
 }
@@ -201,7 +212,7 @@ void SamplingConfig::setTopPResetIds(std::optional<TokenIdType> const& topPReset
     mTopPResetIds = checkTopPResetIds(topPResetIds);
 }
 
-void SamplingConfig::setTopPDecay(std::optional<FloatType> const& topPDecay)
+void SamplingConfig::setTopPDecay(OptFloat const& topPDecay)
 {
     mTopPDecay = checkTopPDecay(topPDecay);
 }
@@ -217,58 +228,58 @@ void SamplingConfig::setRandomSeed(std::optional<RandomSeedType> const& randomSe
     mSeed = randomSeed;
 }
 
-void SamplingConfig::setTemperature(std::optional<FloatType> const& temperature)
+void SamplingConfig::setTemperature(OptFloat const& temperature)
 {
     mTemperature = checkTemperature(temperature);
 }
 
-void SamplingConfig::setMinTokens(std::optional<SizeType32> const& minTokens)
+void SamplingConfig::setMinTokens(OptSize32 const& minTokens)
 {
     mMinTokens = checkMinTokens(minTokens);
 }
 
-void SamplingConfig::setMinLength(std::optional<SizeType32> const& minLength)
+void SamplingConfig::setMinLength(OptSize32 const& minLength)
 {
     TLLM_LOG_WARNING("setMinLength is being deprecated; please use setMinTokens instead.");
     mMinTokens = checkMinTokens(minLength);
 }
 
-void SamplingConfig::setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate)
+void SamplingConfig::setBeamSearchDiversityRate(OptFloat const& beamSearchDiversityRate)
 {
     mBeamSearchDiversityRate = checkBeamSearchDiversityRate(beamSearchDiversityRate);
 }
 
-void SamplingConfig::setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty)
+void SamplingConfig::setRepetitionPenalty(OptFloat const& repetitionPenalty)
 {
     mRepetitionPenalty = checkRepetitionPenalty(repetitionPenalty);
 }
 
-void SamplingConfig::setPresencePenalty(std::optional<FloatType> const& presencePenalty)
+void SamplingConfig::setPresencePenalty(OptFloat const& presencePenalty)
 {
     mPresencePenalty = presencePenalty;
 }
 
-void SamplingConfig::setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty)
+void SamplingConfig::setFrequencyPenalty(OptFloat const& frequencyPenalty)
 {
     mFrequencyPenalty = frequencyPenalty;
 }
 
-void SamplingConfig::setLengthPenalty(std::optional<FloatType> const& lengthPenalty)
+void SamplingConfig::setLengthPenalty(OptFloat const& lengthPenalty)
 {
-    mLengthPenalty = lengthPenalty;
+    mLengthPenalty = lengthPenalty; // TODO: re-enable `checkLengthPenalty` later
 }
 
-void SamplingConfig::setEarlyStopping(std::optional<SizeType32> const& earlyStopping)
+void SamplingConfig::setEarlyStopping(OptSize32 const& earlyStopping)
 {
-    mEarlyStopping = earlyStopping;
+    mEarlyStopping = earlyStopping; // TODO: re-enable `checkEarlyStopping` later
 }
 
-void SamplingConfig::setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize)
+void SamplingConfig::setNoRepeatNgramSize(OptSize32 const& noRepeatNgramSize)
 {
     mNoRepeatNgramSize = checkNoRepeatNgramSize(noRepeatNgramSize);
 }
 
-void SamplingConfig::setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences)
+void SamplingConfig::setNumReturnSequences(OptSize32 const& numReturnSequences)
 {
     mNumReturnSequences = checkNumReturnSequences(numReturnSequences, mBeamWidth);
     updateNumReturnBeams();
@@ -279,13 +290,19 @@ void SamplingConfig::setMinP(std::optional<FloatType> const& minP)
     mMinP = checkMinP(minP);
 }
 
+void SamplingConfig::setBeamWidthArray(OptVec<SizeType32> const& beamWidthArray)
+{
+    mBeamWidthArray = checkBeamWidthArray(beamWidthArray, std::nullopt);
+}
+
+// Checkers
 SizeType32 SamplingConfig::checkBeamWidth(SizeType32 beamWidth)
 {
-    TLLM_CHECK(beamWidth > 0);
+    TLLM_CHECK(beamWidth > 0 && beamWidth < static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
     return beamWidth;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkTopK(std::optional<FloatType> const& topK)
+OptFloat const& SamplingConfig::checkTopK(OptFloat const& topK)
 {
     if (topK.has_value())
     {
@@ -294,7 +311,7 @@ std::optional<FloatType> const& SamplingConfig::checkTopK(std::optional<FloatTyp
     return topK;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkTopP(std::optional<FloatType> const& topP)
+OptFloat const& SamplingConfig::checkTopP(OptFloat const& topP)
 {
     if (topP.has_value())
     {
@@ -304,7 +321,7 @@ std::optional<FloatType> const& SamplingConfig::checkTopP(std::optional<FloatTyp
     return topP;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkTopPMin(std::optional<FloatType> const& topPMin)
+OptFloat const& SamplingConfig::checkTopPMin(OptFloat const& topPMin)
 {
     if (topPMin.has_value())
     {
@@ -323,7 +340,7 @@ std::optional<TokenIdType> const& SamplingConfig::checkTopPResetIds(std::optiona
     return topPResetIds;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkTopPDecay(std::optional<FloatType> const& topPDecay)
+OptFloat const& SamplingConfig::checkTopPDecay(OptFloat const& topPDecay)
 {
     if (topPDecay.has_value())
     {
@@ -333,7 +350,7 @@ std::optional<FloatType> const& SamplingConfig::checkTopPDecay(std::optional<Flo
     return topPDecay;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkTemperature(std::optional<FloatType> const& temperature)
+OptFloat const& SamplingConfig::checkTemperature(OptFloat const& temperature)
 {
     if (temperature.has_value())
     {
@@ -342,7 +359,7 @@ std::optional<FloatType> const& SamplingConfig::checkTemperature(std::optional<F
     return temperature;
 }
 
-std::optional<SizeType32> const& SamplingConfig::checkMinTokens(std::optional<SizeType32> const& minTokens)
+OptSize32 const& SamplingConfig::checkMinTokens(OptSize32 const& minTokens)
 {
     if (minTokens.has_value())
     {
@@ -351,28 +368,7 @@ std::optional<SizeType32> const& SamplingConfig::checkMinTokens(std::optional<Si
     return minTokens;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkRepetitionPenalty(std::optional<FloatType> const& penalty)
-{
-    if (penalty.has_value())
-    {
-        TLLM_CHECK_WITH_INFO(penalty.value() > 0.F,
-            "Repetition penalty should be strictly greater than zero. Provided value was %f", penalty.value());
-    }
-    return penalty;
-}
-
-std::optional<SizeType32> const& SamplingConfig::checkNoRepeatNgramSize(
-    std::optional<SizeType32> const& noRepeatNgramSize)
-{
-    if (noRepeatNgramSize.has_value())
-    {
-        TLLM_CHECK(noRepeatNgramSize.value() > 0);
-    }
-    return noRepeatNgramSize;
-}
-
-std::optional<FloatType> const& SamplingConfig::checkBeamSearchDiversityRate(
-    std::optional<FloatType> const& beamSearchDiversityRate)
+OptFloat const& SamplingConfig::checkBeamSearchDiversityRate(OptFloat const& beamSearchDiversityRate)
 {
     if (beamSearchDiversityRate.has_value())
     {
@@ -381,8 +377,43 @@ std::optional<FloatType> const& SamplingConfig::checkBeamSearchDiversityRate(
     return beamSearchDiversityRate;
 }
 
-std::optional<SizeType32> const& SamplingConfig::checkNumReturnSequences(
-    std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth)
+OptFloat const& SamplingConfig::checkRepetitionPenalty(OptFloat const& repetitionpenalty)
+{
+    if (repetitionpenalty.has_value())
+    {
+        TLLM_CHECK(repetitionpenalty.value() > 0.f);
+    }
+    return repetitionpenalty;
+}
+
+OptFloat const& SamplingConfig::checkLengthPenalty(OptFloat const& lengthPenalty)
+{
+    if (lengthPenalty.has_value())
+    {
+        TLLM_CHECK(lengthPenalty.value() >= 0.f);
+    }
+    return lengthPenalty;
+}
+
+OptSize32 const& SamplingConfig::checkEarlyStopping(OptSize32 const& earlyStopping)
+{
+    if (earlyStopping.has_value())
+    {
+        TLLM_CHECK(earlyStopping.value() >= 0);
+    }
+    return earlyStopping;
+}
+
+OptSize32 const& SamplingConfig::checkNoRepeatNgramSize(OptSize32 const& noRepeatNgramSize)
+{
+    if (noRepeatNgramSize.has_value())
+    {
+        TLLM_CHECK(noRepeatNgramSize.value() >= 0);
+    }
+    return noRepeatNgramSize;
+}
+
+OptSize32 const& SamplingConfig::checkNumReturnSequences(OptSize32 const& numReturnSequences, SizeType32 beamWidth)
 {
     if (numReturnSequences.has_value())
     {
@@ -392,13 +423,35 @@ std::optional<SizeType32> const& SamplingConfig::checkNumReturnSequences(
     return numReturnSequences;
 }
 
-std::optional<FloatType> const& SamplingConfig::checkMinP(std::optional<FloatType> const& minP)
+OptFloat const& SamplingConfig::checkMinP(OptFloat const& minP)
 {
     if (minP.has_value())
     {
         TLLM_CHECK(minP.value() >= 0.f && minP.value() <= 1.0f);
     }
     return minP;
+}
+
+OptVec<SizeType32> const& SamplingConfig::checkBeamWidthArray(
+    OptVec<SizeType32> const& beamWidthArray, std::optional<SizeType32> const beamWidth)
+{
+    if (beamWidthArray.has_value())
+    {
+        auto const maxLength = static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength);
+        auto array = beamWidthArray.value();
+        TLLM_CHECK(array.size() >= 0 && array.size() <= maxLength);
+        SizeType32 maxBeamWidth = 0;
+        for (auto const& bm : array)
+        {
+            TLLM_CHECK(bm > 0 && bm <= maxLength);
+            maxBeamWidth = std::max(maxBeamWidth, bm);
+        }
+        if (beamWidth.has_value())
+        {
+            TLLM_CHECK(maxBeamWidth <= beamWidth.value());
+        }
+    }
+    return beamWidthArray;
 }
 
 void SamplingConfig::updateNumReturnBeams()

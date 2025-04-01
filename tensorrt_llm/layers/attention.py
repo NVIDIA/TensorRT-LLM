@@ -395,13 +395,13 @@ class Attention(Module):
         self.cross_attention = cross_attention
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
-        self.num_kv_heads = num_kv_heads
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else self.num_attention_heads
         self.hidden_size = hidden_size
         self.attention_hidden_size = self.attention_head_size * self.num_attention_heads
         self.max_position_embeddings = max_position_embeddings
@@ -1058,6 +1058,7 @@ class Attention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                num_kv_heads_origin=self.num_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -1866,6 +1867,7 @@ class CogVLMAttention(Attention):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
+                num_kv_heads_origin=self.num_kv_heads,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 position_embedding_type=self.position_embedding_type,
@@ -2216,6 +2218,7 @@ class DeepseekV2Attention(Attention):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=1,
+                num_kv_heads_origin=1,
                 hidden_size_per_head=self.kv_lora_rank + self.qk_rope_head_dim,
                 q_scaling=self.q_scaling,
                 position_embedding_type=self.position_embedding_type,

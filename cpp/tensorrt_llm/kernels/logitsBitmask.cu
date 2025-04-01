@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -49,57 +49,100 @@ __device__ __nv_bfloat16 negativeInfinity<__nv_bfloat16>()
 }
 
 template <typename T, typename PackedT>
+__device__ PackedT packedNegativeInfinity()
+{
+    int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    T packed[kAlignment];
+#pragma unroll
+    for (int i = 0; i < kAlignment; i++)
+    {
+        packed[i] = negativeInfinity<T>();
+    }
+    return *reinterpret_cast<PackedT*>(packed);
+}
+
+template <typename T, typename PackedT, int32_t kBitsPerThread>
 __global__ void __launch_bounds__(kThreadsPerBlock) logitsBitmaskKernel(
     T** __restrict__ logits, uint32_t const** __restrict__ bitmask, int32_t vocabSizePadded, int32_t bitmaskSize)
 {
     int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    uint32_t constexpr kPackedMask = (1 << kAlignment) - 1;
+
     int const batchIdx = blockIdx.y;
 
-    int const logitsGmemOffset = kThreadsPerBlock * blockIdx.x * kBitsPerMaskElement;
-    T* logitsGmemPtr = logits[batchIdx] + logitsGmemOffset;
-    __shared__ T logitsSmem[kThreadsPerBlock * kBitsPerMaskElement];
+    int const blockOffset = blockIdx.x * kThreadsPerBlock * kBitsPerThread;
+    T* logitsGmemPtr = logits[batchIdx] + blockOffset;
+
+    uint32_t const* bitmaskGmemPtr = bitmask[batchIdx] + blockOffset / kBitsPerMaskElement;
+    int const bitmaskInnerIdx = threadIdx.x % (kBitsPerMaskElement / kAlignment);
+    T logitsReg[kAlignment];
 
 #pragma unroll
-    for (int offset = 0; offset < kThreadsPerBlock * kBitsPerMaskElement; offset += kThreadsPerBlock * kAlignment)
+    for (int offset = threadIdx.x * kAlignment; offset < kThreadsPerBlock * kBitsPerThread;
+         offset += kThreadsPerBlock * kAlignment)
     {
-        int localOffset = offset + threadIdx.x * kAlignment;
-        if (logitsGmemOffset + localOffset >= vocabSizePadded)
+        if (blockOffset + offset >= vocabSizePadded)
         {
             break;
         }
-        *reinterpret_cast<PackedT*>(logitsSmem + localOffset)
-            = *reinterpret_cast<PackedT*>(logitsGmemPtr + localOffset);
-    }
-    __syncthreads();
 
-    int const bitmaskIdx = kThreadsPerBlock * blockIdx.x + threadIdx.x;
-    uint32_t const bitmaskVal = bitmask[batchIdx][bitmaskIdx];
+        uint32_t const bitmaskVal
+            = (~bitmaskGmemPtr[offset / kBitsPerMaskElement] >> (bitmaskInnerIdx * kAlignment)) & kPackedMask;
 
-#pragma unroll
-    for (int i = 0; i < kBitsPerMaskElement; ++i)
-    {
-        int offset = (i + threadIdx.x) % warpSize;
-        if (bitmaskIdx * kBitsPerMaskElement + offset >= vocabSizePadded)
+        if (bitmaskVal == 0)
         {
             continue;
         }
-        if (!((bitmaskVal >> offset) & 1))
-        {
-            logitsSmem[threadIdx.x * kBitsPerMaskElement + offset] = negativeInfinity<T>();
-        }
-    }
-    __syncthreads();
 
-#pragma unroll
-    for (int offset = 0; offset < kThreadsPerBlock * kBitsPerMaskElement; offset += kThreadsPerBlock * kAlignment)
-    {
-        int localOffset = offset + threadIdx.x * kAlignment;
-        if (logitsGmemOffset + localOffset >= vocabSizePadded)
+        if (bitmaskVal == kPackedMask)
         {
-            break;
+            *reinterpret_cast<PackedT*>(logitsGmemPtr + offset) = packedNegativeInfinity<T, PackedT>();
+            continue;
         }
-        *reinterpret_cast<PackedT*>(logitsGmemPtr + localOffset)
-            = *reinterpret_cast<PackedT*>(logitsSmem + localOffset);
+
+        *reinterpret_cast<PackedT*>(logitsReg) = *reinterpret_cast<PackedT*>(logitsGmemPtr + offset);
+#pragma unroll
+        for (int i = 0; i < kAlignment; i++)
+        {
+            if (((bitmaskVal >> i) & 1))
+            {
+                logitsReg[i] = negativeInfinity<T>();
+            }
+        }
+        *reinterpret_cast<PackedT*>(logitsGmemPtr + offset) = *reinterpret_cast<PackedT*>(logitsReg);
+    }
+}
+
+template <typename T, typename PackedT>
+void logitsBitmaskDispatchToBitsPerThread(
+    T** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream)
+{
+    int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    int32_t const numBlocksPerRow = ceilDiv(2048 / kThreadsPerBlock * 128, batchSize);
+    int32_t const numBitsPerThread = ceilDiv(vocabSizePadded, kThreadsPerBlock * numBlocksPerRow);
+    int32_t bitmaskSize = ceilDiv(vocabSizePadded, kBitsPerMaskElement);
+
+    dim3 const block(kThreadsPerBlock);
+
+    if (numBitsPerThread <= 4 && kAlignment <= 4)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 4), batchSize);
+        logitsBitmaskKernel<T, PackedT, 4><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else if (numBitsPerThread <= 8 && kAlignment <= 8)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 8), batchSize);
+        logitsBitmaskKernel<T, PackedT, 8><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else if (numBitsPerThread <= 16 && kAlignment <= 16)
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 16), batchSize);
+        logitsBitmaskKernel<T, PackedT, 16><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else
+    {
+        dim3 const grid(ceilDiv(vocabSizePadded, kThreadsPerBlock * 32), batchSize);
+        logitsBitmaskKernel<T, PackedT, 32><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
     }
 }
 } // namespace
@@ -108,25 +151,22 @@ template <typename T>
 void invokeLogitsBitmask(
     T** logits, uint32_t const** bitmask, int32_t batchSize, int32_t vocabSizePadded, cudaStream_t stream)
 {
-    int bitmaskSize = ceilDiv(vocabSizePadded, kBitsPerMaskElement);
-    dim3 grid(ceilDiv(bitmaskSize, kThreadsPerBlock), batchSize);
-    dim3 block(kThreadsPerBlock);
-
+    // Dispatch to PackedT
     if (vocabSizePadded % (sizeof(float4) / sizeof(T)) == 0)
     {
-        logitsBitmaskKernel<T, float4><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+        logitsBitmaskDispatchToBitsPerThread<T, float4>(logits, bitmask, batchSize, vocabSizePadded, stream);
     }
     else if (vocabSizePadded % (sizeof(float2) / sizeof(T)) == 0)
     {
-        logitsBitmaskKernel<T, float2><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+        logitsBitmaskDispatchToBitsPerThread<T, float2>(logits, bitmask, batchSize, vocabSizePadded, stream);
     }
     else if (vocabSizePadded % (sizeof(float) / sizeof(T)) == 0)
     {
-        logitsBitmaskKernel<T, float><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+        logitsBitmaskDispatchToBitsPerThread<T, float>(logits, bitmask, batchSize, vocabSizePadded, stream);
     }
     else
     {
-        logitsBitmaskKernel<T, T><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+        logitsBitmaskDispatchToBitsPerThread<T, T>(logits, bitmask, batchSize, vocabSizePadded, stream);
     }
 }
 

@@ -101,6 +101,7 @@ void compareIterationStats(texec::IterationStats const& lh, texec::IterationStat
 void compareDisServingRequestStats(texec::DisServingRequestStats const& lh, texec::DisServingRequestStats const& rh)
 {
     EXPECT_EQ(lh.kvCacheTransferMS, rh.kvCacheTransferMS);
+    EXPECT_EQ(lh.kvCacheSize, rh.kvCacheSize);
 }
 
 void compareRequestStats(texec::RequestStats const& lh, texec::RequestStats const& rh)
@@ -799,7 +800,7 @@ TEST(SerializeUtilsTest, ExecutorConfig)
 
 TEST(SerializeUtilsTest, RequestStats)
 {
-    tensorrt_llm::executor::DisServingRequestStats disServingRequestStats{0.56222};
+    tensorrt_llm::executor::DisServingRequestStats disServingRequestStats{0.56222, 78643200};
     texec::RequestStats requestStats{123, tensorrt_llm::executor::RequestStage::kQUEUED, 56, 25, 135, true, false,
         disServingRequestStats, 33, 22, 6, 1, 8};
     auto requestStats2 = serializeDeserialize(requestStats);
@@ -812,7 +813,7 @@ TEST(SerializeUtilsTest, RequestStats)
 TEST(SerializeUtilsTest, RequestStatsPerIteration)
 {
 
-    tensorrt_llm::executor::DisServingRequestStats disServingRequestStats{0.56222};
+    tensorrt_llm::executor::DisServingRequestStats disServingRequestStats{0.56222, 78643200};
     texec::RequestStats requestStats1{123, tensorrt_llm::executor::RequestStage::kQUEUED, 56, 25, 135, true, false,
         disServingRequestStats, 33, 22, 6, 1, 8};
     texec::RequestStats requestStats2{

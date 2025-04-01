@@ -1,6 +1,4 @@
 """Test the metrics endpoint when using OpenAI API to send requests"""
-import os
-import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,8 +9,7 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import llama_model_path
+from ..test_llm import llama_model_path
 
 
 @pytest.fixture(scope="module")

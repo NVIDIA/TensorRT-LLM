@@ -134,7 +134,8 @@ class OPTModel(Module):
                 attention_params=None,
                 prompt_embedding_table=None,
                 prompt_tasks=None,
-                prompt_vocab_size=None):
+                prompt_vocab_size=None,
+                **kwargs):
 
         args = [prompt_embedding_table, prompt_tasks, prompt_vocab_size
                 ] if prompt_embedding_table is not None else []

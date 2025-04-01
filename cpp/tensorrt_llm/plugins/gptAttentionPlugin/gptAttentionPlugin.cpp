@@ -46,8 +46,8 @@ static char const* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
 GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
-    int num_kv_heads, int head_size, int unidirectional, float q_scaling, float attn_logit_softcapping_scale,
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    int num_kv_heads, int num_kv_heads_origin, int head_size, int unidirectional, float q_scaling,
+    float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale,
@@ -65,17 +65,17 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     int spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
     int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool fuse_fp4_quant, bool skip_attn, int cp_size,
     int cp_rank, std::set<int32_t> cp_group)
-    : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, head_size,
-        unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions, rotary_embedding_original_max_positions, tp_size,
-        tp_rank, unfuse_qkv_gemm, use_logn_scaling, context_fmha_type, kv_cache_quant_mode, remove_input_padding,
-        mask_type, block_sparse_params, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
-        cross_attention, max_distance, pos_shift_enabled, dense_context_fmha, use_paged_context_fmha,
-        use_fp8_context_fmha, has_full_attention_mask, use_cache, is_spec_decoding_enabled,
-        spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
-        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, fuse_fp4_quant, skip_attn, cp_size, cp_rank,
-        cp_group)
+    : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, num_kv_heads_origin,
+        head_size, unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale, rotary_embedding_max_positions,
+        rotary_embedding_original_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, use_logn_scaling, context_fmha_type,
+        kv_cache_quant_mode, remove_input_padding, mask_type, block_sparse_params, paged_kv_cache, tokens_per_block,
+        type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
+        dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, has_full_attention_mask, use_cache,
+        is_spec_decoding_enabled, spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length,
+        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, fuse_fp4_quant,
+        skip_attn, cp_size, cp_rank, cp_group)
 {
     TLLM_CHECK_WITH_INFO(
         !is_mla_enabled, "GPTAttentionPlugin no longer supports MLA. Please use the PyTorch workflow instead.");
@@ -890,7 +890,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
 
-        auto const blockSize = mTokensPerBlock * mNumKVHeads / mCpSize * mHeadSize;
+        auto const kv_cache_head_num = (mNumKVHeads + mCpSize - 1) / mCpSize;
+        auto const blockSize = mTokensPerBlock * kv_cache_head_num * mHeadSize;
         auto const bytesPerBlock = blockSize * cacheElemSize;
         auto const layerOffset = layerIdxInCachePool * 2 * bytesPerBlock;
 
@@ -1311,8 +1312,9 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
         auto* obj = new GPTAttentionPlugin(p.getScalar<int32_t>("layer_idx").value(),
             p.getScalar<int32_t>("num_heads").value(), p.getScalar<int32_t>("vision_start").value(),
             p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
-            p.getScalar<int32_t>("head_size").value(), p.getScalar<int32_t>("unidirectional").value(),
-            p.getScalar<float>("q_scaling").value(), p.getScalar<float>("attn_logit_softcapping_scale").value(),
+            p.getScalar<int32_t>("num_kv_heads_origin").value(), p.getScalar<int32_t>("head_size").value(),
+            p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
+            p.getScalar<float>("attn_logit_softcapping_scale").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),

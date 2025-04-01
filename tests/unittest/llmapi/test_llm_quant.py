@@ -4,7 +4,7 @@ from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
 # isort: off
-from test_llm import cnn_dailymail_path, llama_model_path, get_model_path
+from .test_llm import cnn_dailymail_path, llama_model_path, get_model_path
 from utils.util import skip_blackwell, skip_pre_blackwell, skip_pre_hopper
 # isort: on
 

@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 
 import torch
 
-from tensorrt_llm import BuildConfig, SamplingParams
+from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -70,14 +70,13 @@ def generate_llm_outputs(args,
         "block_size": args.sa_block_size
     }
 
-    build_config = BuildConfig(max_batch_size=args.max_batch_size,
-                               max_input_len=args.max_input_len,
-                               max_seq_len=args.max_seq_len,
-                               max_num_tokens=args.max_num_tokens)
     pytorch_backend_config = PyTorchConfig(
         attn_backend='FLASHINFER_STAR_ATTENTION')
     llm = LLM(model=args.model_path,
-              build_config=build_config,
+              max_batch_size=args.max_batch_size,
+              max_input_len=args.max_input_len,
+              max_seq_len=args.max_seq_len,
+              max_num_tokens=args.max_num_tokens,
               quant_config=quant_config,
               tensor_parallel_size=1,
               context_parallel_size=args.num_procs,

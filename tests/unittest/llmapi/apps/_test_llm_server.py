@@ -1,20 +1,13 @@
 import concurrent.futures
-import os
-import sys
 import time
 
 import pytest
+from apps.fastapi_server import LLM, BuildConfig, KvCacheConfig, LlmServer
 from fastapi.testclient import TestClient
 
 import tensorrt_llm.profiler as profiler
 
-sys.path.append(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "examples",
-                 "apps"))
-from fastapi_server import LLM, BuildConfig, KvCacheConfig, LlmServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import llama_model_path
+from ..test_llm import llama_model_path
 
 
 @pytest.fixture(scope="module")

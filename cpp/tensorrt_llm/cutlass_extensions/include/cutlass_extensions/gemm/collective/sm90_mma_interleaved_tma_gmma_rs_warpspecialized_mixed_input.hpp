@@ -211,6 +211,9 @@ public:
 
     using PipelineParams = typename MainloopPipeline::Params;
 
+    // One threads per CTA are producers (1 for operand tile)
+    static constexpr int NumProducerThreadEvents = 1;
+
     using SmemLayoutAtomScale = Layout<Shape<decltype(cute::shape<0>(InternalSmemLayoutAtomA{})), cute::Int<1>>>;
     using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
     static constexpr int type_factor = sizeof_bits<ElementB>::value / sizeof_bits<ElementA>::value;

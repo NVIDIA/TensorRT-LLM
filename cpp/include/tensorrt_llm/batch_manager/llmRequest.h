@@ -1668,6 +1668,21 @@ public:
                 .count());
     }
 
+    void updateKvCacheSize(size_t targetBufferSize) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheSize += targetBufferSize;
+    }
+
+    void setKvCacheSize(size_t targetBufferSize) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheSize = targetBufferSize;
+    }
+
+    [[nodiscard]] size_t getKvCacheSize() const
+    {
+        return mPerfMetrics.timingMetrics.kvCacheSize;
+    }
+
     void updateAllocTotalBlocksPerRequest(SizeType32 allocTotalBlocksPerRequest)
     {
         mPerfMetrics.kvCacheMetrics.numTotalAllocatedBlocks += allocTotalBlocksPerRequest;

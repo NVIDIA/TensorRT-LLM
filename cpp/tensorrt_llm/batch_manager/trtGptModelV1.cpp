@@ -120,6 +120,7 @@ void addToSamplingConfig(SamplingConfig& batchSamplingConfig, SamplingConfig con
     TLLM_CHECK(batchSamplingConfig.beamSearchDiversityRate == addSamplingConfig.beamSearchDiversityRate);
     TLLM_CHECK(batchSamplingConfig.lengthPenalty == addSamplingConfig.lengthPenalty);
     TLLM_CHECK(batchSamplingConfig.earlyStopping == addSamplingConfig.earlyStopping);
+    TLLM_CHECK(batchSamplingConfig.beamWidthArray == addSamplingConfig.beamWidthArray);
 
     auto addOptional = [](auto& batch, auto const& add, char const* name)
     {

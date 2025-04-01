@@ -15,9 +15,8 @@
  */
 
 #pragma once
+
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/converter.h"
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/details.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/utility.h"
 
 namespace tensorrt_llm

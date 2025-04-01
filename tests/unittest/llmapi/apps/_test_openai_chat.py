@@ -1,7 +1,6 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
 import os
-import sys
 import tempfile
 from typing import List
 
@@ -9,10 +8,9 @@ import numpy as np
 import openai
 import pytest
 import yaml
-from openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])

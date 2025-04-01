@@ -14,8 +14,8 @@ context_servers:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
   pytorch_backend_config:
-    use_cuda_graph: True
-    enable_overlap_scheduler: false
+    use_cuda_graph: False
+    enable_overlap_scheduler: False
   urls:
       - "localhost:8001"
 generation_servers:
@@ -29,7 +29,7 @@ generation_servers:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
   pytorch_backend_config:
-    use_cuda_graph: True
-    enable_overlap_scheduler: true
+    use_cuda_graph: False
+    enable_overlap_scheduler: True
   urls:
       - "localhost:8002"

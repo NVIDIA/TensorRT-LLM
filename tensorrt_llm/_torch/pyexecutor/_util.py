@@ -41,6 +41,7 @@ def check_flash_mla_config(config):
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping):
+    # TODO: take space occupied by draft KV cache manager into account.
     mem_per_token = 2
     quant_config = model_config.quant_config
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
@@ -66,7 +67,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
 
-    mem_per_token *= config.num_hidden_layers * head_dim
+    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
 

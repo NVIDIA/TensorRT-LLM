@@ -24,10 +24,11 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-static constexpr size_t nMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
-static constexpr size_t nMaxBeamWidthForV1 = 8;         // Max beam width for V1 kernels
-static constexpr size_t nThreadForSmallBeamWidth = 256; // Max count of thread for V1 stage 1
-static constexpr size_t nMaxVPartStage1 = 128;          // Max vocab part count for V1 stage 1
+static size_t constexpr kMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
+static size_t constexpr kMaxBeamWidthForV1 = 8;         // Max beam width for V1 workflow (V2 for larger)
+static size_t constexpr kMaxBeamWidthArrayLength = 8;   // Max length of beam width array of a request
+static size_t constexpr kThreadForSmallBeamWidth = 256; // Max count of thread for stage 1 in V1 workflow
+static size_t constexpr kMaxVPartStage1 = 128;          // Max vocab part count for stage 1 in V1 workflow
 
 struct BeamHypotheses
 {

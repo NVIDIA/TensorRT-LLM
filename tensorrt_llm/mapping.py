@@ -123,6 +123,8 @@ class Mapping(object):
             pp_size=1,
             moe_tp_size=-1,  # -1 means no moe
             moe_ep_size=-1,  # -1 means no moe
+            attn_tp_size=-1,
+            attn_cp_size=-1,
             auto_parallel=False,
             enable_attention_dp=False):
         # set default values for non-moe cases
@@ -136,6 +138,22 @@ class Mapping(object):
 
         elif moe_ep_size == -1:
             moe_ep_size = tp_size // moe_tp_size
+
+        if attn_tp_size == -1 and attn_cp_size == -1:
+            # fallback to ulysses
+            attn_tp_size = tp_size * cp_size
+            attn_cp_size = 1
+
+        elif attn_tp_size == -1:
+            attn_tp_size = cp_size * tp_size // attn_cp_size
+
+        elif attn_cp_size == -1:
+            attn_cp_size = cp_size * tp_size // attn_tp_size
+
+        if attn_cp_size != 1:
+            raise ValueError(
+                f"attn_cp_size must be 1 for now, but got {attn_tp_size}, {attn_cp_size}."
+            )
 
         if auto_parallel:
             if tp_size != 1 or pp_size != 1 or tp_size != 1:
@@ -154,6 +172,12 @@ class Mapping(object):
                 f"tp_size must equal to moe_tp_size * moe_ep_size, but got {tp_size} != {moe_tp_size} * {moe_ep_size}"
             )
 
+        attn_tp_cp_size = attn_tp_size * attn_cp_size
+        if attn_tp_cp_size != tp_size * cp_size:
+            raise ValueError(
+                f"tp_size * cp_size must equal to attn_tp_size * attn_cp_size, but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
+            )
+
         if moe_ep_size != 1 and cp_size > 1:
             raise NotImplementedError("CP don't support MoE tp/ep yet")
 
@@ -163,6 +187,8 @@ class Mapping(object):
         self.pp_size = pp_size
         self.moe_tp_size = moe_tp_size
         self.moe_ep_size = moe_ep_size
+        self.attn_tp_size = attn_tp_size
+        self.attn_cp_size = attn_cp_size
         self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.rank = rank
@@ -218,6 +244,8 @@ class Mapping(object):
                 and self.pp_size == other.pp_size
                 and self.moe_tp_size == other.moe_tp_size
                 and self.moe_ep_size == other.moe_ep_size
+                and self.attn_tp_size == other.attn_tp_size
+                and self.attn_cp_size == other.attn_cp_size
                 and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
@@ -225,6 +253,7 @@ class Mapping(object):
                 ^ hash(self.gpus_per_node) ^ hash(self.cp_size)
                 ^ hash(self.tp_size) ^ hash(self.pp_size)
                 ^ hash(self.moe_tp_size) ^ hash(self.moe_ep_size)
+                ^ hash(self.attn_tp_size) ^ hash(self.attn_cp_size)
                 ^ hash(self.auto_parallel))
 
     @property
@@ -375,5 +404,7 @@ class Mapping(object):
             'pp_size': self.pp_size,
             'moe_tp_size': self.moe_tp_size,
             'moe_ep_size': self.moe_ep_size,
+            'attn_tp_size': self.attn_tp_size,
+            'attn_cp_size': self.attn_cp_size,
             'auto_parallel': self.auto_parallel,
         }

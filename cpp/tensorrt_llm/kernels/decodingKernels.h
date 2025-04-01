@@ -16,9 +16,7 @@
 
 #pragma once
 
-#include "gptKernels.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -129,11 +127,11 @@ namespace runtime::kernels
 //! \param decodingOutput contains a slice of the output buffers to gather. Also contains the
 //! DecodingOutput::BeamHypotheses object with the finished beams.
 //! \param decodingInput used for endIds and input lengths.
-//! \param manager the usual buffer manager.
 //! \param samplingConfig the usual buffer samplingConfig.
+//! \param cudaStream the CUDA stream on which to perform the operation.
 
-void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput, BufferManager const& manager,
-    SamplingConfig const& samplingConfig);
+void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
 } // namespace runtime::kernels
 
 } // namespace tensorrt_llm

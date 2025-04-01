@@ -30,18 +30,15 @@ class StatefulGptDecoderBatched : public IStatefulGptDecoder
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = ITensor::SharedPtr;
-    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
-    StatefulGptDecoderBatched(
-        CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
+    StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype);
 
     ~StatefulGptDecoderBatched() override;
 
     // IStatefulGptDecoder implementation
     void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig) override;
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
 
     void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig,
         ModelConfig const& modelConfig) override;
@@ -61,7 +58,7 @@ private:
     std::unique_ptr<GptDecoderBatched> mDecoder;
 
     // only used for IStatefulGptDecoder
-    DecoderFinishedEventPtr mDecoderFinishEvent;
+    CudaEvent mDecoderFinishEvent;
     CudaEvent mForwardEvent;
     TensorPtr mFinishedSum;
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned

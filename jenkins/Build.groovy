@@ -16,7 +16,7 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
-AGENT_IMAGE = "urm-rn.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
+AGENT_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 
@@ -217,7 +217,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                         fieldRef:
                           fieldPath: spec.nodeName
                   - name: jnlp
-                    image: urm-rn.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
@@ -707,7 +707,7 @@ pipeline {
         //Workspace normally is: /home/jenkins/agent/workspace/LLM/L0_MergeRequest@tmp/
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
-        PIP_INDEX_URL="https://urm-rn.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
     }

@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 
@@ -14,8 +12,6 @@ from tensorrt_llm._torch.models.modeling_mamba_hybrid import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 MAMBA_HYBRID_CONFIG = {
     "architectures": ["MambaHybridForCausalLM"],

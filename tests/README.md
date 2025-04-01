@@ -145,7 +145,7 @@ The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_ge
 In `integration/test_lists/test-db`, cases with prefix `unittest/` are treated as unit test bridges. Each of them generates an instance of `test_unittests_v2` which executes a `pytest` subprocess in `tests/unittest` directory.
 The entire line will be passed as commandline arguments of `pytest` subprocess.
 
-For example, `unittest/attention/test_gpt_attention.py -k "partition0"` is equivalent to `cd tests; pytest unittest/attention/test_gpt_attention.py -k "partition0"`.
+For example, `unittest/trt/attention/test_gpt_attention.py -k "partition0"` is equivalent to `cd tests; pytest unittest/trt/attention/test_gpt_attention.py -k "partition0"`.
 
 New unit tests can be added to CI as follows:
 

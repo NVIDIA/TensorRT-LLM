@@ -45,6 +45,26 @@ class CachedSequenceInterface:
             name: get_cache(self.info) for name, get_cache in self._cache_initializers.items()
         }
 
+    def current_cache_size_bytes(self) -> int:
+        """Calculate and return the total size of all caches in bytes."""
+        total_size = 0
+        for name, cache in self._caches.items():
+            # this hack is needed since _caches also contains global buffers such as freqs_cis.
+            if "cache" in name:
+                total_size += cache.element_size() * cache.numel()
+        return total_size
+
+    def resize_cache(self, new_num_pages: int):
+        """Resize the cache to the new number of pages."""
+        # TODO: We should do some sanity check on the new number of pages.
+        self.info.num_pages = new_num_pages
+        for name, cache in self._caches.items():
+            # We assume cache is a tensor of shape (max_batch_size, page_size, n_heads, head_dim)
+            if "cache" in name:
+                current_shape = cache.shape
+                new_shape = (new_num_pages, *current_shape[1:])
+                cache.resize_(new_shape)
+
 
 GetInferenceModel = Callable[[CachedSequenceInterface], nn.Module]
 

@@ -428,7 +428,9 @@ mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt
 The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
 
 First make sure Modelopt toolkit `nvidia-modelopt>=0.22.1` is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation)).
-> **Note:** Modelopt 0.22.1 is not yet released.
+
+> [!NOTE]
+> Modelopt 0.22.1 is not yet released.
 
 #### Get quantized checkpoint with ModelOpt
 Currently supported conversion are `bart-large-cnn` and `T5` family. For `bart`, please set `--dtype float16`; for `T5` family, please set `--dtype float32` due to known bug with apex+HF mentioned in [transformer:issue/34264](https://github.com/huggingface/transformers/issues/34264).

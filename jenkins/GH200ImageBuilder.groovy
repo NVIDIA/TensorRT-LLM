@@ -134,7 +134,7 @@ pipeline {
         timeout(time: 24, unit: 'HOURS')
     }
     environment {
-        PIP_INDEX_URL="https://urm-rn.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
     }
     stages {
         stage("Build")

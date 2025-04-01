@@ -1,15 +1,12 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_completion.py
-import os
-import sys
 from typing import List
 
 import openai
 import pytest
-from openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path
+from ..test_llm import get_model_path
+from .openai_server import RemoteOpenAIServer
 
 
 @pytest.fixture(scope="module")

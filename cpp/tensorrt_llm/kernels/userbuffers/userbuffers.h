@@ -125,9 +125,9 @@ int allgather2_userbuff_residual_impl(int const handler, size_t const offset, si
     int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable);
 
-int allreduce2_userbuff_inplace_rmsnorm_impl(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* beta, void* gamma, float eps, void* residual_in, void* residual_out,
-    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
+int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int const out_handler,
+    size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,

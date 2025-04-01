@@ -905,6 +905,8 @@ def quantize_and_export(*,
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+                tensorrt_llm_config["mapping"]["attn_tp_size"] = -1
+                tensorrt_llm_config["mapping"]["attn_cp_size"] = -1
                 tensorrt_llm_config["mapping"]["world_size"] *= cp_size
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)

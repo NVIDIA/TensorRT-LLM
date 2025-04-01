@@ -1,15 +1,8 @@
-import os
-import sys
-
 import pytest
+from apps.chat import (LLM, AutoTokenizer, BuildConfig, LlmConsole,
+                       SamplingParams)
 
-sys.path.append(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "examples",
-                 "apps"))
-from chat import LLM, AutoTokenizer, BuildConfig, LlmConsole, SamplingParams
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import llama_model_path
+from ..test_llm import llama_model_path
 
 
 @pytest.fixture

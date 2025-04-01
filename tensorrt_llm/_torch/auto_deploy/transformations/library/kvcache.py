@@ -171,3 +171,43 @@ def insert_mha_with_kv_cache(
     egm = canonicalize_graph(egm, shape_prop=False)
     ad_logger.debug("After inserting MHA with KV cache: " + str(egm))
     return egm
+
+
+def resize_kv_cache(
+    egm: GraphModule, cm: CachedSequenceInterface, free_mem_ratio: float = 0.8
+) -> None:
+    """Inflate the kv cache to occupy the available GPU memory.
+
+    free_mem_ratio specifies the fraction of available memory to occupy.
+    """
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
+    current_cache_size = cm.current_cache_size_bytes()
+    current_num_pages = cm.info.num_pages
+    ad_logger.info(
+        f"Current cache size: {current_cache_size}, Current num pages: {current_num_pages}"
+    )
+
+    try:
+        # Let's run a forward pass to get the memory usage
+        cm.info._set_max_num_tokens_sample()
+        free_mem_pre, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
+        egm(*cm.args)
+        free_mem_post, _ = torch.cuda.mem_get_info()
+        ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
+
+        memory_for_forward_pass = free_mem_pre - free_mem_post
+        ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
+
+        new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
+        new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
+        ad_logger.info(f"New cache size: {new_cache_size}, New num pages: {new_num_pages}")
+        cm.resize_cache(new_num_pages)
+    except Exception as e:
+        ad_logger.warning(
+            f"Error encountered while resizing kv cache: {e}.\nSkipping cache resize."
+        )
+
+    # Free memory
+    torch.cuda.empty_cache()

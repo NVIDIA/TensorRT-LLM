@@ -12,6 +12,7 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -107,6 +108,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Path where report should be written to.",
 )
+@optgroup.option(
+    "--iteration_log",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where iteration logging is written to.",
+)
 @click.pass_obj
 def latency_command(
     bench_env: BenchmarkEnvironment,
@@ -136,6 +147,8 @@ def latency_command(
 
     # Reporting Options
     report_json: Path = params.pop("report_json")
+    iteration_log: Path = params.pop("iteration_log")
+    iteration_writer = IterationWriter(iteration_log)
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -190,11 +203,13 @@ def latency_command(
     logger.info("Running experimental latency benchmark.")
 
     llm = None
+    kwargs = runtime_config.get_llm_args()
+
     try:
         sampling_params = SamplingParams(end_id=eos_id,
                                          pad_id=pad_id,
                                          beam_width=1)
-        llm = LLM(**runtime_config.get_llm_args())
+        llm = LLM(**kwargs)
 
         # Perform warmup if requested.
         if warmup > 0:
@@ -204,18 +219,28 @@ def latency_command(
             asyncio.run(
                 async_benchmark(llm, sampling_params, warmup_dataset, False,
                                 concurrency))
+            # WAR: IterationResult is a singleton tied to the executor.
+            # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
+            # we must reset it to ensure it attaches to the correct event loop.
+            llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
-        statistics = asyncio.run(
-            async_benchmark(llm, sampling_params, requests, True, concurrency))
+        with iteration_writer.capture():
+            statistics = asyncio.run(
+                async_benchmark(llm, sampling_params, requests, True,
+                                concurrency, iteration_writer.full_address))
+
+        logger.info(f"Benchmark done. Reporting results...")
         report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, params, True)
+                                       logger, kwargs, True)
         if report_json:
             logger.info(f"Writing report to '{report_json}'.")
             with open(report_json, "w") as f:
                 f.write(
                     json.dumps(report_utility.get_statistics_dict(), indent=4))
         report_utility.report_statistics()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt, exiting benchmark...")
     finally:
         if llm is not None:
-            llm.__exit__(None, None, None)
+            llm.shutdown()

@@ -1,15 +1,10 @@
-import os
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import reference_moe_torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.modules.fused_moe import FusedMoE  # noqa: F401
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
-from helpers import reference_moe_torch
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

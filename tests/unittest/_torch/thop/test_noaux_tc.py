@@ -1,12 +1,7 @@
-import os
-import sys
-
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3Gate
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.parametrize("seq_len", [1, 32, 8192])

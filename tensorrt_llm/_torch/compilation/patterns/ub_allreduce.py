@@ -132,7 +132,7 @@ def register_ub_allreduce_finalize(custom_pass: PatternMatcherPass):
     )
     trtllm_userbuffers_allreduce_finalize_default = CallFunction(
         torch.ops.trtllm.userbuffers_allreduce_finalize.default,
-        KeywordArg("sharded_residual"), Ignored())
+        KeywordArg("sharded_residual"), False)
     trtllm_ub_scaled_mm_allreduce_quant_scaled_mm_op_default = CallFunction(
         torch.ops.trtllm.ub_scaled_mm_allreduce_quant_scaled_mm_op.default,
         KeywordArg("mm0_a"),

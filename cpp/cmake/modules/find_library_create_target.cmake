@@ -30,6 +30,9 @@ macro(find_library_create_target target_name lib libtype hints)
   find_library(${lib}_LIB_PATH ${lib} HINTS ${hints} NO_DEFAULT_PATH)
   find_library(${lib}_LIB_PATH ${lib})
   message(STATUS "Library that was found ${${lib}_LIB_PATH}")
+  if(${${lib}_LIB_PATH} STREQUAL "${lib}_LIB_PATH-NOTFOUND")
+    message(FATAL_ERROR "${lib} not found. (hints: ${hints})")
+  endif()
   add_library(${target_name} ${libtype} IMPORTED)
   set_target_properties(
     ${target_name} PROPERTIES IMPORTED_LOCATION ${${lib}_LIB_PATH}

@@ -8,13 +8,12 @@ context_servers:
   max_batch_size: 1
   max_num_tokens: 3000
   max_seq_len: 4096
-  enable_attention_dp: true
-  mtp_nextn: 1
+  enable_attention_dp: True
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   pytorch_backend_config:
-    use_cuda_graph: True
-    enable_overlap_scheduler: false
+    use_cuda_graph: False
+    enable_overlap_scheduler: False
   urls:
       - "localhost:8001"
 generation_servers:
@@ -23,11 +22,10 @@ generation_servers:
   pipeline_parallel_size: 1
   max_batch_size: 256
   max_num_tokens: 4096
-  enable_attention_dp: true
-  mtp_nextn: 1
+  enable_attention_dp: True
   max_seq_len: 4096
   pytorch_backend_config:
-    use_cuda_graph: True
-    enable_overlap_scheduler: true
+    use_cuda_graph: False
+    enable_overlap_scheduler: True
   urls:
       - "localhost:8002"

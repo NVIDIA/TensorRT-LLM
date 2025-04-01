@@ -348,11 +348,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         return py::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
             config.presencePenalty, config.frequencyPenalty, config.topK, config.topP, config.randomSeed,
             config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate, config.lengthPenalty,
-            config.earlyStopping, config.noRepeatNgramSize, config.minP);
+            config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences, config.minP,
+            config.beamWidthArray);
     };
     auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
     {
-        assert(t.size() == 17);
+        assert(t.size() == 19);
 
         tr::SamplingConfig config;
         config.beamWidth = t[0].cast<SizeType32>();
@@ -371,7 +372,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         config.lengthPenalty = t[13].cast<OptVec<float>>();
         config.earlyStopping = t[14].cast<OptVec<SizeType32>>();
         config.noRepeatNgramSize = t[15].cast<OptVec<SizeType32>>();
-        config.minP = t[16].cast<OptVec<float>>();
+        config.numReturnSequences = t[16].cast<SizeType32>();
+        config.minP = t[17].cast<OptVec<float>>();
+        config.beamWidthArray = t[18].cast<OptVec<std::vector<SizeType32>>>();
 
         return config;
     };
@@ -396,7 +399,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty)
         .def_readwrite("early_stopping", &tr::SamplingConfig::earlyStopping)
         .def_readwrite("no_repeat_ngram_size", &tr::SamplingConfig::noRepeatNgramSize)
+        .def_readwrite("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
         .def_readwrite("min_p", &tr::SamplingConfig::minP)
+        .def_readwrite("beam_width_array", &tr::SamplingConfig::beamWidthArray)
         .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
         .def("__eq__", &tr::SamplingConfig::operator==);
 

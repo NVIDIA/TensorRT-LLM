@@ -9,6 +9,7 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -41,7 +42,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(["pytorch"]),
+                 type=click.Choice(["pytorch", "autodeploy"]),
                  default=None,
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -164,7 +165,17 @@ from tensorrt_llm.sampling_params import SamplingParams
                     path_type=Path,
                     resolve_path=True),
     required=False,
-    help="Path where report should be written to.",
+    help="Path where report is written to.",
+)
+@optgroup.option(
+    "--iteration_log",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where iteration logging is written to.",
 )
 @click.pass_obj
 def throughput_command(
@@ -183,11 +194,13 @@ def throughput_command(
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
-    # TODO: Re-add iteration log. Disabled due to instability in LLM API.
-    #iteration_log: Path = params.pop("iteration_log")
-    report_json: Path = params.pop("report_json")
     concurrency: int = params.pop("concurrency")
     backend: str = params.get("backend")
+
+    # Reporting options
+    report_json: Path = params.pop("report_json")
+    iteration_log: Path = params.pop("iteration_log")
+    iteration_writer = IterationWriter(iteration_log)
 
     # Runtime kwargs and option tracking.
     kwargs = {}
@@ -209,7 +222,7 @@ def throughput_command(
     logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() == "pytorch":
+    if backend and backend.lower() in ["pytorch", "autodeploy"]:
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
@@ -255,6 +268,7 @@ def throughput_command(
 
     # LlmArgs
     exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
+    exec_settings["iteration_log"] = iteration_log
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
@@ -262,6 +276,11 @@ def throughput_command(
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
+        kwargs['backend'] = backend
+
+        if "pytorch_backend_config" in kwargs and iteration_log is not None:
+            kwargs["pytorch_backend_config"].enable_iter_perf_stats = True
+
         if runtime_config.backend == 'pytorch':
             llm = PyTorchLLM(**kwargs)
         else:
@@ -279,12 +298,18 @@ def throughput_command(
             asyncio.run(
                 async_benchmark(llm, sampling_params, warmup_dataset, False,
                                 concurrency))
+            # WAR: IterationResult is a singleton tied to the executor.
+            # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
+            # we must reset it to ensure it attaches to the correct event loop.
+            llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
-        statistics = asyncio.run(
-            async_benchmark(llm, sampling_params, requests, streaming,
-                            concurrency))
+        with iteration_writer.capture():
+            statistics = asyncio.run(
+                async_benchmark(llm, sampling_params, requests, streaming,
+                                concurrency, iteration_writer.full_address))
 
+        logger.info(f"Benchmark done. Reporting results...")
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, kwargs, streaming)
         if report_json:
@@ -293,6 +318,8 @@ def throughput_command(
                 f.write(
                     json.dumps(report_utility.get_statistics_dict(), indent=4))
         report_utility.report_statistics()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt, exiting benchmark...")
     finally:
         if llm is not None:
-            llm.__exit__(None, None, None)
+            llm.shutdown()

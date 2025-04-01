@@ -264,7 +264,7 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
-void updateKVCacheTransferTime(mpi::MpiComm const& mpiComm, LlmRequest* request)
+void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
 {
     namespace su = executor::serialize_utils;
     int worldSize = mpiComm.getSize();
@@ -293,11 +293,24 @@ void updateKVCacheTransferTime(mpi::MpiComm const& mpiComm, LlmRequest* request)
         maxEndTime = std::max(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), maxEndTime);
     }
 
+    // Handle KV cache size separately - gather all sizes to the leader rank
+    std::size_t localKVCacheSize = request->getKvCacheSize();
+    std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
+
+    mpiComm.allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
+
+    std::size_t totalKVCacheSize = 0;
+    for (int rank = 0; rank < worldSize; rank++)
+    {
+        totalKVCacheSize += allKVCacheSizes[rank];
+    }
+
     // Update the latest KV cache transfer time for leader rank
     if (mpiComm.getRank() == 0)
     {
         request->setKvCacheTransferStart(minStartTime);
         request->setKvCacheTransferEnd(maxEndTime);
+        request->setKvCacheSize(totalKVCacheSize);
     }
 }
 
@@ -447,7 +460,7 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
             // Gather the kv cache transfer time from all workers and update to leader rank
             if (!common::getEnvKVCacheTransferOutputPath().empty())
             {
-                updateKVCacheTransferTime(*mMpiGroupComm, it->first);
+                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
             }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",

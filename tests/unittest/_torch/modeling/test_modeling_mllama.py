@@ -1,10 +1,9 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 
 import torch
 from parameterized import parameterized
+from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
 from transformers import \
     MllamaForConditionalGeneration as HFMllamaForConditionalGeneration
@@ -20,11 +19,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.dirname(__file__))
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
-
-from test_modeling_llama import Scenario, reduce_llama_config
 
 LLAMA_3_2_11B_VISION_CONFIG = {
     'architectures': ['MllamaForConditionalGeneration'],

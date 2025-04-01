@@ -4117,10 +4117,16 @@ TEST_P(TimeoutTest, TimeoutStreamingTest)
     }
     else
     {
+        if (val != NULL && !isMultiGpu)
+        {
+            GTEST_SKIP() << "Skipping SingleGpu tests";
+        }
+
         if (!isMultiGpu && !useOrchestratorMode)
         {
             GTEST_SKIP() << "Leader mode on single GPU crashes";
         }
+
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
@@ -4324,10 +4330,16 @@ TEST_P(TimeoutTest, TimeoutNonstreamingTest)
     }
     else
     {
+        if (val != NULL && !isMultiGpu)
+        {
+            GTEST_SKIP() << "Skipping SingleGpu tests";
+        }
+
         if (!isMultiGpu && !useOrchestratorMode)
         {
             GTEST_SKIP() << "Leader mode on single GPU crashes";
         }
+
         // Check that it was launched with right number of MPI ranks
         if (!useOrchestratorMode && COMM_SESSION.getSize() != 4)
         {
