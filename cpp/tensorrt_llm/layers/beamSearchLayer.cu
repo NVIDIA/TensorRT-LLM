@@ -94,7 +94,7 @@ void BeamSearchLayer<T>::allocateBuffer()
     SizeType32 const nBS{mDecoderDomain.getBatchSize()};
     auto const batchSizeShape = ITensor::makeShape({nBS});
     auto const batchSizeXBeamWidthArraySizeShape
-        = ITensor::makeShape({nBS * static_cast<runtime::SizeType32 const> (kMaxBeamWidthArrayLength)});
+        = ITensor::makeShape({nBS * static_cast<runtime::SizeType32 const>(kMaxBeamWidthArrayLength)});
 
     mBeamSearchDiversityRateHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mBeamSearchDiversityRateDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
