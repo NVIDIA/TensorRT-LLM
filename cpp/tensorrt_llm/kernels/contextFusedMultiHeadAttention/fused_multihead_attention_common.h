@@ -202,6 +202,15 @@ struct MHARunnerFixedParams
         case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
             attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
             break;
+        case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 4: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONALGLM
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 5: // tensorrt_llm::kernels::AttentionMaskType::BLOCKSPARSE
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
         case 6: // tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK
             attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
             break;
