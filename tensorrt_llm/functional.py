@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum, IntFlag, auto
+from enum import IntEnum, auto
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -3884,7 +3884,7 @@ class AllReduceStrategy(IntEnum):
     AUTO = 4
 
 
-class AllReduceConfig(IntFlag):
+class AllReduceConfig(IntEnum):
     """
     Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
              they must be kept in sync
@@ -3893,7 +3893,7 @@ class AllReduceConfig(IntFlag):
     PUSH_MODE = auto()
 
 
-class AllReduceFusionOp(IntFlag):
+class AllReduceFusionOp(IntEnum):
     """
     Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
              they must be kept in sync
@@ -3910,7 +3910,7 @@ class AllReduceParams():
 
     def __init__(self,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 config: AllReduceConfig = AllReduceConfig(0),
+                 config: AllReduceConfig = AllReduceConfig.USE_MEMCPY,
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
