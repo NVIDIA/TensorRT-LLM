@@ -125,7 +125,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_device_not_contain(["H100"])
     def test_fp8_block_scales(self):
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/fp8") as llm:
+        model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/fp8"
+        # https://nvbugs/5141289: OOM on H100 with default free_gpu_memory_fraction=0.9
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -134,7 +137,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_nvfp4(self):
-        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only") as llm:
+        model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only"
+        with LLM(model_path) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
