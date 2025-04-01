@@ -356,11 +356,9 @@ class LLM:
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
         )
-        #For dis serving context only requests, skip post-processing
-        tokenizer = None if (disaggregated_params
-                             and disaggregated_params.request_type
-                             == "context_only") else self.tokenizer
-        return RequestOutput._from_generation_result(result, prompt, tokenizer)
+
+        return RequestOutput._from_generation_result(result, prompt,
+                                                     self.tokenizer)
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
