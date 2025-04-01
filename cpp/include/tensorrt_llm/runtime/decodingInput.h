@@ -66,11 +66,9 @@ public:
 
     std::vector<SizeType32> beamWidths; //!<  [batchSize], the beam widths of each request.
 
-    std::vector<SizeType32> numDecodingEngineTokens; //!<  [batchSize], the num tokens of each request.
+    SizeType32 maxStopWordsLen;         //!<  The maximum value in the `stopWordsLens` tensor.
 
-    SizeType32 maxStopWordsLen;                      //!<  The maximum value in the `stopWordsLens` tensor.
-
-    SizeType32 maxBadWordsLen;                       //!<  The maximum value in the `badWordsLens` tensor.
+    SizeType32 maxBadWordsLen;          //!<  The maximum value in the `badWordsLens` tensor.
 
     TensorConstPtr logits; //!<  [batchSize, beamWidth, vocabSizePadded], on gpu. Logits are are a probability
                            //!<  distribution over the vocabulary, the output of the model.
