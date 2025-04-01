@@ -30,6 +30,7 @@ class StatefulGptDecoderBatched : public IStatefulGptDecoder
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = ITensor::SharedPtr;
+    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
     StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype);
 
@@ -58,7 +59,7 @@ private:
     std::unique_ptr<GptDecoderBatched> mDecoder;
 
     // only used for IStatefulGptDecoder
-    CudaEvent mDecoderFinishEvent;
+    DecoderFinishedEventPtr mDecoderFinishEvent;
     CudaEvent mForwardEvent;
     TensorPtr mFinishedSum;
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned

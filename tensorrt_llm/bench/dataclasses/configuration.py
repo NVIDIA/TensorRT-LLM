@@ -32,6 +32,7 @@ class RuntimeConfig(BaseModel):
     performance_options: PerformanceOptions
     backend: Literal["pytorch", "autodeploy", None] = None
     extra_llm_api_options: Optional[str] = None
+    iteration_log: Optional[Path] = None
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model

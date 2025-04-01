@@ -89,6 +89,19 @@ public:
 
 using Output = decoder::Output;
 
+// used just as a container for easy returning / passing to function
+class DecoderFinishedEvent
+{
+public:
+    explicit DecoderFinishedEvent(CudaEvent&& event, std::vector<bool> const& active)
+        : event(std::move(event))
+        , active(active)
+    {
+    }
+
+    CudaEvent event;
+    std::vector<bool> active;
+};
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
@@ -99,6 +112,7 @@ public:
     using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = std::shared_ptr<ITensor>;
+    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
     //! @brief Setup the decoder before calling `forward()`
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -113,7 +127,7 @@ public:
         = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual CudaEvent forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+    virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
     virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;

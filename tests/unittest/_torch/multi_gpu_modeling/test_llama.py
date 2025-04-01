@@ -8,7 +8,7 @@ from utils.util import getSMVersion
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi.llm_utils import BuildConfig, CalibConfig
+from tensorrt_llm.llmapi.llm_utils import CalibConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -94,9 +94,8 @@ def test_llama(model_name, backend, quant, tp_size, pp_size, torch_compile):
         pytorch_backend_config=pytorch_config,
         calib_config=CalibConfig(calib_dataset=str(llm_models_root() /
                                                    "datasets/cnn_dailymail")),
-        build_config=BuildConfig(
-            max_seq_len=2048,
-        ),  # This verifies a bug in compile warmUp that does not generate valid warmup requests
+        max_seq_len=
+        2048,  # This verifies a bug in compile warmUp that does not generate valid warmup requests
     )
     with llm:
         outputs = llm.generate(

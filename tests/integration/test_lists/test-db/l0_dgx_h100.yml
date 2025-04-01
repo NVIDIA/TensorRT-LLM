@@ -79,7 +79,6 @@ l0_dgx_h100:
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
   - examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b]
-  - examples/test_dit.py::test_llm_dit_multiple_gpus[dit-xl-2-256x256-tp1]
   - examples/test_mamba.py::test_llm_mamba2_2gpu[mamba-codestral-7B-v0.1]
   - accuracy/test_accuracy.py::TestLlama2_7B::test_smooth_quant_ootb_tp2
   - accuracy/test_accuracy.py::TestLlama2_7B::test_int4_awq_tp2

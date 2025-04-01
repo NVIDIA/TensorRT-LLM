@@ -21,18 +21,11 @@
             "license_name": "apache"
         },
         {
-            "include_re": "^tensorrt_llm/kernels/internal_cutlass_kernels/src/internal_cutlass_type_conversion.h",
-            "license_name": "apache"
-        },
-        {
             "include_re": "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
             "license_name": "nvidia"
         },
         {
             "include_re": "^tensorrt_llm/kernels/internal_cutlass_kernels/src/",
-            "exclude_re": [
-                "^tensorrt_llm/kernels/internal_cutlass_kernels/src/internal_cutlass_type_conversion.h"
-            ],
             "license_name": "nvidia"
         }
     ],

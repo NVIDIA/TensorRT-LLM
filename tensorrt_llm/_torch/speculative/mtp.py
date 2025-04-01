@@ -918,6 +918,7 @@ class MTPEagleWorker(MTPWorker):
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -967,6 +968,14 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.host_request_types[:attn_metadata.
                                                  num_contexts].fill_(1)
                 attn_metadata.num_contexts = 0
+                if i == 0 and num_contexts > 0 and attn_metadata.enable_flash_mla:
+                    reorder_block_ids_per_seq = torch.cat([
+                        attn_metadata.
+                        kv_block_ids_per_seq[num_contexts:batch_size],
+                        attn_metadata.kv_block_ids_per_seq[:num_contexts]
+                    ])
+                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                        reorder_block_ids_per_seq, non_blocking=True)
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
@@ -984,6 +993,7 @@ class MTPEagleWorker(MTPWorker):
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
             attn_metadata.num_contexts = num_contexts
+            attn_metadata.num_generations = num_generations
             attn_metadata._seq_lens[:batch_size].copy_(seq_len)
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
