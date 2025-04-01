@@ -36,12 +36,12 @@ microsoft/Phi-3.5-mini-instruct:
 state-spaces/mamba-130m-hf:
   - accuracy: 19.470
 lmsys/vicuna-7b-v1.3:
-  - spec_dec_algo: lookahead
+  - spec_dec_algo: Lookahead
     accuracy: 33.427
   - dtype: float16
-    spec_dec_algo: medusa
+    spec_dec_algo: Medusa
     accuracy: 33.419
-  - spec_dec_algo: eagle
+  - spec_dec_algo: Eagle
     accuracy: 27.832
 llama-7b-hf:
   - accuracy: 30.457
@@ -94,6 +94,9 @@ meta-llama/Llama-3.1-8B:
   - accuracy: 24.360
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
     accuracy: 25.004
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 25.469
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 24.359
@@ -111,7 +114,7 @@ meta-llama/Llama-3.1-8B-Instruct:
     kv_cache_quant_algo: FP8
     accuracy: 33.464
   - dtype: float16
-    spec_dec_algo: medusa
+    spec_dec_algo: Medusa
     accuracy: 33.663
 meta-llama/Llama-3.2-1B:
   - accuracy: 27.427
@@ -136,8 +139,17 @@ meta-llama/Llama-3.2-1B:
     accuracy: 27.259
   - extra_acc_spec: max_attention_window_size=960;beam_width=4
     accuracy: 0
+meta-llama/Llama-3.3-70B-Instruct:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 34.383
+  - quant_algo: FP8
+    accuracy: 34.927
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 29.733
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.109
@@ -206,3 +218,9 @@ nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 25.72
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 25.682
+  - quant_algo: NVFP4
+    accuracy: 25.243
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 25.546
