@@ -257,6 +257,8 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             attn_backend=attn_backend,
             load_format=pytorch_backend_config.load_format,
+            max_num_tokens=max_num_tokens,
+            moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
         )
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -732,11 +734,13 @@ class PyTorchModelEngine(ModelEngine):
         torch.cuda.empty_cache()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
-                    **kwargs):
+                    max_num_tokens: int, moe_max_num_tokens: int, **kwargs):
         config = ModelConfig.from_pretrained(checkpoint_dir,
                                              trust_remote_code=True,
                                              **kwargs)
         config.spec_config = self.spec_config
+        config.max_num_tokens = max_num_tokens
+        config.moe_max_num_tokens = moe_max_num_tokens
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
