@@ -289,7 +289,7 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
     fillBuffers(setupParams->earlyStopping, DefaultDecodingParams::getEarlyStopping(), mEarlyStoppingHost,
         mEarlyStoppingDevice, batchSlots, std::make_pair(-fltEpsilon, int32Max), "early stopping");
     fillBuffers(setupParams->beamWidthArray, DefaultDecodingParams::getBeamWidthArray(), mBeamWidthArrayHost,
-        mBeamWidthArrayDevice, batchSlots, std::make_pair(-fltEpsilon, int32Max), "beam width array");
+        mBeamWidthArrayDevice, batchSlots, std::make_pair(-fltEpsilon, kMaxBeamWidth), "beam width array");
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

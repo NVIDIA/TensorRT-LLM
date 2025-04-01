@@ -195,8 +195,8 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
         {                                                                                                              \
             __syncthreads();                                                                                           \
         }                                                                                                              \
-        if (true && blockIdx.x == (blockIdxx) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0                \
-            && threadIdx.y == 0 && threadIdx.z == 0)                                                                   \
+        if (blockIdx.x == (blockIdxx) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0    \
+            && threadIdx.z == 0)                                                                                       \
         {                                                                                                              \
             code                                                                                                       \
         }                                                                                                              \

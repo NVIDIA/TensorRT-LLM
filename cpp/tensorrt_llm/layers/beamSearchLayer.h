@@ -64,8 +64,8 @@ private:
     TensorPtr mLengthPenaltyDevice;           // [batchSize] gpu
     TensorPtr mEarlyStoppingHost;             // [batchSize] cpu
     TensorPtr mEarlyStoppingDevice;           // [batchSize] gpu
-    TensorPtr mBeamWidthArrayHost;            // [batchSize] cpu
-    TensorPtr mBeamWidthArrayDevice;          // [batchSize] gpu
+    TensorPtr mBeamWidthArrayHost;            // [batchSize, kMaxBeamWidthArrayLength] cpu
+    TensorPtr mBeamWidthArrayDevice;          // [batchSize, kMaxBeamWidthArrayLength] gpu
     TensorPtr mBeamWidthIn;                   // [batchSize] cpu
     TensorPtr mBeamWidthOut;                  // [batchSize] cpu
 };
