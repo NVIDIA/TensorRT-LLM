@@ -18,7 +18,7 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 # Add the functional directory to the Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../functional'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../utils'))
 from torch_ref import attention_qkvpacked_ref
 
 

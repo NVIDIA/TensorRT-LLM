@@ -1,6 +1,3 @@
-import os
-import sys
-
 import numpy as np
 import torch
 from transformers import LlamaConfig
@@ -20,8 +17,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.layers import Attention
 from tensorrt_llm.layers.lora import Lora, LoraParams
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../functional'))
 
 
 class TestLoraAttention:
