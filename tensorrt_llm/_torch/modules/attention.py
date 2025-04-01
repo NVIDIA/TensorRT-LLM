@@ -104,6 +104,10 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
         self.rotary_emb = rotary_emb
+
+        # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
+        # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
+        # handles them as a single fused operation.
         self.splitted_qkv_lora = LoraLayer([
             LoraModuleType.ATTENTION_Q, LoraModuleType.ATTENTION_K,
             LoraModuleType.ATTENTION_V
@@ -136,7 +140,7 @@ class Attention(nn.Module):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
-        lora_params=None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)

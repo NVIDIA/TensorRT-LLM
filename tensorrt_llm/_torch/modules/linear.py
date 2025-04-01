@@ -186,7 +186,8 @@ class Linear(nn.Module):
 
         self.linear_lora = LoraLayer(
             [LoraModuleType.DENSE],
-            [self.out_features])  # todo didn't add binding to module type
+            [self.out_features
+             ])  # todo (dafrimi) didn't add binding to module type
 
         if not skip_create_weights:
             self.create_weights()
@@ -385,7 +386,7 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
-        lora_params=None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         from ..distributed import allgather
 

@@ -1,10 +1,9 @@
 from enum import IntEnum
-from typing import Dict, List, Union
+from typing import Dict, List, Optional
 
 import torch
 
 
-# LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 class LoraModuleType(IntEnum):
     """Enum class representing different types of modules that can have LoRA adapters.
 
@@ -35,7 +34,7 @@ class LoraModuleType(IntEnum):
     MLP_ROUTER = 17  # MLP router
     MLP_GATE_UP = 18  # Combined gate and up projections
 
-    # TODO (Daniel): added dense layer
+    # TODO (dafrimi): added dense layer
     DENSE = 19  # Dense layer
 
     def __str__(self):
@@ -97,12 +96,12 @@ class LoraLayer(torch.nn.Module):
         assert len(lora_module_types) == len(output_hidden_sizes)
 
     def forward(self, x, lora_params: Dict,
-                layer_idx: int) -> Union[torch.Tensor, None]:
+                layer_idx: int) -> Optional[torch.Tensor]:
         if bool(lora_params):
             lora_ranks = []
             lora_weight_pointers = []
             lora_weight_tensors = [
-            ]  # TODO (Daniel) needs to delete this when we use loraOps which uses ptr
+            ]  # TODO (dafrimi) needs to delete this when we use loraOps which uses ptr
             active_lora_module_ids = []
             for module_idx in self.lora_module_types:
                 module_idx = int(module_idx)
@@ -116,7 +115,7 @@ class LoraLayer(torch.nn.Module):
                         lora_params[layer_idx][module_idx]['weight_pointers'])
                     lora_weight_tensors.append(
                         lora_params[layer_idx][module_idx]['weight_tensors']
-                    )  # TODO (Daniel) needs to delete this when we use loraOps which uses ptr
+                    )  # TODO (dafrimi) needs to delete this when we use loraOps which uses ptr
 
             lora_params['num_seqs']
 
@@ -145,7 +144,7 @@ class LoraLayer(torch.nn.Module):
                 lora_output = torch.cat(lora_outputs, dim=-1)
                 return lora_output
 
-                # TODO(Daniel): use torch implementation. For now, this is just a placeholder, until we will do the biniding to lora ops C++
+                # TODO(dafrimi): use torch implementation. For now, this is just a placeholder, until we will do the biniding to lora ops C++
                 # lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
                 #     x,
                 #     lora_params['host_request_types'][:num_seqs],

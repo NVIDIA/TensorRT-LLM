@@ -1,5 +1,6 @@
 import os
 import sys
+import unittest
 
 import numpy as np
 import tensorrt as trt
@@ -14,17 +15,13 @@ from tensorrt_llm.layers.linear import Linear
 from tensorrt_llm.layers.lora import Lora, LoraRuntimeParams
 from tensorrt_llm.runtime.session import Session
 
-# Add the unittest directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 from utils.util import create_session, run_session
 
 
-class TestLoraLinearPivotVsTrt:
-    """Test class for comparing LoRA linear layer implementations."""
+class TestLoraLinearPivotVsTRT(unittest.TestCase):
 
-    def setup_method(self, method):
-        """Set up test parameters and resources."""
-        # Test parameters
+    def setUp(self):
         self.dtype = "float16"
         self.batch_size = 16
         self.seq_len = 32
@@ -32,21 +29,19 @@ class TestLoraLinearPivotVsTrt:
         self.lora_rank = 8
 
         # Create input tensors
-        self.activations = torch.randn(self.batch_size,
-                                       self.seq_len,
-                                       self.hidden_size,
-                                       dtype=tensorrt_llm.str_dtype_to_torch(
-                                           self.dtype),
-                                       device="cuda")
+        self.input_tensor = torch.randn(self.batch_size,
+                                        self.seq_len,
+                                        self.hidden_size,
+                                        dtype=tensorrt_llm.str_dtype_to_torch(
+                                            self.dtype),
+                                        device="cuda")
 
-        # Create weights
         self.weight = torch.randn(self.hidden_size,
                                   self.hidden_size,
                                   dtype=tensorrt_llm.str_dtype_to_torch(
                                       self.dtype),
                                   device="cuda")
 
-        # Create LoRA weights
         self.A = torch.randn(self.lora_rank,
                              self.hidden_size,
                              dtype=tensorrt_llm.str_dtype_to_torch(self.dtype),
@@ -57,7 +52,6 @@ class TestLoraLinearPivotVsTrt:
                              device="cuda")
 
     def _create_linear_lora_trt_session(self) -> Session:
-        """Create a TensorRT session for the LoRA linear layer."""
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
 
@@ -76,7 +70,6 @@ class TestLoraLinearPivotVsTrt:
             linear.weight.value = np.ascontiguousarray(
                 torch_to_numpy(self.weight.cpu()))
 
-            # Define input tensors
             inp = Tensor(
                 name="input_tensor",
                 shape=[self.batch_size, self.seq_len, self.hidden_size],
@@ -94,21 +87,18 @@ class TestLoraLinearPivotVsTrt:
                                 shape=(self.batch_size, ),
                                 dtype=trt.int32)
 
-            # Create LoRA runtime parameters
             lora_params = LoraRuntimeParams(
                 lora_ranks=[lora_ranks],
                 lora_weights_pointers=[lora_weights_pointers],
                 host_request_types=host_request_types,
                 weight_index=0)
 
-            # Define output
             output = linear(inp, lora_runtime_params=lora_params)
             output.mark_output("output", self.dtype)
 
         return create_session(builder, network, precision=self.dtype)
 
     def _create_trt_inputs(self):
-        """Create input dictionary for TensorRT session."""
         host_request_types = torch.zeros(self.batch_size, dtype=torch.int32)
         magnitude_dora = torch.zeros(self.hidden_size,
                                      dtype=tensorrt_llm.str_dtype_to_torch(
@@ -116,7 +106,7 @@ class TestLoraLinearPivotVsTrt:
                                      device="cuda")
 
         inputs = {
-            "input_tensor": self.activations,
+            "input_tensor": self.input_tensor,
             "host_request_types": host_request_types
         }
 
@@ -133,7 +123,6 @@ class TestLoraLinearPivotVsTrt:
         return inputs
 
     def _setup_pivot_linear(self):
-        """Set up the pivot linear layer with weights."""
         pivot_linear = PivotLinear(in_features=self.hidden_size,
                                    out_features=self.hidden_size,
                                    layer_idx=0)
@@ -143,21 +132,14 @@ class TestLoraLinearPivotVsTrt:
         return pivot_linear
 
     def test_lora_linear_layer(self):
-        """Test LoRA linear layer implementation."""
-        # Create TensorRT session
         session = self._create_linear_lora_trt_session()
 
-        # Create input dictionary
         inputs = self._create_trt_inputs()
-
-        # Run TensorRT inference
         outputs = run_session(session, inputs)
         torch.cuda.synchronize()
 
-        # Set up and run pivot implementation
         pivot_linear = self._setup_pivot_linear()
 
-        # Create lora_params in the same format as before
         lora_params = {
             'num_seqs': self.batch_size,
             'host_request_types': torch.zeros(self.batch_size,
@@ -177,14 +159,6 @@ class TestLoraLinearPivotVsTrt:
             }
         }
 
-        outputs_pivot = pivot_linear(self.activations, lora_params=lora_params)
+        outputs_pivot = pivot_linear(self.input_tensor, lora_params=lora_params)
 
-        # Compare outputs
         torch.testing.assert_close(outputs["output"], outputs_pivot)
-        print("Test passed!")
-
-
-if __name__ == "__main__":
-    test = TestLoraLinearPivotVsTrt()
-    test.setup_method(None)  # None is passed as method parameter
-    test.test_lora_linear_layer()

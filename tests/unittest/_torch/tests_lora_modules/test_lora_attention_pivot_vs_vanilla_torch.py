@@ -1,5 +1,6 @@
 import os
 import sys
+import unittest
 
 import numpy as np
 import torch
@@ -17,17 +18,13 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-# Add the functional directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../utils'))
 from torch_ref import attention_qkvpacked_ref
 
 
-class TestLoraAttentionPivotVsVanilla:
-    """Test class for comparing LoRA attention with vanilla attention."""
+class TestLoraAttentionPivotVsVanilla(unittest.TestCase):
 
-    def setup_method(self, method):
-        """Set up test parameters and resources."""
-        # Test parameters
+    def setUp(self):
         self.batch_size = 1
         self.seq_len = 16
         self.hidden_size = 64
@@ -40,7 +37,6 @@ class TestLoraAttentionPivotVsVanilla:
         self.num_blocks = 4
         self.tokens_per_block = 32
 
-        # Create model config
         self.llama_config = LlamaConfig(
             hidden_size=self.hidden_size,
             num_attention_heads=self.head_num,
@@ -52,7 +48,6 @@ class TestLoraAttentionPivotVsVanilla:
             num_key_value_heads=self.head_num,
             torch_dtype=self.dtype)
 
-        # Create KV cache manager
         head_dim = self.llama_config.hidden_size // self.llama_config.num_attention_heads
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=self.num_blocks *
@@ -70,13 +65,10 @@ class TestLoraAttentionPivotVsVanilla:
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF)
 
-    def teardown_method(self, method):
-        """Clean up resources after each test."""
-        if hasattr(self, 'kv_cache_manager'):
-            self.kv_cache_manager.shutdown()
+    def tearDown(self):
+        self.kv_cache_manager.shutdown()
 
     def _get_lora_params(self, in_dim, out_dim):
-        """Create LoRA parameters for a given input and output dimension."""
         lora_rank = 8
         lora_weight_ins = torch.randn(in_dim,
                                       lora_rank,
@@ -89,14 +81,11 @@ class TestLoraAttentionPivotVsVanilla:
         return lora_weight_ins, lora_weight_outs
 
     def _create_attention_inputs(self):
-        """Create input tensors and weights for attention."""
-        # Create hidden states
         hidden_states = torch.randn(self.seq_len,
                                     self.llama_config.hidden_size,
                                     dtype=self.dtype,
                                     device=self.device)
 
-        # Create weights
         q_weight = torch.empty(size=[self.hidden_size, self.hidden_size],
                                dtype=self.dtype)
         torch.nn.init.xavier_uniform_(q_weight)
@@ -126,7 +115,6 @@ class TestLoraAttentionPivotVsVanilla:
         return attention_module, model_config
 
     def _create_attention_metadata(self, model_config):
-        """Create attention metadata for the test."""
         sequence_lengths = [self.seq_len]
         past_seen_tokens = [0]
         request_ids = [0]
@@ -136,7 +124,6 @@ class TestLoraAttentionPivotVsVanilla:
         # Add requests to KV cache manager
         self.kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-        # Create attention metadata
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         return metadata_cls(
             seq_lens=torch.tensor(sequence_lengths, dtype=torch.int32),
@@ -156,7 +143,6 @@ class TestLoraAttentionPivotVsVanilla:
                                hidden_states,
                                qkv_weight,
                                lora_params=None):
-        """Run vanilla attention with optional LoRA."""
         head_dim = self.hidden_size // self.head_num
 
         # Base QKV computation
@@ -166,7 +152,7 @@ class TestLoraAttentionPivotVsVanilla:
             # Get the LoRA weights from the new structure
             dense_params = lora_params[0][
                 LoraModuleType.
-                ATTENTION_DENSE]  # TODO 0 is the layer_idx, needs to pass it here somehow
+                ATTENTION_DENSE]  # TODO (dafrimi) 0 is the layer_idx, needs to pass it here somehow
             Q_params = lora_params[0][LoraModuleType.ATTENTION_Q]
             K_params = lora_params[0][LoraModuleType.ATTENTION_K]
             V_params = lora_params[0][LoraModuleType.ATTENTION_V]
@@ -185,22 +171,18 @@ class TestLoraAttentionPivotVsVanilla:
             lora_output_k = (hidden_states @ B_k.T) @ A_k.T
             lora_output_v = (hidden_states @ B_v.T) @ A_v.T
 
-            # Combine base and LoRA outputs
             packed_lora_torch_qkv = torch.cat(
                 [lora_output_q, lora_output_k, lora_output_v], dim=-1)
             packed_lora_torch_qkv = packed_torch_qkv + packed_lora_torch_qkv
 
-            # Reshape for attention
             packed_lora_torch_qkv = packed_lora_torch_qkv.reshape(
                 [self.batch_size, self.seq_len, 3, self.head_num, head_dim])
 
-            # Run attention
             mha_out_lora, _ = attention_qkvpacked_ref(packed_lora_torch_qkv,
                                                       causal=True,
                                                       upcast=False,
                                                       bias=None)
 
-            # Reshape output
             torch_out = mha_out_lora.reshape(
                 [self.batch_size, self.seq_len, self.hidden_size])
             torch_out = torch_out.squeeze(0)
@@ -226,7 +208,6 @@ class TestLoraAttentionPivotVsVanilla:
 
     def _run_pivot_attention(self, attention_module, hidden_states,
                              attn_metadata, lora_params):
-        """Run pivot attention with LoRA."""
         with torch.inference_mode():
             attn_metadata.prepare()
             return attention_module(
@@ -237,8 +218,6 @@ class TestLoraAttentionPivotVsVanilla:
                 lora_params=lora_params)
 
     def test_attention_with_lora(self):
-        """Test attention with LoRA weights."""
-        # Create inputs and weights
         hidden_states, qkv_weight, out_weight = self._create_attention_inputs()
 
         # Create LoRA parameters
@@ -247,17 +226,16 @@ class TestLoraAttentionPivotVsVanilla:
         A_v, B_v = self._get_lora_params(self.hidden_size, self.hidden_size)
         A_o, B_o = self._get_lora_params(self.hidden_size, self.hidden_size)
 
-        # Set up attention module
         attention_module, model_config = self._setup_attention_module(
             qkv_weight, out_weight)
 
-        # Create attention metadata
         attn_metadata = self._create_attention_metadata(model_config)
 
         # Verify QKV projection
-        assert torch.allclose(attention_module.qkv_proj.forward(hidden_states),
-                              hidden_states.to("cuda") @ qkv_weight.to("cuda"),
-                              atol=2e-1)
+        self.assertTrue(
+            torch.allclose(attention_module.qkv_proj.forward(hidden_states),
+                           hidden_states.to("cuda") @ qkv_weight.to("cuda"),
+                           atol=2e-1))
 
         # Create lora_params in the new format
         lora_params = {
@@ -318,17 +296,7 @@ class TestLoraAttentionPivotVsVanilla:
                                                  hidden_states, attn_metadata,
                                                  lora_params)
 
-        # Compare outputs
-        a_tol = 5e-5 if (self.dtype == torch.float32) else 2e-3
-        np.testing.assert_allclose(pivot_output.cpu().numpy(),
-                                   vanilla_output.cpu().numpy(),
-                                   atol=a_tol,
-                                   verbose=True)
-        print("Test passed!")
-
-
-if __name__ == "__main__":
-    test = TestLoraAttentionPivotVsVanilla()
-    test.setup_method(None)  # None is passed as method parameter
-    test.test_attention_with_lora()
-    test.teardown_method(None)  # None is passed as method parameter
+        torch.testing.assert_close(pivot_output,
+                                   vanilla_output,
+                                   atol=2e-3,
+                                   rtol=0)
