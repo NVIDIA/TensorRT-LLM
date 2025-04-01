@@ -38,7 +38,7 @@ class AttentionMetadata:
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
 
-    is_mla: bool = False
+    enable_flash_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -167,6 +167,16 @@ class AttentionMetadata:
         self.on_update()
 
     @property
+    def num_generations(self) -> int:
+        return self._num_generations
+
+    @num_generations.setter
+    def num_generations(self, value: int):
+        value = value if value is not AttentionMetadata.num_generations else 0
+        self._num_generations = value
+        self.on_update()
+
+    @property
     def seq_lens_cuda(self):
         return self._seq_lens_cuda
 
@@ -215,10 +225,6 @@ class AttentionMetadata:
         return self.cross is not None and self.cross is not self
 
     @property
-    def num_generations(self) -> int:
-        return self._num_generations
-
-    @property
     def num_ctx_tokens(self) -> int:
         return self._num_ctx_tokens
 
@@ -255,6 +261,17 @@ class AttentionMetadata:
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
+        if self.enable_flash_mla:
+            if self.kv_cache_manager is not None:
+                cuda_graph_metadata.block_ids_per_seq = torch.zeros(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.max_num_requests = max_batch_size
         cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
