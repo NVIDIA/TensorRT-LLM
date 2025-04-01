@@ -443,24 +443,23 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def githubPrApiUrl = globalVars[GITLAB_PR_API_URL]
-    def cachedChangedFileList = globalVars[CACHED_CHANGED_FILE_LIST]
 
-    if (cachedChangedFileList != null) {
-        return cachedChangedFileList
+    if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
+        return globalVars[CACHED_CHANGED_FILE_LIST]
     }
     try {
         if (githubPrApiUrl != null) {
-            cachedChangedFileList = getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
         } else {
-            cachedChangedFileList = getMergeRequestChangedFileListGitlab(pipeline)
+            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGitlab(pipeline)
         }
-        return cachedChangedFileList
+        return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
-        cachedChangedFileList = []
-        return cachedChangedFileList
+        globalVars[CACHED_CHANGED_FILE_LIST] = []
+        return globalVars[CACHED_CHANGED_FILE_LIST]
     }
 }
 
