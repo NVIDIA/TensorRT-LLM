@@ -16,19 +16,19 @@ l0_a100:
   - unittest/llmapi/test_llm.py -m "part0"
   - unittest/llmapi/test_llm.py -m "not part0"
   - unittest/llmapi/test_executor.py
-  - accuracy/test_accuracy.py::TestGpt2::test_int8_kv_cache # 1 min
-  - accuracy/test_accuracy.py::TestGpt2::test_weight_only[int4] # 1 min
-  - accuracy/test_accuracy.py::TestStarcoder2_15B::test_smooth_quant_ootb
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_int4_awq_int8_kv_cache
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_smooth_quant_ootb
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_smooth_quant
-  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only[int8]
-  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only[int4]
-  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only_int8_kv_cache[int8]
-  - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_weight_only_manage_weights[int4]
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_smooth_quant_ootb_manage_weights
-  - accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_int8_gptq
-  - accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_int4_awq_pre_quantized
+  - accuracy/test_cli_flow.py::TestGpt2::test_int8_kv_cache # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int4] # 1 min
+  - accuracy/test_cli_flow.py::TestStarcoder2_15B::test_smooth_quant_ootb
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_int4_awq_int8_kv_cache
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_smooth_quant_ootb
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_smooth_quant
+  - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_weight_only[int8]
+  - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_weight_only[int4]
+  - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_weight_only_int8_kv_cache[int8]
+  - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_weight_only_manage_weights[int4]
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_smooth_quant_ootb_manage_weights
+  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_int8_gptq
+  - accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
 - condition:
     ranges:
       system_gpu_count:
@@ -41,9 +41,9 @@ l0_a100:
     terms:
       stage: post_merge
   tests:
-  - accuracy/test_accuracy.py::TestGptNext::test_auto_dtype # 1.5 mins
-  - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_weight_only[int8] # 1 min
+  - accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype # 1.5 mins
+  - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_weight_only[int8] # 1 min
   - unittest/trt/model_api/test_model_level_api.py
   - unittest/trt/model_api/test_model_quantization.py
   - unittest/trt/model_api/test_model_api_multi_gpu.py
