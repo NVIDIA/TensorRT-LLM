@@ -21,7 +21,10 @@
         "source=${localEnv:HOME}/.cache/huggingface,target=/huggingface,type=bind", // HF cache
         "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent"
       ],
-      "postCreateCommand": "pip install -r requirements-dev.txt && pre-commit install --install-hooks",
+      // Note: sourcing .profile is required since we use a local user and the python interpreter is
+      // global (/usr/bin/python). In this case, pip will default to a local user path which is not
+      // by default in the PATH. In interactive devcontainer shells, .profile is sourced by default.
+      "postCreateCommand": "mkdir -p $HOME/.local/bin && source $HOME/.profile && pip install -r requirements-dev.txt && pre-commit install --install-hooks",
       "customizations": {
         "vscode": {
           "extensions": [
@@ -54,7 +57,7 @@
             // "clang-format.executable": "/usr/local/bin/clang-format",
             "clangd.arguments": [
               // "--compile-commands-dir=${workspaceFolder}/cpp/build_RelWithDebInfo"
-              "--compile-commands-dir=${workspaceFolder}"
+              "--compile-commands-dir=${workspaceFolder}/cpp/build"
             ],
             "python.defaultInterpreterPath": "/usr/bin/python"
           }
