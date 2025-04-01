@@ -1,4 +1,4 @@
-### Curl Chat Client
+#! /usr/bin/env bash
 
 if [[ -z $BASE_URL ]]; then
     BASE_URL=http://localhost:8000/v1
