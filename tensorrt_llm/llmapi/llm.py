@@ -508,7 +508,8 @@ class LLM:
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=self.args.batching_type or tllm.BatchingType.INFLIGHT,
+            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
+            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
@@ -547,7 +548,8 @@ class LLM:
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
-            executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
+            executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
+                self.args.extended_runtime_perf_knob_config)
 
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         update_executor_config(

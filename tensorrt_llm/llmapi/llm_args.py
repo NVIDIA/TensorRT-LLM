@@ -628,11 +628,12 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
     )
 
     def _to_pybind(self):
-        return _ExtendedRuntimePerfKnobConfig(
+        res = _ExtendedRuntimePerfKnobConfig(
             multi_block_mode=self.multi_block_mode,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
-            cuda_graph_mode=self.cuda_graph_mode,
-            cuda_graph_cache_size=self.cuda_graph_cache_size)
+            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
+        res.cuda_graph_mode = self.cuda_graph_mode
+        res.cuda_graph_cache_size = self.cuda_graph_cache_size
+        return res
 
 
 @dataclass
@@ -1056,7 +1057,7 @@ class LlmArgs(BaseModel):
                     )
                 self._load_config_from_engine(model_obj.model_dir)
                 runtime_defaults = self._pretrained_config.runtime_defaults
-                if self._use_runtime_defaults and runtime_defaults:
+                if runtime_defaults:
                     self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
                         runtime_defaults)
 
