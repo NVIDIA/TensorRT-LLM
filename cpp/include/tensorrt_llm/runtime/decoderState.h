@@ -73,7 +73,7 @@ public:
     void setupEagle(EagleBuffers::Inputs eagleBuffers) const;
 
     //! @brief Disable lookahead decoding.
-    void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests);
+    void disableLookahead(RequestVector const& genRequests);
 
     //! @returns [batchSize], number of finished sequences per request, on gpu
     [[nodiscard]] TensorPtr getFinishedSum() const;
@@ -149,6 +149,20 @@ public:
 
     [[nodiscard]] SizeType32 getMaxDecodingEngineTokens() const;
 
+    //! @brief Get the number of tokens for all requests in the batch.
+    //! @returns The number of tokens for all requests in the batch.
+    [[nodiscard]] std::vector<SizeType32> const& getNumDecodingEngineTokens() const;
+
+    //! @brief Get the number of tokens for a specific request in the batch.
+    //! @param batchIdx The index of the request in the batch.
+    //! @returns The number of tokens for the specified request.
+    [[nodiscard]] SizeType32 getNumDecodingEngineTokens(SizeType32 batchIdx) const;
+
+    //! @brief Set the number of tokens for a specific request in the batch.
+    //! @param batchIdx The index of the request in the batch.
+    //! @param numTokens The number of tokens for the specified request.
+    void setNumDecodingEngineTokens(SizeType32 batchIdx, SizeType32 numTokens);
+
     [[nodiscard]] SpeculativeDecodingMode getSpeculativeDecodingMode() const;
 
     //! @brief Workspace for beam search in streaming mode.
@@ -185,6 +199,9 @@ private:
     // How many tokens predicted by the engine for one request.
     // It is maxDecodingTokens. >= 1 for speculative decoding and == 1 for non speculative decoding.
     SizeType32 mMaxDecodingEngineTokens{1};
+
+    //! @brief [batchSize], the num tokens of each request.
+    std::vector<SizeType32> mNumDecodingEngineTokens;
 
     SpeculativeDecodingMode mSpeculativeDecodingMode{SpeculativeDecodingMode::None()};
 };
