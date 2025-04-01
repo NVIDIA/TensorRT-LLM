@@ -54,8 +54,7 @@ public:
         SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) override;
 
-    void disableLookahead(
-        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots) override;
+    void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
     DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
     void forward(decoder_batch::Output& output, decoder_batch::Input const& input) override;
@@ -65,7 +64,12 @@ public:
     [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
         SamplingConfig const& samplingConfig, bool streaming) const override;
 
-    decoder::DecoderState& getDecoderState() const
+    decoder::DecoderState& getDecoderState()
+    {
+        return *mDecoderState;
+    }
+
+    decoder::DecoderState const& getDecoderState() const
     {
         return *mDecoderState;
     }
