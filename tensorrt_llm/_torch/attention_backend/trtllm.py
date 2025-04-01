@@ -706,7 +706,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill
             or metadata.runtime_features.cache_reuse
-            or metadata.runtime_features.has_speculative_draft_tokens) if metadata.runtime_features else False
+            or metadata.runtime_features.has_speculative_draft_tokens
+        ) if metadata.runtime_features else False
 
         if use_paged_context_fmha and self.has_fp8_kv_cache:
             # NOTE: W4A8_AWQ can be included too, exclude for now since

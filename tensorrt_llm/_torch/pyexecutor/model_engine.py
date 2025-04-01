@@ -556,7 +556,8 @@ class PyTorchModelEngine(ModelEngine):
                              resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
-    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager,
+    def _set_up_attn_metadata(self,
+                              kv_cache_manager: KVCacheManager,
                               is_dummy_forward: bool = False):
         # is_dummy_forward is used to indicate whether the forward is
         # a dummy forward for memory estimation OR
