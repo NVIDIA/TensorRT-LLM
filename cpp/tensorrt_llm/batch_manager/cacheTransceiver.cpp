@@ -146,11 +146,13 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
             *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
             mManager = makeUcxConnectionManager();
+            TLLM_LOG_INFO("UCX Connection Manager created");
         }
         else
         {
             mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
             mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+            TLLM_LOG_INFO("MPI Connection Manager created");
         }
 
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;

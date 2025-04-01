@@ -235,4 +235,53 @@ TEST_F(UcxCommTest, multiSend)
     }
 }
 
+TEST_F(UcxCommTest, CommCache)
+{
+
+    try
+    {
+        TransceiverTag::Id id1;
+        TransceiverTag::Id id2;
+
+        auto connectionManager1 = makeOneUcxConnectionManager();
+        EXPECT_NE(connectionManager1, nullptr);
+        auto connectionManager2 = makeOneUcxConnectionManager();
+        EXPECT_NE(connectionManager2, nullptr);
+        auto CommState1 = connectionManager1->getCommState();
+        auto CommState2 = connectionManager2->getCommState();
+        ASSERT_EQ(CommState1.isSocketState(), true);
+        ASSERT_EQ(CommState2.isSocketState(), true);
+
+        auto connections1 = connectionManager2->getConnections(CommState1);
+        ASSERT_EQ(connections1.size(), 1);
+        auto connection1 = connections1[0];
+        id1 = TransceiverTag::Id::REQUEST_SEND;
+        connection1->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
+
+        auto connection1Peer = connectionManager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
+        ASSERT_EQ(id2, id1);
+        auto connection1Cached = connectionManager2->getConnections(CommState1)[0];
+        ASSERT_EQ(connection1Cached, connection1);
+        id1 = TransceiverTag::Id::REQUEST_SEND;
+        connection1Cached->send(DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
+
+        auto connection1PeerCached
+            = connectionManager1->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id2, sizeof(id2));
+        ASSERT_EQ(id2, id1);
+
+        ASSERT_EQ(connection1PeerCached, connection1Peer);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
+            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw e;
+    }
+}
+
 }; // namespace

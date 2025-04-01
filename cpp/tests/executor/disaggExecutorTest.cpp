@@ -837,9 +837,11 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
         tensorrt_llm::executor::ExecutorConfig executorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig);
         tensorrt_llm::executor::OrchestratorConfig orchestratorConfig{
             isOrchestrator, PathUtil::EXECUTOR_WORKER_PATH(), nullptr, spawnProcess};
+
         tensorrt_llm::executor::ParallelConfig parallelConfig{tensorrt_llm::executor::CommunicationType::kMPI,
             tensorrt_llm::executor::CommunicationMode::kORCHESTRATOR, participantDeviceIdsEachInstance.at(in),
-            participantIdsEachInstance.at(in), orchestratorConfig};
+            spawnProcess ? std::nullopt : std::optional<std::vector<SizeType32>>(participantIdsEachInstance.at(in)),
+            orchestratorConfig};
         executorConfig.setParallelConfig(parallelConfig);
         if (in < contextNum)
         {
