@@ -674,6 +674,12 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     if (commSize == 1)
     {
         spawnProcess = true;
+        int deviceCount = -1;
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount < 4)
+        {
+            GTEST_SKIP() << "DisaggExecutorTest requires at least 4 GPUs";
+        }
         ASSERT_TRUE(tensorrt_llm::common::getEnvUseUCXKvCache());
     }
 
