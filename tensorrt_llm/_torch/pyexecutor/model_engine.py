@@ -535,7 +535,10 @@ class PyTorchModelEngine(ModelEngine):
         logger.info(
             f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
         )
-        for bs in self._cuda_graph_batch_sizes:
+        # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
+        cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
+                                        reverse=True)
+        for bs in cuda_graph_batch_sizes:
             if bs > self.batch_size:
                 # skip batch size larger than self.batch_size
                 continue
@@ -550,8 +553,6 @@ class PyTorchModelEngine(ModelEngine):
                 torch.cuda.synchronize()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
-        is_mla = hasattr(self.model.model_config.pretrained_config,
-                         "kv_lora_rank")
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -559,7 +560,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                is_mla=is_mla)
+                enable_flash_mla=self.model.model_config.enable_flash_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -573,7 +574,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            is_mla=is_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
