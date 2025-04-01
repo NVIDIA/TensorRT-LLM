@@ -34,7 +34,7 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests through completions API and Chat API.
+After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs.
 
 Chat API
 ~~~~~~~~

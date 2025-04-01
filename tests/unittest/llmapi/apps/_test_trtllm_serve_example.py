@@ -3,7 +3,8 @@ import subprocess
 import sys
 
 import pytest
-from openai_server import RemoteOpenAIServer
+
+from .openai_server import RemoteOpenAIServer
 
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "examples",

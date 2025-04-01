@@ -92,14 +92,14 @@ def generate_examples():
     with open(doc_dir / "llm_api_examples.rst", "w+") as f:
         example_docs = "\n   ".join(path.stem for path in llmapi_script_paths)
         f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs)\
-                .replace(r"%EXAMPLE_NAME%", "LLM API Examples"))
+                .replace(r"%EXAMPLE_NAME%", "LLM Examples"))
 
     # Generate the toctree for trtllm-serve example scripts
     write_script(serve_script_base_url, serve_script_paths, serve_doc_paths)
     with open(doc_dir / "trtllm_serve_examples.rst", "w+") as f:
         example_docs = "\n   ".join(path.stem for path in serve_script_paths)
         f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs)\
-                .replace(r"%EXAMPLE_NAME%", "TRTLLM Serve Examples"))
+                .replace(r"%EXAMPLE_NAME%", "Online Serving Examples"))
 
     with open(doc_dir / "index.rst") as f:
         examples_index = f.read()
