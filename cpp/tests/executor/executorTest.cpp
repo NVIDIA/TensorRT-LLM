@@ -2182,6 +2182,10 @@ TEST_P(AllParamsTest, TokenComparison)
     else if (modelName == "llama_tp4_pp1_cp1" || modelName == "llama_tp1_pp4_cp1" || modelName == "llama_tp2_pp2_cp1"
         || modelName == "llama_tp1_pp2_cp1")
     {
+        inputPath = DATA_PATH / "input_tokens_llama.npy";
+        modelIds.padId = 128001;
+        modelIds.endId = 128001;
+
         auto const resultsPath
             = LLAMA_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
         if (modelName == "llama_tp4_pp1_cp1")
@@ -2365,7 +2369,8 @@ TEST_P(AllParamsTest, TokenComparison)
         }
     }
 
-    SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
+    //SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
+    SizeType32 constexpr vocabSizePadded{128256}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
     if (streaming && (outConfig.returnContextLogits || outConfig.returnGenerationLogits))

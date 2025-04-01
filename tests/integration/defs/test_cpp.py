@@ -5,6 +5,7 @@ import pathlib as _pl
 import platform
 import shutil
 import sys as _sys
+import time
 from typing import List
 
 import defs.cpp_common as _cpp
@@ -220,6 +221,9 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
 
     def _prepare(model_name: str):
         if platform.system() != "Windows":
+
+            start_time = time.time()
+
             _cpp.prepare_multi_gpu_model_tests(
                 test_list=[model_name],
                 python_exe=python_exe,
@@ -227,6 +231,10 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
                 resources_dir=cpp_resources_dir,
                 model_cache=model_cache,
             )
+
+            duration = time.time() - start_time
+            print(f"Built multi-GPU model: {model_name}")
+            print(f"Duration: {duration} seconds")
 
     return _prepare
 
