@@ -2369,7 +2369,7 @@ TEST_P(AllParamsTest, TokenComparison)
         }
     }
 
-    //SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
+    // SizeType32 constexpr vocabSizePadded{50257}; // gpt vocabSizePadded
     SizeType32 constexpr vocabSizePadded{128256}; // gpt vocabSizePadded
 
     // Returning logits will bring higher latency
