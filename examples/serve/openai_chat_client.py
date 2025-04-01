@@ -1,3 +1,5 @@
+### OpenAI Chat Client
+
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 

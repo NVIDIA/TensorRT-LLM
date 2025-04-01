@@ -1,3 +1,5 @@
+### OpenAI Completion Client
+
 from openai import OpenAI
 
 

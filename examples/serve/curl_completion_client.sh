@@ -1,4 +1,4 @@
-#! /usr/bin/env bash
+### Curl Completion Client
 
 if [[ -z $BASE_URL ]]; then
     BASE_URL=http://localhost:8000/v1
