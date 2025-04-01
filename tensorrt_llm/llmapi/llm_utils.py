@@ -347,7 +347,7 @@ class ModelLoader:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
 
         Returns:
-            pre_quantized (bool): Whether the checkpoint is pre-quantized.
+            prequantized (bool): Whether the checkpoint is pre-quantized.
         """
         quant_config = self.llm_args.quant_config
 
@@ -431,7 +431,7 @@ class ModelLoader:
             if hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model else None)
 
-        pre_quantized = self._update_from_hf_quant_config()
+        prequantized = self._update_from_hf_quant_config()
 
         # FP4 Gemm force to use plugin.
         if self.llm_args.quant_config.quant_mode.has_nvfp4():
@@ -446,7 +446,7 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
-        elif self.llm_args.quant_config._requires_calibration and not pre_quantized:
+        elif self.llm_args.quant_config._requires_calibration and not prequantized:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:

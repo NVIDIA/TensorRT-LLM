@@ -68,7 +68,7 @@ l0_h100:
   - unittest/trt/model/test_mamba.py # 3 mins
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
-  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_pre_quantized
+  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8_gemm_plugin
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8_gemm_swiglu_plugin
@@ -138,7 +138,7 @@ l0_h100:
   - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
   - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_cli_flow.py::TestMinitron4BBase::test_fp8
-  - accuracy/test_cli_flow.py::TestNemotronMini4BInstruct::test_fp8_pre_quantized
+  - accuracy/test_cli_flow.py::TestNemotronMini4BInstruct::test_fp8_prequantized
   - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_float32
   - accuracy/test_cli_flow.py::TestLlama3_8BInstructGradient1048k::test_long_context
   - accuracy/test_cli_flow.py::TestLlama3_8BInstructGradient1048k::test_long_context_ppl

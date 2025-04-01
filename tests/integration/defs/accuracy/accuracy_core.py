@@ -344,22 +344,22 @@ class CliFlowAccuracyTestHarness:
     def convert(self):
         print("Converting model to TensorRT-LLM checkpoint...")
 
-        is_pre_quantized = False
+        is_prequantized = False
         for quant_config_file in [
                 "hf_quant_config.json", "quant_config.json",
                 "quantize_config.json"
         ]:
             if exists(f"{self.MODEL_PATH}/{quant_config_file}"):
-                is_pre_quantized = True
+                is_prequantized = True
                 break
-        if not is_pre_quantized and exists(f"{self.MODEL_PATH}/config.json"):
+        if not is_prequantized and exists(f"{self.MODEL_PATH}/config.json"):
             with open(f"{self.MODEL_PATH}/config.json") as f:
                 hf_config = json.load(f)
             if "quantization_config" in hf_config:
-                is_pre_quantized = True
+                is_prequantized = True
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
-        if not is_pre_quantized and quant_config._requires_modelopt_quantization:
+        if not is_prequantized and quant_config._requires_modelopt_quantization:
             script = "../quantization/quantize.py"
         else:
             script = "convert_checkpoint.py"
@@ -382,7 +382,7 @@ class CliFlowAccuracyTestHarness:
         if self.cp_size > 1:
             convert_cmd.append(f"--cp_size={self.cp_size}")
 
-        if not is_pre_quantized and quant_config._requires_modelopt_quantization:
+        if not is_prequantized and quant_config._requires_modelopt_quantization:
             if self.quant_algo == QuantAlgo.MIXED_PRECISION:
                 assert self.extra_convert_args is not None
                 assert any(

@@ -38,7 +38,7 @@ l0_a30:
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-vision-trtllm-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - accuracy/test_cli_flow.py::TestMinitron4BBase::test_auto_dtype
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_weight_sparsity # 4 mins
-  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_pre_quantized
+  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_weight_streaming[0.1]
   - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
   - accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype

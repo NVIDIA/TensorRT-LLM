@@ -182,7 +182,7 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "gpt"
 
     @skip_pre_ada
-    def test_fp8_pre_quantized(self, mocker):
+    def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
@@ -447,14 +447,14 @@ class TestLlama2_7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W4A16_AWQ, tp_size=2)
 
     @pytest.mark.skip_less_device(2)
-    def test_int4_awq_pre_quantized_tp2(self, mocker):
+    def test_int4_awq_prequantized_tp2(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-models-v2/Llama-2-7B-AWQ")
         self.run(quant_algo=QuantAlgo.W4A16_AWQ, tp_size=2)
 
     @pytest.mark.skip_less_device(2)
-    def test_int4_gptq_pre_quantized_tp2(self, mocker):
+    def test_int4_gptq_prequantized_tp2(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-models-v2/Llama-2-7B-GPTQ")
@@ -643,14 +643,14 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
         self.run(dtype='auto')
 
     @skip_pre_ada
-    def test_fp8_pre_quantized(self, mocker):
+    def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_ada
-    def test_medusa_fp8_pre_quantized(self, mocker):
+    def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
         mocker.patch.object(self.__class__, "MODEL_PATH",
                             f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1")
@@ -812,7 +812,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--fast_build"])
 
     @skip_pre_blackwell
-    def test_nvfp4_pre_quantized(self, mocker):
+    def test_nvfp4_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
@@ -914,7 +914,7 @@ class TestQwen7BChat(CliFlowAccuracyTestHarness):
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 
-    def test_int4_gptq_pre_quantized(self, mocker):
+    def test_int4_gptq_prequantized(self, mocker):
         mocker.patch.object(self.__class__, "MODEL_PATH",
                             f"{llm_models_root()}/Qwen-7B-Chat-Int4")
         self.run(quant_algo=QuantAlgo.W4A16_GPTQ)
@@ -963,7 +963,7 @@ class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
 
-    def test_int4_awq_pre_quantized(self, mocker):
+    def test_int4_awq_prequantized(self, mocker):
         mocker.patch.object(self.__class__, "MODEL_PATH",
                             f"{llm_models_root()}/Qwen2-7B-Instruct-AWQ")
         self.run(quant_algo=QuantAlgo.W4A16_AWQ)
