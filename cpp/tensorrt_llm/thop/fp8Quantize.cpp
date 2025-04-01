@@ -75,6 +75,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self)
             act_scal_elesize, " elements, got ", scaleFP8SF.numel());
 
         // scaleFP8SF = scaleFP8SF[0:num_n_blocks, 0:m] // no 4-element alignment in blackwell
+        // TODO: This is a hack to use sm90 quantize kernel for sm100; ideally we should have a separate quantize kernel for sm100.
         scaleFP8SF
             = scaleFP8SF.slice(0, 0, act_scal_elesize).view({num_n_blocks, m_padded}).slice(1, 0, m).contiguous();
     }
