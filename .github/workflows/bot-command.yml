@@ -21,10 +21,9 @@ on:
   pull_request:
     types: [opened]
 
-# Add permission configuration
 permissions:
-  issues: write
   pull-requests: write
+  issues: write
   contents: read
 
 jobs:
@@ -79,9 +78,15 @@ jobs:
             "`reuse-pipeline `\n\n" +
             "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the merge request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
             "</details>";
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: helpMessage
-            });
+            
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: helpMessage
+              });
+            } catch (error) {
+              console.error('Failed to create comment:', error);
+              core.setFailed('Failed to add help comment');
+            }
