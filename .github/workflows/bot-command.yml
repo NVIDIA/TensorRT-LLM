@@ -20,6 +20,13 @@ on:
     types: [created]
   pull_request:
     types: [opened]
+
+# Add permission configuration
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
 jobs:
   Bot-command-check:
     name: Bot command check
