@@ -136,6 +136,24 @@ class TunableRunner(ABC):
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
 
+    def gen_custom_cache_key(self, inputs: List[torch.Tensor]) -> Tuple:
+        """Generate a custom cache key for the runner.
+        The cache key is used to identify the runner and the inputs.
+        Inputs and the runner's attributes can be used to generate the key.
+        And the key should be unique for different runners.
+        This method is optional, if not implemented, the default cache key generation will be used. And this method should not be invoked directly.
+
+        Args:
+            inputs: List of input tensors
+
+        Returns:
+            A tuple of values that can be used to generate a unique cache key
+        """
+        raise NotImplementedError
+
+    def is_gen_custom_cache_key_reimplemented(self) -> bool:
+        return self.__class__.gen_custom_cache_key != TunableRunner.gen_custom_cache_key
+
     @abstractmethod
     def forward(
             self,
@@ -191,8 +209,8 @@ class AutoTunerStatistics:
         tuned_op_successful_configs (Dict[str, int]): Successful configurations per operation
     """
     cache_misses: int = 0
-    cache_miss_config_collection: Dict[str, Set[tuple]] = field(
-        default_factory=dict)
+    cache_miss_config_collection: Dict[str,
+                                       Set[tuple]] = field(default_factory=dict)
     failed_profiling_count: Dict[str, Set[Tuple[str, TunableRunner,
                                                 OptimizationProfile]]] = field(
                                                     default_factory=dict)
@@ -271,9 +289,12 @@ class AutoTuner:
         """Search for cached profiling results matching the current configuration.
         """
         for r in runners:
-            if not hasattr(r, "get_specific_profile"):
-                found_profile = self._find_nearest_profile(tuning_config.dynamic_tensors, tuning_config.constraints, inputs)
-                cache_key = self.get_cache_key(custom_op, r, found_profile, inputs)
+            if not r.is_gen_custom_cache_key_reimplemented():
+                found_profile = self._find_nearest_profile(
+                    tuning_config.dynamic_tensors, tuning_config.constraints,
+                    inputs)
+                cache_key = self.get_cache_key(custom_op, r, found_profile,
+                                               inputs)
             else:
                 cache_key = self.get_cache_key(custom_op, r, None, inputs)
 
@@ -320,8 +341,10 @@ class AutoTuner:
                 self.stats.cache_misses += 1
                 if custom_op not in self.stats.cache_miss_config_collection:
                     self.stats.cache_miss_config_collection[custom_op] = set()
-                missed_profile = stored_profile.get_hash_key() if stored_profile else tuple(t.shape for t in inputs)
-                self.stats.cache_miss_config_collection[custom_op].add(missed_profile)
+                missed_profile = stored_profile.get_hash_key(
+                ) if stored_profile else tuple(t.shape for t in inputs)
+                self.stats.cache_miss_config_collection[custom_op].add(
+                    missed_profile)
 
                 logger.debug(f"[AutoTunner]: Using fallback tactic")
                 assert runner == runners[0] \
@@ -331,7 +354,7 @@ class AutoTuner:
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), \
             "All Given runners must be subclass of TunableRunner"
-        
+
         profiles = self._optimization_profiles(tuning_config.dynamic_tensors,
                                                tuning_config.constraints,
                                                inputs)
@@ -380,7 +403,8 @@ class AutoTuner:
                             runner, tactic = r, tac
                 if runner is not None:
                     # At least one valid (runner, tactic) pair is found
-                    cache_key = self.get_cache_key(custom_op, runner, p, tensors)
+                    cache_key = self.get_cache_key(custom_op, runner, p,
+                                                   tensors)
                     self.profiling_cache[cache_key] = (runner, tactic, p)
                     self.stats.tuned_op_successful_configs[
                         custom_op] = self.stats.tuned_op_successful_configs.get(
@@ -391,7 +415,8 @@ class AutoTuner:
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
-        _, runner, tactic, _ = self.search_cache(custom_op, runners, None, inputs, tuning_config)
+        _, runner, tactic, _ = self.search_cache(custom_op, runners, None,
+                                                 inputs, tuning_config)
 
         return runner, tactic
 
@@ -586,9 +611,9 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
-    def get_cache_key(
-            self, custom_op: str, runner: TunableRunner,
-            profile: OptimizationProfile, inputs: List[torch.Tensor]) -> Tuple:
+    def get_cache_key(self, custom_op: str, runner: TunableRunner,
+                      profile: OptimizationProfile,
+                      inputs: List[torch.Tensor]) -> Tuple:
         """Generate a unique cache key for the given custom operation, runner, inputs, and profile.
 
         Args:
@@ -606,8 +631,9 @@ class AutoTuner:
         # TODO: Eliminate the overhead of the cache key creation. env_key has not been added to the cache key yet.
         # NOTE: Attribute names affect the hash order
 
-        if hasattr(runner, "get_specific_profile"):
-            return (custom_op, runner.__class__.__name__, runner.get_specific_profile(inputs))
+        if runner.is_gen_custom_cache_key_reimplemented():
+            return (custom_op, runner.__class__.__name__,
+                    runner.gen_custom_cache_key(inputs))
 
         attributes = {
             k: v
@@ -619,6 +645,10 @@ class AutoTuner:
         profile_key = profile.get_hash_key()
         runner_key = runner.__class__.__name__
         return (custom_op, runner_key, attribute_key, profile_key)
+
+    def clear_cache(self) -> None:
+        """Clear the profiling cache."""
+        self.profiling_cache.clear()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

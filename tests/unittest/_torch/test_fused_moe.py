@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    DefaultMoeRoutingMethod,
@@ -53,6 +53,7 @@ def test_fused_moe(dtype, experts, RoutingMethodCls):
     fused_moe.load_weights([weights])
     fused_moe.cuda()
 
+    AutoTuner.get().clear_cache()
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
@@ -143,6 +144,7 @@ def test_fused_moe_fp8(dtype):
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
+    AutoTuner.get().clear_cache()
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
@@ -256,6 +258,7 @@ def test_fused_moe_nvfp4(dtype):
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
+    AutoTuner.get().clear_cache()
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 

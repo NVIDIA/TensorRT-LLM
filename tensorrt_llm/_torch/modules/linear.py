@@ -1,7 +1,7 @@
 import enum
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -145,15 +145,14 @@ class NVFP4GemmRunner(TunableRunner):
                 output_dtype] = torch.classes.trtllm.FP4GemmRunner(output_dtype)
         self._nvfp4_gemm_runner = NVFP4GemmRunner._runner_dict[output_dtype]
 
-    def get_specific_profile(self, inputs: List[torch.Tensor]):
+    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
         m, k = inputs[0].shape
         n = inputs[1].shape[0]
         return (next_positive_power_of_2(m), n, k, self.output_dtype)
 
     def get_valid_tactics(
         self,
-        *args,
-        **kwargs,
+        inputs: List[torch.Tensor],
     ) -> List[int]:
         return list(range(self._nvfp4_gemm_runner.get_num_configs()))
 
