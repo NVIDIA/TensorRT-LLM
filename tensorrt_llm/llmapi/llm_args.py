@@ -32,6 +32,7 @@ from ..bindings.executor import SchedulerConfig as _SchedulerConfig
 # yapf: enable
 from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
+from ..lora_manager import PeftConfig
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
@@ -752,6 +753,8 @@ LLMARGS_IMPLICIT_DOCSTRING = """
         extended_runtime_perf_knob_config (tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
 
         backend (str, optional): The backend to use. None means TensorRT engine and C++ executor. Defaults to None.
+
+        peft_config (PeftConfig, optional): The PEFT configuration for the model. Defaults to None.
 """
 
 
@@ -894,6 +897,10 @@ class LlmArgs:
     # private options
     _num_postprocess_workers: int = 0  # Number of postprocess worker processes
     _postprocess_tokenizer_dir: Optional[str] = None
+
+    # configuration of peft model
+    # FIXME consider how to combine with peft_cache_config
+    peft_config: Optional[PeftConfig] = None
 
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future

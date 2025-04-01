@@ -580,7 +580,8 @@ class LLM:
                 num_postprocess_workers=self.args._num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True)
+            is_llm_executor=True,
+            peft_config=self.args.peft_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:

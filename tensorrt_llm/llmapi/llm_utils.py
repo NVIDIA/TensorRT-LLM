@@ -23,6 +23,7 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
 from ..logger import logger
+from ..lora_manager import PeftConfig
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
 from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
@@ -791,32 +792,14 @@ class LlmBuildStats:
 
 
 __all__ = [
-    'LlmArgs',
-    'LlmBuildStats',
-    'ModelLoader',
-    '_ModelRuntimeContext',
-    '_ModelInfo',
-    '_ParallelConfig',
-    '_ModelFormatKind',
-    '_ModelWrapper',
-    'BatchingType',
-    'ExecutorConfig',
-    'SchedulerConfig',
-    'KvCacheRetentionConfig',
-    'LookaheadDecodingConfig',
-    'MedusaDecodingConfig',
-    'MTPDecodingConfig',
-    'ContextChunkingPolicy',
-    'CapacitySchedulerPolicy',
-    'BuildConfig',
-    'BuildCacheConfig',
-    'QuantConfig',
-    'CalibConfig',
-    'KvCacheConfig',
-    'CachedModelLoader',
-    'ConfigArbitrateError',
-    '_ConfigArbitrator',
-    'EagleDecodingConfig',
-    'update_llm_args_with_extra_dict',
-    'update_llm_args_with_extra_options',
+    'LlmArgs', 'LlmBuildStats', 'ModelLoader', '_ModelRuntimeContext',
+    '_ModelInfo', '_ParallelConfig', '_ModelFormatKind', '_ModelWrapper',
+    'BatchingType', 'ExecutorConfig', 'SchedulerConfig',
+    'KvCacheRetentionConfig', 'LookaheadDecodingConfig', 'MedusaDecodingConfig',
+    'MTPDecodingConfig', 'ContextChunkingPolicy', 'CapacitySchedulerPolicy',
+    'BuildConfig', 'BuildCacheConfig', 'QuantConfig', 'CalibConfig',
+    'KvCacheConfig', 'CachedModelLoader', 'ConfigArbitrateError',
+    '_ConfigArbitrator', 'EagleDecodingConfig',
+    'update_llm_args_with_extra_dict', 'update_llm_args_with_extra_options',
+    'PeftConfig'
 ]

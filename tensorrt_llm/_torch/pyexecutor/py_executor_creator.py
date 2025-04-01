@@ -6,6 +6,7 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import PeftConfig
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
@@ -90,7 +91,8 @@ def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
-                       engine_dir: str = None):
+                       engine_dir: str = None,
+                       peft_config: PeftConfig = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -241,6 +243,16 @@ def create_py_executor(executor_config: ExecutorConfig,
             resources["spec_resource_manager"] = spec_resource_manager
     else:
         spec_decoder = None
+
+    if peft_config is not None:
+        peft_config.update_model_config(model_engine.model.config.hidden_size,
+                                        torch_dtype_to_str(model_engine.dtype))
+        # TODO (dafrimi) wait for shachar PR
+        # peft_cache_manager = PeftCacheManager(
+        #     peft_cache_config=executor_config.peft_cache_config,
+        #     model_config=model_engine.model.config,
+        #     peft_config=peft_config)
+        # resources["peft_cache_manager"] = peft_cache_manager
 
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:

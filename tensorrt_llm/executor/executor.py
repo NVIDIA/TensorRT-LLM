@@ -25,6 +25,7 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
+from ..lora_manager import PeftConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
@@ -324,8 +325,9 @@ class GenerationExecutor(ABC):
         mpi_session: Optional[MpiSession] = None,
         reuse_mpi_comm: bool = False,
         return_logits: bool = False,
-        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        postproc_worker_config: Optional[Postpr1ocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        peft_config: Optional[PeftConfig] = None,
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import ExecutorBindingsProxy
@@ -353,6 +355,10 @@ class GenerationExecutor(ABC):
             "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
         }
+
+        if peft_config is not None:
+            print("peft_config is not None in create of GenerationExecutor")
+            worker_kwargs["peft_config"] = peft_config
 
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)

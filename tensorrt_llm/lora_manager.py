@@ -21,6 +21,70 @@ if TYPE_CHECKING:
     from .runtime import ModelConfig
 
 
+def get_default_trtllm_modules_to_hf_modules():
+    return {
+        "attn_q": "q_proj",
+        "attn_k": "k_proj",
+        "attn_v": "v_proj",
+        "attn_dense": "o_proj",
+        "mlp_h_to_4h": "gate_proj",
+        "mlp_4h_to_h": "down_proj",
+        "mlp_gate": "up_proj",
+        "moe_h_to_4h": "w1",
+        "moe_4h_to_h": "w2",
+        "moe_gate": "w3",
+        "moe_router": "gate",
+        "mlp_gate_up": "gate_up_proj",
+    }
+
+
+@dataclass
+class PeftConfig:
+
+    # TODO check that can we merge it with LoraConfig or not
+    # FIXME Refine this class
+    def __init__(self):
+        self.lora_target_modules = [
+            'attn_q', 'attn_k', 'attn_v', 'attn_qkv', 'attn_dense',
+            'cross_attn_dense', 'cross_attn_k', 'cross_attn_q',
+            'cross_attn_qkv', 'cross_attn_v', 'mlp_4h_to_h', 'mlp_gate',
+            'mlp_gate_up', 'mlp_h_to_4h', 'mlp_router', 'moe_4h_to_h',
+            'moe_gate', 'moe_h_to_4h', 'moe_router'
+        ]
+        self.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+        )
+        self.hidden_size: int = None
+        self.dtype: str = None
+
+        # FIXME
+        self.lora_prefetch_dir: str = None
+        self.lora_manager_prefetch_dir_list: List[str] = []
+        self.device_cache_percent: int = 0.5
+
+    def update_model_config(self, hidden_size, dtype):
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+
+    @staticmethod
+    def hidden_size(self):
+        assert self.hidden_size is not None, "The hidden_size of PeftConfig is not initialized."
+        return self.hidden_size
+
+    @staticmethod
+    def dtype(self):
+        assert self.dtype is not None, "The dtype of PeftConfig is not initialized."
+        return self.dtype
+
+
+@dataclass
+class LoraParam:
+
+    def __init__(self, config, weights, task_ids):
+        self.config = config
+        self.weights = weights
+        self.task_ids = task_ids
+
+
 def get_all_nemo_lora_weights(lora_weights):
     layer_weights = defaultdict(dict)
     adapter_key = "self_attention.adapter_layer.lora_kqv_adapter"
@@ -451,12 +515,14 @@ class LoraManager(object):
     def missing_qkv_modules(self) -> List[str]:
         return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
 
-    def load_from_ckpt(self,
-                       model_dirs_or_files: List[str],
-                       model_config: 'ModelConfig',
-                       runtime_mapping: Optional[Mapping] = None,
-                       uids: Optional[List[str]] = None,
-                       ckpt_source: str = 'hf'):
+    def load_from_ckpt(
+            self,
+            model_dirs_or_files: List[str],
+            model_config:
+        'ModelConfig',  # FIXME (dafrimi) change the class to be ModelConfig? PeftConfig?
+            runtime_mapping: Optional[Mapping] = None,
+            uids: Optional[List[str]] = None,
+            ckpt_source: str = 'hf'):
         if ckpt_source == 'hf':
             self.load_from_hf(model_dirs=model_dirs_or_files,
                               model_config=model_config,
@@ -470,11 +536,13 @@ class LoraManager(object):
         else:
             assert False, f"{self.__class__.__name__} does not support source {ckpt_source}"
 
-    def load_from_nemo(self,
-                       model_files: List[str],
-                       model_config: 'ModelConfig',
-                       runtime_mapping: Optional[Mapping] = None,
-                       uids: Optional[List[str]] = None):
+    def load_from_nemo(
+            self,
+            model_files: List[str],
+            model_config:
+        'ModelConfig',  # FIXME (dafrimi) change the class to be ModelConfig? PeftConfig?
+            runtime_mapping: Optional[Mapping] = None,
+            uids: Optional[List[str]] = None):
         if runtime_mapping is None:
             runtime_mapping = Mapping()
         tp_size = runtime_mapping.tp_size
@@ -571,12 +639,14 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
-    def load_from_hf(self,
-                     model_dirs: List[str],
-                     model_config: 'ModelConfig',
-                     runtime_mapping: Optional[Mapping] = None,
-                     uids: Optional[List[str]] = None,
-                     component: Optional[str] = None):
+    def load_from_hf(
+            self,
+            model_dirs: List[str],
+            model_config:
+        'ModelConfig',  # todo change the class to be ModelConfig? PeftConfig?
+            runtime_mapping: Optional[Mapping] = None,
+            uids: Optional[List[str]] = None,
+            component: Optional[str] = None):
         '''
         lora config of https://huggingface.co/hfl/chinese-alpaca-2-lora-7b
         {
@@ -646,9 +716,16 @@ class LoraManager(object):
 
         lora_hf_configs = []
         for model_dir in new_model_dirs:
-            with open(f"{model_dir}/adapter_config.json", 'r') as f:
-                config = json.load(f)
-                lora_hf_configs.append(config)
+            if model_dir is not None:
+                with open(f"{model_dir}/adapter_config.json", 'r') as f:
+                    config = json.load(f)
+                    lora_hf_configs.append(config)
+            else:  # todo (dafrimi): add default config
+                lora_hf_configs.append({
+                    "r": 0,
+                    "use_rslora": False,
+                    "lora_alpha": 1.0,
+                })
 
         self.lora_target_modules = model_config.lora_target_modules
         hf_modules_to_trtllm_modules = invert_module_mapping(
