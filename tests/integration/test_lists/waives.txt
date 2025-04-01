@@ -450,8 +450,6 @@ full:B40/perf/test_perf.py::test_perf[t5_11b] SKIP (bert_attention_plugin does n
 full:B40/perf/test_perf.py::test_perf[t5_3b] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B40/perf/test_perf.py::test_perf[t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B40/perf/test_perf.py::test_perf[t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5166600)
-disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5184661)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization] SKIP (https://nvbugspro.nvidia.com/bug/5181262)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)

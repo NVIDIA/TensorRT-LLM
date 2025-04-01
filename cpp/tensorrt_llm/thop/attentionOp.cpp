@@ -285,10 +285,13 @@ public:
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
             {
-                TORCH_CHECK(block_ids_per_seq.has_value());
-                int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
+                if (op.mUseFlashMLA == true)
+                {
+                    TORCH_CHECK(block_ids_per_seq.has_value());
+                    int const* block_ids_per_seq_ptr = static_cast<int*>(block_ids_per_seq->data_ptr());
+                    mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
+                }
                 mla_params.cache_seq_lens = sequence_lengths_ptr;
-                mla_params.block_ids_per_seq = block_ids_per_seq_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
             }
             else
