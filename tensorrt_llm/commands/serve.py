@@ -6,31 +6,15 @@ import click
 import torch
 import yaml
 from torch.cuda import device_count
-
-if (os.getenv("OMPI_COMM_WORLD_RANK")):
-    env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
-elif (os.getenv("SLURM_PROCID")):
-    env_global_rank = int(os.environ["SLURM_PROCID"])
-else:
-    raise RuntimeError("Could not determine rank from environment")
-device_id = env_global_rank % device_count()
-print(
-    f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
-)
-torch.cuda.set_device(device_id)
-
-from mpi4py.futures import MPICommExecutor
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             DynamicBatchConfig, SchedulerConfig)
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, MpiCommSession
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              parse_disagg_config_file,
-                                              split_world_comm)
+                                              parse_disagg_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -278,6 +262,20 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
 
+def set_cuda_device():
+    if (os.getenv("OMPI_COMM_WORLD_RANK")):
+        env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+    elif (os.getenv("SLURM_PROCID")):
+        env_global_rank = int(os.environ["SLURM_PROCID"])
+    else:
+        raise RuntimeError("Could not determine rank from environment")
+    device_id = env_global_rank % device_count()
+    print(
+        f"env_global_rank: {env_global_rank}, set device_id: {device_id} before importing mpi4py"
+    )
+    torch.cuda.set_device(device_id)
+
+
 @click.command("disaggregated_mpi_worker")
 @click.option("-c",
               "--config_file",
@@ -286,6 +284,14 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
               help="Specific option for disaggregated mode.")
 def disaggregated_mpi_worker(config_file: Optional[str]):
     """Launching disaggregated MPI worker"""
+
+    set_cuda_device()
+    # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
+    from mpi4py.futures import MPICommExecutor
+
+    from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
+    from tensorrt_llm.llmapi import MpiCommSession
+    from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
