@@ -410,12 +410,18 @@ class ModelLoader:
                 hf_quant_config = hf_config.get("quantization_config", None)
 
             if hf_quant_config is not None:
+                logger.info(
+                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                )
                 # DeepSeek V3 FP8 ckpt
                 if hf_quant_config.get(
                         "quant_method") == "fp8" and hf_quant_config.get(
-                            "weight_block_size", []):
+                            "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported quantization_config: {hf_quant_config}.")
 
                 return True
 
