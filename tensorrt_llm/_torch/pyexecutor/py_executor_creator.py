@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..speculative import (Eagle3Config, get_num_spec_layers, get_spec_decoder,
                            get_spec_resource_manager)
-from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
+from ._util import estimate_max_kv_cache_tokens, is_mla
 from .config import PyTorchConfig
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
@@ -202,7 +202,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
-        if check_flash_mla_config(config):
+        if model_engine.model.model_config.enable_flash_mla:
             executor_config.tokens_per_block = 64
             logger.info(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"

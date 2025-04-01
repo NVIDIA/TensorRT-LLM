@@ -41,6 +41,10 @@ l0_h100:
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-enable_request_rate] # negative test
+  - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_trtllm_bench_iteration_log[PyTorch-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_trtllm_bench_iteration_log[TRT-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  - test_e2e.py::test_trtllm_bench_iteration_log[TRT-non-streaming-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_help_sanity[meta-llama/Llama-3.1-8B]
   - accuracy/test_accuracy.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
   - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[] # 5 mins
@@ -48,6 +52,7 @@ l0_h100:
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.1-8b]
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.2-1b]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
+  - examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it]
   - unittest/trt/model_api/test_model_level_api.py # 9 mins on H100
   - unittest/trt/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100
   - unittest/trt/model/test_gpt_e2e.py # 3 mins / 6 mins on H100
@@ -88,7 +93,6 @@ l0_h100:
       stage: post_merge
   tests:
   # ------------- CPP tests ---------------
-  - test_cpp.py::test_model[fp8-chatglm-90]
   - test_cpp.py::test_model[bart-90]
   - test_cpp.py::test_benchmarks[bart-90]
   # ------------- TRT tests ---------------
@@ -97,10 +101,8 @@ l0_h100:
   - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins
   - examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[cogvlm-chat-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[cogvlm-chat-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
@@ -136,6 +138,7 @@ l0_h100:
   - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
   - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
   - accuracy/test_accuracy.py::TestMinitron4BBase::test_fp8
+  - accuracy/test_accuracy.py::TestNemotronMini4BInstruct::test_fp8_pre_quantized
   - accuracy/test_accuracy.py::TestTinyLlama1_1BChat::test_float32
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context
   - accuracy/test_accuracy.py::TestLlama3_8BInstructGradient1048k::test_long_context_ppl

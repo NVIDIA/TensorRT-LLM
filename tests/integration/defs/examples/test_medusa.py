@@ -16,7 +16,8 @@
 import os
 
 import pytest
-from defs.common import convert_weights, generate_dummy_medusa, venv_check_call
+from defs.common import (convert_weights, get_dummy_spec_decoding_heads,
+                         venv_check_call)
 from defs.conftest import skip_fp8_pre_ada
 from defs.trt_test_alternative import check_call
 
@@ -201,10 +202,10 @@ def test_with_dummy_medusa(hf_model_root, medusa_example_root, llm_venv,
                            cmodel_dir, engine_dir, batch_size, data_type,
                            num_medusa_heads, use_py_session, model_type):
     print("Creating dummy Medusa heads...")
-    generate_dummy_medusa(hf_model_dir=hf_model_root,
-                          save_dir=llm_venv.get_working_directory(),
-                          mode='medusa',
-                          num_heads=num_medusa_heads)
+    get_dummy_spec_decoding_heads(hf_model_dir=hf_model_root,
+                                  save_dir=llm_venv.get_working_directory(),
+                                  mode='medusa',
+                                  num_heads=num_medusa_heads)
 
     print("Converting to TRTLLM checkpoints...")
     model_name = model_type + "_medusa"

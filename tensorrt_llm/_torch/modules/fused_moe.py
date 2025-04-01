@@ -5,9 +5,10 @@ import torch
 from torch import nn
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
-from ..distributed import allgather
+from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
-from ..utils import disable_fp4_allgather, is_torch_compiling, reswizzle_sf
+from ..utils import (EventType, disable_fp4_allgather, is_torch_compiling,
+                     reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -198,9 +199,9 @@ class FusedMoE(nn.Module):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
+        aux_stream (torch.cuda.Stream): Auxiliary CUDA stream to overlap chunks.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
-        tune_max_num_tokens (int): Maximum number of tokens for performance tuning.
         model_config (ModelConfig): Configuration object for the model.
     """
 
@@ -213,8 +214,8 @@ class FusedMoE(nn.Module):
             intermediate_size: int,
             dtype: Optional[torch.dtype] = None,
             reduce_results: bool = False,
-            tune_max_num_tokens: int = 8192,
             model_config: ModelConfig = ModelConfig(),
+            aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
     ):
         from ..distributed import AllReduce
 
@@ -223,6 +224,12 @@ class FusedMoE(nn.Module):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+
+        self.aux_stream = aux_stream
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeChunkingOverlap]
+        }
 
         self.dtype = dtype
         self.reduce_results = reduce_results
@@ -256,7 +263,18 @@ class FusedMoE(nn.Module):
             self.expert_start + self.expert_size_per_partition,
             self.num_experts)
 
-        self.tune_max_num_tokens = tune_max_num_tokens
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
+        if self.moe_max_num_tokens is None:
+            self.moe_max_num_tokens = model_config.max_num_tokens
+            if self.use_dp:
+                self.moe_max_num_tokens *= model_config.mapping.world_size
+        # The profiler converges on the same best tactic when the number of tokens is large enough.
+        # To avoid long profiling time, the max number of tokens used in the profiling is capped to
+        # around 16k tokens per expert, which is well into the compute bound domain.
+        self.tune_max_num_tokens = min(
+            self.moe_max_num_tokens,
+            16384 * num_experts / routing_method.get_experts_per_token(),
+        )
         self.has_been_profiled = False
 
         self._weights_created = False
@@ -484,7 +502,18 @@ class FusedMoE(nn.Module):
             outputs.append(output)
         return outputs
 
-    def forward(
+    def reducescatter_or_allreduce(self, inputs):
+        outputs = inputs
+        if self.parallel_size > 1:
+            if self.use_dp:
+                outputs = reducescatter(inputs,
+                                        self.parallel_config,
+                                        scatter_dim=0)
+            elif self.reduce_results:
+                outputs = self.all_reduce(inputs)
+        return outputs
+
+    def forward_chunk(
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
@@ -570,10 +599,64 @@ class FusedMoE(nn.Module):
             use_fp8_block_scaling=use_fp8_block_scaling,
         )
 
-        if self.reduce_results and self.parallel_size > 1:
-            final_hidden_states = self.all_reduce(final_hidden_states)
-
         return final_hidden_states
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        max_chunk_size = self.moe_max_num_tokens
+        if self.use_dp:
+            assert all_rank_num_tokens is not None
+            if not disable_fp4_allgather():
+                max_chunk_size //= len(all_rank_num_tokens)
+        num_chunks = (x.shape[0] + max_chunk_size - 1) // max_chunk_size
+        if num_chunks == 1:
+            outputs = self.forward_chunk(x, router_logits)
+            outputs = self.reducescatter_or_allreduce(outputs)
+        else:
+            val_div = x.shape[0] // num_chunks
+            val_mod = x.shape[0] % num_chunks
+            chunk_size_list = [val_div + 1
+                               ] * val_mod + [val_div] * (num_chunks - val_mod)
+            x_list = x.split(chunk_size_list)
+            router_logits_list = router_logits.split(chunk_size_list)
+            outputs_list = []
+            self.event_dict[EventType.Main].record()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+            # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
+            for idx_chunk, (x, router_logits) in enumerate(
+                    zip(x_list, router_logits_list)):
+                if idx_chunk % 2 == 0:
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs = self.forward_chunk(x, router_logits)
+                    if idx_chunk > 0:
+                        outputs_list[-1] = self.reducescatter_or_allreduce(
+                            outputs_list[-1])
+                else:
+                    outputs = self.forward_chunk(x, router_logits)
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs_list[-1] = self.reducescatter_or_allreduce(
+                            outputs_list[-1])
+                outputs_list.append(outputs)
+            if num_chunks % 2 == 0:
+                outputs_list[-1] = self.reducescatter_or_allreduce(
+                    outputs_list[-1])
+            else:
+                with torch.cuda.stream(self.aux_stream):
+                    outputs_list[-1] = self.reducescatter_or_allreduce(
+                        outputs_list[-1])
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.MoeChunkingOverlap].record()
+            self.event_dict[EventType.MoeChunkingOverlap].wait()
+            outputs = torch.cat(outputs_list)
+        if self.use_dp:
+            rank = self.parallel_config.tensor_parallel_rank
+            outputs = outputs[:all_rank_num_tokens[rank]]
+        return outputs
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created

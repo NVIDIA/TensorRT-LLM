@@ -174,6 +174,20 @@ class TestMinitron4BBase(AccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
 
+class TestNemotronMini4BInstruct(AccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron/Nemotron-Mini-4B-Instruct"
+    EXAMPLE_FOLDER = "gpt"
+
+    @skip_pre_ada
+    def test_fp8_pre_quantized(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
+        )
+        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
+
+
 class TestPhi2(AccuracyTestHarness):
     MODEL_NAME = "microsoft/phi-2"
     MODEL_PATH = f"{llm_models_root()}/phi-2"

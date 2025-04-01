@@ -23,22 +23,6 @@ def is_mla(config):
     return False
 
 
-def is_hopper():
-    if torch.cuda.get_device_capability() == (9, 0):
-        return True
-    return False
-
-
-def check_flash_mla_config(config):
-    if is_mla(config):
-        if is_hopper():
-            if hasattr(config, "qk_rope_head_dim"):
-                head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-                if head_dim == 576:
-                    return True
-    return False
-
-
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping):
     # TODO: take space occupied by draft KV cache manager into account.
@@ -67,7 +51,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
 
-    mem_per_token *= config.num_hidden_layers * head_dim
+    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
 
