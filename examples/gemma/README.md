@@ -24,6 +24,8 @@
       - [Run inference under INT8 KV caches for keras checkpoint](#run-inference-under-int8-kv-caches-for-keras-checkpoint)
     - [Run Gemma 2](#run-gemma-2)
       - [Run inference under bfloat16 for torch checkpoint](#run-inference-under-bfloat16-for-torch-checkpoint-1)
+    - [Run Gemma 3](#run-gemma-3)
+      - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint-1)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
       - [Quantize Checkpoints](#quantize-checkpoints)
@@ -628,6 +630,52 @@ Average accuracy 0.697 - other (business, health, misc.)
 Average accuracy: 0.630
 ```
 
+### Run Gemma 3
+
+Gemma 3's text generation model from HuggingFace is supported. Gemma3 1B model interleaves 5 local layers between each global layer. While local layers use sliding window attention with a short span of 512 tokens, global layers attend to the long context. TRTLLM support layerwise sliding-window attention and the sliding window size for each layer could be passed in using the `--max_attention_window_size` parameter at runtime. If a subpattern is provided, TRTLLM can extrapolate the complete pattern and the extrapolation logic is printed to terminal.
+
+#### Run inference under bfloat16 for HF checkpoint
+```bash
+git clone https://huggingface.co/google/gemma-3-1b-it
+
+CKPT_PATH=gemma-3-1b-it/
+UNIFIED_CKPT_PATH=/tmp/checkpoints/tmp_1b_it_tensorrt_llm/bf16/tp1/
+ENGINE_PATH=/tmp/gemma3/1b/bf16/1-gpu/
+VOCAB_FILE_PATH=gemma-3-1b-it/tokenizer.model
+
+python3 ./examples/gemma/convert_checkpoint.py \
+    --ckpt-type hf \
+    --model-dir ${CKPT_PATH} \
+    --dtype bfloat16 \
+    --world-size 1 \
+    --output-model-dir ${UNIFIED_CKPT_PATH}
+
+trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 3000 \
+             --max_seq_len 3100 \
+             --output_dir ${ENGINE_PATH}
+
+python3 ./examples/summarize.py --test_trt_llm \
+                      --vocab_file ${VOCAB_FILE_PATH} \
+                      --engine_dir ${ENGINE_PATH} \
+                      --batch_size 1 \
+                      --max_ite 5 \
+                      --max_attention_window_size 512 512 512 512 512 3100
+
+...
+[TensorRT-LLM][INFO] TRTGptModel mMaxAttentionWindowSize: (512, 512, 512, 512, 512, 3100) * 4 + (512, 512)
+...
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (total latency: 1.6197962760925293 sec)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 475)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 293.2467539349165)
+[04/09/2025-18:28:26] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[04/09/2025-18:28:26] [TRT-LLM] [I]   rouge1: 22.780314381954003
+[04/09/2025-18:28:26] [TRT-LLM] [I]   rouge2: 4.331099231480823
+[04/09/2025-18:28:26] [TRT-LLM] [I]   rougeL: 15.26751867562475
+[04/09/2025-18:28:26] [TRT-LLM] [I]   rougeLsum: 20.14696930976001
+```
 
 ### Run Modelopt Quantization
 
