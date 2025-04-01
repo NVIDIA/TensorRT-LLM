@@ -1129,7 +1129,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
             // First count the number of blocks to pre-allocate the vector
             auto currentBlock = lastBlock;
             size_t blockCount = 0;
-            while (currentBlock != nullptr)
+            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
             {
                 blockCount++;
                 currentBlock = currentBlock->getPrevBlockInSeq();
@@ -1142,7 +1142,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
             // Now traverse backwards and fill from the end
             currentBlock = lastBlock;
             size_t currentIndex = blockCount - 1;
-            while (currentBlock != nullptr)
+            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
             {
                 cacheBlockIds[currentIndex] = currentBlock->getBlockId();
                 allocatedBlocks[currentIndex] = currentBlock;
