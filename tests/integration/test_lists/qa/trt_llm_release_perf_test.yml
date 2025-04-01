@@ -13,34 +13,37 @@ trt_llm_release_perf_test:
   - perf/test_perf.py::test_perf[roberta_base-cpp-plugin-float16-bs:32+64-input_len:128+512]
 
   # E2E gptManagerBenchmark IFB
-  - perf/test_perf.py::test_perf[llama_7b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b-bench-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_hf-bench-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[mistral_7b_v0.1_hf-bench-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-static_batching-plugin_ifb-float16-bs:8+64-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.0-input_output_len:128,128+512,32]
   - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-bfloat16-gwp:0.5-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[qwen2_7b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[starcoder2_3b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200]
 
   # E2E ENC-DEC
-  - perf/test_perf.py::test_perf[t5_base-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[t5_large-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
   - perf/test_perf.py::test_perf[t5_large-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[t5_3b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[flan_t5_base-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[flan_t5_large-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[whisper_large_v3-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
+
+  # E2E trtllm-bench
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-streaming-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-streaming-float16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[qwen2_7b_instruct-bench-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[starcoder2_3b-bench-float16-input_output_len:512,200]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:128,128]
+
+  # E2E ENC-DEC
   - perf/test_perf.py::test_perf[bart_large_cnn-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
   - perf/test_perf.py::test_perf[mbart_large_50_many_to_one_mmt-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[mamba_370m-cppmanager-exe-plugin-float16-input_output_len:128,128+512,32]
-  - perf/test_perf.py::test_perf[mamba_2.8b-cppmanager-exe-plugin-float16-input_output_len:128,128+512,32]
-
+  - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20]
+  - perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20]
+  - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20]
+  - perf/test_perf.py::test_perf[whisper_large_v3-bench-float16-input_output_len:128,20]
+  - perf/test_perf.py::test_perf[mamba_370m-bench-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[mamba_370m-bench-float16-input_output_len:512,32]
+  - perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:128,128]
+  - perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:512,32]
   # Test list validation
   - test_list_validation.py::test_list_validation
 
@@ -49,18 +52,18 @@ trt_llm_release_perf_test:
       system_gpu_count:
         gte: 2
   tests:
-  - perf/test_perf.py::test_perf[t5_11b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[flan_t5_xl-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[flan_t5_xxl-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:int8_sq_per_tensor-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:int8_sq_per_token_channel-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-mp-maxbs:256-input_output_len:128,128-pp:2]
-  - perf/test_perf.py::test_perf[llama_v2_13b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-loras:8-gpus:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-loras:8-gpus:2]
-  - perf/test_perf.py::test_perf[llama_13b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:2]
-  - perf/test_perf.py::test_perf[llama_30b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-tp:2]
+  - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20-gpus:2]
+  - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-quant:int8_sq-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-quant:int8_wo-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-streaming-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-maxbs:256-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:128,128-loras:8-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-loras:8-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:512,32-gpus:2]
 
 - condition:
     ranges:
@@ -70,37 +73,24 @@ trt_llm_release_perf_test:
         gt: 80000
   tests:
   - perf/test_perf.py::test_perf[llama_70b_sq_per_tensor-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:1024,1024-tp:2]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128+512,32-gpus:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-tp:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:2]
   - perf/test_perf.py::test_perf[mixtral_8x7b-cppmanager-exe-plugin_ifb-float16-mp-input_output_len:128,128+512,32-gpus:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-maxbs:256-input_output_len:128,128+512,32-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128+512,32-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-streaming-float16-input_output_len:128,128-gpus:2]
 
 - condition:
     ranges:
       system_gpu_count:
         gte: 4
   tests:
-  - perf/test_perf.py::test_perf[flan_t5_xxl-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:4]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-streaming-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:4]
-  - perf/test_perf.py::test_perf[llama_70b_sq_per_tensor-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:4]
-  - perf/test_perf.py::test_perf[qwen_14b_chat-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-gpus:4]
-  - perf/test_perf.py::test_perf[starcoder_15.5b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-gpus:4]
-
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 8
-  tests:
-  - perf/test_perf.py::test_perf[gpt_175b-cppmanager-exe-plugin_ifb-float16-maxbs:8-input_output_len:128,128+512,32-reqs:80-gpus:8]
-  - perf/test_perf.py::test_perf[llama_70b_long_context-cppmanager-exe-plugin_ifb-float16-input_output_len:2000,200-reqs:64-gpus:8]
-  - perf/test_perf.py::test_perf[llama_70b_long_generation-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-con:200-gpus:8]
-  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-con:1-gpus:8]
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-reqs:64-gpus:8]
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-reqs:64-con:50-gpus:8]
+  - perf/test_perf.py::test_perf[flan_t5_xxl-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[flan_t5_xxl-cppmanager-exe-plugin_ifb-float16-input_output_len:512,32-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-streaming-float16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:512,32-gpus:4]
+  - perf/test_perf.py::test_perf[qwen_14b_chat-bench-float16-input_output_len:128,128-gpus:4]
+  - perf/test_perf.py::test_perf[qwen_14b_chat-bench-float16-input_output_len:512,32-gpus:4]
+  - perf/test_perf.py::test_perf[starcoder_15b-bench-float16-input_output_len:512,200-gpus:4]
 
 - condition:
     ranges:
@@ -109,10 +99,22 @@ trt_llm_release_perf_test:
       gpu_memory:
         gt: 80000
   tests:
-  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-reqs:64-con:1-gpus:8]
+  # E2E trtllm-bench
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-loras:8-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-float16-input_output_len:128,128-reqs:64-gpus:8]
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-float16-input_output_len:128,128-reqs:64-con:50-gpus:8]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1_instruct-bench-float16-input_output_len:128,128-reqs:64-con:1-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:1024,1024-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:200,2000-reqs:64-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-float16-input_output_len:200,2000-reqs:64-con:200-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-float16-input_output_len:200,2000-reqs:64-con:1-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct-bench-float16-input_output_len:2000,200-reqs:64-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8]
+  - perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8]
 
 - condition:
+    # for 8xH200
     ranges:
       system_gpu_count:
         gte: 8
@@ -121,31 +123,29 @@ trt_llm_release_perf_test:
   tests:
   - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:32-input_output_len:128,128-quant:fp8-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-streaming-float16-maxbs:32-input_output_len:128,128-quant:fp8-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:1-input_output_len:1000,2000-reqs:10-quant:fp8-con:1-ep:4-tp:8-gpus:8] #min latency test
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-quant:fp8-con:1024-ep:8-tp:8-gpus:8] #max throughput test
 
 # FP8 specific tests
 - condition:
     terms:
       supports_fp8: true
   tests:
-  - perf/test_perf.py::test_perf[llama_v3_8b_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000-quant:fp8]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:fp8]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128-beams:4-quant:fp8]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:int4_awq]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:w4a8_awq]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-maxbs:256-input_output_len:128,128+512,32-quant:fp8]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_hf-bench-float16-input_output_len:128,128-quant:fp8]
-  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_hf-bench-pytorch-float16-input_output_len:128,128-quant:fp8]
-  - perf/test_perf.py::test_perf[mistral_7b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000+500,2000-quant:fp8]
-  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000+500,2000-quant:fp8]
 
-- condition:
-    terms:
-      supports_fp8: true
-    ranges:
-      gpu_memory:
-        gt: 80000
-  tests:
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128-quant:int4_awq]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128-quant:w4a8_awq]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-maxbs:256-input_output_len:128,128-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-maxbs:256-input_output_len:512,32-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:1000,1000-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-quant:fp8]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-float16-input_output_len:128,128-quant:fp8]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:1000,1000-quant:fp8]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8]
+  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-input_output_len:1000,1000-quant:fp8]
+  - perf/test_perf.py::test_perf[phi_3_mini_4k_instruct-bench-float16-input_output_len:500,2000-quant:fp8]
 
 - condition:
     terms:
@@ -154,11 +154,15 @@ trt_llm_release_perf_test:
       system_gpu_count:
         gte: 2
   tests:
-  - perf/test_perf.py::test_perf[llama_13b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:2]
-  - perf/test_perf.py::test_perf[llama_30b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-quant:fp8-gpus:2]
-  - perf/test_perf.py::test_perf[mixtral_8x7b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:2]
-  - perf/test_perf.py::test_perf[mistral_7b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000+500,2000-quant:fp8-tp:2]
-  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-cppmanager-exe-plugin_ifb-float16-input_output_len:1000,1000+500,2000-quant:fp8-tp:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:128,128-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:512,32-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:512,200-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:512,32-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:1000,1000-quant:fp8-tp:2]
+  - perf/test_perf.py::test_perf[mistral_7b_v0.1-bench-float16-input_output_len:500,2000-quant:fp8-tp:2]
+  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-float16-input_output_len:1000,1000-quant:fp8-tp:2]
+  - perf/test_perf.py::test_perf[phi_3_mini_128k_instruct-bench-float16-input_output_len:500,2000-quant:fp8-tp:2]
 
 - condition:
     terms:
@@ -170,6 +174,8 @@ trt_llm_release_perf_test:
         gt: 80000
   tests:
   - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:128,128-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-bench-float16-input_output_len:512,32-quant:fp8-gpus:2]
+  - perf/test_perf.py::test_perf[llama_v3.2_11b-bench-float16-input_output_len:512,200-quant:fp8-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:128,128-quant:fp8-tp:2]
 
 - condition:
@@ -179,9 +185,9 @@ trt_llm_release_perf_test:
       system_gpu_count:
         gte: 4
   tests:
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-quant:fp8-tp:4]
-  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:4]
-  - perf/test_perf.py::test_perf[starcoder_15.5b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:4]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:512,200-quant:fp8-tp:4]
+  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-bench-float16-input_output_len:512,512-quant:fp8-tp:4]
+  - perf/test_perf.py::test_perf[starcoder_15b-bench-float16-input_output_len:512,512-quant:fp8-tp:4]
 
 - condition:
     terms:
@@ -190,8 +196,9 @@ trt_llm_release_perf_test:
       system_gpu_count:
         gte: 8
   tests:
-  - perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:8]
-  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:128,128-quant:fp8-gpus:8]
+  - perf/test_perf.py::test_perf[llama_v3.1_70b-bench-float16-input_output_len:512,32-quant:fp8-gpus:8]
+  - perf/test_perf.py::test_perf[mixtral_8x22b_v0.1-bench-float16-input_output_len:512,512-quant:fp8-tp:8]
 
 # GB chip specific tests
 - condition:
@@ -199,7 +206,7 @@ trt_llm_release_perf_test:
       chip: 'gb*'
       linux_distribution_name: '*'
   tests:
-  - perf/test_perf.py::test_perf[llama_v3.1_8b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128-quant:nvfp4]
+  - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-input_output_len:128,128-quant:nvfp4]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_nvfp4-bench-pytorch-float16-input_output_len:128,128-quant:nvfp4]
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8]
 
@@ -215,5 +222,9 @@ trt_llm_release_perf_test:
       linux_distribution_name: '*'
   tests:
   - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:fp8-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:1-input_output_len:1000,2000-quant:fp8-reqs:10-ep:4-tp:8-gpus:8] #min latency test
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:fp8-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:nvfp4-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float16-maxbs:512-input_output_len:1000,1000-quant:nvfp4-con:4096-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1-nvfp4-bench-pytorch-float16-maxbs:1-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8] #min latency test
+  - perf/test_perf.py::test_perf[deepseek_r1-nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
