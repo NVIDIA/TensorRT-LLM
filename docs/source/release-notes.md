@@ -9,7 +9,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
   - **Features that were previously available in the 0.18.0.dev pre-releases are not included in this release**.
-  - [BREAKING CHANGE] Windows platform support is deprecated in this release. All Windows-related code and functionality will be completely removed in future releases.
+  - [BREAKING CHANGE] Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.
 
 ### Known Issues
   - The PyTorch workflow on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.

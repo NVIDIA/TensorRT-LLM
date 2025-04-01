@@ -35,7 +35,7 @@ Certain limitations might apply. Refer to the {ref}`support-matrix` for more inf
 
 ### Native Windows Support
 
-Windows platform support is deprecated in this release. All Windows-related code and functionality will be completely removed in future releases.
+Windows platform support is deprecated as of v0.18.0. All Windows-related code and functionality will be completely removed in future releases.
 
 ## What Can You Do With TensorRT-LLM?
 
