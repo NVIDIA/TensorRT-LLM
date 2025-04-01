@@ -2,7 +2,7 @@ import math
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
-from torch import _assert, nn
+from torch import nn
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
@@ -636,10 +636,14 @@ class FusedMoE(nn.Module):
         num_chunks = (x.shape[0] + max_chunk_size - 1) // max_chunk_size
 
         if min_latency_mode:
-            assert(num_chunks == 1 and (not self.reduce_results), "min_latency_mode must be used with a single chunk and reduce_results must be False")
+            assert (num_chunks == 1 and (
+                not self.reduce_results
+            ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
+                    )
 
         if num_chunks == 1:
-            outputs = self.forward_chunk(x, router_logits, min_latency_mode, output_dtype)
+            outputs = self.forward_chunk(x, router_logits, min_latency_mode,
+                                         output_dtype)
             outputs = self.reducescatter_or_allreduce(outputs)
         else:
             val_div = x.shape[0] // num_chunks
