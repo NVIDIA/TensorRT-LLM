@@ -351,6 +351,12 @@ examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (http
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5141400)
 unittest/_torch/auto_deploy/integration/test_lm_eval.py SKIP (https://nvbugs/5144854)
 examples/test_qwen.py::test_llm_qwen1_5_moe_plugin_single_gpu_lora[qwen1.5_moe_a2.7b_chat-Upcycled-Qwen1.5-MoE2.7B-LoRA] SKIP (https://nvbugs/5155141)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5155144)
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5166600)
+disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5188909)
 
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2] SKIP (https://nvbugs/5170160)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp2pp2-mtp_nextn=2-attention_dp] SKIP (https://nvbugs/5170160)
