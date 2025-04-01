@@ -779,9 +779,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
         size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t fmha_scheduler_counter = sizeof(uint32_t);
-
-        // The head dim.
-        int headDim = (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
+        size_t headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
 
         int const NUM_BUFFERS = 10;
         size_t workspaces[NUM_BUFFERS];
@@ -798,8 +796,6 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[7] = sizeof(float) * 256 * mMultiProcessorCount;
         // The partialMax size.
         workspaces[8] = sizeof(float) * 256 * mMultiProcessorCount;
-        // TLLM_LOG_ERROR("czq q buffer size: %d, %d %d %d %d", workspaces[5],
-        //     max_num_seq, mNumHeads, mMLAParams.kv_lora_rank, mMLAParams.qk_rope_head_dim);
         workspaces[9] = flash_mla_workspace_size;
 
         return tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
@@ -873,6 +869,7 @@ int AttentionOp::mlaGeneration(
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
 
+    // The element size of the KV cache.
     auto const elemSize = mKVCacheQuantMode.hasFp8KvCache() ? sizeof(__nv_fp8_e4m3) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
     params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
@@ -1004,8 +1001,9 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
 
         // Scales for quantization
+        static constexpr int bmm1_scale_offset = 1;
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(params.bmm1_scale);
+        tllmRunnerParams.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
 
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
@@ -2366,7 +2364,6 @@ int AttentionOp::initialize() noexcept
         // If the kernel must read from KV cache, set the dtype correctly.
         if (mPagedKVCache && mPagedContextFMHA)
         {
-            // TODO(ziqingc): add fp8 kv + fp8 context mla support
             if (mKVCacheQuantMode.hasFp8KvCache())
             {
                 fmhaParams.dataTypeKv = DATA_TYPE_E4M3;

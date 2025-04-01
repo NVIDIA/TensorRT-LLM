@@ -473,20 +473,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                         else
                             reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                     }
-
-                    {
-                        auto kDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_kv_idx));
-                        auto inBlockIdx = kv_cache.getKVLocalIdx(
-                            token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                        if (cache_type == KvCacheDataType::FP8)
-                        {
-
-                            quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
-                                reinterpret_cast<T const*>(&data), quant_scale_kv_val);
-                        }
-                        else
-                            reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
-                    }
                 }
                 else
                 {
@@ -533,19 +519,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                 auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
-                {
-                    auto kDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_kv_idx));
-                    auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
-
-                    if (cache_type == KvCacheDataType::FP8)
-                    {
-                        quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * 8,
-                            fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
-                    }
-                    else
-                        reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                            = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
-                }
                 {
                     auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                     auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
