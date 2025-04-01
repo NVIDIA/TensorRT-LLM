@@ -67,7 +67,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
 
-    mem_per_token *= config.num_hidden_layers * head_dim
+    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
 
