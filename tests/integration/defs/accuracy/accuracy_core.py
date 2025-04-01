@@ -273,7 +273,7 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_OUTPUT_LEN = 50
 
 
-class CliAccuracyTestHarness:
+class CliFlowAccuracyTestHarness:
     # Model
     MODEL_NAME = None
     MODEL_PATH = None
