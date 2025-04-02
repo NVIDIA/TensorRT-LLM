@@ -300,7 +300,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
     }
     {
-        using AdditionalModelOutput = texec::OutputConfig::AdditionalModelOutput;
+        using AdditionalModelOutput = texec::AdditionalModelOutput;
         // Validate additional context and gen outputs
         texec::Request execReq(inputTokens, maxNewTokens);
         std::vector<AdditionalModelOutput> additionalModelOutputs{
@@ -318,7 +318,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         EXPECT_EQ(additionalGenerationOutputs.count("gen_output"), 1);
     }
     {
-        using AdditionalModelOutput = texec::OutputConfig::AdditionalModelOutput;
+        using AdditionalModelOutput = texec::AdditionalModelOutput;
         // Validate additional context and gen outputs when context outputs not available
         texec::Request execReq(inputTokens, maxNewTokens);
         std::vector<AdditionalModelOutput> additionalModelOutputs{

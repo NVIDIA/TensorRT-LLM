@@ -198,22 +198,22 @@ private:
     std::optional<std::vector<SizeType32>> mBeamWidthArray;
 };
 
+/// @brief Additional output that should be gathered.
+/// @details By default gather output of shape [beamWidth, x] from each generation phase.
+///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
+class AdditionalModelOutput
+{
+public:
+    explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
+
+    std::string name;
+    bool gatherContext{false};
+};
+
 /// @brief Configuration that controls the outputs of a Result
 class OutputConfig
 {
 public:
-    /// @brief Additional output that should be gathered.
-    /// @details By default gather output of shape [beamWidth, x] from each generation phase.
-    ///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
-    class AdditionalModelOutput
-    {
-    public:
-        explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
-
-        std::string name;
-        bool gatherContext{false};
-    };
-
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
         bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
         bool returnPerfMetrics = false,
@@ -1413,7 +1413,7 @@ public:
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
@@ -1443,7 +1443,7 @@ public:
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
-    [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
 
@@ -1469,7 +1469,7 @@ public:
     void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
-    void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
+    void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
 
@@ -1541,8 +1541,8 @@ private:
     /// @brief The guided decoding configuration
     std::optional<GuidedDecodingConfig> mGuidedDecodingConfig;
 
-    /// @brief The additional output tensor names
-    std::optional<std::vector<std::string>> mAdditionalOutputNames;
+    /// @brief The additional outputs to gather from the model.
+    std::optional<std::vector<AdditionalModelOutput>> mAdditionalModelOutputs;
 
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};

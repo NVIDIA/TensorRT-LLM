@@ -51,7 +51,8 @@ public:
         uint64_t maxSeqIdleMicroseconds = executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        bool isLeaderInOrchMode = false, std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        bool isLeaderInOrchMode = false,
+        std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         bool gatherGenerationLogits = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
@@ -71,7 +72,7 @@ public:
         , speculativeDecodingConfig{specDecConfig}
         , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
-        , additionalOutputNames{std::move(additionalOutputNames)}
+        , additionalModelOutputs{std::move(additionalModelOutputs)}
         , gatherGenerationLogits{gatherGenerationLogits}
     {
         if (guidedDecodingConfig)
@@ -90,7 +91,7 @@ public:
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
             executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
-            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalOutputNames(),
+            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalModelOutputs(),
             executorConfig.getGatherGenerationLogits())
     {
     }
@@ -143,7 +144,7 @@ public:
     std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig;
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
-    std::optional<std::vector<std::string>> additionalOutputNames;
+    std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
     bool gatherGenerationLogits;
 };
 
