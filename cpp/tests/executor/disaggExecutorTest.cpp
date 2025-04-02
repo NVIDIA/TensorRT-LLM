@@ -1102,7 +1102,7 @@ INSTANTIATE_TEST_SUITE_P(GptSingleDeviceDisaggSymmetricExecutorMixedTest, Disagg
         testing::Values(1)),
     generateTestNameDisaggParams);
 
-INSTANTIATE_TEST_SUITE_P(ConditionalDisaggExecutorTest, ConditionalDisaggParamsTest,
+INSTANTIATE_TEST_SUITE_P(ConditionalDisaggSymmetricExecutorTest, ConditionalDisaggParamsTest,
     testing::Combine(testing::Values("gpt", "llama_tp1_pp1_cp1")), generateTestNameCondDisaggParams);
 
 INSTANTIATE_TEST_SUITE_P(LlamaTP2DisaggSymmetricExecutorTest, DisaggParamsTest,

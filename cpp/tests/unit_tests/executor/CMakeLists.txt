@@ -9,7 +9,7 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-add_gtest(execSamplingConfigTest samplingConfigTest.cpp)
+add_gtest(executorSamplingConfigTest samplingConfigTest.cpp)
 add_gtest(kvCacheConfigTest kvCacheConfigTest.cpp)
 add_gtest(decodingConfigTest decodingConfigTest.cpp)
 add_gtest(requestTest requestTest.cpp)

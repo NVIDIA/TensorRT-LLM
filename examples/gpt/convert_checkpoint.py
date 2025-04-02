@@ -180,9 +180,9 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8
 
     # Check if model ckpt is pre-quantized to fp8.
-    hf_quant_config_file = Path(args.model_dir) / "hf_quant_config.json"
-    if hf_quant_config_file.exists():
-        with open(hf_quant_config_file, 'r') as f:
+    hf_quant_config_path = f"{args.model_dir}/hf_quant_config.json"
+    if os.path.exists(hf_quant_config_path):
+        with open(hf_quant_config_path, 'r') as f:
             hf_quant_config = json.load(f)
         if hf_quant_config.get("producer", {}).get("name") == "modelopt":
             modelopt_quant_config = hf_quant_config.get("quantization", {})

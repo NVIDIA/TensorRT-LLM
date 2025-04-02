@@ -116,6 +116,25 @@ void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector c
             manager.copy(*srcView, *dstView);
         }
         srcTensorIndex += numContextTokens;
+
+        // Copy output of last token to generation outputs
+        if (llmReq->isLastContextChunk())
+        {
+            for (auto const& outputTensor : llmReq->getAdditionalGenerationOutputs())
+            {
+                auto const& outputTensorName = outputTensor.first;
+                auto tensorIt = outputMap.find(outputTensorName);
+                TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional generation output tensor not found %s",
+                    outputTensorName.c_str());
+
+                auto srcView = ITensor::slice(tensorIt->second, srcTensorIndex - 1, 1);
+                for (SizeType32 beam = 0; beam < llmReq->mSamplingConfig.beamWidth; beam++)
+                {
+                    auto dstView = ITensor::slice(outputTensor.second, {beam, 0}, 1);
+                    manager.copy(*srcView, *dstView);
+                }
+            }
+        }
     }
 
     for (auto const& llmReq : generationRequests)
@@ -133,7 +152,7 @@ void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector c
                 auto generatedLength = llmReq->getNumTokens(beam) - llmReq->getPromptLen();
                 TLLM_CHECK(generatedLength >= 1);
                 auto srcView = ITensor::slice(tensorIt->second, srcTensorIndex + beam, 1);
-                auto dstView = ITensor::slice(outputTensor.second, {beam, generatedLength - 1}, 1);
+                auto dstView = ITensor::slice(outputTensor.second, {beam, generatedLength}, 1);
                 manager.copy(*srcView, *dstView);
             }
         }

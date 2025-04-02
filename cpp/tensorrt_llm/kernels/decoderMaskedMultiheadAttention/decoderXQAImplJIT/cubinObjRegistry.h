@@ -19,14 +19,12 @@
 #include "compileEngine.h"
 #include "serializationUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 
-namespace tensorrt_llm
-{
-namespace kernels
-{
-namespace jit
+namespace tensorrt_llm::kernels::jit
 {
 
 // A thread-safe collection of CubinObjs, with caching functionality.
@@ -39,19 +37,19 @@ public:
     CubinObjRegistryTemplate(void const* buffer_, size_t buffer_size)
     {
         size_t remaining_buffer_size = buffer_size;
-        uint8_t const* buffer = static_cast<uint8_t const*>(buffer_);
+        auto const* buffer = static_cast<uint8_t const*>(buffer_);
         // First 4 bytes: num of elements.
-        uint32_t n = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
+        auto const n = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
 
         for (uint32_t i = 0; i < n; ++i)
         {
-            uint32_t key_size = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
+            auto key_size = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
             TLLM_CHECK(key_size <= remaining_buffer_size);
             Key key(buffer, key_size);
             buffer += key_size;
             remaining_buffer_size -= key_size;
 
-            uint32_t obj_size = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
+            auto obj_size = readFromBuffer<uint32_t>(buffer, remaining_buffer_size);
             TLLM_CHECK(obj_size <= remaining_buffer_size);
             CubinObj obj(buffer, obj_size);
             buffer += obj_size;
@@ -89,7 +87,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mMutex);
         size_t remaining_buffer_size = buffer_size;
-        uint8_t* buffer = static_cast<uint8_t*>(buffer_);
+        auto* buffer = static_cast<uint8_t*>(buffer_);
         uint32_t n = mMap.size();
         writeToBuffer<uint32_t>(n, buffer, remaining_buffer_size);
         for (auto&& p : mMap)
@@ -131,7 +129,6 @@ public:
             obj.initialize();
         }
         mMap.insert({key, std::move(obj)});
-        return;
     }
 
     CubinObj* getCubin(Key const& key)
@@ -142,10 +139,8 @@ public:
         {
             return &iter->second;
         }
-        else
-        {
-            return nullptr;
-        }
+
+        return nullptr;
     }
 
     // When initialize is true, initialize cubins.
@@ -178,6 +173,4 @@ using CubinObjKey = XQAKernelFullHashKey;
 using CubinObjHasher = XQAKernelFullHasher;
 using CubinObjRegistry = CubinObjRegistryTemplate<CubinObjKey, CubinObjHasher>;
 
-} // namespace jit
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels::jit

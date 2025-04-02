@@ -38,10 +38,18 @@ Qwen/Qwen2-0.5B-Instruct:
   - accuracy: 45.30
   - quant_algo: FP8
     accuracy: 45.03
+Qwen/Qwen2.5-0.5B-Instruct:
+  - accuracy: 49.59
+  - quant_algo: FP8
+    accuracy: 48.59
 Qwen/Qwen2.5-1.5B-Instruct:
   - accuracy: 61.45
   - quant_algo: FP8
     accuracy: 61.43
+Qwen/Qwen2.5-7B-Instruct:
+  - accuracy: 75.32
+  - quant_algo: FP8
+    accuracy: 75.32
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 71.47
   - quant_algo: NVFP4

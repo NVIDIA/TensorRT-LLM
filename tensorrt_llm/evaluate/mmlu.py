@@ -14,7 +14,7 @@
 # limitations under the License.
 import math
 import random
-from typing import Iterable, List, Union
+from typing import Iterable, List, Optional, Union
 
 import click
 import numpy as np
@@ -112,7 +112,11 @@ class MMLU(Evaluator):
                  dataset_path: str,
                  num_samples: int = None,
                  num_train: int = 5,
-                 random_seed: int = 0):
+                 random_seed: int = 0,
+                 apply_chat_template: bool = False,
+                 system_prompt: Optional[str] = None):
+        super().__init__(apply_chat_template=apply_chat_template,
+                         system_prompt=system_prompt)
         self.dataset_path = dataset_path
         if num_samples is None:
             self.num_samples_per_subject = None

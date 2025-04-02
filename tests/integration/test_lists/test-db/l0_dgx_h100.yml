@@ -43,6 +43,7 @@ l0_dgx_h100:
   - accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
   - accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
   - accuracy/test_cli_flow.py::TestQwen2_57B_A14B::test_tp4
+  - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_tp2
   - examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp4pp2-nb:4]
   - examples/test_llama.py::test_llm_llama_v2_lora_benchmark_2gpu[chinese_lora-llama-v2-13b-hf]
   - examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
@@ -52,7 +53,6 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part3"
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0"
   - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
-  - unittest/llmapi/test_llm_models_multi_gpu.py
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
   - test_e2e.py::test_llmapi_exit_multi_gpu
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B]
