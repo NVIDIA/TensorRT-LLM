@@ -368,11 +368,16 @@ class MTPWorker(nn.Module):
             num_accepted_tokens=num_accepted_tokens,
             spec_metadata=spec_metadata,
             attn_metadata=attn_metadata)
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+
+        # update attn metadata
+        if attn_metadata is not None:
+            self.change_attn_metadata(num_accepted_tokens, attn_metadata)
+            draft_inputs.update(attn_metadata=attn_metadata)
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         for _, mtp_layer in enumerate(mtp_layers):
             hidden_states, logits = mtp_layer(lm_head=lm_head,
                                               embed_tokens=embed_tokens,
@@ -393,8 +398,9 @@ class MTPWorker(nn.Module):
                 "attn_metadata": draft_inputs["attn_metadata"],
                 "spec_metadata": draft_inputs["spec_metadata"],
             }
-
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # restore attn metadata
         if attn_metadata.is_cuda_graph and attn_metadata is not None:
             self.restore_attn_metadata(attn_metadata=attn_metadata)
 
@@ -976,9 +982,6 @@ class MTPWorker(nn.Module):
             return_input_ids = torch.concat(return_input_ids_list, dim=0)
             return_hidden_states = torch.concat(return_hidden_states_list,
                                                 dim=0)
-
-        if attn_metadata is not None:
-            self.change_attn_metadata(num_accepted_tokens, attn_metadata)
 
         return {
             "input_ids": return_input_ids,
