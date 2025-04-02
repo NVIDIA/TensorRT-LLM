@@ -1083,7 +1083,13 @@ class PyExecutor:
                 self.request_queue, timeout,
                 total_max_num_active_requests - total_num_active_requests)
 
-        new_requests = self._broadcast_new_requests(new_requests)
+        if self.dist.rank == 0:
+            # Preserve original `new_requests` on rank 0 since it may contain
+            # non-serializable objects (e.g., user-defined function references)
+            # that cannot be transmitted via MPI.
+            _ = self._broadcast_new_requests(new_requests)
+        else:    
+            new_requests = self._broadcast_new_requests(new_requests)
 
         if not self.enable_attention_dp:
             self._update_new_active_requests_queue_latency(new_requests)

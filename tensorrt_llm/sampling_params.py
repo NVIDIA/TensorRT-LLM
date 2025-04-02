@@ -48,8 +48,8 @@ class LogitsProcessor(ABC):
 
     @abstractmethod
     def __call__(self, req_id: int, logits: torch.Tensor,
-                 token_ids: List[List[int]], stream_ptr: int,
-                 client_id: Optional[int]) -> None:
+                 token_ids: List[List[int]], stream_ptr: Optional[int],
+                 client_id: Optional[int]) -> Optional[torch.Tensor]:
         """Logits processing callback. The callback is expected to inplace modify the logits.
 
         Args:

@@ -385,10 +385,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME
                     if request.sampling_params.apply_batched_logits_processor
                     else None),
-                logits_post_processor=request.sampling_params.logits_processor,
+                # logits_post_processor=request.sampling_params.logits_processor, # TODO: tmp
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+
+            executor_request.logits_post_processors = [
+                request.sampling_params.logits_processor
+            ] if request.sampling_params.logits_processor else None
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

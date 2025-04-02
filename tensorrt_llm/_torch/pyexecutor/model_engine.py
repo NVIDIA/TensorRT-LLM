@@ -25,7 +25,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
-from ..metadata import KVCacheParams
+from ..metadata import KVCacheParams, LogitsProcessorMetadata
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
@@ -858,6 +858,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            logits_processor_metadata: Optional[LogitsProcessorMetadata] = None,
             new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
         """
         Prepare inputs for Pytorch Model.
@@ -1015,6 +1016,20 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices.append(request.py_batch_idx)
 
             request.py_batch_idx = batch_idx
+
+            logits_processors = getattr(request, "logits_post_processors", None)
+            if logits_processors and not (self.mapping.has_tp() and self.mapping.tp_rank > 0 or \
+                self.mapping.has_pp() and self.mapping.pp_rank > 0):
+                logits_processor_metadata = logits_processor_metadata or LogitsProcessorMetadata(
+                )
+                logits_processor_metadata.update_per_request(
+                    request.py_request_id,
+                    logits_processors,
+                    request.py_batch_idx,
+                    torch.tensor(request.get_tokens(0),
+                                 dtype=torch.long)  # TODO: need all beams
+                )
+
             batch_idx += 1
 
         num_tokens = len(input_ids)
@@ -1158,6 +1173,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+
+        if logits_processor_metadata is not None:
+            logits_processor_metadata.prepare()
+            inputs['logits_processor_metadata'] = logits_processor_metadata
 
         # support attention dp
         if self.enable_attention_dp:

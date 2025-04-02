@@ -223,8 +223,10 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-def test_tinyllama_logits_processor_tp2pp2():
-    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
+@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
+def test_tinyllama_logits_processor_tp2pp2(backend: str):
+    tinyllama_logits_processor_test_harness(backend,
+                                            tensor_parallel_size=2,
                                             pipeline_parallel_size=2)
 
 
