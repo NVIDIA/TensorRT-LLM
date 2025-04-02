@@ -1,3 +1,5 @@
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
 import java.lang.Exception
 import groovy.transform.Field
 
@@ -63,7 +65,7 @@ def buildImage(action, type)
         sh 'ls -lah'
     }
 
-    checkoutSource(LLM_REPO, branch, LLM_ROOT)
+    trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     docker.image(DOCKER_IMAGE).inside('-v /var/run/docker.sock:/var/run/docker.sock --privileged') {
