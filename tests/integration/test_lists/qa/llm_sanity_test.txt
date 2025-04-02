@@ -122,10 +122,10 @@ accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_fp8
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_fp8
-accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
 accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_weight_only
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_fp8
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
