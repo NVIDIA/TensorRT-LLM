@@ -108,7 +108,9 @@ class LoraLayer(torch.nn.Module):
                 if module_idx in lora_params[layer_idx]:
                     active_lora_module_ids.append(module_idx)
 
-                    lora_params[layer_idx][module_idx]['is_dora']
+                    is_dora = lora_params[layer_idx][module_idx][
+                        'is_dora']  # todo what to do with this?
+
                     lora_ranks.append(
                         lora_params[layer_idx][module_idx]['adapter_size'])
                     lora_weight_pointers.append(
