@@ -121,7 +121,8 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
             executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
             executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt,
-            std::vector<std::string>{DecoderTestShared<TLogits>::kTopKTensorName});
+            std::vector<executor::AdditionalModelOutput>{
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}});
 
     auto optionalParams = batch_manager::TrtGptModelOptionalParams{executorConfig, false};
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
@@ -152,8 +153,8 @@ protected:
         requests.reserve(static_cast<std::size_t>(parameters.numRequests));
         for (auto i = 0; i < parameters.numRequests; i++)
         {
-            std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
-                executor::OutputConfig::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}};
+            std::vector<executor::AdditionalModelOutput> additionalOutputs{
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}};
             requests.emplace_back(requestTokens, parameters.maxOutputLength, false, executor::SamplingConfig{},
                 executor::OutputConfig{false, false, false, true, false, false, additionalOutputs});
         }
@@ -212,8 +213,8 @@ protected:
         requests.reserve(static_cast<std::size_t>(parameters.numRequests));
         for (auto i = 0; i < parameters.numRequests; i++)
         {
-            std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
-                executor::OutputConfig::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}};
+            std::vector<executor::AdditionalModelOutput> additionalOutputs{
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}};
             requests.emplace_back(requestTokens, parameters.maxOutputLength, true, executor::SamplingConfig{},
                 executor::OutputConfig{false, false, false, true, false, false, additionalOutputs});
         }
@@ -276,8 +277,8 @@ protected:
         {
             // create different sequence for each request to avoid KV cache reuse
             auto const requestTokens = createConsecutiveTokenSequence(parameters.promptLength, parameters.vocabSize, i);
-            std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
-                executor::OutputConfig::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, true}};
+            std::vector<executor::AdditionalModelOutput> additionalOutputs{
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, true}};
             requests.emplace_back(requestTokens, parameters.maxOutputLength, true, executor::SamplingConfig{},
                 executor::OutputConfig{false, false, false, true, false, false, additionalOutputs});
         }
@@ -344,8 +345,8 @@ protected:
         {
             // create different sequence for each request to avoid KV cache reuse
             auto const requestTokens = createConsecutiveTokenSequence(parameters.promptLength, parameters.vocabSize, i);
-            std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
-                executor::OutputConfig::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, true}};
+            std::vector<executor::AdditionalModelOutput> additionalOutputs{
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, true}};
             requests.emplace_back(requestTokens, parameters.maxOutputLength, false, executor::SamplingConfig{},
                 executor::OutputConfig{false, false, false, true, false, false, additionalOutputs});
         }
