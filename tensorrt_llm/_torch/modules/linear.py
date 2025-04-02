@@ -145,11 +145,6 @@ class NVFP4GemmRunner(TunableRunner):
                 output_dtype] = torch.classes.trtllm.FP4GemmRunner(output_dtype)
         self._nvfp4_gemm_runner = NVFP4GemmRunner._runner_dict[output_dtype]
 
-    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
-        m, k = inputs[0].shape
-        n = inputs[1].shape[0]
-        return (next_positive_power_of_2(m), n, k, self.output_dtype)
-
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -197,16 +192,11 @@ def nvfp4_gemm(
 
     tuner = AutoTuner.get()
 
-    tuning_config = TuningConfig(dynamic_tensors={
-        0: {
-            0: (get_power_of_2_num_tokens_buckets, next_positive_power_of_2),
-        },
-    },
-                                 constraints={
-                                     2: {
-                                         0: fp4_scale_dims,
-                                     },
-                                 })
+    tuning_config = TuningConfig(
+        dynamic_tensors=((0, 0, (get_power_of_2_num_tokens_buckets,
+                                 next_positive_power_of_2)), ),
+        constraints=((2, 0, fp4_scale_dims), ),
+    )
 
     # allocate workspace for profiling
     nvfp4_gemm_runner = NVFP4GemmRunner(sf_use_ue8m0, output_dtype)

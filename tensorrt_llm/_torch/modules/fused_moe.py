@@ -60,16 +60,6 @@ class MoERunner(TunableRunner):
                     min_latency_mode)
         self._fused_moe_runner = MoERunner._runner_dict[instance_key]
 
-    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
-        x, fc2_expert_weights = inputs
-        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
-                self.top_k, self.ep_size)
-
-    def gen_custom_cache_key(self, inputs: List[torch.Tensor]):
-        x, fc2_expert_weights = inputs
-        return (next_positive_power_of_2(x.shape[0]), fc2_expert_weights.shape,
-                self.top_k, self.ep_size)
-
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -121,14 +111,10 @@ def fused_moe(
 
     tuner = AutoTuner.get()
 
-    tuning_config = TuningConfig(dynamic_tensors={
-        0: {
-            0: ([
-                16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                2, 1
-            ], next_positive_power_of_2),
-        },
-    }, )
+    tuning_config = TuningConfig(
+        dynamic_tensors=((0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128,
+                                  64, 32, 16, 8, 4, 2, 1),
+                                 next_positive_power_of_2)), ), )
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
