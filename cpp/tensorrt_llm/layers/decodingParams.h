@@ -58,12 +58,14 @@ class DecoderDomain
 public:
     DecoderDomain(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSize,
         std::optional<runtime::SizeType32> vocabSizePadded = std::nullopt,
-        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr)
+        std::shared_ptr<runtime::SpeculativeDecodingModule const> speculativeDecodingModule = nullptr,
+        bool const useVariableBeamWidthSearch = false)
         : mBatchSize(batchSize)
         , mBeamWidth(beamWidth)
         , mVocabSize(vocabSize)
         , mVocabSizePadded(vocabSizePadded.value_or(vocabSize))
         , mSpeculativeDecodingModule(std::move(speculativeDecodingModule))
+        , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
     {
     }
 
@@ -103,12 +105,18 @@ public:
         return mSpeculativeDecodingModule;
     }
 
+    [[nodiscard]] bool getUseVariableBeamWidthSearch() const
+    {
+        return mUseVariableBeamWidthSearch;
+    }
+
 private:
     runtime::SizeType32 mBatchSize;
     runtime::SizeType32 mBeamWidth;
     runtime::SizeType32 mVocabSize;
     runtime::SizeType32 mVocabSizePadded;
     std::shared_ptr<runtime::SpeculativeDecodingModule const> mSpeculativeDecodingModule;
+    bool mUseVariableBeamWidthSearch;
 };
 
 class BaseSetupParams
@@ -167,6 +175,8 @@ public:
     std::optional<std::vector<float>> beamSearchDiversityRate; // [setupBatchSize] on cpu
     std::optional<std::vector<float>> lengthPenalty;           // [setupBatchSize] on cpu
     std::optional<std::vector<int>> earlyStopping;             // [setupBatchSize] on cpu
+    std::optional<std::vector<std::vector<runtime::SizeType32>>>
+        beamWidthArray;                                        // [setupBatchSize, nMaxBeamWidthArray] on cpu
     bool hasDiffRuntimeArgs{false};
 };
 
@@ -330,6 +340,9 @@ public:
     std::shared_ptr<BanWordsDecodingInputs> banWordsInputs;
 
     std::shared_ptr<StopCriteriaDecodingInputs> stopCriteriaInputs;
+
+    //! Step of each request, for Variable-Beam-Width-Search
+    std::optional<std::vector<runtime::SizeType32>> beamSearchSteps; // [batchSize]
 };
 
 class SamplingInputs : public DecodingInputs

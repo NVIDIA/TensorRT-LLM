@@ -37,7 +37,7 @@ void beamSearchKernelLauncher(
 template <typename T, bool IS_V2>
 void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
 {
-    int const nPadBeamWidth = padToNextPowerOfTwo(bh.nBeamWidth);
+    int const nPadBeamWidth{padToNextPowerOfTwo(bh.nBeamWidth)};
 
     // case X means X/2 < beam_width <= X
     if constexpr (IS_V2)
@@ -85,43 +85,96 @@ template void invokeTopkBeamSearch<half, false>(
 template void invokeTopkBeamSearch<half, true>(
     half const* logProbs, half const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
 
-template <typename T>
-__global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM)
+__global__ void updateCacheIndirectionKernel(
+    int* tgtCI, int const* srcCI, BeamHypotheses bh, int const nMaxAttentionWindow, int const nSinkTokenLength)
 {
-    int const bid = blockIdx.x;
-    runtime::SizeType32 const slot = batchSlots[bid];
-    float const diversityRate{diversityRates[slot]};
-    T* pLocalProbs = pStage1Probs + bid * nBM * nBM * 2;
+    // Update cache indirections which steps are between `bh.inputLength[x]` to `sequenceLengths[x]`
+    int const step = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nBMIn{bh.nBeamWidthIn};
+    size_t const nBMOut{bh.nBeamWidthOut};
+    size_t const nMSL{bh.nMaxSeqLen};
+    int const indexBatch = blockIdx.y;
+    int const batchSlot = bh.batchSlots[indexBatch];
+    int const tgtIndexBeam = blockIdx.z;
+    int const tgtIndexBatchBeam = batchSlot * nBM + tgtIndexBeam;
+    int const lastStep{bh.sequenceLengths[tgtIndexBatchBeam] - 1}; // minus 1 since it is updated in stage 3 kernel
 
-    for (int index = threadIdx.x; index < nBM * nBM * 2; index += blockDim.x)
+    // Return early when at least one of the conditions is true:
+    // 1. `step` is out of the bound
+    // 2. `step` is inside of input part (since context KV Cache is shared)
+    // 3. `step` is outside of attention widow
+    if (step >= nMSL || step < bh.inputLengths[tgtIndexBatchBeam] || step < (nMSL - nMaxAttentionWindow))
     {
-        int const indexBM = index / (nBM * 2);
-        if (finished[slot * nBM + indexBM].isFinished())
+        return;
+    }
+
+    // Keep all past tokens by parentIdsPtr
+    int const srcIndexBeam = bh.parentIdsPtr[batchSlot][tgtIndexBeam * nMSL + lastStep];
+    // Return early when the source beam isfinished
+    if (bh.finished[tgtIndexBatchBeam].isFinished())
+    {
+        return;
+    }
+
+    int const stepCirc = (step >= nSinkTokenLength)
+        ? nSinkTokenLength + (step - nSinkTokenLength) % (nMaxAttentionWindow - nSinkTokenLength)
+        : step;
+    // Consider cyclic kv cache for the indir tables
+    uint32_t const tgtOffset = batchSlot * nBMOut * nMaxAttentionWindow + tgtIndexBeam * nMaxAttentionWindow + stepCirc;
+    uint32_t const srcOffset = batchSlot * nBMIn * nMaxAttentionWindow + srcIndexBeam * nMaxAttentionWindow + stepCirc;
+    tgtCI[tgtOffset] = (step == lastStep) ? tgtIndexBeam : srcCI[srcOffset];
+}
+
+void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
+    runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream)
+{
+    dim3 const grid(common::roundUp(bh.nMaxSeqLen, 32), bh.nBatchSize, bh.nBeamWidthOut);
+    updateCacheIndirectionKernel<<<grid, 32, 0, stream>>>(tgtCI, srcCI, bh, maxAttentionWindow, sinkTokenLength);
+    sync_check_cuda_error(stream);
+}
+
+template <typename T>
+__global__ void addCumLogProbs(T* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
+    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
+{
+    int const bid = blockIdx.x; // Index of request in batch
+    float const diversityRate{diversityRates[batchSlots[bid]]};
+    T* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
+
+    for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
+    {
+        int const iBMIn = i / (nBMOut * 2);
+        if (finished[bid * nBMIn + iBMIn].isFinished())
         {
-            pLocalProbs[index] += (index == endIds[slot]) ? 1.0f : 0.0f;
+            pLocalLogProbs[i] += (i == endIds[bid]) ? 1.0f : 0.0f;
         }
         else
         {
-            pLocalProbs[index] += cumLogProbs[slot * nBM + indexBM] + diversityRate * indexBM;
+            // nBM is used in VBWS since `cumLogProbs` is initialized with kMaxBeamWidth earlier than BeamSearchLayer
+            pLocalLogProbs[i] += cumLogProbs[bid * nBM + iBMIn] + diversityRate * iBMIn;
         }
     }
     return;
 }
 
-template __global__ void addCumLogProbs<float>(float* __restrict pStage1Probs, float const* __restrict cumLogProbs,
+template __global__ void addCumLogProbs<float>(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM);
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
-template __global__ void addCumLogProbs<half>(half* __restrict pStage1Probs, float const* __restrict cumLogProbs,
+template __global__ void addCumLogProbs<half>(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM);
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
-__global__ void gatherId(
-    int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS, size_t const nBM, size_t const nV)
+__global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
+    size_t const nBMIn, size_t const nBMOut, size_t const nV)
 {
-    // Example (definition of the processes and variables and are in `beamSearchKernelsTemplate.h`).
+    // Use topK output `pStage1Id` and `pStage1Id` to get the index of a new token in `logProbs` for each beam.
+    //
+    // clang-format off
+    //
+    // Example for normal beam search:
     // nBS = 3, nBM = 2, nV = 5, use logProbs with integer values here for simplicity.
     // ┏┏ 46 35 47 18 67 ┓┓      ┏┏ 67 47 46 35 ┓┓ ┏┏ 4 2 0 1 ┓┓
     // ┃┗ 76 23 74 73 17 ┛┃      ┃┗ 76 74 73 23 ┛┃ ┃┗ 0 2 3 1 ┛┃
@@ -129,27 +182,161 @@ __global__ void gatherId(
     // ┃┗ 12 70 77 22 88 ┛┃ ---> ┃┗ 88 77 70 22 ┛┃ ┃┗ 4 2 1 3 ┛┃ ---> ┃ 98 88 88 77 ┃ ┃ 0 1 4 5 ┃ ---> ┃ 2 3 9 7 ┃
     // ┃┏ 55 15 72  3 84 ┓┃      ┃┏ 74 72 55 15 ┓┃ ┃┏ 4 2 0 1 ┓┃      ┗ 98 93 84 77 ┛ ┗ 4 5 0 6 ┛      ┗ 9 6 4 5 ┛
     // ┗┗ 77 93 14 60 98 ┛┛      ┗┗ 98 93 77 60 ┛┛ ┗┗ 4 1 0 3 ┛┛
-    //       logProbs               stage1Probs      stage1Id           stage2Probs    stage2Id      output-stage2Id
+    //       logProbs              stage1LogProbs     stage1Id         stage2LogProbs   stage2Id     output-stage2Id
     //
-    // For `stage2Probs[2][3] == 77`,
-    //     original batch index in logProbs:    bid                         -> 2    (a)
+    // For `stage2LogProbs[2][3] == 77`,
+    //     original batch index in logProbs:    blockIdx.x                  -> 2    (a)
     //     original beam index in logProbs:     stage2Id[2][3] / (nBM * 2)  -> 1    (b)
     //     row index in stage1Probs:            a * nBM + b                 -> 5    (c)
     //     column index in stage1*:             stage2Id[2][3] % (nBM * 2)  -> 2    (d)
     //     column index in logProbs:            stage1Id[c][d]              -> 0    (e)
     //     pad for previous tokens:             b * nV                      -> 5    (f)
     //     final output:                        e + f                       -> 5
-
-    int const bid = blockIdx.x;
-    for (int j = threadIdx.x; j < nBM * 2; j += blockDim.x)
+    //
+    // ========================================================================================================
+    // Example for VBWS:
+    // nBS = 2, nBMIn = 3, nBMOut = 5, nBM = 7, nV = 11, use logProbs with integer values here for simplicity.
+    // ┏┏ 46 35 47 18 67 76 23 74 73 17 67 ┓┓      ┏┏ 76 74 73 67 67 47 46 35 23 18 ┓┓ ┏┏  5  7  8  4 10  2  0  1  6  3 ┓┓
+    // ┃┃ 49 98 88 74 12 70 77 22 88 55 15 ┃┃      ┃┃ 98 88 88 77 74 70 55 49 22 15 ┃┃ ┃┃  1  2  8  6  3  5  9  0  7 10 ┃┃
+    // ┃┗ 72  3 84 77 93 14 60 98 65  4 20 ┛┃  A   ┃┗ 98 93 84 77 72 65 60 20 14  4 ┛┃ ┃┗  7  4  2  3  0  8  6 10  5  9 ┛┃  C
+    // ┃┏ 16 34 71 38 19 91  5 81 97 43 79 ┓┃ ---> ┃┏ 97 91 81 79 71 43 38 34 19 16 ┓┃ ┃┏  8  5  7 10  2  9  3  1  4  0 ┓┃ --->
+    // ┃┃  2 22 77 37 57 33 57 41 27 73 88 ┃┃      ┃┃ 88 77 73 57 57 41 37 33 27 22 ┃┃ ┃┃ 10  2  9  4  6  7  3  5  8  1 ┃┃
+    // ┗┗ 77 16 23 22 82 89  6 77 67 15 31 ┛┛      ┗┗ 89 82 77 77 67 31 23 22 16 15 ┛┛ ┗┗  5  4  0  7  8 10  2  3  1  9 ┛┛
+    //                logProbs                                stage1LogProbs                         stage1Id
+    //
+    //  C    ┏ 98 98 93 88 88 84 77 77 76 74 ┓ ┏ 10 20 21 11 12 22 13 23  0  1 ┓  D   ┏ 12 29 26 13 19 24 17 25  5  7 ┓
+    // --->  ┗ 97 91 89 88 82 81 79 77 77 77 ┛ ┗  0  1 20 10 21  2  3 11 22 23 ┛ ---> ┗  8  5 27 21 26  7 10 13 22 29 ┛
+    //                 stage2LogProbs                        stage2Id                          output-stage2Id
+    //
+    // For `stage2LogProbs[1][4] == 82`,
+    //     original batch index in logProbs:    blockIdx.x                      ->  1   (a)
+    //     original beam index in logProbs:     stage2Id[1][4] / (nBMOut * 2)   ->  2   (b)
+    //     row index in stage1LogProbs:         a * nBMIn + b                   ->  5   (c)
+    //     column index in stage1*:             stage2Id[1][4] % (nBMOut * 2)   ->  1   (d)
+    //     column index in logProbs:            stage1Id[c][d]                  ->  4   (e)
+    //     pad for previous tokens:             b * nV                          -> 22   (f)
+    //     final output:                        e + f                           -> 26   output-stage2Id[1][4]
+    //
+    // clang-format on
+    int const a = blockIdx.x; // Index of request in batch
+    for (int j = threadIdx.x; j < nBMOut * 2; j += blockDim.x)
     {
-        int const index = pStage2Id[bid * nBM * 2 + j];
-        int const iBM = index / (nBM * 2);
-        int const jBM = index % (nBM * 2);
-        pStage2Id[bid * nBM * 2 + j] = pStage1Id[(bid * nBM + iBM) * (nBM * 2) + jBM] + iBM * nV;
+        int const index = a * (nBMOut * 2) + j;
+        int const stage2Id = pStage2Id[index];
+        int const b = stage2Id / (nBMOut * 2);
+        int const c = a * nBMIn + b;
+        int const d = stage2Id % (nBMOut * 2);
+        int const e = pStage1Id[c * (nBMOut * 2) + d];
+        int const f = b * nV;
+        pStage2Id[index] = e + f;
     }
     return;
 }
+
+void printBH(BeamHypotheses const& bh)
+{
+#if BEAM_SEARCH_DEBUG
+    cudaDeviceSynchronize();
+
+    printf("printBH ================================================================\n");
+    PRINT(bh.bReturnNormedScore);
+    PRINT(bh.bVBWS);
+    PRINT(bh.nMaxBatchSize);
+    PRINT(bh.nBatchSize);
+    PRINT(bh.nBeamWidth);
+    PRINT(bh.nBeamWidthIn);
+    PRINT(bh.nBeamWidthOut);
+    PRINT(bh.nMaxSeqLen);
+    PRINT(bh.nVocabSize);
+    PRINT(bh.nVPart);
+    PRINT(bh.nByteMaxSharedMemoryPerBlock);
+    PRINT(bh.nByteSharedMemoryStage1);
+    PRINT(bh.nByteSharedMemoryStage3);
+    size_t const mbs = bh.nMaxBatchSize;
+    size_t const nbs = bh.nBatchSize;
+    size_t const nbm = bh.nBeamWidth;
+    size_t const nbmo = bh.nBeamWidthOut;
+    size_t const msl = bh.nMaxSeqLen;
+
+    PH2(bh.diversityRates, nbs);
+    PH2(bh.lengthPenalties, nbs);
+    PH2(bh.earlyStoppings, nbs);
+    PH3(bh.beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
+    PH3(bh.beamWidthArraysDevice, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
+    PH2(bh.nBeamWidthInHost, nbs);
+    PH2(bh.nBeamWidthOutHost, nbs);
+    PH2(bh.nBeamWidthInDevice, nbs);
+    PH2(bh.nBeamWidthOutDevice, nbs);
+
+    PH2(bh.inputLengths, nbs * nbm);
+    PH2(bh.endIds, nbs);
+    PH2(bh.batchSlots, nbs);
+
+    PH3(bh.outputIds, nbs * nbm * msl, msl);
+    PH3(bh.logProbs, nbs * nbm * msl, msl);
+    PH3(bh.sequenceLengths, nbs * nbm, nbm);
+    PH3(bh.cumLogProbs, nbs * nbm, nbm);
+
+    PH3(bh.outputIdsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(bh.logProbsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(bh.sequenceLengthsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(bh.cumLogProbsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(bh.normedScoresCBA, mbs * nbmo * 2, nbmo * 2);
+    PH2(bh.numBeamsCBA, mbs);
+    PH2(bh.minNormedScoresCBA, mbs);
+
+    PH2(bh.batchDones, nbs);
+    uint8_t* finished = reinterpret_cast<uint8_t*>(bh.finished);
+    PH2(finished, nbs * nbm);
+
+    std::vector<runtime::SizeType32> batchSlots(nbs, 0);
+    cudaMemcpy(batchSlots.data(), bh.batchSlots, sizeof(runtime::SizeType32) * nbs, cudaMemcpyDeviceToHost);
+
+    std::vector<int*> outputIdsPtr(nbs, 0);
+    cudaMemcpy(outputIdsPtr.data(), bh.outputIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
+
+    std::vector<int*> parentIdsPtr(nbs, 0);
+    cudaMemcpy(parentIdsPtr.data(), bh.parentIdsPtr, sizeof(int*) * nbs, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    for (int i = 0; i < nbs; ++i)
+    {
+        int slot = batchSlots[i];
+        printf("slot=%d\n", slot);
+        printf("outputIdsPtr[slot]=%p\n", outputIdsPtr[slot]);
+        PH3(outputIdsPtr[slot], nbm * msl, msl);
+    }
+    for (int i = 0; i < nbs; ++i)
+    {
+        int slot = batchSlots[i];
+        printf("slot=%d\n", slot);
+        printf("parentIdsPtr[slot]=%p\n", parentIdsPtr[slot]);
+        PH3(parentIdsPtr[slot], nbm * msl, msl);
+    }
+
+    // May not available in some context
+    // PH3(bh.outputIdsUnfinish, nbs * nbm * msl, msl);
+    // PH3(bh.parentIdsUnfinish, nbs * nbm * msl, msl);
+#endif
+}
+
+template <typename T>
+void printLogProbs(T const* x, int const nBS, int const nBMIn, int const nBM, int const nV)
+{
+    for (int bs = 0; bs < nBS; ++bs)
+    {
+        T const* ptrBatch = x + bs * nBM * nV;
+        printArrayInfo(ptrBatch, nBMIn * nV, std::string("Request ") + std::to_string(bs));
+        for (int bm = 0; bm < nBMIn; ++bm)
+        {
+            T const* ptrBeam = ptrBatch + bm * nV;
+            printArrayInfo(ptrBeam, nV, std::string("Beam ") + std::to_string(bm), true);
+        }
+    }
+}
+
+template void printLogProbs<float>(float const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
+template void printLogProbs<half>(half const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
 
 } // namespace kernels
 } // namespace tensorrt_llm
