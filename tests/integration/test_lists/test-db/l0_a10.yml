@@ -14,7 +14,7 @@ l0_a10:
       backend: pytorch
   tests:
   # ---Stress tests---
-  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test] 
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-stage-alone]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-stage-alone]
@@ -127,7 +127,7 @@ l0_a10:
       backend: tensorrt
   tests:
   # ---Stress tests---
-  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test] 
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-stage-alone]
   - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-stage-alone]
