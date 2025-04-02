@@ -27,8 +27,6 @@ Welcome to TensorRT-LLM's Documentation!
 
    installation/linux.md
    installation/build-from-source-linux.md
-   installation/windows.md
-   installation/build-from-source-windows.md
    installation/grace-hopper.md
 
 

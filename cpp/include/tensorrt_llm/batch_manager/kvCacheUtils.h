@@ -91,7 +91,7 @@ private:
 
     runtime::ITensor::SharedPtr mPool;
     runtime::ITensor::SharedPtr mCurrent;
-    const std::vector<SizeType32> mBlockIds;
+    std::vector<SizeType32> const mBlockIds;
     size_t mIdx;
 };
 

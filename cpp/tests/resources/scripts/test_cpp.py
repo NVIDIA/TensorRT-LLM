@@ -530,12 +530,6 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         resources_dir=resources_dir,
                         model_cache_arg=model_cache_arg)
 
-    prepare_model_tests(model_name="chatglm",
-                        python_exe=python_exe,
-                        root_dir=root_dir,
-                        resources_dir=resources_dir,
-                        model_cache_arg=model_cache_arg)
-
 
 def prepare_model_tests(model_name: str,
                         python_exe: str,

@@ -166,6 +166,8 @@ class KVCacheBlock
 public:
     using IdType = std::int32_t;
 
+    static constexpr IdType kCachedBlocksRootId = -1;
+
     explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
 
     void startScheduling();
@@ -379,6 +381,16 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
+    [[nodiscard]] bool getContextRequiresCyclicKvCache() const
+    {
+        return mContextRequiresCyclicKvCache;
+    }
+
+    void setContextRequiresCyclicKvCache(bool contextRequiresCyclicKvCache)
+    {
+        mContextRequiresCyclicKvCache = contextRequiresCyclicKvCache;
+    }
+
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -392,6 +404,9 @@ private:
     runtime::ITensor::SharedPtr mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
+
+    // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
+    bool mContextRequiresCyclicKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -443,7 +458,7 @@ public:
         SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
 
     ~BlockManager();
 
@@ -712,6 +727,9 @@ private:
     SizeType32 mMissedBlocks;
     std::set<KVCacheBlock::IdType> reusedBlockIds;
 
+    // Whether or not to maintain a hashmap of blocks.
+    bool mEnableHashKey;
+
 private:
     friend class KVCacheManager;
 };
@@ -818,16 +836,18 @@ public:
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
 
-    virtual bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const = 0;
+    [[nodiscard]] virtual bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const = 0;
 
-    virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const = 0;
+    [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+        LlmRequest::RequestIdType requestId) const
+        = 0;
 
-    virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+    [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds) const
         = 0;
 
-    virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
-    virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
@@ -846,7 +866,7 @@ public:
             * 2 * modelConfig.getSizePerHead();
     }
 
-    [[nodiscard]] static std::tuple<SizeType32, SizeType32> const calculateMaxNumBlocks(KvCacheConfig const& config,
+    [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateMaxNumBlocks(KvCacheConfig const& config,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
@@ -924,7 +944,7 @@ public:
         return mBlockManager.getNumFreeBlocks();
     }
 
-    [[nodiscard]] virtual SizeType32 getNumPools() const override
+    [[nodiscard]] SizeType32 getNumPools() const override
     {
         return mBlockManager.getNumPools();
     }
@@ -993,8 +1013,6 @@ public:
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
     [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req) const override;
-
-    void addContextTokens(LlmRequest::RequestIdType requestId, SizeType32 numTokens);
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;

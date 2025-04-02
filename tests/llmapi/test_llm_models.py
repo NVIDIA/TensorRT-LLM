@@ -37,7 +37,7 @@ gpt_neox_20b_model_path = get_model_path('gpt-neox-20b')
 commandr_v01_model_path = get_model_path('c4ai-command-r-v01')
 commandr_plus_model_path = get_model_path('c4ai-command-r-plus')
 deepseek_v1_model_path = get_model_path("deepseek-moe-16b-base")
-sampling_params = SamplingParams(max_tokens=10)
+sampling_params = SamplingParams(max_tokens=10, end_id=-1)
 
 
 @force_ampere

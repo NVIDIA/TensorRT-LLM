@@ -17,6 +17,7 @@ import os
 import sys
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 
@@ -56,6 +57,7 @@ class TestFunctional(unittest.TestCase):
     )
     @skip_pre_blackwell_unittest
     def test_fp4_quantize_gemm_torch(self, m, n, k):
+        pytest.skip("https://nvbugs/5100633")
         a = torch.randn([m, k], dtype=torch.float32)
         b = torch.randn([n, k], dtype=torch.float32)
         a_global_sf = (448 * 6) / a.abs().max().float()

@@ -490,9 +490,14 @@ public:
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
+    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false)
     {
+        if (mEndId.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(*mEndId >= -1 && *mEndId < vocabSizePadded,
+                "EndId (%d) is not within acceptable range [-1, %d).", *mEndId, vocabSizePadded);
+        }
         TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
             "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
             maxEncoderInputLen.value());

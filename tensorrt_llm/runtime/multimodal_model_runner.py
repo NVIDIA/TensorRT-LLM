@@ -643,12 +643,18 @@ class MultimodalModelRunner:
                    other_vision_inputs):
         # same prompt for single/multiple image(s)
         n_prompts_n_images = False
-        if isinstance(
-                post_prompt,
-                list) and len(post_prompt) > 1 and image is not None and len(
-                    post_prompt) == image.shape[0]:
-            # n prompts and n images
-            n_prompts_n_images = True
+        if isinstance(post_prompt,
+                      list) and len(post_prompt) > 1 and image is not None:
+            if hasattr(image, "pixel_values"):
+                if len(post_prompt) == image["pixel_values"].shape[0]:
+                    n_prompts_n_images = True
+                    # n prompts and n images
+            else:
+                if isinstance(
+                        image,
+                        torch.Tensor) and len(post_prompt) == image.shape[0]:
+                    n_prompts_n_images = True
+                    # n prompts and n images
 
         if self.model_type == 'kosmos-2':
             input_ids = image['input_ids'].clone()
@@ -867,7 +873,14 @@ class MultimodalModelRunner:
                             1] + visual_atts.shape[1]
             else:
                 post_input_ids = None
-                length = pre_input_ids.shape[1] + visual_atts.shape[1]
+                assert pre_input_ids.shape[0] == visual_atts.shape[0]
+                if visual_atts.shape[0] == 1:
+                    length = pre_input_ids.shape[1] + visual_atts.shape[1]
+                else:
+                    length = [
+                        pre_input_ids.shape[1] + visual_atts.shape[1]
+                        for _ in range(visual_atts.shape[0])
+                    ]
 
         if n_prompts_n_images:
             if isinstance(length, int): length = [length]

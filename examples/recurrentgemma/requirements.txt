@@ -1,5 +1,5 @@
-tensorrt_llm==0.17.0.post1
-git+https://github.com/google-deepmind/recurrentgemma.git
+tensorrt_llm==0.18.0
+git+https://github.com/google-deepmind/recurrentgemma.git@8a32e365
 flax>=0.8.2
 jax~=0.4.23
 orbax-checkpoint==0.5.7

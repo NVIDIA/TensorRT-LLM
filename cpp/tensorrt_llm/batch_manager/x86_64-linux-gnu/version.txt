@@ -1,2 +1,2 @@
-0ec83a0451530fcf0e3f325cdc185043 libtensorrt_llm_ucx_wrapper.so
-f8c0381a2bc50ee2739c3d8c2be481b31e5f00bd commit
+e383212a40dca932c7b77bf4544dab80 libtensorrt_llm_ucx_wrapper.so
+3c5fe5eb86077f67febc42070be11f11de17c1e2 commit
