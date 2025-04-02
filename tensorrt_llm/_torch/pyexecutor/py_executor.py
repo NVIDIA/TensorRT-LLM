@@ -1800,6 +1800,13 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            # Unify the behavior of overlapping and non-overlapping cases
+            # return the response after we have second generated token
+            if self.kv_cache_transceiver is not None:
+                if request.decoding_iter == 1:
+                    new_active_requests.append(request)
+                    continue
+
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
