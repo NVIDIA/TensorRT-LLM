@@ -56,7 +56,7 @@ public:
 
 struct ExpiringBlockComparator
 {
-    inline bool operator()(BlockPtr const& a, BlockPtr const& b) const
+    bool operator()(BlockPtr const& a, BlockPtr const& b) const
     {
         // If two blocks expire in the same millisecond, their expiration times will be equal. As a fallback, check the
         // raw pointer values.

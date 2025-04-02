@@ -1,4 +1,4 @@
-tensorrt_llm==0.17.0.post1
+tensorrt_llm==0.18.0
 tiktoken
 datasets
 kaldialign

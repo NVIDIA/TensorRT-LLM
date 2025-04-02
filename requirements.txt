@@ -17,11 +17,11 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.8.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01 uses 2.6.0a0.
-torch>=2.5.1,<=2.6.0a0
+tensorrt~=10.9.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html#rel-25-03 uses 2.7.0a0.
+torch>=2.6.0,<=2.7.0a0
 torchvision
-nvidia-modelopt[torch]~=0.23.0
+nvidia-modelopt[torch]~=0.25.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
 # TODO: Remove the <4.48.0 constraint once https://github.com/huggingface/transformers/issues/35625 is resolved.
@@ -41,5 +41,5 @@ uvicorn
 httpx
 setuptools
 ordered-set
-flashinfer @ git+https://github.com/flashinfer-ai/flashinfer.git@06309c4e
-s2wrapper @ git+https://github.com/bfshi/scaling_on_scales.git@60da2afe
+einops
+flashinfer-python~=0.2.0

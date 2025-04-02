@@ -64,7 +64,7 @@ void initBindings(pybind11::module_& m)
 
     py::classh<GenLlmReq>(m, "GenericLlmRequest")
         .def("validate", &GenLlmReq::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
-            py::arg("max_draft_len"), py::arg("max_endocer_input_len") = std::nullopt,
+            py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false)
         .def("set_exclude_input_from_output", &GenLlmReq::setExcludeInputFromOutput, py::arg("exclude"))
         .def("get_num_tokens", &GenLlmReq::getNumTokens, py::arg("beam"))

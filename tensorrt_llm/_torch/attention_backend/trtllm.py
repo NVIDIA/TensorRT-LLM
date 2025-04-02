@@ -10,6 +10,8 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .interface import dummy_forward
+
 
 @dataclass(kw_only=True, init=False)
 class TrtllmAttentionWrapper:
@@ -432,7 +434,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q = q.reshape(1, -1, num_heads, head_dim).contiguous()
             k = k.reshape(1, -1, num_kv_heads, head_dim).contiguous()
             v = v.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-            return AttentionBackend.dummy_forward(q, k, v)
+            return dummy_forward(q, k, v)
 
         assert isinstance(
             metadata,

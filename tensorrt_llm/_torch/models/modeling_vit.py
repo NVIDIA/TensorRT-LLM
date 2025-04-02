@@ -19,11 +19,12 @@
 import torch
 import torch.nn as nn
 from accelerate.hooks import add_hook_to_module
-from s2wrapper import forward as multiscale_forward
 from transformers import (CLIPImageProcessor, CLIPVisionModel, PretrainedConfig,
                           PreTrainedModel)
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+from .modeling_multimodal_utils import multiscale_forward
 
 
 class VisionTower(nn.Module):

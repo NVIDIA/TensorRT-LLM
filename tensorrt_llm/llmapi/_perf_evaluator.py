@@ -366,8 +366,8 @@ class LLMPerfEvaluator:
                 sample = self.samples[sample_offset]
                 sample_offset += 1
                 sampling_params.max_tokens = sample.output_len
-                sampling_params.end_id = -2
-                sampling_params.pad_id = -2
+                sampling_params.end_id = -1
+                sampling_params.pad_id = -1
                 if self.sampling_extra_params is not None:
                     for key, value in self.sampling_extra_params.items():
                         setattr(sampling_params, key, value)

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <vector>
