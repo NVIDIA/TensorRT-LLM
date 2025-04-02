@@ -403,6 +403,18 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 add_library(${SHARED_TARGET} SHARED)
 
+# Find cufile
+find_library(CUFILE_LIBRARY cufile
+    HINTS
+        /usr/local/cuda-12.6/targets/x86_64-linux/lib
+        /usr/lib/x86_64-linux-gnu
+        /usr/local/lib
+)
+if(NOT CUFILE_LIBRARY)
+    message(FATAL_ERROR "Could not find cufile library inside container.")
+endif()
+message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
+
 set_target_properties(
   ${SHARED_TARGET}
   PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
