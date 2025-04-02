@@ -110,6 +110,7 @@ class Phi3DecoderLayer(Module):
             rope_scaling_short_mscale=rope_scaling_short_mscale,
             rope_scaling_long_mscale=rope_scaling_long_mscale,
             original_max_position_embeddings=original_max_position_embeddings,
+            rotary_embedding_percentage=config.rotary_pct,
             block_sparse_params=block_sparse_attn_params)
 
         ClsMLP = MLP

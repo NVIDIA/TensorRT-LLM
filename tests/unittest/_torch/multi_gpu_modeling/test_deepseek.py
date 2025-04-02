@@ -14,7 +14,132 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
-MAX_SEQ_LEN = 2048
+# Test combinations for different scenarios
+# Each tuple contains: (tp_size, pp_size, ep_size, mtp_nextn, enable_dp, enable_cuda_graph, enable_overlap_scheduler, test_id)
+TEST_COMBINATIONS = [
+    # single-gpu test
+    # basic test
+    (1, 1, 1, 0, False, False, False,
+     "tp1_pp1_ep1_nextn0_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (1, 1, 1, 0, True, False, False,
+     "tp1_pp1_ep1_nextn0_enable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (1, 1, 1, 0, False, True, False,
+     "tp1_pp1_ep1_nextn0_disable_dp_enable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (1, 1, 1, 0, False, False, True,
+     "tp1_pp1_ep1_nextn0_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (1, 1, 1, 0, True, True, True,
+     "tp1_pp1_ep1_nextn0_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    # mtp test
+    (1, 1, 1, 2, False, False, False,
+     "tp1_pp1_ep1_nextn2_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (1, 1, 1, 2, False, False, True,
+     "tp1_pp1_ep1_nextn2_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (1, 1, 1, 2, False, True, True,
+     "tp1_pp1_ep1_nextn2_disable_dp_enable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (1, 1, 1, 2, True, False, True,
+     "tp1_pp1_ep1_nextn2_enable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (1, 1, 1, 2, True, True, True,
+     "tp1_pp1_ep1_nextn2_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    # multi-gpu test
+    # tp4
+    (4, 1, 1, 0, False, False, False,
+     "tp4_pp1_ep1_nextn0_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 1, 0, True, False, False,
+     "tp4_pp1_ep1_nextn0_enable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 1, 0, False, True, False,
+     "tp4_pp1_ep1_nextn0_disable_dp_enable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 1, 0, False, False, True,
+     "tp4_pp1_ep1_nextn0_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 1, 0, True, True, True,
+     "tp4_pp1_ep1_nextn0_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    #tp4, mtp2
+    (4, 1, 1, 2, False, False, False,
+     "tp4_pp1_ep1_nextn2_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 1, 2, False, False, True,
+     "tp4_pp1_ep1_nextn2_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 1, 2, False, True, True,
+     "tp4_pp1_ep1_nextn2_disable_dp_enable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 1, 2, True, False, True,
+     "tp4_pp1_ep1_nextn2_enable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 1, 2, True, True, True,
+     "tp4_pp1_ep1_nextn2_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    # tp4, ep4
+    (4, 1, 4, 0, False, False, False,
+     "tp4_pp1_ep4_nextn0_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 4, 0, True, False, False,
+     "tp4_pp1_ep4_nextn0_enable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 4, 0, False, True, False,
+     "tp4_pp1_ep4_nextn0_disable_dp_enable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 4, 0, False, False, True,
+     "tp4_pp1_ep4_nextn0_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 4, 0, True, True, True,
+     "tp4_pp1_ep4_nextn0_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    #tp4, ep4, mtp2
+    (4, 1, 4, 2, False, False, False,
+     "tp4_pp1_ep4_nextn2_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (4, 1, 4, 2, False, False, True,
+     "tp4_pp1_ep4_nextn2_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 4, 2, False, True, True,
+     "tp4_pp1_ep4_nextn2_disable_dp_enable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 4, 2, True, False, True,
+     "tp4_pp1_ep4_nextn2_enable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (4, 1, 4, 2, True, True, True,
+     "tp4_pp1_ep4_nextn2_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    #tp2, pp2
+    (2, 2, 1, 0, False, False, False,
+     "tp2_pp2_ep1_nextn0_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (2, 2, 1, 0, True, False, False,
+     "tp2_pp2_ep1_nextn0_enable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (2, 2, 1, 0, False, True, False,
+     "tp2_pp2_ep1_nextn0_disable_dp_enable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (2, 2, 1, 0, False, False, True,
+     "tp2_pp2_ep1_nextn0_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (2, 2, 1, 0, True, True, True,
+     "tp2_pp2_ep1_nextn0_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+    #tp2, pp2, mtp2
+    (2, 2, 1, 2, False, False, False,
+     "tp2_pp2_ep1_nextn2_disable_dp_disable_cuda_graph_disable_overlap_scheduler"
+     ),
+    (2, 2, 1, 2, False, False, True,
+     "tp2_pp2_ep1_nextn2_disable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (2, 2, 1, 2, False, True, True,
+     "tp2_pp2_ep1_nextn2_disable_dp_enable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (2, 2, 1, 2, True, False, True,
+     "tp2_pp2_ep1_nextn2_enable_dp_disable_cuda_graph_enable_overlap_scheduler"
+     ),
+    (2, 2, 1, 2, True, True, True,
+     "tp2_pp2_ep1_nextn2_enable_dp_enable_cuda_graph_enable_overlap_scheduler"),
+]
 
 
 def similar(a, b, threshold=0.9):
@@ -25,22 +150,12 @@ def similar(a, b, threshold=0.9):
 @pytest.mark.parametrize("model_name", ["DeepSeek-V3-Lite"],
                          ids=["deepseekv3_lite"])
 @pytest.mark.parametrize("backend", ["TRTLLM"], ids=["trtllm"])
-@pytest.mark.parametrize("quant", ["bf16", "fp4", "fp8"])
-@pytest.mark.parametrize("tp_size", [1, 2, 4], ids=["tp1", "tp2", "tp4"])
-@pytest.mark.parametrize("pp_size", [1, 2, 4], ids=["pp1", "pp2", "pp4"])
-@pytest.mark.parametrize("ep_size", [1, 2, 4], ids=["ep1", "ep2", "ep4"])
-@pytest.mark.parametrize("mtp_nextn", [0, 1, 2],
-                         ids=["nextn0", "nextn1", "nextn2"])
-@pytest.mark.parametrize("enable_dp", [True, False],
-                         ids=["enable_dp", "disable_dp"])
-@pytest.mark.parametrize("enable_cuda_graph", [True, False],
-                         ids=["enable_cuda_graph", "disable_cuda_graph"])
-@pytest.mark.parametrize(
-    "enable_overlap_scheduler", [True, False],
-    ids=["enable_overlap_scheduler", "disable_overlap_scheduler"])
-def test_deepseek(model_name, backend, quant, tp_size, pp_size, ep_size,
-                  mtp_nextn, enable_dp, enable_cuda_graph,
-                  enable_overlap_scheduler):
+@pytest.mark.parametrize("quant", ["bf16", "fp8", "fp4"],
+                         ids=["bf16", "fp8", "fp4"])
+@pytest.mark.parametrize("test_config", TEST_COMBINATIONS, ids=lambda x: x[-1])
+def test_deepseek(model_name, backend, quant, test_config):
+    tp_size, pp_size, ep_size, mtp_nextn, enable_dp, enable_cuda_graph, enable_overlap_scheduler, _ = test_config
+
     model_path = {
         "bf16": "bf16",
         "fp8": "fp8",

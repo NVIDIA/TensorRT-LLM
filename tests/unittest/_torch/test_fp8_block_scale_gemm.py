@@ -22,7 +22,7 @@ from utils.util import getSMVersion
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90,
+    getSMVersion() not in [90, 100],
     reason="Op only supported on Hopper",
 )
 @pytest.mark.parametrize(
@@ -32,7 +32,7 @@ from utils.util import getSMVersion
 )
 @pytest.mark.parametrize(
     "m",
-    [64, 128, 4096],
+    [7, 64, 128, 4096],
 )
 @pytest.mark.parametrize(
     "dtype",

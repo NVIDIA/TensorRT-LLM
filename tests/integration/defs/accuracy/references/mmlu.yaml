@@ -10,11 +10,20 @@ meta-llama/Meta-Llama-3-8B-Instruct:
     accuracy: 63.47
 meta-llama/Llama-3.1-8B:
   - accuracy: 66.06
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 63.16
   - quant_algo: FP8_PER_CHANNEL_PER_TOKEN
     accuracy: 65.55
   - quant_algo: MIXED_PRECISION
     extra_acc_spec: autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8
     accuracy: 64.99
+meta-llama/Llama-3.3-70B-Instruct:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 79.31
+  - quant_algo: FP8
+    accuracy: 81.02
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 71.35
   - quant_algo: FP8
@@ -33,3 +42,9 @@ Qwen/Qwen2.5-1.5B-Instruct:
   - accuracy: 61.45
   - quant_algo: FP8
     accuracy: 61.43
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 71.47
+  - quant_algo: NVFP4
+    accuracy: 70.66
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 71.32

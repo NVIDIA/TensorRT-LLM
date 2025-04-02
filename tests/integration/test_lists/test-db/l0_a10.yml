@@ -45,7 +45,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
   - unittest/trt/quantization # 18 mins
-  - accuracy/test_accuracy.py::TestLlama7B::test_streamingllm # 2 mins
+  - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
   - test_cache.py::test_cache_sanity # 1 sec
   - test_e2e.py::test_llmapi_quickstart_atexit
@@ -55,22 +55,22 @@ l0_a10:
   - unittest/llmapi/test_llm_perf_evaluator.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
-  - accuracy/test_accuracy.py::TestGpt2::test_auto_dtype # 1 min
-  - accuracy/test_accuracy.py::TestGpt2::test_beam_search # 1 min
-  - accuracy/test_accuracy.py::TestGpt2::test_beam_search_large # 6 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_cuda_graph # 1 min
-  - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
-  - accuracy/test_accuracy.py::TestMamba130M::test_auto_dtype # 1 min
-  - accuracy/test_accuracy.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
+  - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
+  - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
+  - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
+  - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
@@ -111,14 +111,14 @@ l0_a10:
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-disable_gemm_plugin] # 3 mins
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_context_fmha_disabled # 1 min
-  - accuracy/test_accuracy.py::TestLlama7B::test_auto_dtype # 2 mins
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
-  - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
-  - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi2::test_auto_dtype # 2 mins
-  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestGpt2::test_context_fmha_disabled # 1 min
+  - accuracy/test_cli_flow.py::TestLlama7B::test_auto_dtype # 2 mins
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
+  - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
+  - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype # 2 mins
+  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - test_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min

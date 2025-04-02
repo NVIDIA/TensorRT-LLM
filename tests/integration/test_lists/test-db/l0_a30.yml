@@ -36,16 +36,16 @@ l0_a30:
   - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-vision-trtllm-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-  - accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity # 4 mins
-  - accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_medusa_fp8_pre_quantized
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_weight_streaming[0.1]
-  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3Mini4kInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3Mini128kInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3_5MiniInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestQwen2_0_5BInstruct::test_weight_only
-  - accuracy/test_accuracy.py::TestQwen2_5_1_5BInstruct::test_weight_only
+  - accuracy/test_cli_flow.py::TestMinitron4BBase::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestLlama2_7B::test_weight_sparsity # 4 mins
+  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_weight_streaming[0.1]
+  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3Mini128kInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_weight_only
+  - accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_weight_only
   - examples/test_multimodal.py::test_llm_multimodal_general[deplot-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
@@ -97,8 +97,8 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
-  - accuracy/test_accuracy.py::TestLlama7B::test_manage_weights # 2 mins
-  - accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_weight_only
+  - accuracy/test_cli_flow.py::TestLlama7B::test_manage_weights # 2 mins
+  - accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins
