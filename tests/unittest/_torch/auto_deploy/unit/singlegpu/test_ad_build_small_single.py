@@ -68,7 +68,7 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-         # small Phi3-mini-4k model with world_size 1
+        # small Phi3-mini-4k model with world_size 1
         (
             1,
             {
