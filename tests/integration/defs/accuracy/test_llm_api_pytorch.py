@@ -211,8 +211,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -259,8 +259,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   pytorch_backend_config=pytorch_config,
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -271,26 +271,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [
-        None,
-        pytest.param(
-            2, marks=pytest.mark.skip("FP4 checkpoint has no MTP weights"))
-    ])
-    def test_nvfp4(self, mtp_nextn, attention_dp, cuda_graph,
-                   overlap_scheduler):
+    def test_nvfp4(self, attention_dp, cuda_graph, overlap_scheduler):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
-        if mtp_nextn is not None and mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                   pytorch_backend_config=pytorch_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+                  enable_attention_dp=attention_dp)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         with llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -301,20 +290,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [
-        None,
-        pytest.param(
-            2, marks=pytest.mark.skip("FP4 checkpoint has no MTP weights"))
-    ])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1)],
                              ids=["tp4", "ep4", "tp2pp2"])
-    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
-                         attention_dp, cuda_graph, overlap_scheduler):
-        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
-            pytest.skip(
-                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
-            )
+    def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler):
         if pp_size > 2 and cuda_graph and overlap_scheduler:
             pytest.skip(
                 "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
@@ -322,19 +302,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
-        if mtp_nextn is not None and mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-        else:
-            mtp_config = None
         llm = LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
                   pytorch_backend_config=pytorch_config,
-                  enable_attention_dp=attention_dp,
-                  speculative_config=mtp_config)
+                  enable_attention_dp=attention_dp)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         with llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
