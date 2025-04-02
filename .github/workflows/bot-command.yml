@@ -59,6 +59,7 @@ jobs:
             "<details>\n\n" +
             "`run  [--disable-fail-fast  --skip-test  --stage-list \"A10-e2e-0, xxx\" --gpu-type \"A30, H100_PCIe\" --multi-gpu-test  --post-merge  --extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\" --memory-profiling  --disable-incremental-build  --enable-publish-last-known-good ]`\n\n" +
             "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
+            "`--disable-fail-fast ` *(OPTIONAL)* : Disable fail fast on build/tests/infra failures.\n\n" +
             "`--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.\n\n" +
             "`--stage-list \"A10-e2e-0, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-e2e-0, xxx\". Note: Does **NOT** update GitHub check status.\n\n" +
             "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
