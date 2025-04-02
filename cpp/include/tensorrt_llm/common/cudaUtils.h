@@ -677,6 +677,7 @@ __host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol,
         }
         printf("\n");
     }
+    printf("\n");
 }
 
 template <typename T>
@@ -742,6 +743,19 @@ __device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int n
     printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
     print_elements(ptr, nRow, nCol, nStride);
 }
+
+template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
+#ifdef ENABLE_BF16
+template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+#endif
+#ifdef ENABLE_FP8
+template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+#endif
+template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 #ifndef CUDA_CALL
 #define CUDA_CALL(answer)                                                                                              \
@@ -1360,19 +1374,6 @@ DEFINE_MEMBER_CHECKER(bias)
 DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
-
-template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
-#ifdef ENABLE_BF16
-template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
-#endif
-#ifdef ENABLE_FP8
-template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
-#endif
-template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 } // namespace tensorrt_llm::common
 

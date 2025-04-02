@@ -433,6 +433,11 @@ TEST_P(DisaggParamsTest, DisaggTokenComparison)
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
     auto const processNum = std::get<0>(GetParam());
     auto const modelNames = std::get<1>(GetParam());
     auto const participantIdsEachInstance = std::get<2>(GetParam());       // std::vector<std::vector<int>>
@@ -645,6 +650,11 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     {
         setenv("UCX_TLS", "^cuda_ipc", 1); // disable cuda_ipc for testing for mpi
     }
+    else
+    {
+        setenv("UCX_TCP_CM_REUSEADDR", "y",
+            1); // tests creates and destroies ucxCacheCommunicatoers frequently, so listener ports must be reused
+    }
     auto const processNum = std::get<0>(GetParam());
     auto const modelNames = std::get<1>(GetParam());
     auto const participantIdsEachInstance = std::get<2>(GetParam());       // std::vector<std::vector<int>>
@@ -660,6 +670,19 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
     {
         GTEST_SKIP() << " need " << processNum << " processes but got " << commSize << " mpi processes, skip test.";
     }
+    bool spawnProcess = false;
+    if (commSize == 1)
+    {
+        spawnProcess = true;
+        int deviceCount = -1;
+        TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+        if (deviceCount < 4)
+        {
+            GTEST_SKIP() << "DisaggExecutorTest requires at least 4 GPUs";
+        }
+        ASSERT_TRUE(tensorrt_llm::common::getEnvUseUCXKvCache());
+    }
+
     ASSERT_EQ(participantIdsEachInstance.size(), participantDeviceIdsEachInstance.size());
     SizeType32 instanceNum = participantIdsEachInstance.size();
     ASSERT_EQ(instanceNum, instanceRoles.size());
@@ -818,10 +841,13 @@ TEST_P(DisaggOrchestratorParamsTest, DisaggTokenComparison)
         KvCacheConfig kvCacheConfig{true, std::nullopt, std::nullopt, std::nullopt, 0.2};
 
         tensorrt_llm::executor::ExecutorConfig executorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig);
-        tensorrt_llm::executor::OrchestratorConfig orchestratorConfig{isOrchestrator, "", nullptr, false};
+        tensorrt_llm::executor::OrchestratorConfig orchestratorConfig{
+            isOrchestrator, PathUtil::EXECUTOR_WORKER_PATH(), nullptr, spawnProcess};
+
         tensorrt_llm::executor::ParallelConfig parallelConfig{tensorrt_llm::executor::CommunicationType::kMPI,
             tensorrt_llm::executor::CommunicationMode::kORCHESTRATOR, participantDeviceIdsEachInstance.at(in),
-            participantIdsEachInstance.at(in), orchestratorConfig};
+            spawnProcess ? std::nullopt : std::optional<std::vector<SizeType32>>(participantIdsEachInstance.at(in)),
+            orchestratorConfig};
         executorConfig.setParallelConfig(parallelConfig);
         if (in < contextNum)
         {
@@ -1229,4 +1255,20 @@ INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen1TP2PP2DisaaggOrchestrator, DisaggOrches
         testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4, 5, 6}}),
         testing::Values(std::vector<std::vector<int>>{{0}, {1}, {0, 1, 2, 3}}),
         testing::Values(std::vector<int>{1, 1, 0}), testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP2Gen2TP1DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+    testing::Combine(testing::Values(1),
+        testing::Values(std::vector<std::string>{"llama_tp2_pp1", "llama_tp2_pp1", "llama_tp1_pp1", "llama_tp1_pp1"}),
+        testing::Values(std::vector<std::vector<int>>{{1, 2}, {3, 4}, {5}, {6}}),
+        testing::Values(std::vector<std::vector<int>>{{0, 1}, {2, 3}, {0}, {1}}),
+        testing::Values(std::vector<int>{1, 1, 0, 0}), testing::Values(0)),
+    generateTestNameDisaggParams);
+
+INSTANTIATE_TEST_SUITE_P(LlamaCon2TP1Gen2PP2DisaaggSpawnOrchestrator, DisaggOrchestratorParamsTest,
+    testing::Combine(testing::Values(1),
+        testing::Values(std::vector<std::string>{"llama_tp1_pp1", "llama_tp1_pp1", "llama_tp1_pp2", "llama_tp1_pp2"}),
+        testing::Values(std::vector<std::vector<int>>{{1}, {2}, {3, 4}, {5, 6}}),
+        testing::Values(std::vector<std::vector<int>>{{0}, {1}, {3, 2}, {1, 0}}),
+        testing::Values(std::vector<int>{1, 1, 0, 0}), testing::Values(0)),
     generateTestNameDisaggParams);

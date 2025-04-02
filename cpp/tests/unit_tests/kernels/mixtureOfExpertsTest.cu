@@ -334,7 +334,7 @@ protected:
             * sizeof(WeightStorage) * num_gemms / WEIGHT_ELEM_PER_BYTE;
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
-            num_experts, k, this->mActType, {}, mUseLora, useDeepseek, mUsePrequantScale);
+            num_experts, k, this->mActType, {}, mUseLora, useDeepseek, false, mUsePrequantScale);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -372,7 +372,7 @@ protected:
 
         bool const useDeepseek = false;
         size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, parallelism_config, mUseLora, useDeepseek, mUsePrequantScale);
+            mActType, parallelism_config, mUseLora, useDeepseek, false, mUsePrequantScale);
 
         auto const stream = mStream->get();
 
@@ -981,11 +981,13 @@ protected:
 
         LoraParams lora_params;
         bool const useFp8BlockScales = false;
+        bool const minLatencyMode = false;
+        MoeMinLatencyParams min_latency_params;
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, stream);
+            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -1855,7 +1857,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);

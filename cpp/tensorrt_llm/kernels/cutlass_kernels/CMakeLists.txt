@@ -74,6 +74,9 @@ file(GLOB_RECURSE FBGEMM_CU_INSTANTIATIONS
      ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm/*.cu)
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
 
+# Get the sources for FP8 Blockwise GEMM launchers
+file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
+
 # Get the sources for FP4 GEMM launchers
 file(GLOB_RECURSE FP4_CU_INSTANTIATIONS
      ${INSTANTIATION_GENERATION_DIR}/gemm_fp4/*.cu)
@@ -89,6 +92,7 @@ set(ALL_SRCS ${SRC_CPP};${SRC_CU})
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "moe_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
+list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
 list(REMOVE_ITEM ALL_SRCS
@@ -102,6 +106,7 @@ message(
   "Group srcs ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP} ${GROUPED_CU_INSTANTIATIONS}"
 )
 message(VERBOSE "Fbgemm srcs ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS}")
+message(VERBOSE "FP8 Blockscale GEMM srcs ${FP8_BLOCKSCALE_GEMM_SRC_CU}")
 message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
 message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
 message(VERBOSE "All srcs ${ALL_SRCS}")
@@ -116,6 +121,7 @@ add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU}
 # add_library(moe_gemm_src STATIC ${GROUPED_SRC_CU} ${GROUPED_SRC_CPP}
 # ${GROUPED_CU_INSTANTIATIONS})
 add_library(fb_gemm_src STATIC ${FBGEMM_SRC_CU} ${FBGEMM_CU_INSTANTIATIONS})
+add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
 add_library(
   ar_gemm_src STATIC
   ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
@@ -168,8 +174,10 @@ function(process_target target_name enable_hopper enable_blackwell)
 
 endfunction()
 
-foreach(target_name
-        ar_gemm_src;fpA_intB_gemm_src;fb_gemm_src;gemm_swiglu_sm90_src)
+foreach(
+  target_name
+  ar_gemm_src;fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src
+)
   process_target(${target_name} true false) # Name, Hopper, Blackwell
 endforeach()
 

@@ -15,10 +15,12 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
 #include "tensorrt_llm/runtime/common.h"
 
-#include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
+#define BEAM_SEARCH_DEBUG 0
 
 namespace tensorrt_llm
 {
@@ -37,23 +39,33 @@ struct BeamHypotheses
     // %%: parameter name in file generation.py (python workflow)
     // Candidate beams: a beam which generates end_id or its sequence length reaches MSL
     // Candidate-Beam-Array (CBA): The arrays to place the candidate beams and related information
+    // Variable-Beam-Width-Search (VBWS): A search mode that allows using different beam width for each step
 
     // Scalar values
-    bool bReturnNormedScore{false};         // return `normedScore` or `cumLogProbs`, always be `false` now
-    size_t nMaxBatchSize{0};                // buildtime max batch size
-    size_t nBatchSize{0};                   // runtime batch size
-    size_t nBeamWidth{0};                   //
+    bool bReturnNormedScore{false};         // Return `normedScore` or `cumLogProbs`, always be `false` now
+    bool bVBWS{false};                      // whether to use VBWS for Beam-Search
+    size_t nMaxBatchSize{0};                // Buildtime max batch size
+    size_t nBatchSize{0};                   // Runtime batch size
+    size_t nBeamWidth{0};                   // Runtime beam width
+    size_t nBeamWidthIn{0};                 // Scalar value of current input beam width, for VBWS
+    size_t nBeamWidthOut{0};                // Scalar value of current output beam width, for VBWS
     size_t nMaxSeqLen{0};                   //
-    size_t nVocabSize{0};                   // vocab_size_padded
+    size_t nVocabSize{0};                   // Vocab Size Padded
     size_t nVPart{0};                       // Count of vocab_size_padded divided
-    size_t nByteMaxSharedMemoryPerBlock{0};  // Device information
-    size_t nByteSharedMemoryStage1{0};       // Dynamic shared memory size of stage 1
-    size_t nByteSharedMemoryStage3{0};       // Static shared memory size of stage 3
+    size_t nByteMaxSharedMemoryPerBlock{0}; // Device information
+    size_t nByteSharedMemoryStage1{0};      // Dynamic shared memory size of stage 1
+    size_t nByteSharedMemoryStage3{0};      // Static shared memory size of stage 3
 
     // Pointers from SamplingConfig
     float const* diversityRates{nullptr};           // [BS]
     float const* lengthPenalties{nullptr};          // [BS]
     int const* earlyStoppings{nullptr};             // [BS]
+    int const* beamWidthArraysHost{nullptr};        // [BS, kMaxBeamWidthArrayLength]                           for VBWS
+    int const* beamWidthArraysDevice{nullptr};      // [BS, kMaxBeamWidthArrayLength]                           for VBWS
+    int* nBeamWidthInHost{nullptr};                 // [BS], cpu                                                for VBWS, beam width of last forward computation
+    int* nBeamWidthOutHost{nullptr};                // [BS], cpu                                                for VBWS, beam width of next forward computation
+    int* nBeamWidthInDevice{nullptr};               // [BS]                                                     for VBWS, beam width of last forward computation
+    int* nBeamWidthOutDevice{nullptr};              // [BS]                                                     for VBWS, beam width of next forward computation
 
     // Pointers from input
     int const* inputLengths{nullptr};               // [BS, BM]         %% context_length
@@ -79,7 +91,7 @@ struct BeamHypotheses
     // Pointers related to beam search process, they are initialized in those two functions:
     // [gptDecoder.cpp] GptDecoder<T>::forward or [dynamicDecodeOp.cpp] FtDynamicDecode<T>::forward
     bool* batchDones{nullptr};                      // [BS]             %% self.beam_hyps_is_done               whether a whole batch is finished
-    FinishedState* finished{nullptr};               // [BS*BM]          %% self.finished                        whether and how a beam is finished
+    FinishedState* finished{nullptr};               // [BS*BM], uint8   %% self.finished                        whether and how a beam is finished
 
     // Pointers for backtrack of the beams, they are relocated in [dynamicDecodeLayer.cpp] DynamicDecodeLayer<T>::prepareIdsPtrs
     int** outputIdsPtr{nullptr};                    // [BS][BM, MSL]    %% self.output_ids
@@ -116,13 +128,94 @@ __device__ __forceinline__ T applyLengthPenalty(T const log_prob, int const leng
 template <typename T, bool IS_V2>
 void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
 
+void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
+    runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
+
 template <typename T>
 __global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM);
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 
-__global__ void gatherId(
-    int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS, size_t const nBM, size_t const nV);
+__global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
+    size_t const nBMIn, size_t const nBMOut, size_t const nV);
+
+void printBH(BeamHypotheses const& bh);
+
+void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM, int const nV);
+
+// for Beam Search debug
+#if BEAM_SEARCH_DEBUG
+#define BID 0
+
+#define LINE(x) printf(x "@L%d\n", __LINE__);
+
+#define PRINT(x)                                                                                                       \
+    {                                                                                                                  \
+        printf(#x "=");                                                                                                \
+        print_element_(x);                                                                                             \
+    }
+
+// Host function
+#define PRINT_HOST(x, nRow, nCol, nColPadded)                                                                          \
+    {                                                                                                                  \
+        if (x == nullptr)                                                                                              \
+        {                                                                                                              \
+            printf(#x "=nullptr\n");                                                                                   \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            printf(#x "=\n");                                                                                          \
+            printMatrix(x, nRow, nCol, nColPadded);                                                                    \
+        }                                                                                                              \
+    }
+#define PH2(x, nCol) PRINT_HOST(x, 1, nCol, nCol)
+#define PH3(x, nElement, nCol) PRINT_HOST(x, ((nElement) / (nCol)), nCol, nCol)
+
+// Device function
+#define PRINT_DEVICE(x, nRow, nCol, nColPadded)                                                                        \
+    {                                                                                                                  \
+        if (x == nullptr)                                                                                              \
+        {                                                                                                              \
+            printf(#x "=nullptr\n");                                                                                   \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            printf(#x "=\n");                                                                                          \
+            printMatrixDevice(x, nRow, nCol, nColPadded);                                                              \
+        }                                                                                                              \
+    }
+#define PD2(x, nCol) PRINT_DEVICE(x, 1, nCol, nCol)
+#define PD3(x, nElement, nCol) PRINT_DEVICE(x, ((nElement) / (nCol)), nCol, nCol)
+
+// Device function
+#define WITH(blockIdxx, bSync, code)                                                                                   \
+    {                                                                                                                  \
+        if (bSync)                                                                                                     \
+        {                                                                                                              \
+            __syncthreads();                                                                                           \
+        }                                                                                                              \
+        if (blockIdx.x == (blockIdxx) && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0    \
+            && threadIdx.z == 0)                                                                                       \
+        {                                                                                                              \
+            code                                                                                                       \
+        }                                                                                                              \
+        if (bSync)                                                                                                     \
+        {                                                                                                              \
+            __syncthreads();                                                                                           \
+        }                                                                                                              \
+    }
+
+#else
+#define LINE(x)
+#define PRINT(x)
+#define QH(x, y, z, w)
+#define PH2(x, nCol)
+#define PH3(x, nElement, nCol)
+#define PRINT_DEVICE(x, y, z, w)
+#define PD2(x, nCol)
+#define PD3(x, nElement, nCol)
+#define WITH(x, y, z)
+#endif
 
 } // namespace kernels
 } // namespace tensorrt_llm
