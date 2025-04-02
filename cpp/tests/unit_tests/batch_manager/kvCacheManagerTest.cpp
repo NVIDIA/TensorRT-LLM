@@ -3632,6 +3632,7 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
 
             auto remainingBlocksToCompletion = kvCacheManager.getRemainingBlocksToCompletion(*llmRequest);
             auto neededBlocksOneStep = kvCacheManager.getNeededBlocksOneStep(*llmRequest, false);
+            auto currentNumAllocTotalBlocks = kvCacheManager.getNumAllocTotalBlocks();
 
             EXPECT_NO_THROW(kvCacheManager.addSequence(requestId, inputLength, maxBeamWidth, llmRequest));
             for (int di = 0; di < draftLen && di < maxNewTokens && (inputLength + di) < maxAttentionWindow; ++di)
@@ -3643,14 +3644,14 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                 EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
             }
 
-            auto numUsedBlocksThisStep = kvCacheManager.getUsedNumBlocks();
+            auto numUsedBlocksThisStep = kvCacheManager.getNumAllocTotalBlocks() - currentNumAllocTotalBlocks;
             EXPECT_EQ(numUsedBlocksThisStep, neededBlocksOneStep);
 
             // Simulate adding new tokens during generation
             llmRequest->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
             for (int i = draftLen; i < maxNewTokens && (inputLength + i) < maxAttentionWindow; i += (draftLen + 1))
             {
-                auto numCurrentlyUsedBlocks = kvCacheManager.getUsedNumBlocks();
+                currentNumAllocTotalBlocks = kvCacheManager.getNumAllocTotalBlocks();
                 for (int beam = 0; beam < maxBeamWidth; beam++)
                 {
                     llmRequest->addNewToken(1, beam);
@@ -3672,14 +3673,23 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                 {
                     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
                 }
-                numUsedBlocksThisStep = kvCacheManager.getUsedNumBlocks() - numCurrentlyUsedBlocks;
+                numUsedBlocksThisStep = kvCacheManager.getNumAllocTotalBlocks() - currentNumAllocTotalBlocks;
 
-                EXPECT_EQ(numUsedBlocksThisStep, neededBlocksOneStep);
+                if (inputLength + i + draftLen + 1 < maxAttentionWindow)
+                {
+                    EXPECT_EQ(numUsedBlocksThisStep, neededBlocksOneStep);
+                }
+                else
+                {
+                    // This test calculates neededBlocksOneStep for the entire step (which may exceed maxAttentionWindow), 
+                    // but adds tokens only up to maxAttentionWindow.
+                    // In this case, we can expect at most 1 block difference.
+                    EXPECT_LE(std::abs(numUsedBlocksThisStep - neededBlocksOneStep), 1);
+                }
             }
 
-            // After adding all tokens, we should match remainingBlocksToCompletion
-            EXPECT_EQ(remainingBlocksToCompletion, kvCacheManager.getUsedNumBlocks());
-            EXPECT_EQ(kvCacheManager.getRemainingBlocksToCompletion(*llmRequest), 0);
+            // After adding tokens, initial remainingBlocksToCompletion should match current state + new remainingBlocksToCompletion
+            EXPECT_EQ(remainingBlocksToCompletion, kvCacheManager.getNumAllocTotalBlocks() + kvCacheManager.getRemainingBlocksToCompletion(*llmRequest));
         }
     }
 }
