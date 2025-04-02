@@ -54,23 +54,28 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
 
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=
+        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
+    )
+
     def test_auto_dtype(self):
-        extra_evaluator_kwargs = dict(
-            apply_chat_template=True,
-            system_prompt=
-            "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
-        )
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    def test_weight_only(self):
+        quant_config = QuantConfig(QuantAlgo.W8A16)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
-        extra_evaluator_kwargs = dict(
-            apply_chat_template=True,
-            system_prompt=
-            "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
-        )
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=extra_evaluator_kwargs)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
