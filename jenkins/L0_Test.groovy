@@ -91,6 +91,7 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+// Test filter flags
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
