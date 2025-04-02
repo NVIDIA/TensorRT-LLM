@@ -450,3 +450,4 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization] SKIP (https://nvbugspro.nvidia.com/bug/5181262)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5166600)
