@@ -1408,6 +1408,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req) const
 {
+    if (req.isFinished())
+    {
+        return 0;
+    }
+
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
@@ -1439,12 +1444,26 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req)
         }
     }
 
-    if (numAllocBlocksPerBeam < numContextBlocks)
+    // In case of sliding window attention, a new block is allocated when the window slides (and then the out-of-window block is offloaded / evicted)
+    // So we need an extra block for generation if the diff between the max sequence length and the current sequence length crosses a block boundary
+    SizeType32 numExtraBlocksPerBeam = 0;
+    SizeType32 const maxSeqlenInBlocks = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
+    SizeType32 const attentionWindowInBlocks = tc::ceilDiv(mMaxAttentionWindow + mTemporaryAttentionWindow, getTokensPerBlock());
+    if (maxSeqlenInBlocks > attentionWindowInBlocks)
     {
-        return numContextBlocks - numAllocBlocksPerBeam + numGenBlocksPerBeam * req.mSamplingConfig.beamWidth;
+        SizeType32 const numCurrentBlocksPerBeam = tc::ceilDiv(req.getTokens(0).size(), getTokensPerBlock());
+        if (maxSeqlenInBlocks > numCurrentBlocksPerBeam)
+        {
+            numExtraBlocksPerBeam = 1;
+        }
     }
 
-    return (numTotalBlocksPerBeam - numAllocBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    if (numAllocBlocksPerBeam < numContextBlocks)       // Still didn't allocate all context blocks
+    {
+        return numContextBlocks - numAllocBlocksPerBeam + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    }
+
+    return (numTotalBlocksPerBeam - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
 
 void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence)
