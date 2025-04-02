@@ -82,7 +82,7 @@ if [[ "${SKIP_KILL}" != "yes" ]]; then
   pkill -9 -f trtllm-serve || true
 fi
 
-# Check that size of output is size of prompts.json + 2
+# Check that size of output is size of prompts.json
 num_outputs=$(jq '. | length' output.json)
 num_outputs_streaming=$(jq '. | length' output_streaming.json)
 expected_num_outputs=$(jq '. | length' ${CLIENT_DIR}/prompts.json)
