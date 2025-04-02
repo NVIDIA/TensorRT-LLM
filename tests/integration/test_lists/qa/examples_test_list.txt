@@ -425,9 +425,9 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s
