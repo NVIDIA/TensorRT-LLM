@@ -135,6 +135,32 @@ std::vector<int> getWorldRanks(MpiComm const& comm)
     return worldRanks;
 }
 
+int getNumNodes()
+{
+#if ENABLE_MULTI_DEVICE
+    TLLM_LOG_WARNING("Number of nodes was not provided, using MPI to determine number of nodes");
+
+    // Create a communicator for processes with the same hostname
+    MPI_Comm node_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+
+    // Get rank in node_comm
+    int node_rank;
+    MPI_Comm_rank(node_comm, &node_rank);
+
+    // Count only rank 0 processes
+    int local_count = (node_rank == 0) ? 1 : 0;
+    int num_nodes = 0;
+
+    MPI_Allreduce(&local_count, &num_nodes, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    MPI_Comm_free(&node_comm);
+    return num_nodes;
+#else
+    return 1;
+#endif
+}
+
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 {
     // double-checked locking
