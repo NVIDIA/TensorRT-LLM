@@ -1537,7 +1537,7 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
             {
                 mBlockManager.allocateBlock(sequence);
             }
-            if (newNumTokens > mMaxTokenNum)
+            if (!isCrossKv() && newNumTokens > mMaxTokenNum)
             {
                 // Get the block to release from sequence
                 auto const requestId = sequence.getRequestId();
