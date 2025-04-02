@@ -1,3 +1,7 @@
+import os
+import pathlib
+import subprocess
+import sys
 import unittest
 
 import numpy as np
@@ -12,9 +16,43 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.lora_manager import PeftConfig
 
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
+current_dir = pathlib.Path(__file__).parent.resolve()
+root_dir = current_dir.parent.parent.parent
+
+sys.path.append(str(root_dir / "tests" / "integration"))
 
 
 class TestResourceManager(unittest.TestCase):
+    CPP_RESOURCES_DIR = os.path.join(str(root_dir), "cpp", "tests", "resources")
+    CPP_DATA_DIR = os.path.join(CPP_RESOURCES_DIR, "data")
+    LORA_TEST_WEIGHTS_TP1 = "lora-test-weights-tp1"
+    TP1_WEIGHTS_PATH = os.path.join(CPP_DATA_DIR, LORA_TEST_WEIGHTS_TP1,
+                                    "source.npy")
+    TP1_CONFIG_PATH = os.path.join(CPP_DATA_DIR, LORA_TEST_WEIGHTS_TP1,
+                                   "config.npy")
+
+    @classmethod
+    def setUpClass(cls):
+        """
+        Setup the lora test data resources
+        """
+        # TODO smor- this should be ported to a different place, ideally run once
+        # in a similar way to the cpp tests fixutres.
+
+        cpp_script_dir = os.path.join(cls.CPP_RESOURCES_DIR, "scripts")
+
+        generate_lora_data_args_tp1 = [
+            sys.executable,
+            f"{cpp_script_dir}/generate_test_lora_weights.py",
+            f"--out-dir={cls.CPP_DATA_DIR}/{cls.LORA_TEST_WEIGHTS_TP1}",
+            "--tp-size=1",
+        ]
+
+        subprocess.check_call(generate_lora_data_args_tp1,
+                              cwd=root_dir,
+                              shell=False,
+                              env=None,
+                              timeout=100)
 
     class MockModelConfig:
         """
@@ -91,8 +129,6 @@ class TestResourceManager(unittest.TestCase):
             lora_config = torch.from_numpy(lora_config)
 
         input_tokens = [i + 1 for i in range(max_new_tokens)]
-        print(f"input_tokens: {input_tokens}")
-        # Create the request with minimal parameters
         request = tensorrt_llm.bindings.internal.batch_manager.LlmRequest(
             request_id=request_id,
             max_new_tokens=max_new_tokens,
@@ -113,12 +149,9 @@ class TestResourceManager(unittest.TestCase):
             tuple: (weights tensor, config tensor) formatted correctly for the C++ implementation.
         """
         # TODO smor- change from custom path configuration to relative path
-        lora_weights = np.load(
-            "cpp/tests/resources/data/lora-test-weights-tp1/source.npy").astype(
-                np.float16)
+        lora_weights = np.load(self.TP1_WEIGHTS_PATH).astype(np.float16)
         lora_weights = np.expand_dims(lora_weights, axis=0)
-        lora_config = np.load(
-            "cpp/tests/resources/data/lora-test-weights-tp1/config.npy")
+        lora_config = np.load(self.TP1_CONFIG_PATH)
         lora_config = np.expand_dims(lora_config, axis=0)
         return lora_weights, lora_config
 
