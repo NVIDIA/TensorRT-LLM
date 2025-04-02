@@ -39,13 +39,13 @@ def _create_and_register_weight(
 ):
     orig_weight = gm.get_parameter(weight_key)
     weight_module_path, sub_weight_key = weight_key.rsplit(".", 1)
-    new_module_name = f"{weight_module_path}_unfused"
-    new_param_name = f"{sub_weight_key}_{user.name}"
+    new_module_name = f"{weight_module_path}_unfused_{user.name}"
+    new_param_name = f"{sub_weight_key}"
 
     split_weight = orig_weight[start_idx:end_idx]  # spilt weights on dim=0
     new_weight = nn.Parameter(split_weight.detach().clone())
     full_new_param_name = add_new_parameter_to_submodule(
-        gm, new_module_name, new_param_name, new_weight, ad_logger
+        gm, new_module_name, new_param_name, new_weight
     )
 
     weight_split_info[weight_key].append((full_new_param_name, start_idx, end_idx))
@@ -68,6 +68,8 @@ def unfuse_weights(gm: GraphModule) -> GraphModule:
     Returns:
         The transformed GraphModule with unfused weights
     """
+    ad_logger.info("Unfusing GEMM")
+    ad_logger.debug("Before Unfusing GEMM: " + str(gm))
     graph = gm.graph
 
     # track weight split info for load hook
@@ -137,4 +139,5 @@ def unfuse_weights(gm: GraphModule) -> GraphModule:
         gm._register_load_state_dict_pre_hook(partial(_load_hook, param_key=weight_key))
 
     gm = canonicalize_graph(gm)
+    ad_logger.debug("After Unfusing GEMM: " + str(gm))
     return gm

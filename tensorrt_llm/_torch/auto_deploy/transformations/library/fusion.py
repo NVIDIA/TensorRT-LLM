@@ -18,7 +18,7 @@ from ...utils.quantization_utils import QuantizationImpl
 from .._graph import canonicalize_graph
 
 
-def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]):
+def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[Node]):
     """Fuse GEMMs that have the same input activation.
 
     Below, is a simple example of how the fusion works:
@@ -40,7 +40,9 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     keys_unfused = [extract_param_names_from_lin_node(n)[0] for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
-    key_fused = f"fused_weight_{idx}"
+
+    new_weight_key = _fuse_keys(keys_unfused)
+    new_module_name, new_param_name = new_weight_key.rsplit(".", 1)
 
     quantization_impl = QuantizationImpl.create(linear_nodes[0])
 
@@ -90,17 +92,16 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
         param_fused = nn.Parameter(weights_fused, requires_grad=False)
 
         for scale_name, buffer in buffer_fused.items():
-            fused_buffer_name = key_fused + "_" + scale_name
-            gm.register_buffer(fused_buffer_name, buffer)
+            submodule = gm.get_submodule(new_module_name)
+            fused_buffer_name = new_param_name + "_" + scale_name
+            submodule.register_buffer(fused_buffer_name, buffer)
 
     else:
         param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
 
-    weight_key = keys_unfused[0]
-    weight_module_path, _ = weight_key.rsplit(".", 1)
-    new_module_name = f"{weight_module_path}_fused"
+    # Register fused parameters to new submodule
     full_new_param_name = add_new_parameter_to_submodule(
-        gm, new_module_name, key_fused, param_fused, ad_logger
+        gm, new_module_name, new_param_name, param_fused
     )
 
     # Handle fused_kwargs for quantized fused gemm.
@@ -112,7 +113,7 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
             for scale_name in quantization_impl.scale_names():
                 # Creates new nodes for the fused scales so the unfused linear ops can be fully erased.
                 fused_kwargs[scale_name] = gm.graph.create_node(
-                    "get_attr", key_fused + "_" + scale_name
+                    "get_attr", new_module_name + "_" + fused_buffer_name
                 )
 
     # add new linear node + split node
@@ -135,6 +136,31 @@ def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_node
     gm.delete_all_unused_submodules()
 
 
+def _fuse_keys(keys: list[str]) -> str:
+    """
+    Fuse multiple dot-separated keys into a single key with a common prefix and fused middle segments.
+
+    For Example, ["model.layers.0.q.weight", "model.layers.0.k.weight", "model.layers.1.v.weight"]
+    is fused as 'model.layers.fused__0_q__0_k__1_v.weight'
+
+    """
+    token_lists = [key.split(".") for key in keys]
+
+    common_prefix = []
+    for tokens in zip(*token_lists):
+        if len(set(tokens)) == 1:
+            common_prefix.append(tokens[0])
+        else:
+            break
+
+    fused_parts = ["_".join(tokens[len(common_prefix) : -1]) for tokens in token_lists]
+
+    fused_str = "__".join(fused_parts)
+    final_str = f"{'.'.join(common_prefix)}.fused__{fused_str}.{token_lists[0][-1]}"
+
+    return final_str
+
+
 def fuse_gemms(gm: GraphModule) -> GraphModule:
     ad_logger.info("GEMM fusion")
     ad_logger.debug("Before GEMM fusion: " + str(gm))
@@ -146,7 +172,6 @@ def fuse_gemms(gm: GraphModule) -> GraphModule:
             linear_nodes[node.args[0]].append(node)
 
     # fuse linear nodes
-    idx = -1
     with cuda_memory_tracker():
         for parent_node, lin_children in linear_nodes.items():
             if len(lin_children) < 2:
@@ -155,11 +180,10 @@ def fuse_gemms(gm: GraphModule) -> GraphModule:
             ad_logger.debug(
                 f"Found linear nodes to fuse: {lin_children} with parent node: {parent_node}"
             )
-            _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
+            _insert_fused_gemm(gm, parent_node, lin_children)
 
         # clean up and return
         gm = canonicalize_graph(gm)
 
     ad_logger.debug("After GEMM fusion: " + str(gm))
-    torch.cuda.empty_cache()
     return gm

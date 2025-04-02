@@ -9,6 +9,7 @@ from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
 from ..custom_ops.quant import QUANT_OPS
+from .logger import ad_logger
 
 try:
     # import modelopt to get quantize_op
@@ -276,7 +277,9 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def add_new_parameter_to_submodule(gm, new_submodule_name, new_param_name, new_param, logger=None):
+def add_new_parameter_to_submodule(
+    gm: GraphModule, new_submodule_name: str, new_param_name: str, new_param: torch.Tensor
+) -> str:
     """
     Adds a new parameter to a submodule within gm.
 
@@ -289,16 +292,13 @@ def add_new_parameter_to_submodule(gm, new_submodule_name, new_param_name, new_p
     """
     try:
         submodule = gm.get_submodule(new_submodule_name)
-        if logger:
-            logger.debug(f"Found existing submodule '{new_submodule_name}'.")
+        ad_logger.debug(f"Found existing submodule '{new_submodule_name}'.")
     except AttributeError:
         result = gm.add_submodule(new_submodule_name, nn.Module())
-        if logger:
-            logger.debug(f"Added submodule '{new_submodule_name}' with result: {result}.")
+        ad_logger.debug(f"Added submodule '{new_submodule_name}' with result: {result}.")
         submodule = gm.get_submodule(new_submodule_name)
 
-    setattr(submodule, new_param_name, new_param)
-    if logger:
-        logger.debug(f"Set new parameter '{new_param_name}' in submodule '{new_submodule_name}'.")
+    submodule.register_parameter(new_param_name, new_param)
+    ad_logger.debug(f"Set new parameter '{new_param_name}' in submodule '{new_submodule_name}'.")
 
     return f"{new_submodule_name}.{new_param_name}"
