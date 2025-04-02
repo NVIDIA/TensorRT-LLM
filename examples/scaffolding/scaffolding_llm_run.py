@@ -1,10 +1,9 @@
 import argparse
 import asyncio
 
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.scaffolding.controller import NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.worker import ProposerWorker, SamplingParams
+from tensorrt_llm.scaffolding.worker import TRTLLMWorker
 
 
 def parse_arguments():
@@ -69,19 +68,17 @@ def main():
         "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
         "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
-    proposer_worker = ProposerWorker(
-        args.generation_dir,
-        pytorch_backend_config=PyTorchConfig(
-            mixed_decoder=True,
-            enable_overlap_scheduler=True,
-        ),
-        sampling_params=SamplingParams(max_tokens=2048),
-    )
+
+    llm_worker = TRTLLMWorker.init_with_new_llm(args.generation_dir,
+                                                backend="pytorch",
+                                                max_batch_size=32,
+                                                max_num_tokens=4096,
+                                                temperature=0.9)
 
     if args.run_async:
-        test_async(prompts[0], proposer_worker)
+        test_async(prompts[0], llm_worker)
     else:
-        test_sync(prompts, proposer_worker)
+        test_sync(prompts, llm_worker)
 
 
 if __name__ == "__main__":

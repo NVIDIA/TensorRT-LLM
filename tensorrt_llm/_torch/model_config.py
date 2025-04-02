@@ -23,6 +23,8 @@ class ModelConfig(Generic[TConfig]):
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     skip_create_weights: bool = False
     is_generation: bool = True
+    max_num_tokens: int = 8192
+    moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
 
