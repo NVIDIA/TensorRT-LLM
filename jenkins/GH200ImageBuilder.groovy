@@ -13,37 +13,6 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 LLM_ROOT = "llm"
 
-// Utilities
-def checkoutSource(String repo, String branch, String directory) {
-    def extensionsList = [
-        [$class: 'CleanCheckout'],
-        [$class: 'RelativeTargetDirectory',
-            relativeTargetDir: directory],
-        [$class: 'SubmoduleOption',
-            parentCredentials: true,
-            recursiveSubmodules: true,
-            timeout: 60
-            ]
-    ]
-    def scmSpec = [
-        $class: "GitSCM",
-        doGenerateSubmoduleConfigurations: false,
-        submoduleCfg: [],
-        branches: [[name: branch]],
-        userRemoteConfigs: [
-            [
-                credentialsId: "svc_tensorrt_gitlab_api_token",
-                name: "origin",
-                url: repo,
-            ]
-        ],
-        extensions: extensionsList,
-    ]
-    echo "Cloning with SCM spec: ${scmSpec.toString()}"
-    checkout(scm: scmSpec, changelog: true)
-}
-
-
 def buildImage(action, type)
 {
     def branch = env.gitlabBranch

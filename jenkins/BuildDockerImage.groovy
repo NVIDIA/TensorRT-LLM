@@ -1,3 +1,5 @@
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
 import java.lang.Exception
 import groovy.transform.Field
 
@@ -14,53 +16,6 @@ LLM_BRANCH = env.gitlabBranch? env.gitlabBranch : params.branch
 LLM_BRANCH_TAG = LLM_BRANCH.replaceAll('/', '_')
 
 BUILD_JOBS = "32"
-
-// Utilities
-def checkoutSource(String repo, String branch, String directory) {
-    def extensionsList = [
-        lfs(),
-        [
-            $class: 'CleanCheckout'
-        ],
-        [
-            $class: 'CloneOption',
-            shallow: true,
-            depth: 1,
-            noTags: true,
-            honorRefspec: true,
-        ],
-        [
-            $class: 'RelativeTargetDirectory',
-            relativeTargetDir: directory
-        ],
-        [
-            $class: 'SubmoduleOption',
-            parentCredentials: true,
-            recursiveSubmodules: true,
-            shallow: true,
-            timeout: 60
-        ]
-    ]
-
-    def scmSpec = [
-        $class: "GitSCM",
-        doGenerateSubmoduleConfigurations: false,
-        submoduleCfg: [],
-        branches: [[name: branch]],
-        userRemoteConfigs: [
-            [
-                credentialsId: "svc_tensorrt_gitlab_api_token",
-                name: "origin",
-                refspec: "${branch}:refs/remotes/origin/${branch}",
-                url: repo,
-            ]
-        ],
-        extensions: extensionsList,
-    ]
-    echo "Cloning with SCM spec: ${scmSpec.toString()}"
-    checkout(scm: scmSpec, changelog: true)
-}
-
 
 def createKubernetesPodConfig(type)
 {
@@ -147,7 +102,7 @@ def buildImage(target, action="build", torchInstallType="skip", args="", custom_
 
     // Step 1: cloning tekit source code
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT)
+    trtllm_utils.checkoutSource(LLM_REPO, LLM_BRANCH, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     container("docker") {
