@@ -1,79 +1,305 @@
 
 
 <!DOCTYPE html>
-<html class="writer-html5" lang="en" data-content_root="../">
-<head>
-  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Speculative Sampling &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
-      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Speculative Sampling &#8212; tensorrt_llm</title>
   
-      <script src="../_static/jquery.js?v=5d32c60e"></script>
-      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
-      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-      <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/js/theme.js"></script>
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=a746c00c" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../_static/doctools.js?v=888ff710"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'advanced/speculative-decoding';</script>
+    <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Disaggregated-Service (experimental)" href="disaggregated-service.html" />
-    <link rel="prev" title="KV cache reuse" href="kv-cache-reuse.html" /> 
-</head>
+    <link rel="prev" title="KV cache reuse" href="kv-cache-reuse.html" />
 
-<body class="wy-body-for-nav"> 
-  <div class="wy-grid-for-nav">
-    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
-      <div class="wy-side-scroll">
-        <div class="wy-side-nav-search" >
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
 
-          
-          
-          <a href="../index.html" class="icon icon-home">
-            tensorrt_llm
-          </a>
-<div role="search">
-  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
-    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
-    <input type="hidden" name="check_keywords" value="yes" />
-    <input type="hidden" name="area" value="default" />
-  </form>
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
 </div>
-        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
-<ul>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="tensorrt_llm - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="tensorrt_llm - Home"/>
+  
+  
+    <p class="title logo__title">tensorrt_llm</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="tensorrt_llm - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="tensorrt_llm - Home"/>
+  
+  
+    <p class="title logo__title">tensorrt_llm</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
-<ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api-examples/llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
@@ -81,110 +307,123 @@
 <li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+
+
+
 <li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
-<ul class="current">
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
-<li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
+
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Speculative Sampling</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#about-speculative-sampling">About Speculative Sampling</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#performance-improvements">Performance Improvements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#draft-target-model">Draft-Target-Model</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#using-draft-target-model-approach-with-triton-inference-server">Using Draft-Target-Model approach with Triton Inference Server</a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#medusa">Medusa</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#medusa-tree">Medusa Tree</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#using-medusa-with-tensorrt-llm">Using Medusa with TensorRT-LLM</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#limitations">Limitations</a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="#redrafter">ReDrafter</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#eagle">EAGLE</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#lookahead-decoding">Lookahead Decoding</a></li>
-</ul>
-</li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Speculative Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
 </ul>
-<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
-<ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
 </ul>
-
-        </div>
-      </div>
-    </nav>
-
-    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
-          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
-          <a href="../index.html">tensorrt_llm</a>
-      </nav>
-
-      <div class="wy-nav-content">
-        <div class="rst-content">
-          <div role="navigation" aria-label="Page navigation">
-  <ul class="wy-breadcrumbs">
-      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">Speculative Sampling</li>
-      <li class="wy-breadcrumbs-aside">
-            <a href="../_sources/advanced/speculative-decoding.md.txt" rel="nofollow"> View page source</a>
-      </li>
-  </ul>
-  <hr/>
 </div>
-          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
-           <div itemprop="articleBody">
-             
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Speculative Sampling</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
   <section id="speculative-sampling">
-<h1>Speculative Sampling<a class="headerlink" href="#speculative-sampling" title="Link to this heading"></a></h1>
+<h1>Speculative Sampling<a class="headerlink" href="#speculative-sampling" title="Link to this heading">#</a></h1>
 <ul class="simple">
 <li><p><a class="reference internal" href="#about-speculative-sampling">About Speculative Sampling</a></p></li>
 <li><p><a class="reference internal" href="#Performance-improvements"><span class="xref myst">Performance Improvements</span></a></p></li>
@@ -209,7 +448,7 @@
 <li><p><a class="reference internal" href="#lookahead-decoding">Lookahead decoding</a></p></li>
 </ul>
 <section id="about-speculative-sampling">
-<h2>About Speculative Sampling<a class="headerlink" href="#about-speculative-sampling" title="Link to this heading"></a></h2>
+<h2>About Speculative Sampling<a class="headerlink" href="#about-speculative-sampling" title="Link to this heading">#</a></h2>
 <p>Speculative Sampling (also referred to as Speculative Decoding) is a set of techniques designed to allow generation of more than one token per forward pass iteration. This can lead to a reduction in the average per-token latency <strong>in situations where the GPU
 is underutilized due to small batch sizes.</strong></p>
 <p>Speculative Sampling involves predicting a sequence of future tokens, referred to as draft tokens, using a method
@@ -237,7 +476,7 @@ The combination of both these allows speculative decoding to result in reduced l
 </ol>
 </section>
 <section id="performance-improvements">
-<h2>Performance Improvements<a class="headerlink" href="#performance-improvements" title="Link to this heading"></a></h2>
+<h2>Performance Improvements<a class="headerlink" href="#performance-improvements" title="Link to this heading">#</a></h2>
 <p>It’s important to note that the effectiveness of speculative decoding techniques is highly dependent
 on the specific task at hand. For instance, forecasting subsequent tokens in a code-completion scenario
 may prove simpler than generating a summary for an article.</p>
@@ -245,7 +484,7 @@ may prove simpler than generating a summary for an article.</p>
 tuned as TensorRT-LLM, the potential time savings are more pronounced.</p>
 </section>
 <section id="draft-target-model">
-<h2>Draft-Target-Model<a class="headerlink" href="#draft-target-model" title="Link to this heading"></a></h2>
+<h2>Draft-Target-Model<a class="headerlink" href="#draft-target-model" title="Link to this heading">#</a></h2>
 <p>The Draft-Target-Model involves the use of two distinct models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.</p>
 <p>There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md">examples/draft_target_model/README.md</a> and the code can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py">examples/prompt_lookup/run_dtm_pld.py</a>.</p>
 <p>The management of Draft and Target models is facilitated through two separate <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> instances.
@@ -267,7 +506,7 @@ it is advisable to enable KV cache reuse for both models.
 This can be achieved by adding the <code class="docutils literal notranslate"><span class="pre">--use_paged_context_fmha=enable</span></code> flag to the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command
 and setting <code class="docutils literal notranslate"><span class="pre">enableBlockReuse=true</span></code> in the <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code>.</p>
 <section id="using-draft-target-model-approach-with-triton-inference-server">
-<h3>Using Draft-Target-Model approach with Triton Inference Server<a class="headerlink" href="#using-draft-target-model-approach-with-triton-inference-server" title="Link to this heading"></a></h3>
+<h3>Using Draft-Target-Model approach with Triton Inference Server<a class="headerlink" href="#using-draft-target-model-approach-with-triton-inference-server" title="Link to this heading">#</a></h3>
 <p>This example is only relevant for Draft-Target-Model model method. For all other speculative decoding models, you can deploy them in Triton server in the same way as standard non-speculative autoregressive models.</p>
 <ul class="simple">
 <li><p>Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with <a class="reference external" href="https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting">Business Logic Scripting</a>, BLS).</p></li>
@@ -511,11 +750,11 @@ pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span
 </section>
 </section>
 <section id="prompt-lookup-decoding">
-<h2>Prompt-Lookup-Decoding<a class="headerlink" href="#prompt-lookup-decoding" title="Link to this heading"></a></h2>
+<h2>Prompt-Lookup-Decoding<a class="headerlink" href="#prompt-lookup-decoding" title="Link to this heading">#</a></h2>
 <p>See document in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md">examples/prompt_lookup/README.md</a> and the code can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py">examples/prompt_lookup/run_dtm_pld.py</a>.</p>
 </section>
 <section id="medusa">
-<h2>Medusa<a class="headerlink" href="#medusa" title="Link to this heading"></a></h2>
+<h2>Medusa<a class="headerlink" href="#medusa" title="Link to this heading">#</a></h2>
 <p>This approach leverages a single model to both generate and verify draft tokens.
 It enhances the existing model by adding multiple extra language model heads, known as Medusa heads.
 These additional heads are trained to predict future tokens while the base model remains unchanged.
@@ -540,7 +779,7 @@ performance for your specific application.</p>
 This flexibility allows you to experiment and identify the optimal tree structure for your use case,
 which can then be utilized in a production environment.</p>
 <section id="medusa-tree">
-<h3>Medusa Tree<a class="headerlink" href="#medusa-tree" title="Link to this heading"></a></h3>
+<h3>Medusa Tree<a class="headerlink" href="#medusa-tree" title="Link to this heading">#</a></h3>
 <p>Consider the following diagram, which illustrates how the hidden states from the last layer of the base model
 are passed to the base model’s language model (LM) head and to four Medusa heads (MHs).</p>
 <p align="center">
@@ -581,10 +820,10 @@ So, only <code class="docutils literal notranslate"><span class="pre">9</span></
 <p><strong>Specifying paths-only instead of all choices is currently supported only in the Python runtime.</strong></p>
 </section>
 <section id="using-medusa-with-tensorrt-llm">
-<h3>Using Medusa with TensorRT-LLM<a class="headerlink" href="#using-medusa-with-tensorrt-llm" title="Link to this heading"></a></h3>
+<h3>Using Medusa with TensorRT-LLM<a class="headerlink" href="#using-medusa-with-tensorrt-llm" title="Link to this heading">#</a></h3>
 <p>For guidance on constructing and executing Medusa with the Python runtime, consult the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/medusa/README.md">Medusa README</a>. When utilizing the Inflight Fused Batching (IFB) with the C++ API, it is necessary to define the <code class="docutils literal notranslate"><span class="pre">medusa_choices</span></code> explicitly within the model configuration. For detailed instructions, refer to the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration">model configuration in TensorRT-LLM backend</a> for more details.</p>
 <section id="limitations">
-<h4>Limitations<a class="headerlink" href="#limitations" title="Link to this heading"></a></h4>
+<h4>Limitations<a class="headerlink" href="#limitations" title="Link to this heading">#</a></h4>
 <ul class="simple">
 <li><p>TensorRT-LLM supports Medusa only for Vicuna (fine tuned LLaMA).
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.</p></li>
@@ -595,73 +834,185 @@ However, similar to any new model, you can follow the same approach to define yo
 </section>
 </section>
 <section id="redrafter">
-<h2>ReDrafter<a class="headerlink" href="#redrafter" title="Link to this heading"></a></h2>
+<h2>ReDrafter<a class="headerlink" href="#redrafter" title="Link to this heading">#</a></h2>
 <p>The ReDrafter approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read <a class="reference external" href="https://arxiv.org/html/2403.09919v1">the ReDrafter paper</a>.</p>
 <p>TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as <code class="docutils literal notranslate"><span class="pre">explicit_draft_tokens</span></code>. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/redrafter/README.md">ReDrafter README</a> for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.</p>
 </section>
 <section id="eagle">
-<h2>EAGLE<a class="headerlink" href="#eagle" title="Link to this heading"></a></h2>
+<h2>EAGLE<a class="headerlink" href="#eagle" title="Link to this heading">#</a></h2>
 <p>The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.</p>
 <p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. Only EAGLE-1 is supported. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
 </section>
 <section id="lookahead-decoding">
-<h2>Lookahead Decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading"></a></h2>
+<h2>Lookahead Decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading">#</a></h2>
 <p>Lookahead decoding algorithm operates through two parallel computation branches within the same model: a lookahead branch that generates n-grams using a fixed-sized 2D window, and a verification branch that validates promising n-gram candidates. This approach eliminates the necessity for additional model training or fine-tuning and can be enabled for any autoregressive model. Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/lookahead/README.md">Lookahead decoding README</a> for information about building and running the model.</p>
 </section>
 </section>
 
 
-           </div>
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="kv-cache-reuse.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">KV cache reuse</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="disaggregated-service.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Disaggregated-Service (experimental)</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#about-speculative-sampling">About Speculative Sampling</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-improvements">Performance Improvements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#draft-target-model">Draft-Target-Model</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-draft-target-model-approach-with-triton-inference-server">Using Draft-Target-Model approach with Triton Inference Server</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#medusa">Medusa</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#medusa-tree">Medusa Tree</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#using-medusa-with-tensorrt-llm">Using Medusa with TensorRT-LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations">Limitations</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#redrafter">ReDrafter</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#eagle">EAGLE</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#lookahead-decoding">Lookahead Decoding</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
           </div>
-          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="kv-cache-reuse.html" class="btn btn-neutral float-left" title="KV cache reuse" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="disaggregated-service.html" class="btn btn-neutral float-right" title="Disaggregated-Service (experimental)" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
     </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
 
-  <hr/>
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
 
-  <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f96d1365100>
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
 
-<div class="footer">
-    <p>
-        Copyright © 2024 NVIDIA Corporation
-    </p>
-    <p>
-        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
-            data-cms-ai="0">Privacy Policy</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
-            data-cms-ai="0">Manage My Privacy</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
-            data-cms-ai="0">Do Not Sell or Share My Data</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
-            rel="noopener" data-cms-ai="0">Terms of Service</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
-            data-cms-ai="0">Accessibility</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
-            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
-            data-cms-ai="0">Product Security</a> |
-        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
-            data-cms-ai="0">Contact</a>
-    </p>
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2024, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
 </div>
 
-
-  </div>
-
-   
-
-</footer>
-        </div>
-      </div>
-    </section>
-  </div>
-  <script>
-      jQuery(function () {
-          SphinxRtdTheme.Navigation.enable(true);
-      });
-  </script> 
-
-</body>
+  </footer>
+  </body>
 </html>
