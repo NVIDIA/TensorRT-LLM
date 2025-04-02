@@ -297,4 +297,7 @@ class TestLoraAttentionPivotVsVanilla(unittest.TestCase):
                                                  hidden_states, attn_metadata,
                                                  lora_params)
 
-        torch.testing.assert_close(pivot_output, vanilla_output, atol=2e-1)
+        torch.testing.assert_close(pivot_output,
+                                   vanilla_output,
+                                   atol=2e-2,
+                                   rtol=0)

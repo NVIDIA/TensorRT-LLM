@@ -162,4 +162,7 @@ class TestLoraLinearPivotVsTRT(unittest.TestCase):
 
         outputs_pivot = pivot_linear(self.input_tensor, lora_params=lora_params)
 
-        torch.testing.assert_close(outputs["output"], outputs_pivot, atol=2e-3)
+        torch.testing.assert_close(outputs["output"],
+                                   outputs_pivot,
+                                   atol=2e-3,
+                                   rtol=0)
