@@ -103,29 +103,36 @@ test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
 
 # Accuracy test list
-accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
-accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
-accuracy/test_accuracy.py::TestPhi3Mini4kInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestPhi3Mini128kInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestPhi3Small8kInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestPhi3Small128kInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestPhi3_5MiniInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_fp8
-accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
-accuracy/test_accuracy.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
-accuracy/test_accuracy.py::TestLlama3_1_8B::test_tp4[enable_gemm_allreduce_plugin]
-accuracy/test_accuracy.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_allreduce_plugin]
-accuracy/test_accuracy.py::TestLlama3_1_8B::test_autoq
-accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_medusa_fp8_pre_quantized
-accuracy/test_accuracy.py::TestLlama3_2_1B::test_auto_dtype
-accuracy/test_accuracy.py::TestMixtral8x7B::test_fp8_tp2pp2
-accuracy/test_accuracy.py::TestGemma2_9BIt::test_fp8
-accuracy/test_accuracy.py::TestQwen2_0_5BInstruct::test_auto_dtype
-accuracy/test_accuracy.py::TestQwen2_0_5BInstruct::test_fp8
-accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_weight_only
-accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_int4_awq_pre_quantized
-accuracy/test_accuracy.py::TestQwen2_5_1_5BInstruct::test_weight_only
-accuracy/test_accuracy.py::TestQwen2_5_1_5BInstruct::test_fp8
+accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
+accuracy/test_cli_flow.py::TestMinitron4BBase::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi3Mini128kInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi3Small8kInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi3Small128kInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
+accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
+accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
+accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[enable_gemm_allreduce_plugin]
+accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_allreduce_plugin]
+accuracy/test_cli_flow.py::TestLlama3_1_8B::test_autoq
+accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
+accuracy/test_cli_flow.py::TestLlama3_2_1B::test_auto_dtype
+accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
+accuracy/test_cli_flow.py::TestGemma2_9BIt::test_fp8
+accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype
+accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_fp8
+accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_weight_only
+accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
+accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_weight_only
+accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_fp8
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
+accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
 
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
@@ -138,13 +145,6 @@ test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image]
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
 test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-hf-nvfp4-False-False]
-examples/test_pytorch.py::test_mmlu_llmapi_4gpus[Llama-3.3-70B-Instruct-fp8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
-examples/test_pytorch.py::test_mmlu_llmapi_4gpus[Llama-3.3-70B-Instruct-fp4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
-examples/test_pytorch.py::test_mmlu_llmapi_2gpus[Mixtral-8x7B-Instruct-v0.1-fp8-modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp8]
-examples/test_pytorch.py::test_mmlu_llmapi_2gpus[Mixtral-8x7B-Instruct-v0.1-fp4-modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4]
-examples/test_pytorch.py::test_llm_deepseek_1gpu[deepseek-v3-lite-disable_fp8-enable_fp4]
-examples/test_pytorch.py::test_llm_deepseek_1gpu[deepseek-v3-lite-disable_fp8-disable_fp4]
-examples/test_pytorch.py::test_llm_deepseek_1gpu[deepseek-v3-lite-enable_fp8-disable_fp4]
 
 # PyTorch flow disaggregated tests
 disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
