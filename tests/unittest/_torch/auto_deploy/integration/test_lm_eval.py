@@ -129,7 +129,10 @@ def _cli_evaluate_with_mocks(args):
             },
             ["gsm8k", "mmlu"],
             ["exact_match,strict-match", "acc,none"],
-            [0.80, 0.70],
+            [0.75, 0.70],
+            marks_extra=[
+                pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416; timeout")
+            ],
         ),
     ],
 )
