@@ -908,6 +908,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         self.model_nextn = 0
         if model_config.spec_config is not None:
+            assert not model_config.mapping.has_pp(
+            ), "PP + MTP combination is not supported"
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
