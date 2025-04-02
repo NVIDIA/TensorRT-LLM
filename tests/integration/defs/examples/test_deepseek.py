@@ -47,7 +47,7 @@ def test_deepseek_gpqa_llmapi(llmapi_example_root, llm_datasets_root, llm_venv,
             f"FP8 is not supported for gpqa test, and it will be added in the near future"
         )
 
-    if is_fp4 and get_sm_version() < 100:
+    if is_fp4 and (get_sm_version() < 100 or get_sm_version() >= 120):
         pytest.skip(
             f"FP4 is not supported in this SM version {get_sm_version()}")
 

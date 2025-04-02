@@ -126,7 +126,7 @@ def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
 
 
 def skip_fp4_pre_blackwell(use_fp4):
-    if use_fp4 and getSMVersion() < 100:
+    if use_fp4 and (getSMVersion() < 100 or getSMVersion() >= 120):
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
 
 

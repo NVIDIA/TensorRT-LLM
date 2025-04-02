@@ -383,7 +383,7 @@ public:
         static_assert(!FP4, "FP4 Tests enabled on unsupported CUDA version");
 #endif
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = getSMVersion() < 100 && FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
         return should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 

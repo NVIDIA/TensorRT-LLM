@@ -175,7 +175,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
     case CutlassGemmType::Fp8:
         if (config_type_param & CutlassGemmConfig::GROUPED_GEMM)
         {
-            if (sm == 89)
+            if (sm == 89 || sm >= 120)
             {
                 return {CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128,
                     CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
@@ -193,7 +193,7 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
         }
         else
         {
-            if (sm == 89)
+            if (sm == 89 || sm >= 120)
             {
                 return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                     CutlassTileConfig::CtaShape64x128x64_WarpShape32x64x64,
@@ -414,7 +414,7 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm90(config_type_param);
     }
-    if (sm >= 100 && sm != 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    if (sm >= 100 && sm < 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
     {
         return get_candidate_configs_sm100(config_type_param);
     }
