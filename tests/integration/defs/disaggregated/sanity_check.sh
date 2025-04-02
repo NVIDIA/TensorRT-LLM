@@ -1,5 +1,6 @@
 #!/bin/bash
 set -x
+set -e
 pkill -9 -f trtllm-serve || true
 
 rm -rf output.json || true
@@ -116,7 +117,20 @@ if [[ "${TEST_DESC}" != "gen_only" ]]; then
   fi
 
   for expected_string in "${expected_strings[@]}"; do
-      grep "${expected_string}" output.json
-      grep "${expected_string}" output_streaming.json
+    grep "${expected_string}" output.json
+    grep "${expected_string}" output_streaming.json
+
+    # Check the double first token in streaming output for ds-v3-lite
+    if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
+      if [ "$expected_string" != "${expected_strings[0]}" ]; then
+          continue
+      fi
+
+      first_word=$(echo "$expected_string" | awk '{print $1}')
+      count=$(grep -o "$first_word" output_streaming.json | wc -l)
+      if [ "$count" -ne 1 ]; then
+          exit 1
+      fi
+    fi
   done
 fi

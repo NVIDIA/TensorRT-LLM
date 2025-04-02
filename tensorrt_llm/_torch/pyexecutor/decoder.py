@@ -281,6 +281,7 @@ class TorchDecoder(Decoder):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
+                request.decoding_iter += 1
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
                 request.py_decoding_iter += 1

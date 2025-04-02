@@ -1401,7 +1401,7 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
-                req.decoding_iter = 1
+                req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 req.py_draft_tokens = req.context_phase_params.draft_tokens
                 beam_width = req.sampling_config.beam_width
@@ -1820,6 +1820,15 @@ class PyExecutor:
             if request.is_dummy == True:
                 requests_to_terminate.append(request)
                 continue
+
+            # Unify the behavior of overlapping and non-overlapping cases
+            # return the response after we have second generated token
+            if self.kv_cache_transceiver is not None:
+                if request.state == LlmRequestState.GENERATION_IN_PROGRESS and \
+                    request.is_generation_only_request:
+                    if request.py_decoding_iter == 1:
+                        new_active_requests.append(request)
+                        continue
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter
