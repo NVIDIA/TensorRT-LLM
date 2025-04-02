@@ -119,7 +119,7 @@ class SpecMetadata:
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
     num_layers: int = 0
 
-    def prepare():
+    def prepare(self):
         """
         Hook to be called before the forward step of the model.
         """
