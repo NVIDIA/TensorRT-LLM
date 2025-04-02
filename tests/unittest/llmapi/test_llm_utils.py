@@ -14,7 +14,7 @@ from tensorrt_llm.llmapi.llm_utils import *
 
 def test_ModelLoader():
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-    args = LlmArgs(llama_model_path, kv_cache_config=kv_cache_config)
+    args = LlmArgs(model=llama_model_path, kv_cache_config=kv_cache_config)
     args._setup()
 
     # Test with HF model
@@ -38,7 +38,7 @@ def test_ModelLoader():
 
 def test_CachedModelLoader():
     # CachedModelLoader enables engine caching and multi-gpu building
-    args = LlmArgs(llama_model_path,
+    args = LlmArgs(model=llama_model_path,
                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
     args.enable_build_cache = True
     args._setup()
@@ -53,9 +53,9 @@ def test_CachedModelLoader():
 
 def test_LlmArgs_default_gpus_per_node():
     # default
-    llm_args = LlmArgs(llama_model_path)
+    llm_args = LlmArgs(model=llama_model_path)
     assert llm_args.gpus_per_node == torch.cuda.device_count()
 
     # set explicitly
-    llm_args = LlmArgs(llama_model_path, gpus_per_node=6)
+    llm_args = LlmArgs(model=llama_model_path, gpus_per_node=6)
     assert llm_args.gpus_per_node == 6
