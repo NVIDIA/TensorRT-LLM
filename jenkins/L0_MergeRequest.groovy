@@ -112,11 +112,11 @@ def testFilter = [
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
 
 @Field
-def GITLAB_PR_API_URL = "gitlab_pr_api_url"
+def GITHUB_PR_API_URL = "github_pr_api_url"
 @Field
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def globalVars = [
-    (GITLAB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
+    (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
 ]
 
@@ -442,7 +442,7 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
-    def githubPrApiUrl = globalVars[GITLAB_PR_API_URL]
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
 
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
@@ -527,7 +527,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-    if (!changedFileList) {
+    if (!changedFileList || changedFileList.isEmpty()) {
         return false
     }
 
@@ -572,7 +572,7 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     def result = changedFileList.every { file ->
         def isPytorchFile = file =~ pytorchOnlyPattern
         if (!isPytorchFile) {
-            pipeline.echo("Found non-pytorch file: ${file}")
+            pipeline.echo("Found non-PyTorch file: ${file}")
         }
         return isPytorchFile
     }
