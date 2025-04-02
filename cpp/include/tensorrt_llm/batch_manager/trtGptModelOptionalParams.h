@@ -96,30 +96,6 @@ public:
     {
     }
 
-    bool operator==(TrtGptModelOptionalParams const& other) const
-    {
-        return kvCacheConfig == other.kvCacheConfig                                 //
-            && enableTrtOverlap == other.enableTrtOverlap                           //
-            && deviceIds == other.deviceIds                                         //
-            && normalizeLogProbs == other.normalizeLogProbs                         //
-            && enableChunkedContext == other.enableChunkedContext                   //
-            && decodingConfig == other.decodingConfig                               //
-            && gpuWeightsPercent == other.gpuWeightsPercent                         //
-            && maxBeamWidth == other.maxBeamWidth                                   //
-            && maxBatchSize == other.maxBatchSize                                   //
-            && maxNumTokens == other.maxNumTokens                                   //
-            && schedulerConfig == other.schedulerConfig                             //
-            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig //
-            && debugConfig == other.debugConfig                                     //
-            && maxSeqIdleMicroseconds == other.maxSeqIdleMicroseconds               //
-            && speculativeDecodingConfig == other.speculativeDecodingConfig         //
-            && guidedDecodingConfig == other.guidedDecodingConfig                   //
-            && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
-            && additionalOutputNames == other.additionalOutputNames                 //
-            && gatherGenerationLogits == other.gatherGenerationLogits               //
-            ;
-    }
-
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
 
     KvCacheConfig kvCacheConfig;
