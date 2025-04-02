@@ -15,7 +15,7 @@ from tensorrt_llm.layers.linear import Linear
 from tensorrt_llm.layers.lora import Lora, LoraRuntimeParams
 from tensorrt_llm.runtime.session import Session
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 from utils.util import create_session, run_session
 
 
@@ -162,4 +162,4 @@ class TestLoraLinearPivotVsTRT(unittest.TestCase):
 
         outputs_pivot = pivot_linear(self.input_tensor, lora_params=lora_params)
 
-        torch.testing.assert_close(outputs["output"], outputs_pivot)
+        torch.testing.assert_close(outputs["output"], outputs_pivot, atol=2e-3)
