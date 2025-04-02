@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Iterable, List, Union
+from typing import Iterable, List, Optional, Union
 
 import click
 import datasets
@@ -31,7 +31,11 @@ class CnnDailymail(Evaluator):
                  dataset_path: str = "ccdv/cnn_dailymail",
                  num_samples: int = None,
                  random_seed: int = 0,
-                 rouge_path: str = "rouge"):
+                 rouge_path: str = "rouge",
+                 apply_chat_template: bool = False,
+                 system_prompt: Optional[str] = None):
+        super().__init__(apply_chat_template=apply_chat_template,
+                         system_prompt=system_prompt)
         self.data = datasets.load_dataset(dataset_path, "3.0.0", split="test")
         self.data = self.data.shuffle(random_seed)
         if num_samples is None:

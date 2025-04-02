@@ -1407,7 +1407,7 @@ public:
             auto shape = getTensorShape(outputTensorName);
             TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
                 outputTensorName.c_str());
-            shape.d[0] = mMaxNewTokens - 1;
+            shape.d[0] = mMaxNewTokens;
             shape = runtime::ITensor::unsqueeze(shape, 0);
             shape.d[0] = mSamplingConfig.beamWidth;
             auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);

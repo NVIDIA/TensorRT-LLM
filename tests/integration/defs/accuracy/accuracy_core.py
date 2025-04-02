@@ -73,6 +73,10 @@ class AccuracyTask:
     MAX_OUTPUT_LEN = None
     MAX_BATCH_SIZE = None
 
+    # Evaluator
+    EVALUATOR_CLS = None
+    EVALUATOR_KWARGS = None
+
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
             self.reference = yaml.safe_load(f)[model_name]
@@ -128,12 +132,12 @@ class AccuracyTask:
               "===========================================================\n")
         return num_samples, threshold
 
-    def create_evaluator(self, **kwargs):
-        raise NotImplementedError()
-
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
-                 extra_acc_spec: Optional[str] = None):
+                 extra_acc_spec: Optional[str] = None,
+                 extra_evaluator_kwargs: Optional[dict] = None):
+        assert self.EVALUATOR_CLS is not None
+
         spec_dec_algo = None
         if llm.args.speculative_config is not None:
             spec_dec_algo = llm.args.speculative_config.decoding_type
@@ -148,7 +152,14 @@ class AccuracyTask:
         sampling_params = SamplingParams(
             max_tokens=self.MAX_OUTPUT_LEN,
             truncate_prompt_tokens=self.MAX_INPUT_LEN)
-        evaluator = self.create_evaluator(num_samples=num_samples)
+
+        evaluator_kwargs = {}
+        if self.EVALUATOR_KWARGS is not None:
+            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
+        if extra_evaluator_kwargs is not None:
+            evaluator_kwargs.update(extra_evaluator_kwargs)
+        evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
+                                       **evaluator_kwargs)
         accuracy = evaluator.evaluate(llm, sampling_params)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"
@@ -170,11 +181,10 @@ class CnnDailymail(AccuracyTask):
     MAX_INPUT_LEN = 924
     MAX_OUTPUT_LEN = 100
 
-    def create_evaluator(self, **kwargs):
-        return tensorrt_llm.evaluate.CnnDailymail(dataset_path=self.DATASET_DIR,
-                                                  random_seed=0,
-                                                  rouge_path=self.ROUGE_DIR,
-                                                  **kwargs)
+    EVALUATOR_CLS = tensorrt_llm.evaluate.CnnDailymail
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            rouge_path=ROUGE_DIR)
 
 
 class Humaneval(AccuracyTask):
@@ -237,10 +247,8 @@ class MMLU(AccuracyTask):
     MAX_INPUT_LEN = 4094
     MAX_OUTPUT_LEN = 2
 
-    def create_evaluator(self, **kwargs):
-        return tensorrt_llm.evaluate.MMLU(dataset_path=self.DATASET_DIR,
-                                          random_seed=0,
-                                          **kwargs)
+    EVALUATOR_CLS = tensorrt_llm.evaluate.MMLU
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
 class PassKeyRetrieval64k(AccuracyTask):
@@ -280,7 +288,7 @@ class CliFlowAccuracyTestHarness:
     MODEL_FORMAT = "HF"
     EXAMPLE_FOLDER = None
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
     def setup_class(cls, request):
         cls.llm_venv = request.getfixturevalue("llm_venv")
@@ -645,6 +653,10 @@ class LlmapiAccuracyTestHarness:
     MODEL_NAME = None
     MODEL_PATH = None
 
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
     def setup_class(cls):
+        original_level = logger.level
         logger.set_level("info")
+        yield
+        logger.set_level(original_level)
