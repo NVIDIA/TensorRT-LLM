@@ -437,7 +437,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.top_k = config.num_experts_per_tok
 
         self.self_attn = ATTENTION_CLASSES[model_config.attn_backend](
-            model_config, layer_idx=layer_idx, aux_stream=aux_stream_dict[AuxStreamType.Attention])
+            model_config,
+            layer_idx=layer_idx,
+            aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.fusion_config = EagerFusionConfig()
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mlp_tp_size = model_config.mapping.tp_size
