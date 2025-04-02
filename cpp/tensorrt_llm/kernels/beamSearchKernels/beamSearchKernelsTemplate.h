@@ -600,7 +600,7 @@ void beamSearchKernelLauncher(
     //     + `nBM` is the max value of the beam width array, which is used for memory allocatation
     // Normal Beam Search:
     //     + `nBMIn` / `nBMOut` / `nBM` share the same value
-    // TODO (wili): now `nBMIn` and `nBMOut` of request 0 is used for the whole batch,
+    // TODO: now `nBMIn` and `nBMOut` of request 0 is used for the whole batch,
     //     change to corresponding BMs if Diverse-Beam-Width-Search is supported
     size_t const nBMIn = bh.bVBWS ? bh.nBeamWidthInHost[0] : nBM;
     size_t const nBMOut = bh.bVBWS ? bh.nBeamWidthOutHost[0] : nBM;

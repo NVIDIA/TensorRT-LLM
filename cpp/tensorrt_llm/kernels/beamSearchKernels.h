@@ -46,7 +46,7 @@ struct BeamHypotheses
     bool bVBWS{false};                      // whether to use VBWS for Beam-Search
     size_t nMaxBatchSize{0};                // Buildtime max batch size
     size_t nBatchSize{0};                   // Runtime batch size
-    size_t nBeamWidth{0};                   //
+    size_t nBeamWidth{0};                   // Runtime beam width
     size_t nBeamWidthIn{0};                 // Scalar value of current input beam width, for VBWS
     size_t nBeamWidthOut{0};                // Scalar value of current output beam width, for VBWS
     size_t nMaxSeqLen{0};                   //
@@ -153,11 +153,10 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
     {                                                                                                                  \
         printf(#x "=");                                                                                                \
         print_element_(x);                                                                                             \
-        printf("\n");                                                                                                  \
     }
 
-// Use only in host function
-#define QH(x, nRow, nCol, nColPadded)                                                                                  \
+// Host function
+#define PRINT_HOST(x, nRow, nCol, nColPadded)                                                                          \
     {                                                                                                                  \
         if (x == nullptr)                                                                                              \
         {                                                                                                              \
@@ -169,11 +168,11 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
             printMatrix(x, nRow, nCol, nColPadded);                                                                    \
         }                                                                                                              \
     }
-#define QH1(x, nCol) QH(x, 1, nCol, nCol)
-#define QH2(x, nElement, nCol) QH(x, ((nElement) / (nCol)), nCol, nCol)
+#define PH2(x, nCol) PRINT_HOST(x, 1, nCol, nCol)
+#define PH3(x, nElement, nCol) PRINT_HOST(x, ((nElement) / (nCol)), nCol, nCol)
 
-// Use only in device function
-#define QD(x, nRow, nCol, nColPadded)                                                                                  \
+// Device function
+#define PRINT_DEVICE(x, nRow, nCol, nColPadded)                                                                        \
     {                                                                                                                  \
         if (x == nullptr)                                                                                              \
         {                                                                                                              \
@@ -185,11 +184,11 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
             printMatrixDevice(x, nRow, nCol, nColPadded);                                                              \
         }                                                                                                              \
     }
-#define QD1(x, nCol) QD(x, 1, nCol, nCol)
-#define QD2(x, nElement, nCol) QD(x, ((nElement) / (nCol)), nCol, nCol)
+#define PD2(x, nCol) PRINT_DEVICE(x, 1, nCol, nCol)
+#define PD3(x, nElement, nCol) PRINT_DEVICE(x, ((nElement) / (nCol)), nCol, nCol)
 
-// Use only in device function
-#define GUARD(blockIdxx, bSync, code)                                                                                  \
+// Device function
+#define WITH(blockIdxx, bSync, code)                                                                                   \
     {                                                                                                                  \
         if (bSync)                                                                                                     \
         {                                                                                                              \
@@ -210,12 +209,12 @@ void printLogProbs(float const* x, int const nBS, int const nBMIn, int const nBM
 #define LINE(x)
 #define PRINT(x)
 #define QH(x, y, z, w)
-#define QH1(x, nCol)
-#define QH2(x, nElement, nCol)
-#define QD(x, y, z, w)
-#define QD1(x, nCol)
-#define QD2(x, nElement, nCol)
-#define GUARD(x, y, z)
+#define PH2(x, nCol)
+#define PH3(x, nElement, nCol)
+#define PRINT_DEVICE(x, y, z, w)
+#define PD2(x, nCol)
+#define PD3(x, nElement, nCol)
+#define WITH(x, y, z)
 #endif
 
 } // namespace kernels

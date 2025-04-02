@@ -30,40 +30,41 @@ using namespace tensorrt_llm::kernels;
 namespace tensorrt_llm::layers
 {
 
-#define GET_INFO_STAGE1(nPBM)                                                                                          \
+#define GET_INFO_STAGE1(paddedBeamWidth)                                                                               \
     {                                                                                                                  \
-        int constexpr nBlock = ((nPBM) < 16) ? (((nPBM) < 8) ? kThreadForSmallBeamWidth : 128) : 64;                   \
+        int constexpr nBlock = (paddedBeamWidth < 16) ? ((paddedBeamWidth < 8) ? kThreadForSmallBeamWidth : 128) : 64; \
         TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(                                                 \
-            &nMaxActiveBlock, beamStage1Kernel<T, 2 * (nPBM), nBlock>, nBlock, 0));                                    \
-        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, 2 * (nPBM), nBlock>));                        \
+            &nMaxActiveBlock, beamStage1Kernel<T, 2 * paddedBeamWidth, nBlock>, nBlock, 0));                           \
+        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, 2 * paddedBeamWidth, nBlock>));               \
         break;                                                                                                         \
     }
 
-#define GET_INFO_STAGE2(nPBM)                                                                                          \
+#define GET_INFO_STAGE2(paddedBeamWidth)                                                                               \
     {                                                                                                                  \
         if (nByteDynamicSharedMemoryStage2 > nByteMaxSharedMemoryPerBlock)                                             \
         {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, (nPBM), 128, false>));                    \
+            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, paddedBeamWidth, 128, false>));           \
         }                                                                                                              \
         else if (nVPart <= 32)                                                                                         \
         {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, (nPBM), 32, true>));                      \
+            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, paddedBeamWidth, 32, true>));             \
         }                                                                                                              \
         else if (nVPart <= 64)                                                                                         \
         {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, (nPBM), 64, true>));                      \
+            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, paddedBeamWidth, 64, true>));             \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, (nPBM), 128, true>));                     \
+            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage2Kernel<T, paddedBeamWidth, 128, true>));            \
         }                                                                                                              \
         break;                                                                                                         \
     }
 
-#define GET_INFO_STAGE3(nPBM, bV2)                                                                                     \
+#define GET_INFO_STAGE3(paddedBeamWidth, isV2)                                                                         \
     {                                                                                                                  \
-        int constexpr nThreadStage3 = ((nPBM) + 31) / 32 * 32;                                                         \
-        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage3Kernel<T, (nPBM), nThreadStage3, true, bV2>));          \
+        int constexpr nThreadStage3 = (paddedBeamWidth + 31) / 32 * 32;                                                \
+        TLLM_CUDA_CHECK(                                                                                               \
+            cudaFuncGetAttributes(&attr, beamStage3Kernel<T, paddedBeamWidth, nThreadStage3, true, isV2>));            \
         break;                                                                                                         \
     }
 
@@ -73,11 +74,11 @@ BeamSearchLayer<T>::BeamSearchLayer(DecoderDomain const& decoderDomain, std::sha
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 const nBS{mDecoderDomain.getBatchSize()};
-    SizeType32 const nBM{mDecoderDomain.getBeamWidth()};
-    SizeType32 const nV{mDecoderDomain.getVocabSize()};
-    TLLM_CHECK_WITH_INFO(nBM <= kMaxBeamWidth, "Beam width is larger than the maximum supported (%d > %d)", int(nBM),
-        int(kMaxBeamWidth));
+    SizeType32 const batchSize{mDecoderDomain.getBatchSize()};
+    SizeType32 const beamWidth{mDecoderDomain.getBeamWidth()};
+    SizeType32 const vocabSize{mDecoderDomain.getVocabSize()};
+    TLLM_CHECK_WITH_INFO(beamWidth <= kMaxBeamWidth, "Beam width is larger than the maximum supported (%d > %d)",
+        int(beamWidth), int(kMaxBeamWidth));
     this->mVBWS = decoderDomain.getUseVariableBeamWidthSearch();
 
     allocateBuffer();
@@ -91,10 +92,10 @@ void BeamSearchLayer<T>::allocateBuffer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 const nBS{mDecoderDomain.getBatchSize()};
-    auto const batchSizeShape = ITensor::makeShape({nBS});
-    auto const batchSizeXBeamWidthArraySizeShape
-        = ITensor::makeShape({nBS * static_cast<runtime::SizeType32 const>(kMaxBeamWidthArrayLength)});
+    SizeType32 const batchSize{mDecoderDomain.getBatchSize()};
+    auto const batchSizeShape{ITensor::makeShape({batchSize})};
+    auto const batchSizeXBeamWidthArraySizeShape{
+        ITensor::makeShape({batchSize * static_cast<SizeType32>(kMaxBeamWidthArrayLength)})};
 
     mBeamSearchDiversityRateHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mBeamSearchDiversityRateDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
@@ -119,10 +120,10 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 const nBS{mDecoderDomain.getBatchSize()};
-    SizeType32 const nBM{mDecoderDomain.getBeamWidth()};
-    SizeType32 const nV{mDecoderDomain.getVocabSize()};
-    SizeType32 const nPBM{padToNextPowerOfTwo(nBM)}; // Padded Beam Width
+    SizeType32 const batchSize{mDecoderDomain.getBatchSize()};
+    SizeType32 const beamWidth{mDecoderDomain.getBeamWidth()};
+    SizeType32 const vocabSize{mDecoderDomain.getVocabSize()};
+    SizeType32 const paddedBeamWidth{padToNextPowerOfTwo(beamWidth)};
     cudaFuncAttributes attr;
 
     // Find device information to determine `nVPart`.
@@ -131,12 +132,12 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
     int const nByteReservedSharedMemoryPerBlock = nByteMaxSharedMemoryPerSM - nByteMaxSharedMemoryPerBlock;
     this->mByteMaxSharedMemoryPerBlock = nByteMaxSharedMemoryPerBlock;
 
-    if (nBM <= kMaxBeamWidthForV1 && !(this->mVBWS))
+    if (beamWidth <= kMaxBeamWidthForV1 && !(this->mVBWS))
     {
         // V1 workflow for small beam width and non-VBWS
         // Stage 1
         int nMaxActiveBlock = -1;
-        switch (nPBM)
+        switch (paddedBeamWidth)
         {
         case 1: GET_INFO_STAGE1(1);
         case 2: GET_INFO_STAGE1(2);
@@ -147,8 +148,8 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         int nByteStaticSharedMemory = attr.sharedSizeBytes;
         int nByteMaxDynamicSharedMemoryPerBlock = nByteMaxSharedMemoryPerBlock - nByteStaticSharedMemory;
         // Find the maximum of `nBlock` (maximum of `nVPart`, minimum of `nByteDynamicSharedMemoryStage1`), s.t.
-        // `nVPart <= kMaxVPartStage1 && nByteDynamicSharedMemoryStage1 * nVPart >= sizeof(T) * nV`
-        TLLM_CHECK_WITH_INFO(nByteMaxDynamicSharedMemoryPerBlock * kMaxVPartStage1 >= sizeof(T) * nV,
+        // `nVPart <= kMaxVPartStage1 && nByteDynamicSharedMemoryStage1 * nVPart >= sizeof(T) * vocabSize`
+        TLLM_CHECK_WITH_INFO(nByteMaxDynamicSharedMemoryPerBlock * kMaxVPartStage1 >= sizeof(T) * vocabSize,
             "vocab_size is too large for Beam search.");
         int nByteExtralSharedMemory = nByteReservedSharedMemoryPerBlock + nByteStaticSharedMemory;
         int nBlock = nMaxActiveBlock;
@@ -157,21 +158,22 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         {
             int nByteDynamicSharedMemoryStage1 = nByteMaxSharedMemoryPerSM / nBlock - nByteExtralSharedMemory;
             nByteDynamicSharedMemoryStage1 -= nByteDynamicSharedMemoryStage1 % sizeof(T);
-            nVPart = ceilDiv(sizeof(T) * nV, nByteDynamicSharedMemoryStage1);
+            nVPart = ceilDiv(sizeof(T) * vocabSize, nByteDynamicSharedMemoryStage1);
         }
         TLLM_CHECK_WITH_INFO(nBlock >= 0, "No enough active blocks for Beam Search stage 1 kernel.");
 
-        int const nByteDynamicSharedMemoryStage1 = sizeof(T) * ceilDiv(nV, nVPart);
+        int const nByteDynamicSharedMemoryStage1 = sizeof(T) * ceilDiv(vocabSize, nVPart);
         this->mVPart = nVPart;
         this->mByteSharedMemoryStage1 = nByteDynamicSharedMemoryStage1; // Only dynamic shared memory
 
         // Stage 2
-        TLLM_CHECK_WITH_INFO(nBS * nBM * nPBM < (1 << 21),
+        TLLM_CHECK_WITH_INFO(batchSize * beamWidth * paddedBeamWidth < (1 << 21),
             "max_batch_size or max_beam_width of TRT-LLM engine is too large for Beam search, try to decrease the "
             "parameters while building.");
-        size_t const nByteDynamicSharedMemoryStage2
-            = common::roundUp(sizeof(float) * nVPart * (nPBM * 4) + sizeof(cub::KeyValuePair<int, T>) * nPBM * 2, 4);
-        switch (nPBM)
+        size_t const nByteDynamicSharedMemoryStage2 = common::roundUp(
+            sizeof(float) * nVPart * (paddedBeamWidth * 4) + sizeof(cub::KeyValuePair<int, T>) * paddedBeamWidth * 2,
+            4);
+        switch (paddedBeamWidth)
         {
         case 1: GET_INFO_STAGE2(1);
         case 2: GET_INFO_STAGE2(2);
@@ -186,8 +188,9 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
 
         // Stage 3
         // Keep top 2K candidates in case of k candidates finishes in one iteration
-        size_t const nByteDynamicSharedMemoryStage3 = common::roundUp(sizeof(T) * nPBM * nPBM * 2, 4);
-        switch (nPBM)
+        size_t const nByteDynamicSharedMemoryStage3
+            = common::roundUp(sizeof(T) * paddedBeamWidth * paddedBeamWidth * 2, 4);
+        switch (paddedBeamWidth)
         {
         case 1: GET_INFO_STAGE3(1, false);
         case 2: GET_INFO_STAGE3(2, false);
@@ -208,8 +211,9 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         // B for data exchange between stage 1 and 2, can be reuse for stage 3
         // C for stage 2 if `bUseGlobalMemoryStage2 == true`, can be reuse for stage 3
         // D for stage 3 if `bUseGlobalMemoryStage3 == true`
-        size_t const nByteA = common::roundUp(sizeof(T) * nBS * nPBM * nPBM * 4, 4);
-        size_t const nByteB = common::roundUp(sizeof(T) * nBS * nPBM * kMaxVPartStage1 * nPBM * 4, 4);
+        size_t const nByteA = common::roundUp(sizeof(T) * batchSize * paddedBeamWidth * paddedBeamWidth * 4, 4);
+        size_t const nByteB
+            = common::roundUp(sizeof(T) * batchSize * paddedBeamWidth * kMaxVPartStage1 * paddedBeamWidth * 4, 4);
         size_t const nByteC = (bUseGlobalMemoryStage2) ? nByteDynamicSharedMemoryStage2 : 0;
         size_t const nByteD = (bUseGlobalMemoryStage3) ? nByteDynamicSharedMemoryStage3 : 0;
         this->mWorkspaceSize = nByteA + std::max(nByteB + nByteC, nByteD);
@@ -218,7 +222,7 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
     {
         // V2 workflow for large beam width or VBWS
         this->mV2 = true;
-        switch (nPBM)
+        switch (paddedBeamWidth)
         {
         case 1: GET_INFO_STAGE3(1, true);
         case 2: GET_INFO_STAGE3(2, true);
@@ -240,17 +244,19 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         // |<- Stage2Ids ->|<- Stage2LogProbs ->|<- Stage1Ids ->|<- Stage1LogProbs ->|<---- Stage1TopK ---->|
         //                                                                           |<- stage2TopK ->|
         //                                      |<------------------ Stage3 ------------------>|
-        SizeType32 const nBS{mDecoderDomain.getBatchSize()};
-        SizeType32 const nBM{mDecoderDomain.getBeamWidth()};
-        SizeType32 const nV{mDecoderDomain.getVocabSize()};
-        SizeType32 const nPBM{padToNextPowerOfTwo(nBM)};
-        size_t const nByteStage1LogProbs = roundUp(sizeof(T) * nBS * nPBM * nPBM * 2, 4);
-        size_t const nByteStage1Ids = roundUp(sizeof(int) * nBS * nPBM * nPBM * 2, 4);
-        size_t const nByteStage2LogProbs = roundUp(sizeof(T) * nBS * nPBM * 2, 4);
-        size_t const nByteStage2Ids = roundUp(sizeof(int) * nBS * nPBM * 2, 4);
-        size_t const nByteStage1TopK = invokeComputeTopkLastDimWorkspaceSize<T>(nBS * nBM, nV, nPBM * 2, true);
-        size_t const nByteStage2TopK = invokeComputeTopkLastDimWorkspaceSize<T>(nBS, nPBM * nPBM * 2, nBM * 2, true);
-        size_t const nByteStage3 = sizeof(T) * nBM * nBM * 2;
+        SizeType32 const batchSize{mDecoderDomain.getBatchSize()};
+        SizeType32 const beamWidth{mDecoderDomain.getBeamWidth()};
+        SizeType32 const vocabSize{mDecoderDomain.getVocabSize()};
+        SizeType32 const paddedBeamWidth{padToNextPowerOfTwo(beamWidth)};
+        size_t const nByteStage1LogProbs = roundUp(sizeof(T) * batchSize * paddedBeamWidth * paddedBeamWidth * 2, 4);
+        size_t const nByteStage1Ids = roundUp(sizeof(int) * batchSize * paddedBeamWidth * paddedBeamWidth * 2, 4);
+        size_t const nByteStage2LogProbs = roundUp(sizeof(T) * batchSize * paddedBeamWidth * 2, 4);
+        size_t const nByteStage2Ids = roundUp(sizeof(int) * batchSize * paddedBeamWidth * 2, 4);
+        size_t const nByteStage1TopK
+            = invokeComputeTopkLastDimWorkspaceSize<T>(batchSize * beamWidth, vocabSize, paddedBeamWidth * 2, true);
+        size_t const nByteStage2TopK = invokeComputeTopkLastDimWorkspaceSize<T>(
+            batchSize, paddedBeamWidth * paddedBeamWidth * 2, beamWidth * 2, true);
+        size_t const nByteStage3 = sizeof(T) * beamWidth * beamWidth * 2;
         this->mWorkspaceSize = nByteStage2LogProbs + nByteStage2Ids
             + max(nByteStage1LogProbs + nByteStage1Ids + max(nByteStage1TopK, nByteStage2TopK), nByteStage3);
     }
@@ -271,9 +277,9 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    SizeType32 const nBM{mDecoderDomain.getBeamWidth()};
-    TLLM_CHECK_WITH_INFO(
-        beamWidth <= nBM, "Beam width is larger than the constructed for (%d > %d).", int(beamWidth), int(nBM));
+    SizeType32 const maxBamWidth{mDecoderDomain.getBeamWidth()};
+    TLLM_CHECK_WITH_INFO(beamWidth <= maxBamWidth, "Beam width is larger than the constructed for (%d > %d).",
+        int(beamWidth), int(maxBamWidth));
 
     auto setupParams = std::dynamic_pointer_cast<BeamSearchSetupParams>(baseSetupParams);
     auto constexpr fltMax = std::numeric_limits<float>::max();

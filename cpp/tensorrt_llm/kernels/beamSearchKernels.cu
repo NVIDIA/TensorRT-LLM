@@ -258,36 +258,36 @@ void printBH(BeamHypotheses const& bh)
     size_t const nbmo = bh.nBeamWidthOut;
     size_t const msl = bh.nMaxSeqLen;
 
-    QH1(bh.diversityRates, nbs);
-    QH1(bh.lengthPenalties, nbs);
-    QH1(bh.earlyStoppings, nbs);
-    QH2(bh.beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
-    QH2(bh.beamWidthArraysDevice, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
-    QH1(bh.nBeamWidthInHost, nbs);
-    QH1(bh.nBeamWidthOutHost, nbs);
-    QH1(bh.nBeamWidthInDevice, nbs);
-    QH1(bh.nBeamWidthOutDevice, nbs);
+    PH2(bh.diversityRates, nbs);
+    PH2(bh.lengthPenalties, nbs);
+    PH2(bh.earlyStoppings, nbs);
+    PH3(bh.beamWidthArraysHost, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
+    PH3(bh.beamWidthArraysDevice, nbs * kMaxBeamWidthArrayLength, kMaxBeamWidthArrayLength);
+    PH2(bh.nBeamWidthInHost, nbs);
+    PH2(bh.nBeamWidthOutHost, nbs);
+    PH2(bh.nBeamWidthInDevice, nbs);
+    PH2(bh.nBeamWidthOutDevice, nbs);
 
-    QH1(bh.inputLengths, nbs * nbm);
-    QH1(bh.endIds, nbs);
-    QH1(bh.batchSlots, nbs);
+    PH2(bh.inputLengths, nbs * nbm);
+    PH2(bh.endIds, nbs);
+    PH2(bh.batchSlots, nbs);
 
-    QH2(bh.outputIds, nbs * nbm * msl, msl);
-    QH2(bh.logProbs, nbs * nbm * msl, msl);
-    QH2(bh.sequenceLengths, nbs * nbm, nbm);
-    QH2(bh.cumLogProbs, nbs * nbm, nbm);
+    PH3(bh.outputIds, nbs * nbm * msl, msl);
+    PH3(bh.logProbs, nbs * nbm * msl, msl);
+    PH3(bh.sequenceLengths, nbs * nbm, nbm);
+    PH3(bh.cumLogProbs, nbs * nbm, nbm);
 
-    QH2(bh.outputIdsCBA, mbs * nbmo * 2 * msl, msl);
-    QH2(bh.logProbsCBA, mbs * nbmo * 2 * msl, msl);
-    QH2(bh.sequenceLengthsCBA, mbs * nbmo * 2, nbmo * 2);
-    QH2(bh.cumLogProbsCBA, mbs * nbmo * 2, nbmo * 2);
-    QH2(bh.normedScoresCBA, mbs * nbmo * 2, nbmo * 2);
-    QH1(bh.numBeamsCBA, mbs);
-    QH1(bh.minNormedScoresCBA, mbs);
+    PH3(bh.outputIdsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(bh.logProbsCBA, mbs * nbmo * 2 * msl, msl);
+    PH3(bh.sequenceLengthsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(bh.cumLogProbsCBA, mbs * nbmo * 2, nbmo * 2);
+    PH3(bh.normedScoresCBA, mbs * nbmo * 2, nbmo * 2);
+    PH2(bh.numBeamsCBA, mbs);
+    PH2(bh.minNormedScoresCBA, mbs);
 
-    QH1(bh.batchDones, nbs);
+    PH2(bh.batchDones, nbs);
     uint8_t* finished = reinterpret_cast<uint8_t*>(bh.finished);
-    QH1(finished, nbs * nbm);
+    PH2(finished, nbs * nbm);
 
     std::vector<runtime::SizeType32> batchSlots(nbs, 0);
     cudaMemcpy(batchSlots.data(), bh.batchSlots, sizeof(runtime::SizeType32) * nbs, cudaMemcpyDeviceToHost);
@@ -304,18 +304,19 @@ void printBH(BeamHypotheses const& bh)
         int slot = batchSlots[i];
         printf("slot=%d\n", slot);
         printf("outputIdsPtr[slot]=%p\n", outputIdsPtr[slot]);
-        QH2(outputIdsPtr[slot], nbm * msl, msl);
+        PH3(outputIdsPtr[slot], nbm * msl, msl);
     }
     for (int i = 0; i < nbs; ++i)
     {
         int slot = batchSlots[i];
         printf("slot=%d\n", slot);
         printf("parentIdsPtr[slot]=%p\n", parentIdsPtr[slot]);
-        QH2(parentIdsPtr[slot], nbm * msl, msl);
+        PH3(parentIdsPtr[slot], nbm * msl, msl);
     }
 
-    // QH2(bh.outputIdsUnfinish, nbs * nbm * msl, msl);
-    // QH2(bh.parentIdsUnfinish, nbs * nbm * msl, msl);
+    // May not available in some context
+    // PH3(bh.outputIdsUnfinish, nbs * nbm * msl, msl);
+    // PH3(bh.parentIdsUnfinish, nbs * nbm * msl, msl);
 #endif
 }
 
