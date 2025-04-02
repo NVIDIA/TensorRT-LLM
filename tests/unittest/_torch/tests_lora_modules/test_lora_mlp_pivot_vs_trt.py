@@ -4,7 +4,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
-from tensorrt_llm._torch.modules.mlp import MLP as TorchMLP
+from tensorrt_llm._torch.modules.mlp import MLP as PivotMLP
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.layers import MLP as TRTMLP
@@ -121,7 +121,7 @@ class TestLoraMLPPivotVsTRT(unittest.TestCase):
 
     def _setup_mlp_module(self):
 
-        mlp_module = TorchMLP(hidden_size=self.hidden_size,
+        mlp_module = PivotMLP(hidden_size=self.hidden_size,
                               intermediate_size=self.intermediate_size,
                               bias=True,
                               activation=torch.nn.functional.silu,
@@ -294,7 +294,3 @@ class TestLoraMLPPivotVsTRT(unittest.TestCase):
         pivot_output = mlp_module(hidden_states.squeeze(0), lora_params_pivot)
 
         torch.testing.assert_close(pivot_output, trt_output, atol=2e-3, rtol=0)
-
-
-if __name__ == "__main__":
-    unittest.main()
