@@ -519,27 +519,58 @@ class TRTLLMDecoder(Decoder):
                 self.max_num_sequences, self.beam_width,
                 self.store["buffer_manager"], self.store["cuda_stream"])
 
-            decoder_finish_event = self.algs.decoder.forward_async(
-                self.decoding_output, decoding_input)
+            self.algs.decoder.forward_async(self.decoding_output,
+                                            decoding_input)
 
-            decoder_event = self.algs.update_decoder_buffers(
-                self.model_config, self.store["decoder_buffers"],
-                self.store["buffer_manager"], self.algs.decoder, False,
-                decoder_finish_event)
+        # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
+        #       current implementation of model_engine.
+        # TODO: When we support speculative decoding:
+        # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
+        new_tokens_device_tensor = torch.empty(
+            (self.batch_size * self.beam_width, ),
+            dtype=torch.int,
+            device='cuda')
+        for idx, request in enumerate(
+                itertools.chain(scheduled_requests.context_requests,
+                                scheduled_requests.generation_requests)):
+            seq_slot = request.seq_slot
+            for beam in range(self.beam_width):
+                new_tokens_device_tensor[idx * self.beam_width + beam].copy_(
+                    self.algs.decoder.all_new_tokens[0][seq_slot][beam],
+                    non_blocking=True)
 
-        new_tokens_device = {
-            "new_tokens_device": self.store["decoder_buffers"].new_output_tokens
-        }
+        # NOTE: This does dynamic memory allocations.
+        new_output_tokens = self.algs.decoder.all_new_tokens.to(
+            'cpu', non_blocking=True)
+        finished_sum = self.algs.decoder.finished_sum.to('cpu',
+                                                         non_blocking=True)
+        finish_reasons = self.algs.decoder.finish_reasons.to('cpu',
+                                                             non_blocking=True)
+
+        # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
+        #       This could be a race condition.
+        self.store["decoder_buffers"].sequence_lengths_host.copy_(
+            self.store["decoder_buffers"].sequence_lengths, non_blocking=True)
+
+        # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
+        #       Possibly this doesn't work until Robin's fixes are in.
+        # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
+
+        new_tokens_device = {"new_tokens_device": new_tokens_device_tensor}
+
         new_tokens_host = OrderedDict({
             "new_tokens_host":
-            self.store["decoder_buffers"].new_output_tokens_host,
+            new_output_tokens,
             "finished_sum_host":
-            self.store["decoder_buffers"].finished_sum_host,
+            finished_sum,
             "finish_reasons_host":
-            self.store["decoder_buffers"].finish_reasons_host,
+            finish_reasons,
             "sequence_lengths_host":
             self.store["decoder_buffers"].sequence_lengths_host
         })
+
+        decoder_event = torch.cuda.Event()
+        decoder_event.record()
 
         return new_tokens_device, new_tokens_host, decoder_event
 
