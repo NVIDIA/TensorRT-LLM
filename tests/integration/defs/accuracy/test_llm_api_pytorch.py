@@ -19,7 +19,8 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell
+from ..conftest import (llm_models_root, parametrize_with_ids,
+                        skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -119,7 +120,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    # Only Hopper and Blackwell MLA kernel supports MTP
+    @parametrize_with_ids("mtp_nextn",
+                          [None, pytest.param(2, marks=skip_pre_hopper)])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
@@ -147,12 +150,22 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    # Only Hopper and Blackwell MLA kernel supports MTP
+    @parametrize_with_ids("mtp_nextn",
+                          [None, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1)],
                              ids=["tp4", "ep4", "tp2pp2"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler):
+        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
+            pytest.skip(
+                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
+            )
+        if pp_size > 2 and cuda_graph and overlap_scheduler:
+            pytest.skip(
+                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
+            )
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         pytorch_config = PyTorchConfig(
@@ -218,6 +231,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
+        if (pp_size == 4 and mtp_nextn is None and not overlap_scheduler
+                and cuda_graph and not attention_dp):
+            pytest.skip("https://nvbugspro.nvidia.com/bug/5189673")
+        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
+            pytest.skip(
+                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
+            )
+        if pp_size > 2 and cuda_graph and overlap_scheduler:
+            pytest.skip(
+                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
+            )
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
@@ -247,7 +271,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids("mtp_nextn", [
+        None,
+        pytest.param(
+            2, marks=pytest.mark.skip("FP4 checkpoint has no MTP weights"))
+    ])
     def test_nvfp4(self, mtp_nextn, attention_dp, cuda_graph,
                    overlap_scheduler):
         pytorch_config = PyTorchConfig(
@@ -273,12 +301,24 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [(False, False, False), (True, False, False),
                            (False, True, False), (False, False, True),
                            (True, True, True)])
-    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @parametrize_with_ids("mtp_nextn", [
+        None,
+        pytest.param(
+            2, marks=pytest.mark.skip("FP4 checkpoint has no MTP weights"))
+    ])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1)],
                              ids=["tp4", "ep4", "tp2pp2"])
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                          attention_dp, cuda_graph, overlap_scheduler):
+        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
+            pytest.skip(
+                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
+            )
+        if pp_size > 2 and cuda_graph and overlap_scheduler:
+            pytest.skip(
+                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
+            )
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)

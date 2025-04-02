@@ -163,48 +163,6 @@ def test_deepseek(model_name, backend, quant, test_config):
     }
     assert quant in model_path.keys()
 
-    is_fp8 = quant == "fp8"
-    is_fp4 = quant == "fp4"
-
-    if (not enable_overlap_scheduler and enable_cuda_graph and not enable_dp
-            and mtp_nextn == 0 and ep_size == 1 and pp_size == 4
-            and tp_size == 1 and is_fp8):
-
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5189673")
-
-    if ep_size > tp_size:
-        pytest.skip(
-            f"Expert parallel size {ep_size} must be less than or equal to tensor parallel size {tp_size}"
-        )
-
-    if torch.cuda.device_count() < tp_size * pp_size:
-        pytest.skip(f"Not enough GPUs available, need {tp_size * pp_size} "
-                    f"but only have {torch.cuda.device_count()}")
-
-    if is_fp8 and getSMVersion() != 90:
-        pytest.skip(f"FP8 is not supported in this SM version {getSMVersion()}")
-
-    if is_fp4 and getSMVersion() < 100:
-        pytest.skip(f"FP4 is not supported in this SM version {getSMVersion()}")
-
-    if is_fp4 and mtp_nextn > 0:
-        pytest.skip(f"FP4 checkpoint has no MTP weights")
-
-    if mtp_nextn > 0 and getSMVersion() < 90:
-        pytest.skip(f"Only Hopper and Blackwell MLA kernel can support MTP now")
-
-    if pp_size > 1 and mtp_nextn > 0:
-        pytest.skip(
-            "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
-        )
-    if pp_size > 2 and enable_cuda_graph and enable_overlap_scheduler:
-        pytest.skip(
-            "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
-        )
-
-    if get_total_gpu_memory(0) < 60 * 1024**3:
-        pytest.skip(f"Not enough GPU memory to run. {get_total_gpu_memory(0)}")
-
     prompts = [
         "The president of the United States is",
     ] * 32
