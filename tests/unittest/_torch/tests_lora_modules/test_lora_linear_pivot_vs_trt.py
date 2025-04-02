@@ -21,35 +21,36 @@ from utils.util import create_session, run_session
 
 class TestLoraLinearPivotVsTRT(unittest.TestCase):
 
-    def setUp(self):
-        self.dtype = "float16"
-        self.batch_size = 16
-        self.seq_len = 32
-        self.hidden_size = 1024
-        self.lora_rank = 8
+    @classmethod
+    def setUpClass(cls):
+        cls.dtype = "float16"
+        cls.batch_size = 16
+        cls.seq_len = 32
+        cls.hidden_size = 1024
+        cls.lora_rank = 8
 
         # Create input tensors
-        self.input_tensor = torch.randn(self.batch_size,
-                                        self.seq_len,
-                                        self.hidden_size,
-                                        dtype=tensorrt_llm.str_dtype_to_torch(
-                                            self.dtype),
-                                        device="cuda")
+        cls.input_tensor = torch.randn(cls.batch_size,
+                                       cls.seq_len,
+                                       cls.hidden_size,
+                                       dtype=tensorrt_llm.str_dtype_to_torch(
+                                           cls.dtype),
+                                       device="cuda")
 
-        self.weight = torch.randn(self.hidden_size,
-                                  self.hidden_size,
-                                  dtype=tensorrt_llm.str_dtype_to_torch(
-                                      self.dtype),
-                                  device="cuda")
+        cls.weight = torch.randn(cls.hidden_size,
+                                 cls.hidden_size,
+                                 dtype=tensorrt_llm.str_dtype_to_torch(
+                                     cls.dtype),
+                                 device="cuda")
 
-        self.A = torch.randn(self.lora_rank,
-                             self.hidden_size,
-                             dtype=tensorrt_llm.str_dtype_to_torch(self.dtype),
-                             device="cuda")
-        self.B = torch.randn(self.hidden_size,
-                             self.lora_rank,
-                             dtype=tensorrt_llm.str_dtype_to_torch(self.dtype),
-                             device="cuda")
+        cls.A = torch.randn(cls.lora_rank,
+                            cls.hidden_size,
+                            dtype=tensorrt_llm.str_dtype_to_torch(cls.dtype),
+                            device="cuda")
+        cls.B = torch.randn(cls.hidden_size,
+                            cls.lora_rank,
+                            dtype=tensorrt_llm.str_dtype_to_torch(cls.dtype),
+                            device="cuda")
 
     def _create_linear_lora_trt_session(self) -> Session:
         builder = tensorrt_llm.Builder()

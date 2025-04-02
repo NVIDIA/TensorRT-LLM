@@ -13,15 +13,16 @@ from tensorrt_llm.layers.lora import Lora, LoraParams
 
 class TestLoraMLPPivotVsTRT(unittest.TestCase):
 
-    def setUp(self):
-        self.batch_size = 1
-        self.seq_len = 16
-        self.hidden_size = 64
-        self.intermediate_size = self.hidden_size * 4
-        self.num_hidden_layers = 1
-        self.dtype = 'float16'
-        self.torch_dtype = str_dtype_to_torch(self.dtype)
-        self.device = torch.device('cuda')
+    @classmethod
+    def setUpClass(cls):
+        cls.batch_size = 1
+        cls.seq_len = 16
+        cls.hidden_size = 64
+        cls.intermediate_size = cls.hidden_size * 4
+        cls.num_hidden_layers = 1
+        cls.dtype = 'float16'
+        cls.torch_dtype = str_dtype_to_torch(cls.dtype)
+        cls.device = torch.device('cuda')
 
     def _create_mlp_inputs(self):
         hidden_states = torch.empty(

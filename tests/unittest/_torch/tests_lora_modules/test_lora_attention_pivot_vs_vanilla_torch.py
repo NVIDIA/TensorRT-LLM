@@ -24,49 +24,50 @@ from torch_ref import attention_qkvpacked_ref
 
 class TestLoraAttentionPivotVsVanilla(unittest.TestCase):
 
-    def setUp(self):
-        self.batch_size = 1
-        self.seq_len = 16
-        self.hidden_size = 64
-        self.head_num = 1
-        self.num_hidden_layers = 1
-        self.dtype = torch.float16
-        self.device = torch.device('cuda')
+    @classmethod
+    def setUpClass(cls):
+        cls.batch_size = 1
+        cls.seq_len = 16
+        cls.hidden_size = 64
+        cls.head_num = 1
+        cls.num_hidden_layers = 1
+        cls.dtype = torch.float16
+        cls.device = torch.device('cuda')
 
         # KV cache parameters
-        self.num_blocks = 4
-        self.tokens_per_block = 32
+        cls.num_blocks = 4
+        cls.tokens_per_block = 32
 
-        self.llama_config = LlamaConfig(
-            hidden_size=self.hidden_size,
-            num_attention_heads=self.head_num,
-            num_hidden_layers=self.num_hidden_layers,
-            intermediate_size=256,
-            max_position_embeddings=512,
-            rms_norm_eps=1e-5,
-            vocab_size=32000,
-            num_key_value_heads=self.head_num,
-            torch_dtype=self.dtype)
+        cls.llama_config = LlamaConfig(hidden_size=cls.hidden_size,
+                                       num_attention_heads=cls.head_num,
+                                       num_hidden_layers=cls.num_hidden_layers,
+                                       intermediate_size=256,
+                                       max_position_embeddings=512,
+                                       rms_norm_eps=1e-5,
+                                       vocab_size=32000,
+                                       num_key_value_heads=cls.head_num,
+                                       torch_dtype=cls.dtype)
 
-        head_dim = self.llama_config.hidden_size // self.llama_config.num_attention_heads
+        head_dim = cls.llama_config.hidden_size // cls.llama_config.num_attention_heads
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(max_tokens=self.num_blocks *
-                                        self.tokens_per_block)
-        self.kv_cache_manager = KVCacheManager(
+        kv_cache_config = KvCacheConfig(max_tokens=cls.num_blocks *
+                                        cls.tokens_per_block)
+        cls.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.SELF,
-            num_layers=self.llama_config.num_hidden_layers,
-            num_kv_heads=self.llama_config.num_key_value_heads,
+            num_layers=cls.llama_config.num_hidden_layers,
+            num_kv_heads=cls.llama_config.num_key_value_heads,
             head_dim=head_dim,
-            tokens_per_block=self.tokens_per_block,
-            max_seq_len=self.num_blocks * self.tokens_per_block,
-            max_batch_size=self.batch_size,
+            tokens_per_block=cls.tokens_per_block,
+            max_seq_len=cls.num_blocks * cls.tokens_per_block,
+            max_batch_size=cls.batch_size,
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF)
 
-    def tearDown(self):
-        self.kv_cache_manager.shutdown()
+    @classmethod
+    def tearDownClass(cls):
+        cls.kv_cache_manager.shutdown()
 
     def _get_lora_params(self, in_dim, out_dim):
         lora_rank = 8

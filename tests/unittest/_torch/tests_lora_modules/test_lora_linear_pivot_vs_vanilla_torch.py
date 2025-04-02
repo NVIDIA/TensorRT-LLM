@@ -9,16 +9,17 @@ from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 class TestLoraLinearPivotVsVanilla(unittest.TestCase):
 
-    def setUp(self):
-        self.in_dim = 64
-        self.out_dim = 64
-        self.input_length = 10
-        self.batch_size = 4
-        self.device = "cuda"
-        self.input_tensor = torch.randn(self.batch_size,
-                                        self.input_length,
-                                        self.in_dim,
-                                        device=self.device)
+    @classmethod
+    def setUpClass(cls):
+        cls.in_dim = 64
+        cls.out_dim = 64
+        cls.input_length = 10
+        cls.batch_size = 4
+        cls.device = "cuda"
+        cls.input_tensor = torch.randn(cls.batch_size,
+                                       cls.input_length,
+                                       cls.in_dim,
+                                       device=cls.device)
 
     def _get_lora_params(self):
         lora_rank = 8
