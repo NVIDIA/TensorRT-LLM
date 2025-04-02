@@ -160,7 +160,7 @@ if __name__ == '__main__':
     if model_type not in supported_models:
         assert False, "Invalid model type"
 
-    is_phi3 = 'Phi3' in model_type or 'MoE' in model_type
+    is_phi3 = 'Phi3' in model_type or 'PhiMoE' in model_type
     phi_model_cls = Phi3ForCausalLM if is_phi3 else PhiForCausalLM
 
     quant_config = args_to_quant_config(args)

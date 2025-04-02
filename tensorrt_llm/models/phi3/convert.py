@@ -34,6 +34,8 @@ def load_weights_from_hf_model(hf_model, config):
             key = key.replace("mlp.down_proj.", "mlp.proj.")  #128k
             key = key.replace("mlp.gate_proj.", "mlp.fc.")  #128k
             key = key.replace("o_proj.", "dense.")  #128k
+            # LoRA
+            key = key.replace("base_layer.", "")
 
             #MoE
             key = key.replace("block_sparse_moe.gate", "mlp.router")
@@ -114,14 +116,15 @@ def load_weights_from_hf_model(hf_model, config):
         for key in keys_to_delete:
             del weights[key]
 
-    if config.architecture == 'Phi3SmallForCausalLM':
+    if config.tie_word_embeddings or config.architecture == 'Phi3SmallForCausalLM':
         weights['lm_head.weight'] = weights[
             'transformer.vocab_embedding.weight'].clone()
 
-        # Transform QKV weights from custom Phi3Small format to TRT-LLM format
-        for key, value in weights.items():
-            if "qkv." in key:
-                weights[key] = shuffle_qkv_weights(weights[key], config)
+        if config.architecture == 'Phi3SmallForCausalLM':
+            # Transform QKV weights from custom Phi3Small format to TRT-LLM format
+            for key, value in weights.items():
+                if "qkv." in key:
+                    weights[key] = shuffle_qkv_weights(weights[key], config)
 
     if config.architecture in ['Phi3SmallForCausalLM', "PhiMoEForCausalLM"
                                ] and config.mapping.has_tp():
