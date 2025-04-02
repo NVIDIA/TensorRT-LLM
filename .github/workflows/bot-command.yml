@@ -59,24 +59,23 @@ jobs:
             "<details>\n\n" +
             "`run  [--disable-fail-fast  --skip-test  --stage-list \"A10-e2e-0, xxx\" --gpu-type \"A30, H100_PCIe\" --multi-gpu-test  --post-merge  --extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\" --memory-profiling  --disable-incremental-build  --enable-publish-last-known-good ]`\n\n" +
             "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
-            "`--skip-test ` *(OPTIONAL)* : Skip all test stages. Note: Does **NOT** update GitLab pipeline status.\n\n" +
-            "`--stage-list \"A10-e2e-0, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-e2e-0, xxx\". Note: Does **NOT** update GitLab pipeline status.\n\n" +
-            "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitLab pipeline status.\n\n" +
-            "`--multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitLab pipeline status.\n\n" +
+            "`--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--stage-list \"A10-e2e-0, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-e2e-0, xxx\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--disable-multi-gpu-test ` *(OPTIONAL)* : Disable multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--add-multi-gpu-test ` *(OPTIONAL)* : Force run multi-GPU tests. Will also run L0 pre-merge pipeline.\n\n" +
             "`--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.\n\n" +
-            "`--extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages from the L0 post-merge pipeline. Examples: --extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\".\n\n" +
-            "`--memory-profiling ` *(OPTIONAL)* : Enable memory profiling in the test stages.\n\n" +
-            "`--disable-incremental-build ` *(OPTIONAL)* : Disable incremental build. Note: Only impacts Windows builds that would otherwise be incremental.\n\n" +
-            "`--enable-publish-last-known-good ` *(OPTIONAL)* : Enable LKG build image publishing. Note: Only impacts Windows builds that would otherwise not publish LKG.\n\n" +
+            "`--extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage \"H100_PCIe-[Post-Merge]accuracy-0, xxx\".\n\n" +
             "### kill\n\n" +
             "`kill  `\n\n" +
-            "Kill all running builds associated with merge request.\n\n" +
+            "Kill all running builds associated with pull request.\n\n" +
             "### skip\n\n" +
             "`skip --comment COMMENT `\n\n" +
-            "Skip testing for latest commit on merge request. This action is restricted to admins. Please contact a maintainer/owner for the project if you would like to use this option.\n\n" +
+            "Skip testing for latest commit on pull request.\n\n" +
             "### reuse-pipeline\n\n" +
             "`reuse-pipeline `\n\n" +
-            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the merge request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
+            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
             "</details>";
             
             github.rest.issues.createComment({
