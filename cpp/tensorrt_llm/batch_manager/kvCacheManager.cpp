@@ -323,6 +323,51 @@ bool KVCacheBlock::isLeaf() const
     return mNextBlocks.empty();
 }
 
+std::map<SizeType32, SizeType32> BlockManager::blocksPerWindowSize(
+    // totalBlocks = 16384
+    SizeType32 totalBlocks,
+    // uniqueWindowSizeToLayers = {1024: [1], 4096: [0, 4, 5], 8192: [2, 3]}
+    std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers)
+{
+    TLLM_CHECK(totalBlocks > 0);
+    // windowSizeToContribution = {1024: (1024*1=1024), 4096: (4096*3=12288), 8192: (8192*2)}
+    std::map<SizeType32, SizeType32> windowSizeToContribution;
+
+    // windowSizesTotalSum = 1024 + 12288 + 16384 = 29696;
+    auto windowSizesTotalSum = 0;
+    for (auto const& [windowSize, layers] : uniqueWindowSizeToLayers)
+    {
+        auto const windowSizeContribution = windowSize * layers.size();
+        windowSizeToContribution[windowSize] = windowSizeContribution;
+        windowSizesTotalSum += windowSizeContribution;
+    }
+
+    std::map<SizeType32, SizeType32> windowSizeToAllottedBlocks;
+    SizeType32 remainingBlocks = totalBlocks;
+    // First pass: allocate blocks proportionally
+    for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
+    {
+        float const fraction = static_cast<float>(windowSizeSum) / windowSizesTotalSum;
+        TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
+        SizeType32 const allotted = static_cast<int>(fraction * totalBlocks);
+        windowSizeToAllottedBlocks[windowSize] = allotted;
+        remainingBlocks -= allotted;
+    }
+
+    // Second pass: awarded blocks lost to rounding down back to heaps.
+    for (auto& [windowSize, allottedBlocks] : windowSizeToAllottedBlocks)
+    {
+        if (remainingBlocks == 0)
+        {
+            break;
+        }
+        allottedBlocks++;
+        remainingBlocks--;
+    }
+    // {1024: (1024.0/29696)*16384 + 1, 4096: (12288.0/29696)*16384 + 1, 8192: (16384.0/29696)*16384}
+    return windowSizeToAllottedBlocks;
+}
+
 BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
     SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
     SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
@@ -357,6 +402,13 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     mIsVariableWindow = numUniqueWindowSizes > 1;
     mIsVariableGQA = std::unordered_set(numKvHeadsPerLayer.begin(), numKvHeadsPerLayer.end()).size() > 1;
 
+    auto const primaryBlocksPerWindowSize = blocksPerWindowSize(blocksInPrimaryPool, uniqueWindowSizeToLayers);
+    std::optional<std::map<SizeType32, SizeType32>> secondaryBlocksPerWindowSize;
+    if (blocksInSecondaryPool > 0)
+    {
+        secondaryBlocksPerWindowSize = blocksPerWindowSize(blocksInSecondaryPool, uniqueWindowSizeToLayers);
+    }
+
     mLayerToWindowSize.resize(mNumLayers);
     for (auto const& [windowSize, layersWithWindowSize] : uniqueWindowSizeToLayers)
     {
@@ -364,8 +416,12 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         {
             mLayerToWindowSize.at(layerIdx) = windowSize;
         }
+        SizeType32 const allottedPrimaryBlocks = primaryBlocksPerWindowSize.at(windowSize);
+        TLLM_CHECK(allottedPrimaryBlocks > 0); // You can't have a model with negative primary blocks...
+        SizeType32 const allottedSecondaryBlocks
+            = secondaryBlocksPerWindowSize ? secondaryBlocksPerWindowSize->at(windowSize) : 0;
         mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
-            sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool, maxNumSequences, stream,
+            sizePerHead, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks, maxNumSequences, stream,
             onboardBlocks, cacheType, secondaryOffloadMinPriority, mEventManager, enableHashKey, enablePartialReuse,
             copyOnPartialReuse);
     }
@@ -388,8 +444,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const maxBlocksPerSeq = tc::ceilDiv(maxTokenNum + temporaryAttentionWindow, tokensPerBlock);
         TLLM_LOG_INFO("Max KV cache pages per sequence: %d [window size=%d]", maxBlocksPerSeq, windowSize);
-        mWindowSizeToMetadata[windowSize]
-            = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, temporaryAttentionWindow};
+        mWindowSizeToMetadata[windowSize] = WindowSizeMetadata{absolutePoolsOffset, numPools, maxTokenNum,
+            maxBlocksPerSeq, manager.getMaxNumBlocks(), temporaryAttentionWindow};
         TLLM_LOG_DEBUG(
             "%s Metadata: %s", manager.getLogPrefix().c_str(), mWindowSizeToMetadata[windowSize].toString().c_str());
         absolutePoolsOffset += numPools;

@@ -390,6 +390,34 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
+TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize)
+{
+    auto constexpr numPrimaryBlocks = 16384;
+    // Single window size
+    {
+        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{{1024, {0, 1, 2}}};
+        auto result = BlockManager::blocksPerWindowSize(numPrimaryBlocks, windowSizeToLayers);
+        EXPECT_EQ(result.size(), 1);
+        EXPECT_EQ(result.at(1024), numPrimaryBlocks);
+    }
+    // Variable window size
+    {
+        std::map<SizeType32, std::vector<SizeType32>> windowSizeToLayers{
+            {1024, {1}},       // contribution = 1024*1 = 1024  / 29696
+            {4096, {0, 4, 5}}, // contribution = 4096*3 = 12288 / 29696
+            {8192, {2, 3}},    // contribution = 8192*2 = 16384 / 29696
+        };
+        auto result = BlockManager::blocksPerWindowSize(numPrimaryBlocks, windowSizeToLayers);
+        EXPECT_EQ(result.size(), 3);
+        EXPECT_EQ(std::accumulate(result.begin(), result.end(), 0, [](auto sum, auto cur) { return sum + cur.second; }),
+            numPrimaryBlocks);
+        // Two blocks that were lost due to rounding down were awarded in order to the smallest window sizes:
+        EXPECT_EQ(result.at(1024), 565);  // 564 + 1
+        EXPECT_EQ(result.at(4096), 6780); // 6779 + 1
+        EXPECT_EQ(result.at(8192), 9039); // 9039 + 0
+    }
+}
+
 #ifdef ENABLE_FP4
 TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
 {
@@ -2491,7 +2519,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto const& blockManager = kvCacheManager.getBlockManager();
 
     auto const allBlocksInPrimaryPools = blockManager.getNumPrimaryBlocks();
-    EXPECT_THAT(allBlocksInPrimaryPools, blocksInPrimaryPool * maxAttentionWindowVec.size());
+    EXPECT_THAT(allBlocksInPrimaryPools, blocksInPrimaryPool);
 
     ASSERT_EQ(blockManager.isVariableWindow(), true);
     ASSERT_EQ(blockManager.isVariableGQA(), false);

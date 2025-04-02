@@ -82,6 +82,7 @@ struct WindowSizeMetadata
     SizeType32 numPools;                 // number of managed pools
     SizeType32 maxTokenNum;              // Maximum token length (including bubble)
     SizeType32 maxBlocksPerSeq;
+    SizeType32 maxNumBlocks;             // Number of primary+secondary blocks allotted to the windowSize
     SizeType32 temporaryAttentionWindow; // Temporary kv cache length per sequence.
                                          // Only needed when chunked context + sliding window attention are used
                                          // together. And it should only be considered when allocating blocks.
@@ -90,8 +91,8 @@ struct WindowSizeMetadata
     {
         return tensorrt_llm::common::fmtstr(
             "WindowSizeMetadata{ .absolutePoolsOffset=%d, .numPools=%d, .maxTokenNum=%d, .maxBlocksPerSeq=%d, "
-            ".temporaryAttentionWindow=%d }",
-            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, temporaryAttentionWindow);
+            ".maxNumBlocks=%d, .temporaryAttentionWindow=%d }",
+            absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq, maxNumBlocks, temporaryAttentionWindow);
     }
 };
 
@@ -855,6 +856,12 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
+
+    //! \brief Per window size, calculate the size of the slice (=the fraction) the window's pools should receive of
+    //! blocksIn{Primary/Secondary}Pool
+    // Example: {1024: [1], 4096: [0, 4, 5], 8192: [2, 3]} -> {1024: 0.034, 4096: 0.413, 8192: 0.551} [Pie sums to 1]
+    static std::map<SizeType32, SizeType32> blocksPerWindowSize(
+        SizeType32 totalBlocks, std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers);
 
     void allocatePools(bool useUvm);
 
