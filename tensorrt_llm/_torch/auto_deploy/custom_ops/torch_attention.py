@@ -9,6 +9,7 @@ import torch.nn as nn
 from ...attention_backend.vanilla import repeat_kv
 
 
+# Function to apply rotary positional embeddings (RoPE)
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -16,11 +17,9 @@ def apply_rotary_pos_emb(
     head_dim: int,
     rope_theta: Optional[float] = None,
     rope_scale: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+):
     """
-    Apply rotary positional embeddings to query and key tensors using Neox-style (non-interleaved)
-    splitting of the last dimension.
-
+    Apply rotary positional embeddings to query and key tensors.
     Args:
         q: Query tensor of shape [batch, n_heads, seq_len, head_dim]
         k: Key tensor of shape [batch, n_kv_heads, seq_len, head_dim]
@@ -28,7 +27,6 @@ def apply_rotary_pos_emb(
         head_dim: Dimension of each head
         rope_theta: Base value for RoPE (default 10000.0)
         rope_scale: Scaling factor for positions (default 1.0)
-
     Returns:
         Tuple of transformed query and key tensors
     """
@@ -51,31 +49,49 @@ def apply_rotary_pos_emb(
     # Shape: [seq_len, head_dim/2]
     freqs = torch.outer(position, inv_freq)
 
-    # Compute cos and sin values and reshape for broadcasting.
-    cos = (
-        torch.cos(freqs).to(torch.float32).unsqueeze(0).unsqueeze(0)
-    )  # shape: [1, 1, seq_len, head_dim/2]
-    sin = (
-        torch.sin(freqs).to(torch.float32).unsqueeze(0).unsqueeze(0)
-    )  # shape: [1, 1, seq_len, head_dim/2]
+    # Compute the rotation matrix elements: cos and sin
+    # Shape: [seq_len, head_dim/2]
+    emb = torch.cat((freqs, freqs), dim=-1)
+    # Ensure stable computation of sin/cos in float32
+    cos = torch.cos(emb).to(dtype=torch.float32)
+    sin = torch.sin(emb).to(dtype=torch.float32)
 
-    # Always compute in float32.
-    q_float = q.to(torch.float32)
-    k_float = k.to(torch.float32)
+    # Reshape for broadcasting
+    # Shape: [1, 1, seq_len, head_dim]
+    cos = cos.view(1, 1, seq_len, head_dim)
+    sin = sin.view(1, 1, seq_len, head_dim)
 
-    # Split the last dimension into two halves.
-    q1, q2 = q_float[..., : head_dim // 2], q_float[..., head_dim // 2 :]
-    k1, k2 = k_float[..., : head_dim // 2], k_float[..., head_dim // 2 :]
+    # Always compute in float32 for numerical stability
+    q_float = q.to(dtype=torch.float32)
+    k_float = k.to(dtype=torch.float32)
 
-    # Apply rotation for Neox-style RoPE:
-    q_rotated_first = q1 * cos - q2 * sin
-    q_rotated_second = q1 * sin + q2 * cos
-    k_rotated_first = k1 * cos - k2 * sin
-    k_rotated_second = k1 * sin + k2 * cos
+    # For the even indices of the dimension
+    q_embed_even = q_float[..., 0::2]
+    q_embed_odd = q_float[..., 1::2]
+    k_embed_even = k_float[..., 0::2]
+    k_embed_odd = k_float[..., 1::2]
 
-    q_rotated = torch.cat([q_rotated_first, q_rotated_second], dim=-1)
-    k_rotated = torch.cat([k_rotated_first, k_rotated_second], dim=-1)
+    # Apply the rotation using the identities:
+    # q' = q * cos + rotate(q) * sin
+    # k' = k * cos + rotate(k) * sin
+    # where rotate(x) swaps the even and odd dimensions and negates the odd dimensions
+    q_rotated = torch.cat(
+        [
+            q_embed_even * cos[..., 0::2] - q_embed_odd * sin[..., 0::2],
+            q_embed_odd * cos[..., 1::2] + q_embed_even * sin[..., 1::2],
+        ],
+        dim=-1,
+    )
 
+    k_rotated = torch.cat(
+        [
+            k_embed_even * cos[..., 0::2] - k_embed_odd * sin[..., 0::2],
+            k_embed_odd * cos[..., 1::2] + k_embed_even * sin[..., 1::2],
+        ],
+        dim=-1,
+    )
+
+    # Convert back to the original dtype
     return q_rotated.to(dtype=original_dtype), k_rotated.to(dtype=original_dtype)
 
 
@@ -90,7 +106,6 @@ def fused_mha(
     rope_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Fused MHA+Rope that takes raw input from q, k, v GEMMs.
-
     Rope is performed according to the specified rope configuration. No support for caching.
     """
     # b, s info
