@@ -44,6 +44,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
         finished (bool): Whether the whole request is finished.
+        decoding_iter (int): The decoding iteration counter.
     """
 
     def __init__(self) -> None:
