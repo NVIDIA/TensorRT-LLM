@@ -171,26 +171,27 @@ void initConfigBindings(pybind11::module_& m)
     auto parallelConfigGetstate = [](tle::ParallelConfig const& self)
     {
         return py::make_tuple(self.getCommunicationType(), self.getCommunicationMode(), self.getDeviceIds(),
-            self.getParticipantIds(), self.getOrchestratorConfig());
+            self.getParticipantIds(), self.getOrchestratorConfig(), self.getNumNodes());
     };
     auto parallelConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 5)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid state!");
         }
         return tle::ParallelConfig(state[0].cast<tle::CommunicationType>(), state[1].cast<tle::CommunicationMode>(),
             state[2].cast<std::optional<std::vector<SizeType32>>>(),
             state[3].cast<std::optional<std::vector<SizeType32>>>(),
-            state[4].cast<std::optional<tle::OrchestratorConfig>>());
+            state[4].cast<std::optional<tle::OrchestratorConfig>>(), state[5].cast<std::optional<SizeType32>>());
     };
     py::class_<tle::ParallelConfig>(m, "ParallelConfig")
         .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType32>> const&,
-                 std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&>(),
+                 std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&,
+                 std::optional<SizeType32> const&>(),
             py::arg_v("communication_type", tle::CommunicationType::kMPI, "CommunicationType.MPI"),
             py::arg_v("communication_mode", tle::CommunicationMode::kLEADER, "CommunicationMode.LEADER"),
             py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none(),
-            py::arg("orchestrator_config") = py::none())
+            py::arg("orchestrator_config") = py::none(), py::arg("num_nodes") = py::none())
         .def_property("communication_type", &tle::ParallelConfig::getCommunicationType,
             &tle::ParallelConfig::setCommunicationType)
         .def_property("communication_mode", &tle::ParallelConfig::getCommunicationMode,
@@ -200,6 +201,7 @@ void initConfigBindings(pybind11::module_& m)
             "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds)
         .def_property("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
             &tle::ParallelConfig::setOrchestratorConfig)
+        .def_property("num_nodes", &tle::ParallelConfig::getNumNodes, &tle::ParallelConfig::setNumNodes)
         .def(py::pickle(parallelConfigGetstate, parallelConfigSetstate));
 
     auto peftCacheConfigSetstate = [](py::tuple const& state)
