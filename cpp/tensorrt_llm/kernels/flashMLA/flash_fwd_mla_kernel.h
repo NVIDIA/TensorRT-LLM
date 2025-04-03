@@ -658,6 +658,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(Flash_fwd_mla
             params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
 template <typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
     flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params)
@@ -709,9 +710,18 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
             scale_softmax_log2);
     }
 }
+#else
+template <typename Kernel_traits, bool Is_causal, typename SharedStorage>
+__global__ void flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        FLASH_DEVICE_ASSERT(false and "FlashMLA is only supported on Hopper (sm90a)");
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
 template <typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
 __global__ void __launch_bounds__(256, 1, 1)
     flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params)
@@ -813,6 +823,14 @@ __global__ void __launch_bounds__(256, 1, 1)
         = make_tensor(make_gmem_ptr(o_ptr + tidx * Elements), Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
     cute::copy(rO, gO);
 }
+#else
+template <typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
+__global__ void flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        FLASH_DEVICE_ASSERT(false and "FlashMLA is only supported on Hopper (sm90a)");
+}
+#endif
 
 } // namespace flash
 
