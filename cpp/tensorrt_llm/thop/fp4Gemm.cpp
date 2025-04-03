@@ -326,12 +326,12 @@ std::pair<tkc::CutlassGemmConfig, int64_t> runProfilingFor(
     constexpr int sfVecSize = 16;
 
     auto const scaleColSize = gemmId.k / sfVecSize;
-    auto mat1ScaleNumElems = tensorrt_llm::computeSFSize(m, scaleColSize) * batch_count;
+    auto mat1ScaleNumElems = tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, scaleColSize) * batch_count;
     at::Tensor mat1Scale = at::randint(
         randMin, randMax, {mat1ScaleNumElems}, at::ScalarType::Byte, std::nullopt, torch::kCUDA, std::nullopt)
                                .view(SF_DTYPE);
 
-    auto mat2ScaleNumElems = tensorrt_llm::computeSFSize(gemmId.n, scaleColSize) * batch_count;
+    auto mat2ScaleNumElems = tensorrt_llm::computeFP4SwizzledLayoutSFSize(gemmId.n, scaleColSize) * batch_count;
     at::Tensor mat2Scale = at::randint(
         randMin, randMax, {mat2ScaleNumElems}, at::ScalarType::Byte, std::nullopt, torch::kCUDA, std::nullopt)
                                .view(SF_DTYPE);
