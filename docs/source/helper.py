@@ -54,7 +54,7 @@ def generate_examples():
     serve_script_base_url = "https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve"
 
     # Generate the example docs for each example script
-    def write_script(base_url, script_paths, doc_paths):
+    def write_script(base_url, script_paths, doc_paths, extra_content=""):
         for script_path, doc_path in zip(script_paths, doc_paths):
             if script_path.name in ignore_list:
                 logging.warning(f"Ignoring file: {script_path.name}")
@@ -77,6 +77,7 @@ def generate_examples():
                 title = underline(title_text)
 
             content = (f"{title}\n\n"
+                       f"{extra_content}"
                        f"Source {script_url}.\n\n"
                        f".. literalinclude:: {include_path}\n"
                        f"    :language: {language}\n"
@@ -95,7 +96,9 @@ def generate_examples():
                 .replace(r"%EXAMPLE_NAME%", "LLM Examples"))
 
     # Generate the toctree for trtllm-serve example scripts
-    write_script(serve_script_base_url, serve_script_paths, serve_doc_paths)
+    trtllm_serve_content = "Refer to `trtllm-serve's documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.\n\n"
+    write_script(serve_script_base_url, serve_script_paths, serve_doc_paths,
+                 trtllm_serve_content)
     with open(doc_dir / "trtllm_serve_examples.rst", "w+") as f:
         example_docs = "\n   ".join(path.stem for path in serve_script_paths)
         f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs)\
