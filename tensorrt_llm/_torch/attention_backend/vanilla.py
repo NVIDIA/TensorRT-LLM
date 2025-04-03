@@ -67,9 +67,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+                         quant_config, **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
     def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
