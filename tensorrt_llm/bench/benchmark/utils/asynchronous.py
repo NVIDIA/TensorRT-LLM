@@ -74,7 +74,7 @@ class LlmManager:
             response_is_final=response.finished,
             error=False,
             tokens=tokens,
-            decoding_iteration=len(tokens),
+            decoding_iteration=response.decoding_iter,
             time_on_first_token=time_on_first_token,
         )
 

@@ -208,6 +208,7 @@ class MTPDecoder(TorchDecoder):
                     should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
+            request.py_decoding_iter += 1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -228,6 +229,7 @@ class MTPDecoder(TorchDecoder):
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
+                request.py_decoding_iter += 1
             idx += 1
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
