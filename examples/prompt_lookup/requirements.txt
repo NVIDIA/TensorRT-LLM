@@ -1,4 +1,5 @@
 -c ../constraints.txt
+--extra-index-url https://pypi.nvidia.com
 tensorrt_llm>=0.0.0.dev0
 datasets~=2.14.5
 rouge_score
