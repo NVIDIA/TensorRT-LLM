@@ -597,7 +597,7 @@ RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std:
                     TLLM_CHECK_WITH_INFO(beamWidth == 1, "Logits substitution is not supported for beam search");
 
                     auto const genLogitsOffset = tokens[0].size() - expectedContextLogits->getShape().d[0];
-                    // TODO(xiweny): Avoid static cast in TRT 10.0
+                    // TODO: Avoid static cast in TRT 10.0
                     auto const numLogits = static_cast<SizeType32>(logits->getShape().d[0]);
                     auto const numVerifyLogits = std::min(numLogits, acceptedDraftTokensLengths + 1);
 

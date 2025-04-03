@@ -32,13 +32,13 @@ class InferenceOptimizer:
     def __init__(
         self,
         factory: ModelFactory,
-        *,  # TODO (lliebenwein): temporary until we have a better config system
+        *,  # TODO: temporary until we have a better config system
         ad_config: AutoDeployConfig,
         visualize: bool = False,
     ):
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
-        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
+        # TODO: let's split up the compile backend to separately handle cuda graph
         # and torch compile so we can follow the PyTorchConfig here and enable it separately.
         self.ad_config = ad_config
         if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:

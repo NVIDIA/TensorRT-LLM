@@ -62,7 +62,7 @@ void invokeTopPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, 
     SizeType32 batchSize, SizeType32 vocabSize, cudaStream_t stream)
 {
     // vocabSize: the column number of logits_buffer for top_p sampling
-    // TODO(nkorobov): launch based on available resources
+    // TODO: launch based on available resources
     topPInitialize<<<32, 512, 0, stream>>>(topPIdValBuf, topPOffsetBuf, beginTopPOffsetBuf, batchSize, vocabSize);
 }
 

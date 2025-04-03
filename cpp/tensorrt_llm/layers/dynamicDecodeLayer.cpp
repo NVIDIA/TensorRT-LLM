@@ -136,7 +136,7 @@ void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Te
     TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
     if (setupParams->decodingParams->outputLogProbs)
     {
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         mOutputLogProbs = std::any_of(setupParams->decodingParams->outputLogProbs->begin(),
             setupParams->decodingParams->outputLogProbs->end(),
             [this](bool outputLogProbs) { return this->mOutputLogProbs | outputLogProbs; });
