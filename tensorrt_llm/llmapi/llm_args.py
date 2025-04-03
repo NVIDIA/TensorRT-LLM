@@ -928,7 +928,7 @@ class LlmArgs:
             self.moe_expert_parallel_size = -1
 
         if self.cp_config is None:
-            self.co_config = {}
+            self.cp_config = {}
 
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,

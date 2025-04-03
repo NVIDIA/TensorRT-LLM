@@ -1,23 +1,30 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
     // https://github.com/microsoft/vscode-dev-containers/tree/v0.245.2/containers/docker-existing-dockerfile
     {
-      "name": "TRT-LLM clangd Devcontainer",
+      "name": "TRT-LLM Devcontainer",
       "dockerComposeFile": [
-        "../docker-compose.yml"
+        "docker-compose.yml"
       ],
       "service": "tensorrt_llm-dev",
       "remoteUser": "ubuntu",
       "containerEnv": {
         // "CCACHE_DIR" : "/home/coder/${localWorkspaceFolderBasename}/cpp/.ccache",
         // "CCACHE_BASEDIR" : "/home/coder/${localWorkspaceFolderBasename}",
+        "HF_TOKEN": "${localEnv:HF_TOKEN}",
+        "HF_HOME": "/huggingface",
         "HISTFILE": "${containerWorkspaceFolder}/.cache/._bash_history"
       },
       "workspaceFolder": "/workspaces/tensorrt_llm",
       // "workspaceFolder": "/home/coder/${localWorkspaceFolderBasename}",
       // "workspaceMount": "source=${localWorkspaceFolder},target=/home/coder/${localWorkspaceFolderBasename},type=bind,consistency=consistent",
       "mounts": [
+        "source=${localEnv:HOME}/.cache/huggingface,target=/huggingface,type=bind", // HF cache
         "source=/home/scratch.trt_llm_data/,target=/home/scratch.trt_llm_data/,type=bind,consistency=consistent"
       ],
+      // Note: sourcing .profile is required since we use a local user and the python interpreter is
+      // global (/usr/bin/python). In this case, pip will default to a local user path which is not
+      // by default in the PATH. In interactive devcontainer shells, .profile is sourced by default.
+      "postCreateCommand": "mkdir -p $HOME/.local/bin && source $HOME/.profile && pip install -r requirements-dev.txt && pre-commit install --install-hooks",
       "customizations": {
         "vscode": {
           "extensions": [
@@ -28,6 +35,8 @@
             // Python
             "ms-python.python",
             "eeyore.yapf",
+            // AutoDeploy Linting and Formatting
+            "charliermarsh.ruff",
             // Build Tools
             // "ms-azuretools.vscode-docker",
             // "ms-vscode.makefile-tools",
@@ -48,8 +57,9 @@
             // "clang-format.executable": "/usr/local/bin/clang-format",
             "clangd.arguments": [
               // "--compile-commands-dir=${workspaceFolder}/cpp/build_RelWithDebInfo"
-              "--compile-commands-dir=${workspaceFolder}"
-            ]
+              "--compile-commands-dir=${workspaceFolder}/cpp/build"
+            ],
+            "python.defaultInterpreterPath": "/usr/bin/python"
           }
         }
       },

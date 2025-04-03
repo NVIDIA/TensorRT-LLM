@@ -44,6 +44,7 @@ public:
     using BufferManager = tensorrt_llm::runtime::BufferManager;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
     using TensorPtr = runtime::ITensor::SharedPtr;
+    using DecoderFinishedEventPtr = std::unique_ptr<runtime::decoder_batch::DecoderFinishedEvent const>;
 
     TrtEncoderModel(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::RawEngine const& rawEngine, std::shared_ptr<nvinfer1::ILogger> logger,
@@ -194,6 +195,7 @@ private:
     SizeType32 mNumBuffers;
 
     std::vector<ScheduledRequests> mMicroBatchScheduledRequests;
+    std::vector<DecoderFinishedEventPtr> mEncoderWaitEvents;
     ReqIdsSet mInflightReqIds;
     ReqIdsSet mReqIdsToPause;
 

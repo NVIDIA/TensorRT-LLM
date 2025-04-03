@@ -6,7 +6,7 @@ import logging
 import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Union
+from typing import List, Optional, Union
 
 import aiohttp
 import uvicorn
@@ -43,7 +43,7 @@ class OpenAIDisaggServer:
             raise ValueError("At least one context server and one generation server must be provided")
 
         # Session will be initialized in lifespan
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -118,6 +118,7 @@ class OpenAIDisaggServer:
             req.disaggregated_params = DisaggregatedParams(request_type="context_only")
             # Disable streaming for context server
             req.stream = False
+            req.stream_options = None
             ctx_response = await self.send_request(ctx_server, req)
 
             #TODO: Context server should skip de-tokenization and return raw tokens
@@ -212,7 +213,9 @@ class OpenAIDisaggServer:
                     raise ValueError("Received an event-stream although request stream was False")
 
                 response_dict = await response.json()
-                response.raise_for_status()
+                if not response.ok:
+                    logging.error(f"Received failed response {response_dict}")
+                    response.raise_for_status()
                 return CompletionResponse(**response_dict)
 
     async def check_server_ready(self, server_url: str) -> bool:

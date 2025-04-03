@@ -1826,14 +1826,13 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     asyncio.run(main())
 
 
-@pytest.mark.parametrize(
-    "return_context_logits, pytorch_backend, use_overlap",
-    [
-        (True, False, False),
-        (False, False, False),
-        (False, True, False),
-        #  (False, True, True), https://nvbugspro.nvidia.com/bug/5163585
-    ])
+@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
+                         [
+                             (True, False, False),
+                             (False, False, False),
+                             (False, True, False),
+                             (False, True, True),
+                         ])
 def test_llm_get_stats_async(return_context_logits, pytorch_backend,
                              use_overlap):
     llm_get_stats_async_test_harness(

@@ -55,7 +55,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_accuracy.py::TestGpt2CnnDailymail::test_auto_dtype"
+pytest "accuracy/test_cli_flow.py::TestGpt2CnnDailymail::test_auto_dtype"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>

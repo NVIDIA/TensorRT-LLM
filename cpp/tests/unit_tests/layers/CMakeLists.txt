@@ -14,6 +14,10 @@ set(SAMPLING_LAYER_TEST_SRC
     topPSamplingLayerTest.cpp externalDraftTokensLayerTest.cpp)
 add_gtest(samplingLayerTest "${SAMPLING_LAYER_TEST_SRC}")
 
+set(BEAM_SEARCH_LAYER_TEST_SRC baseSamplingLayerTest.cpp
+                               beamSearchLayerTest.cpp)
+add_gtest(beamSearchLayerTest "${BEAM_SEARCH_LAYER_TEST_SRC}")
+
 set(LOOKAHEAD_POOLMANAGER_TEST_SRC randomLlm.cpp lookaheadPoolManagerTest.cpp)
 add_gtest(lookaheadPoolManagerTest "${LOOKAHEAD_POOLMANAGER_TEST_SRC}")
 

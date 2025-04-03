@@ -17,14 +17,18 @@
 #pragma once
 
 #include <NvInferRuntime.h>
-#include <cuda_bf16.h>
+
+#include "cutlass/half.h"
 #include <cuda_fp16.h>
 
+#include "cutlass/bfloat16.h"
+#include <cuda_bf16.h>
+
+#include "cutlass/float8.h"
 #include <cuda_fp8.h>
 
-#include "cutlass/bfloat16.h"
-#include "cutlass/float8.h"
-#include "cutlass/half.h"
+#include "cutlass/float_subbyte.h"
+#include <cuda_fp4.h>
 
 namespace tensorrt_llm
 {
@@ -57,6 +61,12 @@ template <>
 struct CutlassType<nvinfer1::DataType::kFP8>
 {
     using type = cutlass::float_e4m3_t;
+};
+
+template <>
+struct CutlassType<nvinfer1::DataType::kFP4>
+{
+    using type = cutlass::float_e2m1_t;
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -96,6 +106,14 @@ struct TllmToCutlassTypeAdapter<__nv_fp8_e5m2>
 };
 #endif
 
+#if defined(ENABLE_FP4)
+template <>
+struct TllmToCutlassTypeAdapter<__nv_fp4_e2m1>
+{
+    using type = cutlass::float_e2m1_t;
+};
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Cutlass to Tllm
 
@@ -130,6 +148,14 @@ template <>
 struct CutlassToTllmTypeAdapter<cutlass::float_e5m2_t>
 {
     using type = __nv_fp8_e5m2;
+};
+#endif
+
+#if defined(ENABLE_FP4)
+template <>
+struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t>
+{
+    using type = __nv_fp4_e2m1;
 };
 #endif
 

@@ -343,6 +343,90 @@ class ModelLoader:
 
             assert self.speculative_model_obj.is_local_model
 
+    def _update_from_hf_quant_config(self) -> bool:
+        """Update quant_config from the config file of pre-quantized HF checkpoint.
+
+        Returns:
+            prequantized (bool): Whether the checkpoint is pre-quantized.
+        """
+        quant_config = self.llm_args.quant_config
+
+        hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
+        if os.path.exists(hf_quant_config_path):
+            logger.info(
+                f"Found {hf_quant_config_path}, pre-quantized checkpoint is used."
+            )
+            with open(hf_quant_config_path, "r") as f:
+                hf_quant_config = json.load(f)
+                hf_quant_config = hf_quant_config["quantization"]
+
+            hf_quant_algo = hf_quant_config.pop("quant_algo", None)
+            if hf_quant_algo is not None:
+                hf_quant_algo = QuantAlgo(hf_quant_algo)
+                if quant_config.quant_algo is None:
+                    logger.info(
+                        f"Setting quant_algo={hf_quant_algo} form HF quant config."
+                    )
+                    quant_config.quant_algo = hf_quant_algo
+                elif quant_config.quant_algo != hf_quant_algo:
+                    raise ValueError(
+                        f"Specified quant_algo={quant_config.quant_algo}, conflicting with quant_algo={hf_quant_algo} from HF quant config."
+                    )
+            else:
+                raise ValueError(
+                    "Pre-quantized checkpoint must have quant_algo.")
+
+            hf_kv_cache_quant_algo = hf_quant_config.pop(
+                "kv_cache_quant_algo", None)
+            if hf_kv_cache_quant_algo is not None:
+                hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
+                if quant_config.kv_cache_quant_algo is None:
+                    logger.info(
+                        f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
+                    )
+                    quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+                elif quant_config.kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                    raise ValueError(
+                        f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, conflicting with kv_cache_quant_algo={hf_kv_cache_quant_algo} from HF quant config."
+                    )
+            else:
+                if quant_config.kv_cache_quant_algo not in [
+                        None, QuantAlgo.FP8
+                ]:
+                    raise ValueError(
+                        f"Only kv_cache_quant_algo={QuantAlgo.FP8} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
+                    )
+
+            for key, value in hf_quant_config.items():
+                logger.info(f"Setting {key}={value} from HF quant config.")
+                setattr(quant_config, key, value)
+
+            return True
+
+        hf_config_path = f"{self._model_dir}/config.json"
+        if os.path.exists(hf_config_path):
+            with open(hf_config_path, "r") as f:
+                hf_config = json.load(f)
+                hf_quant_config = hf_config.get("quantization_config", None)
+
+            if hf_quant_config is not None:
+                logger.info(
+                    f"Found quantization_config field in {hf_config_path}, pre-quantized checkpoint is used."
+                )
+                # DeepSeek V3 FP8 ckpt
+                if hf_quant_config.get(
+                        "quant_method") == "fp8" and hf_quant_config.get(
+                            "weight_block_size"):
+                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.exclude_modules = ["*eh_proj"]
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported quantization_config: {hf_quant_config}.")
+
+                return True
+
+        return False
+
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
@@ -353,46 +437,7 @@ class ModelLoader:
             if hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model else None)
 
-        # Update quant_config if it's ModelOpt quantized ckpt
-        user_quant_config = self.llm_args.quant_config
-        hf_quant_config_path = Path(self._model_dir) / "hf_quant_config.json"
-        if hf_quant_config_path.exists():
-            logger.info(
-                f"Found {hf_quant_config_path}, pre-quantized checkpoints are used."
-            )
-            already_quantized = True
-            with open(hf_quant_config_path, "r") as f:
-                hf_quant_config = json.load(f)
-                hf_quant_algo = hf_quant_config["quantization"].get(
-                    "quant_algo")
-                if hf_quant_algo == "FP8" and user_quant_config.quant_algo \
-                        and user_quant_config.quant_algo != QuantAlgo.FP8:
-                    raise ValueError(
-                        f"Expecting quant_algo to be FP8, got {user_quant_config.quant_algo}."
-                    )
-                user_quant_config.quant_algo = hf_quant_algo
-                logger.info(f"quant_algo is set to {hf_quant_algo}")
-
-                hf_kv_cache_quant_algo = hf_quant_config["quantization"].get(
-                    "kv_cache_quant_algo")
-                if hf_kv_cache_quant_algo != user_quant_config.kv_cache_quant_algo:
-                    if user_quant_config.kv_cache_quant_algo is None:
-                        user_quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
-                        logger.info(
-                            f"kv_cache_quant_algo is set to {hf_kv_cache_quant_algo}"
-                        )
-                    elif user_quant_config.kv_cache_quant_algo == QuantAlgo.FP8 and hf_kv_cache_quant_algo is None:
-                        logger.warning(
-                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo} "
-                            f"will overwrite {hf_kv_cache_quant_algo} from {hf_quant_config_path}."
-                        )
-                    else:
-                        raise ValueError(
-                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo}, "
-                            f"while it's {hf_kv_cache_quant_algo} in {hf_quant_config_path}."
-                        )
-        else:
-            already_quantized = False
+        prequantized = self._update_from_hf_quant_config()
 
         # FP4 Gemm force to use plugin.
         if self.llm_args.quant_config.quant_mode.has_nvfp4():
@@ -407,7 +452,7 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
-        elif self.llm_args.quant_config._requires_calibration and not already_quantized:
+        elif self.llm_args.quant_config._requires_calibration and not prequantized:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -598,7 +643,7 @@ class CachedModelLoader:
                 self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
 
-        if (self.llm_args.backend is not None):
+        if self.llm_args.backend is not None:
             if self.llm_args.backend not in ["pytorch", "autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
@@ -615,6 +660,10 @@ class CachedModelLoader:
                 logger.warning(
                     "QuantConfig for pytorch backend is ignored. You can load"
                     "quantized model with hf_quant_config.json directly.")
+            # Currently, this is to make updated quant_config visible by llm.args.quant_config
+            # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
+            self.model_loader._update_from_hf_quant_config()
+
             return None, self._hf_model_dir
 
         return self._build_model(), self._hf_model_dir

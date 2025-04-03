@@ -435,6 +435,16 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq_tensors = [
+            torch.tensor(sublist, dtype=torch.int)
+            for sublist in block_ids_per_seq
+        ]
+        padded_tensor = torch.nn.utils.rnn.pad_sequence(
+            block_ids_per_seq_tensors, batch_first=True, padding_value=0)
+        return padded_tensor
+
     def flush_iteration_events(self):
         self.impl.flush_iteration_events()
 

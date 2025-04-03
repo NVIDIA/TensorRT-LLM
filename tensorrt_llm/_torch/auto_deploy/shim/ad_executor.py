@@ -300,6 +300,10 @@ def create_autodeploy_executor(
         decoder=decoder,
         dist=mpi_dist,
         enable_overlap_scheduler=py_config.enable_overlap_scheduler,
+        max_input_len=executor_config.max_input_len,
         max_batch_size=executor_config.max_batch_size,
+        max_draft_tokens=executor_config.speculative_config.max_draft_tokens
+        if executor_config.speculative_config is not None
+        else 0,
     )
     return py_executor

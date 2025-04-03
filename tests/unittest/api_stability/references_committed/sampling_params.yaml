@@ -54,9 +54,6 @@ methods:
       min_p:
         annotation: Optional[float]
         default: null
-      beam_width_array:
-        annotation: Optional[List[int]]
-        default: null
       # Panelities
       repetition_penalty:
         annotation: Optional[float]

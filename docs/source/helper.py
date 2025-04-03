@@ -9,9 +9,12 @@ def underline(title: str, character: str = "=") -> str:
 
 def generate_title(filename: str) -> str:
     with open(filename) as f:
-        first_line = f.readline()
-        assert first_line.startswith("### ")
-        title = first_line[4:].strip()
+        # fine the first line that contains '###'
+        for line in f:
+            if '###' in line:
+                title = line[3:].strip()
+                break
+        assert title is not None, f"No title found in {filename}"
     return underline(title)
 
 
@@ -20,10 +23,16 @@ def generate_examples():
 
     # Source paths
     script_dir = root_dir / "examples/llm-api"
-    script_paths = sorted(
+    # Look for both Python files and shell scripts
+    py_script_paths = sorted(
         script_dir.glob("*.py"),
         # The autoPP example should be at the end since it is a preview example
         key=lambda x: math.inf if 'llm_auto_parallel' in x.stem else 0)
+
+    sh_script_paths = sorted(script_dir.glob("*.sh"))
+
+    # Combine both file types
+    script_paths = py_script_paths + sh_script_paths
 
     ignore_list = {'__init__.py', 'quickstart_example.py'}
     script_paths = [i for i in script_paths if i.name not in ignore_list]
@@ -38,12 +47,25 @@ def generate_examples():
             continue
         script_url = f"https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/{script_path.name}"
 
+        # Determine language based on file extension
+        language = "python" if script_path.suffix == ".py" else "bash"
+
         # Make script_path relative to doc_path and call it include_path
         include_path = '../../..' / script_path.relative_to(root_dir)
-        content = (f"{generate_title(script_path)}\n\n"
+
+        # For Python files, use generate_title to extract title from comments
+        # For shell scripts, use filename as title
+        if script_path.suffix == ".py":
+            title = generate_title(script_path)
+        else:
+            # Create a title from the filename (remove extension and replace underscores with spaces)
+            title_text = script_path.stem.replace('_', ' ').title()
+            title = underline(title_text)
+
+        content = (f"{title}\n\n"
                    f"Source {script_url}.\n\n"
                    f".. literalinclude:: {include_path}\n"
-                   "    :language: python\n"
+                   f"    :language: {language}\n"
                    "    :linenos:\n")
         with open(doc_path, "w+") as f:
             f.write(content)

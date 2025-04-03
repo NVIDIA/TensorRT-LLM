@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import List
 
 import torch
@@ -9,6 +10,17 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from .pipeline_interface import PipelineInterface
 
 is_torch_compiling_flag = False
+
+aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+AuxStreamType = Enum(
+    'AuxStreamType',
+    aux_stream_name_list,
+)
+EventType = Enum(
+    'EventType',
+    ['Main', *aux_stream_name_list],
+    start=0,
+)
 
 
 def set_torch_compiling(enable: bool):

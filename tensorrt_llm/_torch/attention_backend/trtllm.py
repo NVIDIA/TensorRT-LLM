@@ -458,8 +458,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=True,
             )
             self.block_ids_per_seq = None
-            if self.is_mla:
-                self.block_table_cuda = torch.empty(
+            self.kv_block_ids_per_seq = None
+            if self.enable_flash_mla:
+                self.block_ids_per_seq = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.kv_block_ids_per_seq = torch.zeros(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq
@@ -485,23 +494,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
 
-        # set block table for flashmla
-        if self.is_mla:
-            block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-                self.request_ids)
-            block_ids_per_seq_tensors = [
-                torch.tensor(sublist, dtype=torch.int)
-                for sublist in block_ids_per_seq
-            ]
-            padded_tensor = torch.nn.utils.rnn.pad_sequence(
-                block_ids_per_seq_tensors, batch_first=True, padding_value=0)
-            self.block_table_cuda[:padded_tensor.shape[0], :padded_tensor.
-                                  shape[1]].copy_(padded_tensor,
-                                                  non_blocking=True)
-            self.block_ids_per_seq = self.block_table_cuda[
-                self.num_contexts:self.num_contexts +
-                self.num_generations, :padded_tensor.shape[1]]
-
+        if self.enable_flash_mla:
+            self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
@@ -523,6 +517,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 non_blocking=True)
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
+
+    def prepare_flash_mla(self) -> None:
+        block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
+            self.request_ids)
+        num_blocks = block_ids_per_seq.shape[1]
+        self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
+            block_ids_per_seq, non_blocking=True)
+        self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
+            block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
