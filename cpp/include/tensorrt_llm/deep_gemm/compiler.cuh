@@ -349,16 +349,17 @@ __global__ void dummy_kernel() {
 
         std::vector<std::filesystem::path> includeDirs = getJitIncludeDirs();
 
-        // Write the code to a system temp directory with a unique ID to avoid multiprocess collisions
         std::filesystem::path tmpPath = getTmpDir() / (name + "_" + generateUniqueId());
-        std::filesystem::create_directories(tmpPath);
-
-        // Compile into a shared object file
         std::filesystem::path cubinPath = path / kKernelName;
         std::filesystem::path tmpCubinPath = tmpPath / kKernelName;
 
         // Create the target directory if it doesn't exist
-        std::filesystem::create_directories(path);
+        if (kJitUseNvcc || kJitDumpCubin)
+        {
+            std::filesystem::create_directories(tmpPath);
+            std::filesystem::create_directories(path);
+        }
+
         for (auto const& dir : includeDirs)
         {
             flags.push_back("-I" + dir.string());
@@ -483,10 +484,23 @@ __global__ void dummy_kernel() {
             CHECK_NVRTC(nvrtcGetCUBINSize(prog, &cubinSize));
             std::vector<char> cubin(cubinSize);
             CHECK_NVRTC(nvrtcGetCUBIN(prog, cubin.data()));
+
+            // Cache the runtime in memory by default
+            if (!kJitDumpCubin)
+            {
+                auto runtime = std::make_unique<Runtime>(path.string(), cubin, gemm_type);
+                Runtime* result = runtime.get();
+                runtimeCache.set(path.string(), std::move(runtime));
+                if (kJitDebugging)
+                {
+                    TLLM_LOG_INFO("Successfully cached JIT runtime %s in memory", name.c_str());
+                }
+                return result;
+            }
+
             std::ofstream cubinFile(tmpCubinPath.string(), std::ios::binary);
             cubinFile.write(cubin.data(), static_cast<std::streamsize>(cubinSize));
             cubinFile.close();
-
             CHECK_NVRTC(nvrtcDestroyProgram(&prog));
         }
 
@@ -516,10 +530,9 @@ __global__ void dummy_kernel() {
         }
 
         // Create runtime and cache it
-        auto runtime = std::make_unique<Runtime>(path.string(), gemm_type);
+        auto runtime = std::make_unique<Runtime>(path.string(), std::vector<char>(), gemm_type);
         Runtime* result = runtime.get();
         runtimeCache.set(path.string(), std::move(runtime));
-
         return result;
     }
 
