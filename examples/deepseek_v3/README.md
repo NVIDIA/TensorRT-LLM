@@ -5,25 +5,31 @@ This guide walks you through the complete process of running the DeepSeek‑v3 m
 > [!NOTE]
 > This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and docker image.
 
----
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Hardware](#hardware)
-3. [Downloading the Model Weights](#downloading-the-model-weights)
-4. [Quick Start](#quick-start)
-5. [Preparing the Dataset & Configuration for Benchmark](#preparing-the-dataset--configuration-for-benchmark)
-   - [Build the Dataset](#build-the-dataset)
-   - [Create Configuration Files](#create-configuration-files)
-6. [Running the Benchmark](#running-the-benchmark)
-   - [Parameter Overview](#parameter-overview)
-7. [Multi-node](#multi-node)
-   - [mpirun](#mpirun)
-   - [Slurm](#slurm)
-8. [Notes and Troubleshooting](#notes-and-troubleshooting)
+- [DeepSeek‑V3](#deepseekv3)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Hardware](#hardware)
+  - [Downloading the Model Weights](#downloading-the-model-weights)
+  - [Quick Start](#quick-start)
+    - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
+    - [Run evaluation on GPQA dataset](#run-evaluation-on-gpqa-dataset)
+  - [Preparing the Dataset \& Configuration for Benchmark](#preparing-the-dataset--configuration-for-benchmark)
+    - [Build the Dataset](#build-the-dataset)
+    - [Create Configuration Files](#create-configuration-files)
+  - [Running the Benchmark](#running-the-benchmark)
+    - [Parameter Overview](#parameter-overview)
+  - [Serving](#serving)
+  - [Multi-node](#multi-node)
+    - [mpirun](#mpirun)
+    - [Slurm](#slurm)
+    - [Advanced Features](#advanced-features)
+    - [FlashMLA](#flashmla)
+    - [DeepGEMM](#deepgemm)
+  - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
----
 
 ## Overview
 
@@ -34,14 +40,12 @@ DeepSeek‑v3 is a high‑capacity language model that can be executed using NVI
 - Configure backend options.
 - Run a performance benchmark using `trtllm-bench`.
 
----
 
 ## Hardware
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory. 8\*H100 (640GB) is not enough to accommodate the weights. The following steps have been tested on 8\*H20 141GB, we will test on 8*H20 96GB in the future.
 
 DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TensorRT-LLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
 
----
 
 ## Downloading the Model Weights
 
@@ -52,7 +56,6 @@ git lfs install
 git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ```
 
----
 
 ## Quick Start
 
@@ -143,14 +146,13 @@ This command writes the dataset to `/workspace/dataset.txt`.
 > [!TIP]
 > Ensure that the quotes and formatting in the configuration files are correct to avoid issues during runtime.
 
----
 
 ## Running the Benchmark
 
 With the model weights downloaded, the dataset prepared, and the configuration files in place, run the benchmark using the following command:
 
 ```bash
-  trtllm-bench \
+trtllm-bench \
   --model deepseek-ai/DeepSeek-V3 \
   --model_path  <YOUR_MODEL_DIR> \
   throughput \
@@ -181,7 +183,38 @@ With the model weights downloaded, the dataset prepared, and the configuration f
 
 Benchmark logs are saved to `/workspace/trt_bench.log`.
 
----
+
+## Serving
+
+To serve the model using `trtllm-serve`:
+```bash
+trtllm-serve \
+  deepseek-ai/DeepSeek-V3 \
+  --host localhost \
+  --port 8000 \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 8 \
+  --ep_size 4 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+To query the server, you can start with a `curl` command:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+      "model": "deepseek-ai/DeepSeek-V3",
+      "prompt": "Where is New York?",
+      "max_tokens": 16,
+      "temperature": 0
+  }'
+```
+
+For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
 
 ## Multi-node
 TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
@@ -347,7 +380,6 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
 
 The cuda kernels of DeepGEMM are JIT compiled using NVCC. You need to install CUDA Toolkit 12.3 or above and specify the path to the CUDA Toolkit in the environment variable `CUDA_HOME`. We recommend you to use the latest version of CUDA Toolkit. In the case of compilation errors, you can set the environment variable `TRTLLM_DG_JIT_DEBUG` to 1 to print the debug information of the JIT compilation.
 
----
 
 ## Notes and Troubleshooting
 
@@ -356,6 +388,5 @@ The cuda kernels of DeepGEMM are JIT compiled using NVCC. You need to install CU
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
 
----
 
 By following these steps, you should be able to successfully run the DeepSeek‑v3 benchmark using TensorRT-LLM with the PyTorch backend.
