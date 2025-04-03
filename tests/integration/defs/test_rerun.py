@@ -47,7 +47,8 @@ def generate_rerun_tests_list(outdir, xml_filename):
                 elif duration <= 10 * 60:
                     rerun_1_file.write(test_name + '\n')
                     print(test_name + " will rerun 1 time")
-                elif any(failSig.lower() in ET.tostring(case, encoding='unicode').lower() 
+                elif any(failSig.lower() in ET.tostring(
+                        case, encoding='unicode').lower()
                          for failSig in failSignaturesList):
                     rerun_1_file.write(test_name + '\n')
                     print(test_name +
@@ -119,6 +120,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames):
     # Write to new file
     tree = ET.ElementTree(merged_root)
     tree.write(merged_xml_filename, encoding='utf-8', xml_declaration=True)
+
 
 def xml_to_html(xml_filename, html_filename):
     # HTML template
