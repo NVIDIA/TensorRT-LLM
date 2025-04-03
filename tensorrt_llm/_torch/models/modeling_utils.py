@@ -255,9 +255,9 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
-        if hasattr(self, 'aux_stream'):  # DeepseekV3
+        if hasattr(self, 'aux_stream_dict'):  # DeepseekV3
             layer_fn = lambda layer_idx: decoder_layer_cls(
-                self.model_config, layer_idx, self.aux_stream)
+                self.model_config, layer_idx, self.aux_stream_dict)
         else:
             layer_fn = lambda layer_idx: decoder_layer_cls(
                 self.model_config, layer_idx)

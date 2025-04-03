@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A workflow to display bot command help information
+name: Bot-Command
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+jobs:
+  Bot-command-check:
+    name: Bot command check
+    if: github.event_name == 'pull_request' || startsWith(github.event.comment.body, '/bot')
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - id: check
+        name: Check bot command
+        run: |
+          if [[ "${{ github.event.comment.body }}" == "/bot run"* ]] ||
+             [[ "${{ github.event.comment.body }}" == "/bot skip --comment"* ]] ||
+             [[ "${{ github.event.comment.body }}" == "/bot reuse-pipeline"* ]] ||
+             [[ "${{ github.event.comment.body }}" == "/bot kill"* ]]; then
+            echo 'status=success' >> $GITHUB_OUTPUT
+          else
+            echo 'status=failure' >> $GITHUB_OUTPUT
+          fi
+      - name: Add bot help comment
+        if: steps.check.outputs.status == 'failure'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const helpMessage = "" +
+            "## GitHub Bot Help\n\n" +
+            "`/bot [-h] ['run', 'kill', 'skip', 'reuse-pipeline'] ...`\n\n" +
+            "Provide a user friendly way for developers to interact with a Jenkins server.\n\n" +
+            "Run `/bot [-h|--help]` to print this help message.\n\n" +
+            "See details below for each supported subcommand.\n\n" +
+            "<details>\n\n" +
+            "`run  [--disable-fail-fast --skip-test --stage-list \"A10-1, xxx\" --gpu-type \"A30, H100_PCIe\" --add-multi-gpu-test --only-multi-gpu-test --disable-multi-gpu-test --post-merge --extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\"]`\n\n" +
+            "Launch build/test pipelines. All previously running jobs will be killed.\n\n" +
+            "`--disable-fail-fast ` *(OPTIONAL)* : Disable fail fast on build/tests/infra failures.\n\n" +
+            "`--skip-test ` *(OPTIONAL)* : Skip all test stages, but still run build stages, package stages and sanity check stages. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--stage-list \"A10-1, xxx\"` *(OPTIONAL)* : Only run the specified test stages. Examples: \"A10-1, xxx\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--gpu-type \"A30, H100_PCIe\"` *(OPTIONAL)* : Only run the test stages on the specified GPU types. Examples: \"A30, H100_PCIe\". Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--only-multi-gpu-test ` *(OPTIONAL)* : Only run the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--disable-multi-gpu-test ` *(OPTIONAL)* : Disable the multi-GPU tests. Note: Does **NOT** update GitHub check status.\n\n" +
+            "`--add-multi-gpu-test ` *(OPTIONAL)* : Force run the multi-GPU tests. Will also run L0 pre-merge pipeline.\n\n" +
+            "`--post-merge ` *(OPTIONAL)* : Run the L0 post-merge pipeline instead of the ordinary L0 pre-merge pipeline.\n\n" +
+            "`--extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\"` *(OPTIONAL)* : Run the ordinary L0 pre-merge pipeline and specified test stages. Examples: --extra-stage \"H100_PCIe-[Post-Merge]-1, xxx\".\n\n" +
+            "### kill\n\n" +
+            "`kill  `\n\n" +
+            "Kill all running builds associated with pull request.\n\n" +
+            "### skip\n\n" +
+            "`skip --comment COMMENT `\n\n" +
+            "Skip testing for latest commit on pull request. `--comment \"Reason for skipping build/test\"` is required. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
+            "### reuse-pipeline\n\n" +
+            "`reuse-pipeline `\n\n" +
+            "Reuse a previous pipeline to validate current commit. This action will also kill all currently running builds associated with the pull request. IMPORTANT NOTE: This is dangerous since lack of user care and validation can cause top of tree to break.\n\n" +
+            "</details>";
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: helpMessage
+            });

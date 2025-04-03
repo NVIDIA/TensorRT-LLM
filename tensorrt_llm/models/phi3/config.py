@@ -68,6 +68,10 @@ class Phi3Config(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         small_variant = hf_config.architectures[0] == "Phi3SmallForCausalLM"
+
+        kwargs['rotary_pct'] = getattr(hf_config, "partial_rotary_factor", 1.0)
+        kwargs['tie_word_embeddings'] = getattr(hf_config,
+                                                "tie_word_embeddings", False)
         if small_variant:
             kwargs['gegelu_limit'] = getattr(hf_config, "gegelu_limit", None)
             kwargs['rotary_base'] = hf_config.rope_embedding_base

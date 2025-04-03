@@ -28,6 +28,7 @@ from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor, cast,
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
+from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -369,3 +370,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
                 del hf_weights
         else:
             cls.assert_valid_quant_algo(quant_algo)
+
+    def use_lora(self, lora_config: LoraConfig) -> None:
+        return use_lora(
+            self, lora_config)  # Use the default trtllm->hf module mapping

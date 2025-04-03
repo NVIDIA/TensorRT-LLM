@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -26,12 +27,12 @@ namespace tensorrt_llm::batch_manager
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
     : mManager{manager}
-    , mSelfState{std::move(selfCacheState),
-          executor::kv_cache::CommState{
-              tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), selfIndex}}
+    , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
+    TLLM_CHECK(mManager);
+    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
 }
 
 [[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
@@ -117,12 +118,11 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
 DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
     : mManager{manager}
-    , mSelfState{std::move(selfCacheState),
-          executor::kv_cache::CommState{
-              tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), selfIndex}}
+    , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
 {
     TLLM_CHECK(mManager);
+    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
 }
 

@@ -1,14 +1,13 @@
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Optional
+from typing import Callable, List, Optional, Union
 
+import openai
 from transformers import AutoTokenizer
 
-from tensorrt_llm import bindings as tllm
-from tensorrt_llm._torch.pyexecutor.config import (PyTorchConfig,
-                                                   update_executor_config)
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.executor import GenerationExecutor, GenerationRequest
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .task import GenerationTask, Task, TaskStatus
@@ -17,10 +16,19 @@ ExecutorCls = GenerationExecutor
 
 
 class Worker(ABC):
+    # user can use this api to register/add/override task handle function
+    def register_task_handler(self, task_cls: type[Task],
+                              handler: Callable[[object, Task], TaskStatus]):
+        worker_cls = type(self)
+        worker_cls.task_handlers[task_cls] = handler
 
-    @abstractmethod
     async def run_task(self, task: Task) -> TaskStatus:
-        raise NotImplementedError
+        worker_cls = type(self)
+        if type(task) not in worker_cls.task_handlers:
+            return TaskStatus.WORKER_NOT_SUPPORTED
+        return await worker_cls.task_handlers[type(task)](self, task)
+
+    task_handlers = {}
 
     @abstractmethod
     def shutdown(self):
@@ -33,49 +41,133 @@ class Worker(ABC):
         self.shutdown()
 
 
-class ProposerWorker(Worker):
+# helper function
+# add first non-None candidate_values to params with key
+def add_param_if_not_none(params, key, candidate_values):
+    for value in candidate_values:
+        if value is not None:
+            params[key] = value
+            return
 
-    def __init__(self,
-                 model_dir: str,
-                 *,
-                 pytorch_backend_config: PyTorchConfig = None,
-                 sampling_params: SamplingParams = None,
-                 max_batch_size: int = 64,
-                 max_num_tokens: int = 8192,
-                 max_seq_len: int = 16384):
-        self.pytorch_backend_config = pytorch_backend_config
-        self.executor, self.tokenizer = self._create_executor(
-            model_dir, max_batch_size, max_num_tokens, max_seq_len)
-        # TODO: enable Top-P or Top-K Sampling for Best-Of-N
-        self.sampling_params = self._prepare_sampling_params(sampling_params)
 
-    def _create_executor(self,
-                         model_dir: str,
-                         max_batch_size: int = 64,
-                         max_num_tokens: int = 8192,
-                         max_seq_len: int = 16384):
-        # TODO: maybe need common interface for create pyExecutor with LLM.
-        scheduler_config = tllm.executor.SchedulerConfig()
-        kv_cache_config = tllm.executor.KvCacheConfig(enable_block_reuse=True)
-        executor_config = tllm.executor.ExecutorConfig(
-            max_beam_width=1,
-            scheduler_config=scheduler_config,
-            batching_type=tllm.executor.BatchingType.INFLIGHT,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens)
-        executor_config.kv_cache_config = kv_cache_config
-        build_config = BuildConfig()
+# helper function
+# add first non-None candidate_values to the attribute of the object with key
+def add_attr_if_not_none(obj, attr, candidate_values):
+    for value in candidate_values:
+        if value is not None:
+            setattr(obj, attr, value)
+            return
 
-        update_executor_config(
-            executor_config,
-            backend='pytorch',
-            pytorch_backend_config=self.pytorch_backend_config,
-            build_config=build_config,
-            max_seq_len=max_seq_len,
-            hf_model_dir=model_dir,
-            trt_engine_dir=None,
+
+# Worker for standard openai api
+class OpenaiWorker(Worker):
+
+    def __init__(
+        self,
+        async_client: openai.AsyncOpenAI,
+        model: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.9,
+        top_p: Optional[float] = None,
+    ):
+        self.model = model
+        self.async_client = async_client
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+    def combine_params_with_generation_task(self, params: dict,
+                                            task: GenerationTask):
+        params["prompt"] = task.input_str
+
+        add_param_if_not_none(params, "max_tokens",
+                              [task.max_tokens, self.max_tokens])
+        add_param_if_not_none(params, "temperature",
+                              [task.temperature, self.temperature])
+        add_param_if_not_none(params, "top_p", [task.top_p, self.top_p])
+
+    def fill_generation_task_with_response(self, task: GenerationTask,
+                                           response: openai.Completion):
+        task.output_str = response.choices[0].text
+        task.logprobs = response.choices[0].logprobs
+
+    async def generation_handler(self, task: GenerationTask) -> TaskStatus:
+        params = {}
+
+        # Set required parameters
+        params["model"] = self.model
+
+        self.combine_params_with_generation_task(params, task)
+
+        # Make the API call
+        try:
+            response = await self.async_client.completions.create(**params)
+            self.fill_generation_task_with_response(task, response)
+
+            return TaskStatus.SUCCESS
+
+        except Exception as e:
+            # Handle errors
+            print('Openai client get exception: ' + str(e))
+            return TaskStatus.WORKER_EXECEPTION
+
+    def shutdown(self):
+        # OpenAI client doesn't require explicit cleanup
+        pass
+
+    task_handlers = {GenerationTask: generation_handler}
+
+
+# worker inherit from OpenaiWorker
+# add TRT-LLM openai server special params
+class TRTOpenaiWorker(OpenaiWorker):
+    # just manager the TRT-LLM openai server special params
+    def __init__(self, top_k: Optional[float] = None, **kwargs):
+        self.top_k = top_k
+        super().__init__(**kwargs)
+
+    def combine_params_with_generation_task(self, params: dict,
+                                            task: GenerationTask):
+        super().combine_params_with_generation_task(params, task)
+        extra_body = {}
+        add_param_if_not_none(extra_body, "top_k", [task.top_k, self.top_k])
+        params["extra_body"] = extra_body
+
+
+class TRTLLMWorker(Worker):
+
+    def __init__(
+        self,
+        llm: LLM,
+        tokenizer: AutoTokenizer,
+        max_num_tokens: int = 2048,
+        temperature: float = 0.9,
+        top_p: Optional[float] = None,
+        topk: Optional[float] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+    ):
+        self.llm = llm
+        self.tokenizer = tokenizer
+        self.default_sampling_params = SamplingParams(max_tokens=max_num_tokens,
+                                                      temperature=temperature,
+                                                      top_p=top_p,
+                                                      top_k=topk,
+                                                      stop=stop)
+
+        self.default_sampling_params._setup(self.tokenizer)
+        self.own_llm = False
+
+    @classmethod
+    def init_with_new_llm(cls,
+                          model_dir: str,
+                          backend: str = None,
+                          max_batch_size: int = 32,
+                          **kwargs):
+        pytorch_backend_config = PyTorchConfig(
+            mixed_decoder=True,
+            enable_overlap_scheduler=True,
         )
-        executor = ExecutorCls.create(None, executor_config)
+
         tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
             legacy=False,
@@ -85,90 +177,45 @@ class ProposerWorker(Worker):
             use_fast=True,
         )
 
-        return executor, tokenizer
+        llm = LLM(model_dir,
+                  backend=backend,
+                  tokenizer=tokenizer,
+                  pytorch_backend_config=pytorch_backend_config,
+                  max_batch_size=max_batch_size,
+                  max_num_tokens=kwargs.get("max_num_tokens", 2048))
 
-    def _prepare_sampling_params(
-        self,
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> SamplingParams:
-        """From LLM._prepare_sampling_params"""
-        if sampling_params is None:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "tokenizer is required to initialize a default sampling_params, or you can explicitly specify a sampling_params"
-                )
-            sampling_param = SamplingParams(end_id=self.tokenizer.eos_token_id,
-                                            pad_id=self.tokenizer.pad_token_id,
-                                            max_tokens=4096)
+        worker = cls(llm, tokenizer, **kwargs)
+        worker.own_llm = True
+        return worker
 
-        if not isinstance(sampling_params, SamplingParams):
-            raise TypeError(
-                f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
-            )
+    def combine_sampling_params_with_generation_task(self,
+                                                     task: GenerationTask):
+        sampling_params = deepcopy(self.default_sampling_params)
 
-        if sampling_params.end_id is None and self.tokenizer is None:
-            raise ValueError(
-                "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
-            )
+        add_attr_if_not_none(sampling_params, "max_tokens", [task.max_tokens])
+        add_attr_if_not_none(sampling_params, "temperature", [task.temperature])
+        add_attr_if_not_none(sampling_params, "top_p", [task.top_p])
+        add_attr_if_not_none(sampling_params, "top_k", [task.top_k])
 
-        # TODO(zhenhuanc): sync this with LLM._prepare_sampling_params
-        if sampling_params.stop is None and self.tokenizer is not None:
-            sampling_params.stop = []
-            vocab = self.tokenizer.get_vocab()
-            # Many models' eos_token_id is not aligned with tokenizer.eos_token, so we add stop words here.
-            # Sometimes llama3.1-intruct will use "\r\n\r\n\n" as end token, not sure should we add it here
-            for token in [
-                    "<|eot_id|>", "<|endoftext|>", "<|end_of_text|>",
-                    "<｜end▁of▁sentence｜>"
-            ]:
-                if token in vocab and token != self.tokenizer.eos_token:
-                    sampling_params.stop.append(token)
-        sampling_params._setup(self.tokenizer)
         return sampling_params
 
-    def _combine_sampling_params(self, base: SamplingParams, custom: dict):
-        base = deepcopy(base)
-        for key, value in custom.items():
-            if hasattr(base, key):
-                setattr(base, key, value)
-        return base
+    async def generation_handler(self, task: GenerationTask) -> TaskStatus:
+        sampling_params = self.combine_sampling_params_with_generation_task(
+            task)
 
-    def _create_generation_request_from_task(
-            self, task: GenerationTask) -> GenerationRequest:
-        if not task.skip_tokenizer:
-            task.input_tokens = self.tokenizer.encode(task.input_str)
-        else:
-            assert task.input_tokens
-        if hasattr(task, "custom_sampling_params"
-                   ) and task.custom_sampling_params is not None:
-            sampling_params = self._combine_sampling_params(
-                self.sampling_params, task.custom_sampling_params)
-        else:
-            sampling_params = self.sampling_params
+        result = await self.llm.generate_async(task.input_str,
+                                               sampling_params=sampling_params)
 
-        generation_request = GenerationRequest(
-            prompt_token_ids=task.input_tokens, sampling_params=sampling_params)
-        return generation_request
-
-    async def run_task(self, task: Task) -> TaskStatus:
-        assert isinstance(
-            task, GenerationTask
-        ), 'Only GenerationTas should be dispatched to ProposerWorker'
-
-        generation_request = self._create_generation_request_from_task(task)
-        result = self.executor.submit(generation_request)
-        await result.aresult()
         task.output_tokens = result.outputs[0].token_ids
         task.cumulative_logprob = result.outputs[0].cumulative_logprob
         task.logprobs = result.outputs[0].logprobs
-        task.output_str = None
-        if not task.skip_detokenizer:
-            task.output_str = self.tokenizer.decode(task.output_tokens)
-        # TODO: handle status
-        status = TaskStatus()
-        return status
+        task.output_str = result.outputs[0].text
+
+        # TODO: error handle
+        return TaskStatus.SUCCESS
 
     def shutdown(self):
-        if self.executor:
-            self.executor.shutdown()
-            self.executor = None
+        if self.own_llm:
+            self.llm.shutdown()
+
+    task_handlers = {GenerationTask: generation_handler}
