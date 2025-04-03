@@ -165,7 +165,7 @@ def trtllm_fused_moe(
         tp_rank=0,
         ep_size=1,
         ep_rank=0,
-    )
+    )[0]
 
 
 @trtllm_fused_moe.register_fake
