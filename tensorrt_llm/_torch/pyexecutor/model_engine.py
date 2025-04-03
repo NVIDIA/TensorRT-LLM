@@ -11,7 +11,7 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, release_gc
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -731,7 +731,8 @@ class PyTorchModelEngine(ModelEngine):
         if self.ub_buffers:
             for u in self.ub_buffers:
                 ub.ub_deallocate(u)
-        torch.cuda.empty_cache()
+        # Release model weights.
+        release_gc()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
                     max_num_tokens: int, moe_max_num_tokens: int, **kwargs):

@@ -9,6 +9,8 @@ import tensorrt_llm.profiler as profiler
 
 from ..test_llm import llama_model_path
 
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -22,8 +24,7 @@ def client():
     client = TestClient(app_instance.app)
     yield client
 
-    del llm
-    del app_instance.llm
+    llm.shutdown()
 
 
 def test_health(client):

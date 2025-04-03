@@ -29,6 +29,7 @@ from pathlib import Path
 import defs.ci_profiler
 import psutil
 import pytest
+import tqdm
 import yaml
 
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -2091,6 +2092,11 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if test_prefix:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+
+def pytest_configure(config):
+    # avoid thread leak of tqdm's TMonitor
+    tqdm.tqdm.monitor_interval = 0
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):

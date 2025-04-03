@@ -63,7 +63,8 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
         assert llm.args.parallel_config.tp_size == tp_size
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     return tmpdir
 
@@ -141,6 +142,7 @@ def test_llm_generate_mixtral_for_tp2():
               kv_cache_config=global_kv_cache_config)
     for output in llm.generate(prompts):
         print(output)
+    llm.shutdown()
 
 
 @skip_gpu_memory_less_than(70 * 1024**3)
@@ -156,7 +158,8 @@ def test_llm_generate_mixtral_for_ep2():
         print(output)
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
         # read the build_config and check if the parameters are correctly saved
@@ -219,6 +222,8 @@ def test_llm_end2end_tp2(llm_additional_options):
     llm_check_output(llm,
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=8))
+
+    llm.shutdown()
 
 
 @pytest.mark.gpu4
@@ -331,6 +336,7 @@ def test_executor_results_cleanup():
 
     num_remaining_results = len(llm._executor._results)
     assert num_remaining_results == 0
+    llm.shutdown()
 
 
 class DummyExecutorMeta(type):
@@ -403,6 +409,7 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
                     print(output)
 
     asyncio.run(task())
+    llm.shutdown()
 
 
 class DummyExecutorProxy3(ExecutorBindingsProxy):

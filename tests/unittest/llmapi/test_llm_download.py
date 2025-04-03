@@ -15,12 +15,14 @@ def test_llm_with_model_downloaded():
     llm = LLM(model=model_name, enable_build_cache=True)
     for output in llm.generate(prompts):
         print(output)
+    llm.shutdown()
 
 
 def test_llm_with_tokenizer_downloaded():
     llm = LLM(model=llama_model_path, tokenizer=model_name)
     for output in llm.generate(prompts):
         print(output)
+    llm.shutdown()
 
 
 def test_download_config():

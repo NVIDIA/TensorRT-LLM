@@ -23,6 +23,7 @@ def test_llm_int4_awq_quantization():
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I"
+    llm.shutdown()
 
 
 @skip_pre_hopper
@@ -39,6 +40,7 @@ def test_llm_fp8_quantization():
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I"
+    llm.shutdown()
 
 
 @skip_pre_blackwell
@@ -55,6 +57,7 @@ def test_llm_nvfp4_quantization():
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == "D E F G H I"
+    llm.shutdown()
 
 
 @skip_pre_hopper
@@ -68,6 +71,7 @@ def test_llm_fp8_quantization_modelOpt_ckpt():
     for output in llm.generate(["A B C"], sampling_params=sampling_params):
         print(output)
         assert output.outputs[0].text == " D E F G H I"
+    llm.shutdown()
 
 
 if __name__ == "__main__":

@@ -119,6 +119,7 @@ def test_expected_kv_cache_events():
                 assert event[0]["data"]["type"] == "created"
             elif event[0]["event_id"] == 1:
                 assert event[0]["data"]["type"] == "stored"
+    llm.shutdown()
 
 
 @pytest.mark.skip("https://nvbugs/5150466: flaky fail")
@@ -147,6 +148,7 @@ def test_kv_cache_event_async_api():
             await asyncio.gather(task0(), task1())
 
     asyncio.run(main())
+    llm.shutdown()
 
 
 def test_llm_kv_events_api():
@@ -207,3 +209,5 @@ def test_llm_kv_events_api():
 
     # no more events after request is finished
     assert not llm.get_kv_cache_events(5)
+
+    llm.shutdown()

@@ -33,8 +33,7 @@ def client():
     client = TestClient(app_instance.app)
     yield client
 
-    del llm
-    del app_instance.llm
+    llm.shutdown()
 
 
 def test_health(client):
