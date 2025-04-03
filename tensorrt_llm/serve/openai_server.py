@@ -5,8 +5,7 @@ import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
-                    TypedDict)
+from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple, TypedDict
 
 import uvicorn
 from fastapi import FastAPI
@@ -189,6 +188,8 @@ class OpenAIServer:
             )
             sampling_params = request.to_sampling_params()
             postproc_args = ChatPostprocArgs.from_request(request)
+            postproc_args.tools = request.tools
+            postproc_args.tool_choice = request.tool_choice
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
@@ -197,7 +198,6 @@ class OpenAIServer:
                 if request.stream else chat_response_post_processor,
                 postproc_args=postproc_args,
             )
-
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
