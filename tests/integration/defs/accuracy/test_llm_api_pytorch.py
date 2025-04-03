@@ -126,7 +126,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
@@ -158,14 +158,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler):
-        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
-            pytest.skip(
-                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
-            )
-        if pp_size > 2 and cuda_graph and overlap_scheduler:
-            pytest.skip(
-                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
-            )
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         pytorch_config = PyTorchConfig(
@@ -231,17 +223,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
-        if (pp_size == 4 and mtp_nextn is None and not overlap_scheduler
-                and cuda_graph and not attention_dp):
-            pytest.skip("https://nvbugspro.nvidia.com/bug/5189673")
-        if pp_size > 1 and mtp_nextn is not None and mtp_nextn > 0:
-            pytest.skip(
-                "PP + MTP is not supported: https://nvbugspro.nvidia.com/bug/5170160"
-            )
-        if pp_size > 2 and cuda_graph and overlap_scheduler:
-            pytest.skip(
-                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
-            )
         # OOM on H100 with default free_gpu_memory_fraction=0.9
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = PyTorchConfig(
@@ -295,10 +276,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2"])
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler):
-        if pp_size > 2 and cuda_graph and overlap_scheduler:
-            pytest.skip(
-                "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
-            )
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
