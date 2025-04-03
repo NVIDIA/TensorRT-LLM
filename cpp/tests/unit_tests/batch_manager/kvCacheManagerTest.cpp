@@ -3683,8 +3683,8 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                 {
                     // This test calculates neededBlocksOneStep for the entire step (which may exceed maxAttentionWindow), 
                     // but adds tokens only up to maxAttentionWindow.
-                    // In this case, we can expect at most 1 block difference.
-                    EXPECT_LE(std::abs(numUsedBlocksThisStep - neededBlocksOneStep), 1);
+                    // In this case, numUsedBlocksThisStep may be smaller than neededBlocksOneStep by 1 block.
+                    ASSERT_THAT(numUsedBlocksThisStep, testing::AnyOf(testing::Eq(neededBlocksOneStep), testing::Eq(neededBlocksOneStep - 1)));
                 }
             }
 
