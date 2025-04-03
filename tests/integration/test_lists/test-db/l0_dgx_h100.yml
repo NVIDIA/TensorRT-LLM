@@ -9,6 +9,9 @@ l0_dgx_h100:
       gpu:
       - '*h100*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/multi_gpu
@@ -26,12 +29,38 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_multi_gpu_simple[90]
   - test_cpp.py::test_multi_gpu_t5[90]
   - test_cpp.py::test_multi_gpu_llama_executor[90]
   - test_cpp.py::test_multi_gpu_trt_gpt_real_decoder[90]
   - test_cpp.py::test_multi_gpu_disagg[90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_tp2[disable_reduce_fusion-disable_fp8_context_fmha]
   - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_tp2[enable_reduce_fusion-enable_fp8_context_fmha]
@@ -71,10 +100,24 @@ l0_dgx_h100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/auto_deploy/integration/test_ad_build.py
   - unittest/_torch/auto_deploy/integration/test_lm_eval.py
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2]

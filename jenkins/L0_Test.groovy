@@ -112,6 +112,8 @@ def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
+@Field
+def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): null,
@@ -124,6 +126,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
+    (ONLY_PYTORCH_FILE_CHANGED): false,
 ]
 
 String getShortenedJobName(String path)
@@ -478,7 +481,7 @@ def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
         </failure></testcase></testsuite></testsuites>"""
 }
 
-def getMakoOpts(getMakoScript, makoArgs="") {
+def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
     def makoOpts = [:]
     def turtleOutput = ""
@@ -492,8 +495,9 @@ def getMakoOpts(getMakoScript, makoArgs="") {
         getMakoScript,
         "--device 0"].join(" ")
 
-    if (makoArgs != "") {
-        listMakoCmd = [listMakoCmd, "--mako-opt ${makoArgs}"].join(" ")
+    if (makoArgs) {
+        def makoOptArgs = makoArgs.collect { "--mako-opt " + it }
+        listMakoCmd += " " + makoOptArgs.join(" ")
     }
     // Add the withCredentials step to access gpu-chip-mapping file
     withCredentials([file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')]) {
@@ -557,13 +561,29 @@ def getMakoOpts(getMakoScript, makoArgs="") {
 }
 
 def renderTestDB(testContext, llmSrc, stageName) {
-    def makoOpts = ""
     def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
-    if (stageName.contains("Post-Merge")) {
-        makoOpts = getMakoOpts(scriptPath, "stage=post_merge")
+    def makoArgs = []
+    def isPostMerge = stageName.contains("Post-Merge")
+    makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
+    // Determine the backend type based on keywords in stageName
+    if (stageName.contains("-PyTorch-")) {
+        // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
+        // At this point, only tests with backend=pytorch or unspecified backend will be run
+        makoArgs += ["backend=pytorch"]
+    } else if (stageName.contains("-TensorRT-")) {
+        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
+        // At this point, only tests with backend=tensorrt or unspecified backend will be run
+        makoArgs += ["backend=tensorrt"]
+    } else if (stageName.contains("-CPP-")) {
+        // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
+        // At this point, only tests with backend=cpp or unspecified backend will be run
+        makoArgs += ["backend=cpp"]
     } else {
-        makoOpts = getMakoOpts(scriptPath)
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", or "-CPP-", do not add any backend
+        // At this point, all tests will be run
+        // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
+    def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
@@ -577,43 +597,11 @@ def renderTestDB(testContext, llmSrc, stageName) {
         "--test-names",
         "--output",
         testList,
-        "--match-exact",
+        "--match",
         "'${makoOpts}'"
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    if (stageName.contains("Post-Merge")){
-        // Using the "stage: post_merge" mako will contain pre-merge tests by default.
-        // But currently post-merge test stages only run post-merge tests for
-        // triaging failures efficiently. We need to remove pre-merge tests explicitly.
-        // This behavior may change in the future.
-        def jsonSlurper = new JsonSlurper()
-        def jsonMap = jsonSlurper.parseText(makoOpts)
-        if (jsonMap.containsKey('stage') && jsonMap.stage == 'post_merge') {
-            jsonMap.remove('stage')
-        }
-        def updatedMakoOptsJson = JsonOutput.toJson(jsonMap)
-        def defaultTestList = "${llmSrc}/default_test.txt"
-        def updatedTestDBQueryCmd = [
-            "trt-test-db",
-            "-d",
-            testDBPath,
-            "--context",
-            testContext,
-            "--test-names",
-            "--output",
-            defaultTestList,
-            "--match-exact",
-            "'${updatedMakoOptsJson}'"
-        ].join(" ")
-        sh(label: "Render default test list from test-db", script: updatedTestDBQueryCmd)
-        def linesToRemove = readFile(defaultTestList).readLines().collect { it.trim() }.toSet()
-        def updatedLines = readFile(testList).readLines().findAll { line ->
-            !linesToRemove.contains(line.trim())
-        }
-        def contentToWrite = updatedLines.join('\n')
-        sh "echo \"${contentToWrite}\" > ${testList}"
-    }
     sh(script: "cat ${testList}")
 
     return testList
@@ -1013,59 +1001,63 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
-        "DGX_H100-4_GPUs-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 4, 4],
-        "DGX_H100-4_GPUs-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 4, 4],
-        "DGX_H100-4_GPUs-3": ["dgx-h100-x4", "l0_dgx_h100", 3, 4, 4],
-        "DGX_H100-4_GPUs-4": ["dgx-h100-x4", "l0_dgx_h100", 4, 4, 4],
-        "A10-1": ["a10", "l0_a10", 1, 8],
-        "A10-2": ["a10", "l0_a10", 2, 8],
-        "A10-3": ["a10", "l0_a10", 3, 8],
-        "A10-4": ["a10", "l0_a10", 4, 8],
-        "A10-5": ["a10", "l0_a10", 5, 8],
-        "A10-6": ["a10", "l0_a10", 6, 8],
-        "A10-7": ["a10", "l0_a10", 7, 8],
-        "A10-8": ["a10", "l0_a10", 8, 8],
-        "A30-1": ["a30", "l0_a30", 1, 8],
-        "A30-2": ["a30", "l0_a30", 2, 8],
-        "A30-3": ["a30", "l0_a30", 3, 8],
-        "A30-4": ["a30", "l0_a30", 4, 8],
-        "A30-5": ["a30", "l0_a30", 5, 8],
-        "A30-6": ["a30", "l0_a30", 6, 8],
-        "A30-7": ["a30", "l0_a30", 7, 8],
-        "A30-8": ["a30", "l0_a30", 8, 8],
-        "A100X-1": ["a100x", "l0_a100", 1, 4],
-        "A100X-2": ["a100x", "l0_a100", 2, 4],
-        "A100X-3": ["a100x", "l0_a100", 3, 4],
-        "A100X-4": ["a100x", "l0_a100", 4, 4],
-        "L40S-1": ["l40s", "l0_l40s", 1, 4],
-        "L40S-2": ["l40s", "l0_l40s", 2, 4],
-        "L40S-3": ["l40s", "l0_l40s", 3, 4],
-        "L40S-4": ["l40s", "l0_l40s", 4, 4],
-        "H100_PCIe-1": ["h100-cr", "l0_h100", 1, 7],
-        "H100_PCIe-2": ["h100-cr", "l0_h100", 2, 7],
-        "H100_PCIe-3": ["h100-cr", "l0_h100", 3, 7],
-        "H100_PCIe-4": ["h100-cr", "l0_h100", 4, 7],
-        "H100_PCIe-5": ["h100-cr", "l0_h100", 5, 7],
-        "H100_PCIe-6": ["h100-cr", "l0_h100", 6, 7],
-        "H100_PCIe-7": ["h100-cr", "l0_h100", 7, 7],
-        "B200_PCIe-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-2": ["b100-ts2", "l0_b200", 2, 2],
+        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
+        "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
+        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 6],
+        "A10-TensorRT-2": ["a10", "l0_a10", 2, 6],
+        "A10-TensorRT-3": ["a10", "l0_a10", 3, 6],
+        "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
+        "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
+        "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
+        "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
+        "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 2],
+        "A30-CPP-2": ["a30", "l0_a30", 2, 2],
+        "A30-TensorRT-1": ["a30", "l0_a30", 1, 4],
+        "A30-TensorRT-2": ["a30", "l0_a30", 2, 4],
+        "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
+        "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
+        "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
+        "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
+        "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
+        "A100X-TensorRT-4": ["a100x", "l0_a100", 4, 4],
+        "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
+        "L40S-TensorRT-1": ["l40s", "l0_l40s", 1, 3],
+        "L40S-TensorRT-2": ["l40s", "l0_l40s", 2, 3],
+        "L40S-TensorRT-3": ["l40s", "l0_l40s", 3, 3],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 5],
+        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 5],
+        "H100_PCIe-TensorRT-3": ["h100-cr", "l0_h100", 3, 5],
+        "H100_PCIe-TensorRT-4": ["h100-cr", "l0_h100", 4, 5],
+        "H100_PCIe-TensorRT-5": ["h100-cr", "l0_h100", 5, 5],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
-        "A10-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
-        "A30-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
-        "A30-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
-        "A100X-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
-        "L40S-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
-        "L40S-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 3],
-        "H100_PCIe-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 3],
-        "H100_PCIe-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 3],
-        "DGX_H100-4_GPUs-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "A100_80GB_PCIE-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
-        "H100_PCIe-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
+        "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
+        "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
+        "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
+        "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
+        "DGX_H100-4_GPUs-PyTorch-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
+        "H100_PCIe-TensorRT-Perf": ["h100-cr", "l0_perf", 1, 1],
     ]
 
     parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1119,7 +1111,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     sanityCheckConfigs = [
-        "pytorch": [
+        "DLFW": [
             LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
@@ -1151,7 +1143,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = [
-            "pytorch": [
+            "DLFW": [
                 LLM_DOCKER_IMAGE,
                 "GH200",
                 AARCH64_TRIPLE,
@@ -1163,7 +1155,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         ]
     }
 
-    fullSet += [toStageName("GH200", "pytorch")]
+    fullSet += [toStageName("GH200", "DLFW")]
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -1316,6 +1308,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     if (testFilter[(GPU_TYPE_LIST)] != null) {
         echo "Use GPU_TYPE_LIST for filtering."
         parallelJobsFiltered = parallelJobsFiltered.findAll {it.key.tokenize('-')[0] in testFilter[(GPU_TYPE_LIST)]}
+        println parallelJobsFiltered.keySet()
+    }
+
+    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
+        echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
+        parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
         println parallelJobsFiltered.keySet()
     }
 
