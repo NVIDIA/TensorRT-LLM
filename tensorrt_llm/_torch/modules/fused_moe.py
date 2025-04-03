@@ -256,7 +256,7 @@ class FusedMoE(nn.Module):
         # around 16k tokens per expert, which is well into the compute bound domain.
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
-            16384 * num_experts / routing_method.get_experts_per_token(),
+            16384 * num_experts // routing_method.get_experts_per_token(),
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
