@@ -139,6 +139,7 @@ class PyExecutor:
                  enable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
+                 max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None):
         super(PyExecutor, self).__init__()
@@ -166,6 +167,7 @@ class PyExecutor:
         self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.num_fetch_requests_cur_rank = 0
@@ -1184,6 +1186,8 @@ class PyExecutor:
             request_ids=list(range(num_dummy_request)),
             is_gen=not self.has_context_request,
             prepare_resource=not self.has_context_request,
+            max_num_draft_tokens=0
+            if self.has_context_request else self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
             llm_request.is_dummy = True
