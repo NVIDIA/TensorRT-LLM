@@ -55,12 +55,13 @@ CubinObj CompileEngine::compile() const
     tllmXqaJitProgram program;
     bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
-    bool const applyRoPEInXqaKernel = useQGMMAKernel
+    bool const applyRoPEInXqaKernel = !mXqaParams.multi_query_tokens && useQGMMAKernel
         && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
                                               PositionEmbeddingType::kROPE_GPTJ},
             mXqaParams.position_embedding_type);
-    if (useQGMMAKernel)
+    if (applyRoPEInXqaKernel)
     {
+        TLLM_CHECK(useQGMMAKernel);
         switch (mXqaParams.position_embedding_type)
         {
         case PositionEmbeddingType::kROPE_GPTJ: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_GPTJ; break;
@@ -92,6 +93,7 @@ CubinObj CompileEngine::compile() const
         /*beam_width=*/static_cast<uint32_t>(mXqaParams.beam_width),
         /*tokens_per_block=*/static_cast<uint32_t>(mXqaParams.tokens_per_block),
         /*multi_query_tokens=*/mXqaParams.multi_query_tokens,
+        /*q_seq_len=*/static_cast<uint32_t>(mXqaParams.generation_input_length),
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
