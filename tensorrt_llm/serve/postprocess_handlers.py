@@ -23,7 +23,7 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaMessage,
                               FunctionCall, StreamOptions, ToolCall, UsageInfo)
-from .function_calling_utils import detect_and_parse_function_calls, validate_function_arguments, FUNCTION_CALL_PATTERN
+from .function_calling_utils import detect_and_parse_function_calls, FUNCTION_CALL_PATTERN
 
 # yapf: enale
 
