@@ -42,32 +42,59 @@ def get_test_config(test_desc, example_dir, test_root):
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
         "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
+        "gen_only": (2, f"{example_dir}/disagg_config_gen_only.yaml"),
+        "4_ranks": (4, f"{example_dir}/disagg_config_ctxtp2_gentp1.yaml"),
         "cuda_graph":
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
-        "deepseek_v3_lite_fp_8_overlap_dp":
-        (4, f"{test_configs_root}/disagg_config_overlap_dp.yaml"),
-        "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "deepseek_v3_lite_fp8":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml"
          ),
+        "deepseek_v3_lite_fp8_tp1":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml"
+         ),
+        "deepseek_v3_lite_fp8_tp1_mtp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_mtp.yaml"
+         ),
+        "deepseek_v3_lite_fp8_ucx":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_ucx.yaml"
+         ),
+        "deepseek_v3_lite_fp_8_overlap_dp":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_dp.yaml"
+         ),
         "deepseek_v3_lite_fp8_attention_dp":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml"
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp.yaml"
+         ),
+        "deepseek_v3_lite_fp_8_attention_dp_overlap":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_overlap.yaml"
+         ),
+        "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml"
+         ),
+        "deepseek_v3_lite_fp8_overlap_cuda_graph":
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_cuda_graph.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp_one":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one.yaml"
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_one.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp_one_mtp":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one_mtp.yaml"
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_one_mtp.yaml"
          ),
         "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp":
         (4,
-         f"{test_root}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_tp1_attention_dp_overlap_one_mtp.yaml"
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_tp1_attention_dp_overlap_one_mtp.yaml"
          ),
     }
 
@@ -92,9 +119,9 @@ def run_disaggregated_test(example_dir,
 
     # Start workers
     workers_cmd = [
-        'mpirun', '--allow-run-as-root', '-n',
-        str(num_ranks), 'python3',
-        f'{example_dir}/launch_disaggregated_workers.py', '-c', config_file
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
     ]
     with open('output_workers', 'w') as f:
         workers_proc = subprocess.Popen(workers_cmd,
@@ -106,8 +133,7 @@ def run_disaggregated_test(example_dir,
     server_start_timeout = 900
     # Start server
     server_cmd = [
-        'python3', f'{example_dir}/launch_disaggregated_server.py',
-        '--server_start_timeout',
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
     with open('output_disagg', 'w') as f:
@@ -133,18 +159,39 @@ def run_disaggregated_test(example_dir,
         ]
         subprocess.run(streaming_client_cmd, check=True, env=env)
 
+        # Run the chat completion endpoint test only for TinyLlama
+        if test_desc == "overlap":
+            chat_client_cmd = client_cmd + [
+                '-e', 'chat', '-o', 'output_chat.json'
+            ]
+            subprocess.run(chat_client_cmd, check=True, env=env)
+
+            streaming_chat_client_cmd = chat_client_cmd + [
+                '--streaming', '-o', 'output_streaming_chat.json'
+            ]
+            subprocess.run(streaming_chat_client_cmd, check=True, env=env)
+
         # Verify outputs
         expected_strings = [
             "The capital of Germany is Berlin", "Asyncio is a Python library"
         ]
-        if "deepseek_v3_lite" in test_desc:
-            expected_strings = ["Berlin", "Asyncio is a powerful tool"]
 
-        for output_file in ['output.json', 'output_streaming.json']:
+        if "deepseek_v3_lite" in test_desc:
+            expected_strings = ["Berlin", "Asyncio is a"]
+        not_expected_strings = ["Berlin Berlin"]
+
+        output_files = ['output.json', 'output_streaming.json']
+        if test_desc == "overlap":
+            output_files.extend(
+                ['output_chat.json', 'output_streaming_chat.json'])
+
+        for output_file in output_files:
             with open(output_file, 'r') as f:
                 content = f.read()
                 for expected_string in expected_strings:
                     assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                for not_expected_string in not_expected_strings:
+                    assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
     # Print outputs
     print("------------------")
@@ -196,11 +243,10 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} gen_only"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "gen_only",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(2)
@@ -315,11 +361,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -336,11 +381,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1_mtp"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_tp1_mtp",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -422,11 +466,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp_8_attention_dp_overlap"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -444,11 +487,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -466,11 +509,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_overlap_cuda_graph"
-    check_call(cmd,
-               shell=True,
-               env=llm_venv._new_env,
-               cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_overlap_cuda_graph",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -530,7 +572,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())
