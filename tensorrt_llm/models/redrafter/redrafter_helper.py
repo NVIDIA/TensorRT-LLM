@@ -465,7 +465,7 @@ def _beam_search_candidates(prompt_state: Tensor, init_token: Tensor,
                               num_beams)  # [bs, nb, H]
 
         cur_logits_token_in_beam = unsqueeze(
-            _gather_beams(logits_new_token, gather_indices, batch_size,
+            _gather_beams(log_p_new_token, gather_indices, batch_size,
                           num_beams), 2)  # [bs, nb, 1, V]
         if logits_token_in_beam is None:  # first iteration
             logits_token_in_beam = cur_logits_token_in_beam
