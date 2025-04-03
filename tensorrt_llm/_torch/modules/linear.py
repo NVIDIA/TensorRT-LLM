@@ -13,12 +13,9 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 
 from ...models.modeling_utils import QuantConfig
 from ..distributed import ParallelConfig, TensorParallelMode
-from ..utils import (Fp4QuantizedTensor, get_power_of_2_num_tokens_buckets,
-                     next_positive_power_of_2)
+from ..utils import Fp4QuantizedTensor
 
 E2M1_MAX = 6.0
-
-from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 
 
 class WeightMode(str, enum.Enum):
@@ -128,103 +125,6 @@ def load_weight_scales_nvfp4(weights: List[Dict],
     input_scale = 1.0 / input_scale
 
     return input_scale, weight_scale, alpha
-
-
-class NVFP4GemmRunner(TunableRunner):
-    _runner_dict = dict()
-
-    def __init__(
-        self,
-        sf_use_ue8m0: bool,
-        output_dtype: torch.dtype,
-    ):
-        self.sf_use_ue8m0 = sf_use_ue8m0
-        self.output_dtype = output_dtype
-        if output_dtype not in NVFP4GemmRunner._runner_dict:
-            NVFP4GemmRunner._runner_dict[
-                output_dtype] = torch.classes.trtllm.FP4GemmRunner(output_dtype)
-        self._nvfp4_gemm_runner = NVFP4GemmRunner._runner_dict[output_dtype]
-
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-    ) -> List[int]:
-        return list(range(self._nvfp4_gemm_runner.get_num_configs()))
-
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: int = -1,
-        do_preparation: bool = False,
-    ) -> torch.Tensor:
-        mat1, mat2, mat1_scale, mat2_scale, global_scale = inputs
-        return self._nvfp4_gemm_runner.run_gemm(
-            mat1,
-            mat2,
-            mat1_scale,
-            mat2_scale,
-            global_scale,
-            self.sf_use_ue8m0,
-            tactic,
-        )
-
-
-def fp4_scale_dims(input_shapes: List[torch.Tensor], sf_vec_size: int = 16):
-    """Calculate the dimensions of the fp4 scale tensor.
-
-    The shape of act_fp4 determines the dimensions of the fp4 scale tensor. And due to the first dimension of act_fp4 is dynamic and will be tuned in Autotuner, we should always keep these associated dimensions aligned.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size)
-    return scale_shape * 2
-
-
-@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
-def nvfp4_gemm(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    sf_use_ue8m0: bool,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-
-    tuner = AutoTuner.get()
-
-    tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (get_power_of_2_num_tokens_buckets,
-                                 next_positive_power_of_2)), ),
-        constraints=((2, 0, fp4_scale_dims), ),
-    )
-
-    # allocate workspace for profiling
-    nvfp4_gemm_runner = NVFP4GemmRunner(sf_use_ue8m0, output_dtype)
-
-    _, best_tactic = tuner.choose_one(
-        "trtllm::nvfp4_gemm::gemm",
-        [nvfp4_gemm_runner],
-        tuning_config,
-        [act_fp4, weight, act_sf, weight_scale, alpha],
-    )
-
-    return nvfp4_gemm_runner(
-        inputs=[act_fp4, weight, act_sf, weight_scale, alpha],
-        tactic=best_tactic)
-
-
-@nvfp4_gemm.register_fake
-def _(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    sf_use_ue8m0: bool,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.new_empty((act_fp4.size(0), weight.size(0)),
-                           dtype=output_dtype)
 
 
 class Linear(nn.Module):
