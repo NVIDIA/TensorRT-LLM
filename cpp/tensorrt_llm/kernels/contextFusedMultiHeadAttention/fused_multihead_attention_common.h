@@ -202,6 +202,7 @@ struct MHARunnerFixedParams
         case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
             attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
             break;
+        // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used
         case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
             attentionMaskType = ContextAttentionMaskType::CAUSAL;
             break;

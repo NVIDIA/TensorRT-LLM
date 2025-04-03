@@ -238,8 +238,26 @@ struct TllmGenFmhaRunnerParams
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)
     {
-        TLLM_CHECK_WITH_INFO(maskType >= 0 && maskType <= 3, "Invalid mask type for TrtllmGenAttentionMaskType");
-        mMaskType = static_cast<TrtllmGenAttentionMaskType>(maskType);
+        // maskType is the enum of tensorrt_llm::kernels::ContextAttentionMaskType
+        // convert ContextAttentionMaskType to TrtllmGenAttentionMaskType
+        switch (maskType)
+        {
+        case 0: // tensorrt_llm::kernels::ContextAttentionMaskType::PADDING
+            mMaskType = TrtllmGenAttentionMaskType::Dense;
+            break;
+        case 1: // tensorrt_llm::kernels::ContextAttentionMaskType::CAUSAL
+            mMaskType = TrtllmGenAttentionMaskType::Causal;
+            break;
+        case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL
+            mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCausal;
+            break;
+        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+            mMaskType = TrtllmGenAttentionMaskType::Custom;
+            break;
+        default:
+            TLLM_THROW("ContextAttentionMaskType %d cannot be mapped to TrtllmGenAttentionMaskType",
+                static_cast<int>(maskType));
+        }
         return *this;
     }
 };
