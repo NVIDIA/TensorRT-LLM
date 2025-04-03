@@ -168,8 +168,9 @@ class NVSmallModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         config.num_key_value_heads = [
-            config.num_attention_heads // block.attention.n_heads_in_group
-            if block.attention.n_heads_in_group else 0
+            config.num_attention_heads //
+            block.attention.n_heads_in_group if block.attention.n_heads_in_group
+            else 0  # Set to 0 when block is configured to be a NO-OP
             for block in config.block_configs
         ]
 
