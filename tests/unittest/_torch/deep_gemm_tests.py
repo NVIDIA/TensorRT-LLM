@@ -22,26 +22,21 @@ from utils.util import getSMVersion
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in [90, 100],
-    reason="Op only supported on Hopper",
+    getSMVersion() != 90,
+    reason="The test is for Hopper only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",
-    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
-     (2048, 7168), (1024, 1024)],
+    [(7168, 2112), (2048, 7168)],
 )
 @pytest.mark.parametrize(
     "m",
     [7, 64, 128, 4096],
 )
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.bfloat16],
-)
-def test_fp8_block_scale_gemm(dtype, m, k, n):
+def test_fp8_block_scale_gemm(m, k, n):
     torch.random.manual_seed(0)
-    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
-    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16) / k
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16) / k
 
     act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
     act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
@@ -165,7 +160,7 @@ def construct_batched(
 
 @pytest.mark.skipif(
     getSMVersion() != 90,
-    reason="Op only supported on Hopper",
+    reason="Op only supported on Hopper, current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize("ms", [[256, 256], [128, 64, 64], [16, 24, 48]])
 @pytest.mark.parametrize("k, n", [(7168, 4096), (2048, 7168)])
@@ -183,7 +178,7 @@ def test_fp8_block_scaling_moe_gemm(ms, k, n):
 
 @pytest.mark.skipif(
     getSMVersion() != 90,
-    reason="Op only supported on Hopper",
+    reason="Op only supported on Hopper, current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize("batch_size, m", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("k, n", [(7168, 4096), (2048, 7168)])

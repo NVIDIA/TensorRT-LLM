@@ -65,7 +65,7 @@ public:
         , lib_(nullptr)
         , kernel_(nullptr)
     {
-        assert(!cubin.empty() || isPathValid(path_));
+        DG_HOST_ASSERT(!cubin.empty() || isPathValid(path_));
     }
 
     ~Runtime()
