@@ -43,6 +43,12 @@ static bool kJitUseNvcc = []()
     return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
 }();
 
+static bool kJitDumpCubin = []()
+{
+    char const* env_var = getenv("TRTLLM_DG_JIT_DUMP_CUBIN");
+    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+}();
+
 static std::string kKernelName = kJitUseNvcc ? "nvcc_kernel.cubin" : "nvrtc_kernel.cubin";
 
 /**
@@ -52,21 +58,50 @@ static std::string kKernelName = kJitUseNvcc ? "nvcc_kernel.cubin" : "nvrtc_kern
 class Runtime
 {
 public:
-    Runtime(std::string const& path, deep_gemm::GemmType gemm_type);
-    ~Runtime();
+    Runtime(std::string const& path, std::vector<char> const& cubin, deep_gemm::GemmType gemm_type)
+        : path_(path)
+        , cubin_(cubin)
+        , gemm_type_(gemm_type)
+        , lib_(nullptr)
+        , kernel_(nullptr)
+    {
+        assert(!cubin.empty() || isPathValid(path_));
+    }
 
-    static bool isPathValid(std::string const& path);
+    ~Runtime()
+    {
+        if (lib_ != nullptr)
+        {
+            CHECK_CUDA(cuLibraryUnload(lib_));
+        }
+    }
+
+    static bool isPathValid(std::string const& path)
+    {
+        // Check if path exists and is a directory
+        if (!std::filesystem::exists(path) || !std::filesystem::is_directory(path))
+        {
+            return false;
+        }
+
+        // Check if all necessary files exist
+        return std::filesystem::exists(std::filesystem::path(path) / kKernelName);
+    }
 
     CUkernel getKernel()
     {
         // Load shared object if not already loaded
         if (kernel_ == nullptr)
         {
-            std::filesystem::path cubinPath = std::filesystem::path(path_);
-            cubinPath /= kKernelName;
-            std::ifstream cubinFile(cubinPath.string(), std::ios::binary);
-            std::vector<char> cubin(std::istreambuf_iterator<char>(cubinFile), {});
-            CHECK_CUDA(cuLibraryLoadData(&lib_, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+            if (cubin_.empty())
+            {
+                std::filesystem::path cubinPath = std::filesystem::path(path_);
+                cubinPath /= kKernelName;
+                std::ifstream cubinFile(cubinPath.string(), std::ios::binary);
+                cubin_ = std::vector<char>(std::istreambuf_iterator<char>(cubinFile), {});
+            }
+
+            CHECK_CUDA(cuLibraryLoadData(&lib_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
 
             unsigned int numKernels = 0;
             CHECK_CUDA(cuLibraryGetKernelCount(&numKernels, lib_));
@@ -97,6 +132,7 @@ public:
 
 private:
     std::string path_;
+    std::vector<char> cubin_;
     CUlibrary lib_;
     CUkernel kernel_;
     deep_gemm::GemmType gemm_type_;
@@ -109,9 +145,57 @@ private:
 class RuntimeCache
 {
 public:
-    static RuntimeCache& getInstance();
-    Runtime* operator[](std::string const& path);
-    void set(std::string const& path, std::unique_ptr<Runtime> runtime);
+    static RuntimeCache& getInstance()
+    {
+        static RuntimeCache instance;
+        return instance;
+    }
+
+    Runtime* operator[](std::string const& path)
+    {
+        // Check if already in cache
+        auto it = cache_.find(path);
+        if (it != cache_.end())
+        {
+            return it->second.get();
+        }
+
+        // Check if already compiled
+        if (Runtime::isPathValid(path))
+        {
+            // Parse path to get gemm type
+            std::string gemm_type_str = path.substr(path.find_last_of('_') + 1);
+            deep_gemm::GemmType gemm_type;
+            if (gemm_type_str == "Normal")
+            {
+                gemm_type = deep_gemm::GemmType::Normal;
+            }
+            else if (gemm_type_str == "GroupedWithOffset")
+            {
+                gemm_type = deep_gemm::GemmType::GroupedWithOffset;
+            }
+            else if (gemm_type_str == "StridedBatched")
+            {
+                gemm_type = deep_gemm::GemmType::StridedBatched;
+            }
+            else
+            {
+                throw std::runtime_error("Unsupported gemm type: " + gemm_type_str);
+            }
+
+            auto runtime = std::make_unique<Runtime>(path, std::vector<char>(), gemm_type);
+            Runtime* result = runtime.get();
+            cache_[path] = std::move(runtime);
+            return result;
+        }
+
+        return nullptr;
+    }
+
+    void set(std::string const& path, std::unique_ptr<Runtime> runtime)
+    {
+        cache_[path] = std::move(runtime);
+    }
 
 private:
     // Private constructor for singleton pattern
@@ -125,96 +209,6 @@ private:
 };
 
 // Global function to access the singleton
-RuntimeCache& getGlobalRuntimeCache();
-
-} // namespace deep_gemm::jit
-
-namespace deep_gemm::jit
-{
-// Runtime implementation
-Runtime::Runtime(std::string const& path, deep_gemm::GemmType gemm_type)
-    : path_(path)
-    , gemm_type_(gemm_type)
-    , lib_(nullptr)
-    , kernel_(nullptr)
-{
-    assert(isPathValid(path_));
-}
-
-Runtime::~Runtime()
-{
-    if (lib_ != nullptr)
-    {
-        CHECK_CUDA(cuLibraryUnload(lib_));
-    }
-}
-
-bool Runtime::isPathValid(std::string const& path)
-{
-    // Check if path exists and is a directory
-    if (!std::filesystem::exists(path) || !std::filesystem::is_directory(path))
-    {
-        return false;
-    }
-
-    // Check if all necessary files exist
-    return std::filesystem::exists(std::filesystem::path(path) / kKernelName);
-}
-
-// RuntimeCache implementation
-RuntimeCache& RuntimeCache::getInstance()
-{
-    static RuntimeCache instance;
-    return instance;
-}
-
-Runtime* RuntimeCache::operator[](std::string const& path)
-{
-    // Check if already in cache
-    auto it = cache_.find(path);
-    if (it != cache_.end())
-    {
-        return it->second.get();
-    }
-
-    // Check if already compiled
-    if (Runtime::isPathValid(path))
-    {
-        // Parse path to get gemm type
-        std::string gemm_type_str = path.substr(path.find_last_of('_') + 1);
-        deep_gemm::GemmType gemm_type;
-        if (gemm_type_str == "Normal")
-        {
-            gemm_type = deep_gemm::GemmType::Normal;
-        }
-        else if (gemm_type_str == "GroupedWithOffset")
-        {
-            gemm_type = deep_gemm::GemmType::GroupedWithOffset;
-        }
-        else if (gemm_type_str == "StridedBatched")
-        {
-            gemm_type = deep_gemm::GemmType::StridedBatched;
-        }
-        else
-        {
-            throw std::runtime_error("Unsupported gemm type: " + gemm_type_str);
-        }
-
-        auto runtime = std::make_unique<Runtime>(path, gemm_type);
-        Runtime* result = runtime.get();
-        cache_[path] = std::move(runtime);
-        return result;
-    }
-
-    return nullptr;
-}
-
-void RuntimeCache::set(std::string const& path, std::unique_ptr<Runtime> runtime)
-{
-    cache_[path] = std::move(runtime);
-}
-
-// Global function to access the RuntimeCache singleton
 RuntimeCache& getGlobalRuntimeCache()
 {
     return RuntimeCache::getInstance();

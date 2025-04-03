@@ -175,7 +175,6 @@ def run_test_in_subprocess(env, test_file):
     },
     {
         'TRTLLM_DG_ENABLED': '1',
-        'TRTLLM_DG_JIT_USE_NVCC': '0'
     },
     {
         'TRTLLM_DG_ENABLED': '1',
