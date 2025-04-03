@@ -25,7 +25,7 @@ namespace tensorrt_llm::common
 {
 [[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
 {
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()));
+    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
 }
 
 } // namespace tensorrt_llm::common

@@ -18,13 +18,14 @@
 #pragma once
 #include "cutlass/gemm/gemm.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
-#include "tensorrt_llm/kernels/lora/lora.h"
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
+#include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
 #include <optional>
 #include <random>
@@ -220,6 +221,12 @@ struct QuantParams
         return QuantParams{{}, {}, {}, {}, {fc1_scales, fc2_scales}};
     }
 };
+
+// Change to following declarations must sync with lora.h in public repo
+class LoraImpl;
+
+int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
+    void const* const* loraWeightsPtr, int weightIndex, void* const* outputs, void* workspace, cudaStream_t stream);
 
 struct LoraParams
 {

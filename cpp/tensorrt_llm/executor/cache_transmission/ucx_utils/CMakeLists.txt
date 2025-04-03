@@ -16,23 +16,8 @@ if(ENABLE_UCX)
   set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
   target_compile_definitions(${UCX_WRAPPER_TARGET}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
-
-  target_include_directories(
-    ${UCX_WRAPPER_TARGET}
-    PRIVATE $<TARGET_PROPERTY:ucxx::ucxx,INTERFACE_INCLUDE_DIRECTORIES>)
-  # link_whole_archive
-  if(WIN32)
-    target_link_libraries(${UCX_WRAPPER_TARGET}
-                          PUBLIC $<TARGET_FILE:ucxx::ucxx>)
-    set_target_properties(${UCX_WRAPPER_TARGET}
-                          PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:ucxx::ucxx")
-  else()
-    # Assume everything else is like gcc
-    target_link_libraries(
-      ${UCX_WRAPPER_TARGET}
-      PRIVATE "-Wl,--whole-archive" $<TARGET_FILE:ucxx::ucxx>
-              "-Wl,--no-whole-archive")
-  endif()
+  target_link_libraries(${UCX_WRAPPER_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,ucxx::ucxx>)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucxx::ucxx ucx::ucs)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${CUDA_RT_LIB})
 endif()
