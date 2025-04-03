@@ -1471,7 +1471,7 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == AARCH64_TRIPLE // Skip this stage if running on ARM architecture
+                    env.targetArch != AARCH64_TRIPLE // Skip this stage if running on ARM architecture
                 }
             }
             steps
