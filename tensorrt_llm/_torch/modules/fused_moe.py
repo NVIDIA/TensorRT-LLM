@@ -9,7 +9,6 @@ from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                     get_power_of_2_num_tokens_buckets,
                      next_positive_power_of_2, reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
@@ -647,17 +646,6 @@ class FusedMoE(nn.Module):
                                          nbytes].view(dtype).view(*shape)
             outputs.append(output)
         return outputs
-
-    def _run_profiler(self, x, output_dtype, use_fp8_block_scaling,
-                      min_latency_mode):
-        profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-            x.dtype, self.w3_w1_weight.dtype, output_dtype,
-            use_fp8_block_scaling, min_latency_mode)
-        profiler.run_profile(
-            self.w2_weight, self.routing_method.experts_per_token, self.tp_size,
-            self.tp_rank, self.ep_size, self.ep_rank,
-            get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
-        return profiler
 
     def reducescatter_or_allreduce(self, inputs):
         outputs = inputs
