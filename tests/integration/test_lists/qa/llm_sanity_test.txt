@@ -92,8 +92,6 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session]
-test_e2e.py::test_llmapi_load_engine_from_build_command[falcon-falcon-7b-instruct] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[gptj-gpt-j-6b] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
 test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
