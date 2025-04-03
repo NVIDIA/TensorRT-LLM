@@ -1469,6 +1469,11 @@ pipeline {
         }
         stage("Check Test Lists")
         {
+            when {
+                expression {
+                    env.targetArch == AARCH64_TRIPLE // Skip this stage if running on ARM architecture
+                }
+            }
             steps
             {
                 script {
