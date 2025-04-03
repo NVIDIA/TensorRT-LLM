@@ -497,6 +497,7 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     auto inter_size_mul = {4.f};               // {7.f/2.f, 4.f};
     auto num_tokens = {2048};                  // {1, 20, 200, 2048};
     auto use_bias = {0};                       // {0, 1};
+    auto use_final_scale = {0, 1};             // {0, 1};
     auto activation_type = {tensorrt_llm::ActivationType::Gelu};
     // {tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Gelu,
     // tensorrt_llm::ActivationType::Silu, tensorrt_llm::ActivationType::Geglu,
@@ -513,12 +514,13 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
                         auto inter_size = static_cast<int>(size * inter_mul);
                         for (auto tokens : num_tokens)
                             for (auto bias : use_bias)
-                                for (auto act : activation_type)
-                                    for (auto tactic1 : cutlass_tactic)
-                                        for (auto tactic2 : cutlass_tactic)
-                                            for (auto routing : routing_config)
-                                                benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens, bias,
-                                                    (int) act, tactic1, tactic2, routing});
+                                for (auto final_scale : use_final_scale)
+                                    for (auto act : activation_type)
+                                        for (auto tactic1 : cutlass_tactic)
+                                            for (auto tactic2 : cutlass_tactic)
+                                                for (auto routing : routing_config)
+                                                    benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens,
+                                                        bias, final_scale, (int) act, tactic1, tactic2, routing});
                     }
 }
 
@@ -540,8 +542,9 @@ void argGen(benchmark::internal::Benchmark* benchmark)
 
     // Generic setup
     benchmark->UseManualTime();
-    benchmark->ArgNames({"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank",
-        "Num Tokens", "Use Bias", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
+    benchmark->ArgNames(
+        {"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank", "Num Tokens", "Use Bias",
+            "Use Final Scale", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
 
     if (workloadFile)
         argGenLoadFile<BenchClass>(benchmark);

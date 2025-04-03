@@ -193,8 +193,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
                 reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
                 hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
             {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
-                reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
-                hopper_inputs.default_epilogue.stride_d},
+                reinterpret_cast<ElementD**>(hopper_inputs.ptr_d), hopper_inputs.stride_d},
             hw_info};
         *workspace_size = gemm.get_workspace_size(args);
         return;
@@ -207,8 +206,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
             reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
             hopper_inputs.int4_groupwise_params.stride_s_a, int(inputs.groupwise_quant_group_size)},
         {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
-            reinterpret_cast<ElementD**>(hopper_inputs.default_epilogue.ptr_d),
-            hopper_inputs.default_epilogue.stride_d},
+            reinterpret_cast<ElementD**>(hopper_inputs.ptr_d), hopper_inputs.stride_d},
         hw_info};
 
     if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size)
