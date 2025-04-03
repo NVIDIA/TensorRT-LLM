@@ -139,6 +139,7 @@ class PyExecutor:
                  enable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
+                 max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None):
         super(PyExecutor, self).__init__()
@@ -166,6 +167,7 @@ class PyExecutor:
         self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.num_fetch_requests_cur_rank = 0
@@ -490,10 +492,7 @@ class PyExecutor:
             iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -516,11 +515,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     # TODO: add pause_requests together with inflight_req_ids and handle draft_tokens
@@ -585,10 +585,7 @@ class PyExecutor:
             iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -612,11 +609,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     self._add_inflight_ids(scheduled_batch)
@@ -720,10 +718,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -846,10 +841,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                if self.enable_attention_dp:
-                    new_requests = self._fetch_adp_new_requests()
-                else:
-                    new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
@@ -1015,18 +1007,7 @@ class PyExecutor:
 
         return new_tensors_host
 
-    @nvtx_range("_fetch_new_requests")
-    def _fetch_new_requests(self):
-        timeout = None if len(
-            self.active_requests) == 0 else datetime.timedelta(0)
-        new_requests = []
-        if self.dist.rank == 0:
-            new_requests = _get_from_request_queue(
-                self.request_queue, timeout,
-                self.max_num_active_requests - len(self.active_requests))
-
-        new_requests = self._broadcast_new_requests(new_requests)
-
+    def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             now = time.time()
             for req in new_requests:
@@ -1035,8 +1016,6 @@ class PyExecutor:
                     if req_id in self.start_times:
                         self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                             req_id)
-
-        return new_requests
 
     @nvtx_range("_broadcast_new_requests")
     def _broadcast_new_requests(self, new_requests):
@@ -1087,10 +1066,15 @@ class PyExecutor:
 
         return new_requests
 
-    @nvtx_range("_fetch_adp_new_requests")
-    def _fetch_adp_new_requests(self):
-        total_num_active_requests = sum(self.all_ranks_num_active_requests)
-        total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+    @nvtx_range("_fetch_new_requests")
+    def _fetch_new_requests(self):
+        if self.enable_attention_dp:
+            total_num_active_requests = sum(self.all_ranks_num_active_requests)
+            total_max_num_active_requests = self.dist.tp_size * self.max_num_active_requests
+        else:
+            total_num_active_requests = len(self.active_requests)
+            total_max_num_active_requests = self.max_num_active_requests
+
         timeout = None if total_num_active_requests == 0 else datetime.timedelta(
             0)
         new_requests = []
@@ -1100,6 +1084,10 @@ class PyExecutor:
                 total_max_num_active_requests - total_num_active_requests)
 
         new_requests = self._broadcast_new_requests(new_requests)
+
+        if not self.enable_attention_dp:
+            self._update_new_active_requests_queue_latency(new_requests)
+            return new_requests
 
         num_new_requests_all_ranks = len(new_requests)
         self.expected_num_active_requests = max(
@@ -1149,12 +1137,8 @@ class PyExecutor:
                 elif val.rank == self.dist.tp_rank:
                     break
             self.has_context_request = len(new_requests_cur_rank) > 0
-            now = time.time()
-            if self.enable_iter_perf_stats and self.dist.rank == 0:
-                for request in new_requests_cur_rank:
-                    self.new_active_requests_queue_latency_ms += now - self.start_times[
-                        request[0]]
-                    self.start_times.pop(request[0])
+            self._update_new_active_requests_queue_latency(
+                new_requests_cur_rank)
 
         self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
@@ -1202,6 +1186,8 @@ class PyExecutor:
             request_ids=list(range(num_dummy_request)),
             is_gen=not self.has_context_request,
             prepare_resource=not self.has_context_request,
+            max_num_draft_tokens=0
+            if self.has_context_request else self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
             llm_request.is_dummy = True
@@ -1763,6 +1749,7 @@ class PyExecutor:
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
                 request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
             else:
@@ -1814,6 +1801,7 @@ class PyExecutor:
                 continue
 
             request.draft_tokens = request.py_draft_tokens
+            request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
 

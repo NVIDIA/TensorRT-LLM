@@ -259,6 +259,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+            request.py_decoding_iter += 1
             idx += 1
 
         if hasattr(scheduled_requests, 'chunked_requests'):
@@ -282,6 +283,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+                request.py_decoding_iter += 1
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
@@ -308,6 +310,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+                request.py_decoding_iter += 1
             idx += 1
 
     def _mixed_decode(self, scheduled_requests: ScheduledRequests,
@@ -379,11 +382,14 @@ class TorchStarAttentionDecoder(TorchDecoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+            request.py_decoding_iter += 1
 
         for request in scheduled_requests.generation_requests:
             new_token = new_tokens_list[request.output_token_idx]
             num_tokens = request.add_new_token(new_token, beam_idx)
             self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                request.py_decoding_iter += 1
 
 
 class Algorithms():
@@ -589,6 +595,10 @@ class TRTLLMDecoder(Decoder):
             request.update_num_tokens_per_iteration(
                 request.max_beam_num_tokens - current_num_of_tokens,
                 self.model_config)
+
+            # Increment the decoding iteration counter
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                request.py_decoding_iter += 1
 
             if finished_sum_host[seq_slot] == self.beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE

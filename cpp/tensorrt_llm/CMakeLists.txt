@@ -380,6 +380,7 @@ set(TRTLLM_LINK_LIBS
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
+    fp8_blockscale_gemm_src
     ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
@@ -429,6 +430,7 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
+link_whole_archive(${SHARED_TARGET} fp8_blockscale_gemm_src)
 link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
