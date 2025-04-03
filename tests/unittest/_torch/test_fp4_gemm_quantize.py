@@ -30,10 +30,11 @@ def e2m1_and_ufp8_scale_to_float_tensor_v2(
     global_scale_tensor: torch.Tensor,
     sf_vec_size,
     ufp8_type: int = 1,
+    is_sf_swizzled_layout: bool = True,
 ):
     float_tensor = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
         e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
-        ufp8_type)
+        ufp8_type, is_sf_swizzled_layout)
     return float_tensor
 
 
@@ -52,6 +53,7 @@ class TestFunctional(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @skip_pre_blackwell_unittest
+    # TODO: add GEMM test for linear SF layout when kernel is ready
     def test_fp4_quantize_gemm_torch(self, m, n, k):
         pytest.skip("https://nvbugs/5100633")
         a = torch.randn([m, k], dtype=torch.float32)
@@ -105,11 +107,43 @@ class TestFunctional(unittest.TestCase):
             # The gap is too large for ue8m0, so we just make sure that it runs
             self.assertTrue(torch.allclose(a_pt, a, atol=1, rtol=0))
 
-    @parameterized.expand(list([[64, 64, torch.float8_e4m3fn, False],
-                                [13, 16, torch.float8_e4m3fn, True]]),
+    @parameterized.expand(list([[2, 16, torch.half, False, True],
+                                [2, 16, torch.half, False, False],
+                                [128, 512, torch.half, True, False],
+                                [256, 128, torch.bfloat16, False, True],
+                                [128, 128, torch.bfloat16, False, False],
+                                [1024, 512, torch.bfloat16, True, False]]),
                           name_func=unittest_name_func)
     @skip_pre_blackwell_unittest
-    def test_fp4_quantize_torch_fp8(self, m, k, dtype, use_ue8m0):
+    def test_fp4_quantize_torch_different_sf_layot(self, m, k, dtype, use_ue8m0,
+                                                   is_sf_swizzled_layout):
+        a = torch.randn([m, k], dtype=torch.float32).to(dtype).float()
+        a_global_sf = (448 * 6) / a.abs().max().float()
+        sf_vec_size = 16
+
+        a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
+            a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0,
+            is_sf_swizzled_layout)
+
+        a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
+                                                      1 / a_global_sf,
+                                                      sf_vec_size, 1,
+                                                      is_sf_swizzled_layout)
+
+        torch.cuda.synchronize()
+        if not use_ue8m0:
+            # The gap is too large for ue8m0, so we just make sure that it runs
+            self.assertTrue(torch.allclose(a_pt, a, atol=1, rtol=0))
+
+    @parameterized.expand(list([[64, 64, torch.float8_e4m3fn, False, True],
+                                [13, 16, torch.float8_e4m3fn, True, True],
+                                [3, 48, torch.float8_e4m3fn, False, False],
+                                [1024, 1024, torch.float8_e4m3fn, True,
+                                 False]]),
+                          name_func=unittest_name_func)
+    @skip_pre_blackwell_unittest
+    def test_fp4_quantize_torch_fp8(self, m, k, dtype, use_ue8m0,
+                                    is_sf_swizzled_layout):
         assert dtype == torch.float8_e4m3fn
         a = torch.randn([m, k], dtype=torch.float32)
         amax = a.abs().max().float()
@@ -120,11 +154,13 @@ class TestFunctional(unittest.TestCase):
 
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a_fp8.cuda(),
                                                     a_global_sf.cuda(),
-                                                    sf_vec_size, use_ue8m0)
+                                                    sf_vec_size, use_ue8m0,
+                                                    is_sf_swizzled_layout)
 
         a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
                                                       1 / a_global_sf,
-                                                      sf_vec_size)
+                                                      sf_vec_size, 1,
+                                                      is_sf_swizzled_layout)
 
         torch.cuda.synchronize()
 

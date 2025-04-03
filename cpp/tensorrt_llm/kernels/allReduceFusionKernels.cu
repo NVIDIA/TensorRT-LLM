@@ -250,9 +250,9 @@ __device__ __forceinline__ void fused_op(
     if constexpr (QuantOut)
     {
         PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&norm_val);
-        auto sf_out
-            = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_id, access_id_in_token,
-                std::nullopt /* numRows */, params.hidden_dim, reinterpret_cast<uint32_t*>(params.scale_out));
+        auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_id,
+            access_id_in_token, std::nullopt /* numRows */, params.hidden_dim,
+            reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
         reinterpret_cast<uint32_t*>(params.quant_out)[access_id]
             = cvt_warp_fp16_to_fp4(pack_val, *params.scale_factor, sf_out);
     }

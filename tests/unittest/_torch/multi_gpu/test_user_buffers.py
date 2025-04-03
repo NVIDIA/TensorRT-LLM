@@ -644,12 +644,15 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
         q_internal, scale_ub, residual = ar.forward(hidden,
                                                     all_reduce_params=ar_params)
 
-        def e2m1_and_ufp8sf_scale_to_float_v2(e2m1_tensor, ufp8_scale_tensor,
-                                              global_scale_tensor, sf_vec_size,
-                                              ufp8_type):
+        def e2m1_and_ufp8sf_scale_to_float_v2(e2m1_tensor,
+                                              ufp8_scale_tensor,
+                                              global_scale_tensor,
+                                              sf_vec_size,
+                                              ufp8_type,
+                                              is_sf_swizzled_layout=True):
             return torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
                 e2m1_tensor, ufp8_scale_tensor, global_scale_tensor,
-                sf_vec_size, ufp8_type)
+                sf_vec_size, ufp8_type, is_sf_swizzled_layout)
 
         def quant_fp4(x, sf):
             return torch.ops.trtllm.fp4_quantize(x, sf, 16, False)
