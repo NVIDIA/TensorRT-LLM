@@ -12,8 +12,8 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
-from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import SamplingParams
+from ..llmapi import DisaggregatedParams as LlmDisaggregatedParams
+from ..llmapi import SamplingParams
 
 
 class OpenAIBaseModel(BaseModel):

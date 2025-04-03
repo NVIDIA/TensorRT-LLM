@@ -4,14 +4,13 @@ from typing import Optional
 import click
 from transformers import AutoTokenizer
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
-                                            DynamicBatchConfig, SchedulerConfig)
-from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
-from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.serve import OpenAIServer
+from .._torch.pyexecutor.config import PyTorchConfig
+from ..bindings.executor import (CapacitySchedulerPolicy, DynamicBatchConfig,
+                                 SchedulerConfig)
+from ..llmapi import LLM, BuildConfig, KvCacheConfig
+from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..logger import logger, severity_map
+from ..serve import OpenAIServer
 
 
 @click.command("trtllm-serve")
@@ -142,15 +141,9 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
         llm_args = update_llm_args_with_extra_options(llm_args,
                                                       extra_llm_api_options)
 
-    if backend == 'pytorch':
-        llm = PyTorchLLM(**llm_args)
-    else:
-        llm = LLM(**llm_args)
-
+    llm = LLM(**llm_args)
     hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
-
     server = OpenAIServer(llm=llm, model=model, hf_tokenizer=hf_tokenizer)
-
     asyncio.run(server(host, port))
 
 
