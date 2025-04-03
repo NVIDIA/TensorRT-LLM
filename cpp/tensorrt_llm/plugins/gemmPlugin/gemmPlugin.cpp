@@ -399,8 +399,8 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
             nvinfer1::DataType::kFP8, mOutputType);
         cudaKernelFinished = tensorrt_llm::kernels::cuda_core_gemm::cudaCoreGemmDispatcher(params, stream);
     }
-    else if (!isArch90or100 && ((mArch < 90 && M <= 6) || (isArch90or100 && M <= 2)) && N <= 128000 && !mUseFp8 && noPadDim
-        && cudaKernelSupportType)
+    else if (!isArch90or100 && ((mArch < 90 && M <= 6) || (isArch90or100 && M <= 2)) && N <= 128000 && !mUseFp8
+        && noPadDim && cudaKernelSupportType)
     {
         tensorrt_llm::common::QuantMode quantMode;
         tensorrt_llm::kernels::cuda_core_gemm::Params params(reinterpret_cast<void const*>(inputs[0]),
