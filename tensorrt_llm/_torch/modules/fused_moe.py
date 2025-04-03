@@ -632,10 +632,9 @@ class FusedMoE(nn.Module):
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if min_latency_mode:
-            assert (num_chunks == 1 and (
+            assert num_chunks == 1 and (
                 not self.reduce_results
             ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
-                    )
 
         if num_chunks == 1:
             outputs = self.forward_chunk(x, router_logits, min_latency_mode,
