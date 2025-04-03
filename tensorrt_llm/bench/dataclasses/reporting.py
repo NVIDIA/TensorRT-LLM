@@ -361,12 +361,22 @@ class ReportUtility:
                     }
             }
 
+        spec_decoding, decoding_mode = False, None
         if (self.rt_cfg.decoding_config
                 and self.rt_cfg.decoding_config.decoding_mode
                 != SpeculativeDecodingMode.NONE):
+            # cpp decoding
+            spec_decoding = True
+            decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
+        elif ("speculative_config" in self.kwargs
+              and self.kwargs["speculative_config"] is not None):
+            # pytorch speculative decoding
+            spec_decoding = True
+            decoding_mode = self.kwargs["speculative_config"].decoding_type
+        if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
-                self.rt_cfg.decoding_config.decoding_mode.values[1],
+                decoding_mode,
                 "acceptance_percentiles":
                 self.statistics.acceptance_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json')
