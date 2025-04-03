@@ -862,7 +862,7 @@ protected:
     auto getFilteredConfigs(int sm)
     {
         auto tactics = mMoERunner.getTactics();
-        if (sm == 89 || sm == 120 || sm == 121)
+        if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
             auto it = std::remove_if(tactics.begin(), tactics.end(),
