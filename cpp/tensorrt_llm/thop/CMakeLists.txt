@@ -65,6 +65,7 @@ add_library(
   relativeAttentionBiasOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
+  userbuffersTensor.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
