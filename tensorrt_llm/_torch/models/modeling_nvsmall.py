@@ -80,6 +80,7 @@ class NVSmallAttention(Attention):
             pos_embd_params=pos_embd_params,
             rotary_emb=NVSmallRotaryEmbedding(config, layer_idx=layer_idx),
             layer_idx=layer_idx,
+            dtype=config.torch_dtype,
             config=model_config)
 
 
