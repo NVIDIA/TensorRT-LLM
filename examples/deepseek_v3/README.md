@@ -76,7 +76,7 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py).
 ```bash
 cd examples/pytorch
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --mtp_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
