@@ -39,9 +39,9 @@ bool ub_is_initialized()
     return UserBufferAllocator::Instance().is_initialized();
 }
 
-void* ub_allocate(int idx, size_t bytes)
+UBBuffer ub_allocate(size_t bytes)
 {
-    return UserBufferAllocator::Instance().allocate(idx, bytes);
+    return UserBufferAllocator::Instance().allocate(bytes);
 }
 
 void ub_deallocate(void* addr)
@@ -128,9 +128,9 @@ bool ub_is_initialized()
     return false;
 }
 
-void* ub_allocate(int idx, size_t bytes)
+UBBuffer ub_allocate(size_t bytes)
 {
-    return nullptr;
+    return UBBuffer();
 }
 
 void ub_deallocate(void* addr) {}
