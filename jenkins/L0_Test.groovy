@@ -114,6 +114,8 @@ def EXTRA_STAGE_LIST = "extra_stage"
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+@Field
+def BACKEND_TYPE = "backend_type"
 
 def testFilter = [
     (REUSE_STAGE_LIST): null,
@@ -127,6 +129,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (BACKEND_TYPE): null,
 ]
 
 String getShortenedJobName(String path)
