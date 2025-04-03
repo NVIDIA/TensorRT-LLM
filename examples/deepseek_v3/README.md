@@ -207,7 +207,7 @@ To query the server, you can start with a `curl` command:
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-      "model": deepseek-ai/DeepSeek-V3,
+      "model": "deepseek-ai/DeepSeek-V3",
       "prompt": "Where is New York?",
       "max_tokens": 16,
       "temperature": 0
