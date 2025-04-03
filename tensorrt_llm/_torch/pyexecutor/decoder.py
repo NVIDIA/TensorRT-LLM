@@ -553,7 +553,7 @@ class TRTLLMDecoder(Decoder):
             self.store["decoder_buffers"].sequence_lengths, non_blocking=True)
 
         # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
-        #       Possibly this doesn't work until Robin's fixes are in.
+        #       It's still not understood why.
         # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
 
         new_tokens_device = {"new_tokens_device": new_tokens_device_tensor}
