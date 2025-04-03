@@ -1653,11 +1653,11 @@ class PyExecutor:
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
-            self._decode_async(draft_batch, outputs)
+            _, new_tensors_host, decoder_event = self._decode_async(draft_batch, outputs)
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(draft_batch, outputs)
+            self._update_requests(draft_batch, new_tensors_host, decoder_event)
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1698,9 +1698,9 @@ class PyExecutor:
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
-                self._decode_async(draft_batch, outputs)
+                _, new_tensors_host, decoder_event = self._decode_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(draft_batch, outputs)
+                self._update_requests(draft_batch, new_tensors_host, decoder_event)
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
