@@ -212,6 +212,6 @@ test_cpp.py::test_model[eagle-86]
 3. Invoke `pytest` with TRT-LLM custom option `--test-list`:
 
 ```shell
-cd integration/defs
+cd tests/integration/defs
 pytest . --test-list="a10_list.txt" --output-dir=/tmp/llm_integration_test
 ```
