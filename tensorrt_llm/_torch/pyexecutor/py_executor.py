@@ -1088,7 +1088,7 @@ class PyExecutor:
             # non-serializable objects (e.g., user-defined function references)
             # that cannot be transmitted via MPI.
             _ = self._broadcast_new_requests(new_requests)
-        else:    
+        else:
             new_requests = self._broadcast_new_requests(new_requests)
 
         if not self.enable_attention_dp:

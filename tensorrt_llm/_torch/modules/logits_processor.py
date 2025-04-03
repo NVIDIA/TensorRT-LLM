@@ -58,8 +58,6 @@ def _apply_logits_processors(
             for i, (req_id, batch_idx) in enumerate(
                     zip(seq_group.request_ids, seq_group.batch_indices)):
                 logits_row = logits[batch_idx]
-                # TODO: slice tokenids
-
                 logits[batch_idx] = \
                     _apply_logits_processors_single_seq(
                         logits_processors,
