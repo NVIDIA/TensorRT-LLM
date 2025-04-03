@@ -130,9 +130,9 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
 
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
