@@ -14,25 +14,8 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-
-
-class NVSmallRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
-        if config.rope_scaling is not None:
-            rope_type = config.rope_scaling.get("rope_type",
-                                                config.rope_scaling.get("type"))
-        else:
-            rope_type = "default"
-        super().__init__(config,
-                         head_dim=config.hidden_size //
-                         config.num_attention_heads,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         rope_type=rope_type)
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
@@ -64,21 +47,16 @@ class NVSmallAttention(Attention):
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads[layer_idx],
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=pos_embd_params,
-            rotary_emb=NVSmallRotaryEmbedding(config, layer_idx=layer_idx),
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
             layer_idx=layer_idx,
             config=model_config)
 

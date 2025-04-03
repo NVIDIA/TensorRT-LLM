@@ -263,6 +263,7 @@ public:
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kYARN
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
