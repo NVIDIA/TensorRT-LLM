@@ -1415,7 +1415,8 @@ static int kNumDeviceSMs = -1;
 static bool kDeepGemmEnabled = []() -> bool
 {
     char const* env_var = std::getenv("TRTLLM_DG_ENABLED");
-    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+    return deep_gemm::jit::getGlobalCompiler().isValid() && env_var
+        && (std::string(env_var) == "1" || std::string(env_var) == "true");
 }();
 
 void fp8_1x128_cs(

@@ -18,7 +18,42 @@ import sys
 
 import pytest
 import torch
+from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_block_scale_gemm(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8, act_b_fp8,
+                                                     act_a_sf, act_b_sf)
+
+    output_expected = a @ b.t()
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
 def deepSeekFp8ComputeGemmReference(mM, mN, mK, valsC, dqSfsC, valsA, dqSfsA,
@@ -169,6 +204,10 @@ def run_test_in_subprocess(env, test_file):
     return result.returncode
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 90,
+    reason="The test is for Hopper only. Current SM is %d." % getSMVersion(),
+)
 @pytest.mark.parametrize("env", [
     {
         'TRTLLM_DG_ENABLED': '0'

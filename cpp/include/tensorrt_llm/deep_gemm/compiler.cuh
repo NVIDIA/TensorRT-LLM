@@ -44,215 +44,205 @@
 namespace deep_gemm::jit
 {
 
-/**
- * C++ implementation of the Compiler class from compiler.py
- * Compiles CUDA kernels into shared libraries
- */
-class Compiler
+// Generate a unique ID for temporary directories to avoid collisions
+std::string generateUniqueId()
 {
-public:
-    // Get singleton instance
-    static Compiler& getInstance()
+    // Use current time and random number to generate a unique ID
+    static std::mt19937 gen(std::random_device{}());
+    static std::uniform_int_distribution<> distrib(0, 999999);
+
+    auto now = std::chrono::system_clock::now();
+    auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
+    auto value = now_ms.time_since_epoch().count();
+
+    // Use the static random generator
+    int random_value = distrib(gen);
+
+    return std::to_string(value) + "_" + std::to_string(random_value);
+}
+
+std::filesystem::path getDefaultUserDir()
+{
+    static std::filesystem::path userDir;
+    if (userDir.empty())
     {
-        static Compiler instance;
-        return instance;
-    }
-
-    // Generate a unique ID for temporary directories to avoid collisions
-    std::string generateUniqueId()
-    {
-        // Use current time and random number to generate a unique ID
-        static std::mt19937 gen(std::random_device{}());
-        static std::uniform_int_distribution<> distrib(0, 999999);
-
-        auto now = std::chrono::system_clock::now();
-        auto now_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now);
-        auto value = now_ms.time_since_epoch().count();
-
-        // Use the static random generator
-        int random_value = distrib(gen);
-
-        return std::to_string(value) + "_" + std::to_string(random_value);
-    }
-
-    std::filesystem::path getDefaultUserDir()
-    {
-        static std::filesystem::path userDir;
-        if (userDir.empty())
+        char const* cacheDir = getenv("TRTLLM_DG_CACHE_DIR");
+        if (cacheDir)
         {
-            char const* cacheDir = getenv("TRTLLM_DG_CACHE_DIR");
-            if (cacheDir)
-            {
-                userDir = cacheDir;
-                std::filesystem::create_directories(userDir);
-            }
-            else
-            {
-#ifdef _WIN32
-                char const* appData = getenv("APPDATA");
-                if (appData)
-                {
-                    userDir = std::filesystem::path(appData) / "tensorrt_llm";
-                }
-                else
-                {
-                    userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
-                }
-#else
-                char const* homeDir = getenv("HOME");
-                if (homeDir)
-                {
-                    userDir = std::filesystem::path(homeDir) / ".tensorrt_llm";
-                }
-                else
-                {
-                    userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
-                }
-#endif
-            }
+            userDir = cacheDir;
+            std::filesystem::create_directories(userDir);
         }
-        return userDir;
-    }
-
-    std::filesystem::path getTmpDir()
-    {
-        return getDefaultUserDir() / "tmp";
-    }
-
-    std::filesystem::path getCacheDir()
-    {
-        return getDefaultUserDir() / "cache";
-    }
-
-    std::string getNvccCompiler()
-    {
-        static std::string compiler;
-        if (compiler.empty())
+        else
         {
-            // Check environment variable
-            char const* envCompiler = getenv("TRTLLM_DG_NVCC_COMPILER");
-            if (envCompiler)
+#ifdef _WIN32
+            char const* appData = getenv("APPDATA");
+            if (appData)
             {
-                compiler = envCompiler;
+                userDir = std::filesystem::path(appData) / "tensorrt_llm";
             }
             else
             {
-                // Check CUDA_HOME
-                char const* cudaHome = getenv("CUDA_HOME");
-                if (cudaHome)
-                {
-                    std::filesystem::path cudaPath(cudaHome);
-#ifdef _WIN32
-                    compiler = (cudaPath / "bin" / "nvcc.exe").string();
+                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
+            }
 #else
-                    compiler = (cudaPath / "bin" / "nvcc").string();
+            char const* homeDir = getenv("HOME");
+            if (homeDir)
+            {
+                userDir = std::filesystem::path(homeDir) / ".tensorrt_llm";
+            }
+            else
+            {
+                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
+            }
 #endif
-                }
-                else
-                {
+        }
+    }
+    return userDir;
+}
+
+inline std::filesystem::path getTmpDir()
+{
+    return getDefaultUserDir() / "tmp";
+}
+
+inline std::filesystem::path getCacheDir()
+{
+    return getDefaultUserDir() / "cache";
+}
+
+std::string getNvccCompiler()
+{
+    static std::string compiler;
+    if (compiler.empty())
+    {
+        // Check environment variable
+        char const* envCompiler = getenv("TRTLLM_DG_NVCC_COMPILER");
+        if (envCompiler)
+        {
+            compiler = envCompiler;
+        }
+        else
+        {
+            // Check CUDA_HOME
+            char const* cudaHome = getenv("CUDA_HOME");
+            if (cudaHome)
+            {
+                std::filesystem::path cudaPath(cudaHome);
+#ifdef _WIN32
+                compiler = (cudaPath / "bin" / "nvcc.exe").string();
+#else
+                compiler = (cudaPath / "bin" / "nvcc").string();
+#endif
+            }
+            else
+            {
 // Default to system nvcc
 #ifdef _WIN32
-                    compiler = "nvcc.exe";
+                compiler = "nvcc.exe";
 #else
-                    compiler = "nvcc";
+                compiler = "nvcc";
 #endif
-                }
             }
         }
-        return compiler;
     }
+    return compiler;
+}
 
-    std::vector<std::filesystem::path> getJitIncludeDirs()
+std::vector<std::filesystem::path> getJitIncludeDirs()
+{
+    static std::vector<std::filesystem::path> includeDirs;
+    if (includeDirs.empty())
     {
-        static std::vector<std::filesystem::path> includeDirs;
-        if (includeDirs.empty())
-        {
-            // Command to execute
-            char const* cmd = "pip show tensorrt_llm 2>/dev/null";
+        // Command to execute
+        char const* cmd = "pip show tensorrt_llm 2>/dev/null";
 
-            // Buffer to store the output
-            std::array<char, 128> buffer;
-            std::string result;
+        // Buffer to store the output
+        std::array<char, 128> buffer;
+        std::string result;
 
 // Open pipe to command
 #ifdef _MSC_VER
-            FILE* pipe = _popen(cmd, "r");
+        FILE* pipe = _popen(cmd, "r");
 #else
-            FILE* pipe = popen(cmd, "r");
+        FILE* pipe = popen(cmd, "r");
 #endif
 
-            if (pipe)
+        if (pipe)
+        {
+            // Read the output
+            while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
             {
-                // Read the output
-                while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
-                {
-                    result += buffer.data();
-                }
+                result += buffer.data();
+            }
 
 // Close the pipe
 #ifdef _MSC_VER
-                _pclose(pipe);
+            _pclose(pipe);
 #else
-                pclose(pipe);
+            pclose(pipe);
 #endif
 
-                // Parse the location using regex
-                // `pip show tensorrt_llm` will output something like:
-                // Location: /usr/local/lib/python3.12/dist-packages
-                // Editable project location: /code
-                std::regex locationRegex("(Location|Editable project location): (.+)");
+            // Parse the location using regex
+            // `pip show tensorrt_llm` will output something like:
+            // Location: /usr/local/lib/python3.12/dist-packages
+            // Editable project location: /code
+            std::regex locationRegex("(Location|Editable project location): (.+)");
 
-                // Find all matches
-                auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
-                auto match_end = std::sregex_iterator();
+            // Find all matches
+            auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
+            auto match_end = std::sregex_iterator();
 
-                // Get the number of matches
-                auto match_count = std::distance(match_begin, match_end);
+            // Get the number of matches
+            auto match_count = std::distance(match_begin, match_end);
 
-                if (match_count > 0)
+            if (match_count > 0)
+            {
+                // Get the last match
+                auto last_match_iter = match_begin;
+                std::advance(last_match_iter, match_count - 1);
+
+                // Get the path from the second capture group
+                std::string location = last_match_iter->str(2);
+                location.erase(location.find_last_not_of(" \n\r\t") + 1);
+
+                // Set the include directory based on the package location
+                includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include");
+
+                if (!kJitUseNvcc)
                 {
-                    // Get the last match
-                    auto last_match_iter = match_begin;
-                    std::advance(last_match_iter, match_count - 1);
-
-                    // Get the path from the second capture group
-                    std::string location = last_match_iter->str(2);
-                    location.erase(location.find_last_not_of(" \n\r\t") + 1);
-
-                    // Set the include directory based on the package location
-                    includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include");
-
-                    if (!kJitUseNvcc)
-                    {
-                        includeDirs.push_back(
-                            std::filesystem::path(location) / "tensorrt_llm" / "include" / "cuda" / "include");
-                    }
+                    includeDirs.push_back(
+                        std::filesystem::path(location) / "tensorrt_llm" / "include" / "cuda" / "include");
                 }
             }
         }
-        return includeDirs;
+        else
+        {
+            TLLM_LOG_WARNING("Failed to find TensorRT-LLM installation, DeepGEMM will be disabled.");
+        }
+    }
+    return includeDirs;
+}
+
+std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
+    uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
+    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type)
+{
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+
+    std::string input_type;
+    switch (gemm_type)
+    {
+    case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedContiguous: input_type = "GroupedContiguousSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedMasked: input_type = "GroupedMaskedSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInput"; break;
+    case deep_gemm::GemmType::StridedBatched: input_type = "StridedBatchedSchedulerInput"; break;
+    default: throw std::runtime_error("Unsupported gemm type");
     }
 
-    std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
-        uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
-        uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type)
-    {
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-
-        std::string input_type;
-        switch (gemm_type)
-        {
-        case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInput"; break;
-        case deep_gemm::GemmType::GroupedContiguous: input_type = "GroupedContiguousSchedulerInput"; break;
-        case deep_gemm::GemmType::GroupedMasked: input_type = "GroupedMaskedSchedulerInput"; break;
-        case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInput"; break;
-        case deep_gemm::GemmType::StridedBatched: input_type = "StridedBatchedSchedulerInput"; break;
-        default: throw std::runtime_error("Unsupported gemm type");
-        }
-
-        // Create the kernel source code using raw string literal
-        std::string code = R"(
+    // Create the kernel source code using raw string literal
+    std::string code = R"(
 #ifdef __CUDACC_RTC__
 #ifndef NVRTC_JIT_COMPILATION
 #define NVRTC_JIT_COMPILATION
@@ -276,21 +266,40 @@ using namespace deep_gemm;
 
 using SchedulerType =
 typename SchedulerSelector<GemmType::)"
-            + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k)
-            + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n) + R"(, )" + std::to_string(block_k)
-            + R"(, )" + std::to_string(num_groups) + R"(, )" + std::to_string(num_tma_multicast) + R"(>::type;
+        + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k)
+        + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n) + R"(, )" + std::to_string(block_k)
+        + R"(, )" + std::to_string(num_groups) + R"(, )" + std::to_string(num_tma_multicast) + R"(>::type;
 
 __global__ void dummy_kernel() {
   void *ptr = (void *)&fp8_gemm_kernel<)"
-            + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )"
-            + std::to_string(block_n) + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups)
-            + R"(, )" + std::to_string(num_stages) + R"(, )" + std::to_string(kNumTMAThreads) + R"(, )"
-            + std::to_string(kNumMathThreadsPerGroup) + R"(, )" + std::to_string(num_tma_multicast)
-            + R"(, SchedulerType, )" + input_type + R"(>;
+        + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )"
+        + std::to_string(block_n) + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups) + R"(, )"
+        + std::to_string(num_stages) + R"(, )" + std::to_string(kNumTMAThreads) + R"(, )"
+        + std::to_string(kNumMathThreadsPerGroup) + R"(, )" + std::to_string(num_tma_multicast) + R"(, SchedulerType, )"
+        + input_type + R"(>;
 }
 )";
 
-        return code;
+    return code;
+}
+
+/**
+ * C++ implementation of the Compiler class
+ * Compiles CUDA code into CUBINs
+ */
+class Compiler
+{
+public:
+    // Get singleton instance
+    static Compiler& getInstance()
+    {
+        static Compiler instance;
+        return instance;
+    }
+
+    [[nodiscard]] bool isValid() const
+    {
+        return !includeDirs_.empty();
     }
 
     // Build function
@@ -347,8 +356,6 @@ __global__ void dummy_kernel() {
             flags.push_back("-default-device");
         }
 
-        std::vector<std::filesystem::path> includeDirs = getJitIncludeDirs();
-
         std::filesystem::path tmpPath = getTmpDir() / (name + "_" + generateUniqueId());
         std::filesystem::path cubinPath = path / kKernelName;
         std::filesystem::path tmpCubinPath = tmpPath / kKernelName;
@@ -360,7 +367,7 @@ __global__ void dummy_kernel() {
             std::filesystem::create_directories(path);
         }
 
-        for (auto const& dir : includeDirs)
+        for (auto const& dir : includeDirs_)
         {
             flags.push_back("-I" + dir.string());
         }
@@ -537,12 +544,18 @@ __global__ void dummy_kernel() {
     }
 
 private:
+    std::vector<std::filesystem::path> includeDirs_;
+
     // Private constructor for singleton pattern
     Compiler()
+        : includeDirs_(getJitIncludeDirs())
     {
         // Create necessary directories
-        std::filesystem::create_directories(getTmpDir());
-        std::filesystem::create_directories(getCacheDir());
+        if (kJitUseNvcc || kJitDumpCubin)
+        {
+            std::filesystem::create_directories(getTmpDir());
+            std::filesystem::create_directories(getCacheDir());
+        }
     }
 
     // Delete copy constructor and assignment operator
