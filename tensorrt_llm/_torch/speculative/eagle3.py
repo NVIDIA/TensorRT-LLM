@@ -21,7 +21,6 @@ class Eagle3Config(SpecConfig):
 
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
             self.spec_dec_name)
-        self.num_extra_kv_tokens = 0
 
     def update_from_model_config(self, model_config):
         self.num_layers = model_config.num_hidden_layers
