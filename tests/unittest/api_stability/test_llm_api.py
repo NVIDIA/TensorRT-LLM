@@ -20,6 +20,7 @@ class TestSamplingParams(ApiStabilityTestHarness):
     def test_get_sampling_config(self):
         expected_fields = {
             "beam_width",
+            "beam_width_array",
             "top_k",
             "top_p",
             "top_p_min",
