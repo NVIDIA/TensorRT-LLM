@@ -23,7 +23,6 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
-from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -227,7 +226,7 @@ def throughput_command(
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
-        kwargs["build_config"] = BuildConfig(max_seq_len=kwargs_max_sql, )
+        kwargs["max_seq_len"] = kwargs_max_sql
     else:
         assert max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")

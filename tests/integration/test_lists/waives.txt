@@ -341,7 +341,6 @@ full:B200/examples/test_llama.py::test_llm_llama_lookahead_xqa_fp8_1gpu[llama-3.
 full:B200/examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1] SKIP (No available XQA kernels are found for speculative decoding mode)
 full:B200/examples/accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized SKIP (No available XQA kernels are found for speculative decoding mode)
 full:B200/examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-nb:1] SKIP (Only Context FMHA supports custom mask input currently)
-full:B200/test_e2e.py::test_llmapi_load_engine_from_build_command[falcon-falcon-7b-instruct] SKIP (Not supported on B200)
 full:B200/examples/test_qwen.py::test_llm_qwen_smooth_quant_single_gpu_summary[qwen_7b_chat-enable_ptpc-nb:4] SKIP (Not supported on B200)
 full:B200/examples/test_gpt.py::test_llm_gpt2_starcoder_weight_only[starcoder2-int4-float16] SKIP (not support on B200)
 full:B200/examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora] SKIP (https://nvbugs/5064768)
@@ -444,3 +443,4 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-re
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization] SKIP (https://nvbugspro.nvidia.com/bug/5181262)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5166600)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)

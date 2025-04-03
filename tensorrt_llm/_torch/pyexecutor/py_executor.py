@@ -1749,6 +1749,7 @@ class PyExecutor:
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
                 request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
             else:
@@ -1800,6 +1801,7 @@ class PyExecutor:
                 continue
 
             request.draft_tokens = request.py_draft_tokens
+            request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
 
