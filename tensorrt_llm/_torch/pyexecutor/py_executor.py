@@ -515,11 +515,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     # TODO: add pause_requests together with inflight_req_ids and handle draft_tokens
@@ -608,11 +609,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     self._add_inflight_ids(scheduled_batch)

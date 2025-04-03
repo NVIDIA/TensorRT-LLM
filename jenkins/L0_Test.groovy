@@ -687,7 +687,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         def extraInternalEnv = ""
         // Move back to 3600 once TRTLLM-4000 gets resolved
-        def pytestTestTimeout = "7200"
+        def pytestTestTimeout = "5400"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
