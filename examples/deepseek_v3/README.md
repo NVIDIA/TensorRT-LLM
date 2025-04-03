@@ -214,6 +214,8 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
+For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
 ## Multi-node
 TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
 
