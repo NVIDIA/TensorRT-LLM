@@ -172,7 +172,7 @@ protected:
                 auto const& additionalOutputs = response.getResult().additionalOutputs;
                 ASSERT_EQ(additionalOutputs.size(), 1);
                 auto const& topKLogits = additionalOutputs.front();
-                auto const expectedOutputSize = (parameters.maxOutputLength - 1) * parameters.numTopKLogits;
+                auto const expectedOutputSize = parameters.maxOutputLength * parameters.numTopKLogits;
                 ASSERT_EQ(topKLogits.output.getSize(), expectedOutputSize);
                 auto const* topKLogitsData = reinterpret_cast<TLogits const*>(topKLogits.output.getData());
                 for (auto i = 0; i < parameters.numTopKLogits; i++)
@@ -234,7 +234,7 @@ protected:
                 auto const& additionalOutputs = response.getResult().additionalOutputs;
                 ASSERT_EQ(additionalOutputs.size(), 1);
                 auto const& topKLogits = additionalOutputs.front();
-                auto const expectedOutputSize = (parameters.maxOutputLength - 1) * parameters.numTopKLogits;
+                auto const expectedOutputSize = parameters.maxOutputLength * parameters.numTopKLogits;
                 ASSERT_EQ(topKLogits.output.getSize(), expectedOutputSize);
                 auto const* topKLogitsData = reinterpret_cast<TLogits const*>(topKLogits.output.getData());
                 for (auto i = 0; i < parameters.numTopKLogits; i++)
@@ -302,7 +302,7 @@ protected:
                 auto const contextTopKLogitsPtr = std::find_if(additionalOutputs.cbegin(), additionalOutputs.cend(),
                     [&expectedAdditionalOutputName](auto const& ao)
                     { return ao.name == expectedAdditionalOutputName; });
-                auto const expectedOutputSize = (parameters.promptLength) * parameters.numTopKLogits;
+                auto const expectedOutputSize = parameters.promptLength * parameters.numTopKLogits;
                 ASSERT_EQ(contextTopKLogitsPtr->output.getSize(), expectedOutputSize);
                 auto const* topKLogitsData = reinterpret_cast<TLogits const*>(contextTopKLogitsPtr->output.getData());
                 for (auto i = 0; i < parameters.numTopKLogits; i++)
@@ -369,7 +369,7 @@ protected:
                 auto const contextTopKLogitsPtr = std::find_if(additionalOutputs.cbegin(), additionalOutputs.cend(),
                     [&expectedAdditionalOutputName](auto const& ao)
                     { return ao.name == expectedAdditionalOutputName; });
-                auto const expectedOutputSize = (parameters.promptLength) * parameters.numTopKLogits;
+                auto const expectedOutputSize = parameters.promptLength * parameters.numTopKLogits;
                 ASSERT_EQ(contextTopKLogitsPtr->output.getSize(), expectedOutputSize);
                 auto const* topKLogitsData = reinterpret_cast<TLogits const*>(contextTopKLogitsPtr->output.getData());
                 for (auto i = 0; i < parameters.numTopKLogits; i++)
