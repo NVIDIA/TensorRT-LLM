@@ -47,15 +47,6 @@ public:
 };
 #endif
 
-#ifdef __CLION_IDE__
-__host__ __device__ __forceinline__ void host_device_printf(char const* format, ...)
-{
-    asm volatile("trap;");
-}
-
-#define printf host_device_printf
-#endif
-
 #ifndef DG_HOST_ASSERT
 #ifdef NVRTC_JIT_COMPILATION
 #define DG_HOST_ASSERT(cond) ((void) 0)

@@ -192,7 +192,7 @@ public:
         return nullptr;
     }
 
-    void set(std::string const& path, std::unique_ptr<Runtime> runtime)
+    void set(std::string const& path, std::unique_ptr<Runtime>&& runtime)
     {
         cache_[path] = std::move(runtime);
     }

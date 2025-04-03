@@ -77,7 +77,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
         __grid_constant__ const CUtensorMap tensor_map_a, __grid_constant__ const CUtensorMap tensor_map_b,
         __grid_constant__ const CUtensorMap tensor_map_scales_a, __grid_constant__ const CUtensorMap tensor_map_d)
 {
-#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 900)) or defined(__CLION_IDE__)
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 900))
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
