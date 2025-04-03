@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -60,7 +61,8 @@ class MTPConfig(SpecConfig):
 
     def update_from_model_config(self, model_config):
         assert self.num_nextn_predict_layers > 0
-        if model_config.num_nextn_predict_layers == 1:
+        force_vanilla = os.environ.get("TRTLLM_FORCE_MTP_VANILLA", "0") == "1"
+        if model_config.num_nextn_predict_layers == 1 and not force_vanilla:
             self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
             self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
 
@@ -1006,7 +1008,7 @@ class MTPWorker(nn.Module):
                 return_hidden_states_list.append(hidden_states_ctx)
             # generation
             if num_gens > 0:
-                slot_ids = spec_metadata.slot_ids[num_ctx_tokens:batch_size]
+                slot_ids = spec_metadata.slot_ids[num_contexts:batch_size]
                 gen_batch_idx = spec_metadata.batch_indices_cuda[:num_gens]
                 gen_token_idx = num_accepted_tokens[num_contexts:] - 1
                 accepted_tokens_gen = accepted_tokens[num_contexts:, :]
