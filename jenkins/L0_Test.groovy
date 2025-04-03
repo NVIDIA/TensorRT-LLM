@@ -622,11 +622,11 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure pattern),
     // fail the build immediately without attempting any reruns
-    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt" 
+    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         error "There are some failed tests that cannot be rerun, skip the rerun step"
     }
-    
+
     // Rerun tests
     for (times in [1, 2]) {
         rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"

@@ -4,8 +4,9 @@ import xml.etree.ElementTree as ET
 
 
 def parse_name(name, filename):
-    if name.startswith("test_unittests_v2[unittest/") and filename == "test_unittests.py":
-        return name[len("test_unittests_v2[") : -1]
+    if name.startswith("test_unittests_v2[unittest/") and \
+       filename == "test_unittests.py":
+        return name[len("test_unittests_v2["):-1]
     else:
         return filename + "::" + name
 
@@ -21,7 +22,7 @@ def generate_rerun_tests_list(outdir, xml_filename):
 
     # todo: change
     # failSignaturesList = trtllm_utils.getFailSignaturesList()
-    failSignaturesList = ["bad luck"]  
+    failSignaturesList = ["bad luck"]
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
@@ -35,18 +36,22 @@ def generate_rerun_tests_list(outdir, xml_filename):
          open(rerun_1_filename, 'w') as rerun_1_file, \
          open(rerun_2_filename, 'w') as rerun_2_file:
         for case in suite.findall('testcase'):
-            if case.find('failure') is not None or case.find('error') is not None:
+            if case.find('failure') is not None or \
+               case.find('error') is not None:
                 duration = float(case.attrib.get('time', 0))
-                test_name = parse_name(case.attrib.get('name', ''), case.attrib.get('file', ''))
+                test_name = parse_name(case.attrib.get('name', ''), \
+                                       case.attrib.get('file', ''))
                 if duration <= 5 * 60:
                     rerun_2_file.write(test_name + '\n')
                     print(test_name + " will rerun 2 times")
                 elif duration <= 10 * 60:
                     rerun_1_file.write(test_name + '\n')
                     print(test_name + " will rerun 1 time")
-                elif any(failSig.lower() in ET.tostring(case, encoding='unicode').lower() for failSig in failSignaturesList):
+                elif any(failSig.lower() in ET.tostring(case, encoding='unicode').lower() 
+                         for failSig in failSignaturesList):
                     rerun_1_file.write(test_name + '\n')
-                    print(test_name + " will rerun 1 time, because of fail signature")
+                    print(test_name +
+                          " will rerun 1 time, because of fail signature")
                 else:
                     rerun_0_file.write(test_name + '\n')
                     print(test_name + " will not rerun")
@@ -60,7 +65,16 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames):
     merged_root = ET.Element('testsuites')
     merged_suite = ET.Element('testsuite')
 
-    attribs = {'name': '', 'errors': 0, 'failures': 0, 'skipped': 0, 'tests': 0, 'time': 0.0, 'timestamp': '', 'hostname': ''}
+    attribs = {
+        'name': '',
+        'errors': 0,
+        'failures': 0,
+        'skipped': 0,
+        'tests': 0,
+        'time': 0.0,
+        'timestamp': '',
+        'hostname': ''
+    }
 
     # Iterate through all input files
     for xml_filename in xml_filenames:
@@ -69,7 +83,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames):
         tree = ET.parse(xml_filename)
         root = tree.getroot()
         suite = root.find('testsuite')
-        
+
         if attribs['name'] == "":
             attribs['name'] = suite.attrib.get('name', '')
         if attribs['timestamp'] == "":
@@ -80,7 +94,9 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames):
 
         for case in suite.findall('testcase'):
             # Check if test case with same name and classname already exists
-            existing_case = merged_suite.find(f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}']")
+            existing_case = merged_suite.find(
+                f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}']"
+            )
             if existing_case is not None:
                 # Remove existing case and add the new one (which is presumably from a rerun)
                 merged_suite.remove(existing_case)
@@ -99,7 +115,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames):
     for key, value in attribs.items():
         merged_root.set(key, str(value))
     merged_root.append(merged_suite)
-    
+
     # Write to new file
     tree = ET.ElementTree(merged_root)
     tree.write(merged_xml_filename, encoding='utf-8', xml_declaration=True)
@@ -117,7 +133,7 @@ def xml_to_html(xml_filename, html_filename):
             .success {{ color: #1e8e3e; }}
             .failure {{ color: #d93025; }}
             .skipped {{ color: #666666; }}
-            .testcase {{ 
+            .testcase {{
                 border-left: 4px solid #ddd;
                 margin: 5px 0;
                 background: white;
@@ -189,10 +205,12 @@ def xml_to_html(xml_filename, html_filename):
     tree = ET.parse(xml_filename)
     root = tree.getroot()
     suite = root.find('testsuite')
-    
-    failed_tests_count = int(suite.attrib.get('failures', 0)) + int(suite.attrib.get('errors', 0))
+
+    failed_tests_count = int(suite.attrib.get('failures', 0)) + \
+                         int(suite.attrib.get('errors', 0))
     skipped_tests_count = int(suite.attrib.get('skipped', 0))
-    passed_tests_count = int(suite.attrib.get('tests', 0)) - failed_tests_count - skipped_tests_count
+    passed_tests_count = int(suite.attrib.get('tests', 0)) - \
+                         failed_tests_count - skipped_tests_count
 
     # Generate summary
     summary = f"""
@@ -202,26 +220,27 @@ def xml_to_html(xml_filename, html_filename):
 
     # Generate test case details
     test_cases_html = []
-    
+
     # First collect all test cases and sort them by status
     all_test_cases = []
     for testcase in suite.findall('testcase'):
         status = "success"
-        if testcase.find('failure') is not None or testcase.find('error') is not None:
+        if testcase.find('failure') is not None or \
+           testcase.find('error') is not None:
             status = "failure"
         elif testcase.find('skipped') is not None:
             status = "skipped"
         all_test_cases.append((status, testcase))
-    
+
     # Sort test cases: failure/error first, then skipped, then success
     status_order = {"failure": 0, "skipped": 1, "success": 2}
     all_test_cases.sort(key=lambda x: status_order[x[0]])
-    
+
     # Generate HTML for sorted test cases
     for status, testcase in all_test_cases:
         test_name = f"{testcase.attrib['name']} - {testcase.attrib.get('classname', 'N/A')}"
         test_time = f"{float(testcase.attrib['time']):.3f}s"
-        
+
         if status == "failure":
             failure = testcase.find('failure') or testcase.find('error')
             system_out = testcase.find('system-out')
@@ -262,10 +281,8 @@ def xml_to_html(xml_filename, html_filename):
         test_cases_html.append(test_case_html)
 
     # Generate complete HTML
-    html_content = html_template.format(
-        summary=summary,
-        test_cases="\n".join(test_cases_html)
-    )
+    html_content = html_template.format(summary=summary,
+                                        test_cases="\n".join(test_cases_html))
 
     # Write to file
     with open(html_filename, 'w', encoding='utf-8') as f:
