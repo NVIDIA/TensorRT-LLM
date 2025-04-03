@@ -666,7 +666,8 @@ if __name__ == "__main__":
     operations = []
     operations += generate_sm100_operations(has_arch(100))
     operations += generate_sm90_operations(has_arch(90))
-    operations += generate_sm80_operations(has_arch(80) or has_arch(89) or has_arch(120))
+    operations += generate_sm80_operations(
+        has_arch(80) or has_arch(89) or has_arch(120))
 
     def should_skip(op):
         is_internal = op.gemm_kind == GemmKind.Grouped
