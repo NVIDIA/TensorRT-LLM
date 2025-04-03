@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -46,19 +48,6 @@ def _find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
-class LinearMLP(nn.Module):
-
-    def __init__(self, config: PretrainedConfig):
-        super().__init__()
-        self.linear_mlp = nn.Linear(config.hidden_size,
-                                    config.hidden_size,
-                                    bias=False,
-                                    dtype=config.torch_dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear_mlp(x)
-
-
 class NVSmallAttention(Attention):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
@@ -84,14 +73,28 @@ class NVSmallAttention(Attention):
             config=model_config)
 
 
-class LinearAttention(nn.Module):
+class NVSmallLinear(nn.Module):
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 config: PretrainedConfig):
         super().__init__()
-        self.linear_attn = nn.Linear(config.hidden_size,
-                                     config.hidden_size,
-                                     bias=False,
-                                     dtype=config.torch_dtype)
+        self.linear_attn = Linear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            parallel_config=ParallelConfig(
+                tensor_parallel_rank=model_config.mapping.tp_rank,
+                tensor_parallel_size=model_config.mapping.tp_size,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                pipeline_parallel_size=model_config.mapping.pp_size,
+                parallel_rank=model_config.mapping.rank,
+                gather_output=True,
+                gpus_per_node=model_config.mapping.gpus_per_node,
+            ),
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights=model_config.skip_create_weights,
+        )
 
     def forward(
         self,
@@ -99,6 +102,14 @@ class LinearAttention(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         return self.linear_attn(hidden_states)
+
+
+class LinearAttention(NVSmallLinear):
+    pass
+
+
+class LinearMLP(NVSmallLinear):
+    pass
 
 
 class NVSmallDecoderLayer(DecoderLayer):
@@ -113,7 +124,7 @@ class NVSmallDecoderLayer(DecoderLayer):
                                            eps=config.rms_norm_eps,
                                            dtype=config.torch_dtype)
             if self.block_config.attention.replace_with_linear:
-                self.self_attn = LinearAttention(config)
+                self.self_attn = LinearAttention(model_config, config)
             else:
                 self.self_attn = NVSmallAttention(model_config=model_config,
                                                   layer_idx=layer_idx)
@@ -123,14 +134,15 @@ class NVSmallDecoderLayer(DecoderLayer):
                 eps=config.rms_norm_eps,
                 dtype=config.torch_dtype)
             if self.block_config.ffn.replace_with_linear:
-                self.mlp = LinearMLP(config)
+                self.mlp = LinearMLP(model_config, config)
             else:
                 self.mlp = GatedMLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=_ffn_mult_to_intermediate_size(
                         self.block_config.ffn.ffn_mult, config.hidden_size),
                     bias=False,
-                    dtype=config.torch_dtype)
+                    dtype=config.torch_dtype,
+                    config=model_config)
 
     def forward(
         self,
