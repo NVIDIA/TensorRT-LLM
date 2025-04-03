@@ -256,7 +256,7 @@ class FusedMoE(nn.Module):
         # around 16k tokens per expert, which is well into the compute bound domain.
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
-            16384 * num_experts / routing_method.get_experts_per_token(),
+            16384 * num_experts // routing_method.get_experts_per_token(),
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
@@ -632,10 +632,9 @@ class FusedMoE(nn.Module):
         num_chunks = (num_rows + max_chunk_size - 1) // max_chunk_size
 
         if min_latency_mode:
-            assert (num_chunks == 1 and (
+            assert num_chunks == 1 and (
                 not self.reduce_results
             ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
-                    )
 
         if num_chunks == 1:
             outputs = self.forward_chunk(x, router_logits, min_latency_mode,

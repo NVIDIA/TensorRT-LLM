@@ -9,6 +9,9 @@ l0_l40s:
       gpu:
       - '*l40s*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
@@ -25,6 +28,19 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image]
   - test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video]
   - test_e2e.py::test_ptp_quickstart_bert[BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*l40s*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - unittest/trt/attention/test_gpt_attention.py -k "partition0"
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
@@ -67,6 +83,7 @@ l0_l40s:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: tensorrt
   tests:
   - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
   - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
