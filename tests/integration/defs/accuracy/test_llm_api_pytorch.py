@@ -201,6 +201,18 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMistral_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-7B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
