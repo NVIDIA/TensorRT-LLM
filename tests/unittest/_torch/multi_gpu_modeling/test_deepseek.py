@@ -169,7 +169,6 @@ def test_deepseek(model_name, backend, quant, test_config):
     if (not enable_overlap_scheduler and enable_cuda_graph and not enable_dp
             and mtp_nextn == 0 and ep_size == 1 and pp_size == 4
             and tp_size == 1 and is_fp8):
-
         pytest.skip("https://nvbugspro.nvidia.com/bug/5189673")
 
     if ep_size > tp_size:
@@ -201,6 +200,9 @@ def test_deepseek(model_name, backend, quant, test_config):
         pytest.skip(
             "Race condition causes incorrect output for some requests: https://nvbugspro.nvidia.com/bug/5177565"
         )
+
+    if tp_size > 2 and mtp_nextn > 0 and enable_dp:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5201224")
 
     if get_total_gpu_memory(0) < 60 * 1024**3:
         pytest.skip(f"Not enough GPU memory to run. {get_total_gpu_memory(0)}")
