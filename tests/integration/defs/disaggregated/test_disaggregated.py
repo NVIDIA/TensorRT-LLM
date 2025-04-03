@@ -88,9 +88,9 @@ def run_disaggregated_test(example_dir,
 
     # Start workers
     workers_cmd = [
-        'mpirun', '--allow-run-as-root', '-n',
-        str(num_ranks), 'python3',
-        f'{example_dir}/launch_disaggregated_workers.py', '-c', config_file
+        'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
+        str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
+        config_file
     ]
     with open('output_workers', 'w') as f:
         workers_proc = subprocess.Popen(workers_cmd,
@@ -102,8 +102,7 @@ def run_disaggregated_test(example_dir,
     server_start_timeout = 900
     # Start server
     server_cmd = [
-        'python3', f'{example_dir}/launch_disaggregated_server.py',
-        '--server_start_timeout',
+        'trtllm-serve', 'disaggregated', '--server_start_timeout',
         str(server_start_timeout), '-c', config_file
     ]
     with open('output_disagg', 'w') as f:
