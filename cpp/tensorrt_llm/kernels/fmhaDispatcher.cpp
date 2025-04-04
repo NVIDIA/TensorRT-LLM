@@ -92,7 +92,7 @@ bool FmhaDispatcher::isSupported()
         TllmGenFmhaRunnerParams tllmRunnerParams;
         memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
@@ -143,7 +143,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
 
         // Parameters to select kernels.
         tllmRunnerParams.mQkvLayout = qkvLayout;
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mFixedParams.attentionMaskType));
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         // Always use persistent scheduler for better performance.
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;

@@ -124,6 +124,8 @@ class TestQwen(unittest.TestCase):
             self._prepare_sanity_test("qwen_prm", quant_algo)
 
         with torch.inference_mode():
+            attn_metadata.max_seq_len = input_ids.size(-1)
+            attn_metadata.prepare()
             scores_logits = model.forward(input_ids=input_ids,
                                           position_ids=position_ids,
                                           attn_metadata=attn_metadata)
@@ -456,7 +458,8 @@ class TestQwen(unittest.TestCase):
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
-            num_contexts=len(context_sequence_lengths),
+            num_contexts=len(context_sequence_lengths)
+            if model_config.is_generation else len(sequence_lengths),
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
