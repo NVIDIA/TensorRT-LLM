@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::ar_fusion
@@ -54,6 +55,7 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
+    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
 

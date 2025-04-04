@@ -888,24 +888,39 @@ def test_llm_mixtral_1gpu_fp4_llmapi(
     venv_check_call(llm_venv, mmlu_cmd)
 
 
-@pytest.mark.parametrize("model_name", ['mixtral-8x7b-v0.1-AWQ'])
+@pytest.mark.parametrize(
+    "model_name", ['mixtral-8x7b-v0.1-AWQ', 'Mixtral-8x7B-Instruct-v0.1'])
 def test_llm_mixtral_int4_awq_1gpu_summary(llama_example_root,
                                            llm_datasets_root, model_name,
                                            llm_rouge_root, llm_venv, cmodel_dir,
-                                           engine_dir):
+                                           engine_dir,
+                                           qcache_dir_without_install_package):
     models_root = llm_models_root()
     model_dir = os.path.join(models_root, model_name)
     ckpt_dir = os.path.join(cmodel_dir, model_name)
 
-    print("Convert checkpoint...")
-    convert_cmd = [
-        f"{llama_example_root}/convert_checkpoint.py",
-        "--model_dir",
-        model_dir,
-        "--output_dir",
-        ckpt_dir,
-    ]
-    venv_check_call(llm_venv, convert_cmd)
+    if 'AWQ' in model_name:
+        print("Convert checkpoint...")
+        convert_cmd = [
+            f"{llama_example_root}/convert_checkpoint.py",
+            "--model_dir",
+            model_dir,
+            "--output_dir",
+            ckpt_dir,
+        ]
+        venv_check_call(llm_venv, convert_cmd)
+    else:
+        print("Quantizing model...")
+        ckpt_dir = quantize_data(
+            llm_venv,
+            llama_example_root,
+            model_dir=model_dir,
+            calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
+            dtype="float16",
+            qformat="int4_awq",
+            quantize_dir=qcache_dir_without_install_package,
+            tp_size=1,
+            calib_size=32)
 
     print("Build engines...")
     build_cmd = [

@@ -160,21 +160,24 @@ int QuantizeToFP4Plugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     case DataType::kHALF:
     {
         auto input = reinterpret_cast<half const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, mMultiProcessorCount, stream);
+        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+            mMultiProcessorCount, stream);
         break;
     }
 
     case DataType::kBF16:
     {
         auto input = reinterpret_cast<__nv_bfloat16 const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, mMultiProcessorCount, stream);
+        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+            mMultiProcessorCount, stream);
         break;
     }
 
     case DataType::kFP8:
     {
         auto input = reinterpret_cast<__nv_fp8_e4m3 const*>(inputs[0]);
-        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, mMultiProcessorCount, stream);
+        invokeFP4Quantization(m, n, input, SFScale, output, SFoutput, false, FP4QuantizationSFLayout::SWIZZLED,
+            mMultiProcessorCount, stream);
         break;
     }
 
