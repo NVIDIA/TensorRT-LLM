@@ -230,7 +230,8 @@ def args_to_build_options(args):
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
         'disable_weight_only_quant_plugin':
-        args.disable_weight_only_quant_plugin
+        args.disable_weight_only_quant_plugin,
+        'load_model_on_cpu': args.load_model_on_cpu,
     }
 
 
@@ -264,6 +265,7 @@ def convert_and_save_hf(args):
                                  dtype=args.dtype,
                                  mapping=mapping,
                                  quant_config=quant_config,
+                                 device='cpu' if args.load_model_on_cpu else 'cuda',
                                  calib_dataset=args.calib_dataset,
                                  **override_fields)
     else:
