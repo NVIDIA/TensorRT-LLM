@@ -15,8 +15,12 @@ l0_dgx_h100:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/multi_gpu
-  - unittest/_torch/multi_gpu_modeling -k "deepseek and not (tp1 and pp1) and nextn0"
-  - unittest/_torch/multi_gpu_modeling -k "deepseek and not (tp1 and pp1) and not nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp4_pp1_ep1_nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp4_pp1_ep1_nextn2"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp4_pp1_ep4_nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp4_pp1_ep4_nextn2"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp2_pp2_ep1_nextn0"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp2_pp2_ep1_nextn2"
   - unittest/_torch/multi_gpu_modeling -k "llama and not (tp1 and pp1)"
   - unittest/_torch/auto_deploy/unit/multigpu
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
