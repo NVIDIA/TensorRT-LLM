@@ -18,7 +18,7 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            DeepseekAllReduce, ParallelConfig, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
-from ..modules.attention import MLA
+from ..modules.attention import MLA, VanillaMLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
@@ -109,6 +109,39 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream)
+
+
+class DeepseekV3VanillaAttention(VanillaMLA):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        config = model_config.pretrained_config
+        super().__init__(hidden_size=config.hidden_size,
+                         num_attention_heads=config.num_attention_heads,
+                         num_key_value_heads=config.num_key_value_heads,
+                         qk_rope_head_dim=config.qk_rope_head_dim,
+                         qk_nope_head_dim=config.qk_nope_head_dim,
+                         q_lora_rank=config.q_lora_rank,
+                         kv_lora_rank=config.kv_lora_rank,
+                         v_head_dim=config.v_head_dim,
+                         max_position_embeddings=config.max_position_embeddings,
+                         bias=False,
+                         rotary_emb=DeepseekV3RotaryEmbedding(config),
+                         pos_embd_params=None,
+                         layer_idx=layer_idx,
+                         dtype=config.torch_dtype,
+                         config=model_config,
+                         aux_stream=aux_stream)
+
+
+ATTENTION_CLASSES = {
+    "TRTLLM": DeepseekV3Attention,
+    "VANILLA": DeepseekV3VanillaAttention,
+}
 
 
 class Deepseekv3RoutingImpl():
@@ -403,7 +436,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
-        self.self_attn = DeepseekV3Attention(
+        self.self_attn = ATTENTION_CLASSES[model_config.attn_backend](
             model_config,
             layer_idx=layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
@@ -1106,6 +1139,16 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         tp_size = self.model_config.mapping.tp_size
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
+        vanilla_params_map = {
+            "wkv_a": "kv_a_proj_with_mqa",
+            "wkv_b": "kv_b_proj",
+            "wo": "o_proj",
+            "kv_norm": "kv_a_layernorm",
+            "q_norm": "q_a_layernorm",
+            "wq_a": "q_a_proj",
+            "wq_b": "q_b_proj",
+            "wq": "q_proj",
+        }
         all_named_modules = dict(self.named_modules())
 
         for name, module in tqdm(all_named_modules.items(),
@@ -1190,6 +1233,15 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
+                elif names[-1] in vanilla_params_map:
+                    module_weights = filter_weights(
+                        '.'.join(names[:-1] + [vanilla_params_map[names[-1]]]),
+                        weights)
+                    if hasattr(module, 'load_weights'):
+                        module.load_weights(weights=[module_weights])
+                    else:
+                        for n, p in module.named_parameters():
+                            p.data.copy_(module_weights[n][:])
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):

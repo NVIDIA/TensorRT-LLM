@@ -642,3 +642,477 @@ class MLA(nn.Module):
         attn_output_flatten = attn_output.flatten(1, 2)
 
         return attn_output_flatten
+
+
+class VanillaMLA(nn.Module):
+
+    def __init__(self,
+                 *,
+                 hidden_size: int,
+                 num_attention_heads: int,
+                 num_key_value_heads: int,
+                 qk_nope_head_dim: int,
+                 qk_rope_head_dim: int,
+                 v_head_dim: int,
+                 q_lora_rank: int,
+                 kv_lora_rank: int,
+                 max_position_embeddings: int,
+                 bias: bool,
+                 pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+                 rotary_emb: Optional[RotaryEmbedding] = None,
+                 layer_idx: Optional[int] = None,
+                 dtype: torch.dtype = None,
+                 dense_bias: Optional[bool] = None,
+                 config: Optional[ModelConfig] = None,
+                 aux_stream: Optional[torch.cuda.Stream] = None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.dim = hidden_size
+        self.n_heads = num_attention_heads
+        self.n_local_heads = num_attention_heads // config.mapping.tp_size
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.dtype = dtype
+        self.dense_bias = dense_bias
+        if dense_bias is None:
+            self.dense_bias = bias
+
+        # tensor parallel
+        config = config or ModelConfig()
+        tp_size = config.mapping.tp_size
+        tp_rank = config.mapping.tp_rank
+        gpus_per_node = config.mapping.gpus_per_node
+        device = torch.device('cuda')
+
+        row_parallel_config = ParallelConfig(
+            tensor_parallel_rank=tp_rank,
+            tensor_parallel_size=tp_size,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            gpus_per_node=gpus_per_node,
+        )
+        col_parallel_config = ParallelConfig(
+            tensor_parallel_rank=tp_rank,
+            tensor_parallel_size=tp_size,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gpus_per_node=gpus_per_node,
+        )
+
+        # quantization
+        quant_config = config.get_quant_config()
+        quant_mode = quant_config.quant_mode
+
+        if quant_mode.has_fp8_block_scales():
+            self.mla_weight_dtype = torch.float8_e4m3fn
+        else:
+            self.mla_weight_dtype = dtype
+
+        if self.q_lora_rank is None:
+            self.q_lora_rank = hidden_size
+            self.is_lite = True
+        else:
+            self.is_lite = False
+
+        if self.is_lite:
+            self.wq = Linear(
+                self.dim,
+                self.n_heads * self.qk_head_dim,
+                bias=bias,
+                dtype=dtype,
+                parallel_config=col_parallel_config,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights,
+            )
+        else:
+            self.wq_a = Linear(self.dim,
+                               self.q_lora_rank,
+                               bias=bias,
+                               dtype=dtype,
+                               quant_config=config.get_quant_config(),
+                               skip_create_weights=config.skip_create_weights)
+            self.q_norm = RMSNorm(hidden_size=self.q_lora_rank,
+                                  eps=config.pretrained_config.rms_norm_eps,
+                                  dtype=dtype)
+            self.wq_b = Linear(
+                self.q_lora_rank,
+                self.n_heads * self.qk_head_dim,
+                bias=bias,
+                dtype=dtype,
+                parallel_config=col_parallel_config,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights,
+            )
+        self.wkv_a = Linear(self.dim,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            bias=bias,
+                            dtype=dtype,
+                            quant_config=config.get_quant_config(),
+                            skip_create_weights=config.skip_create_weights)
+        self.kv_norm = RMSNorm(hidden_size=self.kv_lora_rank,
+                               eps=config.pretrained_config.rms_norm_eps,
+                               dtype=dtype)
+        if quant_mode.has_fp8_block_scales():
+            self.wkv_b = None
+            self.kv_b_proj = Linear(
+                self.kv_lora_rank,
+                self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=bias,
+                dtype=dtype,
+                parallel_config=col_parallel_config,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights,
+            )
+            self.k_b_proj_trans = nn.Parameter(
+                torch.empty(
+                    (self.n_heads // tp_size, self.kv_lora_rank,
+                     self.qk_nope_head_dim),
+                    dtype=self.mla_weight_dtype,
+                    device=device,
+                ))
+            self.k_b_proj_trans_scale = nn.Parameter(
+                torch.empty(
+                    (
+                        self.n_heads // tp_size,
+                        int(self.kv_lora_rank / 128),
+                        int(self.qk_nope_head_dim / 128),
+                    ),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.v_b_proj = None  # view into self.kv_b_proj.weight
+            self.v_b_proj_scale = None  # view into self.kv_b_proj.weight_scale
+        else:
+            self.wkv_b = Linear(
+                self.kv_lora_rank,
+                self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=bias,
+                dtype=dtype,
+                parallel_config=col_parallel_config,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights,
+            )
+            self.k_b_proj_trans = None
+            self.k_b_proj_trans_scale = None
+            self.v_b_proj = None
+            self.v_b_proj_scale = None
+
+        self.wo = Linear(
+            self.n_heads * self.v_head_dim,
+            self.dim,
+            bias=self.dense_bias,
+            dtype=dtype,
+            parallel_config=row_parallel_config,
+            quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
+        )
+
+        # rope
+        def yarn_get_mscale(scale=1, mscale=1):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        self.softmax_scale = self.qk_head_dim**-0.5
+        rope_scaling = getattr(config.pretrained_config, 'rope_scaling', None)
+        self.rope_params = {
+            "qk_rope_head_dim": config.pretrained_config.qk_rope_head_dim,
+            "rope_theta": config.pretrained_config.rope_theta,
+        }
+        if rope_scaling is not None:
+            self.rope_params.update({
+                "beta_fast":
+                rope_scaling.get("beta_fast", 32),
+                "beta_slow":
+                rope_scaling.get("beta_slow", 1),
+                "original_seq_len":
+                rope_scaling.get("original_max_position_embeddings", 1024),
+                "rope_factor":
+                rope_scaling.get("factor", 1.0),
+            })
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            scaling_factor = rope_scaling.get("factor", 1.0)
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.softmax_scale = self.softmax_scale * mscale * mscale
+        self.freqs_cis = None
+
+    def apply_rotary_emb(self, x: torch.Tensor,
+                         freqs_cis: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+        freqs_cis = freqs_cis.view(x.size(0), 1, x.size(-1))
+        y = torch.view_as_real(x * freqs_cis).flatten(2)
+        return y.to(dtype)
+
+    def precompute_freqs_cis(
+        self,
+        max_seq_len: int,
+        qk_rope_head_dim: int,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        original_seq_len: int = 4096,
+        rope_factor: float = 40,
+        rope_theta: float = 10000,
+    ) -> torch.Tensor:
+        dim = qk_rope_head_dim
+        seqlen = max_seq_len
+        beta_fast = beta_fast
+        beta_slow = beta_slow
+        base = rope_theta
+        factor = rope_factor
+
+        import math
+
+        def find_correction_dim(num_rotations, dim, base, max_seq_len):
+            return dim * math.log(
+                max_seq_len /
+                (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+        def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+            low = math.floor(
+                find_correction_dim(low_rot, dim, base, max_seq_len))
+            high = math.ceil(
+                find_correction_dim(high_rot, dim, base, max_seq_len))
+            return max(low, 0), min(high, dim - 1)
+
+        def linear_ramp_factor(min, max, dim):
+            if min == max:
+                max += 0.001
+            linear_func = (torch.arange(dim, dtype=torch.float32) -
+                           min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
+            return ramp_func
+
+        freqs = 1.0 / (base
+                       **(torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if seqlen > original_seq_len:
+            low, high = find_correction_range(beta_fast, beta_slow, dim, base,
+                                              original_seq_len)
+            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+        t = torch.arange(seqlen)
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis
+
+    def _single_request_update_kv_cache(self, kv, k_pe, kv_cache_tensor,
+                                        cache_idx, start_pos, end_pos):
+        kv_cache = kv_cache_tensor[cache_idx,
+                                   0, :, :, :self.kv_lora_rank].squeeze()
+        pe_cache = kv_cache_tensor[cache_idx, 0, :, :,
+                                   self.kv_lora_rank:].squeeze()
+        kv_cache[start_pos:end_pos] = kv
+        pe_cache[start_pos:end_pos] = k_pe
+        return kv_cache[:end_pos, :], pe_cache[:end_pos, :]
+
+    def _single_request_forward(self, x: torch.Tensor,
+                                kv_cache_tensor: torch.Tensor, start_pos: int,
+                                cache_idx: int):
+        seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        # rope param
+        if end_pos > self.freqs_cis.shape[0]:
+            self.freqs_cis = self.precompute_freqs_cis(max_seq_len=end_pos,
+                                                       **self.rope_params).to(
+                                                           x.device)
+        # get mask
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((end_pos, end_pos), float("-inf"),
+                              device='cuda').triu_(1)
+            mask = mask[-seqlen:]
+        # proj
+        if self.is_lite:
+            q = self.wq(x)
+        else:
+            qnorm = self.q_norm(self.wq_a(x))
+            q = self.wq_b(qnorm)
+        # q rope
+        q = q.view(seqlen, self.n_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = self.apply_rotary_emb(q_pe, self.freqs_cis[start_pos:end_pos])
+        # kv proj a
+        kv = self.wkv_a(x)
+        # kv rope
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim],
+                               dim=-1)
+        k_pe = self.apply_rotary_emb(k_pe.unsqueeze(1),
+                                     self.freqs_cis[start_pos:end_pos])
+        # q_nope proj
+        if self.mla_weight_dtype == torch.bfloat16:
+            wkv_b = self.wkv_b.weight.view(self.n_local_heads, -1,
+                                           self.kv_lora_rank)
+            q_nope = torch.einsum("shd,hdc->shc", q_nope,
+                                  wkv_b[:, :self.qk_nope_head_dim])
+        elif self.mla_weight_dtype == torch.float8_e4m3fn:
+            q_nope, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                q_nope)
+            q_nope = torch.ops.trtllm.fp8_block_scaling_bmm(
+                q_nope, self.k_b_proj_trans, q_nope_scales,
+                self.k_b_proj_trans_scale)
+            q_nope = q_nope.transpose(0, 1)
+        else:
+            raise NotImplementedError(
+                f"Unsupported dtype: {self.mla_weight_dtype}")
+        # update kv cache
+        # Fake QDQ
+        q_nope = q_nope.to(torch.float8_e4m3fn).to(torch.bfloat16)
+        q_pe = q_pe.to(torch.float8_e4m3fn).to(torch.bfloat16)
+
+        kv_states, pe_states = self._single_request_update_kv_cache(
+            self.kv_norm(kv), k_pe.squeeze(1), kv_cache_tensor, cache_idx,
+            start_pos, end_pos)
+
+        kv_states = kv_states.to(torch.float8_e4m3fn).to(torch.bfloat16)
+        pe_states = pe_states.to(torch.float8_e4m3fn).to(torch.bfloat16)
+        # attention
+        scores = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
+            "shr,tr->sht", q_pe, pe_states)) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+
+        # Fake QDQ
+        scores = (scores * 448).to(torch.float8_e4m3fn).to(torch.bfloat16) / 448
+        x = torch.einsum("sht,tc->shc", scores, kv_states)
+        # v proj
+        if self.mla_weight_dtype == torch.bfloat16:
+            x = torch.einsum("shc,hdc->shd", x, wkv_b[:, -self.v_head_dim:])
+        elif self.mla_weight_dtype == torch.float8_e4m3fn:
+            x, x_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                x)
+            x = torch.ops.trtllm.fp8_block_scaling_bmm(x, self.v_b_proj,
+                                                       x_scales,
+                                                       self.v_b_proj_scale)
+            x = x.transpose(0, 1)
+        else:
+            raise NotImplementedError(
+                f"Unsupported dtype: {self.mla_weight_dtype}")
+        # proj
+        x = self.wo(x.flatten(1))
+        return x
+
+    def dummy_forward(self, x: torch.Tensor):
+        seqlen, hidden_dim = x.size()
+        end_pos = seqlen
+        # rope param
+        if self.freqs_cis is None or seqlen > self.freqs_cis.shape[0]:
+            self.freqs_cis = self.precompute_freqs_cis(max_seq_len=seqlen,
+                                                       **self.rope_params).to(
+                                                           x.device)
+        # get mask
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((end_pos, end_pos), float("-inf"),
+                              device='cuda').triu_(1)
+            mask = mask[-seqlen:]
+        # proj
+        if self.is_lite:
+            q = self.wq(x)
+        else:
+            q = self.wq_a(x.view(-1, hidden_dim))
+            q = self.q_norm(q).type_as(x)
+            q = self.wq_b(q).view(seqlen, -1)
+        # q rope
+        q = q.view(seqlen, self.n_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = self.apply_rotary_emb(q_pe, self.freqs_cis[0:end_pos])
+        # kv proj a
+        kv = self.wkv_a(x.view(-1, hidden_dim)).view(seqlen, -1)
+        # kv rope
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim],
+                               dim=-1)
+        k_pe = self.apply_rotary_emb(k_pe.unsqueeze(1),
+                                     self.freqs_cis[0:end_pos])
+        # q_nope proj
+        if self.mla_weight_dtype == torch.bfloat16:
+            wkv_b = self.wkv_b.weight.view(self.n_local_heads, -1,
+                                           self.kv_lora_rank)
+            q_nope = torch.einsum("shd,hdc->shc", q_nope,
+                                  wkv_b[:, :self.qk_nope_head_dim])
+        elif self.mla_weight_dtype == torch.float8_e4m3fn:
+            q_nope, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                q_nope)
+            q_nope = torch.ops.trtllm.fp8_block_scaling_bmm(
+                q_nope, self.k_b_proj_trans, q_nope_scales,
+                self.k_b_proj_trans_scale)
+            q_nope = q_nope.transpose(0, 1)
+        else:
+            raise NotImplementedError(
+                f"Unsupported dtype: {self.mla_weight_dtype}")
+        # get kv and pe states
+        kv_states = self.kv_norm(kv).type(self.dtype)
+        pe_states = k_pe.squeeze(1)
+        # attention
+        scores = (torch.einsum("shc,tc->sht", q_nope, kv_states) + torch.einsum(
+            "shr,tr->sht", q_pe, pe_states)) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        x = torch.einsum("sht,tc->shc", scores, kv_states)
+        # v proj
+        if self.mla_weight_dtype == torch.bfloat16:
+            x = torch.einsum("shc,hdc->shd", x, wkv_b[:, -self.v_head_dim:])
+        elif self.mla_weight_dtype == torch.float8_e4m3fn:
+            x, x_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                x)
+            x = torch.ops.trtllm.fp8_block_scaling_bmm(x, self.v_b_proj,
+                                                       x_scales,
+                                                       self.v_b_proj_scale)
+            x = x.transpose(0, 1)
+        else:
+            raise NotImplementedError(
+                f"Unsupported dtype: {self.mla_weight_dtype}")
+        # proj
+        x = self.wo(x.flatten(1))
+        return x
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.LongTensor],
+        attn_metadata: Optional[AttentionMetadata],
+        **kwargs,
+    ) -> torch.Tensor:
+
+        if attn_metadata is None or attn_metadata.kv_cache_manager is None:
+            return self.dummy_forward(hidden_states)
+
+        max_seq_len = attn_metadata.kv_cache_manager.max_seq_len
+        if self.freqs_cis is None or max_seq_len > self.freqs_cis.shape[0]:
+            self.freqs_cis = self.precompute_freqs_cis(max_seq_len=max_seq_len,
+                                                       **self.rope_params).to(
+                                                           hidden_states.device)
+
+        past_seen_tokens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
+        cache_indices = [
+            block_ids[0] for block_ids in attn_metadata.block_ids_per_seq
+        ]
+        kv_cache_tensor = attn_metadata.kv_cache_manager.get_buffers(
+            self.layer_idx)
+
+        assert len(cache_indices) == len(past_seen_tokens)
+        assert len(cache_indices) == attn_metadata.seq_lens.nelement()
+
+        offset = 0
+        attn_outputs = []
+        for i, seq_len in enumerate(attn_metadata.seq_lens):
+            single_hidden_state = hidden_states[offset:offset + seq_len, :]
+            past_seen_token = past_seen_tokens[i]
+            cache_idx = cache_indices[i]
+            attn_output = self._single_request_forward(single_hidden_state,
+                                                       kv_cache_tensor,
+                                                       past_seen_token,
+                                                       cache_idx)
+            attn_outputs.append(attn_output)
+            offset += seq_len
+
+        attn_output = torch.cat(attn_outputs, dim=0).contiguous()
+        return attn_output
