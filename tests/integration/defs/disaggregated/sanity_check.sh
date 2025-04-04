@@ -77,7 +77,7 @@ fi
 
 expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")
 if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
-  expected_strings=("Berlin" "Asyncio is a powerful tool")
+  expected_strings=("Berlin" "Asyncio is a Python library")
 fi
 for expected_string in "${expected_strings[@]}"; do
     grep "${expected_string}" output.json
