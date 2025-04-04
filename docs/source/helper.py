@@ -96,7 +96,7 @@ def generate_examples():
                 .replace(r"%EXAMPLE_NAME%", "LLM Examples"))
 
     # Generate the toctree for trtllm-serve example scripts
-    trtllm_serve_content = "Refer to `trtllm-serve's documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.\n\n"
+    trtllm_serve_content = "Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.\n\n"
     write_script(serve_script_base_url, serve_script_paths, serve_doc_paths,
                  trtllm_serve_content)
     with open(doc_dir / "trtllm_serve_examples.rst", "w+") as f:
