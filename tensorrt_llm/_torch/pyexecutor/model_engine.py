@@ -2,6 +2,8 @@ import bisect
 import contextlib
 import glob
 import math
+import os
+import pickle
 import traceback
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -512,24 +514,46 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
 
         if self.pytorch_backend_config.autotuner_enabled:
-            with no_cuda_graph(), autotune():
-                num_tokens = min(self.max_num_tokens,
-                                 kv_cache_manager.max_seq_len - 1)
-                with release_batch(
-                        get_torch_compile_warmup_request(1,
-                                                         num_tokens)) as batch:
-                    if batch is None:
-                        # No KV cache space!
-                        pass
-                    else:
-                        logger.info(f"Run autotuning warmup for batch size={1}")
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
-                        torch.cuda.synchronize()
+            if self.pytorch_backend_config.autotuner_disk_cache_option == "load":
+                if os.path.exists(
+                        self.pytorch_backend_config.autotuner_cache_path):
+                    logger.info(
+                        f"Loading autotuner cache from {self.pytorch_backend_config.autotuner_cache_path}"
+                    )
+                    with open(self.pytorch_backend_config.autotuner_cache_path,
+                              "rb") as f:
+                        AutoTuner.get().profiling_cache = pickle.load(f)
+            else:
+                with no_cuda_graph(), autotune():
+                    num_tokens = min(self.max_num_tokens,
+                                     kv_cache_manager.max_seq_len - 1)
+                    with release_batch(
+                            get_torch_compile_warmup_request(
+                                1, num_tokens)) as batch:
+                        if batch is None:
+                            # No KV cache space!
+                            pass
+                        else:
+                            logger.info(
+                                f"Run autotuning warmup for batch size={1}")
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
 
-                logger.info(f"Autotuner Cache size after warmup " +
-                            str(len(AutoTuner.get().profiling_cache)))
+                    logger.info(f"Autotuner Cache size after warmup " +
+                                str(len(AutoTuner.get().profiling_cache)))
+
+                if self.pytorch_backend_config.autotuner_disk_cache_option == "save":
+                    with open(self.pytorch_backend_config.autotuner_cache_path,
+                              "wb") as f:
+                        pickle.dump(AutoTuner.get().profiling_cache, f)
+
+                    logger.info(
+                        "Saved autotuner cache to " +
+                        self.pytorch_backend_config.autotuner_cache_path)
+
+                exit()
 
         if not self._run_cuda_graphs:
             return
