@@ -280,6 +280,7 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
             dtype: str = 'auto',
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
+            attn_implementation: str = 'eager',
             **kwargs):
         import transformers
 
@@ -296,6 +297,7 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
                                               dtype=dtype,
                                               mapping=mapping,
                                               quant_config=quant_config,
+                                              attn_implementation=attn_implementation
                                               **kwargs)
 
         if not use_preloading:
@@ -304,7 +306,8 @@ class Phi3ForCausalLM(DecoderModelForCausalLM):
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_dir,
                 torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
+                trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation)
 
         assert isinstance(hf_model, transformers.PreTrainedModel)
 
