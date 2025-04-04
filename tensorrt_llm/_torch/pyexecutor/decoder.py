@@ -27,6 +27,10 @@ from .scheduler import ScheduledRequests
 class Decoder(ABC):
 
     @abstractmethod
+    def setup_decoder_step(self, requests):
+        raise NotImplementedError
+
+    @abstractmethod
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
         raise NotImplementedError
@@ -40,6 +44,9 @@ class Decoder(ABC):
 
 
 class DummyDecoder(Decoder):
+
+    def setup_decoder_step(self, requests):
+        pass
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
@@ -64,6 +71,9 @@ class EarlyStopDecoder(Decoder):
     Use for skipping decoding step for non generation model,
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
+
+    def setup_decoder_step(self, requests):
+        pass
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
@@ -180,6 +190,9 @@ class TorchDecoder(Decoder):
     def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
+
+    def setup_decoder_step(self, requests):
+        pass
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -466,22 +479,11 @@ class TRTLLMDecoder(Decoder):
         )
         self.algs.update_decoder_buffers = UpdateDecoderBuffers()
 
-    def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs):
-        self.batch_size = scheduled_requests.batch_size
-        for req in itertools.chain(scheduled_requests.context_requests,
-                                   scheduled_requests.generation_requests):
-            self.beam_width = req.sampling_config.beam_width
-            break
-
-        logits = model_outputs["logits"].reshape(
-            (self.batch_size, self.beam_width, -1))
-
+    def setup_decoder_step(self, requests):
         with torch.inference_mode():
             batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
                 self.model_config, self.world_config, self.decoding_config,
-                scheduled_requests.context_requests,
-                self.store["buffer_manager"], self.logits_datatype,
+                requests, self.store["buffer_manager"], self.logits_datatype,
                 self.store["decoder_input_buffers"])
 
             if len(decoder_requests):
@@ -497,6 +499,20 @@ class TRTLLMDecoder(Decoder):
                     self.algs.decoder.decoder_state.joint_decoding_output,
                     decoder_requests)
 
+    def decode_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs):
+        self.batch_size = scheduled_requests.batch_size
+        for req in itertools.chain(scheduled_requests.context_requests,
+                                   scheduled_requests.generation_requests):
+            self.beam_width = req.sampling_config.beam_width
+            break
+
+        logits = model_outputs["logits"].reshape(
+            (self.batch_size, self.beam_width, -1))
+
+        self.setup_decoder_step(scheduled_requests.context_requests)
+
+        with torch.inference_mode():
             # Note: In runtimeBuffers.cpp, num_context_logits is set to:
             #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
             # Revisit this when we support chunked context.
