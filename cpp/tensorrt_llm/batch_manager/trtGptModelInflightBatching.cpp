@@ -1649,7 +1649,8 @@ void TrtGptModelInflightBatching::executeStep(
 
     if (mAdditionalModelOutputs.has_value() && !mAdditionalModelOutputs.value().empty())
     {
-        utils::copyAdditionalOutputs(contextRequests, generationRequests, outputMap, getBufferManager());
+        utils::copyAdditionalOutputs(
+            mAdditionalModelOutputs.value(), contextRequests, generationRequests, outputMap, getBufferManager());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

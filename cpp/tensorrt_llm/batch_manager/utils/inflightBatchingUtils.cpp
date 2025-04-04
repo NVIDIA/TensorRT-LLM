@@ -96,26 +96,44 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector const& generationRequests,
+void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& additionalModelOutputs,
+    RequestVector const& contextRequests, RequestVector const& generationRequests,
     RuntimeBuffers::TensorMap const& outputMap, runtime::BufferManager const& manager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    SizeType32 srcTensorIndex{0}; // One index shared across all output tensors
+
+    // One index shared across all output tensors that have gatherContext
+    SizeType32 srcTensorIndexWithContext{0};
+    // One index shared across all output tensors that do not have gatherContext
+    SizeType32 srcTensorIndexWithoutContext{0};
+
     for (auto const& llmReq : contextRequests)
     {
         auto numContextTokens = llmReq->getContextChunkSize();
         for (auto const& outputTensor : llmReq->getAdditionalContextOutputs())
         {
             auto const& outputTensorName = outputTensor.first;
-            auto tensorIt = outputMap.find(outputTensorName);
-            TLLM_CHECK_WITH_INFO(
-                tensorIt != outputMap.end(), "Additional context output tensor not found %s", outputTensorName.c_str());
 
+            auto const aoIter = std::find_if(additionalModelOutputs.cbegin(), additionalModelOutputs.cend(),
+                [&outputTensorName](auto const& ao) { return ao.name == outputTensorName; });
+            TLLM_CHECK_WITH_INFO(aoIter != additionalModelOutputs.cend(),
+                "Additional context output tensor not found: %s", outputTensorName.c_str());
+
+            auto const gatherContext = aoIter->gatherContext;
+            TLLM_CHECK_WITH_INFO(
+                gatherContext, "Additional context output tensor not gathered: %s", outputTensorName.c_str());
+
+            auto const tensorIt = outputMap.find(outputTensorName);
+            TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional context output tensor not found: %s",
+                outputTensorName.c_str());
+
+            auto const srcTensorIndex = srcTensorIndexWithContext;
             auto srcView = ITensor::slice(tensorIt->second, srcTensorIndex, numContextTokens);
             auto dstView = ITensor::slice(outputTensor.second, llmReq->getContextCurrentPosition(), numContextTokens);
             manager.copy(*srcView, *dstView);
         }
-        srcTensorIndex += numContextTokens;
+        srcTensorIndexWithContext += numContextTokens;
+        srcTensorIndexWithoutContext += 1;
 
         // Copy output of last token to generation outputs
         if (llmReq->isLastContextChunk())
@@ -123,10 +141,19 @@ void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector c
             for (auto const& outputTensor : llmReq->getAdditionalGenerationOutputs())
             {
                 auto const& outputTensorName = outputTensor.first;
-                auto tensorIt = outputMap.find(outputTensorName);
-                TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional generation output tensor not found %s",
+
+                auto const aoIter = std::find_if(additionalModelOutputs.cbegin(), additionalModelOutputs.cend(),
+                    [&outputTensorName](auto const& ao) { return ao.name == outputTensorName; });
+                TLLM_CHECK_WITH_INFO(aoIter != additionalModelOutputs.cend(),
+                    "Additional generation output tensor not found: %s", outputTensorName.c_str());
+
+                auto const gatherContext = aoIter->gatherContext;
+
+                auto const tensorIt = outputMap.find(outputTensorName);
+                TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional generation output tensor not found: %s",
                     outputTensorName.c_str());
 
+                auto const srcTensorIndex = gatherContext ? srcTensorIndexWithContext : srcTensorIndexWithoutContext;
                 auto srcView = ITensor::slice(tensorIt->second, srcTensorIndex - 1, 1);
                 for (SizeType32 beam = 0; beam < llmReq->mSamplingConfig.beamWidth; beam++)
                 {
@@ -143,20 +170,30 @@ void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector c
         for (auto const& outputTensor : llmReq->getAdditionalGenerationOutputs())
         {
             auto const& outputTensorName = outputTensor.first;
-            auto tensorIt = outputMap.find(outputTensorName);
-            TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional generation output tensor not found %s",
+
+            auto const aoIter = std::find_if(additionalModelOutputs.cbegin(), additionalModelOutputs.cend(),
+                [&outputTensorName](auto const& ao) { return ao.name == outputTensorName; });
+            TLLM_CHECK_WITH_INFO(aoIter != additionalModelOutputs.cend(),
+                "Additional generation output tensor not found: %s", outputTensorName.c_str());
+
+            auto const gatherContext = aoIter->gatherContext;
+
+            auto const tensorIt = outputMap.find(outputTensorName);
+            TLLM_CHECK_WITH_INFO(tensorIt != outputMap.end(), "Additional generation output tensor not found: %s",
                 outputTensorName.c_str());
 
+            auto const srcTensorIndex = gatherContext ? srcTensorIndexWithContext : srcTensorIndexWithoutContext;
             for (SizeType32 beam = 0; beam < reqBeamWidth; beam++)
             {
-                auto generatedLength = llmReq->getNumTokens(beam) - llmReq->getPromptLen();
+                auto const generatedLength = llmReq->getNumTokens(beam) - llmReq->getPromptLen();
                 TLLM_CHECK(generatedLength >= 1);
                 auto srcView = ITensor::slice(tensorIt->second, srcTensorIndex + beam, 1);
                 auto dstView = ITensor::slice(outputTensor.second, {beam, generatedLength}, 1);
                 manager.copy(*srcView, *dstView);
             }
         }
-        srcTensorIndex += reqBeamWidth;
+        srcTensorIndexWithContext += reqBeamWidth;
+        srcTensorIndexWithoutContext += reqBeamWidth;
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
