@@ -356,7 +356,7 @@ protected:
     {
         managed_buffers.clear();
 
-        mMoERunner.use_deterministic_hopper_reduce_ = k > 2 && mUseDeterminsiticHopperReduce;
+        mMoERunner.use_deterministic_reduce_ = k > 2 && mUseDeterminsiticHopperReduce;
 
         mHiddenSize = hidden_size;
         mInterSize = hidden_size * mInterSizeFraction;
