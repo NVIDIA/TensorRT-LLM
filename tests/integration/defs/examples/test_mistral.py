@@ -797,8 +797,6 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
             "AI agent" in generated_text
         ), "Generated text should start with either 'Assistant' or 'AI agent'"
 
-    del llm
-
     threshold = 55 if 'int4' in quant else 60
 
     mmlu_cmd = [

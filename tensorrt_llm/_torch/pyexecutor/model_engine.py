@@ -11,7 +11,7 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, release_gc
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -29,7 +29,7 @@ from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
-from ..utils import set_torch_compiling
+from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .distributed import MPIDist
@@ -260,6 +260,9 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
         )
+        # In case that some tests use stub models and override `_load_model`.
+        if not hasattr(self.model, 'extra_attrs'):
+            self.model.extra_attrs = {}
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -731,7 +734,8 @@ class PyTorchModelEngine(ModelEngine):
         if self.ub_buffers:
             for u in self.ub_buffers:
                 ub.ub_deallocate(u)
-        torch.cuda.empty_cache()
+        # Release model weights.
+        release_gc()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
                     max_num_tokens: int, moe_max_num_tokens: int, **kwargs):
@@ -1533,6 +1537,7 @@ class PyTorchModelEngine(ModelEngine):
                                            new_tensors_device)
 
     @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
@@ -1646,9 +1651,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        logits = self.model.forward(**inputs,
-                                    return_context_logits=gather_ids
-                                    is not None)
+        logits = self.model.forward(
+            **inputs,
+            return_context_logits=gather_ids is not None,
+        )
         if gather_ids is not None:
             return {'logits': logits[gather_ids]}
         else:

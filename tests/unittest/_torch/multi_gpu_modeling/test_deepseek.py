@@ -332,3 +332,4 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
                            1.0), f"Expected '{expected}' but get '{result}'"
 
     asyncio.run(test())
+    llm.shutdown()
