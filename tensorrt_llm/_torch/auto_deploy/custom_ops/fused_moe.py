@@ -151,6 +151,9 @@ def trtllm_fused_moe(
     w3_w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
 ) -> torch.Tensor:
+    hidden_dim = x.shape[-1]
+    x = x.view(-1, hidden_dim)
+
     routing_weights = routing_weights.to(torch.float32)
     selected_experts = selected_experts.to(torch.int32)
     quant_scales = []
