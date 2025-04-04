@@ -359,6 +359,22 @@ void initBindings(pybind11::module_& m)
             py::arg("sampling_config"), py::arg("batch_size"), py::arg("batch_slots"), py::arg("output") = std::nullopt,
             py::arg("requests") = std::nullopt);
 
+    py::class_<tr::decoder::DecoderState>(m, "DecoderState")
+        .def(py::init<nvinfer1::DataType, tr::BufferManager const&>(), py::arg("dtype"), py::arg("buffer_manager"))
+        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
+            py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
+            py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+        .def_property_readonly(
+            "joint_decoding_input", [](tr::decoder::DecoderState& self) { return self.getJointDecodingInput(); })
+        .def_property_readonly(
+            "joint_decoding_output", [](tr::decoder::DecoderState& self) { return self.getJointDecodingOutput(); })
+        .def_property_readonly(
+            "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
+        .def_property_readonly(
+            "finished_sum", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishedSum()); })
+        .def_property_readonly("finish_reasons",
+            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getFinishReasons()); });
+
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
             py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
@@ -368,28 +384,9 @@ void initBindings(pybind11::module_& m)
             py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("output"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
-        .def(
-            "new_tokens",
-            [](tr::GptDecoderBatched& self, int iter = 0)
-            {
-                auto allNewTokens = self.getDecoderState().getAllNewTokens();
-                auto newTokensView = std::shared_ptr<tr::ITensor>(tr::ITensor::slice(allNewTokens, iter, 1));
-                newTokensView->squeeze(0);
-                return tr::Torch::tensor(
-                    tr::ITensor::slice(newTokensView, 0, self.getDecoderState().getActualBatchSize()));
-            },
-            py::arg("iter") = 0)
-        .def_property_readonly("joint_decoding_input",
-            [](tr::GptDecoderBatched& self) { return self.getDecoderState().getJointDecodingInput(); })
-        .def_property_readonly("joint_decoding_output",
-            [](tr::GptDecoderBatched& self) { return self.getDecoderState().getJointDecodingOutput(); })
         .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
-        .def_property_readonly("all_new_tokens",
-            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getAllNewTokens()); })
-        .def_property_readonly("finished_sum",
-            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getFinishedSum()); })
-        .def_property_readonly("finish_reasons",
-            [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getDecoderState().getFinishReasons()); });
+        .def_property_readonly(
+            "decoder_state", py::overload_cast<>(&tr::GptDecoderBatched::getDecoderState, py::const_));
 
     m.def(
         "lamport_initialize_all",
