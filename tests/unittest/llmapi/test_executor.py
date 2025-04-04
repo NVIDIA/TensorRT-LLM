@@ -15,6 +15,8 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationExecutor, GenerationRequest,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
+from tensorrt_llm.disaggregated_params import DisaggregatedParamsSafe
+from tensorrt_llm.executor.utils import ExecutorResponseTensorsSafe, ExecutorResponseSafe
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.llmapi import LLM, BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -348,7 +350,7 @@ def test_ZeroMqQueue_sync_async():
 
     assert res.result() == 45
 
-def _ZeroMqQueue_json_task(addr: str):
+def _ZeroMqQueue_json_task_simple(addr: str):
     print(f"Setup receiver: {addr}")
     pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
     print(f"after setup receiver")
@@ -369,19 +371,94 @@ def _ZeroMqQueue_json_task(addr: str):
 
     return total
 
-
-def test_ZeroMqQueue_json_serialization():
+def test_ZeroMqQueue_json_serialization_simple():
     # sync send with JSON serialization, async recv with JSON serialization
     push_pipe = ZeroMqQueue(is_async=False, is_server=True)
 
     pool = ProcessPoolExecutor(max_workers=1)
-    res = pool.submit(_ZeroMqQueue_json_task, push_pipe.address)
+    res = pool.submit(_ZeroMqQueue_json_task_simple, push_pipe.address)
 
     for i in range(10):
         print(f"put: {i}")
         push_pipe.put_with_json_serialization(i)
 
     assert res.result() == 45
+
+def _ZeroMqQueue_json_task_ExecutorResponse(addr: str, iterations: int):
+    print(f"Setup receiver: {addr}")
+    pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
+    print(f"after setup receiver")
+
+    total = 0
+
+    async def task():
+        print(f"running task")
+        for i in range(iterations):
+            print(f"waiting for msg")
+            msg = await pull_pipe.get_async_with_json_serialization()
+            print(f"received: {msg}")
+            nonlocal total
+            try:
+                total += msg.client_id
+            except Exception as e:
+                print(f"error: {e}")
+
+    print(f"to run task")
+    asyncio.run(task())
+
+    return total
+
+def test_ZeroMqQueue_json_serialization_ExecutorResponse():
+    # sync send with JSON serialization, async recv with JSON serialization
+    push_pipe = ZeroMqQueue(is_async=False, is_server=True)
+    iterations = 2
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    res = pool.submit(_ZeroMqQueue_json_task_ExecutorResponse, push_pipe.address, iterations)
+
+    tensors = ExecutorResponseTensorsSafe(
+        output_token_ids=[[64, 128], [256, 512]],
+        context_logits=torch.Tensor([[1, 2], [3, 4]]),
+        generation_logits=torch.Tensor([[5, 6], [7, 8]]),
+        log_probs=[0.1, 0.2, 0.3, 0.4],
+        cum_log_probs=[0.1, 0.3, 0.6, 1.0],
+    )
+
+    # Create sample disaggregated params
+    disaggregated_params = DisaggregatedParamsSafe(
+        request_type="context_only",
+        first_gen_tokens=[123, 456],
+        ctx_request_id=789,
+        opaque_state=b"1234567890",
+        draft_tokens=[1, 2, 3]
+    )
+
+    finish_reason_lst = [
+        tllm.FinishReason.NOT_FINISHED,
+        tllm.FinishReason.END_ID,
+        tllm.FinishReason.STOP_WORDS,
+        tllm.FinishReason.LENGTH,
+        tllm.FinishReason.TIMED_OUT,
+        tllm.FinishReason.CANCELLED
+    ]
+
+    error_handle = ValueError("This is a Value error.")
+
+    for i in range(iterations):
+        response = ExecutorResponseSafe(
+            client_id=i,
+            tensors=tensors,
+            finish_reasons=finish_reason_lst,
+            is_final=True,
+            sequence_index=0,
+            error=error_handle,
+            timestamp=1234.5678,
+            disaggregated_params=disaggregated_params
+        )
+        print(f"put with msg: {response}")
+        push_pipe.put_with_json_serialization(response)
+
+    assert res.result() == (iterations^2 - iterations) / 2
 
 
 Input = PostprocWorker.Input

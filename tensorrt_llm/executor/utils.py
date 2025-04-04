@@ -107,7 +107,7 @@ class ExecutorResponseTensorsSafe(BaseModel):
     class Config:
         arbitrary_types_allowed = True
     
-    output_token_ids: List[List[int]]
+    output_token_ids: list[list[int]]
     # context_logits is a tensor or a string denoting the path to the shared memory.
     context_logits: Optional[torch.Tensor | str]
     # generation_logits is a tensor or a string denoting the path to the shared memory.

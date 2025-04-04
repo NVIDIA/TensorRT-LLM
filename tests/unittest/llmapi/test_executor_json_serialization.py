@@ -137,7 +137,7 @@ def test_ExecutorResponse_json_serialization():
         tllm.FinishReason.CANCELLED
     ]
 
-    error_handle = TypeError("This is a type error.")
+    error_handle = ValueError("This is a Value error.")
 
     # Test with all fields populated
     response = ExecutorResponseSafe(
