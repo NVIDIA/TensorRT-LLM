@@ -180,6 +180,7 @@ examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-in
 examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int8-nb:4]
 examples/test_mixtral.py::test_llm_mixtral_1gpu_fp4_llmapi[Mixtral-8x7B-Instruct-v0.1]
 examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[mixtral-8x7b-v0.1-AWQ]
+examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[Mixtral-8x7B-Instruct-v0.1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]

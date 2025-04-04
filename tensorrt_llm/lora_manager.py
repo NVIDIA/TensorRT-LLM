@@ -136,6 +136,43 @@ def norm_dora_magnitude(W0: torch.Tensor,
 
 
 @dataclass
+class PeftConfig:
+    # TODO (smor) check that can we merge it with LoraConfig or not
+    # FIXME Refine this class
+    def __init__(self):
+        self.lora_target_modules = [
+            'attn_q', 'attn_k', 'attn_v', 'attn_qkv', 'attn_dense',
+            'cross_attn_dense', 'cross_attn_k', 'cross_attn_q',
+            'cross_attn_qkv', 'cross_attn_v', 'mlp_4h_to_h', 'mlp_gate',
+            'mlp_gate_up', 'mlp_h_to_4h', 'mlp_router', 'moe_4h_to_h',
+            'moe_gate', 'moe_h_to_4h', 'moe_router'
+        ]
+        self.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+        )
+        self._hidden_size: int | None = None
+        self._dtype: str | None = None
+
+        # FIXME
+        self.lora_prefetch_dir: str | None = None
+        self.lora_manager_prefetch_dir_list: List[str] = []
+        self.device_cache_percent: float = 0.5
+
+    def update_model_config(self, hidden_size: int, dtype: str):
+        self._hidden_size = hidden_size
+        self._dtype = dtype
+
+    @property
+    def hidden_size(self) -> int:
+        assert self._hidden_size is not None, "The hidden_size of PeftConfig is not initialized."
+        return self._hidden_size
+
+    @property
+    def dtype(self) -> str:
+        assert self._dtype is not None, "The dtype of PeftConfig is not initialized."
+        return self._dtype
+
+
+@dataclass
 class LoraConfig(DictConversion):
     lora_dir: List[str] = field(default_factory=list)
     lora_ckpt_source: str = 'hf'
