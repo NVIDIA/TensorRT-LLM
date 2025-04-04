@@ -34,30 +34,37 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests as shown in the following examples:
+After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs.
 
-.. code-block:: bash
+Chat API
+~~~~~~~~
 
-   curl http://localhost:8000/v1/completions \
-       -H "Content-Type: application/json" \
-       -d '{
-           "model": <model>,
-           "prompt": "Where is New York?",
-           "max_tokens": 16,
-           "temperature": 0
-       }'
+You can query Chat API with any http clients, a typical example is OpenAI Python client:
 
-.. code-block:: bash
+.. literalinclude:: ../../../examples/serve/openai_chat_client.py
+    :language: python
+    :linenos:
 
-   curl http://localhost:8000/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": <model>,
-        "messages":[{"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": "Where is New York?"}],
-        "max_tokens": 16,
-        "temperature": 0
-    }'
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../examples/serve/curl_chat_client.sh
+    :language: bash
+    :linenos:
+
+Completions API
+~~~~~~~~~~~~~~~
+
+You can query Completions API with any http clients, a typical example is OpenAI Python client:
+
+.. literalinclude:: ../../../examples/serve/openai_completion_client.py
+    :language: python
+    :linenos:
+
+Another example uses ``curl``:
+
+.. literalinclude:: ../../../examples/serve/curl_completion_client.sh
+    :language: bash
+    :linenos:
 
 Metrics Endpoint
 ----------------
