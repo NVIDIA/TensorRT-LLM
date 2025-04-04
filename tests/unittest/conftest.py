@@ -14,6 +14,12 @@
 # limitations under the License.
 # # Force resource release after test
 import pytest
+import tqdm
+
+
+def pytest_configure(config):
+    # avoid thread leak of tqdm's TMonitor
+    tqdm.tqdm.monitor_interval = 0
 
 
 @pytest.hookimpl(wrapper=True)
