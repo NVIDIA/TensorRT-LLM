@@ -20,7 +20,8 @@ import torch
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats)
-from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+from tensorrt_llm.bindings.internal.batch_manager import (ReqIdsSet,
+                                                          RequestVector)
 from tensorrt_llm.logger import logger
 
 from .decoder import Decoder
@@ -1396,6 +1397,12 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        cache_trans_complete_requests = RequestVector()
+        for req in scheduled_batch.generation_requests:
+            if req.is_disagg_generation_transmission_complete:
+                cache_trans_complete_requests.append(req)
+        if len(cache_trans_complete_requests) > 0:
+            self._setup_decoder_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1507,6 +1514,16 @@ class PyExecutor:
         try:
             if batch_outputs is not None:
                 return self.decoder.decode_async(scheduled_batch, batch_outputs)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in decode: {error_msg}")
+            self._handle_errors(error_msg)
+
+    @nvtx_range("_setup_decoder_step")
+    def _setup_decoder_step(self, requests):
+        try:
+            return self.decoder.setup_decoder_step(requests)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
