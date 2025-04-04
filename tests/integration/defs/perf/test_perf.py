@@ -1062,6 +1062,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+        report_path = os.path.join(engine_dir, "report.json")
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
         hf_model_name = HF_MODEL_PATH.get(model_name, "")
@@ -1073,6 +1074,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--model_path={model_dir}",
             "throughput",
             f"--dataset={dataset_path}",
+            f"--report_json={report_path}",
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [f"--engine_dir={engine_dir}"]
@@ -1080,6 +1082,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += ["--backend=pytorch"]
         if self._config.max_batch_size > 0:
             benchmark_cmd += [f"--max_batch_size={self._config.max_batch_size}"]
+        if self._config.num_reqs > 0:
+            benchmark_cmd += [f"--num-requests={self._config.num_reqs}"]
         if self._config.concurrency != -1:
             benchmark_cmd += [f"--concurrency={self._config.concurrency}"]
         if self._config.ep_size != None:
