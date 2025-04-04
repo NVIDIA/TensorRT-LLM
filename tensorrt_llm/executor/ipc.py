@@ -11,6 +11,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
+from ..bindings import executor as tllm
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, nvtx_mark,
                             nvtx_range, print_colored, print_colored_debug)
 from .utils import ExecutorResponse, ExecutorResponseTensors
@@ -308,6 +309,23 @@ class ZeroMqQueue:
             log_probs=tensors.log_probs,
             cum_log_probs=tensors.cum_log_probs,
         )
+    def _convert_FinishReason_enum_to_int(finish_reasons: list[tllm.FinishReason]) -> list[int]:
+        return [reason.value for reason in finish_reasons]
+    
+    def _convert_int_to_FinishReason_enum(finish_reasons: list[int]) -> list[tllm.FinishReason]:
+        return [tllm.FinishReason(reason) for reason in finish_reasons]
+    
+    def _convert_Exception_to_str(error: Exception) -> str:
+        return f"{error.__class__.__name__}:{','.join(str(arg) for arg in error.args)}"
+
+    def _convert_str_to_Exception(error: str) -> Exception:
+        exception_type, exception_args = error.split(":", 1)
+        exception_type = eval(exception_type)
+        exception_args = exception_args.split(",") if exception_args else []
+        return exception_type(*exception_args)
+
+    def _check_two_exceptions_equal(e: Exception, e2: Exception) -> bool:
+        assert type(e) is type(e2) and e.args == e2.args
 
     def __del__(self):
         self.close()

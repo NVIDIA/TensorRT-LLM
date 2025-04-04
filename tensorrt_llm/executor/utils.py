@@ -2,17 +2,17 @@ import asyncio
 import concurrent.futures
 import os
 from concurrent.futures import ProcessPoolExecutor
+from pydantic import BaseModel
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 
-from pydantic import BaseModel
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
 from ..bindings import executor as tllm
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggregatedParamsSafe
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
@@ -101,8 +101,9 @@ class ExecutorResponseTensors(NamedTuple):
 
 class ExecutorResponseTensorsSafe(BaseModel):
     # This WAR is necessary to generate pydantic-core schema for <class 'torch.Tensor'>.
-    # It should be noted that pydantic doesn't support serializeing torch.Tensor to json yet,
-    # so in IPC communication, we use string to for context_logits and generation_logits.
+    # Since pydantic doesn't support serializeing torch.Tensor to json, we use string type 
+    # for context_logits and generation_logits in IPC communication and use the Config 
+    # class to allow arbitrary types.
     class Config:
         arbitrary_types_allowed = True
     
@@ -142,23 +143,27 @@ class ExecutorResponse(NamedTuple):
     disaggregated_params: Optional[DisaggregatedParams] = None
 
 
-# class ExecutorResponseSafe(BaseModel):
-#     """ The response from the cpp-executor to the Python main thread. """
-#     client_id: int
-#     tensors: Optional[ExecutorResponseTensorsSafe]
-#     finish_reasons: Optional[List[tllm.FinishReason]]
-#     is_final: Optional[bool]
-#     sequence_index: Optional[int]
-#     # There are two types of errors:
-#     # 1. str for the errors from the cpp-executor.await_responses, this will be dispatched to the user's
-#     #    generate_async as a per-request error, and won't stop the whole service.
-#     # 2. Exception for the errors from the background threads/processes, this will be processed in the main thread,
-#     #    and stop the whole service.
-#     error: Optional[str | Exception]
-#     # The timestamp of the creation of the response. We use this to track the IPC overhead.
-#     timestamp: Optional[float] = None
-#     # Optional disaggregated serving params needed by the generation instances
-#     disaggregated_params: Optional[DisaggregatedParams] = None
+class ExecutorResponseSafe(BaseModel):
+    """ The response from the cpp-executor to the Python main thread. """
+    class Config:
+        arbitrary_types_allowed = True
+        use_enum_values=True
+    
+    client_id: int
+    tensors: Optional[ExecutorResponseTensorsSafe]
+    finish_reasons: Optional[List[tllm.FinishReason | int]] # pydantic cannot serialize pybind enum values so we use int as WAR 
+    is_final: Optional[bool]
+    sequence_index: Optional[int]
+    # There are two types of errors:
+    # 1. str for the errors from the cpp-executor.await_responses, this will be dispatched to the user's
+    #    generate_async as a per-request error, and won't stop the whole service.
+    # 2. Exception for the errors from the background threads/processes, this will be processed in the main thread,
+    #    and stop the whole service.
+    error: Optional[str | Exception]
+    # The timestamp of the creation of the response. We use this to track the IPC overhead.
+    timestamp: Optional[float] = None
+    # Optional disaggregated serving params needed by the generation instances
+    disaggregated_params: Optional[DisaggregatedParamsSafe] = None
 
 class IntraProcessQueue:
     ''' A Queue-like container for IPC within the same process. '''
