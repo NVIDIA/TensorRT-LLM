@@ -449,8 +449,15 @@ void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)
     py::classh<tb::BasePeftCacheManager, PyBasePeftCacheManager>(m, "BasePeftCacheManager")
         .def("add_request_peft", &tb::BasePeftCacheManager::addRequestPeft, py::arg("request"),
             py::arg("try_gpu_cache") = true)
-        .def("ensure_batch", &tb::BasePeftCacheManager::ensureBatch, py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("reset_gpu_cache") = false)
+        .def(
+            "ensure_batch",
+            [](tb::BasePeftCacheManager& self, tb::RequestVector const& contextRequests,
+                tb::RequestVector const& generationRequests, bool resetGpuCache)
+            {
+                py::gil_scoped_release release;
+                return self.ensureBatch(contextRequests, generationRequests, resetGpuCache);
+            },
+            py::arg("context_requests"), py::arg("generation_requests"), py::arg("reset_gpu_cache") = false)
         .def("reset_device_cache", &tb::BasePeftCacheManager::resetDeviceCache)
         .def("mark_request_done", &tb::BasePeftCacheManager::markRequestDone, py::arg("request"),
             py::arg("pause") = false)

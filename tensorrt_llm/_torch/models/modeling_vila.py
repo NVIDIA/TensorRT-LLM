@@ -30,9 +30,8 @@ from einops import rearrange
 from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModel
-from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
-from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
+from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
+                          AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
 from ..._utils import nvtx_range
@@ -560,6 +559,63 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
+def _resize_embeds(old_embeddings, new_num_tokens):
+    # build new embeddings
+    old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+    new_embeddings = nn.Embedding(
+        new_num_tokens,
+        old_embedding_dim,
+        device=old_embeddings.weight.device,
+        dtype=old_embeddings.weight.dtype,
+    )
+
+    # copy weights
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_embeddings.weight.data[:
+                               num_tokens_to_copy, :] = old_embeddings.weight.data[:
+                                                                                   num_tokens_to_copy, :]
+    old_embeddings.weight.data = new_embeddings.weight.data
+    old_embeddings.num_embeddings = new_embeddings.weight.data.shape[0]
+    if hasattr(old_embeddings,
+               "padding_idx") and old_embeddings.padding_idx is not None:
+        if (new_num_tokens - 1) < old_embeddings.padding_idx:
+            old_embeddings.padding_idx = None
+    return old_embeddings
+
+
+def _resize_lm_head(old_lm_head, new_num_tokens):
+    # build new lm head
+    old_num_tokens, old_lm_head_dim = old_lm_head.weight.size()
+    new_lm_head_shape = (old_lm_head_dim, new_num_tokens)
+    has_new_lm_head_bias = old_lm_head.bias is not None
+    new_lm_head = nn.Linear(
+        *new_lm_head_shape,
+        bias=has_new_lm_head_bias,
+        device=old_lm_head.weight.device,
+        dtype=old_lm_head.weight.dtype,
+    )
+
+    # copy weights and bias
+    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    new_lm_head.weight.data[:
+                            num_tokens_to_copy, :] = old_lm_head.weight.data[:
+                                                                             num_tokens_to_copy, :]
+    old_lm_head.weight.data = new_lm_head.weight.data
+
+    if has_new_lm_head_bias:
+        new_lm_head.bias.data[:
+                              num_tokens_to_copy] = old_lm_head.bias.data[:
+                                                                          num_tokens_to_copy]
+        old_lm_head.bias.data = new_lm_head.bias.data
+    return old_lm_head
+
+
+def _resize_token_embeddings(llm, new_num_tokens: int):
+    _resize_embeds(llm.model.embed_tokens, new_num_tokens)
+    if hasattr(llm, "lm_head"):
+        _resize_lm_head(llm.lm_head, new_num_tokens)
+
+
 def init_llm(
     llm_path: str,
     model_config: ModelConfig[PretrainedConfig],
@@ -568,30 +624,9 @@ def init_llm(
     *args,
     **kwargs,
 ) -> PreTrainedModel:
-    # Pre-run to resize vocab embedding (see: https://github.com/NVlabs/VILA/blob/86e009759a14eee045c669421128d703227da362/llava/model/builder.py#L137)
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     tokenizer = init_tokenizer(llm_path)
-    if llm_cfg.vocab_size != len(tokenizer):
-        warnings.warn(
-            "LLM's vocab size does not match tokenizer's vocab size! It is likely this multimodal model has extended the vocabulary with extra special tokens, and have used resize_token_embeddings() (https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings) in the PyTorch implementation. Here, the only way is to refresh the word embedding weight and re-save the checkpoint and update vocab size. This is a one-off operation for a given model. Tokenzier is not re-saved, just the LLM checkpoint."
-        )
-        warnings.warn(
-            "Please be patient when the checkpoint is being updated...")
-        model_hf = HFAutoModelForCausalLM.from_pretrained(llm_path,
-                                                          torch_dtype="auto")
-        model_hf.resize_token_embeddings(len(tokenizer))
-        warnings.warn(f"Saving to {llm_path} by overwriting...")
-        try:
-            model_hf.save_pretrained(llm_path)
-        except (OSError, PermissionError):
-            import tempfile
-            llm_path = os.path.join(tempfile.gettempdir(), "vila")
-            warnings.warn(
-                f"Current checkpoint directory is read-only. Saving to {llm_path} instead."
-            )
-            model_hf.save_pretrained(llm_path)
 
-    # Real run
     llm_cfg = AutoConfig.from_pretrained(llm_path)
     llm_cfg._attn_implementation = attn_implementation
     llm_cfg.model_max_length = model_max_length
@@ -607,6 +642,10 @@ def init_llm(
     llm_model_config = copy.deepcopy(model_config)
     llm_model_config.pretrained_config = llm_cfg
     llm = AutoModelForCausalLM.from_config(llm_model_config)
+    if llm_cfg.vocab_size != len(tokenizer):
+        warnings.warn(
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
+        )
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
     return tokenizer, llm, llm_path, llm_cfg.vocab_size
@@ -1129,8 +1168,11 @@ class VilaModel(PreTrainedModel):
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
         input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
-        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                  inputs_embeds, return_context_logits)
+        logits = self.llm.forward(attn_metadata=attn_metadata,
+                                  input_ids=input_ids,
+                                  position_ids=position_ids,
+                                  inputs_embeds=inputs_embeds,
+                                  return_context_logits=return_context_logits)
         return logits
 
     def get_llm(self):
@@ -1146,6 +1188,10 @@ class VilaModel(PreTrainedModel):
 
     def load_weights(self, weights):
         self.llm.load_weights(weights)
+        # resize token embeddings if vocab size mismatch after loading weights
+        if self.vocab_size != len(self.tokenizer):
+            _resize_token_embeddings(self.llm, len(self.tokenizer))
+            self.vocab_size = len(self.tokenizer)
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

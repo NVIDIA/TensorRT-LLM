@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
@@ -49,6 +50,34 @@ namespace tensorrt_llm::pybind::batch_manager
 void initBindings(pybind11::module_& m)
 {
     using GenLlmReq = tb::GenericLlmRequest<runtime::ITensor::SharedPtr>;
+
+    // Create and register exceptions in module scope
+    static PyObject* peft_exc = PyErr_NewException(
+        "tensorrt_llm.bindings.internal.batch_manager.PeftTaskNotCachedException", nullptr, nullptr);
+    static PyObject* lora_exc
+        = PyErr_NewException("tensorrt_llm.bindings.internal.batch_manager.LoraCacheFullException", nullptr, nullptr);
+
+    m.add_object("PeftTaskNotCachedException", py::handle(peft_exc));
+    m.add_object("LoraCacheFullException", py::handle(lora_exc));
+
+    // Register with no captures
+    py::register_exception_translator(
+        [](std::exception_ptr p)
+        {
+            try
+            {
+                if (p)
+                    std::rethrow_exception(p);
+            }
+            catch (const tb::PeftTaskNotCachedException& e)
+            {
+                PyErr_SetString(peft_exc, e.what());
+            }
+            catch (const tr::LoraCacheFullException& e)
+            {
+                PyErr_SetString(lora_exc, e.what());
+            }
+        });
 
     PybindUtils::bindSet<tb::ReqIdsSet>(m, "ReqIdsSet");
 
@@ -138,7 +167,8 @@ void initBindings(pybind11::module_& m)
                 }
                 return value;
             })
-        .def("lora_config",
+        .def_property(
+            "lora_config",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -148,8 +178,11 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
-        .def("lora_weights",
+            },
+            [](GenLlmReq& self, at::Tensor& loraConfig)
+            { self.setLoraConfig(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraConfig))); })
+        .def_property(
+            "lora_weights",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -159,7 +192,9 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
+            },
+            [](GenLlmReq& self, at::Tensor& loraWeights)
+            { self.setLoraWeights(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraWeights))); })
         .def("stop_words_list",
             [](GenLlmReq& self)
             {

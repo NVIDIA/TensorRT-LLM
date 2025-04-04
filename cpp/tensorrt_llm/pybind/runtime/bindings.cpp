@@ -193,7 +193,20 @@ namespace tensorrt_llm::pybind::runtime
 void initBindings(pybind11::module_& m)
 {
     py::classh<tr::ITensor, PyITensor>(m, "ITensor").def(py::init());
-    py::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig").def(py::init());
+    py::class_<tr::LoraCache::TaskLayerModuleConfig>(m, "TaskLayerModuleConfig")
+        .def(py::init<>())
+        .def_readwrite("pageId", &tr::LoraCache::TaskLayerModuleConfig::pageId)
+        .def_readwrite("slotIdx", &tr::LoraCache::TaskLayerModuleConfig::slotIdx)
+        .def_readwrite("inSize", &tr::LoraCache::TaskLayerModuleConfig::inSize)
+        .def_readwrite("outSize", &tr::LoraCache::TaskLayerModuleConfig::outSize)
+        .def_readwrite("moduleId", &tr::LoraCache::TaskLayerModuleConfig::moduleId)
+        .def_readwrite("layerId", &tr::LoraCache::TaskLayerModuleConfig::layerId)
+        .def_readwrite("adapterSize", &tr::LoraCache::TaskLayerModuleConfig::adapterSize)
+        .def_readwrite("numSlots", &tr::LoraCache::TaskLayerModuleConfig::numSlots)
+        .def_readwrite("weightsInPointer", &tr::LoraCache::TaskLayerModuleConfig::weightsInPointer)
+        .def_readwrite("weightsOutPointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
+        .def_readwrite("scalingVecPointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
+        .def(py::self == py::self);
 
     py::classh<tr::CudaStream>(m, "CudaStream")
         .def(py::init(
