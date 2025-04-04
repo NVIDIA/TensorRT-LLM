@@ -15,6 +15,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationExecutor, GenerationRequest,
                                    GenerationResult, GenerationResultBase,
                                    PostprocWorker)
+from tensorrt_llm.executor.utils import ExecutorResponseTensorsSafe
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.llmapi import LLM, BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -345,6 +346,86 @@ def test_ZeroMqQueue_sync_async():
     for i in range(10):
         print(f"put: {i}")
         push_pipe.put(i)
+
+    assert res.result() == 45
+
+def test_ExecutorResponseTensors_json_serialization():
+    tensors = ExecutorResponseTensorsSafe(
+        output_token_ids=[[64, 128], [256, 512]],
+        context_logits="random_context_tensor_123",
+        generation_logits="random_generation_tensor_456",
+        log_probs=[0.1, 0.2, 0.3, 0.4],
+        cum_log_probs=[0.1, 0.3, 0.6, 1.0],
+    )
+
+    # context_logits and generation_logits cannot be torch.Tensor, otherwise pydantic will not be able to serialize it
+    assert isinstance(tensors.context_logits, str)
+    assert isinstance(tensors.generation_logits, str)
+
+    # Test JSON serialization
+    json_str = tensors.model_dump_json()
+    assert isinstance(json_str, str)
+    
+    # Test deserialization
+    deserialized = ExecutorResponseTensorsSafe.model_validate_json(json_str)
+    
+    # Verify the deserialized data matches the original
+    assert deserialized.output_token_ids == tensors.output_token_ids
+    assert deserialized.context_logits == tensors.context_logits
+    assert deserialized.generation_logits == tensors.generation_logits
+    assert deserialized.log_probs == tensors.log_probs
+    assert deserialized.cum_log_probs == tensors.cum_log_probs
+
+    # Test with None values
+    tensors_none = ExecutorResponseTensorsSafe(
+        output_token_ids=[[64, 128]],
+        context_logits="random_context_tensor_123",
+        generation_logits="random_generation_tensor_456",
+        log_probs=None,
+        cum_log_probs=None,
+    )
+    
+    json_str_none = tensors_none.model_dump_json()
+    deserialized_none = ExecutorResponseTensorsSafe.model_validate_json(json_str_none)
+    
+    assert deserialized_none.output_token_ids == tensors_none.output_token_ids
+    assert deserialized_none.context_logits == tensors_none.context_logits
+    assert deserialized_none.generation_logits == tensors_none.generation_logits
+    assert deserialized_none.log_probs is None
+    assert deserialized_none.cum_log_probs is None
+
+def _ZeroMqQueue_json_task(addr: str):
+    print(f"Setup receiver: {addr}")
+    pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
+    print(f"after setup receiver")
+
+    total = 0
+
+    async def task():
+        print(f"running task")
+        for i in range(10):
+            print(f"waiting for msg")
+            msg = await pull_pipe.get_async_with_json_serialization()
+            print(f"received: {msg}")
+            nonlocal total
+            total += msg
+
+    print(f"to run task")
+    asyncio.run(task())
+
+    return total
+
+
+def test_ZeroMqQueue_json_serialization():
+    # sync send with JSON serialization, async recv with JSON serialization
+    push_pipe = ZeroMqQueue(is_async=False, is_server=True)
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    res = pool.submit(_ZeroMqQueue_json_task, push_pipe.address)
+
+    for i in range(10):
+        print(f"put: {i}")
+        push_pipe.put_with_json_serialization(i)
 
     assert res.result() == 45
 

@@ -106,6 +106,24 @@ class ZeroMqQueue:
         with nvtx_range("send", color="blue", category="IPC"):
             self.socket.send_pyobj(obj)
 
+    def put_with_json_serialization(self, obj: Any):
+        self.setup_lazily()
+
+        if isinstance(obj, ExecutorResponse):
+            tensors = self._store_tensors_in_shmm(obj.tensors)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                sequence_index=obj.sequence_index,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+
+        with nvtx_range("send", color="blue", category="IPC"):
+            self.socket.send_json(obj)
+
     async def put_async(self, obj: Any):
         self.setup_lazily()
         if isinstance(obj, ExecutorResponse):
@@ -121,6 +139,31 @@ class ZeroMqQueue:
 
         try:
             await self.socket.send_pyobj(obj)
+        except TypeError as e:
+            logger.error(f"Cannot pickle {obj}")
+            raise e
+        except Exception as e:
+            logger.error(f"Error sending object: {e}")
+            logger.error(traceback.format_exc())
+            raise e
+
+        nvtx_mark("ipc.send", color="blue", category="IPC")
+    
+    async def put_async_with_json_serialization(self, obj: Any):
+        self.setup_lazily()
+        if isinstance(obj, ExecutorResponse):
+            tensors = self._store_tensors_in_shmm(obj.tensors)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+
+        try:
+            await self.socket.send_json(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -149,10 +192,47 @@ class ZeroMqQueue:
                 disaggregated_params=obj.disaggregated_params)
         return obj
 
+    def get_with_json_serialization(self) -> Any:
+        self.setup_lazily()
+
+        obj = self.socket.recv_json()
+        nvtx_mark("ipc.get", color="orange", category="IPC")
+
+        if isinstance(obj, ExecutorResponse):
+            tensors = self._load_tensors_from_shmm(obj.tensors)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+        return obj
+
     async def get_async(self) -> Any:
         self.setup_lazily()
 
         obj = await self.socket.recv_pyobj()
+        nvtx_mark("ipc.get", color="orange", category="IPC")
+
+        if isinstance(obj, ExecutorResponse):
+            tensors = self._load_tensors_from_shmm(obj.tensors)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                sequence_index=obj.sequence_index,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+        return obj
+    
+    async def get_async_with_json_serialization(self) -> Any:
+        self.setup_lazily()
+
+        obj = await self.socket.recv_json()
         nvtx_mark("ipc.get", color="orange", category="IPC")
 
         if isinstance(obj, ExecutorResponse):

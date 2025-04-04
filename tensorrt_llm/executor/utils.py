@@ -7,6 +7,7 @@ from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from pydantic import BaseModel
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
@@ -98,6 +99,23 @@ class ExecutorResponseTensors(NamedTuple):
     log_probs: Optional[list]
     cum_log_probs: Optional[list]
 
+class ExecutorResponseTensorsSafe(BaseModel):
+    # This WAR is necessary to generate pydantic-core schema for <class 'torch.Tensor'>.
+    # It should be noted that pydantic doesn't support serializeing torch.Tensor to json yet,
+    # so in IPC communication, we use string to for context_logits and generation_logits.
+    class Config:
+        arbitrary_types_allowed = True
+    
+    output_token_ids: List[List[int]]
+    # context_logits is a tensor or a string denoting the path to the shared memory.
+    context_logits: Optional[torch.Tensor | str]
+    # generation_logits is a tensor or a string denoting the path to the shared memory.
+    generation_logits: Optional[torch.Tensor | str]
+    # context_logits: Optional[str]
+    # generation_logits: Optional[str]
+    log_probs: Optional[list]
+    cum_log_probs: Optional[list]
+
 
 class ErrorResponse(NamedTuple):
     client_id: int
@@ -123,6 +141,24 @@ class ExecutorResponse(NamedTuple):
     # Optional disaggregated serving params needed by the generation instances
     disaggregated_params: Optional[DisaggregatedParams] = None
 
+
+# class ExecutorResponseSafe(BaseModel):
+#     """ The response from the cpp-executor to the Python main thread. """
+#     client_id: int
+#     tensors: Optional[ExecutorResponseTensorsSafe]
+#     finish_reasons: Optional[List[tllm.FinishReason]]
+#     is_final: Optional[bool]
+#     sequence_index: Optional[int]
+#     # There are two types of errors:
+#     # 1. str for the errors from the cpp-executor.await_responses, this will be dispatched to the user's
+#     #    generate_async as a per-request error, and won't stop the whole service.
+#     # 2. Exception for the errors from the background threads/processes, this will be processed in the main thread,
+#     #    and stop the whole service.
+#     error: Optional[str | Exception]
+#     # The timestamp of the creation of the response. We use this to track the IPC overhead.
+#     timestamp: Optional[float] = None
+#     # Optional disaggregated serving params needed by the generation instances
+#     disaggregated_params: Optional[DisaggregatedParams] = None
 
 class IntraProcessQueue:
     ''' A Queue-like container for IPC within the same process. '''
