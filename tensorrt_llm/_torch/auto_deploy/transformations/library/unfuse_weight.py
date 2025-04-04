@@ -7,6 +7,8 @@ The algorithm works as follows:
     If so, grab the subgraph and replace old param with new param and delete subgraph in the graph
 2. Update load_hook so that during weight loading, old weight param is mapped to new weight param
     with the subgraph in 1
+
+TODO: Add support for quantized graph
 """
 
 from collections import defaultdict
@@ -38,6 +40,10 @@ def _create_and_register_weight(
     weight_split_info: DefaultDict[str, List[Tuple[str, int, int]]],
 ):
     orig_weight = gm.get_parameter(weight_key)
+
+    # Register each unfused_weight in a uniquely-named submodule so unused ones
+    # can be cleaned up by `gm.delete_all_unused_submodules()`. Direct attributes
+    # are not deleted automatically.
     weight_module_path, sub_weight_key = weight_key.rsplit(".", 1)
     new_module_name = f"{weight_module_path}_unfused_{user.name}"
     new_param_name = f"{sub_weight_key}"

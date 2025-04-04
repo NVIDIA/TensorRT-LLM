@@ -85,11 +85,11 @@ class InferenceOptimizer:
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
 
-        # unfuse weights
-        egm = unfuse_weights(egm)
-
         # quantization
         egm = quantize(egm, self.factory.get_quant_config())
+
+        # unfuse weights
+        egm = unfuse_weights(egm)
 
         # Match MoE pattern
         egm = match_moe_pattern(egm)

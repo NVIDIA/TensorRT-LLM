@@ -41,6 +41,9 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
 
+    # Register each fused_weight in a uniquely-named submodule so unused ones
+    # can be cleaned up by `gm.delete_all_unused_submodules()`. Direct attributes
+    # are not deleted automatically.
     new_weight_key = _fuse_keys(keys_unfused)
     new_module_name, new_param_name = new_weight_key.rsplit(".", 1)
 
@@ -108,7 +111,7 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
     fused_kwargs = dict(linear_nodes[0].kwargs)
 
     with gm.graph.inserting_before(linear_nodes[0]):
-        get_param_node = gm.graph.create_node("get_attr", full_new_param_name)
+        get_param_node = gm.graph.get_attr(full_new_param_name, torch.Tensor)
         if quantization_impl:
             for scale_name in quantization_impl.scale_names():
                 # Creates new nodes for the fused scales so the unfused linear ops can be fully erased.
@@ -133,7 +136,9 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
 
     # Clean up deleted modules to save GPU memory
     gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+    for key_unfused in keys_unfused:
+        submodule_name, _ = key_unfused.rsplit(".", 1)
+        gm.delete_submodule(submodule_name)
 
 
 def _fuse_keys(keys: list[str]) -> str:
@@ -145,6 +150,8 @@ def _fuse_keys(keys: list[str]) -> str:
 
     """
     token_lists = [key.split(".") for key in keys]
+    # Check that all keys have same suffix
+    assert len(set(tokens[-1] for tokens in token_lists)) == 1
 
     common_prefix = []
     for tokens in zip(*token_lists):
