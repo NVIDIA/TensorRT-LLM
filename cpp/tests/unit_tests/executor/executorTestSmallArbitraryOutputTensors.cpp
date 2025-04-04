@@ -34,7 +34,7 @@ namespace tensorrt_llm::testing
 struct TrivialConstantDecoderWithTopKLogitsTestParameters
 {
     using TupleT = std::tuple<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-        runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32>;
+        runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, bool>;
     runtime::SizeType32 randomSeed;
     runtime::SizeType32 vocabSize;
     runtime::SizeType32 maxNumTokens;
@@ -44,6 +44,7 @@ struct TrivialConstantDecoderWithTopKLogitsTestParameters
     runtime::SizeType32 numRequests;
     runtime::SizeType32 promptLength;
     runtime::SizeType32 maxOutputLength;
+    bool gatherContext;
 
     // Constructor that takes a tuple
     TrivialConstantDecoderWithTopKLogitsTestParameters( // NOLINT: implicit to allow gtest to convert from tuple
@@ -58,6 +59,7 @@ struct TrivialConstantDecoderWithTopKLogitsTestParameters
         , numRequests(std::get<6>(t))
         , promptLength(std::get<7>(t))
         , maxOutputLength(std::get<8>(t))
+        , gatherContext(std::get<9>(t))
     {
     }
 };
@@ -122,7 +124,7 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
             std::nullopt, std::nullopt, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
             executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt,
             std::vector<executor::AdditionalModelOutput>{
-                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName}});
+                executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, params.gatherContext}});
 
     auto optionalParams = batch_manager::TrtGptModelOptionalParams{executorConfig, false};
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
@@ -423,19 +425,27 @@ constexpr runtime::SizeType32 kMinMaxOutputLength = 4;
 constexpr runtime::SizeType32 kMaxMaxOutputLength = 256;
 auto const maxOutputLengths = ::testing::Values(kMinMaxOutputLength, kMaxMaxOutputLength);
 
+auto const gatherContext = ::testing::Values(false, true);
+auto const alwaysGatherContext = ::testing::Values(true);
+
 auto const paramGenerator = ::testing::ConvertGenerator<TrivialConstantDecoderWithTopKLogitsTestParameters::TupleT>(
     ::testing::Combine(randomSeeds, vocabSizes, maxNumTokenses, beamWidths, batchSizes, numTopKLogitses, numRequestses,
-        promptLengths, maxOutputLengths));
+        promptLengths, maxOutputLengths, gatherContext));
+
+auto const paramGeneratorGatherContext
+    = ::testing::ConvertGenerator<TrivialConstantDecoderWithTopKLogitsTestParameters::TupleT>(
+        ::testing::Combine(randomSeeds, vocabSizes, maxNumTokenses, beamWidths, batchSizes, numTopKLogitses,
+            numRequestses, promptLengths, maxOutputLengths, alwaysGatherContext));
 
 auto const nameSuffixGenerator
     = [](::testing::TestParamInfo<TrivialConstantDecoderWithTopKLogitsTestParameters> const& info) -> std::string
 {
     std::stringstream nameStringStream;
-    nameStringStream << "_maxBatchSize_" << info.param.maxBatchSize << "_vocabSize_" << info.param.vocabSize
-                     << "_maxBeamWidth_" << info.param.maxBeamWidth << "_maxNumTokens_" << info.param.maxNumTokens
-                     << "_maxOutputLength_" << info.param.maxOutputLength << "_numRequests_" << info.param.numRequests
-                     << "_numTopKLogits_" << info.param.numTopKLogits << "_promptLength_" << info.param.promptLength
-                     << "_randomSeed_" << info.param.randomSeed;
+    nameStringStream << "gatherContext_" << info.param.gatherContext << "_maxBatchSize_" << info.param.maxBatchSize
+                     << "_vocabSize_" << info.param.vocabSize << "_maxBeamWidth_" << info.param.maxBeamWidth
+                     << "_maxNumTokens_" << info.param.maxNumTokens << "_maxOutputLength_" << info.param.maxOutputLength
+                     << "_numRequests_" << info.param.numRequests << "_numTopKLogits_" << info.param.numTopKLogits
+                     << "_promptLength_" << info.param.promptLength << "_randomSeed_" << info.param.randomSeed;
     return nameStringStream.str();
 };
 
@@ -466,7 +476,8 @@ TEST_P(DecoderTopKContextLogitsStreamingFloatTest, TestSizeAndValues)
     runTopKContextLogitsTest(GetParam());
 }
 
-INSTANTIATE_TEST_SUITE_P(Float, DecoderTopKContextLogitsStreamingFloatTest, paramGenerator, nameSuffixGenerator);
+INSTANTIATE_TEST_SUITE_P(
+    Float, DecoderTopKContextLogitsStreamingFloatTest, paramGeneratorGatherContext, nameSuffixGenerator);
 
 using DecoderTopKContextLogitsFloatTest = DecoderTopKContextLogitsTest<float>;
 
@@ -475,6 +486,6 @@ TEST_P(DecoderTopKContextLogitsFloatTest, TestSizeAndValues)
     runTopKContextLogitsTest(GetParam());
 }
 
-INSTANTIATE_TEST_SUITE_P(Float, DecoderTopKContextLogitsFloatTest, paramGenerator, nameSuffixGenerator);
+INSTANTIATE_TEST_SUITE_P(Float, DecoderTopKContextLogitsFloatTest, paramGeneratorGatherContext, nameSuffixGenerator);
 
 } // namespace tensorrt_llm::testing
