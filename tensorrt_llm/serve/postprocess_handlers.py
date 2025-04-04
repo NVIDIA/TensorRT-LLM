@@ -5,6 +5,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..llmapi.tokenizer import TransformersTokenizer
+from ..llmapi.utils import nvtx_range
 # yapf: disable
 from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionLogProbsContent,
@@ -68,6 +69,7 @@ def create_logprobs(token_ids: List[int],
     return chat_logprobs
 
 
+@nvtx_range("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> List[str]:
 
     def yield_first_chat(num_tokens: int,
@@ -155,6 +157,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
     return res
 
 
+@nvtx_range("chat_response_post_processor")
 def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> ChatCompletionResponse:
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
@@ -223,6 +226,7 @@ class CompletionPostprocArgs(PostprocArgs):
         )
 
 
+@nvtx_range("completion_stream_post_processor")
 def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
     prompt_tokens = args.num_prompt_tokens
@@ -268,6 +272,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
     return res
 
 
+@nvtx_range("completion_response_post_processor")
 def completion_response_post_processor(rsp: GenerationResult, args: CompletionPostprocArgs) -> CompletionResponse:
     prompt_tokens = args.num_prompt_tokens
     completion_tokens = 0
