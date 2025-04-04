@@ -423,7 +423,7 @@ def _beam_search_candidates(prompt_state: Tensor, init_token: Tensor,
     state_shape = shape(context, cast_to_dtype=INT_DTYPE_STR)  # [bs, nb, H]
     state = expand(expand_dims(constant_to_tensor_(0.0, dtype=dtype), [0, 1]),
                    state_shape)  # [bs, nb, H]
-    logits_token_in_beam = None
+    log_p_token_in_beam = None
     candidate_length = beam_length - 1
     for _ in range(candidate_length):
         state = (
@@ -464,22 +464,22 @@ def _beam_search_candidates(prompt_state: Tensor, init_token: Tensor,
         state = _gather_beams(state, gather_indices, batch_size,
                               num_beams)  # [bs, nb, H]
 
-        cur_logits_token_in_beam = unsqueeze(
+        cur_log_p_token_in_beam = unsqueeze(
             _gather_beams(log_p_new_token, gather_indices, batch_size,
                           num_beams), 2)  # [bs, nb, 1, V]
-        if logits_token_in_beam is None:  # first iteration
-            logits_token_in_beam = cur_logits_token_in_beam
+        if log_p_token_in_beam is None:  # first iteration
+            log_p_token_in_beam = cur_log_p_token_in_beam
         else:
-            logits_token_in_beam = concat(
+            log_p_token_in_beam = concat(
                 [
-                    _gather_beams(logits_token_in_beam, gather_indices,
+                    _gather_beams(log_p_token_in_beam, gather_indices,
                                   batch_size,
                                   num_beams),  # prev_top_logits [bs, nb, i, V]
-                    cur_logits_token_in_beam
+                    cur_log_p_token_in_beam
                 ],
                 dim=2)  # [bs, nb, i+1, V]
         last_tokens = top_token_ids  # [bs, nb]
-    return beams, logits_token_in_beam
+    return beams, log_p_token_in_beam
 
 
 def _beam_search_candidates_v0(x: Tensor, init_token: Tensor,
