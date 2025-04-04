@@ -58,6 +58,24 @@ def parse_arguments():
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
+    parser.add_argument(
+        "--use_fp8",
+        action="store_true",
+        default=False,
+        help="Enable FP8 per-tensor quantization")
+    parser.add_argument(
+        "--use_fp8_rowwise",
+        action="store_true",
+        default=False,
+        help="Enable FP8 per-token per-channel quantization")
+    parser.add_argument(
+        "--use_meta_fp8_rowwise_recipe",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Meta's LLaMA 3.1 recipe for FP8 per-token per-channel quantization. "
+        "This skips quantization for the first and last Transformer layers and all the Attention layers. "
+        "This option is effective only if use_fp8_rowwise is enabled.")
     parser.add_argument("--load_model_on_cpu", action="store_true")
     parser.add_argument(
         '--use_parallel_embedding',
@@ -101,6 +119,13 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
             quant_config.quant_algo = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
             quant_config.quant_algo = QuantAlgo.W4A16
+    elif args.use_fp8:
+        quant_config.quant_algo = QuantAlgo.FP8
+    elif args.use_fp8_rowwise:
+        quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+        quant_config.use_meta_recipe = args.use_meta_fp8_rowwise_recipe
+        # TODO: Validate this is the correct clamp range for command models
+        quant_config.clamp_val = [-1200.0, 1200.0]
 
     return quant_config
 
