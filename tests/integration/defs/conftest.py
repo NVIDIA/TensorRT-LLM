@@ -25,11 +25,13 @@ import time
 import urllib.request
 from functools import wraps
 from pathlib import Path
+from typing import Iterable, Sequence
 
 import defs.ci_profiler
 import psutil
 import pytest
 import yaml
+from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 
@@ -1828,6 +1830,37 @@ def star_attention_input_root(llm_root):
     star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
 
     return star_attention_input_root
+
+
+def parametrize_with_ids(argnames: str | Sequence[str],
+                         argvalues: Iterable[ParameterSet | Sequence[object]
+                                             | object], **kwargs):
+    if isinstance(argnames, str):
+        argname_list = [n.strip() for n in argnames.split(",")]
+    else:
+        argname_list = argnames
+
+    case_ids = []
+    for case_argvalues in argvalues:
+        if isinstance(case_argvalues, ParameterSet):
+            case_argvalues = case_argvalues.values
+        elif case_argvalues is None or isinstance(case_argvalues,
+                                                  (str, float, int, bool)):
+            case_argvalues = (case_argvalues, )
+        assert len(case_argvalues) == len(argname_list)
+
+        case_id = []
+        for name, value in zip(argname_list, case_argvalues):
+            if value is None:
+                pass
+            elif isinstance(value, bool):
+                if value:
+                    case_id.append(name)
+            else:
+                case_id.append(f"{name}={value}")
+        case_ids.append("-".join(case_id))
+
+    return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
 
 
 @pytest.fixture(autouse=True)

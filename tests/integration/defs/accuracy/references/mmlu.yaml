@@ -51,8 +51,13 @@ Qwen/Qwen2.5-7B-Instruct:
   - quant_algo: FP8
     accuracy: 75.32
 deepseek-ai/DeepSeek-V3-Lite:
-  - accuracy: 71.47
+  - accuracy: 71.40
   - quant_algo: NVFP4
-    accuracy: 70.66
+    accuracy: 70.60
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 71.32
+    accuracy: 71.27
+  - spec_dec_algo: MTP
+    accuracy: 71.39
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 71.29

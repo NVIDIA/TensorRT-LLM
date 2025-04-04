@@ -229,8 +229,13 @@ nvidia/Nemotron-Mini-4B-Instruct:
     kv_cache_quant_algo: FP8
     accuracy: 25.72
 deepseek-ai/DeepSeek-V3-Lite:
-  - accuracy: 25.682
+  - accuracy: 26.465
   - quant_algo: NVFP4
-    accuracy: 25.243
+    accuracy: 26.629
   - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 25.546
+    accuracy: 26.103
+  - spec_dec_algo: MTP
+    accuracy: 26.479
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 26.230
