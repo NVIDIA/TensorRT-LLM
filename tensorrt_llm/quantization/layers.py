@@ -1992,8 +1992,10 @@ class Fp8RowwiseAttention(Module):
         if use_cache:
             assert kv_cache_params.is_valid(
                 default_net().plugin_config.gpt_attention_plugin)
-        assert self.attention_mask_type == AttentionMaskType.causal, \
-            'Plugin only support masked MHA.'
+        assert self.attention_mask_type in [
+            AttentionMaskType.causal,
+            AttentionMaskType.sliding_window_causal
+        ], 'Plugin only support masked MHA.'
         if self.kv_cache_scaling_factor is not None:
             kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value
@@ -2618,8 +2620,10 @@ class SmoothQuantAttention(Module):
             if use_cache:
                 assert kv_cache_params.is_valid(
                     default_net().plugin_config.gpt_attention_plugin)
-            assert self.attention_mask_type == AttentionMaskType.causal, \
-                'Plugin only support masked MHA.'
+            assert self.attention_mask_type in [
+                AttentionMaskType.causal,
+                AttentionMaskType.sliding_window_causal
+            ], 'Plugin only support masked MHA.'
             if self.kv_cache_scaling_factor is not None:
                 kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
@@ -3140,8 +3144,10 @@ class QServeAttention(Module):
             if use_cache:
                 assert kv_cache_params.is_valid(
                     default_net().plugin_config.gpt_attention_plugin)
-            assert self.attention_mask_type == AttentionMaskType.causal, \
-                'Plugin only support masked MHA.'
+            assert self.attention_mask_type in [
+                AttentionMaskType.causal,
+                AttentionMaskType.sliding_window_causal
+            ], 'Plugin only support masked MHA.'
             if self.kv_cache_scaling_factor is not None:
                 kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
