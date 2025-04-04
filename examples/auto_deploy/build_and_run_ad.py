@@ -105,6 +105,7 @@ def main(config: Optional[SimpleConfig] = None):
             "Benchmark with " + ", ".join(f"{k}={getattr(config, k)}" for k in keys),
             results_path=config.benchmark_results_path,
         )
+    llm.shutdown()
 
 
 if __name__ == "__main__":
