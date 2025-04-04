@@ -571,7 +571,7 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         arch = 80;
     }
     // Force use sm80 kernel for GB20x.
-    if (arch == 120)
+    if (arch >= 120)
     {
         arch = 80;
     }

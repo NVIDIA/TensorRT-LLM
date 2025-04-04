@@ -184,7 +184,7 @@ def test_deepseek(model_name, backend, quant, test_config):
     if is_fp8 and getSMVersion() != 90:
         pytest.skip(f"FP8 is not supported in this SM version {getSMVersion()}")
 
-    if is_fp4 and getSMVersion() < 100:
+    if is_fp4 and (getSMVersion() < 100 or getSMVersion() >= 120):
         pytest.skip(f"FP4 is not supported in this SM version {getSMVersion()}")
 
     if is_fp4 and mtp_nextn > 0:
