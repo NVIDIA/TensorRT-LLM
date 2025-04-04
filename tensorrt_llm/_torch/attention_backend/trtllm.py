@@ -502,8 +502,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(kv_lens[:self.num_seqs],
-                                                non_blocking=True)
+        self.kv_lens_cuda[:self.num_seqs].copy_(
+            kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
@@ -520,7 +520,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
-            self.request_ids)
+            self.request_ids).pin_memory()
         num_blocks = block_ids_per_seq.shape[1]
         self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
             block_ids_per_seq, non_blocking=True)

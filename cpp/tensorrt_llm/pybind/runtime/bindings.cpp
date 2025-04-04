@@ -336,15 +336,15 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::DecodingInput>(m, "DecodingInput");
     py::class_<tr::DecodingOutput>(m, "DecodingOutput");
 
-    py::class_<tr::decoder_batch::DecoderFinishedEvent>(m, "Token")
+    py::class_<tr::CudaEvent>(m, "CudaEvent")
         .def(py::init(
-            [](CudaStreamPtr stream, std::vector<bool> const& active)
+            [](CudaStreamPtr stream)
             {
                 tr::CudaEvent eventStop{};
                 stream->record(eventStop);
-                return std::make_unique<tr::decoder_batch::DecoderFinishedEvent>(std::move(eventStop), active);
+                return eventStop;
             }))
-        .def("synchronize", [](tr::decoder_batch::DecoderFinishedEvent& self) { self.event.synchronize(); });
+        .def("synchronize", [](tr::CudaEvent& self) { self.synchronize(); });
 
     py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
         .def(
