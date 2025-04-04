@@ -531,7 +531,9 @@ class MLA(nn.Module):
         # Concat q(including q_pe), k + k_pe, v together as input_qkv
         input_qkv = torch.cat([q, k, v], dim=-1)
 
-        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
         attn_output = self.mha.forward(
             input_qkv,
             None,
@@ -599,7 +601,9 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
-        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,

@@ -52,6 +52,7 @@ enum class NamedBarriers
 {
     SReady = 1,
     SoftmaxReady = 2,
+    TransVReady = 3,
 };
 
 } // namespace flash
