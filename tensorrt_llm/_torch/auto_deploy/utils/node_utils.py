@@ -121,6 +121,25 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     Args:
         mm_node: Matmul node in the graph.
     """
+    # List of nodes allowed in between a get_attr node and the matmul node
+    allowed_ops = {torch.ops.aten.to.dtype}
+
+    def find_get_attr_node(node: Node) -> Node:
+        """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
+        # If node is a get_attr node return node
+        if node.op == "get_attr":
+            return node
+
+        # If node is not in the list of allowable ops then return None
+        if node.target not in allowed_ops:
+            return None
+
+        for input_node in node.all_input_nodes:
+            result = find_get_attr_node(input_node)
+            if result:
+                return result
+        return None
+
     assert is_linear_op(mm_node, include_quantization=True), (
         f"Expecting linear node, Found: {mm_node}"
     )
@@ -130,7 +149,11 @@ def extract_param_names_from_lin_node(mm_node: Node) -> Tuple[str, Optional[str]
     _, weight_params, _ = get_quantization_params_from_linear_node(mm_node)
     weight_node = weight_params.input_node if weight_params else weight_node
 
-    assert weight_node.op == "get_attr"
+    # Find the get_attr node for the weight node so that it can be slice.
+    weight_node = find_get_attr_node(weight_node)
+
+    assert weight_node, "Cannot identify weight parameter of linear node."
+
     # Map arg to named parameter
     weight_name = weight_node.target
 
