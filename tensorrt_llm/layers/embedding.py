@@ -179,7 +179,7 @@ class PromptTuningEmbedding(Embedding):
         # prompt_tokens: [batch_size, seq_len]
         # if speculative decoding is enabled tasks is [batch_size, seq_len + max_draft_len],
         # so we need to expand tasks to [batch_size, seq_len + max_draft_len]
-        tasks = expand(tasks, (tasks.shape[0], prompt_tokens.shape[1]))
+        tasks = expand(tasks, shape(prompt_tokens))
         prompt_tokens = prompt_tokens + tasks
         prompt_embeddings = embedding(prompt_tokens, prompt_embedding_table)
 
