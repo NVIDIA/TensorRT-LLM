@@ -24,11 +24,10 @@ from tensorrt_llm.quantization.mode import (MODELOPT_FLOW_QUANTIZATIONS,
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor, cast,
-                           recv, send)
+                           recv, send, LayerNormType)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
@@ -38,7 +37,6 @@ from .config import GemmaConfig
 if TYPE_CHECKING:
 
     from .config import HfConfigOrDir
-
 
 class GemmaDecoderLayer(Module):
 
@@ -54,15 +52,14 @@ class GemmaDecoderLayer(Module):
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
         self.local_layer_idx = layer_idx - layers_range[0]
 
-        q_scaling = 1.0
+        gemma3_config = config.gemma3_config()
+        qk_layernorm = True
         max_attn_value = 0.0
-
-        gemma2_config = config.gemma2_config()
-        if gemma2_config:
-            q_scaling = math.sqrt(
-                gemma2_config.query_pre_attn_scalar) / math.sqrt(
-                    config.head_size)
-            max_attn_value = config.attn_logit_softcapping or 0.0
+        q_scaling = math.sqrt(
+            gemma3_config.query_pre_attn_scalar) / math.sqrt(
+                config.head_size)
+        is_sliding = bool((layer_idx + 1) % gemma3_config.sliding_window_pattern)
+        rotary_base = config.rope_local_base_freq if is_sliding else config.rotary_base
 
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
@@ -70,12 +67,14 @@ class GemmaDecoderLayer(Module):
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
-            attention_mask_type=AttentionMaskType.causal,
+            attention_mask_type=AttentionMaskType.sliding_window_causal if is_sliding else AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_base=rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
@@ -95,15 +94,14 @@ class GemmaDecoderLayer(Module):
                             tp_size=config.mapping.tp_size,
                             quant_mode=config.quant_mode)
 
-        if self.config.inter_layernorms:
-            self.pre_feedforward_layernorm = RmsNorm(
-                normalized_shape=config.hidden_size,
-                eps=config.norm_epsilon,
-                dtype=config.dtype)
-            self.post_feedforward_layernorm = RmsNorm(
-                normalized_shape=config.hidden_size,
-                eps=config.norm_epsilon,
-                dtype=config.dtype)
+        self.pre_feedforward_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
+            dtype=config.dtype)
+        self.post_feedforward_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.norm_epsilon,
+            dtype=config.dtype)
 
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
@@ -117,15 +115,9 @@ class GemmaDecoderLayer(Module):
                 attention_params: Optional[AttentionParams] = None,
                 lora_layer_params: Optional[LoraParams] = None,
                 next_layer_input_layernorm_args=None):
-        # assert not (
-        #     default_net().plugin_config.reduce_fusion and self.has_residual_mlp
-        # ), "Custom all reduce and residual mlp can't be enabled at the same time."
-        if default_net(
-        ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
-            hidden_states, residual = hidden_states  #FIXME:AN need to check if appropriate residual value is hidden state is pulled out.
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -148,38 +140,13 @@ class GemmaDecoderLayer(Module):
         if use_cache:
             attention_output, presents = attention_output
 
-        if default_net().plugin_config.reduce_fusion:
-            hidden_states, residual = attention_output
-        else:
-            if self.config.inter_layernorms:
-                attention_output = self.post_layernorm(attention_output)
-            hidden_states = residual + attention_output
-            residual = hidden_states
-            if self.config.inter_layernorms:
-                hidden_states = self.pre_feedforward_layernorm(hidden_states)
-            else:
-                hidden_states = self.post_layernorm(hidden_states)
-
-        if next_layer_input_layernorm_args is not None:
-            hidden_states = self.mlp(
-                hidden_states,
-                lora_layer_params=lora_layer_params,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM
-                    if default_net().plugin_config.reduce_fusion else
-                    AllReduceFusionOp.NONE,
-                    residual=residual,
-                    norm_weight=next_layer_input_layernorm_args[0],
-                    norm_pre_residual_weight=self.post_feedforward_layernorm.
-                    weight.value,
-                    eps=next_layer_input_layernorm_args[1]))
-        else:
-            hidden_states = self.mlp(hidden_states,
-                                     lora_layer_params=lora_layer_params)
-
-            if self.config.inter_layernorms:
-                hidden_states = self.post_feedforward_layernorm(hidden_states)
-            hidden_states = residual + hidden_states
+        attention_output = self.post_layernorm(attention_output)
+        hidden_states = residual + attention_output
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, lora_layer_params=lora_layer_params)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -370,7 +337,3 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
                 del hf_weights
         else:
             cls.assert_valid_quant_algo(quant_algo)
-
-    def use_lora(self, lora_config: LoraConfig) -> None:
-        return use_lora(
-            self, lora_config)  # Use the default trtllm->hf module mapping

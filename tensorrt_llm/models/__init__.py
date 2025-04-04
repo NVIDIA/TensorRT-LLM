@@ -33,7 +33,7 @@ from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
-from .gemma.config import GEMMA2_ARCHITECTURE, GEMMA_ARCHITECTURE, GemmaConfig
+from .gemma.config import GEMMA3_ARCHITECTURE, GEMMA2_ARCHITECTURE, GEMMA_ARCHITECTURE, GemmaConfig
 from .gemma.model import GemmaForCausalLM
 from .gpt.config import GPTConfig
 from .gpt.model import GPTForCausalLM, GPTModel
@@ -183,6 +183,7 @@ MODEL_MAP = {
     'SkyworkForCausalLM': LLaMAForCausalLM,
     GEMMA_ARCHITECTURE: GemmaForCausalLM,
     GEMMA2_ARCHITECTURE: GemmaForCausalLM,
+    GEMMA3_ARCHITECTURE: GemmaForCausalLM,
     'QWenLMHeadModel': QWenForCausalLM,
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
