@@ -43,6 +43,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         torch_compile_enabled=config.compile_backend == "torch-opt",
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
+        mla_backend=config.mla_backend,
         skip_loading_weights=config.skip_loading_weights,
         cuda_graph_max_batch_size=config.max_batch_size,
     )
@@ -98,7 +99,7 @@ def main(config: Optional[SimpleConfig] = None):
     if config.benchmark:
         token_ids = torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist()
         sampling_params = SamplingParams(max_tokens=config.benchmark_osl, top_k=None)
-        keys = ["compile_backend", "attn_backend"]
+        keys = ["compile_backend", "attn_backend", "mla_backend"]
         benchmark(
             lambda: llm.generate(token_ids, sampling_params=sampling_params, use_tqdm=False),
             config.benchmark_num,
