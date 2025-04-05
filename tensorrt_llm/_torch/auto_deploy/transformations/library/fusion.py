@@ -96,7 +96,9 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
 
         for scale_name, buffer in buffer_fused.items():
             fused_buffer_name = new_param_name + "_" + scale_name
-            full_new_buffer_name = add_new_attribute_to_submodule(gm, new_module_name, fused_buffer_name, buffer, is_buffer=True)
+            full_new_buffer_name = add_new_attribute_to_submodule(
+                gm, new_module_name, fused_buffer_name, buffer, is_buffer=True
+            )
 
     else:
         param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))

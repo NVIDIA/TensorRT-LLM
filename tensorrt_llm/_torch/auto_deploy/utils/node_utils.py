@@ -278,7 +278,11 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
 
 
 def add_new_attribute_to_submodule(
-    gm: GraphModule, new_submodule_name: str, new_attr_name: str, new_attr: torch.Tensor, is_buffer: bool = False
+    gm: GraphModule,
+    new_submodule_name: str,
+    new_attr_name: str,
+    new_attr: torch.Tensor,
+    is_buffer: bool = False,
 ) -> str:
     """
     Adds a new parameter or buffer to a submodule within gm.
