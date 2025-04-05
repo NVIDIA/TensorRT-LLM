@@ -25,7 +25,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
-from ..metadata import KVCacheParams
+from ..metadata import KVCacheParams, LogitsProcessorMetadata
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
@@ -858,6 +858,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            logits_processor_metadata: Optional[LogitsProcessorMetadata] = None,
             new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
         """
         Prepare inputs for Pytorch Model.
@@ -904,6 +905,10 @@ class PyTorchModelEngine(ModelEngine):
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin)
             request.py_batch_idx = batch_idx
+
+            logits_processor_metadata = self._maybe_update_lp_metadata(
+                request, logits_processor_metadata, is_context=True)
+
             batch_idx += 1
 
         num_ctx_requests = batch_idx
@@ -1015,6 +1020,10 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices.append(request.py_batch_idx)
 
             request.py_batch_idx = batch_idx
+
+            logits_processor_metadata = self._maybe_update_lp_metadata(
+                request, logits_processor_metadata)
+
             batch_idx += 1
 
         num_tokens = len(input_ids)
@@ -1158,6 +1167,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+
+        if logits_processor_metadata is not None:
+            logits_processor_metadata.prepare()
+            inputs['logits_processor_metadata'] = logits_processor_metadata
 
         # support attention dp
         if self.enable_attention_dp:
@@ -1752,3 +1765,29 @@ class PyTorchModelEngine(ModelEngine):
             ub.ub_allocate(1, hidden_size * self.max_num_tokens * 2),
         ]
         return True
+
+    def _maybe_update_lp_metadata(
+            self,
+            request,
+            logits_processor_metadata: Optional[LogitsProcessorMetadata],
+            is_context: bool = False) -> Optional[LogitsProcessorMetadata]:
+        logits_processors = getattr(request, "logits_post_processors", None)
+        if not logits_processors or (self.mapping.has_tp() and self.mapping.tp_rank > 0 or \
+            self.mapping.has_pp() and self.mapping.pp_rank > 0):
+            return
+
+        token_ids = request.get_tokens(0)
+        if is_context and request.py_orig_prompt_len < len(token_ids):
+            # Skip as we only need to apply logit processor on the last context request
+            return
+
+        logits_processor_metadata = logits_processor_metadata or LogitsProcessorMetadata(
+        )
+        logits_processor_metadata.update_per_request(
+            request.py_request_id,
+            logits_processors,
+            request.py_batch_idx,
+            torch.tensor(token_ids, dtype=torch.long)  # TODO: need all beams
+        )
+
+        return logits_processor_metadata

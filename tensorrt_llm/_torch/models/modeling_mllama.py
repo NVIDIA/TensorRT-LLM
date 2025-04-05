@@ -27,7 +27,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..modules.embedding import Embedding, LMHead
-from ..modules.logits_procesor import LogitsProcessor
+from ..modules.logits_processor import LogitsProcessor
 from .modeling_llama import LlamaDecoderLayer
 from .modeling_utils import duplicate_kv_weight, register_auto_model
 
