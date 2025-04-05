@@ -32,6 +32,8 @@ from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
                         unittest_name_func, force_ampere)
 # isort: on
 
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 # shrink the kv_cache_config to avoid OOM in CI
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
@@ -491,7 +493,7 @@ def test_llm_get_kv_cache_events_tp2():
 
 
 @pytest.fixture(scope="module")
-def llm_for_sampling_params_tp2() -> LLM:
+def llm_for_sampling_params_tp2():
     build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
@@ -500,7 +502,8 @@ def llm_for_sampling_params_tp2() -> LLM:
         kv_cache_config=global_kv_cache_config,
         tensor_parallel_size=2,
     )
-    return llm
+    yield llm
+    llm.shutdown()
 
 
 @pytest.mark.parametrize("sampling_params",
