@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -156,8 +157,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
         .def(py::init())
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
             py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("decoder_input_buffers"),
-            py::arg("model_config"), py::arg("max_num_sequences"), py::arg("beam_width"), py::arg("buffer_manager"),
-            py::arg("stream"), py::arg("fused_runtime_buffers") = std::nullopt)
+            py::arg("decoder_state"), py::arg("model_config"), py::arg("max_num_sequences"), py::arg("beam_width"),
+            py::arg("buffer_manager"), py::arg("stream"), py::arg("fused_runtime_buffers") = std::nullopt)
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
