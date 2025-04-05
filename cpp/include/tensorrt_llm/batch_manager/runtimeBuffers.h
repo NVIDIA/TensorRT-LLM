@@ -232,7 +232,6 @@ public:
     //! Helper for KV cache rewind
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
-    TensorPtr sortedSeqSlots;
     //! TODO: move into decoderBuffers.DraftBuffers
     TensorPtr seqSlotRemappingHost;   // [numSequences]
     TensorPtr seqSlotRemappingDevice; // [numSequences]
