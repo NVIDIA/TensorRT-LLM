@@ -49,8 +49,10 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(std::vector<TensorPtr> const& logits, std::vector<bool> const& active)
+    explicit Input(
+        std::vector<TensorPtr> const& logits, std::vector<bool> const& active, SizeType32 maxDecodingEngineTokens)
         : logits{logits}
+        , maxDecodingEngineTokens{maxDecodingEngineTokens}
         , active{active}
     {
         TLLM_CHECK_WITH_INFO(
@@ -58,13 +60,16 @@ public:
     }
 
     explicit Input(std::vector<TensorPtr> const& logits)
-        : Input{logits, std::vector<bool>(logits.size(), true)}
+        : Input{logits, std::vector<bool>(logits.size(), true), 1}
     {
     }
 
     // mandatory parameters
     std::vector<TensorPtr>
         logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
+
+    // maximum number of decoding tokens of active slots
+    SizeType32 maxDecodingEngineTokens;
 
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
