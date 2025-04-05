@@ -347,7 +347,7 @@ def launchReleaseCheck(pipeline)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm-rn.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/docker/golang:1.22"
     stageName = "Release Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build"), "trt-llm", {
         stage("[${stageName}] Run") {
