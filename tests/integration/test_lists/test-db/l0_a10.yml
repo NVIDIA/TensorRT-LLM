@@ -18,6 +18,8 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-pytorch-stress-stage-alone]
 - condition:
     ranges:
       system_gpu_count:
@@ -51,6 +53,8 @@ l0_a10:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-stage-alone]
   - unittest/trt/attention/test_gpt_attention.py -k "partition0"
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
   - unittest/trt/attention/test_gpt_attention.py -k "partition2"
@@ -121,6 +125,8 @@ l0_a10:
       stage: post_merge
       backend: tensorrt
   tests:
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[TinyLlama-1.1B-Chat-v1.0_tp1-trt-stress-stage-alone]
   - test_e2e.py::test_mistral_e2e[use_py_session]
   - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
   - test_e2e.py::test_mistral_e2e[use_py_session-remove_input_padding]
