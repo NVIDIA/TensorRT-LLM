@@ -616,6 +616,8 @@ def collectTestResults(pipeline, testFilter)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
+            sh "python3 llm/jenkins/scripts/generate_duration.py --duration-file=new_test_duration.json"
+            trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
