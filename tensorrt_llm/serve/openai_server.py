@@ -99,7 +99,7 @@ class OpenAIServer:
 
     @property
     def postproc_worker_enabled(self) -> bool:
-        return True if self.llm.args._num_postprocess_workers > 0 else False
+        return True if self.llm.args.num_postprocess_workers > 0 else False
 
     @staticmethod
     def create_error_response(

@@ -228,7 +228,7 @@ class Builder():
         if weight_sparsity:
             config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
 
-        # TODO(Junyi): remove this constraint after trt 10.6 is integrated
+        # TODO: remove this constraint after trt 10.6 is integrated
         if trt_gte(10, 6):
             # set monitor memory
             monitor_memory = kwargs.get("monitor_memory", False)

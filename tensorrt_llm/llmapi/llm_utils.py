@@ -29,10 +29,9 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
-from .llm_args import (CalibConfig, ConfigArbitrateError, EagleDecodingConfig,
-                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
-                       MedusaDecodingConfig, MTPDecodingConfig,
-                       _ConfigArbitrator, _ModelFormatKind, _ModelWrapper,
+from .llm_args import (CalibConfig, EagleDecodingConfig, KvCacheConfig, LlmArgs,
+                       LookaheadDecodingConfig, MedusaDecodingConfig,
+                       MTPDecodingConfig, _ModelFormatKind, _ModelWrapper,
                        _ParallelConfig, get_model_format,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
@@ -863,8 +862,6 @@ __all__ = [
     'CalibConfig',
     'KvCacheConfig',
     'CachedModelLoader',
-    'ConfigArbitrateError',
-    '_ConfigArbitrator',
     'EagleDecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',

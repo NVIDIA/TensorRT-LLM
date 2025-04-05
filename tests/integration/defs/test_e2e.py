@@ -566,6 +566,8 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
     if concurrency:
         benchmark_cmd += " --concurrency 100"
 
+    print(f"cmd: {benchmark_cmd}")
+
     if request_rate and concurrency:
         # negative test, request rate and concurrency should not be turned on at the same time
         check_call_negative_test(benchmark_cmd, shell=True)

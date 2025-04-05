@@ -1137,7 +1137,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
 {
     auto const requestId = sequence.getRequestId();
 
-    // TODO (jdebache): refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
+    // TODO: refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
     // can know which blocks to store for reuse and which to just release.
     // When releasing the blocks for a sequence, we store those blocks for potential reuse only if:
     // - Block reuse is enabled.
@@ -1153,7 +1153,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
         auto const& cacheBlockIds = sequence.getCacheBlockIds();
 
-        // TODO (jdebache): get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
+        // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
         // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
         // the last token's state is not filled yet.
         auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
