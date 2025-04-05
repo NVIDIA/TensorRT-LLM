@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
+from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats)
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
@@ -1136,7 +1137,16 @@ class PyExecutor:
                     heapq.heappush(all_ranks_new_requests_heap, val)
                 elif val.rank == self.dist.tp_rank:
                     break
-            self.has_context_request = len(new_requests_cur_rank) > 0
+
+            # In disaggregated serving, we might get either context request or
+            # generation request. In IFB, we only get context request from request queue
+            if self.kv_cache_transceiver:
+                for req in new_requests_cur_rank:
+                    if req[1].request_type == tllme.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+                        self.has_context_request = True
+                        break
+            else:
+                self.has_context_request = len(new_requests_cur_rank) > 0
             self._update_new_active_requests_queue_latency(
                 new_requests_cur_rank)
 
