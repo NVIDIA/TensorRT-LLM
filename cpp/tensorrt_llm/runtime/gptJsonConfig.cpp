@@ -573,7 +573,7 @@ GptJsonConfig parseJson(InputType&& input)
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
 
-            // TODO(rkobus): adjust param names
+            // TODO: adjust param names
             auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "redrafter_num_beams", 0);
             auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "redrafter_draft_len_per_beam", 0);
             auto const maxDraftLen = maxNumPaths * maxDraftPathLen;

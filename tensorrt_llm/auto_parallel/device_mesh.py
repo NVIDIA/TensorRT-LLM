@@ -213,7 +213,7 @@ class LogicalDeviceMesh(object):
         ]
         return ret
 
-    #[ToDo][KDuan] stub functions here
+    #[ToDo] stub functions here
     def _profile_split(self, min_max_comm_size):
         comm_size, elapsed_time = [], []
         size = min_max_comm_size[0]
@@ -225,7 +225,7 @@ class LogicalDeviceMesh(object):
         return np.array([comm_size, elapsed_time])
 
     def _prase_nccl_test_results(self, f_nccl_test_out_log):
-        '''[ToDo][KDuan] There is some dtye that may not been supported by nccl test, using default dtype (float)'''
+        '''[ToDo] There is some dtye that may not been supported by nccl test, using default dtype (float)'''
         start_parse = False
         comm_size, elapsed_time = [], []
         try:

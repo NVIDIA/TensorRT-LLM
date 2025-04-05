@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
+from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
@@ -1921,11 +1922,10 @@ def test_llm_api_jupyter_scenario():
 
 
 def test_llm_dynamic_batch_config():
-    scheduler_config = tllm.SchedulerConfig(
-        dynamic_batch_config=tllm.DynamicBatchConfig(
-            enable_batch_size_tuning=True,
-            enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=128))
+    scheduler_config = SchedulerConfig(dynamic_batch_config=DynamicBatchConfig(
+        enable_batch_size_tuning=True,
+        enable_max_num_tokens_tuning=True,
+        dynamic_batch_moving_average_window=128))
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=9),

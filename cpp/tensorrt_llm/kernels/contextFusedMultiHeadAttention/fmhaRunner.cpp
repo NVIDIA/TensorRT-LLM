@@ -142,7 +142,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         // Paged kv cache layout.
         mKernelParams.kv_stride_in_bytes = get_size_in_bytes(
             runnerParams.pagedKvCache.mTokensPerBlock * mFixedParams.headSize, mFixedParams.dataType);
-        // Yuxin: only for deepseek
+        // only for deepseek
         mKernelParams.v_stride_in_bytes = mKernelParams.kv_stride_in_bytes;
     }
     else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
