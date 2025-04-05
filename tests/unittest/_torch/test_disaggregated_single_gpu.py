@@ -1,0 +1,203 @@
+import asyncio
+import os
+import pickle
+import sys
+
+import cloudpickle
+import pytest
+from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
+from utils.llm_data import llm_models_root
+
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch import LLM
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._utils import set_mpi_comm
+from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
+
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(
+    cloudpickle.dumps,
+    cloudpickle.loads,
+    pickle.HIGHEST_PROTOCOL,
+)
+
+print(f"Flushing sys.path: {sys.path}", flush=True)
+MPI_TAG = 9999
+MPI_READY = MPI_TAG + 2
+MPI_REQUEST = MPI_TAG
+MPI_RESULT = MPI_TAG + 1
+
+
+def model_path(model_name):
+    if 'DeepSeek-V3-Lite-fp8' in model_name:
+        return os.path.join(llm_models_root(), 'DeepSeek-V3-Lite', 'fp8')
+    elif 'TinyLlama-1.1B-Chat-v1.0' in model_name:
+        return os.path.join(llm_models_root(), 'llama-models-v2',
+                            'TinyLlama-1.1B-Chat-v1.0')
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
+async def run_worker(kv_cache_config, pytorch_config, model_name, rank,
+                     attention_dp):
+    print(f"Running worker {rank}")
+    port_name = MPI.Lookup_name('my_port')
+    intercomm = MPI.COMM_WORLD.Connect(port_name)
+
+    session = MPI.COMM_WORLD.Split(color=rank, key=0)
+    set_mpi_comm(session)
+    mpi_session = MpiCommSession(comm=session, n_workers=session.Get_size())
+
+    try:
+        llm = LLM(tensor_parallel_size=1,
+                  auto_parallel=False,
+                  model=model_name,
+                  enable_chunked_prefill=False,
+                  pytorch_backend_config=pytorch_config,
+                  _mpi_session=mpi_session,
+                  kv_cache_config=kv_cache_config,
+                  enable_attention_dp=attention_dp)
+        print(f"LLM created")
+    except Exception as e:
+        print(f"Error creating LLM: {e}")
+        raise e
+
+    # Send ready signal
+    print(f"Sending ready signal to main process")
+    intercomm.send(intercomm.Get_rank(), dest=0, tag=MPI_READY)
+
+    print(f"Waiting for requests")
+    while True:
+        try:
+            requests = intercomm.recv(source=MPI.ANY_SOURCE, tag=MPI_REQUEST)
+            print(f"Received requests: {requests}")
+            if requests is None:
+                break
+
+            futures = []
+            for request in requests:
+                futures.append(
+                    llm.generate_async(request[0],
+                                       sampling_params=request[1],
+                                       disaggregated_params=request[2]))
+
+            for future in futures:
+                result = await future
+                intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+        except Exception as e:
+            print(f"Worker {rank} error: {e}")
+    llm.shutdown()
+
+
+def send_requests_to_worker(requests, worker_rank, intercomm):
+    print(f"Sending {len(requests)} requests to worker {worker_rank}")
+    intercomm.send(requests, dest=worker_rank, tag=MPI_REQUEST)
+
+    responses = []
+    for _ in range(len(requests)):
+        responses.append(intercomm.recv(source=worker_rank, tag=MPI_RESULT))
+        print(f"Received response {responses[-1]} from worker {worker_rank}")
+    return responses
+
+
+def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank,
+                       attention_dp):
+    return asyncio.run(
+        run_worker(kv_cache_config, pytorch_config, model_name, rank,
+                   attention_dp))
+
+
+def verify_disaggregated(model, generation_overlap, attention_dp_context,
+                         attention_dp_generation):
+    worker_pytorch_configs = []
+
+    # Context worker
+    worker_pytorch_configs.append(
+        PyTorchConfig(enable_overlap_scheduler=False, kv_cache_dtype="auto"))
+
+    # Generation worker
+    worker_pytorch_configs.append(
+        PyTorchConfig(enable_overlap_scheduler=generation_overlap,
+                      kv_cache_dtype="auto"))
+
+    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks,
+            [attention_dp_context, attention_dp_generation]))
+
+    port_name = MPI.Open_port()
+    MPI.Publish_name('my_port', port_name)
+
+    with MPIPoolExecutor(max_workers=2, env={"TRTLLM_USE_MPI_KVCACHE":
+                                             "1"}) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        print("Launched all the workers.")
+        intercomm = MPI.COMM_SELF.Accept(port_name)
+
+        for _ in range(2):
+            intercomm.recv(tag=MPI_READY)
+            print("Received ready signal.")
+
+        requests = []
+        requests.append(
+            ("The capital of France is", SamplingParams(max_tokens=1),
+             DisaggregatedParams(request_type="context_only")))
+
+        responses = send_requests_to_worker(requests, 0, intercomm)
+        output = responses[0]
+        assert output[0].text == "Paris"
+        assert output[0].disaggregated_params is not None
+        assert output[0].disaggregated_params.request_type == "context_only"
+
+        generation_request_disagg_params = output[0].disaggregated_params
+        generation_request_disagg_params.request_type = "generation_only"
+        requests = []
+        requests.append(
+            ("The capital of France is", SamplingParams(max_tokens=10),
+             generation_request_disagg_params))
+
+        responses = send_requests_to_worker(requests, 1, intercomm)
+        output = responses[0]
+        assert output[0].text.startswith("Paris")
+
+        # Send a non-disaggregated request for output verification
+        requests = []
+        requests.append(
+            ("The capital of France is", SamplingParams(max_tokens=10), None))
+
+        response_ref = send_requests_to_worker(requests, 0, intercomm)
+        output_ref = response_ref[0]
+        assert output_ref[0].text.startswith("Paris")
+        assert output_ref[0].text == output[
+            0].text, f"Output mismatch: {output_ref[0].text} != {output[0].text}"
+
+        # Send termination requests
+        intercomm.send(None, dest=0, tag=MPI_REQUEST)
+        intercomm.send(None, dest=1, tag=MPI_REQUEST)
+        print("Sent termination requests to the workers.")
+
+        # Wait for all futures to complete
+        for future in futures:
+            future.result()
+        print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False, True])
+def test_disaggregated_simple_llama(model, generation_overlap):
+    verify_disaggregated(model, generation_overlap, False, False)
+
+
+if __name__ == "__main__":
+    pytest.main()
