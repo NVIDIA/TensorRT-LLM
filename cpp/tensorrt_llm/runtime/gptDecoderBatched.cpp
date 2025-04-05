@@ -249,7 +249,7 @@ void GptDecoderBatched::prepareForward(
         setEagleInputs(input);
     }
 
-    TensorPtr batchSlotsSlice = ITensor::at(input.batchSlots, {step});
+    auto const& batchSlotsSlice = input.batchSlots.at(step);
     auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsSlice);
     SizeType32 localBatchDecoderIdx = 0;
     std::vector<SharedConstPtr> logitsVec;

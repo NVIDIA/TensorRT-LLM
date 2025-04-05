@@ -44,8 +44,11 @@ DecoderInputBuffers::DecoderInputBuffers(
     fillValues = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
     fillValuesDevice = manager.gpu(maxBatchSizeShape, nvSizeType);
 
-    forwardBatchSlots
-        = BufferManager::pinnedPool(ITensor::makeShape({maxTokensPerEngineStep, maxBatchSize}), nvSizeType);
+    forwardBatchSlots.reserve(maxTokensPerEngineStep);
+    for (SizeType32 i = 0; i < maxTokensPerEngineStep; ++i)
+    {
+        forwardBatchSlots.emplace_back(BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize}), nvSizeType));
+    }
 }
 
 DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,

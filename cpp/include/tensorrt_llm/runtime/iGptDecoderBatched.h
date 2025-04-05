@@ -67,8 +67,8 @@ public:
     std::vector<TensorPtr> logits;
     //! Control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
-    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep, batchSize]
-    TensorPtr batchSlots;
+    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep][batchSize]
+    std::vector<TensorPtr> batchSlots;
     //! Filled with slots in request order, [batchSize]
     TensorPtr batchSlotsRequestOrder;
 

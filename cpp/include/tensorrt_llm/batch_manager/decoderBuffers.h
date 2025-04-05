@@ -48,7 +48,7 @@ public:
     TensorPtr forwardBatchSlotsRequestOrderDevice;
     TensorPtr fillValues;
     TensorPtr fillValuesDevice;
-    TensorPtr forwardBatchSlots;
+    std::vector<TensorPtr> forwardBatchSlots;
 };
 
 class DecoderStepAsyncSend
