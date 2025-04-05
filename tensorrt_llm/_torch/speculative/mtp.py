@@ -215,7 +215,7 @@ class MTPDecoder(TorchDecoder):
                     should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
-            request.py_decoding_iter += 1
+                request.py_decoding_iter += 1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
