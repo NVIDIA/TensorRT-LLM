@@ -49,18 +49,16 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(std::vector<std::vector<TensorConstPtr>> const& logits, std::vector<bool> const& active,
-        SizeType32 maxDecodingEngineTokens)
+    explicit Input(std::vector<std::vector<TensorConstPtr>> const& logits, SizeType32 maxDecodingEngineTokens)
         : logits{logits}
         , maxDecodingEngineTokens{maxDecodingEngineTokens}
-        , active{active}
     {
         TLLM_CHECK_WITH_INFO(logits.size() == static_cast<size_t>(maxDecodingEngineTokens),
             "logits vector size does not match maxDecodingEngineTokens");
     }
 
     explicit Input(std::vector<TensorConstPtr> const& logits)
-        : Input{{logits}, std::vector<bool>(logits.size(), true), 1}
+        : Input{{logits}, 1}
     {
     }
 
@@ -72,14 +70,13 @@ public:
     // maximum number of decoding tokens of active slots
     SizeType32 maxDecodingEngineTokens;
 
-    // control activity of decoder slots in batch
-    std::vector<bool> active; // [batchSize]
+    // batch of active decoder slots
     std::vector<TensorPtr>
         batchSlots; // [maxTokensPerEngineStep][batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
     TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
 
     // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
+    TensorPtr cacheIndirection; // [maxBatchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
                                 // within one beam for beam search, on gpu
     std::vector<std::vector<TensorPtr>>
         predictedDraftLogits;   // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]

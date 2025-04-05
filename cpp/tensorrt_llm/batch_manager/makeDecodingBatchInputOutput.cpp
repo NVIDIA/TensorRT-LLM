@@ -98,7 +98,7 @@ std::unique_ptr<tr::decoder_batch::Input> createDecoderInputs(RequestVector cons
             "batchSlots size mismatch: %ld != %d", batchSlots.at(step)->getSize(), localBatchDecoderIdx);
     }
 
-    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, active, maxActiveDecodingEngineTokens);
+    auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecodingEngineTokens);
     decodingInput->batchSlots = batchSlots;
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return decodingInput;
