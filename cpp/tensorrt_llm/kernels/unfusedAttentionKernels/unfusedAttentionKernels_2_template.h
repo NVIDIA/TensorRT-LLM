@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -750,6 +751,10 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     //  1. Contiguous QKV output.
     //  2. Contiguous Q output + Paged KV output (needed by Paged KV FMHA kernels).
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
     // Constants.
     using VecT = typename VecType<T>::Type;
     // Quantized output only supports fp8 currently.
@@ -1093,6 +1098,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             params.fmha_bmm2_scale[0] = o_scale_orig_quant * kv_scale_quant_orig;
         }
     }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 // Use more blocks for the batch dimension in the generation phase.
@@ -1255,22 +1263,38 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     dim3 grid(1, params.head_num);                                                                                     \
     int num_blocks_for_tokens = int(divUp(params.token_num, tokens_per_cuda_block));                                   \
     calGridSizeWithBestEfficiency(block, grid, num_blocks_for_tokens, params.multi_processor_count, 1024);             \
+    cudaLaunchConfig_t config;                                                                                         \
+    config.gridDim = grid;                                                                                             \
+    config.blockDim = block;                                                                                           \
+    config.dynamicSmemBytes = 0;                                                                                       \
+    config.stream = stream;                                                                                            \
+    cudaLaunchAttribute attrs[1];                                                                                      \
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                  \
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();                     \
+    config.numAttrs = 1;                                                                                               \
+    config.attrs = attrs;                                                                                              \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
         || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
-            KVCacheBuffer, RotaryPositionEmbeddingType::GPT_NEOX><<<grid, block, 0, stream>>>(params);                 \
+        cudaLaunchKernelEx(&config,                                                                                    \
+            applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,        \
+                KVCacheBuffer, RotaryPositionEmbeddingType::GPT_NEOX>,                                                 \
+            params);                                                                                                   \
     }                                                                                                                  \
     else if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ)                                      \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
-            KVCacheBuffer, RotaryPositionEmbeddingType::GPTJ><<<grid, block, 0, stream>>>(params);                     \
+        cudaLaunchKernelEx(&config,                                                                                    \
+            applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,        \
+                KVCacheBuffer, RotaryPositionEmbeddingType::GPTJ>,                                                     \
+            params);                                                                                                   \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
-            KVCacheBuffer, RotaryPositionEmbeddingType::NONE><<<grid, block, 0, stream>>>(params);                     \
+        cudaLaunchKernelEx(&config,                                                                                    \
+            applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,        \
+                KVCacheBuffer, RotaryPositionEmbeddingType::NONE>,                                                     \
+            params);                                                                                                   \
     }
 
 #define STORE_QKV_AND_FP8_OUTPUT_DISPATCH(ADD_BIAS, GEN_PHASE)                                                         \

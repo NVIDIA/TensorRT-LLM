@@ -52,6 +52,7 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
