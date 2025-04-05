@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -71,6 +71,10 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
     def free_resources(self, request: LlmRequest):
         self.slot_manager.remove_slot(request.request_id)
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        for rid in request_ids:
+            self.slot_manager.add_slot(rid)
 
     def shutdown(self):
         pass
