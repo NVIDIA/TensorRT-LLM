@@ -195,6 +195,12 @@ class ReportUtility:
         return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
 
     @property
+    def total_token_throughput_tok_s(self) -> float:
+        """Total token throughput in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.total_token_throughput_tok_ns)
+
+    @property
     def per_user_generation_token_throughput_s(self) -> float:
         """Output throughput per user in tokens per second."""
         return self.convert_rate_to_s(
@@ -314,6 +320,8 @@ class ReportUtility:
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
             # Output throughput per user (average per request output throughput)
+            "system_total_throughput_tok_s":
+            self.total_token_throughput_tok_s,
             "output_throughput_per_user_tok_s":
             self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
@@ -477,6 +485,7 @@ class ReportUtility:
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
             f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
             f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
+            f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
         )
