@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -85,8 +86,6 @@ decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBe
     }
 
     decoder_batch::Input inputs{logits};
-    inputs.batchSlots = BufferManager::pinned(
-        ITensor::makeShape({maxGeneratedTokensPerSteps, batchSize}), TRTDataType<SizeType32>::value);
 
     if (maxBeamWidth > 1)
     {
@@ -310,12 +309,18 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
         *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
 
-    std::vector<decoder_batch::Request> decoderRequests;
-    TensorPtr batchSlots = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
-    newRequests(batchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+
+    std::vector<decoder_batch::Request> decoderRequests;
+    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
+
+    auto forwardBatchSlotsRange = BufferRange<SizeType32>(*inputBuffers.forwardBatchSlots.at(0));
+    std::iota(forwardBatchSlotsRange.begin(), forwardBatchSlotsRange.end(), 0);
+    inputs.batchSlots = inputBuffers.forwardBatchSlots;
 
     auto expectedLengths = tiledInputLengths;
     checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
@@ -352,7 +357,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     checkSequenceLengths(*decoder.getDecoderState().getJointDecodingOutput().lengths, expectedLengths, manager);
 
-    TensorPtr batchSlotsView = ITensor::slice(batchSlots, 0, 1);
+    TensorPtr batchSlotsView = ITensor::slice(inputBuffers.setupBatchSlots, 0, 1);
     std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
     newRequests(batchSlotsView, {requests[0]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
     EXPECT_FALSE(getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager)[0]);
@@ -440,15 +445,23 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     EXPECT_EQ(finished.size(), batchSize);
     std::vector<bool> expectedFinished(batchSize, false);
 
-    TensorPtr batchSlots = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
+
+    auto forwardBatchSlotsRange = BufferRange<SizeType32>(*inputBuffers.forwardBatchSlots.at(0));
+    std::iota(forwardBatchSlotsRange.begin(), forwardBatchSlotsRange.end(), 0);
+    inputs.batchSlots = inputBuffers.forwardBatchSlots;
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        TensorPtr batchSlotsView = ITensor::slice(batchSlots, batchIdx, 1);
+        TensorPtr newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
         std::vector<SamplingConfig> singleConfig = {samplingConfigs[batchIdx]};
-        newRequests(batchSlotsView, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+        newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
+
+        TensorPtr batchSlotsSlice = ITensor::slice(inputBuffers.forwardBatchSlots.at(0), 0, batchIdx + 1);
+        inputs.batchSlots = {batchSlotsSlice};
 
         decoder.forward(outputs, inputs);
 
@@ -484,10 +497,18 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         }
         EXPECT_THAT(finishedVec, ::testing::ElementsAreArray(expectedFinished));
 
+        auto counter = 0;
         for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
         {
             inputs.active.at(batchIdx) = !finishedVec.at(batchIdx);
+            if (inputs.active.at(batchIdx))
+            {
+                forwardBatchSlotsRange[counter++] = batchIdx;
+            }
         }
+
+        TensorPtr batchSlotsSlice = ITensor::slice(inputBuffers.forwardBatchSlots.at(0), 0, counter);
+        inputs.batchSlots = {batchSlotsSlice};
     }
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
@@ -565,11 +586,27 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     auto outputs = prepareDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
         *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
 
-    TensorPtr batchSlots = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), TRTDataType<SizeType32>::value);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
+    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
+
+    auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.setupBatchSlots);
     std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
-    newRequests(batchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
+    inputs.batchSlots = inputBuffers.forwardBatchSlots;
+    for (SizeType32 i = 0; i < maxGeneratedTokensPerStep; ++i)
+    {
+        auto batchSlotsRange = BufferRange<SizeType32>(*inputBuffers.forwardBatchSlots.at(i));
+        SizeType32 counter = 0;
+        for (auto b = 0; b < batchSize; ++b)
+        {
+            if (generatedTokensPerSteps.at(b) > i)
+            {
+                batchSlotsRange[counter++] = b;
+            }
+        }
+        inputBuffers.forwardBatchSlots.at(i)->resize(counter);
+    }
+
+    newRequests(inputBuffers.setupBatchSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;

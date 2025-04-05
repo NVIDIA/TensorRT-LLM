@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -249,8 +250,6 @@ void GptDecoderBatched::prepareForward(
         setEagleInputs(input);
     }
 
-    auto const& batchSlotsSlice = input.batchSlots.at(step);
-    auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsSlice);
     SizeType32 localBatchDecoderIdx = 0;
     std::vector<SharedConstPtr> logitsVec;
     for (SizeType32 bi = 0; bi < mDecoderState->getActualBatchSize(); ++bi)
@@ -259,15 +258,15 @@ void GptDecoderBatched::prepareForward(
         {
             continue;
         }
-        batchSlotsRange[localBatchDecoderIdx] = bi;
         localBatchDecoderIdx++;
 
         auto const& targetLogits = allTargetLogits[bi];
         TensorPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
         logitsVec.push_back(logitsSlice);
     }
-    batchSlotsSlice->resize(localBatchDecoderIdx);
-    dInput.batchSlots = batchSlotsSlice;
+    TLLM_CHECK_WITH_INFO(input.batchSlots.at(step)->getSize() == static_cast<size_t>(localBatchDecoderIdx),
+        "batchSlots size mismatch: %ld != %d", input.batchSlots.at(step)->getSize(), localBatchDecoderIdx);
+    dInput.batchSlots = input.batchSlots.at(step);
     dInput.batchSize = localBatchDecoderIdx;
     dInput.logitsVec = logitsVec;
 
