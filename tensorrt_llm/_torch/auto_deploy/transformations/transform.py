@@ -25,6 +25,7 @@ from .library import (
     match_moe_pattern,
     quantize,
     resize_kv_cache,
+    unfuse_weights,
 )
 
 
@@ -86,6 +87,9 @@ class InferenceOptimizer:
 
         # quantization
         egm = quantize(egm, self.factory.get_quant_config())
+
+        # unfuse weights
+        egm = unfuse_weights(egm)
 
         # Match MoE pattern
         egm = match_moe_pattern(egm)

@@ -81,6 +81,7 @@ Additionally, we have officially verified and fully optimized support for the fo
 | DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
 | Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
 | BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| Phi4/Phi3 | microsoft/phi-4<br>microsoft/Phi-3-mini-4k-instruct<br>microsoft/Phi-3-medium-4k-instruct | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
 
 </details>
 
