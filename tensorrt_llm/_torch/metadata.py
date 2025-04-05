@@ -47,7 +47,6 @@ class SequenceGroup:
     logits_processors: list[LogitsProcessor]
     batch_indices: Union[List[int], torch.Tensor] = field(default_factory=list)
     request_ids: Union[List[int], torch.Tensor] = field(default_factory=list)
-    stream_ptr: Optional[int] = None
     client_id: Optional[int] = None
 
 

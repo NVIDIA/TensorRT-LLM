@@ -905,6 +905,10 @@ class PyTorchModelEngine(ModelEngine):
                 mrope_config['mrope_rotary_cos_sin'].append(
                     mrope_rotary_cos_sin)
             request.py_batch_idx = batch_idx
+
+            logits_processor_metadata = self._maybe_update_lp_metadata(
+                request, logits_processor_metadata, is_context=True)
+
             batch_idx += 1
 
         num_ctx_requests = batch_idx
@@ -1017,18 +1021,8 @@ class PyTorchModelEngine(ModelEngine):
 
             request.py_batch_idx = batch_idx
 
-            logits_processors = getattr(request, "logits_post_processors", None)
-            if logits_processors and not (self.mapping.has_tp() and self.mapping.tp_rank > 0 or \
-                self.mapping.has_pp() and self.mapping.pp_rank > 0):
-                logits_processor_metadata = logits_processor_metadata or LogitsProcessorMetadata(
-                )
-                logits_processor_metadata.update_per_request(
-                    request.py_request_id,
-                    logits_processors,
-                    request.py_batch_idx,
-                    torch.tensor(request.get_tokens(0),
-                                 dtype=torch.long)  # TODO: need all beams
-                )
+            logits_processor_metadata = self._maybe_update_lp_metadata(
+                request, logits_processor_metadata)
 
             batch_idx += 1
 
@@ -1771,3 +1765,29 @@ class PyTorchModelEngine(ModelEngine):
             ub.ub_allocate(1, hidden_size * self.max_num_tokens * 2),
         ]
         return True
+
+    def _maybe_update_lp_metadata(
+            self,
+            request,
+            logits_processor_metadata: Optional[LogitsProcessorMetadata],
+            is_context: bool = False) -> Optional[LogitsProcessorMetadata]:
+        logits_processors = getattr(request, "logits_post_processors", None)
+        if not logits_processors or (self.mapping.has_tp() and self.mapping.tp_rank > 0 or \
+            self.mapping.has_pp() and self.mapping.pp_rank > 0):
+            return
+
+        token_ids = request.get_tokens(0)
+        if is_context and request.py_orig_prompt_len < len(token_ids):
+            # Skip as we only need to apply logit processor on the last context request
+            return
+
+        logits_processor_metadata = logits_processor_metadata or LogitsProcessorMetadata(
+        )
+        logits_processor_metadata.update_per_request(
+            request.py_request_id,
+            logits_processors,
+            request.py_batch_idx,
+            torch.tensor(token_ids, dtype=torch.long)  # TODO: need all beams
+        )
+
+        return logits_processor_metadata
