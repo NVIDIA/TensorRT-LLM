@@ -49,24 +49,25 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(
-        std::vector<TensorPtr> const& logits, std::vector<bool> const& active, SizeType32 maxDecodingEngineTokens)
+    explicit Input(std::vector<std::vector<TensorConstPtr>> const& logits, std::vector<bool> const& active,
+        SizeType32 maxDecodingEngineTokens)
         : logits{logits}
         , maxDecodingEngineTokens{maxDecodingEngineTokens}
         , active{active}
     {
-        TLLM_CHECK_WITH_INFO(
-            this->active.size() == logits.size(), "'active' vector size does not match logits vector size");
+        TLLM_CHECK_WITH_INFO(logits.size() == static_cast<size_t>(maxDecodingEngineTokens),
+            "logits vector size does not match maxDecodingEngineTokens");
     }
 
-    explicit Input(std::vector<TensorPtr> const& logits)
-        : Input{logits, std::vector<bool>(logits.size(), true), 1}
+    explicit Input(std::vector<TensorConstPtr> const& logits)
+        : Input{{logits}, std::vector<bool>(logits.size(), true), 1}
     {
     }
 
     // mandatory parameters
-    std::vector<TensorPtr>
-        logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
+    // FIXME: remove first dimension of tensors
+    std::vector<std::vector<TensorConstPtr>>
+        logits; // [generatedTokensPerStep][batchSize][1, beamWidth, vocabSizePadded], on gpu
 
     // maximum number of decoding tokens of active slots
     SizeType32 maxDecodingEngineTokens;
@@ -74,7 +75,7 @@ public:
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
     std::vector<TensorPtr>
-        batchSlots; // maxTokensPerEngineStep * [batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
+        batchSlots; // [maxTokensPerEngineStep][batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
     TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
 
     // parameters for beam search
