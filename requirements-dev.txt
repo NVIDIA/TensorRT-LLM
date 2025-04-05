@@ -19,6 +19,7 @@ pytest-xdist
 pytest-timeout
 pytest-split
 pytest-mock
+pytest-threadleak
 rouge_score
 cloudpickle
 typing-extensions==4.12.2
