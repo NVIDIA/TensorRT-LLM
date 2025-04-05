@@ -1919,12 +1919,10 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
     auto updateDecoderBuffersEvent = (*mUpdateDecoderBuffers)(mModelConfig, *mDecoderBuffers,
-        mRuntime->getBufferManager(), *mDecoder, returnLogProbs, std::move(decoderFinishEvent));
+        mRuntime->getBufferManager(), *mDecoder, returnLogProbs, decoderFinishEvent);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return std::make_unique<runtime::decoder_batch::DecoderFinishedEvent>(std::move(updateDecoderBuffersEvent),
-        std::vector<bool>(
-            scheduledRequests.contextRequests.size() + scheduledRequests.generationRequests.size(), true));
+    return updateDecoderBuffersEvent;
 }
 
 void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
