@@ -542,19 +542,22 @@ class TRTLLMDecoder(Decoder):
         #       current implementation of model_engine.
         # TODO: When we support speculative decoding:
         # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-        new_tokens_device_tensor = torch.empty(
-            (self.batch_size * self.beam_width, ),
-            dtype=torch.int,
-            device='cuda')
-        for idx, request in enumerate(
-                itertools.chain(scheduled_requests.context_requests,
-                                scheduled_requests.generation_requests)):
-            seq_slot = request.seq_slot
-            for beam in range(self.beam_width):
-                new_tokens_device_tensor[idx * self.beam_width + beam].copy_(
-                    self.algs.decoder.decoder_state.all_new_tokens[0][seq_slot]
-                    [beam],
-                    non_blocking=True)
+        new_tokens_device_tensor = torch.empty((
+            self.batch_size,
+            self.beam_width,
+        ),
+                                               dtype=torch.int,
+                                               device='cuda')
+
+        seq_slots = [
+            request.seq_slot for request in itertools.chain(
+                scheduled_requests.context_requests,
+                scheduled_requests.generation_requests)
+        ]
+        new_tokens_device_tensor.copy_(
+            self.algs.decoder.decoder_state.all_new_tokens[0][seq_slots],
+            non_blocking=True)
+        new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
 
         # NOTE: This does dynamic memory allocations.
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
