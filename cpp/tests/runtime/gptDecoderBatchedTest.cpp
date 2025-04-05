@@ -152,7 +152,7 @@ decoder_batch::Input prepareDecoderInputs(std::vector<SizeType32> const& activeS
             "batchSlots size mismatch: %ld != %d", batchSlots.at(step)->getSize(), localBatchDecoderIdx);
     }
 
-    auto decodingInput = decoder_batch::Input(logitsVec, active, maxActiveDecodingEngineTokens);
+    auto decodingInput = decoder_batch::Input(logitsVec, maxActiveDecodingEngineTokens);
     decodingInput.batchSlots = batchSlots;
     // FIXME: ignore cacheIndirection for now since they are all the same
     decodingInput.cacheIndirection = std::move(srcCacheIndirection);
@@ -563,8 +563,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         activeSlots.clear();
         for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
         {
-            inputs.active.at(batchIdx) = !finishedVec.at(batchIdx);
-            if (inputs.active.at(batchIdx))
+            if (!finishedVec.at(batchIdx))
             {
                 activeSlots.push_back(batchIdx);
             }
