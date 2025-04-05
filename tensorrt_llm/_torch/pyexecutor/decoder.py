@@ -259,7 +259,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
-            request.py_decoding_iter += 1
+                request.py_decoding_iter += 1
             idx += 1
 
         if hasattr(scheduled_requests, 'chunked_requests'):
