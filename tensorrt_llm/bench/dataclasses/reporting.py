@@ -273,24 +273,16 @@ class ReportUtility:
 
         # World and runtime info
         stats_dict["world_info"] = {
-            "tp_size":
-            self.rt_cfg.world_config.tp_size,
-            "pp_size":
-            self.rt_cfg.world_config.pp_size,
-            "ep_size":
-            self.rt_cfg.world_config.ep_size,
-            "world_size":
-            self.rt_cfg.world_config.world_size,
-            "max_batch_size":
-            self.rt_cfg.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.rt_cfg.settings_config.max_num_tokens,
-            "scheduling_policy":
-            self.rt_cfg.settings_config.scheduler_policy.values[1],
+            "tp_size": self.rt_cfg.world_config.tp_size,
+            "pp_size": self.rt_cfg.world_config.pp_size,
+            "ep_size": self.rt_cfg.world_config.ep_size,
+            "world_size": self.rt_cfg.world_config.world_size,
+            "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
+            "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
+            "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
             "kv_cache_percentage":
             self.rt_cfg.settings_config.kv_cache_percent * 100.0,
-            "issue_rate":
-            self.convert_rate_to_s(self.statistics.issue_rate_ns)
+            "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
         # Request details

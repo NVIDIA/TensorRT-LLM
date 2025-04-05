@@ -10,8 +10,7 @@ from utils.util import getSMVersion
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import MTPDecodingConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 # Test combinations for different scenarios
