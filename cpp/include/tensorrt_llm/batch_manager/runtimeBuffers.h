@@ -235,7 +235,6 @@ public:
     //! Helper for KV cache rewind
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
-    TensorPtr sortedSeqSlots;
     //! For KV cache rewind
     TensorPtr seqSlotRemappingHost;   // [numSequences]
     TensorPtr seqSlotRemappingDevice; // [numSequences]
