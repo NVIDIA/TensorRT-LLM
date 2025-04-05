@@ -96,7 +96,7 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
 
         for scale_name, buffer in buffer_fused.items():
             fused_buffer_name = new_param_name + "_" + scale_name
-            full_new_buffer_name = add_new_attribute_to_submodule(
+            add_new_attribute_to_submodule(
                 gm, new_module_name, fused_buffer_name, buffer, is_buffer=True
             )
 
@@ -115,6 +115,7 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
         get_param_node = gm.graph.get_attr(full_new_param_name, torch.Tensor)
         if quantization_impl:
             for scale_name in quantization_impl.scale_names():
+                full_new_buffer_name = full_new_param_name + "_" + scale_name
                 fused_kwargs[scale_name] = gm.graph.create_node("get_attr", full_new_buffer_name)
 
     # add new linear node + split node
