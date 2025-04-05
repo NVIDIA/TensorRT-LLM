@@ -168,25 +168,11 @@ void GptDecoderBatched::setEagleInputs(decoder_batch::Input const& input)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-namespace
-{
-template <typename T>
-T maxOfActiveSlots(std::vector<T> const& values, std::vector<bool> const& active)
-{
-    return std::transform_reduce(
-        values.begin(), values.end(), active.begin(), std::numeric_limits<T>::min(),
-        [](auto lhf, auto rhs) { return std::max(lhf, rhs); },
-        [](auto numTokens, auto active) { return active ? numTokens : std::numeric_limits<T>::min(); });
-}
-} // namespace
-
 void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
-
-    for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
+    for (SizeType32 si = 0; si < input.maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
         prepareForward(si, output, input);
 
@@ -270,11 +256,9 @@ void GptDecoderBatched::prepareForward(
     dInput.batchSize = localBatchDecoderIdx;
     dInput.logitsVec = logitsVec;
 
-    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
-
     TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput
-        = ITensor::slice(mDecoderState->getFinishedSteps(), std::min(maxDecodingEngineTokens - 1, step + 1), 1);
+        = ITensor::slice(mDecoderState->getFinishedSteps(), std::min(input.maxDecodingEngineTokens - 1, step + 1), 1);
     finishedStepsInput->squeeze(0);
     finishedStepsOutput->squeeze(0);
     TensorPtr newTokensStepView

@@ -86,6 +86,7 @@ decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBe
     }
 
     decoder_batch::Input inputs{logits};
+    inputs.maxDecodingEngineTokens = maxGeneratedTokensPerSteps;
 
     if (maxBeamWidth > 1)
     {
