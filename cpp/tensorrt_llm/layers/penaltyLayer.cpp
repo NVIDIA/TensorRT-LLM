@@ -168,7 +168,7 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     bool const useFrequencyPenalty
         = mDecodingMode.isUseFrequencyPenalty() && penaltyParams->frequencyPenalty.has_value();
     bool const useMinLength = mDecodingMode.isUseMinLength() && penaltyParams->minLength.has_value();
-    // FIXME(nkorobov): once one of the requests has some penalty, we will always have to compute it.
+    // FIXME: once one of the requests has some penalty, we will always have to compute it.
     // To avoid that we need to scan through all active requests at each iteration.
     mUseTemperature |= useTemperature;
     mUseRepetitionPenalty |= useRepetitionPenalty;

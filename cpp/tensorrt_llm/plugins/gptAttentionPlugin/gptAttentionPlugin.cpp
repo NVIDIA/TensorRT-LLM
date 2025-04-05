@@ -487,7 +487,7 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         // desc_val == -1 means beam_width is not static, we should look at min/max/opt.
         //
         // In prepareEnqueueGeneration, we'll prepare for all cases where beam_width doesn't exceed max.
-        // TODO(minwei): pass min AND max to prepareEnqueueGeneration instead of max only.
+        // TODO: pass min AND max to prepareEnqueueGeneration instead of max only.
         int desc_val = in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1];
         int max_val = in[getIdx(IdxEntry::CACHE_INDIR)].max.d[1];
         beamWidth = desc_val == -1 ? max_val : desc_val;

@@ -97,7 +97,7 @@ struct MHARunnerFixedParams
     Data_type dataTypeOut;
 
     // Do we use fp32 accumulation ?
-    // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+    // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
     // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
     bool forceFp32Acc;
     // The attention mask type.

@@ -977,7 +977,7 @@ void testCopyBatch(tr::SizeType64 stride, tr::BufferManager& manager, tr::CudaSt
 
     auto srcBufferDevice = manager.copyFrom(*srcBufferHost, tr::MemoryType::kGPU);
 
-    // TODO(nkorobov): test different dataSizes copy
+    // TODO: test different dataSizes copy
     tr::kernels::invokeCopyBatch(*srcBufferDevice, *dstBufferDevice, *srcOffsets, *dstOffsets, *sizes, stride, stream);
 
     auto dstBufferHost = manager.copyFrom(*dstBufferDevice, tr::MemoryType::kCPU);
