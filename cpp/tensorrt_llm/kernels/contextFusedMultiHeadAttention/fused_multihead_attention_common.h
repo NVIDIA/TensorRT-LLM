@@ -182,6 +182,44 @@ struct MHARunnerFixedParams
 
         return output;
     }
+
+    /**
+     * Set attention mask type from AttentionMaskType enum
+     * @param maskType The AttentionMaskType to use
+     * @return Reference to this object for method chaining
+     * @throws If the maskType cannot be mapped to ContextAttentionMaskType
+     */
+    MHARunnerFixedParams& setAttentionMaskType(std::int8_t maskType)
+    {
+        switch (maskType)
+        {
+        case 0: // tensorrt_llm::kernels::AttentionMaskType::PADDING
+            attentionMaskType = ContextAttentionMaskType::PADDING;
+            break;
+        case 1: // tensorrt_llm::kernels::AttentionMaskType::CAUSAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
+            attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
+            break;
+        // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used
+        case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 4: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONALGLM
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 5: // tensorrt_llm::kernels::AttentionMaskType::BLOCKSPARSE
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 6: // tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK
+            attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
+            break;
+        default:
+            TLLM_THROW("AttentionMaskType %d cannot be mapped to ContextAttentionMaskType", static_cast<int>(maskType));
+        }
+        return *this;
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

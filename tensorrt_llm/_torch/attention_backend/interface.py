@@ -114,6 +114,7 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
+    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:

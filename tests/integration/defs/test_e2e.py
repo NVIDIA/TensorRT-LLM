@@ -1791,12 +1791,10 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("model_name,model_path", [
     ("BertForSequenceClassification", "bert/bert-base-uncased-yelp-polarity"),
 ])
-def test_ptp_quickstart_bert(llm_root,
-                             llm_venv,
-                             model_name,
-                             model_path,
-                             backend='VANILLA'):
-    print(f"Testing {model_name}.")
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
+                             backend):
+    print(f"Testing {model_name} with {backend} backend.")
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 

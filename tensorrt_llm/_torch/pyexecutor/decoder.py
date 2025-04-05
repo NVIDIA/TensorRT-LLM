@@ -519,7 +519,8 @@ class TRTLLMDecoder(Decoder):
                 sampling_config = make_sampling_config(sampling_configs)
                 self.algs.decoder.underlying_decoder().setup(
                     sampling_config, local_batch_size, batch_slots,
-                    self.algs.decoder.joint_decoding_output, decoder_requests)
+                    self.algs.decoder.decoder_state.joint_decoding_output,
+                    decoder_requests)
 
             # Note: In runtimeBuffers.cpp, num_context_logits is set to:
             #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
@@ -550,11 +551,11 @@ class TRTLLMDecoder(Decoder):
         self.decoder_event.synchronize()
 
         # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
-        new_tokens_host = self.algs.decoder.all_new_tokens.to('cpu',
-                                                              non_blocking=True)
-        finished_sum_host = self.algs.decoder.finished_sum.to('cpu',
-                                                              non_blocking=True)
-        finish_reasons_host = self.algs.decoder.finish_reasons.to(
+        new_tokens_host = self.algs.decoder.decoder_state.all_new_tokens.to(
+            'cpu', non_blocking=True)
+        finished_sum_host = self.algs.decoder.decoder_state.finished_sum.to(
+            'cpu', non_blocking=True)
+        finish_reasons_host = self.algs.decoder.decoder_state.finish_reasons.to(
             'cpu', non_blocking=True)
         sequence_lengths_host_data = self.store[
             "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
