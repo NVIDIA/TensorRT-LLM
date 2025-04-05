@@ -68,8 +68,8 @@ public:
 
     // control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
-    TensorPtr
-        batchSlots; // [maxTokensPerEngineStep, batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
+    std::vector<TensorPtr>
+        batchSlots; // maxTokensPerEngineStep * [batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
     TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
 
     // parameters for beam search

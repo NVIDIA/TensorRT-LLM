@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/statefulGptDecoderBatched.h"
 
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -79,7 +80,7 @@ StatefulGptDecoderBatched::StatefulGptDecoderBatched(CudaStreamPtr stream, nvinf
     auto const& bufferManager = mDecoder->getBufferManager();
 
     mBatchSlotsSetup = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
-    mBatchSlotsDecoder = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
+    mBatchSlotsDecoder.emplace_back(bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType));
     mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
 }
 
@@ -94,7 +95,7 @@ void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeTy
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
     mBatchSlotsSetup->reshape(ITensor::makeShape({maxBatchSize}));
-    mBatchSlotsDecoder->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
+    mBatchSlotsDecoder.at(0)->reshape(ITensor::makeShape({maxBatchSize}));
 }
 
 void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
