@@ -9,7 +9,7 @@ from torch.fx import GraphModule, Node
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
-    add_new_parameter_to_submodule,
+    add_new_attribute_to_submodule,
     extract_param_names_from_lin_node,
     get_op_overload_packet,
     is_linear_op,
@@ -95,15 +95,14 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
         param_fused = nn.Parameter(weights_fused, requires_grad=False)
 
         for scale_name, buffer in buffer_fused.items():
-            submodule = gm.get_submodule(new_module_name)
             fused_buffer_name = new_param_name + "_" + scale_name
-            submodule.register_buffer(fused_buffer_name, buffer)
+            full_new_buffer_name = add_new_attribute_to_submodule(gm, new_module_name, fused_buffer_name, buffer, is_buffer=True)
 
     else:
         param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
 
     # Register fused parameters to new submodule
-    full_new_param_name = add_new_parameter_to_submodule(
+    full_new_param_name = add_new_attribute_to_submodule(
         gm, new_module_name, new_param_name, param_fused
     )
 
@@ -114,10 +113,7 @@ def _insert_fused_gemm(gm: GraphModule, parent_node: Node, linear_nodes: List[No
         get_param_node = gm.graph.get_attr(full_new_param_name, torch.Tensor)
         if quantization_impl:
             for scale_name in quantization_impl.scale_names():
-                # Creates new nodes for the fused scales so the unfused linear ops can be fully erased.
-                fused_kwargs[scale_name] = gm.graph.create_node(
-                    "get_attr", new_module_name + "_" + fused_buffer_name
-                )
+                fused_kwargs[scale_name] = gm.graph.create_node("get_attr", full_new_buffer_name)
 
     # add new linear node + split node
     with gm.graph.inserting_before(linear_nodes[0]):

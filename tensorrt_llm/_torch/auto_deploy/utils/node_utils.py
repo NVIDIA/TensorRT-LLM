@@ -277,18 +277,18 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def add_new_parameter_to_submodule(
-    gm: GraphModule, new_submodule_name: str, new_param_name: str, new_param: torch.Tensor
+def add_new_attribute_to_submodule(
+    gm: GraphModule, new_submodule_name: str, new_attr_name: str, new_attr: torch.Tensor, is_buffer: bool = False
 ) -> str:
     """
-    Adds a new parameter to a submodule within gm.
+    Adds a new parameter or buffer to a submodule within gm.
 
     If the submodule identified by new_submodule_name does not exist,
-    it will be created. Then the new parameter new_param is added to the submodule
-    under the attribute new_param_name.
+    it will be created. Then the new parameter or buffer is added to the submodule
+    under the attribute new_attr_name.
 
     Returns:
-        A string representing the full parameter name in the format "new_submodule_name.new_param_name".
+        A string representing the full parameter/buffer name in the format "new_submodule_name.new_attr_name".
     """
     try:
         submodule = gm.get_submodule(new_submodule_name)
@@ -298,7 +298,11 @@ def add_new_parameter_to_submodule(
         ad_logger.debug(f"Added submodule '{new_submodule_name}' with result: {result}.")
         submodule = gm.get_submodule(new_submodule_name)
 
-    submodule.register_parameter(new_param_name, new_param)
-    ad_logger.debug(f"Set new parameter '{new_param_name}' in submodule '{new_submodule_name}'.")
+    if is_buffer:
+        submodule.register_buffer(new_attr_name, new_attr)
+        ad_logger.debug(f"Set new buffer '{new_attr_name}' in submodule '{new_submodule_name}'.")
+    else:
+        submodule.register_parameter(new_attr_name, new_attr)
+        ad_logger.debug(f"Set new parameter '{new_attr_name}' in submodule '{new_submodule_name}'.")
 
-    return f"{new_submodule_name}.{new_param_name}"
+    return f"{new_submodule_name}.{new_attr_name}"

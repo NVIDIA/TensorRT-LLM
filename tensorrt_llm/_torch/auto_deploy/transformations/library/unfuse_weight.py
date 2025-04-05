@@ -21,7 +21,7 @@ from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
-    add_new_parameter_to_submodule,
+    add_new_attribute_to_submodule,
     extract_param_names_from_lin_node,
     is_chunk_or_slice_op,
     is_linear_op,
@@ -50,7 +50,7 @@ def _create_and_register_weight(
 
     split_weight = orig_weight[start_idx:end_idx]  # spilt weights on dim=0
     new_weight = nn.Parameter(split_weight.detach().clone())
-    full_new_param_name = add_new_parameter_to_submodule(
+    full_new_param_name = add_new_attribute_to_submodule(
         gm, new_module_name, new_param_name, new_weight
     )
 
