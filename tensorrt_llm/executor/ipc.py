@@ -11,9 +11,10 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
+from ..bindings import executor as tllm
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, nvtx_mark,
                             nvtx_range, print_colored, print_colored_debug)
-from .utils import ExecutorResponse, ExecutorResponseTensors
+from .utils import ExecutorResponse, ExecutorResponseTensors, ExecutorResponseTensorsSafe, ExecutorResponseSafe
 
 
 class ZeroMqQueue:
@@ -106,6 +107,26 @@ class ZeroMqQueue:
         with nvtx_range("send", color="blue", category="IPC"):
             self.socket.send_pyobj(obj)
 
+    def put_with_json_serialization(self, obj: Any):
+        self.setup_lazily()
+
+        if isinstance(obj, ExecutorResponseSafe):
+            tensors = self._store_tensors_in_shmm(obj.tensors)
+            finish_reasons_lst = self._convert_FinishReason_enum_to_int(obj.finish_reasons)
+            error_str = self._convert_Exception_to_str(obj.error)
+            obj = ExecutorResponseSafe(
+                client_id=obj.client_id,
+                sequence_index=obj.sequence_index,
+                tensors=tensors,
+                finish_reasons=finish_reasons_lst,
+                is_final=obj.is_final,
+                error=error_str,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+
+        with nvtx_range("send", color="blue", category="IPC"):
+            self.socket.send_string(obj.model_dump_json())
+
     async def put_async(self, obj: Any):
         self.setup_lazily()
         if isinstance(obj, ExecutorResponse):
@@ -121,6 +142,34 @@ class ZeroMqQueue:
 
         try:
             await self.socket.send_pyobj(obj)
+        except TypeError as e:
+            logger.error(f"Cannot pickle {obj}")
+            raise e
+        except Exception as e:
+            logger.error(f"Error sending object: {e}")
+            logger.error(traceback.format_exc())
+            raise e
+
+        nvtx_mark("ipc.send", color="blue", category="IPC")
+    
+    async def put_async_with_json_serialization(self, obj: Any):
+        self.setup_lazily()
+        if isinstance(obj, ExecutorResponseSafe):
+            tensors = self._store_tensors_in_shmm(obj.tensors)
+            finish_reasons_lst = self._convert_FinishReason_enum_to_int(obj.finish_reasons)
+            print(finish_reasons_lst)
+            error_str = self._convert_Exception_to_str(obj.error)
+            obj = ExecutorResponseSafe(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=finish_reasons_lst,
+                is_final=obj.is_final,
+                error=error_str,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+
+        try:
+            await self.socket.send_string(obj.model_dump_json())
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -149,6 +198,26 @@ class ZeroMqQueue:
                 disaggregated_params=obj.disaggregated_params)
         return obj
 
+    def get_with_json_serialization(self) -> Any:
+        self.setup_lazily()
+
+        obj = self.socket.recv_string()
+        nvtx_mark("ipc.get", color="orange", category="IPC")
+
+        if isinstance(obj, ExecutorResponseSafe):
+            tensors = self._load_tensors_from_shmm(obj.tensors)
+            finish_reasons_lst = self._convert_int_to_FinishReason_enum(obj.finish_reasons)
+            error_exception = self._convert_str_to_Exception(obj.error)
+            obj = ExecutorResponseSafe(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=finish_reasons_lst,
+                is_final=obj.is_final,
+                error=error_exception,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+        return obj
+
     async def get_async(self) -> Any:
         self.setup_lazily()
 
@@ -167,6 +236,28 @@ class ZeroMqQueue:
                 timestamp=obj.timestamp,
                 disaggregated_params=obj.disaggregated_params)
         return obj
+    
+    async def get_async_with_json_serialization(self) -> Any:
+        self.setup_lazily()
+
+        obj = await self.socket.recv_string()
+        nvtx_mark("ipc.get", color="orange", category="IPC")
+        obj = ExecutorResponseSafe.model_validate_json(obj)
+
+        if isinstance(obj, ExecutorResponseSafe):
+            tensors = self._load_tensors_from_shmm(obj.tensors)
+            finish_reasons_lst = self._convert_int_to_FinishReason_enum(obj.finish_reasons)
+            error_exception = self._convert_str_to_Exception(obj.error)
+            obj = ExecutorResponseSafe(
+                client_id=obj.client_id,
+                tensors=tensors,
+                sequence_index=obj.sequence_index,
+                finish_reasons=finish_reasons_lst,
+                is_final=obj.is_final,
+                error=error_exception,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
+        return obj
 
     def close(self):
         if self.socket:
@@ -179,7 +270,8 @@ class ZeroMqQueue:
     def _store_tensors_in_shmm(
         self, tensors: Optional["ExecutorResponseTensors"]
     ) -> Optional["ExecutorResponseTensors"]:
-        if tensors is None:
+        do_store_tensor = isinstance(tensors.context_logits, torch.Tensor) and isinstance(tensors.generation_logits, torch.Tensor)
+        if tensors is None or not do_store_tensor:
             return tensors
 
         # The tensors are huge and cannot be transferred through socket directly. We need to store them in shared memory,
@@ -197,7 +289,7 @@ class ZeroMqQueue:
             shm.close()
             return shm.name
 
-        return ExecutorResponseTensors(
+        return ExecutorResponseTensorsSafe(
             output_token_ids=tensors.output_token_ids,
             context_logits=store_tensor(tensors.context_logits),
             generation_logits=store_tensor(tensors.generation_logits),
@@ -208,7 +300,8 @@ class ZeroMqQueue:
     def _load_tensors_from_shmm(
         self, tensors: Optional["ExecutorResponseTensors"]
     ) -> Optional["ExecutorResponseTensors"]:
-        if tensors is None:
+        do_load_tensor = isinstance(tensors.context_logits, str) and isinstance(tensors.generation_logits, str)
+        if tensors is None or not do_load_tensor:
             return tensors
 
         def load_tensor(tensor: Optional[str]) -> Optional[torch.Tensor]:
@@ -221,7 +314,7 @@ class ZeroMqQueue:
             shm.unlink()
             return tensor
 
-        return ExecutorResponseTensors(
+        return ExecutorResponseTensorsSafe(
             output_token_ids=tensors.output_token_ids,
             context_logits=load_tensor(tensors.context_logits),
             generation_logits=load_tensor(tensors.generation_logits),
@@ -232,6 +325,32 @@ class ZeroMqQueue:
     def __del__(self):
         self.close()
 
+    # Helper methods to allow ExecutorResponse to be JSON serialized.
+    def _convert_FinishReason_enum_to_int(self, finish_reasons: Optional[list[tllm.FinishReason]]) -> Optional[list[int]]:
+        if finish_reasons is None or not all(isinstance(reason, tllm.FinishReason) for reason in finish_reasons):
+            return finish_reasons
+        return [reason.value for reason in finish_reasons]
+    
+    def _convert_int_to_FinishReason_enum(self, finish_reasons: Optional[list[int]]) -> Optional[list[tllm.FinishReason]]:
+        if finish_reasons is None or not all(isinstance(reason, int) for reason in finish_reasons):
+            return finish_reasons
+        return [tllm.FinishReason(reason) for reason in finish_reasons]
+    
+    def _convert_Exception_to_str(self, error: Optional[Exception]) -> Optional[str]:
+        if error is None or not isinstance(error, Exception):
+            return error
+        return f"{error.__class__.__name__}:{','.join(str(arg) for arg in error.args)}"
+
+    def _convert_str_to_Exception(self, error: Optional[str]) -> Optional[Exception]:
+        if error is None or not isinstance(error, str):
+            return error
+        exception_type, exception_args = error.split(":", 1)
+        exception_type = eval(exception_type)
+        exception_args = exception_args.split(",") if exception_args else []
+        return exception_type(*exception_args)
+
+    def _check_two_exceptions_equal(self, e: Exception, e2: Exception) -> bool:
+        assert type(e) is type(e2) and e.args == e2.args
 
 IpcQueue = ZeroMqQueue
 
