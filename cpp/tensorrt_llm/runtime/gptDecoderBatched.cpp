@@ -211,12 +211,9 @@ void GptDecoderBatched::prepareForward(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const& allTargetLogits = input.logits;
     auto const& jointOutputIdsShape = mDecoderState->getJointDecodingOutput().ids->getShape();
     auto const maxBeamWidth = jointOutputIdsShape.d[1];
     auto const speculativeDecodingMode = mDecoderState->getSpeculativeDecodingMode();
-
-    auto constexpr singleRequest = 1;
 
     auto& dInput = mDecoderState->getJointDecodingInput();
     auto& dOutput = mDecoderState->getJointDecodingOutput();
@@ -236,25 +233,9 @@ void GptDecoderBatched::prepareForward(
         setEagleInputs(input);
     }
 
-    SizeType32 localBatchDecoderIdx = 0;
-    std::vector<SharedConstPtr> logitsVec;
-    for (SizeType32 bi = 0; bi < mDecoderState->getActualBatchSize(); ++bi)
-    {
-        if (!input.active.at(bi) || step >= mDecoderState->getNumDecodingEngineTokens(bi))
-        {
-            continue;
-        }
-        localBatchDecoderIdx++;
-
-        auto const& targetLogits = allTargetLogits[bi];
-        TensorPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
-        logitsVec.push_back(logitsSlice);
-    }
-    TLLM_CHECK_WITH_INFO(input.batchSlots.at(step)->getSize() == static_cast<size_t>(localBatchDecoderIdx),
-        "batchSlots size mismatch: %ld != %d", input.batchSlots.at(step)->getSize(), localBatchDecoderIdx);
     dInput.batchSlots = input.batchSlots.at(step);
-    dInput.batchSize = localBatchDecoderIdx;
-    dInput.logitsVec = logitsVec;
+    dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
+    dInput.logitsVec = input.logits.at(step);
 
     TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput
