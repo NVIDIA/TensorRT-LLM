@@ -20,7 +20,8 @@ import torch
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats)
-from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+from tensorrt_llm.bindings.internal.batch_manager import (ReqIdsSet,
+                                                          RequestVector)
 from tensorrt_llm.logger import logger
 
 from .decoder import Decoder
@@ -630,6 +631,7 @@ class PyExecutor:
                         batch_outputs = self._forward_step(scheduled_batch)
                         new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
                             scheduled_batch, batch_outputs)
+                        self._update_request_states(scheduled_batch)
                         torch.cuda.nvtx.range_pop()
 
                     if num_dummy_request > 0:
@@ -652,10 +654,10 @@ class PyExecutor:
                             "_handle_new_tokens_inter_pp")
                         _, previous_new_tensors_host, _ = previous_batch
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor(
-                            previous_new_tensors_host["new_tokens_host"],
-                            src=self.dist.prev_pp_rank,
-                            tag=prev_microbatch_id)
+                        self.dist.recv_tensor_list(tensor_list=list(
+                            previous_new_tensors_host.values()),
+                                                   src=self.dist.prev_pp_rank,
+                                                   tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         _, previous_new_tensors_host, previous_decoder_event = previous_batch
@@ -667,8 +669,9 @@ class PyExecutor:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_tensor(
-                                previous_new_tensors_host["new_tokens_host"],
+                            prev_microbatch_id] = self.dist.isend_tensor_list(
+                                tensor_list=list(
+                                    previous_new_tensors_host.values()),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -773,11 +776,17 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
+                    _, new_tensors_host, decoder_event = self._decode_async(
+                        scheduled_batch, batch_outputs)
+
+                    self._update_request_states(scheduled_batch)
+
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    self._decode(scheduled_batch, batch_outputs)
+                    self._update_requests(scheduled_batch, new_tensors_host,
+                                          decoder_event)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -902,15 +911,18 @@ class PyExecutor:
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_new_tensors_device)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     new_tensors_device, new_tensors_host, decoder_event = self._decode_async(
                         scheduled_batch, batch_outputs)
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
+
+                    self._update_request_states(scheduled_batch)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
+
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
                         self._process_previous_batch()
@@ -967,15 +979,15 @@ class PyExecutor:
                                       dtype=torch.int64,
                                       device='cpu',
                                       pin_memory=True)
-        return {"new_tokens_host": new_tokens_host}
+        return OrderedDict({"new_tokens_host": new_tokens_host})
 
     @nvtx_range("_handle_previous_batch_inter_pp")
     def _handle_previous_batch_inter_pp(self, previous_scheduled_batch,
                                         previous_new_tensors_host,
                                         prev_microbatch_id):
         # Receive tokens from prev pp rank w.r.t model forward direction
-        self.dist.recv_tensor(
-            previous_new_tensors_host["new_tokens_host"],
+        self.dist.recv_tensor_list(
+            tensor_list=list(previous_new_tensors_host.values()),
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -985,8 +997,8 @@ class PyExecutor:
         if not self.dist.is_second_last_pp_rank:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
-            self.send_handles[prev_microbatch_id] = self.dist.isend_tensor(
-                tensor=previous_new_tensors_host["new_tokens_host"],
+            self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
+                tensor_list=list(previous_new_tensors_host.values()),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
@@ -996,16 +1008,16 @@ class PyExecutor:
         _, new_tensors_host, decoder_event = self._decode_async(
             scheduled_batch, batch_outputs)
 
+        self._update_request_states(scheduled_batch)
+
         if self.send_handles[microbatch_id] is not None:
             self.send_handles[microbatch_id].Wait()
         decoder_event.synchronize()
 
-        self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            new_tensors_host["new_tokens_host"],
+        self.send_handles[microbatch_id] = self.dist.isend_tensor_list(
+            tensor_list=list(new_tensors_host.values()),
             dest=self.dist.next_pp_rank,
             tag=microbatch_id)
-
-        return new_tensors_host
 
     def _update_new_active_requests_queue_latency(self, new_requests):
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -1385,6 +1397,12 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        cache_trans_complete_requests = RequestVector()
+        for req in scheduled_batch.generation_requests:
+            if req.is_disagg_generation_transmission_complete:
+                cache_trans_complete_requests.append(req)
+        if len(cache_trans_complete_requests) > 0:
+            self._setup_decoder_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1423,6 +1441,8 @@ class PyExecutor:
         for req in scheduled_ctx_requests:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
+                self.resource_manager.resource_managers[
+                    "guided_decoder_resource_manager"].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(False)
 
@@ -1450,8 +1470,6 @@ class PyExecutor:
         try:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device)
-            self._setup_decoder(scheduled_requests, outputs)
-            self._update_request_states(scheduled_requests)
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1491,27 +1509,6 @@ class PyExecutor:
         else:
             self._update_request_states_tp(scheduled_requests)
 
-    @nvtx_range("_decode")
-    def _decode(self, scheduled_batch, batch_outputs):
-        try:
-            if batch_outputs is not None:
-                self.decoder.decode(scheduled_batch, batch_outputs)
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in decode: {error_msg}")
-            self._handle_errors(error_msg)
-
-    @nvtx_range("_setup_decoder")
-    def _setup_decoder(self, scheduled_batch, batch_outputs):
-        try:
-            self.decoder.setup_decoder(scheduled_batch, batch_outputs)
-        except Exception as e:
-            traceback.print_exc()
-            error_msg = str(e)
-            logger.error(f"Encountered an error in setup_decoder: {error_msg}")
-            self._handle_errors(error_msg)
-
     @nvtx_range("_decode_async")
     def _decode_async(self, scheduled_batch, batch_outputs):
         try:
@@ -1523,10 +1520,21 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    @nvtx_range("_setup_decoder_step")
+    def _setup_decoder_step(self, requests):
+        try:
+            return self.decoder.setup_decoder_step(requests)
+        except Exception as e:
+            traceback.print_exc()
+            error_msg = str(e)
+            logger.error(f"Encountered an error in decode: {error_msg}")
+            self._handle_errors(error_msg)
+
     @nvtx_range("_update_requests")
-    def _update_requests(self, scheduled_requests: ScheduledRequests,
+    def _update_requests(self,
+                         scheduled_requests: ScheduledRequests,
                          new_tensors_host: Dict[str, torch.tensor],
-                         event: torch.cuda.Event):
+                         event: torch.cuda.Event or None = None):
         try:
             self.decoder.update_requests(scheduled_requests, new_tensors_host,
                                          event)
@@ -1662,9 +1670,12 @@ class PyExecutor:
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
+            _, new_tensors_host, decoder_event = self._decode_async(
+                draft_batch, outputs)
+
             self._update_request_states(draft_batch)
 
-            self._decode(draft_batch, outputs)
+            self._update_requests(draft_batch, new_tensors_host, decoder_event)
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1705,8 +1716,11 @@ class PyExecutor:
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
+                _, new_tensors_host, decoder_event = self._decode_async(
+                    draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._decode(draft_batch, outputs)
+                self._update_requests(draft_batch, new_tensors_host,
+                                      decoder_event)
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:
