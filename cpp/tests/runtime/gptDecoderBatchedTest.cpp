@@ -105,7 +105,6 @@ decoder_batch::Input prepareDecoderInputs(std::vector<SizeType32> const& activeS
     TensorPtr srcCacheIndirection)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    std::vector<bool> active(maxNumSequences, false);
 
     for (SizeType32 i = 0; i < maxDecodingEngineTokens; ++i)
     {
@@ -116,7 +115,6 @@ decoder_batch::Input prepareDecoderInputs(std::vector<SizeType32> const& activeS
     auto maxActiveDecodingEngineTokens = 1;
     for (auto slot : activeSlots)
     {
-        active[slot] = true;
         maxActiveDecodingEngineTokens = std::max(maxActiveDecodingEngineTokens, numDecodingEngineTokens.at(slot));
         for (SizeType32 i = 0; i < numDecodingEngineTokens.at(slot); ++i)
         {
@@ -135,21 +133,14 @@ decoder_batch::Input prepareDecoderInputs(std::vector<SizeType32> const& activeS
     std::vector<std::vector<ITensor::SharedConstPtr>> logitsVec(maxActiveDecodingEngineTokens);
     for (SizeType32 step = 0; step < maxActiveDecodingEngineTokens; ++step)
     {
-        SizeType32 localBatchDecoderIdx = 0;
-        for (SizeType32 bi = 0; bi < maxNumSequences; ++bi)
-        {
-            if (!active.at(bi) || step >= numDecodingEngineTokens.at(bi))
-            {
-                continue;
-            }
-            localBatchDecoderIdx++;
+        auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots.at(step));
 
-            auto const& targetLogits = logits.at(bi);
+        for (auto slot : batchSlotsRange)
+        {
+            auto const& targetLogits = logits.at(slot);
             TensorPtr logitsSlice = ITensor::slice(targetLogits, step, singleRequest);
             logitsVec.at(step).push_back(logitsSlice);
         }
-        TLLM_CHECK_WITH_INFO(batchSlots.at(step)->getSize() == static_cast<size_t>(localBatchDecoderIdx),
-            "batchSlots size mismatch: %ld != %d", batchSlots.at(step)->getSize(), localBatchDecoderIdx);
     }
 
     auto decodingInput = decoder_batch::Input(logitsVec, maxActiveDecodingEngineTokens);
