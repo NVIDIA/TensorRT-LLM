@@ -129,7 +129,6 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     seqSlots = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT32);
     seqSlotsDevice = manager.gpu(maxBatchSizeShape, nvinfer1::DataType::kINT32);
-    sortedSeqSlots = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT32);
 
     cacheIndirDecoderIOBatchedCopySrcOffsets
         = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvinfer1::DataType::kINT64);
@@ -383,7 +382,6 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     auto const numRequestsShape = ITensor::makeShape({numRequests});
     seqSlots->reshape(numRequestsShape);
     seqSlotsDevice->reshape(numRequestsShape);
-    sortedSeqSlots->reshape(numRequestsShape);
     seqSlotRemappingHost->reshape(numRequestsShape);
     seqSlotRemappingDevice->reshape(numRequestsShape);
 
@@ -743,16 +741,9 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
         {
             auto remappingSeqSlotIndices = BufferRange<SizeType32>(*seqSlotRemappingHost);
-            auto const* seqSlotIndices = bufferCast<SizeType32>(*seqSlots);
 
             std::iota(remappingSeqSlotIndices.begin(), remappingSeqSlotIndices.end(), 0);
-            std::sort(remappingSeqSlotIndices.begin(), remappingSeqSlotIndices.end(),
-                [&seqSlotIndices](SizeType32 a, SizeType32 b) { return seqSlotIndices[a] < seqSlotIndices[b]; });
             manager.copy(*seqSlotRemappingHost, *seqSlotRemappingDevice);
-
-            manager.copy(*seqSlots, *sortedSeqSlots);
-            auto sortedSeqSlotIndices = BufferRange<SizeType32>(*sortedSeqSlots);
-            std::sort(sortedSeqSlotIndices.begin(), sortedSeqSlotIndices.end());
         }
         if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
