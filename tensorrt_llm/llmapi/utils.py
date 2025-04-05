@@ -14,13 +14,15 @@ from contextlib import contextmanager
 from functools import cache, wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable, Iterable, List, Optional, Tuple
+from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
+                    get_type_hints)
 
 import filelock
 import huggingface_hub
 import psutil
 import torch
 from huggingface_hub import snapshot_download
+from pydantic import BaseModel
 from tqdm.auto import tqdm
 
 from tensorrt_llm.logger import Singleton, logger
@@ -483,3 +485,92 @@ def set_sched_setaffinity(required_cores: int):
 def clear_sched_affinity(pid: int):
     ''' Clear the CPU affinity of the current process. '''
     os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
+
+
+def generate_api_docs_as_docstring(model: Type[BaseModel],
+                                   include_annotations=False,
+                                   indent="") -> str:
+    """
+    Generates API documentation for a Pydantic BaseModel, formatted as a
+    Python docstring.
+
+    Args:
+        model: The Pydantic BaseModel class.
+
+    Returns:
+        A string containing the API documentation formatted as a docstring.
+    """
+    docstring_lines = []
+
+    if include_annotations:
+        # Class docstring
+        if model.__doc__:
+            docstring_lines.append(model.__doc__.strip())
+            docstring_lines.append(
+                "")  # Add a blank line after the class docstring
+
+        docstring_lines.append(f"{indent}Args:")
+
+    schema = model.schema()
+    type_hints = get_type_hints(model)
+    type_alias = {
+        'integer': 'int',
+        'number': 'float',
+        'boolean': 'bool',
+        'string': 'str',
+        'array': 'list',
+    }
+
+    for field_name, field_info in schema['properties'].items():
+        if field_name.startswith("_"):  # skip private fields
+            continue
+        if field_info.get("deprecated", False):
+            continue
+
+        field_type = field_info.get('type', None)
+        field_description = field_info.get('description', '')
+        field_default = field_info.get('default', None)
+        field_required = field_name in schema.get('required', [])
+
+        # Get full type path from type hints if available
+        if field_type:
+            type_str = type_alias.get(field_type, field_type)
+        elif field_name in type_hints:
+            type_str = str(type_hints[field_name])
+            type_str = type_str.replace("typing.", "")
+        else:
+            type_str = field_type or 'Any'
+
+        # Format the argument documentation with 12 spaces indent for args
+        arg_line = f"{indent}    {field_name} ({type_str}): "
+        if field_description:
+            arg_line += field_description.split('\n')[0]  # First line with type
+
+        docstring_lines.append(arg_line)
+
+        # Add remaining description lines and default value with 16 spaces indent
+        if field_description and '\n' in field_description:
+            remaining_lines = field_description.split('\n')[1:]
+            for line in remaining_lines:
+                docstring_lines.append(f"{indent}        {line}")
+
+        if not field_required or field_default is not None:
+            default_str = str(
+                field_default) if field_default is not None else "None"
+            docstring_lines[-1] += f" Defaults to {default_str}."
+
+    if include_annotations:
+        docstring_lines.append("")  # Empty line before Returns
+        return_annotation = "None"  # Default to None, adjust if needed
+        docstring_lines.append(
+            f"{indent}Returns:\n{indent}    {return_annotation}")
+
+    return "\n".join(docstring_lines)
+
+
+def get_type_repr(cls):
+    """Handle built-in types gracefully. """
+    module_name = cls.__module__
+    if module_name == 'builtins':  # Special case for built-in types
+        return cls.__qualname__
+    return f"{module_name}.{cls.__qualname__}"
