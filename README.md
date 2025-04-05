@@ -18,7 +18,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [04/05] TensorRT-LLM runs Llama 4 at over 40,000 tokens per second on B200 GPUs!
+* [04/05] TensorRT-LLM can run Llama 4 at over 40,000 tokens per second on B200 GPUs!
 
 ![L4_perf](./docs/source/media/l4_launch_perf.png)
 
