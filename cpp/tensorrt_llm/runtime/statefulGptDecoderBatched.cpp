@@ -80,7 +80,7 @@ StatefulGptDecoderBatched::StatefulGptDecoderBatched(CudaStreamPtr stream, nvinf
     auto const& bufferManager = mDecoder->getBufferManager();
 
     mBatchSlotsSetup = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
-    mBatchSlotsDecoder.emplace_back(bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType));
+    mBatchSlotsDecoder = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
     mFinishedSum = BufferManager::pinned(ITensor::makeShape({1}), nvSizeType);
 }
 
@@ -95,7 +95,7 @@ void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeTy
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
     mBatchSlotsSetup->reshape(ITensor::makeShape({maxBatchSize}));
-    mBatchSlotsDecoder.at(0)->reshape(ITensor::makeShape({maxBatchSize}));
+    mBatchSlotsDecoder->reshape(ITensor::makeShape({maxBatchSize}));
 }
 
 void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
@@ -214,7 +214,12 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     }
 
     decoder_batch::Input batchInput{logits};
-    batchInput.batchSlots = mBatchSlotsDecoder;
+    mBatchSlotsDecoder->resize(batchSize);
+    auto forwardBatchSlotsRange = BufferRange<SizeType32>(*mBatchSlotsDecoder);
+    std::iota(forwardBatchSlotsRange.begin(), forwardBatchSlotsRange.end(), 0);
+    batchInput.batchSlots = {mBatchSlotsDecoder};
+    batchInput.batchSlotsRequestOrder = mBatchSlotsDecoder;
+
     batchInput.cacheIndirection = input.cacheIndirection;
 
     decoder_batch::Output batchOutput;
