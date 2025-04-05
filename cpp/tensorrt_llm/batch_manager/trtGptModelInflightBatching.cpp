@@ -2356,7 +2356,7 @@ void TrtGptModelInflightBatching::rewindKVCacheBlocks(SizeType32 numSequences)
         *mDecoderBuffers->draftBuffers.acceptedLengthsCumSumDevice,
         *mDecoderBuffers->draftBuffers.acceptedPackedPathsDevice, *runtimeBuffers.sequenceLengthsDevice,
         pointerArrayPtr, offsetArrayPtr, localNbLayers, numSequences, numKvHeads, sizeInBytesPerKVHead, commonRewindLen,
-        rewindLens, *runtimeBuffers.seqSlotRemappingDevice, *runtimeBuffers.sortedSeqSlots, getMaxAttentionWindow(),
+        rewindLens, *runtimeBuffers.seqSlotRemappingDevice, *runtimeBuffers.seqSlots, getMaxAttentionWindow(),
         maxBlocksPerSeq, tokensPerBlock, useOneMoreBlock, mRuntime->getStreamPtr()->get());
 
     sync_check_cuda_error(mRuntime->getStream().get());
