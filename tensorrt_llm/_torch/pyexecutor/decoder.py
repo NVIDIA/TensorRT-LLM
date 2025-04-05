@@ -552,16 +552,17 @@ class TRTLLMDecoder(Decoder):
             seq_slot = request.seq_slot
             for beam in range(self.beam_width):
                 new_tokens_device_tensor[idx * self.beam_width + beam].copy_(
-                    self.algs.decoder.all_new_tokens[0][seq_slot][beam],
+                    self.algs.decoder.decoder_state.all_new_tokens[0][seq_slot]
+                    [beam],
                     non_blocking=True)
 
         # NOTE: This does dynamic memory allocations.
-        new_output_tokens = self.algs.decoder.all_new_tokens.to(
+        new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
-        finished_sum = self.algs.decoder.finished_sum.to('cpu',
-                                                         non_blocking=True)
-        finish_reasons = self.algs.decoder.finish_reasons.to('cpu',
-                                                             non_blocking=True)
+        finished_sum = self.algs.decoder.decoder_state.finished_sum.to(
+            'cpu', non_blocking=True)
+        finish_reasons = self.algs.decoder.decoder_state.finish_reasons.to(
+            'cpu', non_blocking=True)
 
         # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
         #       This could be a race condition.
