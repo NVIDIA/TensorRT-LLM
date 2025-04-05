@@ -82,4 +82,11 @@ fi
 for expected_string in "${expected_strings[@]}"; do
     grep "${expected_string}" output.json
     grep "${expected_string}" output_streaming.json
+
+    # Check the double first token in streaming output
+    first_word=$(echo "$expected_string" | awk '{print $1}')
+    count=$(grep -o "$first_word" output_streaming.json | wc -l)
+    if [ "$count" -ne 1 ]; then
+        exit 1
+    fi
 done
