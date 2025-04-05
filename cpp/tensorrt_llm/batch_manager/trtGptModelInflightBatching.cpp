@@ -473,7 +473,7 @@ void TrtGptModelInflightBatching::setupSpeculativeDecodingModule(executor::Decod
 
     if (mModelConfig.getSpeculativeDecodingMode().isLookaheadDecoding() && decodingConfig.getLookaheadDecodingConfig())
     {
-        // FIXME(nkorobov) choose defaults
+        // FIXME choose defaults
         auto maxLookaheadConfig = decodingConfig.getLookaheadDecodingConfig().value();
 
         SizeType32 maxDraftTokens{0};
@@ -974,7 +974,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
 
             if (isTrtOverlap())
             {
-                // WAR(rkobus): Because the decoder is not stateless (yet) a sync is needed between
+                // WAR: Because the decoder is not stateless (yet) a sync is needed between
                 // decoder execution and next decoder step preparation.
                 auto const prevMicroBatchId = getPrevMicroBatchId(mMicroBatchId);
                 auto& prevDecoderFinishedEvent = mDecoderFinishedEvents.at(prevMicroBatchId);
@@ -1222,7 +1222,7 @@ void TrtGptModelInflightBatching::createRuntimeContexts()
 
 namespace
 {
-// TODO(rkobus): move this somewhere else?
+// TODO: move this somewhere else?
 executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
     std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 beamWidth)
 {
@@ -2009,7 +2009,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
 
     if (mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
-        // TODO(rkobus): keep data on device for next iteration
+        // TODO: keep data on device for next iteration
         mDecoderBuffers->draftBuffers.nextDraftTokensDevice = mDecoder->getDecoderState().getNextDraftTokens();
         mCopyBufferManager.copy(
             *mDecoderBuffers->draftBuffers.nextDraftTokensDevice, *mDecoderBuffers->draftBuffers.nextDraftTokensHost);
