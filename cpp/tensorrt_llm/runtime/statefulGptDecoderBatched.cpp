@@ -203,7 +203,7 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     auto const& logitsShape = input.logits->getShape();
     auto const batchSize = logitsShape.d[0];
     auto constexpr singleRequest = 1;
-    std::vector<ITensor::SharedPtr> logits;
+    std::vector<ITensor::SharedConstPtr> logits;
     logits.reserve(batchSize);
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {

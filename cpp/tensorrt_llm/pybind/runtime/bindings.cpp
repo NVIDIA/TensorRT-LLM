@@ -291,9 +291,9 @@ void initBindings(pybind11::module_& m)
     py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>, std::vector<bool>, tr::SizeType32>(), py::arg("logits"),
-            py::arg("active"), py::arg("max_decoding_engine_tokens"))
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>>(), py::arg("logits"))
+        .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, std::vector<bool>, tr::SizeType32>(),
+            py::arg("logits"), py::arg("active"), py::arg("max_decoding_engine_tokens"))
+        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("active", &tr::decoder_batch::Input::active)
         .def_readwrite("max_decoding_engine_tokens", &tr::decoder_batch::Input::maxDecodingEngineTokens)
