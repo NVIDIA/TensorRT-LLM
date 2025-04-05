@@ -2305,7 +2305,7 @@ int AttentionOp::initialize() noexcept
             {
                 fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             }
-            // TODO(tizheng): add FP4 KV cache support.
+            // TODO: add FP4 KV cache support.
         }
         // The output dtype.
         fmhaParams.dataTypeOut = data_type;
@@ -2314,26 +2314,28 @@ int AttentionOp::initialize() noexcept
             // If FP4 quantization workflow is enabled, set output type to FP4.
             fmhaParams.dataTypeOut = DATA_TYPE_E2M1;
         }
-        // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+        // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
+
+        // setting attention mask type based on the mask type
+        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+
         if (isCrossAttention())
         {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::PADDING;
             // always use paged-kv-fmha if paged_kv cache is used.
             fmhaParams.attentionInputLayout
                 = mPagedKVCache ? AttentionInputLayout::Q_PAGED_KV : AttentionInputLayout::Q_CONTIGUOUS_KV;
         }
+        else if (!useKVCache())
+        {
+            fmhaParams.attentionInputLayout = AttentionInputLayout::PACKED_QKV;
+        }
         else
         {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::CAUSAL;
             fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA && !mIsMLAEnabled)
                 ? AttentionInputLayout::Q_PAGED_KV
                 : AttentionInputLayout::PACKED_QKV;
-        }
-        if (useCustomMask())
-        {
-            fmhaParams.attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
         }
         fmhaParams.isSPadded = !mRemovePadding;
         fmhaParams.numQHeads = mNumAttnHeads;
@@ -2407,7 +2409,7 @@ int AttentionOp::initialize() noexcept
                 MHARunnerFixedParams fmhaParams{};
                 fmhaParams.dataType = data_type;
                 fmhaParams.dataTypeOut = data_type;
-                // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+                // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
                 // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in
                 // runtime.
                 fmhaParams.forceFp32Acc = false;
@@ -2448,14 +2450,14 @@ int AttentionOp::initialize() noexcept
     }
 
     mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled) && !mCrossAttention
-        && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
+        && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16) && mUseKVCache;
 
     if (mEnableXQA)
     {
         TLLM_LOG_DEBUG("Enabling XQA kernels for GPTAttention.");
 
         XqaFixedParams fixedParams{};
-        // TODO(tizheng): support more combinations.
+        // TODO: support more combinations.
         // Update Q and O dtype.
         if (mType == nvinfer1::DataType::kHALF)
         {

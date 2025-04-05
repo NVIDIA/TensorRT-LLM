@@ -10,6 +10,9 @@ l0_perf:
           - '*a100*'
           - '*h100*'
         linux_distribution_name: ubuntu*
+      terms:
+        stage: pre_merge
+        backend: tensorrt
     tests:
       - perf/test_perf.py::test_perf[bert_base-plugin-float16-bs:32-input_len:32]
       - perf/test_perf.py::test_perf[bert_base-cpp-plugin-float16-bs:32-input_len:32]

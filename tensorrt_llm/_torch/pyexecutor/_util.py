@@ -127,7 +127,7 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
         req = create_dummy_context_request(max_num_tokens, max_seq_len,
                                            vocab_size)
         resource_manager.prepare_resources(req)
-        model_engine.forward(req, resource_manager)
+        model_engine.forward(req, resource_manager, is_dummy_forward=True)
         torch.cuda.synchronize()
         # Get the torch-managed peak memory
         torch_peak_memory = torch.cuda.memory_stats(

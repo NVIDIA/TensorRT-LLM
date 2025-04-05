@@ -793,7 +793,7 @@ class MixtureOfExperts(Module):
                 "MixtureOfExperts - MOE Does not support FP8 rowwise quantize")
 
         if quant_mode.has_fp8_qdq() and self.bias:
-            # TODO (dastokes) We will need to revisit this if we have a use case for it
+            # TODO  We will need to revisit this if we have a use case for it
             raise ValueError(
                 f"MixtureOfExperts - Bias is not supported with FP8")
 

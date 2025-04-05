@@ -156,7 +156,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
         invokeScatterDecodingParams(
             topKSetupPtr, runtimeTopK.front(), runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
 
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         auto const curMaxTopK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
         return curMaxTopK;
     };

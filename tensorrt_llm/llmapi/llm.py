@@ -88,8 +88,8 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
 class LLM:
     """LLM class is the main class for running a LLM model.
 
-    Args:
-    """
+    Parameters:
+"""
 
     def __init__(self,
                  model: Union[str, Path],
@@ -126,9 +126,9 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
-        print_colored_debug(
-            f"LLM.args._mpi_session: {self.args._mpi_session}\n", "yellow")
-        self.mpi_session = self.args._mpi_session
+        print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
+                            "yellow")
+        self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
             if get_device_count(
@@ -508,7 +508,8 @@ class LLM:
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=self.args.batching_type or tllm.BatchingType.INFLIGHT,
+            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
+            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
@@ -547,7 +548,8 @@ class LLM:
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
-            executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
+            executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
+                self.args.extended_runtime_perf_knob_config)
 
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         update_executor_config(
@@ -575,8 +577,8 @@ class LLM:
                 self.args.parallel_config.world_size),
             return_logits=return_logits,
             postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args._num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
+                num_postprocess_workers=self.args.num_postprocess_workers,
+                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True)
 

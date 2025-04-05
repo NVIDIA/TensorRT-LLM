@@ -827,7 +827,7 @@ class Network(object):
         '''
         return self._get_graph_impl(self._get_network_hash())
 
-    #TODO: tali, using one LRU cache here can cause the Network object to be leaked, need a way to speed this function w/o using global lru cache.
+    #TODO: using one LRU cache here can cause the Network object to be leaked, need a way to speed this function w/o using global lru cache.
     def _get_graph_impl(self, network_hash: bytes) -> "Network._GraphState":
         graph = Network._GraphState()
         graph.build(self)

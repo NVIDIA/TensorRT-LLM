@@ -129,7 +129,10 @@ class MTPSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
         # update batch indeices
-        batch_indices = torch.arange(num_seqs, dtype=torch.int, device='cpu')
+        batch_indices = torch.arange(num_seqs,
+                                     dtype=torch.int,
+                                     device='cpu',
+                                     pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # MTP module need different number of input tokens in generation phase
@@ -153,10 +156,14 @@ class MTPSpecMetadata(SpecMetadata):
                     mtp_past_tokens_pool[slot_id].data_ptr())
                 mtp_slot_ids.append(slot_id)
             mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
-                                                  dtype=torch.int64)
+                                                  dtype=torch.int64,
+                                                  pin_memory=True)
             mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
-                                                dtype=torch.int64)
-            mtp_slot_ids = torch.tensor(mtp_slot_ids, dtype=torch.int)
+                                                dtype=torch.int64,
+                                                pin_memory=True)
+            mtp_slot_ids = torch.tensor(mtp_slot_ids,
+                                        dtype=torch.int,
+                                        pin_memory=True)
 
             self.mtp_hidden_states_ptrs[:num_seqs].copy_(mtp_hidden_states_ptrs,
                                                          non_blocking=True)
@@ -208,6 +215,7 @@ class MTPDecoder(TorchDecoder):
                     should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
+            request.py_decoding_iter += 1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -228,6 +236,7 @@ class MTPDecoder(TorchDecoder):
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
+                request.py_decoding_iter += 1
             idx += 1
 
     def decode_async(self, scheduled_requests: ScheduledRequests,

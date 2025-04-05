@@ -9,6 +9,9 @@ l0_h100:
       gpu:
       - '*h100*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   # Only key models in H100: llama/mixtral/nemotron/deepseek
@@ -22,6 +25,19 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-instruct-hf-fp8-True-True]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_unit_tests[90]
   - test_cpp.py::test_model[fp8-llama-90]
@@ -29,6 +45,19 @@ l0_h100:
   - test_cpp.py::test_benchmarks[t5-90]
   - test_cpp.py::test_model[encoder-90]
   - test_cpp.py::test_model[enc_dec_language_adapter-90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
   - unittest/trt/functional/test_moe.py
@@ -92,10 +121,24 @@ l0_h100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: cpp
   tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_model[bart-90]
   - test_cpp.py::test_benchmarks[bart-90]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
   - examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]

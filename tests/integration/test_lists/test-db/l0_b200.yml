@@ -9,6 +9,9 @@ l0_b200:
       gpu:
       - '*b100*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
@@ -26,6 +29,19 @@ l0_b200:
   - unittest/_torch/multi_gpu_modeling -k "deepseek and tp1 and not nextn0"
   - unittest/_torch/auto_deploy/unit/singlegpu
   - unittest/_torch/speculative/test_eagle3.py
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*b100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4
   - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]

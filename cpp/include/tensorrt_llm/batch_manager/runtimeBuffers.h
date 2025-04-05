@@ -222,7 +222,7 @@ public:
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
     TensorPtr sortedSeqSlots;
-    // TODO(rkobus): move into decoderBuffers.DraftBuffers
+    // TODO: move into decoderBuffers.DraftBuffers
     TensorPtr seqSlotRemappingHost;                                 // [numSequences]
     TensorPtr seqSlotRemappingDevice;                               // [numSequences]
 

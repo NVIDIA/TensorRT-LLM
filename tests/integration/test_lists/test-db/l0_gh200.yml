@@ -9,6 +9,9 @@ l0_gh200:
       gpu:
       - '*h200*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
   tests:
   - unittest/trt/attention/test_gpt_attention.py -k "partition0"
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
@@ -31,6 +34,7 @@ l0_gh200:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: tensorrt
   tests:
   - unittest/test_model_runner_cpp.py
   - accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype # 1.5 mins

@@ -58,7 +58,7 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     }
     if (is_vanilla_mha && xqaParams.head_size <= 128)
     {
-        // TODO(yaoy): remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
+        // TODO: remove this when the kernel bug for num_kv_heads <= 128 gets fixed.
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,

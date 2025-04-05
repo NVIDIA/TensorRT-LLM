@@ -106,6 +106,7 @@ class GenerationResultBase:
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
         self.disaggregated_params = None
+        self.decoding_iter = 0
         self._done = False
 
         if has_event_loop():
@@ -247,6 +248,7 @@ class GenerationResultBase:
             response_result = response.result
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
+            self.decoding_iter = response_result.decoding_iter
             if context_phase_params is not None:
                 self.disaggregated_params = DisaggregatedParams(
                     request_type="context_only",

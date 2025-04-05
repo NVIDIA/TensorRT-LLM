@@ -46,7 +46,7 @@ DecoderXQARunner::DecoderXQARunner(
 {
     mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    // TODO(minwei): needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
+    // TODO: needs both impls because medusa kernels haven't been migrated to JIT yet (which should be).
     // mJITImpl/mPrecompiledImpl assignments must be the last lines of this constructor. DecoderXQAImpl::create() relies
     // on *this being fully initialized.
     mJITImpl = DecoderXQAImpl::create(this, DecoderXQAImpl::ImplType::kJIT);

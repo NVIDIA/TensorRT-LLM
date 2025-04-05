@@ -30,7 +30,7 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    # TODO bhsueh rank 1 is not supported now
+    # TODO rank 1 is not supported now
     @parameterized.expand(
         list(
             product([[1], [2], [4], [2, 4], [8], [16], [8, 16], [1, 2, 4],

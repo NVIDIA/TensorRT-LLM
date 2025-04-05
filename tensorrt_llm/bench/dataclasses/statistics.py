@@ -184,5 +184,10 @@ class BenchmarkStatistics(BaseModel):
         return float(self.total_output_tokens) / self.total_latency_ns
 
     @computed_field
+    def total_token_throughput_tok_ns(self) -> float:
+        return float(self.total_input_tokens +
+                     self.total_output_tokens) / self.total_latency_ns
+
+    @computed_field
     def output_throughput_tok_ns_per_user(self) -> float:
         return self.output_throughput_percentiles.average

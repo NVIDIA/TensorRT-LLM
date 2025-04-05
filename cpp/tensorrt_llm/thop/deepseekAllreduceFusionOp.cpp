@@ -92,8 +92,8 @@ public:
             outputShape[r - 1] = k / 2;
 
             quant_out = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda(
-                {tensorrt_llm::computeSFSize(m, k / sfVecSize)}, SF_DTYPE, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)},
+                SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(reduce_fusion_inputs[0]);
 
             allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
