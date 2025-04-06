@@ -580,6 +580,8 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
             if key.startswith("language_model."):
                 new_key = key[len("language_model."):]
                 new_weights[new_key] = tensor
+            else:
+                new_weights[key] = tensor
 
         super().load_weights(new_weights)
 
