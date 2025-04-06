@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -43,7 +44,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto const& numDecodingEngineTokens = decoderState.getNumDecodingEngineTokens();
     auto const& maxDecodingEngineTokens = decoderState.getMaxDecodingEngineTokens();
     auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
-    auto const maxDecoderSteps = maxDecodingEngineTokens / maxDecodingDecoderTokens;
+    auto const maxDecoderSteps = common::ceilDiv(maxDecodingEngineTokens, maxDecodingDecoderTokens);
 
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
@@ -54,7 +55,7 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto maxActiveDecoderSteps = 1;
     for (auto const slot : activeSlots)
     {
-        auto const numDecoderSteps = numDecodingEngineTokens.at(slot) / maxDecodingDecoderTokens;
+        auto const numDecoderSteps = common::ceilDiv(numDecodingEngineTokens.at(slot), maxDecodingDecoderTokens);
         maxActiveDecoderSteps = std::max(maxActiveDecoderSteps, numDecoderSteps);
         for (SizeType32 step = 0; step < numDecoderSteps; ++step)
         {
