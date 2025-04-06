@@ -1258,7 +1258,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     }
 
     // Consider the mTemporaryAttentionWindow when allocating blocks.
-    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock);
+    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
 
     TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
     TLLM_LOG_DEBUG("Max KV cache pages per sequence: %d", mMaxBlocksPerSeq);
@@ -1524,68 +1524,75 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
         std::swap(currNumTokens, newNumTokens);
     }
 
-    SizeType32 const windowTokenNum = mMaxTokenNum - mSinkBlockTokenLength;
-    SizeType32 const nextTokenIdxInWindow = (currNumTokens - mSinkBlockTokenLength) % windowTokenNum;
-    SizeType32 const nextTokenIdxInCache = mSinkBlockTokenLength + nextTokenIdxInWindow;
-
-    // Check if require a new block
-    if (nextTokenIdxInCache % getTokensPerBlock() == 0)
+    auto const isBlockBoundary = (currNumTokens % getTokensPerBlock() == 0);
+    if (addToken)
     {
-        if (addToken)
+        auto const numTokensWithoutSink = newNumTokens - mSinkBlockTokenLength;
+        auto const numNonSinkTokensInWindow = mMaxTokenNum - mSinkBlockTokenLength;     // This is equivalent to mMaxAttentionWindow - sinkTokenLength - museOneMoreBlock*tokensPerBlock
+        auto const minTokensForBlockDetach = numNonSinkTokensInWindow + getTokensPerBlock();
+        auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach) && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
+
+        if (canDetachBlock)
         {
-            if (!isCrossKv() || newNumTokens < mMaxTokenNum)
-            {
-                mBlockManager.allocateBlock(sequence);
-            }
-            if (!isCrossKv() && newNumTokens > mMaxTokenNum)
-            {
-                // Get the block to release from sequence
-                auto const requestId = sequence.getRequestId();
-                auto const beamWidth = sequence.getBeamWidth();
-                auto& allocatedBlocks = mBlockManager.mAllocatedBlocksPerSeq.at(requestId);
-                SizeType32 outOfWindowBlockIdx = mSinkBlockTokenLength / getTokensPerBlock();
+            // Get the block to detach from sequence
+            auto const requestId = sequence.getRequestId();
+            auto const beamWidth = sequence.getBeamWidth();
+            auto& allocatedBlocks = mBlockManager.mAllocatedBlocksPerSeq.at(requestId);
+            SizeType32 outOfWindowBlockIdx = mSinkBlockTokenLength / getTokensPerBlock();
 
-                auto const storeBlocksForReuse = mEnableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
+            auto const storeBlocksForReuse = mEnableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
 
-                for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+            {
+                auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+
+                // Decrease ref count
+                outOfWindowBlock->decRefCount();
+
+                // If block has no refs, evict / offload it based on block reuse
+                if (!outOfWindowBlock->hasRefs())
                 {
-                    auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
-
-                    // Decrease ref count
-                    outOfWindowBlock->decRefCount();
-
-                    // If block has no refs, evict / offload it based on block reuse
-                    if (!outOfWindowBlock->hasRefs())
+                    if (storeBlocksForReuse)
                     {
-                        if (storeBlocksForReuse)
+                        // If possible, offload the out-of-window block to secondary cache to save primary memory.
+                        // Block can be released only after it is added to radix tree for reuse search, which is done after sequence is complete.
+                        // Otherwise, we will create ophaned blocks and/or blocks that can't be freed since they are not leaf blocks.
+                        if (mBlockManager.mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
                         {
-                            // If possible, offload the out-of-window block to secondary cache to save primary memory.
-                            // Block can be released only after it is added to radix tree for reuse search, which is done after sequence is complete.
-                            // Otherwise, we will create ophaned blocks and/or blocks that can't be freed since they are not leaf blocks.
-                            if (mBlockManager.mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
-                            {
-                                mBlockManager.offloadBlock(outOfWindowBlock);
-                            }
-                        }
-                        else
-                        {
-                            mBlockManager.mEvictionPolicy->releaseBlock(outOfWindowBlock);
-                            mBlockManager.removeBlockFromHashMap(outOfWindowBlock);
+                            mBlockManager.offloadBlock(outOfWindowBlock);
                         }
                     }
+                    else
+                    {
+                        mBlockManager.mEvictionPolicy->releaseBlock(outOfWindowBlock);
+                        mBlockManager.removeBlockFromHashMap(outOfWindowBlock);
+                    }
                 }
-
-                // Disconnect first block from sequence
-                // Remove block from allocated blocks
-                allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
-                    allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
-                // Remove stored block ids in sequence
-                sequence.removeBlock(outOfWindowBlockIdx);
             }
+
+            // Disconnect first block from sequence
+            // Remove block from allocated blocks
+            allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
+                allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
+            // Remove stored block ids in sequence
+            sequence.removeBlock(outOfWindowBlockIdx);
+        }
+
+        if (isBlockBoundary)
+        {
+            mBlockManager.allocateBlock(sequence);
+        }
+
+        if (isBlockBoundary || canDetachBlock)
+        {
             cacheNewBlockOffsets(sequence);
         }
-        else
+    }
+    else
+    {
+        if (isBlockBoundary)
         {
+            // TODO (tomer): in main, releaseLastBlock is called only if newNumTokens <= mMaxTokenNum
             TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
             mBlockManager.releaseLastBlock(sequence);
         }
