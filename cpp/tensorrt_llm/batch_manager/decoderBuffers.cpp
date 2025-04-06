@@ -64,7 +64,6 @@ DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWid
     cacheIndirectionOutput = manager.gpu(
         ITensor::makeShape({maxNumSequences, maxBeamWidth, maxAttentionWindow}), nvinfer1::DataType::kINT32);
 
-    sequenceLengths = manager.gpu(ITensor::makeShape({maxNumSequences, maxBeamWidth}), nvinfer1::DataType::kINT32);
     sequenceLengthsHost
         = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), nvinfer1::DataType::kINT32);
 
@@ -325,22 +324,22 @@ std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(std::shared_
     return decSlotAsyncSndHdl;
 }
 
-std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-    TensorPtr const& sequenceLengthView, bool const returnLogProbs, int const peer)
+std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(
+    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer)
 {
     auto decSlotAsyncSndHdl = std::make_unique<DecoderSlotAsyncSend>(
-        commSession, outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, peer);
+        commSession, outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, peer);
     return decSlotAsyncSndHdl;
 }
 
-void SlotDecoderBuffers::recv(std::shared_ptr<mpi::MpiComm> const& commSession, TensorPtr const& sequenceLengthView,
-    bool const returnLogProbs, int const peer)
+void SlotDecoderBuffers::recv(
+    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start recv outputs of SlotDecoderBuffers from rank %d", peer);
 
     commSession->recv(*outputIds, peer, DecoderSlotAsyncSend::kMpiTagOffset);
-    commSession->recv(*sequenceLengthView, peer, DecoderSlotAsyncSend::kMpiTagOffset + 1);
+    commSession->recv(*sequenceLengths, peer, DecoderSlotAsyncSend::kMpiTagOffset + 1);
     if (returnLogProbs)
     {
         commSession->recv(*cumLogProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 2);
@@ -354,9 +353,9 @@ void SlotDecoderBuffers::recv(std::shared_ptr<mpi::MpiComm> const& commSession, 
 SlotDecoderBuffers::SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, BufferManager const& manager)
 {
     outputIds = manager.gpu(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kINT32);
-
     outputIdsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kINT32);
 
+    sequenceLengths = manager.gpu(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kINT32);
     sequenceLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kINT32);
 
     cumLogProbs = manager.gpu(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kFLOAT);
