@@ -233,10 +233,8 @@ void GptDecoderBatched::prepareForward(
 
     TLLM_CHECK(static_cast<SizeType32>(output.sequenceLengths->getSize())
         == mDecoderState->getActualBatchSize() * maxBeamWidth);
-    // TODO should remove this reshape and set shape to [batch_size, beam_width] outside
-    TensorPtr sequenceLengths = ITensor::view(
-        output.sequenceLengths, ITensor::makeShape({mDecoderState->getActualBatchSize(), maxBeamWidth}));
-    TLLM_CHECK(sequenceLengths);
+    TLLM_CHECK(output.sequenceLengths->getDimension<0>() == mDecoderState->getActualBatchSize());
+    TLLM_CHECK(output.sequenceLengths->getDimension<1>() == maxBeamWidth);
 
     auto& dInput = mDecoderState->getJointDecodingInput();
     auto& dOutput = mDecoderState->getJointDecodingOutput();
@@ -321,7 +319,7 @@ void GptDecoderBatched::prepareForward(
 
     dOutput.newTokens = newTokensStepView;
     dOutput.finishReasons = finishedStepsOutput;
-    dOutput.lengths = sequenceLengths;
+    dOutput.lengths = output.sequenceLengths;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
