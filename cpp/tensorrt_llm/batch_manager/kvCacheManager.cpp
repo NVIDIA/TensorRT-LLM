@@ -1523,11 +1523,12 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
     }
 
     auto const isBlockBoundary = (currNumTokens % getTokensPerBlock() == 0);
+    auto const shouldAllocateBlock = isBlockBoundary && (!isCrossKv() || newNumTokens < mMaxTokenNum);
     if (addToken)
     {
         auto const numTokensWithoutSink = newNumTokens - mSinkBlockTokenLength;
         auto const minTokensForBlockDetach = mNumNonSinkTokensInWindow + getTokensPerBlock();
-        auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach) && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
+        auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach) && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0) && !isCrossKv();
 
         if (canDetachBlock)
         {
@@ -1575,12 +1576,13 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
             sequence.removeBlock(outOfWindowBlockIdx);
         }
 
-        if (isBlockBoundary)
+
+        if (shouldAllocateBlock)
         {
             mBlockManager.allocateBlock(sequence);
         }
 
-        if (isBlockBoundary || canDetachBlock)
+        if (shouldAllocateBlock || canDetachBlock)
         {
             cacheNewBlockOffsets(sequence);
         }
