@@ -301,8 +301,7 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
-        .def_readwrite("cache_indirection", &tr::decoder::Output::cacheIndirection)
-        .def_readwrite("sequence_lengths", &tr::decoder::Output::sequenceLengths);
+        .def_readwrite("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
 
     py::class_<tr::decoder::Input>(m, "Input")
         .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
@@ -368,6 +367,8 @@ void initBindings(pybind11::module_& m)
             "joint_decoding_input", [](tr::decoder::DecoderState& self) { return self.getJointDecodingInput(); })
         .def_property_readonly(
             "joint_decoding_output", [](tr::decoder::DecoderState& self) { return self.getJointDecodingOutput(); })
+        .def_property_readonly("sequence_lengths",
+            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getSequenceLengths()); })
         .def_property_readonly(
             "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
         .def_property_readonly(

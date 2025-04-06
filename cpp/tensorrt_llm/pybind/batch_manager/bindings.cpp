@@ -467,8 +467,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_property_readonly(
-            "sequence_lengths", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengths); })
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
         .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
         .def_property_readonly(

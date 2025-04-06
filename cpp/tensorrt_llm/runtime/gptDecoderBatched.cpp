@@ -231,11 +231,6 @@ void GptDecoderBatched::prepareForward(
 
     auto constexpr singleRequest = 1;
 
-    TLLM_CHECK(static_cast<SizeType32>(output.sequenceLengths->getSize())
-        == mDecoderState->getActualBatchSize() * maxBeamWidth);
-    TLLM_CHECK(output.sequenceLengths->getDimension<0>() == mDecoderState->getActualBatchSize());
-    TLLM_CHECK(output.sequenceLengths->getDimension<1>() == maxBeamWidth);
-
     auto& dInput = mDecoderState->getJointDecodingInput();
     auto& dOutput = mDecoderState->getJointDecodingOutput();
 
@@ -319,7 +314,6 @@ void GptDecoderBatched::prepareForward(
 
     dOutput.newTokens = newTokensStepView;
     dOutput.finishReasons = finishedStepsOutput;
-    dOutput.lengths = output.sequenceLengths;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
