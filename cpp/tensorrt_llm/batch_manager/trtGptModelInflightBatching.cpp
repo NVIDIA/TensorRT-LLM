@@ -2004,10 +2004,8 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
 
     if (returnLogProbs)
     {
-        mDecoderBuffers->cumLogProbs = mDecoder->getDecoderState().getCumLogProbs();
-        mDecoderBuffers->logProbs = mDecoder->getDecoderState().getLogProbs();
-        mCopyBufferManager.copy(*mDecoderBuffers->cumLogProbs, *mDecoderBuffers->cumLogProbsHost);
-        mCopyBufferManager.copy(*mDecoderBuffers->logProbs, *mDecoderBuffers->logProbsHost);
+        mCopyBufferManager.copy(*mDecoder->getDecoderState().getCumLogProbs(), *mDecoderBuffers->cumLogProbsHost);
+        mCopyBufferManager.copy(*mDecoder->getDecoderState().getLogProbs(), *mDecoderBuffers->logProbsHost);
     }
 
     if (mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens())

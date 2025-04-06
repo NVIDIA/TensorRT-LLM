@@ -115,9 +115,7 @@ public:
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
     TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
-    TensorPtr cumLogProbs;         // [mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
-    TensorPtr logProbs;            // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
     TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor

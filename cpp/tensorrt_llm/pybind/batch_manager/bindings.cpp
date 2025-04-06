@@ -475,9 +475,7 @@ void initBindings(pybind11::module_& m)
             "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
         .def_property_readonly("new_output_tokens_host",
             [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
