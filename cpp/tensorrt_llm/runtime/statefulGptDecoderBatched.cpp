@@ -218,7 +218,9 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
 
     decoder_batch::Output batchOutput;
     batchOutput.cacheIndirection = output.cacheIndirection;
-    batchOutput.sequenceLengths = output.sequenceLengths;
+    batchOutput.sequenceLengths = ITensor::view(output.sequenceLengths,
+        ITensor::makeShape(
+            {mDecoder->getDecoderState().getActualBatchSize(), mDecoder->getDecoderState().getMaxBeamWidth()}));
 
     mDecoderFinishEvent = mDecoder->forwardAsync(batchOutput, batchInput);
 
