@@ -1257,6 +1257,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
         mMaxTokenNum += tokensPerBlock;
     }
 
+    // This is equivalent to mMaxAttentionWindow - sinkTokenLength + mUseOneMoreBlock*tokensPerBlock
+    mNumNonSinkTokensInWindow = mMaxTokenNum - mSinkBlockTokenLength;     
+
     // Consider the mTemporaryAttentionWindow when allocating blocks.
     mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
 
@@ -1444,19 +1447,14 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req)
         }
     }
 
-    // In case of sliding window attention, a new block is allocated when the window slides (and then the out-of-window block is offloaded / evicted)
+    // In case of sliding window attention, a new block is allocated when the window slides (and then the out-of-window block is detached)
     // So we need an extra block for generation if the diff between the max sequence length and the current sequence length crosses a block boundary
-    SizeType32 numExtraBlocksPerBeam = 0;
+    auto const isSlidingWindow = req.mPromptLen + req.mMaxNewTokens > mNumNonSinkTokensInWindow + mTemporaryAttentionWindow;
+    // req.getNumTokens() does NOT include sink tokens, so don't consider them in maxSeqlenInBlocks as well
+    SizeType32 const currentSeqlenInBlocks = tc::ceilDiv(req.getNumTokens(0), getTokensPerBlock());
     SizeType32 const maxSeqlenInBlocks = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
-    SizeType32 const attentionWindowInBlocks = tc::ceilDiv(mMaxAttentionWindow + mTemporaryAttentionWindow, getTokensPerBlock());
-    if (maxSeqlenInBlocks > attentionWindowInBlocks)
-    {
-        SizeType32 const numCurrentBlocksPerBeam = tc::ceilDiv(req.getTokens(0).size(), getTokensPerBlock());
-        if (maxSeqlenInBlocks > numCurrentBlocksPerBeam)
-        {
-            numExtraBlocksPerBeam = 1;
-        }
-    }
+    auto const willCrossBlockBoundary = maxSeqlenInBlocks > currentSeqlenInBlocks;
+    SizeType32 numExtraBlocksPerBeam = isSlidingWindow && willCrossBlockBoundary ? 1 : 0;
 
     if (numAllocBlocksPerBeam < numContextBlocks)       // Still didn't allocate all context blocks
     {
@@ -1528,8 +1526,7 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
     if (addToken)
     {
         auto const numTokensWithoutSink = newNumTokens - mSinkBlockTokenLength;
-        auto const numNonSinkTokensInWindow = mMaxTokenNum - mSinkBlockTokenLength;     // This is equivalent to mMaxAttentionWindow - sinkTokenLength - museOneMoreBlock*tokensPerBlock
-        auto const minTokensForBlockDetach = numNonSinkTokensInWindow + getTokensPerBlock();
+        auto const minTokensForBlockDetach = mNumNonSinkTokensInWindow + getTokensPerBlock();
         auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach) && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0);
 
         if (canDetachBlock)

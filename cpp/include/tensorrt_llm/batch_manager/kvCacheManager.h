@@ -1282,6 +1282,8 @@ private:
     SizeType32 mMaxTokenNum;
     // Number of tokens in the sink blocks
     SizeType32 mSinkBlockTokenLength;
+    // Number of non-sink tokens in the attention window
+    SizeType32 mNumNonSinkTokensInWindow;
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences

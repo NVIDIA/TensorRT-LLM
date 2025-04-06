@@ -4048,7 +4048,25 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
             5000,
             128,
             65,
-        }));
+        },
+        GetRemainingBlocksToCompletionOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                64,
+                4096,
+                0,
+                4,
+                4096,
+                1,
+                4097,       // temporaryKvCacheLength = 0
+                false,
+            },
+            5000,
+            128,
+            66,     // 1 extra block for sink tokens
+        }));    
 
 class FillKvCacheAndCompleteRequestsTest : public ::testing::TestWithParam<FillKvCacheAndCompleteRequestsParameters>
 {
