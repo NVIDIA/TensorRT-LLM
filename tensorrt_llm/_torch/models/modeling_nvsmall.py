@@ -48,6 +48,27 @@ def _find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
+def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
+                                config: PretrainedConfig):
+    return Linear(
+        config.hidden_size,
+        config.hidden_size,
+        bias=False,
+        dtype=config.torch_dtype,
+        parallel_config=ParallelConfig(
+            tensor_parallel_rank=model_config.mapping.tp_rank,
+            tensor_parallel_size=model_config.mapping.tp_size,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            pipeline_parallel_size=model_config.mapping.pp_size,
+            parallel_rank=model_config.mapping.rank,
+            gather_output=True,
+            gpus_per_node=model_config.mapping.gpus_per_node,
+        ),
+        quant_config=model_config.get_quant_config(),
+        skip_create_weights=model_config.skip_create_weights,
+    )
+
+
 class NVSmallAttention(Attention):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
@@ -73,28 +94,12 @@ class NVSmallAttention(Attention):
             config=model_config)
 
 
-class NVSmallLinear(nn.Module):
+class LinearAttention(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  config: PretrainedConfig):
         super().__init__()
-        self.linear_attn = Linear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank,
-                gather_output=True,
-                gpus_per_node=model_config.mapping.gpus_per_node,
-            ),
-            quant_config=model_config.get_quant_config(),
-            skip_create_weights=model_config.skip_create_weights,
-        )
+        self.linear_attn = _create_linear_from_configs(model_config, config)
 
     def forward(
         self,
@@ -104,12 +109,15 @@ class NVSmallLinear(nn.Module):
         return self.linear_attn(hidden_states)
 
 
-class LinearAttention(NVSmallLinear):
-    pass
+class LinearMLP(nn.Module):
 
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 config: PretrainedConfig):
+        super().__init__()
+        self.linear_mlp = _create_linear_from_configs(model_config, config)
 
-class LinearMLP(NVSmallLinear):
-    pass
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear_mlp(hidden_states)
 
 
 class NVSmallDecoderLayer(DecoderLayer):
