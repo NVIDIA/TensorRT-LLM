@@ -29,7 +29,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 DecoderInputBuffers::DecoderInputBuffers(
-    SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep, BufferManager const& manager)
+    SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, BufferManager const& manager)
 {
     auto const maxBatchSizeShape = ITensor::makeShape({maxBatchSize});
     auto const nvSizeType = TRTDataType<SizeType32>::value;
@@ -44,8 +44,8 @@ DecoderInputBuffers::DecoderInputBuffers(
     fillValues = tensorrt_llm::runtime::BufferManager::pinnedPool(maxBatchSizeShape, nvSizeType);
     fillValuesDevice = manager.gpu(maxBatchSizeShape, nvSizeType);
 
-    forwardBatchSlots.reserve(maxTokensPerEngineStep);
-    for (SizeType32 i = 0; i < maxTokensPerEngineStep; ++i)
+    forwardBatchSlots.reserve(maxDecoderSteps);
+    for (SizeType32 i = 0; i < maxDecoderSteps; ++i)
     {
         forwardBatchSlots.emplace_back(BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize}), nvSizeType));
     }
