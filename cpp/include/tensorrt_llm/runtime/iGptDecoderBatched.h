@@ -50,13 +50,13 @@ public:
     using TensorPtr = ITensor::SharedPtr;
 
     explicit Input(std::vector<std::vector<TensorConstPtr>> const& logits, std::vector<bool> const& active,
-        SizeType32 maxDecodingEngineTokens)
+        SizeType32 maxDecoderSteps)
         : logits{logits}
-        , maxDecodingEngineTokens{maxDecodingEngineTokens}
+        , maxDecoderSteps{maxDecoderSteps}
         , active{active}
     {
-        TLLM_CHECK_WITH_INFO(logits.size() == static_cast<size_t>(maxDecodingEngineTokens),
-            "logits vector size does not match maxDecodingEngineTokens");
+        TLLM_CHECK_WITH_INFO(
+            logits.size() == static_cast<size_t>(maxDecoderSteps), "logits vector size does not match maxDecoderSteps");
     }
 
     explicit Input(std::vector<TensorConstPtr> const& logits)
@@ -66,11 +66,11 @@ public:
 
     //! Mandatory parameters
     // FIXME: remove first dimension of tensors
-    //! [generatedTokensPerStep][batchSize][1, beamWidth, vocabSizePadded], on gpu
+    //! [maxDecoderSteps][batchSize][1, beamWidth, vocabSizePadded], on gpu
     std::vector<std::vector<TensorConstPtr>> logits;
 
     //! Maximum number of decoding tokens of active slots
-    SizeType32 maxDecodingEngineTokens;
+    SizeType32 maxDecoderSteps;
 
     //! Control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]

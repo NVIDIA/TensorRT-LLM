@@ -296,7 +296,7 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("active", &tr::decoder_batch::Input::active)
-        .def_readwrite("max_decoding_engine_tokens", &tr::decoder_batch::Input::maxDecodingEngineTokens)
+        .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
         .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
         .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
         .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);

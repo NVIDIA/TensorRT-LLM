@@ -172,9 +172,9 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    for (SizeType32 si = 0; si < input.maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
+    for (SizeType32 step = 0; step < input.maxDecoderSteps; ++step)
     {
-        prepareForward(si, output, input);
+        prepareForward(step, output, input);
 
         if (mDecoderState->getJointDecodingInput().batchSize > 0)
         {
@@ -239,7 +239,7 @@ void GptDecoderBatched::prepareForward(
 
     TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput
-        = ITensor::slice(mDecoderState->getFinishedSteps(), std::min(input.maxDecodingEngineTokens - 1, step + 1), 1);
+        = ITensor::slice(mDecoderState->getFinishedSteps(), std::min(input.maxDecoderSteps - 1, step + 1), 1);
     finishedStepsInput->squeeze(0);
     finishedStepsOutput->squeeze(0);
     TensorPtr newTokensStepView

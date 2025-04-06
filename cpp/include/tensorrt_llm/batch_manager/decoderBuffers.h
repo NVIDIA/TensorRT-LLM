@@ -37,7 +37,7 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     explicit DecoderInputBuffers(
-        SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep, runtime::BufferManager const& manager);
+        SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
 
     // buffers for setup
     TensorPtr setupBatchSlots;
