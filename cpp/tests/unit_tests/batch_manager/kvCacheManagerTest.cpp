@@ -3610,12 +3610,9 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
     auto constexpr sizePerHead = 64;
     auto constexpr hiddenSize = numHeads * sizePerHead;
     auto constexpr tokensPerBlock = 8;
-    auto constexpr maxBlocksPerSeq = 10;
     auto constexpr maxNumSequences = 8;
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
-
-    auto constexpr totalNumBlocks = maxNumSequences * maxBlocksPerSeq;
 
     TLLM_CHECK(draftLen == 0 || beamWidth == 1);
 
@@ -3632,13 +3629,14 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
         tr::SamplingConfig const samplingConfig{maxBeamWidth};
         for (int inputLength = 1; inputLength < maxInputLength; ++inputLength)
         {
-            auto constexpr maxNumTokens = tokensPerBlock * maxBlocksPerSeq;
             // auto constexpr maxAttentionWindow = maxNumTokens / 2;
             auto constexpr maxAttentionWindow = 46;
             auto constexpr temporaryAttentionWindow = 0;
-            auto constexpr totalNumBlocks = maxNumSequences * maxBlocksPerSeq;
             auto constexpr blocksInSecondaryPool = 0;
             auto constexpr onboardBlocks = true;
+
+            auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;    // TODO (tomer): explain this +1. Add it as a constant
+            auto constexpr totalNumBlocks = maxNumSequences * maxBlocksPerSeq;
 
             KVCacheManager kvCacheManager = homogeneousLayers
                 ? KVCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, totalNumBlocks,
@@ -3650,7 +3648,7 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                     stream, std::nullopt, kv_cache_block_reuse, onboardBlocks);
             kvCacheManager.allocatePools(nvinfer1::DataType::kHALF, false);
 
-            EXPECT_EQ(kvCacheManager.getMaxBlocksPerSeq(), tc::ceilDiv(maxAttentionWindow, tokensPerBlock));
+            EXPECT_EQ(kvCacheManager.getMaxBlocksPerSeq(), maxBlocksPerSeq);
 
             auto inputTokens = std::make_shared<VecTokens>(VecTokens(inputLength, 0));
 
@@ -4067,6 +4065,59 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
             128,
             66,     // 1 extra block for sink tokens
         }));    
+
+// class NeededBlocksOneStepTest
+//     : public ::testing::TestWithParam<GetRemainingBlocksToCompletionOneRequestParameters>
+// {
+// protected:
+//     void SetUp() override
+//     {
+//         auto const stream = std::make_shared<tr::CudaStream>();
+//         auto const params = GetParam();
+//         kvCacheManager = createKvCacheManager(params.kvCacheManagerInstantiationParameters, stream);
+//         kvCacheManager->allocatePools(nvinfer1::DataType::kFLOAT);
+//     }
+
+//     void TearDown() override {}
+
+//     std::shared_ptr<KVCacheManager> kvCacheManager;
+// };
+
+// TEST_P(NeededBlocksOneStepTest, NeededBlocksOneStepTestCorrectlyEstimated)
+// {
+//     auto const params = GetParam();
+//     auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(params.promptLength));
+//     auto const llmRequest = LlmRequest{
+//         0,
+//         params.maxOutputLength,
+//         inputTokens,
+//         tensorrt_llm::runtime::SamplingConfig{params.kvCacheManagerInstantiationParameters.maxBeamWidth},
+//         true,
+//     };
+//     auto const result = kvCacheManager->getRemainingBlocksToCompletion(llmRequest);
+//     ASSERT_EQ(result, params.expectedRemainingBlocksToCompletion);
+// }
+
+// INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocksOneStepTest,
+//     ::testing::Values(
+//         // GetRemainingBlocksToCompletionOneRequestParameters{
+//         //     KvCacheManagerInstantiationParameters{
+//         //         1,
+//         //         1,
+//         //         1,
+//         //         64,
+//         //         4096,
+//         //         0,
+//         //         0,
+//         //         4096,
+//         //         1,
+//         //         4097,       // temporaryKvCacheLength = 0
+//         //         false,
+//         //     },
+//         //     5000,
+//         //     128,
+//         //     65,
+//         // }));
 
 class FillKvCacheAndCompleteRequestsTest : public ::testing::TestWithParam<FillKvCacheAndCompleteRequestsParameters>
 {

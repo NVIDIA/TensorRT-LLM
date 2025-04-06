@@ -1397,14 +1397,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const numPastTokens = req.mPromptLen + generatedTokens + mSinkBubbleLength - 1;
         auto const numNextTokens = numPastTokens + (twoStepsLookAhead ? 2 : 1) * numTokensPerStep;
 
-        if (numNextTokens > mMaxTokenNum)
-        {
-            return 0;
-        }
-
         auto const numPastBlocks = tc::ceilDiv(numPastTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        numRequiredBlocks = (numNextBlocks - numPastBlocks) * req.mSamplingConfig.beamWidth;
+
+        auto const numNewBlocks = (numNextTokens > mMaxTokenNum) ? std::min(numNextBlocks - numPastBlocks, 1) : (numNextBlocks - numPastBlocks);
+        numRequiredBlocks = numNewBlocks * req.mSamplingConfig.beamWidth;
     }
     return numRequiredBlocks;
 }
@@ -1454,7 +1451,10 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req)
     SizeType32 const currentSeqlenInBlocks = tc::ceilDiv(req.getNumTokens(0), getTokensPerBlock());
     SizeType32 const maxSeqlenInBlocks = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
     auto const willCrossBlockBoundary = maxSeqlenInBlocks > currentSeqlenInBlocks;
-    SizeType32 numExtraBlocksPerBeam = isSlidingWindow && willCrossBlockBoundary ? 1 : 0;
+    // We also need to check if the last block in the window will become full (window size does not have to be a multiple of block size)
+    auto const numSinkBlocks = mSinkBlockTokenLength / getTokensPerBlock();
+    auto const willCrossWindowBlockBoundary = maxSeqlenInBlocks + numSinkBlocks > numTotalBlocksPerBeam;
+    SizeType32 numExtraBlocksPerBeam = isSlidingWindow && willCrossBlockBoundary && willCrossWindowBlockBoundary ? 1 : 0;
 
     if (numAllocBlocksPerBeam < numContextBlocks)       // Still didn't allocate all context blocks
     {
@@ -1941,6 +1941,7 @@ SizeType32 KVCacheManager::getMaxCapacityBatchSize(SizeType32 inputLength, SizeT
 SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
     SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 tokensPerBlock)
 {
+    // TODO (tomer): this should probably be changed
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const actualSeqLen = std::min(sequenceLength, maxAttentionWindow);
     auto actualMaxTokenNum = actualSeqLen + sinkBubbleLength;
