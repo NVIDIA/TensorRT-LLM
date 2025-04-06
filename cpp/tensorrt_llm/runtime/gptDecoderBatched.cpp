@@ -53,12 +53,11 @@ GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream,
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::disableLookahead(
-    SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots)
+void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mDecoderState->disableLookahead(maxBatchSize, genRequests);
+    mDecoderState->disableLookahead(genRequests);
 
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(genRequests.size());
@@ -184,8 +183,7 @@ void GptDecoderBatched::forwardDispatch(decoder_batch::Output& output, decoder_b
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxDecodingEngineTokens
-        = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
+    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
 
     for (SizeType32 si = 0; si < maxDecodingEngineTokens; si += mDecoderState->getMaxDecodingDecoderTokens())
     {
@@ -220,7 +218,7 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
     return eventStop;
 }
 
-// TODO(rkobus): produce new input and output
+// TODO: produce new input and output
 void GptDecoderBatched::prepareForward(
     SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input)
 {
@@ -264,7 +262,7 @@ void GptDecoderBatched::prepareForward(
     std::vector<SharedConstPtr> logitsVec;
     for (SizeType32 bi = 0; bi < mDecoderState->getActualBatchSize(); ++bi)
     {
-        if (!input.active.at(bi) || step >= mDecoderState->getJointDecodingInput().numDecodingEngineTokens.at(bi))
+        if (!input.active.at(bi) || step >= mDecoderState->getNumDecodingEngineTokens(bi))
         {
             continue;
         }
@@ -280,8 +278,7 @@ void GptDecoderBatched::prepareForward(
     dInput.batchSize = localBatchDecoderIdx;
     dInput.logitsVec = logitsVec;
 
-    auto const maxDecodingEngineTokens
-        = maxOfActiveSlots(mDecoderState->getJointDecodingInput().numDecodingEngineTokens, input.active);
+    auto const maxDecodingEngineTokens = maxOfActiveSlots(mDecoderState->getNumDecodingEngineTokens(), input.active);
 
     TensorPtr finishedStepsInput = ITensor::slice(mDecoderState->getFinishedSteps(), step, 1);
     TensorPtr finishedStepsOutput

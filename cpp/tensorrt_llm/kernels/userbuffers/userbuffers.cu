@@ -650,7 +650,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
             if (threadIdx.x % 8 == 0)
             {
                 sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
+                    FP4QuantizationSFLayout::SWIZZLED);
             }
             uint32_t val = cvt_warp_fp16_to_fp4_mc(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
@@ -761,7 +762,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
                 i++;
             }
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
+                FP4QuantizationSFLayout::SWIZZLED);
             mc_ptr_out[out_lineoffset + line + g * loop_step0] = cvt_warp_fp16_to_fp4(valout, sf, sf_out);
         }
     }

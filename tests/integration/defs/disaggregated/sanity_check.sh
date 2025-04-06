@@ -1,6 +1,7 @@
 #!/bin/bash
 set -x
-pkill -9 -f launch_disaggregated || true
+pkill -9 -f trtllm-serve || true
+
 rm -rf output.json || true
 rm -rf output_streaming.json || true
 
@@ -50,8 +51,8 @@ else
   exit 1
 fi
 
-mpirun --allow-run-as-root -n ${NUM_RANKS} python3 ${EXAMPLE_DIR}/launch_disaggregated_workers.py -c ${CONFIG_FILE} &> output_workers &
-python3 ${EXAMPLE_DIR}/launch_disaggregated_server.py  --server_start_timeout 900 -c ${CONFIG_FILE} &> output_disagg &
+mpirun --allow-run-as-root -n ${NUM_RANKS} trtllm-serve disaggregated_mpi_worker -c ${CONFIG_FILE} &> output_workers &
+trtllm-serve disaggregated --server_start_timeout 900 -c ${CONFIG_FILE}  &> output_disagg &
 
 for i in $(seq 1 ${NUM_ITERS}); do
     python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950
@@ -71,7 +72,7 @@ echo "------------------"
 cat output_disagg
 
 if [[ "${SKIP_KILL}" != "yes" ]]; then
-  pkill -9 -f launch_disaggregated || true
+  pkill -9 -f trtllm-serve || true
 fi
 
 expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")

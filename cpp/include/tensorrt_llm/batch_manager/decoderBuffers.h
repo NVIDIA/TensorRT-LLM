@@ -111,8 +111,8 @@ public:
     TensorPtr slotOutputIdsHost; // [beamWidth, maxSeqLen], outputIds of single batch slot
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
-    TensorPtr sequenceLengths;     // [mMaxNumRequests]
-    TensorPtr sequenceLengthsHost; // [mMaxNumRequests], pinned host tensor
+    TensorPtr sequenceLengths;     // [mMaxNumRequests, beamWidth]
+    TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
     TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbs;         // [mMaxNumRequests, beamWidth]

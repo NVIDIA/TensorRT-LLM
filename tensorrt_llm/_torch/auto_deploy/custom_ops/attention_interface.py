@@ -237,7 +237,7 @@ class SequenceInfo:
             Here b <= b_cudagraph. We want to make sure that the seq_len is one-padded to
             b_cudagraph.
 
-            # TODO (lliebenwein): I could see one possible issue with this approach in the future.
+            # TODO: I could see one possible issue with this approach in the future.
             # If we have b < b_cudagraph we now one-pad. However, we don't pad the cache location
             # information. What could happen is that the for the padded sequences the cache location
             # tensors point to allocated pages. This could lead to a situation where we write into

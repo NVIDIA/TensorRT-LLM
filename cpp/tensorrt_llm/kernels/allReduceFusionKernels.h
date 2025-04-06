@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::ar_fusion
@@ -41,6 +42,7 @@ struct AllReduceFusionParams
     int nranks;
     int rank;
     nvinfer1::DataType dtype;
+    // size = token_num * hidden_dim
     int size;
     int hidden_dim;
     void** workspace;
@@ -53,6 +55,7 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
+    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
 
@@ -76,4 +79,31 @@ private:
 };
 
 void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
+
+/////////////////////////////////////////////////////////////////
+//                  * MoE Reduction Fusion *                   //
+/////////////////////////////////////////////////////////////////
+
+// Fuse MoE Reduction before AR + RMS
+// pattern1: MoE Reduction + Add Residual + AR + ADD_RMS + Quant
+// pattern2: MoE Reduction + Add Residual + AR + ADD_RMS
+// [device_num_experts, m, 7168] bf16 moe_reduction_active_experts_token_input
+// [m, 7168] bf16 moe_reduction_token_input
+// [device_num_experts, m] moe_reduction_scale_input
+struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams
+{
+    // * moe reduction specific params
+    // Refer to kernel implementation on layout of those params
+    // number of active experts on current device
+    int* moe_reduction_device_num_experts = nullptr;
+    // per token per expert fp32 scale
+    float* moe_reduction_scale_input = nullptr;
+    // per token per expert input
+    void* moe_reduction_active_experts_token_input = nullptr;
+    // per token input
+    void* moe_reduction_token_input = nullptr;
+};
+
+void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& params);
+
 } // namespace tensorrt_llm::kernels::ar_fusion

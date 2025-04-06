@@ -259,6 +259,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+            request.py_decoding_iter += 1
             idx += 1
 
         if hasattr(scheduled_requests, 'chunked_requests'):
@@ -282,6 +283,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+                request.py_decoding_iter += 1
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
@@ -308,6 +310,7 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+                request.py_decoding_iter += 1
             idx += 1
 
     def _mixed_decode(self, scheduled_requests: ScheduledRequests,
@@ -379,11 +382,14 @@ class TorchStarAttentionDecoder(TorchDecoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+            request.py_decoding_iter += 1
 
         for request in scheduled_requests.generation_requests:
             new_token = new_tokens_list[request.output_token_idx]
             num_tokens = request.add_new_token(new_token, beam_idx)
             self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                request.py_decoding_iter += 1
 
 
 class Algorithms():
@@ -513,7 +519,8 @@ class TRTLLMDecoder(Decoder):
                 sampling_config = make_sampling_config(sampling_configs)
                 self.algs.decoder.underlying_decoder().setup(
                     sampling_config, local_batch_size, batch_slots,
-                    self.algs.decoder.joint_decoding_output, decoder_requests)
+                    self.algs.decoder.decoder_state.joint_decoding_output,
+                    decoder_requests)
 
             # Note: In runtimeBuffers.cpp, num_context_logits is set to:
             #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
@@ -544,11 +551,11 @@ class TRTLLMDecoder(Decoder):
         self.decoder_event.synchronize()
 
         # Note: self.algs.decoder.all_new_tokens will be populated after the synchronize
-        new_tokens_host = self.algs.decoder.all_new_tokens.to('cpu',
-                                                              non_blocking=True)
-        finished_sum_host = self.algs.decoder.finished_sum.to('cpu',
-                                                              non_blocking=True)
-        finish_reasons_host = self.algs.decoder.finish_reasons.to(
+        new_tokens_host = self.algs.decoder.decoder_state.all_new_tokens.to(
+            'cpu', non_blocking=True)
+        finished_sum_host = self.algs.decoder.decoder_state.finished_sum.to(
+            'cpu', non_blocking=True)
+        finish_reasons_host = self.algs.decoder.decoder_state.finish_reasons.to(
             'cpu', non_blocking=True)
         sequence_lengths_host_data = self.store[
             "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
@@ -589,6 +596,10 @@ class TRTLLMDecoder(Decoder):
             request.update_num_tokens_per_iteration(
                 request.max_beam_num_tokens - current_num_of_tokens,
                 self.model_config)
+
+            # Increment the decoding iteration counter
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                request.py_decoding_iter += 1
 
             if finished_sum_host[seq_slot] == self.beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE

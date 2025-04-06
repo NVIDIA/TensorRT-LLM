@@ -18,7 +18,7 @@ Since we care about accuracy regression only, so it should be a one-tailed hypot
 * Null Hypothesis ($H_0$): $x'_1, x'_2, \dots, x'_n$ are drawn from a distribution with a mean equal to or higher than the reference.
 * Alternative Hypothesis ($H_1$): $x'_1, x'_2, \dots, x'_n$ are drawn from a distribution with a mean lower than the reference.
 
-![Hypothesis Testing](./hypothesis-testing.svg)
+![Hypothesis Testing](./media/hypothesis-testing.svg)
 
 ### Two-sample t-test
 

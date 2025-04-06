@@ -473,7 +473,7 @@ void TrtGptModelInflightBatching::setupSpeculativeDecodingModule(executor::Decod
 
     if (mModelConfig.getSpeculativeDecodingMode().isLookaheadDecoding() && decodingConfig.getLookaheadDecodingConfig())
     {
-        // FIXME(nkorobov) choose defaults
+        // FIXME choose defaults
         auto maxLookaheadConfig = decodingConfig.getLookaheadDecodingConfig().value();
 
         SizeType32 maxDraftTokens{0};
@@ -769,7 +769,7 @@ void TrtGptModelInflightBatching::forwardSync()
             }
             // Wait for decoding for requests in flight for the current micro batch
             auto& decoderWaitEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-            mDecStepAsyncSndHdls = decoderSync(currRequests, std::move(decoderWaitEvent.value()));
+            mDecStepAsyncSndHdls = decoderSync(currRequests, decoderWaitEvent);
             decoderWaitEvent.reset();
 
             if (!mWorldConfig.isLastPipelineParallelRank())
@@ -974,7 +974,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
 
             if (isTrtOverlap())
             {
-                // WAR(rkobus): Because the decoder is not stateless (yet) a sync is needed between
+                // WAR: Because the decoder is not stateless (yet) a sync is needed between
                 // decoder execution and next decoder step preparation.
                 auto const prevMicroBatchId = getPrevMicroBatchId(mMicroBatchId);
                 auto& prevDecoderFinishedEvent = mDecoderFinishedEvents.at(prevMicroBatchId);
@@ -1037,7 +1037,7 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 }
                 // Wait for decoding for requests in flight for the current micro batch
                 auto& decoderFinishedEvent = mDecoderFinishedEvents.at(mMicroBatchId);
-                mDecStepAsyncSndHdls = decoderSync(currRequests, std::move(decoderFinishedEvent.value()));
+                mDecStepAsyncSndHdls = decoderSync(currRequests, decoderFinishedEvent);
                 decoderFinishedEvent.reset();
 
                 mAsyncSendWaitThread->notifyStart();
@@ -1222,7 +1222,7 @@ void TrtGptModelInflightBatching::createRuntimeContexts()
 
 namespace
 {
-// TODO(rkobus): move this somewhere else?
+// TODO: move this somewhere else?
 executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
     std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 beamWidth)
 {
@@ -2009,7 +2009,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
 
     if (mModelConfig.getSpeculativeDecodingMode().predictsDraftTokens())
     {
-        // TODO(rkobus): keep data on device for next iteration
+        // TODO: keep data on device for next iteration
         mDecoderBuffers->draftBuffers.nextDraftTokensDevice = mDecoder->getDecoderState().getNextDraftTokens();
         mCopyBufferManager.copy(
             *mDecoderBuffers->draftBuffers.nextDraftTokensDevice, *mDecoderBuffers->draftBuffers.nextDraftTokensHost);
@@ -2296,14 +2296,14 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
 }
 
 std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::decoderSync(
-    ScheduledRequests const& scheduledRequests, runtime::CudaEvent decoderFinishEvent)
+    ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(decoderSync);
 
     if (mWorldConfig.isLastPipelineParallelRank())
     {
-        decoderFinishEvent.synchronize();
+        decoderFinishEvent->synchronize();
     }
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
@@ -2484,8 +2484,8 @@ void TrtGptModelInflightBatching::changeSpecDecMode(ScheduledRequests const& sch
         mDecodingConfig.setDecodingMode(executor::DecodingMode::Auto());
         mBuffers.at(bufferId)->lookaheadBuffers->disableLookaheadDecoding();
         mDecoderBuffers->disableLookaheadDecoding(getMaxNumSequences());
-        mDecoder->disableLookahead(getMaxNumSequences(), scheduledRequests.generationRequests,
-            mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
+        mDecoder->disableLookahead(
+            scheduledRequests.generationRequests, mDecoderInputBuffers.at(getFusedBufferId()).setupBatchSlots);
         for (auto const& llmReq : scheduledRequests.generationRequests)
         {
             if (llmReq->getNumDraftTokens() > 0)

@@ -133,7 +133,7 @@ def update_paged_kv_cache(
     tl.store(v_cache_ptr + cache_offsets, vs, load_mask)
 
 
-# TODO(suyogg): Write a doc describing the 2 stage algorithm
+# TODO: Write a doc describing the 2 stage algorithm
 @triton.jit
 def attention_kv_paged_stage1(
     q_ptr,  # [Batch, 1, N_HEADS, D_HEAD]
@@ -218,7 +218,7 @@ def attention_kv_paged_stage1(
     k = tl.load(k_cache_ptr + cache_offsets, mask=kv_mask)
     v = tl.load(v_cache_ptr + cache_offsets, mask=kv_mask)
 
-    # Note(suyogg): check the output precision of the sum.
+    # Note: check the output precision of the sum.
     # compute q*K^T
     # [D_HEAD] * [seq_block, D_HEAD], sum along axis 1
     attn = tl.sum(q[None, :] * k, axis=1)  # [seq_block]

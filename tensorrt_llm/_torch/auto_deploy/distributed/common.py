@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 
 from ..utils.logger import ad_logger
 
-# TODO (lliebenwein): check to what extend we can reuse _torch/distributed.py
+# TODO: check to what extend we can reuse _torch/distributed.py
 
 
 class _DistGroup:
