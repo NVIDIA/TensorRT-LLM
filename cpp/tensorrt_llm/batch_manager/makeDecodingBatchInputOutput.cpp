@@ -45,8 +45,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
     auto const maxDecoderSteps = maxDecodingEngineTokens / maxDecodingDecoderTokens;
 
-    std::vector<bool> active(maxNumSequences, false);
-
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
         batchSlots.at(step)->resize(maxNumSequences);
@@ -56,7 +54,6 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     auto maxActiveDecoderSteps = 1;
     for (auto const slot : activeSlots)
     {
-        active[slot] = true;
         auto const numDecoderSteps = numDecodingEngineTokens.at(slot) / maxDecodingDecoderTokens;
         maxActiveDecoderSteps = std::max(maxActiveDecoderSteps, numDecoderSteps);
         for (SizeType32 step = 0; step < numDecoderSteps; ++step)
@@ -70,29 +67,20 @@ std::unique_ptr<tr::decoder_batch::Input> MakeDecodingBatchInputOutput::createDe
     for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
     {
         batchSlots.at(step)->resize(batchIdx[step]);
-        auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
-        std::sort(batchSlotsRange.begin(), batchSlotsRange.end());
     }
 
     auto constexpr singleRequest = 1;
     std::vector<std::vector<tr::ITensor::SharedConstPtr>> logitsVec(maxActiveDecoderSteps);
     for (SizeType32 step = 0; step < maxActiveDecoderSteps; ++step)
     {
-        SizeType32 localBatchDecoderIdx = 0;
-        for (SizeType32 bi = 0; bi < maxNumSequences; ++bi)
-        {
-            if (!active.at(bi) || step >= numDecodingEngineTokens.at(bi))
-            {
-                continue;
-            }
-            localBatchDecoderIdx++;
+        auto batchSlotsRange = tr::BufferRange<SizeType32>(*batchSlots.at(step));
 
-            auto const& targetLogits = logits.at(bi);
+        for (auto slot : batchSlotsRange)
+        {
+            auto const& targetLogits = logits.at(slot);
             TensorPtr logitsSlice = tr::ITensor::slice(targetLogits, step, singleRequest);
             logitsVec.at(step).push_back(logitsSlice);
         }
-        TLLM_CHECK_WITH_INFO(batchSlots.at(step)->getSize() == static_cast<size_t>(localBatchDecoderIdx),
-            "batchSlots size mismatch: %ld != %d", batchSlots.at(step)->getSize(), localBatchDecoderIdx);
     }
 
     auto decodingInput = std::make_unique<tr::decoder_batch::Input>(logitsVec, maxActiveDecoderSteps);
@@ -118,6 +106,9 @@ std::vector<SizeType32> getActiveSlots(RequestVector const& contextRequests, Req
             }
         }
     }
+
+    std::sort(activeSlots.begin(), activeSlots.end());
+
     return activeSlots;
 }
 
