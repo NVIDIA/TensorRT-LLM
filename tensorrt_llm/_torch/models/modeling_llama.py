@@ -198,11 +198,7 @@ class LlamaDecoderLayer(DecoderLayer):
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
         self.fusion_config = EagerFusionConfig()
-        # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-        # )
-        # TODO: re-enable these fusions
-        self.fusion_config.PRE_MOE_FUSION = False
-        self.fusion_config.POST_MLP_FUSION = False
+        self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
 
         self.is_llama4 = config.model_type == "llama4_text"
         self.is_nope_layer = False
@@ -244,8 +240,7 @@ class LlamaDecoderLayer(DecoderLayer):
             else:
                 self.mlp = mlp
 
-            # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -257,8 +252,7 @@ class LlamaDecoderLayer(DecoderLayer):
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype)
 
-            # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
