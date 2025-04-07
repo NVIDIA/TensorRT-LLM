@@ -49,7 +49,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_topk_softmax(torch::Tensor const&
     auto token_selected_experts
         = torch::empty({num_rows, top_k}, torch::dtype(torch::kInt32).device(router_logits.device()));
 
-    auto stream = at::cuda::getCurrentCUDAStream(router_logits.get_device());
+    // auto stream = at::cuda::getCurrentCUDAStream(router_logits.get_device());
     // tensorrt_llm::kernels::topkGatingSoftmaxKernelLauncher(
     //     static_cast<__nv_bfloat16 const*>(router_logits.const_data_ptr()),
     //     static_cast<float*>(token_final_scales.data_ptr()), static_cast<int*>(token_selected_experts.data_ptr()),

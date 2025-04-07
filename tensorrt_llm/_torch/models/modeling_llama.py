@@ -1,3 +1,4 @@
+import copy
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -6,8 +7,7 @@ from transformers import Llama4Config, LlamaConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, TensorParallelMode,
-                                             allgather, reducescatter)
+                                             ParallelConfig, TensorParallelMode)
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -63,7 +63,7 @@ class LlamaAttention(Attention):
             is_nope_layer = False
 
         use_rope = not is_nope_layer
-        if model_config.fuse_pos_embd:
+        if use_rope and model_config.fuse_pos_embd:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj
                 if use_gptj_style_rope else PositionEmbeddingType.rope_gpt_neox,
@@ -85,7 +85,6 @@ class LlamaAttention(Attention):
             config=model_config,
             use_qk_norm=use_qk_norm and not is_nope_layer,
             aux_stream=aux_stream,
-            use_rope=use_rope,
         )
 
 
@@ -109,7 +108,6 @@ class Llama4MoE(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
-        self.use_dp = model_config.mapping.enable_attention_dp
         self.experts = FusedMoE(
             routing_method=RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -117,7 +115,7 @@ class Llama4MoE(nn.Module):
             intermediate_size=intermediate_size,
             dtype=dtype,
             reduce_results=
-            False,  # In both low latency and attention dp scenarios, FusedMoE needs not to do allreduce inside op.
+            False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config)
 
@@ -127,7 +125,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            is_expert=not self.use_dp)
+            is_expert=True)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -143,38 +141,11 @@ class Llama4MoE(nn.Module):
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
-    def all_gather(self, input_tensor, all_rank_num_tokens):
-        world_size = self.parallel_config.tensor_parallel_size
-        max_num_token = max(all_rank_num_tokens)
-        if world_size == 1:
-            return input_tensor
-
-        pad_tensor = torch.nn.functional.pad(
-            input_tensor, (0, 0, 0, max_num_token - input_tensor.shape[0]))
-        outputs = allgather(pad_tensor, self.parallel_config, gather_dim=0)
-        return outputs
-
-    def reduce_scatter(self, input_tensor, all_rank_num_tokens):
-        world_size = self.parallel_config.tensor_parallel_size
-        rank = self.parallel_config.tensor_parallel_rank
-        max(all_rank_num_tokens)
-        if world_size == 1:
-            return input_tensor
-        dst_tensor = input_tensor
-        outputs = reducescatter(dst_tensor, self.parallel_config, scatter_dim=0)
-        depad_tensors = outputs[:all_rank_num_tokens[rank]]
-        return depad_tensors
-
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               min_latency_mode):
-        if self.use_dp:
-            hidden_states = self.all_gather(hidden_states, all_rank_num_tokens)
         router_logits = self.router(hidden_states)
         routed_output = self.experts(hidden_states, router_logits,
                                      min_latency_mode)
-        if self.use_dp:
-            routed_output = self.reduce_scatter(routed_output,
-                                                all_rank_num_tokens)
         return routed_output
 
     def forward(
@@ -184,8 +155,6 @@ class Llama4MoE(nn.Module):
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
-        if min_latency_mode:
-            assert not self.use_dp
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         do_multi_stream = torch.cuda.is_current_stream_capturing()
@@ -209,7 +178,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if not self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+        if self.parallel_config.tensor_parallel_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -230,9 +199,8 @@ class LlamaDecoderLayer(DecoderLayer):
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
         self.fusion_config = EagerFusionConfig()
-        self.enable_attention_dp = model_config.mapping.enable_attention_dp
         # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
-        # ) and not self.enable_attention_dp
+        # )
         # TODO: re-enable these fusions
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
@@ -262,7 +230,7 @@ class LlamaDecoderLayer(DecoderLayer):
             )
 
             # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            # ) and not self.enable_attention_dp
+            # )
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -275,7 +243,7 @@ class LlamaDecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype)
 
             # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            # ) and not self.enable_attention_dp
+            # )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -318,8 +286,8 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION
+                or self.parallel_config.tensor_parallel_size == 1)),
             **kwargs,
         )
 
@@ -342,8 +310,8 @@ class LlamaDecoderLayer(DecoderLayer):
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                or self.fusion_config.POST_MLP_FUSION
+                or self.parallel_config.tensor_parallel_size == 1)),
             min_latency_mode=min_latency_mode,
         )
         if spec_metadata is not None:
@@ -580,6 +548,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
         model_config: ModelConfig[Llama4Config],
     ):
         # TODO: figure out a better way to handle multimodality.
+        model_config = copy.copy(model_config)
         model_config.pretrained_config = model_config.pretrained_config.text_config
         super().__init__(LlamaModel(model_config),
                          config=model_config,

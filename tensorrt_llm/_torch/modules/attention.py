@@ -30,7 +30,7 @@ class L2Norm(torch.nn.Module):
         return flash_infer_kernel(x)
 
     def forward(self, x):
-        return self._norm(x.contiguous()).type_as(x)
+        return self._norm(x).type_as(x)
 
 
 class Attention(nn.Module):
@@ -51,7 +51,6 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        use_rope: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -133,7 +132,6 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
         self.rotary_emb = rotary_emb
-        self.use_rope = use_rope
 
         if not config.skip_create_weights:
             self.create_weights()
@@ -145,7 +143,7 @@ class Attention(nn.Module):
             self.num_heads,
             self.head_dim,
             self.num_key_value_heads,
-            pos_embd_params=self.pos_embd_params if self.use_rope else None,
+            pos_embd_params=self.pos_embd_params,
             quant_config=self.quant_config,
         )
 
@@ -182,23 +180,16 @@ class Attention(nn.Module):
             else:
                 q = self.qk_norm(q)
                 k = self.qk_norm(k)
-            qkv = torch.concat(
-                [q.contiguous(), k.contiguous(),
-                 v.contiguous()], dim=-1)
+            qkv = torch.concat([q, k, v], dim=-1)
 
         if is_fused_qkv:
-            if self.use_rope:
-                if self.pos_embd_params is None and position_ids is not None:
-                    q, k, v = qkv.split(
-                        [self.q_size, self.kv_size, self.kv_size], dim=-1)
-                    q, k = self.rotary_emb(
-                        position_ids,
-                        [q.contiguous(), k.contiguous()], attn_metadata)
-                    qkv = torch.concat(
-                        [q.contiguous(),
-                         k.contiguous(),
-                         v.contiguous()],
-                        dim=-1)
+            if self.pos_embd_params is None and position_ids is not None:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                    dim=-1)
+                q, k = self.rotary_emb(
+                    position_ids,
+                    [q.contiguous(), k.contiguous()], attn_metadata)
+                qkv = torch.concat([q, k, v], dim=-1)
 
             out_scale = None
             if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
@@ -214,7 +205,7 @@ class Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
 
-            if self.use_rope and self.pos_embd_params is None and position_ids is not None:
+            if self.pos_embd_params is None and position_ids is not None:
                 q, k = self.rotary_emb(
                     position_ids,
                     [q.contiguous(), k.contiguous()], attn_metadata)
