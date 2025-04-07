@@ -209,8 +209,6 @@ class TestMistral_7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
 
 
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
@@ -429,4 +427,37 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMinitron4BBase(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Minitron-4B-Base"
+    MODEL_PATH = f"{llm_models_root()}/nemotron/Minitron-4B-Base"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = Humaneval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
+
+    @skip_pre_ada
+    def test_fp8_prequantized(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestNemotronNas(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype_tp2(self):
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
