@@ -12,7 +12,7 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb_neox(
+def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
 ):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -97,7 +97,7 @@ def test_rope_ops(dtype, head_dim):
     # HF torch expects inputs of shape [B, N, S, D]
     q_for_hf = query.transpose(1, 2).clone()  # shape: [batch, n_head, seq_len, head_dim]
     k_for_hf = key.transpose(1, 2).clone()
-    q_rotated_hf, k_rotated_hf = apply_rotary_pos_emb_neox(
+    q_rotated_hf, k_rotated_hf = apply_rotary_pos_emb(
         q_for_hf, k_for_hf, cos_new, sin_new, unsqueeze_dim=0
     )
     q_rotated_hf = q_rotated_hf.transpose(1, 2).to(torch.float32)
