@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import namedtuple, OrderedDict
+from collections import OrderedDict, namedtuple
 from contextlib import contextmanager
 from itertools import chain
 from typing import Dict, List, Optional, Tuple, Union
