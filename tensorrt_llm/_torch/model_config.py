@@ -7,6 +7,7 @@ import torch
 import transformers
 
 from tensorrt_llm import logger
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -137,3 +138,41 @@ class ModelConfig(Generic[TConfig]):
                    quant_config=quant_config,
                    quant_config_dict=layer_quant_config,
                    **kwargs)
+
+    def get_bindings_model_config(
+            self,
+            tensor_parallelism: int = 1,
+            context_parallelism: int = 1) -> "ModelConfigCpp":
+        """
+        This method is used to construct the bindings config for the model.
+        Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
+        that an engine has been created.
+        """
+        # TODO smor- this isn't robust, and currently tested for LlamaConfig only
+        # TODO smor- currently parallelism is not supported, set default to 1
+        # TODO smor- currently assuming no rnn layers, no MOE
+        from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+
+        num_heads = self.pretrained_config.num_attention_heads // (
+            tensor_parallelism * context_parallelism)
+
+        model_config_cpp = ModelConfigCpp(
+            vocab_size=self.pretrained_config.vocab_size,
+            num_layers=self.pretrained_config.num_hidden_layers,
+            num_attention_layers=self.pretrained_config.num_hidden_layers,
+            num_rnn_layers=0,
+            num_heads=num_heads,
+            hidden_size=self.pretrained_config.hidden_size,
+            data_type=torch_dtype_to_binding(
+                self.pretrained_config.torch_dtype))
+
+        mlp_hidden_size = self.pretrained_config.intermediate_size // tensor_parallelism
+        if "head_size" in self.pretrained_config:
+            head_size = self.pretrained_config.head_size
+        else:
+            head_size = self.pretrained_config.hidden_size // num_heads
+
+        model_config_cpp.mlp_hidden_size = mlp_hidden_size
+        model_config_cpp.size_per_head = head_size
+
+        return model_config_cpp
