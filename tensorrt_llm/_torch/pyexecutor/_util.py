@@ -291,7 +291,7 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
     ) and executor_config.guided_decoding_config is not None:
         if spec_config is not None:
             raise ValueError(
-                "Guided decoding does not support with speculative decoding.")
+                "Guided decoding is not supported with speculative decoding.")
     
     resources["seq_slot_manager"] = SeqSlotManager(
             executor_config.max_batch_size +

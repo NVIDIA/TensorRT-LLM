@@ -25,7 +25,9 @@ def model_path():
 def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
     """Create LLM with specific overlap scheduler setting"""
     pytorch_config = PyTorchConfig(
-        use_cuda_graph=True, enable_overlap_scheduler=enable_overlap_scheduler, enable_trtllm_decoder=enable_trtllm_decoder)
+        use_cuda_graph=True,
+        enable_overlap_scheduler=enable_overlap_scheduler,
+        enable_trtllm_decoder=enable_trtllm_decoder)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -42,7 +44,8 @@ def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
 
 
 @pytest.mark.parametrize("enable_trtllm_decoder", [True, False])
-def test_overlap_scheduler_consistency(model_path, test_case, enable_trtllm_decoder):
+def test_overlap_scheduler_consistency(model_path, test_case,
+                                       enable_trtllm_decoder):
     # Test configuration
     prompts = test_case["prompts"]
     max_new_tokens = test_case["max_new_tokens"]
@@ -50,15 +53,16 @@ def test_overlap_scheduler_consistency(model_path, test_case, enable_trtllm_deco
     top_p = test_case["top_p"]
     stop_words = test_case["stop_words"] if enable_trtllm_decoder else None
 
-    sampling_config = SamplingParams(
-        max_tokens=max_new_tokens,
-        beam_width=1,
-        stop=stop_words,
-        temperature=temperature,
-        top_p=top_p)
+    sampling_config = SamplingParams(max_tokens=max_new_tokens,
+                                     beam_width=1,
+                                     stop=stop_words,
+                                     temperature=temperature,
+                                     top_p=top_p)
 
     # Test with overlap scheduler enabled
-    llm = create_llm(model_path, enable_overlap_scheduler=True, enable_trtllm_decoder=enable_trtllm_decoder)
+    llm = create_llm(model_path,
+                     enable_overlap_scheduler=True,
+                     enable_trtllm_decoder=enable_trtllm_decoder)
     outputs_with_overlap = llm.generate(prompts,
                                         sampling_params=sampling_config,
                                         use_tqdm=True)
@@ -68,7 +72,9 @@ def test_overlap_scheduler_consistency(model_path, test_case, enable_trtllm_deco
     llm.shutdown()
 
     # Test with overlap scheduler disabled
-    llm = create_llm(model_path, enable_overlap_scheduler=False, enable_trtllm_decoder=enable_trtllm_decoder)
+    llm = create_llm(model_path,
+                     enable_overlap_scheduler=False,
+                     enable_trtllm_decoder=enable_trtllm_decoder)
     outputs_without_overlap = llm.generate(prompts,
                                            sampling_params=sampling_config,
                                            use_tqdm=True)

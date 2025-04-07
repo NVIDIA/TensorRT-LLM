@@ -1679,11 +1679,9 @@ class PyTorchModelEngine(ModelEngine):
             ) and self.guided_decoder is not None:
                 seq_slot_manager = resource_manager.get_resource_manager(
                     "seq_slot_manager")
-                self.guided_decoder.build(scheduled_requests,
-                                          seq_slot_manager)
+                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'],
-                                            seq_slot_manager)
+                                            outputs['logits'], seq_slot_manager)
 
             return outputs
 

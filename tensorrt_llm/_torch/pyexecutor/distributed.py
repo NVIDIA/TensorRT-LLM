@@ -122,10 +122,20 @@ class MPIDist(Distributed):
         return self.recv(tensor.numpy(), src, tag)
 
     def isend_tensor_list(self, tensor_list: list[torch.Tensor], dest, tag=0):
+        if len(tensor_list) == 0:
+            return None
+        elif len(tensor_list) == 1:
+            return self.isend_tensor(tensor_list[0], dest, tag)
+
         return self.isend(
             np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
 
     def recv_tensor_list(self, tensor_list: list[torch.Tensor], src, tag=0):
+        if len(tensor_list) == 0:
+            return None
+        elif len(tensor_list) == 1:
+            return self.recv_tensor(tensor_list[0], src, tag)
+
         # Prepare buffer to receive tensor_list
         recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
                                dtype=np.uint8)

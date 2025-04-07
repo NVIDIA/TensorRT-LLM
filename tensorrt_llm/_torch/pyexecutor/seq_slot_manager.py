@@ -4,6 +4,7 @@ from .llm_request import LlmRequest
 from .resource_manager import BaseResourceManager, SlotManager
 from .scheduler import ScheduledRequests
 
+
 class SeqSlotManager(BaseResourceManager):
 
     def __init__(self, max_num_sequences: int):
@@ -13,7 +14,7 @@ class SeqSlotManager(BaseResourceManager):
         return self.slot_manager.max_num_requests
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        return int(request.guided_decoding_params is not None)
+        return 1
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         for llm_req in itertools.chain(scheduled_batch.context_requests,

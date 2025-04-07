@@ -104,8 +104,7 @@ class GuidedDecoder:
                                              non_blocking=True)
 
     def execute(self, scheduled_requests: ScheduledRequests,
-                logits: torch.Tensor,
-                resource_manager: SeqSlotManager) -> None:
+                logits: torch.Tensor, resource_manager: SeqSlotManager) -> None:
         assert logits.size(0) == len(scheduled_requests.context_requests) + len(
             scheduled_requests.generation_requests)
         torch.cuda.current_stream().wait_stream(self._stream)
