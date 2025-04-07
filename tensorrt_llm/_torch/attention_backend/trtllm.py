@@ -1,7 +1,6 @@
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum
-from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -25,24 +24,32 @@ class AttentionInputType(IntEnum):
     generation_only = 2
 
 
-# Used by FlashMLA
-def get_flash_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k):
+class FlashMLAMetadataCache:
 
-    @lru_cache(maxsize=None)
-    def _get_mla_metadata_cached(cache_seqlens_id, num_heads_per_head_k,
-                                 num_heads_k):
-        """
-        Cached wrapper for torch.ops.trtllm.get_mla_metadata that ensures the function
-        is only called once for the same parameters.
-        """
-        # tensor is not directly hashable, so we use its ID as the cache key
-        # and pass the actual tensor to the function
-        return torch.ops.trtllm.get_mla_metadata(cache_seqlens,
-                                                 num_heads_per_head_k,
-                                                 num_heads_k)
+    def __init__(self):
+        self._cache = None
 
-    return _get_mla_metadata_cached(id(cache_seqlens), num_heads_per_head_k,
-                                    num_heads_k)
+    def get_metadata(self, cache_seqlens, num_heads_per_head_k, num_heads_k):
+        """
+        Get the Flash MLA metadata. If not cached, compute and cache it.
+        """
+        if self._cache is None:
+            self._cache = torch.ops.trtllm.get_mla_metadata(
+                cache_seqlens,
+                num_heads_per_head_k,
+                num_heads_k,
+            )
+        return self._cache
+
+    def clear_cache(self):
+        """
+        Clear the cached metadata.
+        """
+        self._cache = None
+
+
+# Create a single instance of the cache
+flash_mla_cache = FlashMLAMetadataCache()
 
 
 @dataclass(kw_only=True, init=False)
@@ -293,9 +300,12 @@ class TrtllmAttentionWrapper:
                                                    device="cuda")
 
             if self.use_flash_mla:
+                # Clear cache at the start of a new step (layer_idx == 0)
+                if self.layer_idx == 0:
+                    flash_mla_cache.clear_cache()
                 # get_flash_mla_metadata is a cached function,
                 # the actual computation is only performed once per iter rather than per layer.
-                self.tile_scheduler_metadata, self.num_splits = get_flash_mla_metadata(
+                self.tile_scheduler_metadata, self.num_splits = flash_mla_cache.get_metadata(
                     self.sequence_length,
                     self.num_heads,
                     self.num_kv_heads,
