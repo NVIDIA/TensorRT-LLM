@@ -9,7 +9,8 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
-                    estimate_max_kv_cache_tokens, is_mla)
+                    estimate_max_kv_cache_tokens, get_token_num_for_estimation,
+                    is_mla)
 from .config import PyTorchConfig
 from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
@@ -135,16 +136,18 @@ def create_py_executor(executor_config: ExecutorConfig,
     kv_cache_manager = None
     draft_kv_cache_manager = None
     origin_executor_config = copy.deepcopy(executor_config)
+    start_worker = True
     if executor_config.pytorch_backend_config.use_kv_cache:
+        if 'cp_type' not in mapping.cp_config:
+            executor_config.kv_cache_config.max_tokens = get_token_num_for_estimation(
+                executor_config)
+
         kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                    executor_config)
-
         draft_kv_cache_manager = create_kv_cache_manager(
             draft_model_engine, mapping,
             executor_config) if draft_model_engine is not None else None
-    else:
-        kv_cache_manager = None
-        draft_kv_cache_manager = None
+        start_worker = False
 
     # KVCacheManager modifies these fields, update them to executor_config
     if kv_cache_manager is not None:
@@ -155,7 +158,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False)
+                                              start_worker)
 
     if executor_config.pytorch_backend_config.use_kv_cache:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(

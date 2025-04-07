@@ -224,7 +224,7 @@ class PyExecutor:
         self.stats = []
         self.start_times = {}
         self.new_active_requests_queue_latency_ms = 0
-        self.dist_rsp = False
+        self.allgather_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
@@ -387,8 +387,8 @@ class PyExecutor:
             self.enqueue_lock.release()
         return req_id
 
-    def set_dist_response(self, dist_rsp):
-        self.dist_rsp = dist_rsp
+    def set_dist_response(self, allgather_responses):
+        self.allgather_responses = allgather_responses
 
     @contextmanager
     def _profiler(self):
@@ -1804,17 +1804,17 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
-        if 0 not in self.dist.mapping.tp_group and not self.dist_rsp:
+        if 0 not in self.dist.mapping.tp_group and not self.allgather_responses:
             return
 
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            if not self.dist_rsp:
+            if not self.allgather_responses:
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)
-            if self.dist.rank == 0 or self.dist_rsp:
+            if self.dist.rank == 0 or self.allgather_responses:
                 gather_responses = {}
                 if responses_list is not None:
                     for resp in responses_list:
@@ -1823,7 +1823,7 @@ class PyExecutor:
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
-        if self.dist.rank == 0 or self.dist_rsp:
+        if self.dist.rank == 0 or self.allgather_responses:
             with self.response_cv:
                 for req_id, resp in responses.items():
                     if req_id in self.responses.keys():

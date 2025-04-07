@@ -40,7 +40,7 @@ GB = 1 << 30
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
-                   mapping: Mapping, kv_tokens: int, alloc_kv_tokens: int):
+                   mapping: Mapping, alloc_kv_tokens: int):
     # TODO: take space occupied by draft KV cache manager into account.
     mem_per_token = 2
     quant_config = model_config.quant_config
@@ -75,8 +75,8 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
     if fraction is None:
         fraction = 0.9
 
-    available_kv_mem = (total_gpu_memory - peak_memory + alloc_kv_tokens *
-                        mem_per_token - kv_tokens * mem_per_token) * fraction
+    available_kv_mem = (total_gpu_memory - peak_memory +
+                        alloc_kv_tokens * mem_per_token) * fraction
     logger.info(
         f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
         f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB"
@@ -109,8 +109,13 @@ def create_dummy_context_requests(max_num_tokens: int, max_seq_len: int,
 def get_token_num_for_estimation(executor_config):
     mapping = executor_config.mapping
     if 'cp_type' not in mapping.cp_config:
-        return max(executor_config.max_batch_size,
-                   executor_config.max_num_tokens, executor_config.max_seq_len)
+        return max(
+            math.ceil(
+                executor_config.max_batch_size / executor_config.max_seq_len) *
+            executor_config.max_seq_len,
+            math.ceil(
+                executor_config.max_num_tokens / executor_config.max_seq_len) *
+            executor_config.max_seq_len, executor_config.max_seq_len)
     else:
         return None
 
@@ -144,6 +149,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     req_ids = mpi_broadcast(req_ids, root=0)
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
+    # sync all ranks after processing dummy requests
     mpi_allgather(0)
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -164,7 +170,6 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     kv_cache_max_tokens = cal_max_tokens(
         peak_memory, total_gpu_memory, fraction,
         model_engine.model.model_config, mapping,
-        kv_stats.used_num_blocks * kv_stats.tokens_per_block,
         kv_stats.max_num_blocks * kv_stats.tokens_per_block)
 
     if kv_cache_max_tokens_in is not None and kv_cache_max_tokens is not None:
