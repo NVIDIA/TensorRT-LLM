@@ -18,9 +18,9 @@ import numpy as np
 import torch
 
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
-from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats)
+                                            IterationStats, KvCacheStats,
+                                            RequestType)
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
@@ -1142,7 +1142,7 @@ class PyExecutor:
             # generation request. In IFB, we only get context request from request queue
             if self.kv_cache_transceiver:
                 for req in new_requests_cur_rank:
-                    if req[1].request_type == tllme.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+                    if req[1].request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
                         self.has_context_request = True
                         break
             else:
