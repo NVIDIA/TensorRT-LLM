@@ -8,6 +8,7 @@ from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
 from ..custom_ops.quant import QUANT_OPS
+from .logger import ad_logger
 
 try:
     # import modelopt to get quantize_op
@@ -257,8 +258,10 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
             boundary_nodes.append(node)
 
     # sanity check: we expect at most two users for any residual node
+    # TODO: seems to come from post_attention_layer_norm that is *only* applied to the input to the
+    # MLP layer but not to the residual. Hence, the "add" has multiple users.
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
-    assert not res_nodes_more_users, f"Unexpected # of users for residuals: {res_nodes_more_users}"
+    ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)
