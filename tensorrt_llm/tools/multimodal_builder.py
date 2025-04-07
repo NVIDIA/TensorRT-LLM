@@ -39,7 +39,7 @@ def add_multimodal_arguments(parser):
                             'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
                             'fuyu', 'pix2struct', 'neva', 'kosmos-2',
                             'video-neva', 'phi-3-vision', 'mllama', 'internvl',
-                            'qwen2_vl', 'internlm-xcomposer2', 'qwen2_audio'
+                            'qwen2_vl', 'internlm-xcomposer2', 'qwen2_audio', 'mllama4'
                         ],
                         help="Model type")
     parser.add_argument(
@@ -132,6 +132,8 @@ class MultimodalEngineBuilder:
             build_phi_engine(args)
         elif args.model_type == 'mllama':
             build_mllama_engine(args)
+        elif args.model_type == 'mllama4':
+            build_mllama4_engine(args)
         elif args.model_type == 'internvl':
             build_internvl_engine(args)
         elif args.model_type == 'qwen2_vl':
@@ -1408,3 +1410,62 @@ def build_qwen2_audio_engine(args):
                          'num_mul_bins': args.num_mul_bins,
                          'max_mel_seq_len': args.max_mel_seq_len
                      })
+
+def build_mllama4_engine(args):
+    from transformers import Llama4ForConditionalGeneration
+
+    model = Llama4ForConditionalGeneration.from_pretrained(
+        args.model_path,
+        attn_implementation="sdpa",
+        device_map="cpu",
+        torch_dtype=torch.bfloat16,
+    )
+
+    class VisionLlamaWithAdapter(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.vision_model = model.vision_model
+            self.multi_modal_projector = model.multi_modal_projector
+
+            self.vocab_size = model.config.text_config.vocab_size
+            self.pad_token_id = model.config.pad_token_id if model.config.pad_token_id is not None else -1
+            
+            self.vision_feature_layer = model.config.vision_config.vision_feature_layer
+            self.vision_feature_select_strategy = model.config.vision_config.vision_feature_select_strategy
+        
+        def get_image_features(
+            self,
+            pixel_values: torch.FloatTensor,
+            vision_feature_layer,
+            vision_feature_select_strategy: str,
+        ):
+            if vision_feature_select_strategy not in ["default", "full"]:
+                raise ValueError(f"Unexpected select feature strategy: {self.vision_feature_select_strategy}")
+            image_outputs = self.vision_model(pixel_values, output_hidden_states=False)
+            hidden_state = image_outputs.last_hidden_state
+            return hidden_state
+            
+        @torch.no_grad
+        def forward(self, pixel_values):
+            image_features = self.get_image_features(
+                pixel_values=pixel_values,
+                vision_feature_layer=self.vision_feature_layer,
+                vision_feature_select_strategy=self.vision_feature_select_strategy,
+            )
+            vision_flat = image_features.view(-1, image_features.size(-1))
+            projected_vision_flat = self.multi_modal_projector(vision_flat)
+            return projected_vision_flat
+
+    wrapper = VisionLlamaWithAdapter(model).to(args.device)
+
+    image = torch.randn((1, 3, 336, 336), device=args.device, dtype=torch.bfloat16)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size,
+        dtype=torch.bfloat16,
+        engine_name='visual_encoder.engine'
+    )
