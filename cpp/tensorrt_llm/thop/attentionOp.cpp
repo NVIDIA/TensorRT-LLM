@@ -433,6 +433,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mUseKVCache = use_kv_cache;
     op->mPagedKVCache = op->mPagedKVCache && use_kv_cache; // update mPagedKVCache based on use_kv_cache
     op->mTokensPerBlock = tokens_per_block.value_or(0);
+    op->mFP8GenerationMLA = false;
     op->mMaxContextLength = max_context_length;
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
@@ -453,6 +454,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
         op->mIsMLAEnabled = true;
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && head_size == 576 && tokens_per_block == 64;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
@@ -485,6 +487,14 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
 
     int32_t const num_seqs = host_context_lengths.size(0);
     RequestType const* request_types = static_cast<RequestType const*>(host_request_types.data_ptr());
+
+    AttentionInputType attn_input_type = AttentionInputType::Mixed;
+    if (attention_input_type.has_value())
+    {
+        attn_input_type = static_cast<AttentionInputType>(attention_input_type.value());
+    }
+    bool const is_gen_only = attn_input_type == AttentionInputType::GenerationOnly;
+
     int32_t num_contexts = 0;
     // count context requests
     for (int32_t idx = 0; idx < num_seqs; idx++)
@@ -498,7 +508,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     int32_t const num_generations = num_seqs - num_contexts;
     int32_t const num_tokens = qkv.size(0);
     int32_t const num_ctx_tokens = host_context_lengths.slice(0, 0, num_contexts).sum().item<int32_t>();
-    int32_t const num_gen_tokens = num_tokens - num_ctx_tokens;
+    int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - num_ctx_tokens;
 
     for (int32_t idx = num_contexts; idx < num_seqs; idx++)
     {
@@ -525,13 +535,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         workspace = torch::empty({workspace_size}, torch::dtype(torch::kByte).device(qkv.device()));
     }
 
-    AttentionInputType attn_input_type = AttentionInputType::Mixed;
-    if (attention_input_type.has_value())
-    {
-        attn_input_type = static_cast<AttentionInputType>(attention_input_type.value());
-    }
-    bool const is_gen_only = attn_input_type == AttentionInputType::GenerationOnly;
-
     int64_t v_head_size = !op->mIsMLAEnabled ? head_size
         : is_gen_only                        ? op->mMLAParams.kv_lora_rank
                                              : v_head_dim.value();
@@ -555,7 +558,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
     {
 
-        int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - num_ctx_tokens;
         auto seq_offset = num_contexts;
         auto token_offset = is_gen_only ? 0 : num_ctx_tokens;
         runner->run(*op,

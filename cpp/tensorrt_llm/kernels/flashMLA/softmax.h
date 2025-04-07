@@ -64,11 +64,11 @@ __device__ __forceinline__ void thread_reduce_(
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
-    // #pragma unroll
+#pragma unroll
     for (int mi = 0; mi < size<0>(tensor); mi++)
     {
         summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
-        // #pragma unroll
+#pragma unroll
         for (int ni = 1; ni < size<1>(tensor); ni++)
         {
             summary(mi) = op(summary(mi), tensor(mi, ni));
@@ -81,7 +81,7 @@ __device__ __forceinline__ void quad_allreduce_(
     Tensor<Engine0, Layout0>& dst, Tensor<Engine1, Layout1>& src, Operator& op)
 {
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
-    // #pragma unroll
+#pragma unroll
     for (int i = 0; i < size(dst); i++)
     {
         dst(i) = Allreduce<4>::run(src(i), op);
@@ -119,14 +119,14 @@ __forceinline__ __device__ auto scale_apply_exp2(
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
-    // #pragma unroll
+#pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi)
     {
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
         // We don't want (-inf - (-inf)) since that would give NaN.
         // If we don't have float around M_LOG2E the multiplication is done in fp64.
         float const max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
-        // #pragma unroll
+#pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)
         {
 // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
@@ -153,12 +153,12 @@ __forceinline__ __device__ void max_scale_exp2_sum(
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
-    // #pragma unroll
+#pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi)
     {
         MaxOp<float> max_op;
         max(mi) = zero_init ? tensor(mi, 0) : max_op(max(mi), tensor(mi, 0));
-        // #pragma unroll
+#pragma unroll
         for (int ni = 1; ni < size<1>(tensor); ni++)
         {
             max(mi) = max_op(max(mi), tensor(mi, ni));
@@ -168,7 +168,7 @@ __forceinline__ __device__ void max_scale_exp2_sum(
         // We don't want (-inf - (-inf)) since that would give NaN.
         float const max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * scale;
         sum(mi) = 0;
-        // #pragma unroll
+#pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)
         {
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
@@ -187,10 +187,10 @@ __forceinline__ __device__ void rescale_o(Tensor0& acc_o, Tensor1& scale_o)
 {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-    // #pragma unroll
+#pragma unroll
     for (int mi = 0; mi < size(scale_o); ++mi)
     {
-        // #pragma unroll
+#pragma unroll
         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni)
         {
             acc_o_rowcol(mi, ni) *= scale_o(mi);
@@ -228,8 +228,8 @@ struct Softmax
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
             flash::template reduce_max</*zero_init=*/false>(scores, row_max);
-            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
-            // #pragma unroll
+// Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+#pragma unroll
             for (int mi = 0; mi < size(row_max); ++mi)
             {
                 float scores_max_cur = !Check_inf ? row_max(mi) : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
@@ -247,7 +247,7 @@ struct Softmax
 
     template <bool Is_dropout = false, bool Split = false, typename Tensor0>
     __forceinline__ __device__ TensorT normalize_softmax_lse(
-        Tensor0& acc_o, float softmax_scale, float rp_dropout = 1.0)
+        Tensor0& acc_o, float softmax_scale, float descale_v, float rp_dropout = 1.0)
     {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
@@ -255,15 +255,15 @@ struct Softmax
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
-        // #pragma unroll
+#pragma unroll
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi)
         {
             float sum = row_sum(mi);
-            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : descale_v / sum;
             lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY)
                                                  : row_max(mi) * softmax_scale + __logf(sum);
             float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
-            // #pragma unroll
+#pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni)
             {
                 acc_o_rowcol(mi, ni) *= scale;
