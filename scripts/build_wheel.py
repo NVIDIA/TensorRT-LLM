@@ -16,6 +16,7 @@
 
 import os
 import platform
+import re
 import sys
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -23,7 +24,7 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import CalledProcessError, check_output, run
+from subprocess import DEVNULL, CalledProcessError, check_output, run
 from tempfile import TemporaryDirectory
 from textwrap import dedent
 from typing import List
@@ -77,6 +78,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nvrtc_wrapper_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
@@ -182,7 +184,7 @@ def main(*,
         cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
 
     build_dir = get_build_dir(build_dir, build_type)
-    first_build = not build_dir.exists()
+    first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
@@ -253,16 +255,45 @@ def main(*,
             f"{conan_path} remote add -verror --force tensorrt-llm https://edge.urm.nvidia.com/artifactory/api/conan/sw-tensorrt-llm-conan"
         )
         build_run(f"{conan_path} profile detect -f")
-        build_run(
-            f"{conan_path} install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
-        )
-        cmake_def_args.append(
-            f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake")
+        return conan_path
 
-    install_conan()
+    conan_path = install_conan()
+
+    # Build the NVRTC wrapper if the source directory exists
+    if nvrtc_wrapper_root is not None and Path(nvrtc_wrapper_root).exists():
+        print(f"Building the NVRTC wrapper from source in {nvrtc_wrapper_root}")
+        conan_data = Path(source_dir, "conandata.yml").read_text()
+        nvrtc_wrapper_version = re.search(
+            r'tensorrt_llm_nvrtc_wrapper:\s*(\S+)', conan_data).group(1)
+        build_run(
+            f"{conan_path} editable add {nvrtc_wrapper_root}/conan/nvrtc_wrapper --version {nvrtc_wrapper_version}"
+        )
+        nvrtc_wrapper_args = ""
+        if clean:
+            nvrtc_wrapper_args += " -c"
+        if configure_cmake:
+            nvrtc_wrapper_args += " --configure_cmake"
+        if use_ccache:
+            nvrtc_wrapper_args += " --use_ccache"
+        build_run(
+            f'"{sys.executable}" {nvrtc_wrapper_root}/scripts/build_wheel.py {nvrtc_wrapper_args} -a "{cuda_architectures}" -D "USE_CXX11_ABI=1;BUILD_NVRTC_WRAPPER=1" -l'
+        )
+    else:
+        # If the NVRTC wrapper source directory is not present, remove the editable NVRTC wrapper from the conan cache
+        build_run(
+            f"{conan_path} editable remove -r 'tensorrt_llm_nvrtc_wrapper/*'",
+            stdout=DEVNULL,
+            stderr=DEVNULL)
+
     with working_directory(build_dir):
-        cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build or configure_cmake:
+            build_run(
+                f"{conan_path} install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+            )
+            cmake_def_args.append(
+                f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
+            )
+            cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
                 f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
@@ -538,6 +569,12 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument(
+        "--nvrtc_wrapper_root",
+        default="/mnt/src/tensorrt_llm_nvrtc_wrapper",
+        help=
+        "Directory to find internal NVRTC wrapper source code. If the directory exists, the NVRTC wrapper will be built from source."
+    )
     parser.add_argument("--build_dir",
                         type=Path,
                         help="Directory where cpp sources are built")
