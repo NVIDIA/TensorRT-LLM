@@ -66,7 +66,8 @@
  *         - tile_scheduler_metadata: Tensor of shape (num_sm_parts, TileSchedulerMetaDataSize), dtype int32
  *         - num_splits: Tensor of shape (batch_size + 1), dtype int32
  */
-std::tuple<at::Tensor, at::Tensor> get_mla_metadata(at::Tensor& seqlens_k, int64_t const num_heads_per_head_k, int64_t const num_heads_k)
+std::tuple<at::Tensor, at::Tensor> get_mla_metadata(
+    at::Tensor& seqlens_k, int64_t const num_heads_per_head_k, int64_t const num_heads_k)
 {
     // This should match the logic in the MLA kernel.
     static constexpr int block_size_m = 64;
