@@ -237,18 +237,24 @@ class LlamaDecoderLayer(DecoderLayer):
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
 
+        is_llama4 = config.model_type == "llama4_text"
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
             aux_stream=aux_stream,
-            use_gptj_style_rope=config.model_type == "llama4_text",
+            use_gptj_style_rope=is_llama4,
         )
 
         if (layer_idx + 1) % config.interleave_moe_layer_step != 0:
+            if is_llama4:
+                inter_size = config.intermediate_size_mlp
+            else:
+                inter_size = config.intermediate_size
+
             self.feed_forward = GatedMLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
+                intermediate_size=inter_size,
                 # Llama4 has no mlp_bias field.
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
