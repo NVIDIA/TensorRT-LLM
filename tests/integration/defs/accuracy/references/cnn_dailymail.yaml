@@ -109,10 +109,12 @@ meta-llama/Llama-3.1-8B:
     extra_acc_spec: autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8
     accuracy: 22.721
 meta-llama/Llama-3.1-8B-Instruct:
-  - accuracy: 33.574
+  - accuracy: 33.640
+  - quant_algo: FP8
+    accuracy: 33.841
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 33.464
+    accuracy: 33.757
   - dtype: float16
     spec_dec_algo: Medusa
     accuracy: 33.663
