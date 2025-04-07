@@ -435,7 +435,7 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
 
     @skip_pre_ada
-    def test_fp8_prequantized(self):
+    def test_fp8_prequantized_summarization(self):
         with LLM(self.MODEL_PATH) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
@@ -448,7 +448,7 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype_tp2(self):
+    def test_auto_dtype_tp2_summarization(self):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
