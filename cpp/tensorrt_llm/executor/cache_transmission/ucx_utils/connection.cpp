@@ -33,31 +33,41 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
     , mFromRequester(fromRequester)
 {
 
-    if (mFromRequester)
+    try
     {
-        std::shared_ptr<ucxx::Request> request
-            = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+        if (mFromRequester)
+        {
 
-        request
-            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+            std::shared_ptr<ucxx::Request> request = mEndpoint->streamRecv(
+                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
+            while (!request->isCompleted())
+                ;
+            request->checkError();
+            request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
+            while (!request->isCompleted())
+                ;
+            request->checkError();
+        }
+        else
+        {
+            std::shared_ptr<ucxx::Request> request
+                = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
+            while (!request->isCompleted())
+                ;
+            request->checkError();
+
+            request = mEndpoint->streamRecv(
+                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
+            while (!request->isCompleted())
+                ;
+            request->checkError();
+        }
     }
-    else
+    catch (std::exception const& e)
     {
-        std::shared_ptr<ucxx::Request> request
-            = mEndpoint->streamRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
-        request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-        while (!request->isCompleted())
-            ;
-        request->checkError();
+        std::string error = "Error in UcxConnection constructor for rank "
+            + std::to_string(mpi::MpiComm::world().getRank()) + ": " + e.what();
+        TLLM_THROW(error);
     }
 
     mSendTagPrefix = mConnectionIdInPeer;
