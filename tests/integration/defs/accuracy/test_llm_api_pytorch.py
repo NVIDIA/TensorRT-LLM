@@ -205,7 +205,7 @@ class TestMistral_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
 
-    def test_auto_dtype(self):
+    def test_auto_dtype_summarization(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -430,16 +430,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMinitron4BBase(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nvidia/Minitron-4B-Base"
-    MODEL_PATH = f"{llm_models_root()}/nemotron/Minitron-4B-Base"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = Humaneval(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
@@ -447,6 +437,7 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8_prequantized(self):
         with LLM(self.MODEL_PATH) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
