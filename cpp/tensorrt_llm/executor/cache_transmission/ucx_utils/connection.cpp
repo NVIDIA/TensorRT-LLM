@@ -38,29 +38,34 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
         if (mFromRequester)
         {
 
-            std::shared_ptr<ucxx::Request> request = mEndpoint->streamRecv(
-                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-            while (!request->isCompleted())
+            auto recvRequest = mEndpoint->amRecv();
+            while (!recvRequest->isCompleted())
                 ;
-            request->checkError();
-            request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-            while (!request->isCompleted())
+            recvRequest->checkError();
+            TLLM_CHECK_WITH_INFO(recvRequest->getRecvBuffer()->getSize() == sizeof(mConnectionIdInPeer),
+                "recvConnectionId should receive sizeof(mConnectionIdInPeer) bytes");
+            mConnectionIdInPeer = *reinterpret_cast<ConnectionIdType*>(recvRequest->getRecvBuffer()->data());
+
+            auto sendRequest = mEndpoint->amSend(
+                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), UCS_MEMORY_TYPE_HOST);
+            while (!sendRequest->isCompleted())
                 ;
-            request->checkError();
         }
         else
         {
-            std::shared_ptr<ucxx::Request> request
-                = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-            while (!request->isCompleted())
+            auto sendRequest = mEndpoint->amSend(
+                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), UCS_MEMORY_TYPE_HOST);
+            while (!sendRequest->isCompleted())
                 ;
-            request->checkError();
+            sendRequest->checkError();
 
-            request = mEndpoint->streamRecv(
-                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-            while (!request->isCompleted())
+            auto recvRequest = mEndpoint->amRecv();
+            while (!recvRequest->isCompleted())
                 ;
-            request->checkError();
+            recvRequest->checkError();
+            TLLM_CHECK_WITH_INFO(recvRequest->getRecvBuffer()->getSize() == sizeof(mConnectionIdInPeer),
+                "recvConnectionId should receive sizeof(mConnectionIdInPeer) bytes");
+            mConnectionIdInPeer = *reinterpret_cast<ConnectionIdType*>(recvRequest->getRecvBuffer()->data());
         }
     }
     catch (std::exception const& e)
