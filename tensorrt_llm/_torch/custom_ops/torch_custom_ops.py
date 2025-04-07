@@ -29,7 +29,6 @@ class MoERunner(TunableRunner):
         ep_size: int,
         ep_rank: int,
         use_fp8_block_scaling: bool,
-        min_latency_mode: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -40,7 +39,6 @@ class MoERunner(TunableRunner):
         self.ep_size = ep_size
         self.ep_rank = ep_rank
         self.use_fp8_block_scaling = use_fp8_block_scaling
-        self._min_latency_mode = min_latency_mode
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_fp8_block_scaling)
@@ -48,15 +46,30 @@ class MoERunner(TunableRunner):
         if instance_key not in MoERunner._runner_dict:
             MoERunner._runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
-                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling,
-                    min_latency_mode)
+                    x_dtype, weight_dtype, output_dtype, use_fp8_block_scaling)
         self._fused_moe_runner = MoERunner._runner_dict[instance_key]
+        self._is_nvfp4 = weight_dtype == torch.int64
 
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
     ) -> List[int]:
-        return list(range(self._fused_moe_runner.get_tactic_num()))
+        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        min_latency_mode = min_latency_mode_tensor.size(0) == 1
+        m = x.shape[0]
+
+        # Only profile m <= 128 for min latency mode = True
+        # Profile all valid buckets for min latency mode = False
+        # TODO: min_latency_mode = True will cause the following error:
+        # Cannot profile configuration 4: Cutlass GEMM Tactic
+        # [TensorRT-LLM][ERROR] Assertion failed: Failed to initialize cutlass TMA WS grouped gemm.
+        # Should be fixed in the moe_kernels in the future.
+        invalid = (m > 128
+                   and min_latency_mode) or (m <= 128 and min_latency_mode and
+                                             (not self._is_nvfp4))
+
+        return [] if invalid else list(
+            range(self._fused_moe_runner.get_tactic_num()))
 
     def forward(
         self,
@@ -65,9 +78,9 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        x, fc2_expert_weights = inputs
+        x, fc2_expert_weights, min_latency_mode_tensor = inputs
+        min_latency_mode = min_latency_mode_tensor.size(0) == 1
         # determine if we should use min latency mode according to the profiled seq len
-        min_latency_mode = self._min_latency_mode and (x.shape[0] <= 128)
         self._fused_moe_runner.run_gemm_profile(
             x,
             fc2_expert_weights,
@@ -103,11 +116,16 @@ def fused_moe(
 
     tuner = AutoTuner.get()
 
-    tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128,
-                                  64, 32, 16, 8, 4, 2, 1),
-                                 next_positive_power_of_2)), ), )
+    # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
+    tuning_config = TuningConfig(dynamic_tensors=(
+        # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
+        (0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
+                 2, 1), next_positive_power_of_2)),
+        # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
+        (2, 0, ((0, ), lambda x: x)),
+    ))
 
+    min_latency_tensor = torch.empty(1) if min_latency_mode else torch.empty(0)
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
@@ -119,14 +137,13 @@ def fused_moe(
         ep_size=ep_size,
         ep_rank=ep_rank,
         use_fp8_block_scaling=use_fp8_block_scaling,
-        min_latency_mode=min_latency_mode,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights],
+        [input, fc2_expert_weights, min_latency_tensor],
         gemm_idx=1,
     )
 
@@ -134,7 +151,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         tuning_config,
-        [input, fc2_expert_weights],
+        [input, fc2_expert_weights, min_latency_tensor],
         gemm_idx=2,
     )
 
@@ -151,6 +168,7 @@ def fused_moe(
         tp_rank,
         ep_size,
         ep_rank,
+        min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
     )
 

@@ -357,7 +357,8 @@ class AutoTuner:
                         for p in inspect.signature(
                             r.forward).parameters.values()
                     }
-                    if "do_preparation" in runner_arg_names:
+                    if "do_preparation" in runner_arg_names and len(
+                            valid_tactics) > 0:
                         r(tensors, tactic=-1, do_preparation=True, **kwargs)
                     for tac in valid_tactics:
                         try:

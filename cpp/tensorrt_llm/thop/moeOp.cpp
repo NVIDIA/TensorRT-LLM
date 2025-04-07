@@ -82,13 +82,12 @@ public:
     };
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_fp8_block_scaling, bool min_latency_mode)
+        bool use_fp8_block_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
         mUseFp8BlockScaling = use_fp8_block_scaling;
-        mMinLatencyMode = min_latency_mode;
         mInnerDimMultiplier = 1;
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -141,7 +140,6 @@ public:
 
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mAllProfiles = mKernelRunner->getTactics();
-        mMaxDimM = -1;
     }
 
     ~FusedMoeRunner()
@@ -161,7 +159,7 @@ public:
         torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
         torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
-        int64_t const ep_rank, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const ep_rank, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         // Free the profile workspace to save memory
         if (mProfileWorkspace != nullptr)
@@ -220,7 +218,7 @@ public:
         auto output = torch::empty(output_shape, input.options().dtype(mOutputDtype));
 
         WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), activation_type, parallelism_config);
+            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
         kernels::MoeMinLatencyParams min_latency_params{};
@@ -236,7 +234,7 @@ public:
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseFp8BlockScaling, mMinLatencyMode, min_latency_params, stream);
+            mUseFp8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return output;
     }
@@ -246,7 +244,7 @@ public:
         torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
         torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
         int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -306,7 +304,7 @@ public:
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
         WorkspaceInfo workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), activation_type, parallelism_config);
+            static_cast<int>(experts_per_token), activation_type, parallelism_config, min_latency_mode);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
 
@@ -321,7 +319,7 @@ public:
             quant_params, num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-            mUseFp8BlockScaling, mMinLatencyMode, min_latency_params, stream);
+            mUseFp8BlockScaling, min_latency_mode, min_latency_params, stream);
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
     }
@@ -377,26 +375,21 @@ public:
                 hidden_size, inter_size, GROUP_SIZE, tensorrt_llm::ActivationType::Swiglu, USE_BIAS, USE_LORA,
                 min_latency_mode, parallelism_config);
 
-            if (mMaxDimM < num_rows || mProfileWorkspace == nullptr)
+            if (mProfileWorkspace != nullptr)
             {
-                if (mProfileWorkspace != nullptr)
-                {
-                    auto const cu_free_status = cudaFree(mProfileWorkspace);
-                    TORCH_CHECK(cu_free_status == cudaSuccess,
-                        "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
-                    mProfileWorkspace = nullptr;
-                }
-                mMaxDimM = num_rows;
-                size_t profile_workspace_size = mProfiler->getWorkspaceSize(mMaxDimM);
-                auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
-                TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
+                auto const cu_free_status = cudaFree(mProfileWorkspace);
+                TORCH_CHECK(cu_free_status == cudaSuccess,
+                    "Can't free profile workspace for MoE GEMM profile during memory reallocation.");
+                mProfileWorkspace = nullptr;
             }
+            size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
+            auto const cu_malloc_status = cudaMalloc(&mProfileWorkspace, profile_workspace_size);
+            TORCH_CHECK(cu_malloc_status == cudaSuccess, "Can't allocate profile workspace for MoE GEMM profile.");
 
             mProfiler->prepare(num_rows, mProfileWorkspace, stream);
         }
 
         // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-        // mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mWorkspace.data_ptr()), stream);
         mProfiler->runProfiler(num_rows, profile, mProfileWorkspace, stream);
     }
 
@@ -410,7 +403,6 @@ private:
     std::mutex mMutex;
     std::shared_ptr<kernels::CutlassMoeFCRunnerInterface> mKernelRunner;
     std::shared_ptr<kernels::GemmProfilerBackend> mProfiler;
-    int64_t mMaxDimM;
     c10::ScalarType mActivationDtype;
     c10::ScalarType mWeightDtype;
     c10::ScalarType mOutputDtype;
@@ -420,7 +412,6 @@ private:
     char* mProfileWorkspace = nullptr;
 
     bool mUseFp8BlockScaling = false;
-    bool mMinLatencyMode = false;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
@@ -453,11 +444,11 @@ private:
 
     WorkspaceInfo getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int num_experts, int experts_per_token, tensorrt_llm::ActivationType activation_type,
-        kernels::MOEParallelismConfig const& parallelismConfig)
+        kernels::MOEParallelismConfig const& parallelismConfig, bool min_latency_mode)
     {
         size_t moe_workspace_size
             = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts, experts_per_token,
-                activation_type, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling, mMinLatencyMode,
+                activation_type, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling, min_latency_mode,
                 /* hasExpertPrequantScales */ false);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
 
@@ -582,7 +573,7 @@ private:
 TORCH_LIBRARY(trtllm, m)
 {
     m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
-        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool>())
+        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool>())
         .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
