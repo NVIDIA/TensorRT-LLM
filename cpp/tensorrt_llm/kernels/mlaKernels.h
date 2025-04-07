@@ -62,6 +62,10 @@ struct MlaParams
     int32_t head_num; // h
     void* workspace;
     int32_t const* cache_seq_lens;
+    // FlashMLA specific params begin
+    int32_t* tile_scheduler_metadata_ptr;
+    int32_t* num_splits_ptr;
+    // FlashMLA specific params end
     int* seqQOffset;
     uint32_t* fmha_tile_counter;
     int32_t max_input_seq_len;

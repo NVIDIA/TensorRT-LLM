@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -22,6 +23,26 @@ class AttentionInputType(IntEnum):
     mixed = 0  # contains both context and generation
     context_only = 1
     generation_only = 2
+
+
+# Used by FlashMLA
+def get_flash_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k):
+
+    @lru_cache(maxsize=None)
+    def _get_mla_metadata_cached(cache_seqlens_id, num_heads_per_head_k,
+                                 num_heads_k):
+        """
+        Cached wrapper for torch.ops.trtllm.get_mla_metadata that ensures the function
+        is only called once for the same parameters.
+        """
+        # tensor is not directly hashable, so we use its ID as the cache key
+        # and pass the actual tensor to the function
+        return torch.ops.trtllm.get_mla_metadata(cache_seqlens,
+                                                 num_heads_per_head_k,
+                                                 num_heads_k)
+
+    return _get_mla_metadata_cached(id(cache_seqlens), num_heads_per_head_k,
+                                    num_heads_k)
 
 
 @dataclass(kw_only=True, init=False)
@@ -189,6 +210,7 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        use_flash_mla: bool = True,
         **kwargs,
     ):
         """
@@ -216,6 +238,7 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
+            use_flash_mla (bool): Whether to use FlashMLA for MLA generation on Hopper (sm90)
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -247,6 +270,7 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
+        self.use_flash_mla = use_flash_mla
 
         if self.is_mla_enable:
             # max_context_length will increment 1 when overlap scheduler enabled
@@ -266,6 +290,18 @@ class TrtllmAttentionWrapper:
                 self.rotary_cos_sin = torch.tensor(rope_cos_sin,
                                                    dtype=torch.float32,
                                                    device="cuda")
+
+            if self.use_flash_mla:
+                # get_flash_mla_metadata is a cached function,
+                # the actual computation is only performed once per iter rather than per layer.
+                self.tile_scheduler_metadata, self.num_splits = get_flash_mla_metadata(
+                    self.sequence_length,
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
+            else:
+                self.tile_scheduler_metadata = None
+                self.num_splits = None
 
     def run(
         self,
@@ -414,6 +450,9 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            self.use_flash_mla,
+            self.tile_scheduler_metadata,
+            self.num_splits,
         )
         return output
 
@@ -746,6 +785,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
+            use_flash_mla=metadata.enable_flash_mla,
         )
         out_dtype = None
         if out_scale is not None:
