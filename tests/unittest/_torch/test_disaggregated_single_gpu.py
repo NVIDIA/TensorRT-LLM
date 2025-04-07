@@ -22,7 +22,6 @@ MPI.pickle.__init__(
     pickle.HIGHEST_PROTOCOL,
 )
 
-print(f"Flushing sys.path: {sys.path}", flush=True)
 MPI_TAG = 9999
 MPI_READY = MPI_TAG + 2
 MPI_REQUEST = MPI_TAG
@@ -109,7 +108,8 @@ def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank,
 
 
 def verify_disaggregated(model, generation_overlap, attention_dp_context,
-                         attention_dp_generation, enable_cuda_graph):
+                         attention_dp_generation, enable_cuda_graph, prompt,
+                         expected_output, expected_output_ids):
     worker_pytorch_configs = []
 
     # Context worker
@@ -152,44 +152,32 @@ def verify_disaggregated(model, generation_overlap, attention_dp_context,
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
                 print("Received ready signal.")
+            max_tokens = 25
 
             requests = []
-            requests.append(
-                ("The capital of France is", SamplingParams(max_tokens=1),
-                 DisaggregatedParams(request_type="context_only")))
+            requests.append((prompt, SamplingParams(max_tokens=1),
+                             DisaggregatedParams(request_type="context_only")))
 
             responses = send_requests_to_worker(requests, 0, intercomm)
             output = responses[0]
             print(f"Output: {output}")
-            assert output[0].text == "Paris" or output[0].text == " Paris"
             print(f"Output: {output[0].disaggregated_params}")
             assert output[0].disaggregated_params is not None
             print(f"Output: {output[0].disaggregated_params.request_type}")
             assert output[0].disaggregated_params.request_type == "context_only"
+            assert output[0].token_ids[0] == expected_output_ids[0]
+            assert len(output[0].token_ids) == 1
 
             generation_request_disagg_params = output[0].disaggregated_params
             generation_request_disagg_params.request_type = "generation_only"
             requests = []
-            requests.append(
-                ("The capital of France is", SamplingParams(max_tokens=10),
-                 generation_request_disagg_params))
+            requests.append((prompt, SamplingParams(max_tokens=max_tokens),
+                             generation_request_disagg_params))
 
             responses = send_requests_to_worker(requests, 1, intercomm)
             output = responses[0]
-            assert output[0].text.startswith(
-                "Paris") or output[0].text.startswith(" Paris")
-
-            # Send a non-disaggregated request for output verification
-            requests = []
-            requests.append(("The capital of France is",
-                             SamplingParams(max_tokens=10), None))
-
-            response_ref = send_requests_to_worker(requests, 0, intercomm)
-            output_ref = response_ref[0]
-            assert output_ref[0].text.startswith(
-                "Paris") or output_ref[0].text.startswith(" Paris")
-            assert output_ref[0].text == output[
-                0].text, f"Output mismatch: {output_ref[0].text} != {output[0].text}"
+            assert output[0].text == expected_output
+            assert output[0].token_ids == expected_output_ids
 
         finally:
             # Send termination requests
@@ -208,8 +196,13 @@ def verify_disaggregated(model, generation_overlap, attention_dp_context,
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
 def test_disaggregated_simple_llama(model, generation_overlap,
                                     enable_cuda_graph):
-    verify_disaggregated(model, generation_overlap, False, False,
-                         enable_cuda_graph)
+    verify_disaggregated(
+        model, generation_overlap, False, False, enable_cuda_graph,
+        "What is the capital of Germany?",
+        "\n<|assistant|>\nThe capital of Germany is Berlin.", [
+            2, 29871, 13, 29966, 29989, 465, 22137, 29989, 29958, 13, 1576,
+            7483, 310, 9556, 338, 5115, 29889, 2
+        ])
 
 
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
@@ -220,8 +213,16 @@ def test_disaggregated_simple_llama(model, generation_overlap,
 def test_disaggregated_simple_deepseek(model, generation_overlap,
                                        enable_cuda_graph, attention_dp_context,
                                        attention_dp_generation):
-    verify_disaggregated(model, generation_overlap, attention_dp_context,
-                         attention_dp_generation, enable_cuda_graph)
+    verify_disaggregated(
+        model, generation_overlap, attention_dp_context,
+        attention_dp_generation, enable_cuda_graph,
+        "What is the capital of Germany?",
+        " | Berlin \nWhat is the capital of France? | Paris \nWhat is the capital of Italy? | Rome \nWhat is",
+        [
+            369, 17575, 539, 3085, 344, 270, 6102, 294, 8760, 33, 369, 11111,
+            539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
+            344
+        ])
 
 
 if __name__ == "__main__":
