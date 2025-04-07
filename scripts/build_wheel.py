@@ -269,15 +269,31 @@ def main(*,
         clear_folder(cache_dir)
     lib_dir.mkdir(parents=True, exist_ok=True)
     include_dir.mkdir(parents=True, exist_ok=True)
-    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cute",
-             include_dir / "cute",
-             dirs_exist_ok=True)
-    copytree(get_project_dir() / "3rdparty" / "cutlass" / "include" / "cutlass",
-             include_dir / "cutlass",
-             dirs_exist_ok=True)
     copytree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
              include_dir / "deep_gemm",
              dirs_exist_ok=True)
+    required_cuda_headers = [
+        "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
+        "cuda_fp8.h", "cuda_fp8.hpp"
+    ]
+    if os.getenv("CUDA_HOME") is not None:
+        cuda_include_dir = Path(os.getenv("CUDA_HOME")) / "include"
+    elif os.getenv("CUDA_PATH") is not None:
+        cuda_include_dir = Path(os.getenv("CUDA_PATH")) / "include"
+    elif not on_windows:
+        cuda_include_dir = Path("/usr/local/cuda/include")
+    else:
+        cuda_include_dir = None
+
+    if cuda_include_dir is None or not cuda_include_dir.exists():
+        print(
+            "CUDA_HOME or CUDA_PATH should be set to enable DeepGEMM JIT compilation"
+        )
+    else:
+        cuda_include_target_dir = include_dir / "cuda" / "include"
+        cuda_include_target_dir.mkdir(parents=True, exist_ok=True)
+        for header in required_cuda_headers:
+            copy(cuda_include_dir / header, include_dir / header)
 
     link_binary = copy
     if skip_building_wheel and linking_install_binary:

@@ -160,6 +160,7 @@ def build_google_tests(request, build_dir):
         use_ccache=True,
         clean=True,
         trt_root="/usr/local/tensorrt",
+        extra_cmake_vars=["ENABLE_UCX=0"],
     )
 
     make_google_tests = [
