@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "jit_utils.cuh"
+#include "nvrtc.h"
 #include "runtime.cuh"
 #include "scheduler.cuh"
 
@@ -43,162 +44,8 @@
 namespace deep_gemm::jit
 {
 
-/**
- * C++ implementation of the Compiler class from compiler.py
- * Compiles CUDA kernels into shared libraries
- */
-class Compiler
-{
-public:
-    // Get singleton instance
-    static Compiler& getInstance();
-
-    // Build function
-    Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
-        uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
-        deep_gemm::GemmType const gemm_type);
-
-    // Helper functions
-    std::filesystem::path getJitIncludeDir();
-    std::string getNvccCompiler();
-    std::filesystem::path getDefaultUserDir();
-    std::filesystem::path getTmpDir();
-    std::filesystem::path getCacheDir();
-    std::string generateUniqueId();
-
-private:
-    // Private constructor for singleton pattern
-    Compiler();
-
-    // Delete copy constructor and assignment operator
-    Compiler(Compiler const&) = delete;
-    Compiler& operator=(Compiler const&) = delete;
-
-    std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
-        uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
-        uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type);
-};
-
-// Global function to access the singleton
-Compiler& getGlobalCompiler();
-
-} // namespace deep_gemm::jit
-
-namespace deep_gemm::jit
-{
-
-// Compiler implementation
-Compiler::Compiler()
-{
-    // Create necessary directories
-    std::filesystem::create_directories(getTmpDir());
-    std::filesystem::create_directories(getCacheDir());
-}
-
-Compiler& Compiler::getInstance()
-{
-    static Compiler instance;
-    return instance;
-}
-
-std::string Compiler::generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
-    uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
-    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type)
-{
-    // Create the kernel source code
-    std::stringstream code;
-
-    // Header
-    code << "// DeepGEMM auto-generated JIT CUDA source file\n";
-    code << "#include <cuda.h>\n";
-    code << "#include <cuda_fp8.h>\n";
-    code << "#include <cuda_runtime.h>\n";
-    code << "#include <iostream>\n\n";
-
-    // Include necessary headers
-    code << "#include \"cutlass/cutlass.h\"\n";
-    code << "#include \"deep_gemm/fp8_gemm.cuh\"\n\n";
-
-    // Launch function with signature based on gemm type
-    code << "extern \"C\" void launch(";
-
-    switch (gemm_type)
-    {
-    case deep_gemm::GemmType::Normal:
-        code << "void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,\n"
-             << "    float* scales_b, uint32_t shape_m, int* grouped_layout, cudaStream_t stream, int num_sms,\n"
-             << "    uint32_t smem_size)\n";
-        break;
-    case deep_gemm::GemmType::GroupedWithOffset:
-        code << "void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,\n"
-             << "    float* scales_b, int64_t* problem_m_offsets, int64_t* problem_m_padded_offsets, cudaStream_t "
-                "stream, int num_sms,\n"
-             << "    uint32_t smem_size, uint32_t max_shape_m_padded)\n";
-        break;
-    case deep_gemm::GemmType::StridedBatched:
-        code << "void* mat_a, uint64_t ld_a, uint64_t stride_a, void* mat_b, uint64_t ld_b, uint64_t stride_b,\n"
-             << "    void* mat_d, uint64_t ld_d, uint64_t stride_d, float* scales_a, float* scales_b, uint32_t "
-                "num_problems,\n"
-             << "    uint32_t shape_m, cudaStream_t stream, int num_sms, uint32_t smem_size)\n";
-        break;
-    default: throw std::runtime_error("Unsupported gemm type: " + gemm_type_to_string(gemm_type));
-    }
-
-    code << "{\n";
-    code << "    using namespace deep_gemm;\n\n";
-
-    // Template parameters
-    code << "    // Templated args from JIT compilation\n";
-    code << "    constexpr auto N = " << shape_n << ", K = " << shape_k << ";\n";
-    code << "    constexpr auto BLOCK_M = " << block_m << ";\n";
-    code << "    constexpr auto BLOCK_N = " << block_n << ";\n";
-    code << "    constexpr auto BLOCK_K = " << block_k << ";\n";
-    code << "    constexpr auto kNumGroups = " << num_groups << ";\n";
-    code << "    constexpr auto kNumStages = " << num_stages << ";\n";
-    code << "    constexpr auto kNumTMAMulticast = " << num_tma_multicast << ";\n\n";
-
-    // GEMM type
-    code << "    // Make a templated GEMM\n";
-    code << "    using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumStages, kNumTMAMulticast, "
-            "GemmType::"
-         << gemm_type_to_string(gemm_type) << ">;\n\n";
-
-    // Launch kernel
-    code << "    // Launch kernel\n";
-    switch (gemm_type)
-    {
-    case deep_gemm::GemmType::Normal:
-        code << "    GemmType::runGemm(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, "
-                "grouped_layout, "
-                "stream,\n"
-             << "        num_sms, smem_size);\n";
-        break;
-    case deep_gemm::GemmType::GroupedWithOffset:
-        code << "    GemmType::runGemm(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, problem_m_offsets, "
-                "problem_m_padded_offsets, "
-                "stream,\n"
-             << "        num_sms, smem_size, max_shape_m_padded);\n";
-        break;
-    case deep_gemm::GemmType::StridedBatched:
-        code << "    GemmType::runGemm(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, "
-                "scales_b, num_problems, shape_m, "
-                "stream,\n"
-             << "        num_sms, smem_size);\n";
-        break;
-    default: throw std::runtime_error("Unsupported gemm type: " + gemm_type_to_string(gemm_type));
-    }
-    code << "}\n";
-    // Debug print
-    if (std::getenv("TRTLLM_DG_JIT_DEBUG"))
-    {
-        std::cout << "Generated code:\n" << code.str() << std::endl;
-    }
-
-    return code.str();
-}
-
 // Generate a unique ID for temporary directories to avoid collisions
-std::string Compiler::generateUniqueId()
+std::string generateUniqueId()
 {
     // Use current time and random number to generate a unique ID
     static std::mt19937 gen(std::random_device{}());
@@ -214,148 +61,97 @@ std::string Compiler::generateUniqueId()
     return std::to_string(value) + "_" + std::to_string(random_value);
 }
 
-Runtime* Compiler::build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
-    uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
-    deep_gemm::GemmType const gemm_type)
+std::filesystem::path getDefaultUserDir()
 {
-    // Compiler flags
-    std::vector<std::string> nvccFlags = {"-std=c++17", "-shared", "-O3", "--expt-relaxed-constexpr",
-        "--expt-extended-lambda", "-gencode=arch=compute_90a,code=sm_90a",
-        "--ptxas-options=--register-usage-level=10"
-            + (std::getenv("TRTLLM_DG_PTXAS_VERBOSE") ? std::string(",--verbose") : std::string("")),
-        "--diag-suppress=177,174,940"};
-
-    std::vector<std::string> cxxFlags = {"-fPIC", "-O3", "-Wno-deprecated-declarations", "-Wno-abi"};
-
-    std::string cxxFlagsStr = "--compiler-options=";
-    for (size_t i = 0; i < cxxFlags.size(); ++i)
+    static std::filesystem::path userDir;
+    if (userDir.empty())
     {
-        cxxFlagsStr += cxxFlags[i];
-        if (i < cxxFlags.size() - 1)
+        char const* cacheDir = getenv("TRTLLM_DG_CACHE_DIR");
+        if (cacheDir)
         {
-            cxxFlagsStr += ",";
+            userDir = cacheDir;
+            std::filesystem::create_directories(userDir);
         }
-    }
-
-    std::vector<std::string> flags = nvccFlags;
-    flags.push_back(cxxFlagsStr);
-
-    std::vector<std::filesystem::path> includeDirs = {getJitIncludeDir()};
-
-    // Build signature - simplified, no MD5 calculation
-    std::string name = "gemm_" + std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_" + std::to_string(block_m)
-        + "_" + std::to_string(block_n) + "_" + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_"
-        + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
-    std::filesystem::path path = getCacheDir() / name;
-
-    // Check runtime cache or file system hit
-    auto& runtimeCache = getGlobalRuntimeCache();
-    Runtime* cachedRuntime = runtimeCache[path.string()];
-    if (cachedRuntime != nullptr)
-    {
-        if (std::getenv("TRTLLM_DG_JIT_DEBUG"))
+        else
         {
-            std::cout << "Using cached JIT runtime " << name << " during build" << std::endl;
-        }
-        return cachedRuntime;
-    }
-
-    // Write the code to a system temp directory with a unique ID to avoid multiprocess collisions
-    std::filesystem::path tmpPath = getTmpDir() / (name + "_" + generateUniqueId());
-    std::filesystem::create_directories(tmpPath);
-    std::filesystem::path tmpSrcPath = tmpPath / "kernel.cu";
-
-    // Write files
-    std::ofstream srcFile(tmpSrcPath);
-    std::string code = generateKernel(
-        shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages, num_tma_multicast, gemm_type);
-    srcFile << code;
-    srcFile.close();
-
-    // Compile into a shared object file
 #ifdef _WIN32
-    std::filesystem::path soPath = path / "kernel.dll";
-    std::filesystem::path tmpSoPath = tmpPath / "kernel.dll";
+            char const* appData = getenv("APPDATA");
+            if (appData)
+            {
+                userDir = std::filesystem::path(appData) / "tensorrt_llm";
+            }
+            else
+            {
+                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
+            }
 #else
-    std::filesystem::path soPath = path / "kernel.so";
-    std::filesystem::path tmpSoPath = tmpPath / "kernel.so";
+            char const* homeDir = getenv("HOME");
+            if (homeDir)
+            {
+                userDir = std::filesystem::path(homeDir) / ".tensorrt_llm";
+            }
+            else
+            {
+                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
+            }
 #endif
-
-    // Create the target directory if it doesn't exist
-    std::filesystem::create_directories(path);
-
-    // Build command
-    std::vector<std::string> command = {getNvccCompiler(), tmpSrcPath.string(), "-o", tmpSoPath.string()};
-    command.insert(command.end(), flags.begin(), flags.end());
-
-    for (auto const& dir : includeDirs)
-    {
-        command.push_back("-I" + dir.string());
-    }
-
-    // Print command if debug enabled
-    if (std::getenv("TRTLLM_DG_JIT_DEBUG") || std::getenv("TRTLLM_DG_JIT_PRINT_NVCC_COMMAND"))
-    {
-        std::cout << "Compiling JIT runtime " << name << " with command: ";
-        for (auto const& arg : command)
-        {
-            std::cout << arg << " ";
-        }
-        std::cout << std::endl;
-    }
-
-    // Execute command
-    std::string cmd;
-    for (auto const& arg : command)
-    {
-        cmd += arg + " ";
-    }
-
-    int returnCode = system(cmd.c_str());
-    if (returnCode != 0)
-    {
-        throw std::runtime_error("Failed to compile " + tmpSrcPath.string());
-    }
-
-    // Copy the source and compiled files to the cache directory
-    try
-    {
-        // Rename (atomic operation) to final locations
-        std::filesystem::rename(tmpSrcPath, path / "kernel.cu");
-        std::filesystem::rename(tmpSoPath, soPath);
-
-        if (std::getenv("TRTLLM_DG_JIT_DEBUG"))
-        {
-            std::cout << "Successfully copied kernel files to cache directory: " << path.string() << std::endl;
         }
     }
-    catch (std::exception const& e)
-    {
-        std::cerr << "Warning: Failed to copy kernel files to cache: " << e.what() << std::endl;
-    }
-
-    // Clean up temporary directory after successful compilation
-    try
-    {
-        std::filesystem::remove_all(tmpPath);
-    }
-    catch (std::exception const& e)
-    {
-        std::cerr << "Warning: Failed to clean up temporary directory: " << e.what() << std::endl;
-    }
-
-    // Create runtime and cache it
-    auto runtime = std::make_unique<Runtime>(path.string(), gemm_type);
-    Runtime* result = runtime.get();
-    runtimeCache.set(path.string(), std::move(runtime));
-
-    return result;
+    return userDir;
 }
 
-std::filesystem::path Compiler::getJitIncludeDir()
+inline std::filesystem::path getTmpDir()
 {
-    static std::filesystem::path includeDir;
-    if (includeDir.empty())
+    return getDefaultUserDir() / "tmp";
+}
+
+inline std::filesystem::path getCacheDir()
+{
+    return getDefaultUserDir() / "cache";
+}
+
+std::string getNvccCompiler()
+{
+    static std::string compiler;
+    if (compiler.empty())
+    {
+        // Check environment variable
+        char const* envCompiler = getenv("TRTLLM_DG_NVCC_COMPILER");
+        if (envCompiler)
+        {
+            compiler = envCompiler;
+        }
+        else
+        {
+            // Check CUDA_HOME
+            char const* cudaHome = getenv("CUDA_HOME");
+            if (cudaHome)
+            {
+                std::filesystem::path cudaPath(cudaHome);
+#ifdef _WIN32
+                compiler = (cudaPath / "bin" / "nvcc.exe").string();
+#else
+                compiler = (cudaPath / "bin" / "nvcc").string();
+#endif
+            }
+            else
+            {
+// Default to system nvcc
+#ifdef _WIN32
+                compiler = "nvcc.exe";
+#else
+                compiler = "nvcc";
+#endif
+            }
+        }
+    }
+    return compiler;
+}
+
+std::vector<std::filesystem::path> getJitIncludeDirs()
+{
+    static std::vector<std::filesystem::path> includeDirs;
+    if (includeDirs.empty())
     {
         // Command to execute
         char const* cmd = "pip show tensorrt_llm 2>/dev/null";
@@ -410,102 +206,365 @@ std::filesystem::path Compiler::getJitIncludeDir()
                 location.erase(location.find_last_not_of(" \n\r\t") + 1);
 
                 // Set the include directory based on the package location
-                includeDir = std::filesystem::path(location) / "tensorrt_llm" / "include";
-            }
-        }
-    }
-    return includeDir;
-}
+                includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include");
 
-std::string Compiler::getNvccCompiler()
-{
-    static std::string compiler;
-    if (compiler.empty())
-    {
-        // Check environment variable
-        char const* envCompiler = std::getenv("TRTLLM_DG_NVCC_COMPILER");
-        if (envCompiler)
-        {
-            compiler = envCompiler;
+                if (!kJitUseNvcc)
+                {
+                    includeDirs.push_back(
+                        std::filesystem::path(location) / "tensorrt_llm" / "include" / "cuda" / "include");
+                }
+            }
         }
         else
         {
-            // Check CUDA_HOME
-            char const* cudaHome = std::getenv("CUDA_HOME");
-            if (cudaHome)
-            {
-                std::filesystem::path cudaPath(cudaHome);
-#ifdef _WIN32
-                compiler = (cudaPath / "bin" / "nvcc.exe").string();
-#else
-                compiler = (cudaPath / "bin" / "nvcc").string();
-#endif
-            }
-            else
-            {
-// Default to system nvcc
-#ifdef _WIN32
-                compiler = "nvcc.exe";
-#else
-                compiler = "nvcc";
-#endif
-            }
+            TLLM_LOG_WARNING("Failed to find TensorRT-LLM installation, DeepGEMM will be disabled.");
         }
     }
-    return compiler;
+    return includeDirs;
 }
 
-std::filesystem::path Compiler::getDefaultUserDir()
+std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
+    uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
+    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type)
 {
-    static std::filesystem::path userDir;
-    if (userDir.empty())
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+
+    std::string input_type;
+    switch (gemm_type)
     {
-        char const* cacheDir = std::getenv("TRTLLM_DG_CACHE_DIR");
-        if (cacheDir)
+    case deep_gemm::GemmType::Normal: input_type = "NormalSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedContiguous: input_type = "GroupedContiguousSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedMasked: input_type = "GroupedMaskedSchedulerInput"; break;
+    case deep_gemm::GemmType::GroupedWithOffset: input_type = "GroupedWithOffsetSchedulerInput"; break;
+    case deep_gemm::GemmType::StridedBatched: input_type = "StridedBatchedSchedulerInput"; break;
+    default: throw std::runtime_error("Unsupported gemm type");
+    }
+
+    // Create the kernel source code using raw string literal
+    std::string code = R"(
+#ifdef __CUDACC_RTC__
+#ifndef NVRTC_JIT_COMPILATION
+#define NVRTC_JIT_COMPILATION
+#endif
+
+#include <deep_gemm/nvrtc_std.cuh>
+
+#else
+
+#include <string>
+#include <cuda.h>
+
+#endif
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <deep_gemm/nvrtc_cutlass.cuh>
+#include <deep_gemm/fp8_gemm_impl.cuh>
+
+using namespace deep_gemm;
+
+using SchedulerType =
+typename SchedulerSelector<GemmType::)"
+        + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k)
+        + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n) + R"(, )" + std::to_string(block_k)
+        + R"(, )" + std::to_string(num_groups) + R"(, )" + std::to_string(num_tma_multicast) + R"(>::type;
+
+__global__ void dummy_kernel() {
+  void *ptr = (void *)&fp8_gemm_kernel<)"
+        + std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )"
+        + std::to_string(block_n) + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups) + R"(, )"
+        + std::to_string(num_stages) + R"(, )" + std::to_string(kNumTMAThreads) + R"(, )"
+        + std::to_string(kNumMathThreadsPerGroup) + R"(, )" + std::to_string(num_tma_multicast) + R"(, SchedulerType, )"
+        + input_type + R"(>;
+}
+)";
+
+    return code;
+}
+
+/**
+ * C++ implementation of the Compiler class
+ * Compiles CUDA code into CUBINs
+ */
+class Compiler
+{
+public:
+    // Get singleton instance
+    static Compiler& getInstance()
+    {
+        static Compiler instance;
+        return instance;
+    }
+
+    [[nodiscard]] bool isValid() const
+    {
+        return !includeDirs_.empty();
+    }
+
+    // Build function
+    Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
+        uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
+        deep_gemm::GemmType const gemm_type)
+    {
+        // Build signature - simplified, no MD5 calculation
+        std::string name = "gemm_" + std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_"
+            + std::to_string(block_m) + "_" + std::to_string(block_n) + "_" + std::to_string(block_k) + "_"
+            + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
+            + "_" + gemm_type_to_string(gemm_type);
+        std::filesystem::path path = getCacheDir() / name;
+
+        // Check runtime cache or file system hit
+        auto& runtimeCache = getGlobalRuntimeCache();
+        Runtime* cachedRuntime = runtimeCache[path.string()];
+        if (cachedRuntime != nullptr)
         {
-            userDir = cacheDir;
-            std::filesystem::create_directories(userDir);
+            if (kJitDebugging)
+            {
+                TLLM_LOG_INFO("Using cached JIT runtime %s during build", name.c_str());
+            }
+            return cachedRuntime;
+        }
+
+        // Compiler flags
+        std::vector<std::string> flags
+            = {"-std=c++17", "--gpu-architecture=sm_90a", "--ptxas-options=-allow-expensive-optimizations=true",
+                "-lineinfo", "--ptxas-options=--register-usage-level=10", "--diag-suppress=161,174,177,940",
+                "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
+
+        if (kJitUseNvcc)
+        {
+            flags.push_back("-O3");
+            flags.push_back("-cubin");
+            flags.push_back("--expt-relaxed-constexpr");
+            flags.push_back("--expt-extended-lambda");
+
+            std::vector<std::string> cxxFlags = {"-fPIC", "-O3", "-Wno-deprecated-declarations", "-Wno-abi"};
+            std::string cxxFlagsStr = "--compiler-options=";
+            for (size_t i = 0; i < cxxFlags.size(); ++i)
+            {
+                cxxFlagsStr += cxxFlags[i];
+                if (i < cxxFlags.size() - 1)
+                {
+                    cxxFlagsStr += ",";
+                }
+            }
+            flags.push_back(cxxFlagsStr);
         }
         else
         {
-#ifdef _WIN32
-            char const* appData = std::getenv("APPDATA");
-            if (appData)
+            flags.push_back("-default-device");
+        }
+
+        std::filesystem::path tmpPath = getTmpDir() / (name + "_" + generateUniqueId());
+        std::filesystem::path cubinPath = path / kKernelName;
+        std::filesystem::path tmpCubinPath = tmpPath / kKernelName;
+
+        // Create the target directory if it doesn't exist
+        if (kJitUseNvcc || kJitDumpCubin)
+        {
+            std::filesystem::create_directories(tmpPath);
+            std::filesystem::create_directories(path);
+        }
+
+        for (auto const& dir : includeDirs_)
+        {
+            flags.push_back("-I" + dir.string());
+        }
+
+        // Print options if debug enabled
+        if (kJitDebugging)
+        {
+            TLLM_LOG_INFO("Compiling JIT runtime %s with options: ", name.c_str());
+            for (auto const& flag : flags)
             {
-                userDir = std::filesystem::path(appData) / "tensorrt_llm";
+                TLLM_LOG_INFO("%s ", flag.c_str());
             }
-            else
+            TLLM_LOG_INFO("\n");
+        }
+
+        std::string code = generateKernel(
+            shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages, num_tma_multicast, gemm_type);
+
+        if (kJitDebugging)
+        {
+            TLLM_LOG_INFO("Generated kernel code:\n%s", code.c_str());
+        }
+
+        if (kJitUseNvcc)
+        {
+            std::filesystem::path tmpSrcPath = tmpPath / "kernel.cu";
+
+            // Write files
+            std::ofstream srcFile(tmpSrcPath);
+            srcFile << code;
+            srcFile.close();
+
+            // Build command
+            std::vector<std::string> command = {getNvccCompiler(), tmpSrcPath.string(), "-o", tmpCubinPath.string()};
+            command.insert(command.end(), flags.begin(), flags.end());
+
+            // Execute command
+            std::string cmd;
+            for (auto const& arg : command)
             {
-                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
+                cmd += arg + " ";
             }
+
+            // Buffer to store the output
+            std::array<char, 128> buffer;
+            std::string result;
+
+            // Time the compilation
+            auto start = std::chrono::high_resolution_clock::now();
+
+            // Open pipe to command
+#ifdef _MSC_VER
+            FILE* pipe = _popen(cmd.c_str(), "r");
 #else
-            char const* homeDir = std::getenv("HOME");
-            if (homeDir)
-            {
-                userDir = std::filesystem::path(homeDir) / ".tensorrt_llm";
-            }
-            else
-            {
-                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
-            }
+            FILE* pipe = popen(cmd.c_str(), "r");
 #endif
+
+            if (pipe)
+            {
+                // Read the output
+                while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+                {
+                    result += buffer.data();
+                }
+
+// Close the pipe
+#ifdef _MSC_VER
+                _pclose(pipe);
+#else
+                pclose(pipe);
+#endif
+
+                // Output result if debug enabled
+                if (kJitDebugging)
+                {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+                    TLLM_LOG_INFO("NVCC compilation took %d ms", duration.count());
+                    TLLM_LOG_INFO("Compilation log:\n%s", result.c_str());
+                }
+            }
+        }
+        else
+        {
+            nvrtcProgram prog;
+            CHECK_NVRTC(nvrtcCreateProgram(&prog, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
+
+            std::vector<char const*> options;
+            for (auto const& flag : flags)
+            {
+                options.push_back(flag.c_str());
+            }
+
+            // Time the compilation
+            auto start = std::chrono::high_resolution_clock::now();
+            nvrtcResult compileResult = nvrtcCompileProgram(prog, options.size(), options.data());
+
+            if (kJitDebugging)
+            {
+                auto end = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+                TLLM_LOG_INFO("NVRTC compilation took %d ms", duration.count());
+
+                size_t logSize;
+                CHECK_NVRTC(nvrtcGetProgramLogSize(prog, &logSize));
+                std::vector<char> log(logSize);
+                CHECK_NVRTC(nvrtcGetProgramLog(prog, log.data()));
+                TLLM_LOG_INFO("Compilation log:\n%s", log.data());
+            }
+
+            // Check if compilation succeeded
+            if (compileResult != NVRTC_SUCCESS)
+            {
+                TLLM_LOG_ERROR("NVRTC compilation failed");
+                CHECK_NVRTC(nvrtcDestroyProgram(&prog));
+                throw std::runtime_error("NVRTC compilation failed");
+            }
+
+            // Save CUBIN to a file
+            size_t cubinSize;
+            CHECK_NVRTC(nvrtcGetCUBINSize(prog, &cubinSize));
+            std::vector<char> cubin(cubinSize);
+            CHECK_NVRTC(nvrtcGetCUBIN(prog, cubin.data()));
+
+            // Cache the runtime in memory by default
+            if (!kJitDumpCubin)
+            {
+                auto runtime = std::make_unique<Runtime>(path.string(), cubin, gemm_type);
+                Runtime* result = runtime.get();
+                runtimeCache.set(path.string(), std::move(runtime));
+                if (kJitDebugging)
+                {
+                    TLLM_LOG_INFO("Successfully cached JIT runtime %s in memory", name.c_str());
+                }
+                return result;
+            }
+
+            std::ofstream cubinFile(tmpCubinPath.string(), std::ios::binary);
+            cubinFile.write(cubin.data(), static_cast<std::streamsize>(cubinSize));
+            cubinFile.close();
+            CHECK_NVRTC(nvrtcDestroyProgram(&prog));
+        }
+
+        // Copy the source and compiled files to the cache directory
+        try
+        {
+            // Rename (atomic operation) to final locations
+            std::filesystem::rename(tmpCubinPath, cubinPath);
+            if (kJitDebugging)
+            {
+                TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s", path.string().c_str());
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
+        }
+
+        // Clean up temporary directory after successful compilation
+        try
+        {
+            std::filesystem::remove_all(tmpPath);
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("Warning: Failed to clean up temporary directory: %s", e.what());
+        }
+
+        // Create runtime and cache it
+        auto runtime = std::make_unique<Runtime>(path.string(), std::vector<char>(), gemm_type);
+        Runtime* result = runtime.get();
+        runtimeCache.set(path.string(), std::move(runtime));
+        return result;
+    }
+
+private:
+    std::vector<std::filesystem::path> includeDirs_;
+
+    // Private constructor for singleton pattern
+    Compiler()
+        : includeDirs_(getJitIncludeDirs())
+    {
+        // Create necessary directories
+        if (kJitUseNvcc || kJitDumpCubin)
+        {
+            std::filesystem::create_directories(getTmpDir());
+            std::filesystem::create_directories(getCacheDir());
         }
     }
-    return userDir;
-}
 
-std::filesystem::path Compiler::getTmpDir()
-{
-    return getDefaultUserDir() / "tmp";
-}
-
-std::filesystem::path Compiler::getCacheDir()
-{
-    return getDefaultUserDir() / "cache";
-}
+    // Delete copy constructor and assignment operator
+    Compiler(Compiler const&) = delete;
+    Compiler& operator=(Compiler const&) = delete;
+};
 
 // Global function to access the Compiler singleton
-Compiler& getGlobalCompiler()
+inline Compiler& getGlobalCompiler()
 {
     return Compiler::getInstance();
 }
