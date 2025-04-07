@@ -251,17 +251,10 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         return None
 
 
-def create_py_executor_instance(dist,
-                                kv_cache_manager,
-                                draft_kv_cache_manager,
-                                mapping,
-                                pytorch_backend_config,
-                                executor_config,
-                                ctx_chunk_config,
-                                model_engine,
-                                draft_model_engine,
-                                start_worker,
-                                kv_cache_transceiver=None):
+def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
+                                mapping, pytorch_backend_config,
+                                executor_config, ctx_chunk_config, model_engine,
+                                draft_model_engine, start_worker):
     spec_config = model_engine.spec_config
     resources = {
         KV_CACHE_MANAGER_KEY: kv_cache_manager

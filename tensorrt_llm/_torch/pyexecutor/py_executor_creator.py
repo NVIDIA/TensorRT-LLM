@@ -178,7 +178,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, kv_cache_manager, draft_kv_cache_manager, mapping,
                 pytorch_backend_config, executor_config, ctx_chunk_config,
-                model_engine, draft_model_engine, True,
-                py_executor.kv_cache_transceiver)
+                model_engine, draft_model_engine, True)
 
     return py_executor
