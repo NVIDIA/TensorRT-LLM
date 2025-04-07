@@ -4,7 +4,7 @@ import json
 import os
 from unittest import mock
 
-import lm_eval_ad  # noqa: F401
+import lm_eval_tensorrt_llm  # noqa: F401
 import pytest
 from _dist_test_utils import param_with_device_count
 from _model_test_utils import _hf_model_dir_or_hub_id
@@ -60,8 +60,6 @@ def _cli_evaluate_with_mocks(args):
                     f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
                     "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 ),
-                "attn_backend": "FlashInfer",
-                "max_batch_size": 32,
             },
             ["gsm8k", "mmlu"],
             ["exact_match,strict-match", "acc,none"],
@@ -109,7 +107,6 @@ def _cli_evaluate_with_mocks(args):
                     f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
                     "mistralai/Mixtral-8x7B-Instruct-v0.1",
                 ),
-                "compile_backend": "torch-simple",
             },
             ["gsm8k", "mmlu"],
             ["exact_match,strict-match", "acc,none"],
@@ -122,10 +119,14 @@ def _cli_evaluate_with_mocks(args):
 )
 def test_lm_eval(world_size: int, model_args, tasks, score_keys, scores, tmp_path):
     # setup base args for our testing
-    args = ["--model", "autodeploy", "--batch_size", "4", "--limit", "0.1"]
+    args = ["--model", "trt-llm", "--batch_size", "4", "--limit", "0.1"]
 
     # set up model args with world size
-    model_args["world_size"] = world_size
+    model_args["backend"] = "autodeploy"
+    model_args["max_context_length"] = 3072
+    model_args["max_gen_toks"] = 1024
+    model_args["tp"] = world_size
+
     args += ["--model_args", ",".join([f"{k}={v}" for k, v in model_args.items()])]
     gen_kwargs = {}
     # Greedy to avoid variance
