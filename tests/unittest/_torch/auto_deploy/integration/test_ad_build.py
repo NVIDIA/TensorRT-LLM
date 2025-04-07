@@ -120,6 +120,17 @@ from utils.llm_data import llm_models_root
                 "compile_backend": "torch-simple",
             },
         ),
+        # Phi3-mini-4k with torch-opt backend + simple runtime
+        param_with_device_count(
+            2,
+            {
+                "model": _hf_model_dir_or_hub_id(
+                    f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+                    "microsoft/Phi-3-mini-4k-instruct",
+                ),
+                "compile_backend": "torch-opt",
+            },
+        ),
     ],
 )
 def test_build_ad(world_size: Optional[int], config: Dict):
