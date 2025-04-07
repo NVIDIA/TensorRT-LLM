@@ -24,6 +24,7 @@ from .py_executor import PyExecutor
 from .resource_manager import KVCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
+from .seq_slot_manager import SeqSlotManager
 
 
 def is_mla(config):
@@ -291,9 +292,10 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding does not support with speculative decoding.")
-        resources[
-            "guided_decoder_resource_manager"] = GuidedDecoderResourceManager(
-                executor_config.max_batch_size)
+    
+    resources["seq_slot_manager"] = SeqSlotManager(
+            executor_config.max_batch_size +
+            pytorch_backend_config.enable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"

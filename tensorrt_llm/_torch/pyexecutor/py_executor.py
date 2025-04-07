@@ -1481,7 +1481,7 @@ class PyExecutor:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
                 self.resource_manager.resource_managers[
-                    "guided_decoder_resource_manager"].free_resources(req)
+                    "seq_slot_manager"].free_resources(req)
 
         self.kv_cache_transceiver.check_context_transfer_status(False)
 
