@@ -1184,7 +1184,7 @@ TEST_F(LlamaModelLADTest, SeamlessLookaheadDecoding)
         optionalParams.schedulerConfig = executor::SchedulerConfig{executor::CapacitySchedulerPolicy::kMAX_UTILIZATION};
         if (initLADConfig)
         {
-            optionalParams.decodingConfig.setLookaheadDecoding(executor::LookaheadDecodingConfig(5, 5, 5));
+            optionalParams.decodingConfig.setLookaheadDecodingConfig(executor::LookaheadDecodingConfig(5, 5, 5));
         }
 
         auto trtGptModel = std::make_shared<TrtGptModelInflightBatching>(
