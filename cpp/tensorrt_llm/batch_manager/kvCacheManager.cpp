@@ -1638,7 +1638,7 @@ void KVCacheManager::addSequence(
 
     // Get the final token index in kv cache
     SizeType32 const finalTokenKVIdx
-        = mSinkBlockTokenLength + ((inputLength - 1 - mSinkBlockTokenLength) % (mMaxTokenNum - mSinkBlockTokenLength));
+        = mSinkBlockTokenLength + ((inputLength - 1 - mSinkBlockTokenLength) % mNumNonSinkTokensInWindow);
 
     // Get block index that with shareAmongBeams=False.
     // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
