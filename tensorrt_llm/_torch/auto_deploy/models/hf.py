@@ -49,11 +49,23 @@ class HFFactory(ModelFactory):
         self._quant_config = None
         self._pos_embd_config = None
 
-        if self.ckpt_path:
-            # prefetch if needed
-            self.prefetch_checkpoint()
+        # prefetch the model+checkpoint
+        self.prefetch_checkpoint()
+        # load the quantization config
+        self._load_quantization_config()
 
-            self._load_quantization_config()
+    @property
+    def autoconfig_from_pretrained(self):
+        return AutoConfig.from_pretrained
+
+    @property
+    def autotokenizer_from_pretrained(self):
+        return AutoTokenizer.from_pretrained
+
+    # TODO (@lucaslie): Do we ever want to switch to from_pretrained?
+    @property
+    def automodel_from_config(self):
+        return AutoModelForCausalLM.from_config
 
     def build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
@@ -61,15 +73,14 @@ class HFFactory(ModelFactory):
         if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
             self.model_kwargs["torch_dtype"] = torch.half
 
-        model_config = AutoConfig.from_pretrained(
+        model_config = self.autoconfig_from_pretrained(
             self.model, trust_remote_code=True, **self.model_kwargs
         )
-        get_model_from_config = AutoModelForCausalLM.from_config
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             default_dtype = torch.get_default_dtype()
             torch.set_default_dtype(model_config.torch_dtype)
-            model = get_model_from_config(model_config, trust_remote_code=True)
+            model = self.automodel_from_config(model_config, trust_remote_code=True)
             torch.set_default_dtype(default_dtype)
 
         # post-init --> this must be called explicitly for HF models the way we initialize them since
@@ -114,33 +125,32 @@ class HFFactory(ModelFactory):
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model."""
-        if not self.ckpt_path:
+        if not self.model:
             return None
-        return AutoTokenizer.from_pretrained(self.ckpt_path, **self.tokenizer_kwargs)
+        return self.autotokenizer_from_pretrained(self.model, **self.tokenizer_kwargs)
 
     def prefetch_checkpoint(self):
         """Prefetch checkpoint from a HF repo if needed."""
         # already prefetched
         if self._prefetched_path:
             return
-        # nothing to fetch since no ckpt_path
-        if not self._ckpt_path:
-            return
 
         # check if it's a repo id and if so download the repo
         is_hf_repo = True
         try:
-            validate_repo_id(self._ckpt_path)
+            validate_repo_id(self.model)
         except HFValidationError:
             is_hf_repo = False
         if is_hf_repo:
             # we don't expect to use bin files in this context and they are quite large.
+            ignore_patterns = ["**pytorch_model*.bin*", "**.pt"]
+            # we will also ignore the .safetensors files if we skip loading weights
+            if self.skip_loading_weights:
+                ignore_patterns.append("**safetensors")
             ad_logger.info("Pre-fetching checkpoint directory from HF repo.")
-            fetched_dir = snapshot_download(
-                self._ckpt_path, ignore_patterns=["**pytorch_model*.bin*", "**.pt"]
-            )
+            fetched_dir = snapshot_download(self.model, ignore_patterns=ignore_patterns)
         else:
-            fetched_dir = self._ckpt_path
+            fetched_dir = self.model
 
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
@@ -149,14 +159,14 @@ class HFFactory(ModelFactory):
 
     def _load_checkpoint(self, model, **kwargs):
         """Load the checkpoint into the model."""
-        # check for ckpt_path
-        if not self.ckpt_path:
+        # check if we skip loading weights
+        if self.skip_loading_weights:
             return
 
         # prefetch if needed
         self.prefetch_checkpoint()
 
-        ckpt_path = self.ckpt_path
+        ckpt_path = self.model
 
         # sharded checkpoint
         if os.path.isfile(os.path.join(ckpt_path, "model.safetensors.index.json")):
@@ -181,8 +191,8 @@ class HFFactory(ModelFactory):
         model.load_state_dict(state_dict, strict=False, assign=True)
 
     def _load_quantization_config(self):
-        assert self.ckpt_path
-        hf_quant_config_file = os.path.join(self.ckpt_path, "hf_quant_config.json")
+        assert self.model
+        hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):
             with open(hf_quant_config_file, "r") as file:
                 quantization_config = json.load(file)
