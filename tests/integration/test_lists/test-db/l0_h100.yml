@@ -140,7 +140,9 @@ l0_h100:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
   - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins

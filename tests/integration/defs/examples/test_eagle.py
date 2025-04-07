@@ -99,9 +99,10 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
 @pytest.mark.parametrize("data_type", ['float16'])
 @pytest.mark.parametrize("eagle_model_roots", ["llama3.1-eagle-8b-hf_v0.5"],
                          indirect=True)
-def test_llm_eagle_1gpu(batch_size, data_type, eagle_model_roots,
-                        eagle_example_root, llm_datasets_root, llm_rouge_root,
-                        llm_venv, cmodel_dir, engine_dir):
+def test_llm_eagle_1gpu_modelopt_ckpt(batch_size, data_type, eagle_model_roots,
+                                      eagle_example_root, llm_datasets_root,
+                                      llm_rouge_root, llm_venv, cmodel_dir,
+                                      engine_dir):
     print("Build engines...")
     model_name = "eagle"
 
