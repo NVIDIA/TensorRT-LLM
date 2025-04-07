@@ -141,6 +141,12 @@ def match_rope(
         q_node = q_match["raw_input"]
         k_node = k_match["raw_input"]
 
+        # Fetch original 4D shape
+        q_shape = q_node.meta.get("tensor_meta").shape if "tensor_meta" in q_node.meta else None
+        if q_shape is None:
+            raise RuntimeError("q_node does not have tensor_meta information.")
+        batch, n_head, seq_len, head_dim = q_shape
+
         cos_node = q_match["unsqueeze_cos"].args[0]
         sin_node = q_match["unsqueeze_sin"].args[0]
         # Sanity-check: ensure cos_node eventually comes from torch.ops.aten.cos
@@ -150,15 +156,38 @@ def match_rope(
         # TODO: extract a concrete value and register as buffer to avoid recalculation
 
         with graph.inserting_before(q_match["add_node"]):
+            # Insert transpose nodes to change q and k layout from
+            # [batch, n_head, seq_len, head_dim] to [batch, seq_len, n_head, head_dim]
+            q_transposed = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+            k_transposed = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
+            # Insert view nodes to flatten q and k [batch * seq_len, n_head * head_dim]
+            # as expected by the custom op.
+            q_flat = graph.call_function(
+                torch.ops.aten.view, args=(q_transposed, [batch * seq_len, n_head * head_dim])
+            )
+            k_flat = graph.call_function(
+                torch.ops.aten.view, args=(k_transposed, [batch * seq_len, n_head * head_dim])
+            )
             flash_node = graph.call_function(
                 torch.ops.rope.flashinfer,
-                args=(q_node, k_node, cos_node, sin_node),
+                args=(q_flat, k_flat, cos_node, sin_node),
             )
 
-        # Unpack the tuple (rotated_query, rotated_key)
         with graph.inserting_after(flash_node):
-            new_q = graph.call_function(operator.getitem, args=(flash_node, 0))
-            new_k = graph.call_function(operator.getitem, args=(flash_node, 1))
+            raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
+            raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
+        with graph.inserting_after(raw_q):
+            new_q_view = graph.call_function(
+                torch.ops.aten.view, args=(raw_q, [batch, seq_len, n_head, head_dim])
+            )
+        with graph.inserting_after(new_q_view):
+            new_q = graph.call_function(torch.ops.aten.transpose, args=(new_q_view, 1, 2))
+        with graph.inserting_after(raw_k):
+            new_k_view = graph.call_function(
+                torch.ops.aten.view, args=(raw_k, [batch, seq_len, n_head, head_dim])
+            )
+        with graph.inserting_after(new_k_view):
+            new_k = graph.call_function(torch.ops.aten.transpose, args=(new_k_view, 1, 2))
 
         q_match["add_node"].replace_all_uses_with(new_q)
         k_match["add_node"].replace_all_uses_with(new_k)
