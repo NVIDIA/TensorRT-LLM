@@ -81,7 +81,8 @@ private:
         bool valid{true};
         if (vec)
         {
-            valid = std::all_of(vec->begin(), vec->end(), [min, max](T elem)
+            valid = std::all_of(vec->begin(), vec->end(),
+                [min, max](T elem)
                 { return min < elem && ((max.has_value() && elem <= max.value()) || (!max.has_value())); });
             if (!valid)
             {
@@ -178,14 +179,16 @@ public:
         topKMedusaHeads = fuseValues<std::vector<SizeType32>>(
             configs, [&configs](size_t ci) { return configs[ci].topKMedusaHeads; },
             layers::DefaultDecodingParams::getTopKMedusaHeads());
-        outputLogProbs = fuseValues<bool>(configs, [&configs](size_t ci) { return configs[ci].outputLogProbs; }, false);
-        cumLogProbs = fuseValues<bool>(configs, [&configs](size_t ci) { return configs[ci].cumLogProbs; }, false);
+        outputLogProbs = fuseValues<bool>(
+            configs, [&configs](size_t ci) { return configs[ci].outputLogProbs; }, false);
+        cumLogProbs = fuseValues<bool>(
+            configs, [&configs](size_t ci) { return configs[ci].cumLogProbs; }, false);
         beamWidthArray = fuseValues<std::vector<SizeType32>>(
             configs, [&configs](size_t ci) { return configs[ci].beamWidthArray; },
             layers::DefaultDecodingParams::getBeamWidthArray());
         // Only used for tests.
-        draftAcceptanceThreshold
-            = fuseValues<FloatType>(configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
+        draftAcceptanceThreshold = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
         minP = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].minP; }, layers::DefaultDecodingParams::getMinP());
     }
