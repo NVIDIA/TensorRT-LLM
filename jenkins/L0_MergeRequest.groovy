@@ -94,6 +94,8 @@ def EXTRA_STAGE_LIST = "extra_stage"
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+@Field
+def DEBUG_MODE = "debug"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -107,6 +109,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)

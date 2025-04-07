@@ -114,7 +114,9 @@ def EXTRA_STAGE_LIST = "extra_stage"
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
-
+@Field
+def DEBUG_MODE = "debug"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -127,6 +129,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (DEBUG_MODE): false,
 ]
 
 String getShortenedJobName(String path)
@@ -607,6 +610,66 @@ def renderTestDB(testContext, llmSrc, stageName) {
     return testList
 }
 
+def getSSHConnectionPorts(portConfigFile, stageName)
+{
+    def type = stageName.split('-')[0]
+    echo "The type is: ${type}"
+    def fileContent = sh(script: "cat ${portConfigFile}", returnStdout: true).trim()
+
+    // Get available VM port list from portConfigFile based on stage name (e.g. A10: [10022, 10023])
+    def portList = []
+    fileContent.split('\n').each { line ->
+        def matcher = (line =~ /(.+?)=\[(.+?)\]/)
+        if (matcher) {
+            def key = matcher[0][1].replaceAll("\\s","")
+            def values = matcher[0][2].replaceAll("\\s","").split(',').collect { it.replaceAll("\\s","") }
+            if (key == type) {
+                portList.addAll(values)
+            }
+        }
+    }
+    echo "Port List for ${type}: ${portList}"
+
+    // Get current port usage status
+    def portUsage = ""
+    withCredentials([
+        usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
+        string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
+        ]) {
+        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'netstat -tuln'",returnStdout: true)
+    }
+    echo "Port Usage: ${portUsage}"
+
+    // Get an available VM port
+    def userPort = 0
+    while (portList.size() > 0) {
+        def randomIndex = (int)(Math.random() * portList.size())
+        def curPort = portList[randomIndex].toInteger()
+        if (!portUsage.contains(":${curPort}")) {
+            userPort = curPort
+            break
+        }
+        portList.remove(randomIndex)
+    }
+
+    if (userPort == 0) {
+        echo "There is no available port for ${type}"
+        return [0, 0]
+    }
+
+    echo "The chosen port is: ${userPort}"
+
+    // Calculate autossh monitor port by subtracting 9000 from VM port (e.g. 10022 -> 1022)
+    // If monitor port is already in use, randomly assign a value between 2000-3000
+    def monitorPort = userPort - 9000
+    while (portUsage.contains(":${monitorPort}")) {
+        monitorPort = 2000 + (int)(Math.random() * 1000)
+    }
+
+    echo "The monitor port is: ${monitorPort}"
+
+    return [userPort, monitorPort]
+}
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
@@ -666,6 +729,77 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+    }
+
+    if (testFilter[(DEBUG_MODE)]) {
+        stage("Interactive debug session")
+        {
+            testFilter[(DEBUG_MODE)] = false
+
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install openssh-server -y")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install autossh -y")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install sshpass -y")
+
+            sh """
+                echo 'Port 22' >> /etc/ssh/sshd_config
+                echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+                echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+                echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
+                echo 'AllowTcpForwarding yes' >> /etc/ssh/sshd_config
+                echo 'GatewayPorts yes' >> /etc/ssh/sshd_config
+                cat /etc/ssh/sshd_config
+            """
+
+            sh "service ssh restart"
+            sh "service ssh status"
+
+            sh "ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N '' -q"
+
+            sh """
+                chmod 700 ~/.ssh
+                chmod 400 ~/.ssh/id_rsa
+                touch ~/.ssh/authorized_keys
+                chmod 600 ~/.ssh/authorized_keys
+            """
+
+            // The portConfig file is in the VM
+            def portConfigFilePath = "/root/.ssh/ports_config.txt"
+
+            withCredentials([
+                usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
+                string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
+                ]) {
+                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
+
+                def (int userPort, int monitorPort) = getSSHConnectionPorts(portConfigFilePath, stageName)
+                if (userPort == 0) {
+                    echo "Fail to setup an interactive debug session and exit the debug mode."
+                    testFilter[(DEBUG_MODE)] = false
+                    return
+                }
+
+                sh "ssh -f -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "autossh -fNR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "ps aux | grep ssh"
+                try {
+                    timeout(time: 2, unit: 'HOURS') {
+                        input message: "Pause 2 hours for Pre-Debug. Please type 'ssh root@${HOST_NAME} -p ${userPort}' on the CLI to create the connection. Please press the button to proceed when you finish debugging."
+                    }
+                } catch (InterruptedException e) {
+                    echo "Pre-debug session was interrupted by user or timeout"
+                    currentBuild.result = 'ABORTED'
+                    error("Pipeline aborted during pre-debug session")
+                } catch (Exception e) {
+                    echo "An error occurred during pre-debug session: ${e.message}"
+                    currentBuild.result = 'FAILURE'
+                    error("Error in pre-debug session: ${e.message}")
+                }
+            }
+
+            testFilter[(DEBUG_MODE)] = true
+        }
     }
 
     stage ("[${stageName}] Run Pytest")
@@ -780,6 +914,21 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
     }, {
+        if (testFilter[(DEBUG_MODE)]) {
+            try {
+                timeout(time: 2, unit: 'HOURS') {
+                    input message: "Pause 2 hours for Post-Debug. Please press the button to proceed when you finish debugging."
+                }
+            } catch (InterruptedException e) {
+                echo "Post-debug session was interrupted by user or timeout"
+                currentBuild.result = 'ABORTED'
+                error("Pipeline aborted during post-debug session")
+            } catch (Exception e) {
+                echo "An error occurred during post-debug session: ${e.message}"
+                currentBuild.result = 'FAILURE'
+                error("Error in post-debug session: ${e.message}")
+            }
+        }
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
         def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
         // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
