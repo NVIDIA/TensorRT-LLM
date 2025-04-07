@@ -472,7 +472,11 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         op->mNumKVHeads = 1;
         op->mHeadSize = op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mUseFlashMLA = use_flash_mla;
-        op->mFlashMlaNumSmParts = tile_scheduler_metadata.value().size(0);
+        if (op->mUseFlashMLA)
+        {
+            TLLM_CHECK(tile_scheduler_metadata.has_value());
+            op->mFlashMlaNumSmParts = tile_scheduler_metadata.value().size(0);
+        }
     }
 
     auto cache_key = std::make_tuple(op->data(), runner->data());

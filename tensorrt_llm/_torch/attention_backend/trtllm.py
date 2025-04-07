@@ -271,7 +271,8 @@ class TrtllmAttentionWrapper:
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
         self.use_flash_mla = use_flash_mla
-
+        self.tile_scheduler_metadata = None
+        self.num_splits = None
         if self.is_mla_enable:
             # max_context_length will increment 1 when overlap scheduler enabled
             if self.max_context_length > (self.rotary_cos_sin.shape[1] /
@@ -299,9 +300,6 @@ class TrtllmAttentionWrapper:
                     self.num_heads,
                     self.num_kv_heads,
                 )
-            else:
-                self.tile_scheduler_metadata = None
-                self.num_splits = None
 
     def run(
         self,
