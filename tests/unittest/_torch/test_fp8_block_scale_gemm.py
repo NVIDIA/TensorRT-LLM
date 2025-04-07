@@ -209,15 +209,12 @@ def run_test_in_subprocess(env, test_file):
     reason="The test is for Hopper only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize("env", [
+    {},
+    {
+        'TRTLLM_DG_JIT_USE_NVCC': '1'
+    },
     {
         'TRTLLM_DG_ENABLED': '0'
-    },
-    {
-        'TRTLLM_DG_ENABLED': '1',
-    },
-    {
-        'TRTLLM_DG_ENABLED': '1',
-        'TRTLLM_DG_JIT_USE_NVCC': '1'
     },
 ])
 def test_deep_gemm_in_subprocess(env):
