@@ -17,6 +17,8 @@ class TensorRT_LLM(ConanFile):
         cmake = CMakeDeps(self)
         cmake.generate()
         tc = CMakeToolchain(self)
-        tc.variables["NVRTC_WRAPPER_LIB_SOURCE_REL_LOC"] = self.dependencies[
-            "tensorrt_llm_nvrtc_wrapper"].package_folder + "/lib/libtensorrt_llm_nvrtc_wrapper.so"
+        lib_dir = self.dependencies[
+            "tensorrt_llm_nvrtc_wrapper"].cpp_info.libdirs[0]
+        tc.variables[
+            "NVRTC_WRAPPER_LIB_SOURCE_REL_LOC"] = lib_dir + "/libtensorrt_llm_nvrtc_wrapper.so"
         tc.generate()
