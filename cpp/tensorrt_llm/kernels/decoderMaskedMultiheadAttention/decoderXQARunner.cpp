@@ -76,9 +76,14 @@ DecoderXQAImpl* DecoderXQARunner::getImplFromXQAParams(XQAParams const& xqaParam
 {
     if (xqaParams.multi_query_tokens)
     {
-        // Use precompiled cubin for medusa, because medusa cubins are generated from a different CUDA source file than
-        // non-medusa.
-        return mPrecompiledImpl.get();
+        auto const grpSize = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+        // Ampere XQA supports spec dec with pre-compiled cubins (may also work with JIT but not implemented yet)
+        // Hopper XQA supports spec dec with JIT, but only for E4M3 kv cache data type. Only allow 64%grpSize==0 for
+        // now.
+        return (tensorrt_llm::common::getSMVersion() == 90
+                   && xqaParams.kv_cache_data_type == XQADataType::DATA_TYPE_E4M3 && 64 % grpSize == 0)
+            ? mJITImpl.get()
+            : mPrecompiledImpl.get();
     }
 
     std::optional<bool> envEnableXQAJIT = tensorrt_llm::common::getEnvEnableXQAJIT();
