@@ -35,7 +35,7 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
 # Define a constant for process termination timeouts
-GRACEFUL_TERMINATION_TIMEOUT = 4  # seconds
+GRACEFUL_TERMINATION_TIMEOUT = 60  # seconds - set longer when stress large model
 
 
 @dataclass(frozen=True)
@@ -86,11 +86,11 @@ class StressTestConfig:
     # Stress test parameters for stress-test mode
     # stress_time:
     # Used as control parameter to get request count for stress test in phase3
-    stress_time: int = 60  # 1 mins
+    stress_time: int = 3600  # 60 mins for deepseek v3
     # stress_timeout:
     # Maximum time allowed for stress test to run; to prevent hanging tests
     # Must be greater than stress_time to account for initialization, warmup, etc.
-    stress_timeout: int = 300  # 5 mins
+    stress_timeout: int = 5400  # 90 mins for deepseek v3
 
     # Customized stress test parameters for stress-stage-alone mode
     customized_stress_test: bool = True
@@ -115,14 +115,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for genai-perf"""
-    input_len_mean: int = 64
+    input_len_mean: int = 1000  # request from deepseek v3
     input_len_std: int = 16
-    output_len_mean: int = 128
+    output_len_mean: int = 2000  # request from deepseek v3
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hour
+    test_timeout: int = 36000  # 10 hours for deepseek v3
     concurrency_list: List[int] = field(
         default_factory=lambda:
         [8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024])
