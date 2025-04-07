@@ -223,6 +223,7 @@ class PyExecutor:
         self.stats = []
         self.start_times = {}
         self.new_active_requests_queue_latency_ms = 0
+        self.dist_rsp = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
@@ -372,6 +373,9 @@ class PyExecutor:
             self.enqueue_lock.release()
         return req_id
 
+    def set_dist_response(self, dist_rsp):
+        self.dist_rsp = dist_rsp
+
     @contextmanager
     def _profiler(self):
         it = -1
@@ -474,6 +478,9 @@ class PyExecutor:
                             iter_start_time, iter_stats):
         iter_end_time = time.time()
         iter_latency_ms = iter_end_time - iter_start_time
+        if iter_stats is None:
+            return
+
         self._append_iter_stats(
             self._update_iter_stats(iter_stats, iter_latency_ms,
                                     len(finished_requests), scheduled_batch))
@@ -725,7 +732,6 @@ class PyExecutor:
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
-
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
@@ -1797,7 +1803,8 @@ class PyExecutor:
                 responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
-        if self.dist.rank == 0:
+
+        if self.dist.rank == 0 or self.dist_rsp:
             with self.response_cv:
                 for req_id, resp in responses.items():
                     if req_id in self.responses.keys():
@@ -1825,7 +1832,6 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
-
             if response:
                 request_done = response.result.is_final
                 new_responses.update({req_id: response})
@@ -1837,6 +1843,7 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
+
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)

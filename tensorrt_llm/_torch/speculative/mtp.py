@@ -270,7 +270,7 @@ class MTPDecoder(TorchDecoder):
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
         for request in scheduled_requests.context_requests:
-            request.py_draft_tokens = [1] * self.draft_len
+            request.py_draft_tokens = [-1] * self.draft_len
         return new_tensors_device, new_tensors_host, decoder_event
 
 

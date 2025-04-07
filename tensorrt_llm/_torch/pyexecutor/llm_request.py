@@ -141,7 +141,8 @@ def executor_request_to_llm_request(req_id: int,
         guided_decoding_params=executor_request.guided_decoding_params,
         encoder_input_tokens=None,
         return_encoder_output=False,
-        client_id=executor_request.client_id,
+        client_id=executor_request.client_id
+        if executor_request.client_id is not None else req_id,
         priority=0.5,
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params)
