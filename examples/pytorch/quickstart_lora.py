@@ -21,11 +21,12 @@ def main():
     # )
 
     lora_config = LoraConfig(lora_dir=[
-        "/home/scratch.trt_llm_data/llm-models/llama-models/luotuo-lora-7b-0.1"
+        "/home/scratch.trt_llm_data/llm-models/llama-models-v2/chinese-llama-2-lora-13b"
     ],
                              max_lora_rank=64)
     llm = LLM(
-        model="/home/scratch.trt_llm_data/llm-models/llama-models/llama-7b-hf/",
+        model=
+        "/home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-13b-hf",
         lora_config=lora_config,
         enable_torch_lora=True,
     )
@@ -37,7 +38,8 @@ def main():
     sampling_params = SamplingParams(max_tokens=15)
     lora_req_2 = LoRARequest(
         "task-0", 0,
-        "/home/scratch.trt_llm_data/llm-models/llama-models/luotuo-lora-7b-0.1")
+        "/home/scratch.trt_llm_data/llm-models/llama-models-v2/chinese-llama-2-lora-13b"
+    )
     lora_request = [lora_req_2]
 
     outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)

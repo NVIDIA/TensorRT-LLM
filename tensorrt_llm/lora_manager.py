@@ -295,18 +295,11 @@ def load_torch_hf_lora(lora_config: LoraConfig):
     # TODO smor- need to figure this out, currently you don't handle the weights adjustment that is done in load_hf_lora
     trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
     lora_config.trtllm_modules_to_hf_modules = trtllm_modules_to_hf_modules
-    print(
-        f"********SMOR**********  in load_torch_hf_lora, trtllm_modules_to_hf_modules: {trtllm_modules_to_hf_modules}"
-    )
-
     lora_loader = HfLoraLoader(lora_config.lora_dir)
 
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = lora_loader.get_target_modules(
             trtllm_modules_to_hf_modules)
-        print(
-            f"********SMOR**********  in load_torch_hf_lora, lora_config.lora_target_modules: {lora_config.lora_target_modules}"
-        )
     if len(lora_config.lora_target_modules) == 0:
         raise ValueError(
             "lora_target_modules is empty. "

@@ -571,6 +571,7 @@ class PeftCacheManager(BaseResourceManager):
 
     def __init__(self, peft_cache_config: PeftCacheConfig,
                  model_config: ModelConfig, lora_config: LoraConfig):
+
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -584,11 +585,7 @@ class PeftCacheManager(BaseResourceManager):
             max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
             max_pages_per_block_device=peft_cache_config.
             max_pages_per_block_device,
-            # TODO smor- what are these device cache percent fields? search how they obtained elsewhere
-            # Tomorrow change it to something handcoded for now
-            device_cache_percent=(peft_config.device_cache_percent
-                                  if peft_config.device_cache_percent else
-                                  peft_cache_config.device_cache_percent),
+            device_cache_percent=peft_cache_config.device_cache_percent,
             host_cache_size=peft_cache_config.host_cache_size,
             lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
         )

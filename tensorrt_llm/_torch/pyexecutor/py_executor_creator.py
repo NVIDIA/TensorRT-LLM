@@ -246,22 +246,9 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     if lora_config is not None:
         # TODO smor- this is duplicated with LoraManager handle new request
-        print("********SMOR**********  in py_executor_creator, loading hf lora")
         load_torch_hf_lora(lora_config)
         # peft_config.update_model_config(hidden_size,
         #                                 torch_dtype_to_str(model_engine.dtype))
-        print(
-            f"********SMOR**********  in py_executor_creator, max_lora_rank: {lora_config.max_lora_rank}"
-        )
-        print(
-            f"********SMOR**********  in py_executor_creator, model_engine.model.model_config type: {type(model_engine.model.model_config)}"
-        )
-        print(
-            f"********SMOR**********  in py_executor_creator, num_hidden_layers: {model_engine.model.model_config.pretrained_config.num_hidden_layers}"
-        )
-        print(
-            f"********SMOR**********  in py_executor_creator, num_lora_modules: {len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)}"
-        )
         max_lora_rank = lora_config.max_lora_rank
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
@@ -275,6 +262,13 @@ def create_py_executor(executor_config: ExecutorConfig,
             num_host_module_layer=max_lora_rank * num_lora_modules *
             max_cpu_loras,
         )
+        print(
+            f"SMOR: model pretrained config type: {type(model_engine.model.model_config.pretrained_config)}"
+        )
+        print(f"SMOR: model config type: {type(model_engine.model.config)}")
+        from IPython import embed
+        embed()
+        # print(f"SMOR: model config: {model_engine.model.config}")
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
             model_config=model_engine.model.config,
