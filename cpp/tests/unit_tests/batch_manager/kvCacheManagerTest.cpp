@@ -3678,13 +3678,13 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
             llmRequest->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
             for (int i = draftLen; i < maxNewTokens && (inputLength + i) < maxAttentionWindow; i += (draftLen + 1))
             {
-                currentNumAllocTotalBlocks = kvCacheManager.getNumAllocTotalBlocks();
                 for (int beam = 0; beam < maxBeamWidth; beam++)
                 {
                     llmRequest->addNewToken(1, beam);
                 }
 
                 neededBlocksOneStep = kvCacheManager.getNeededBlocksOneStep(*llmRequest, false);
+                currentNumAllocTotalBlocks = kvCacheManager.getNumAllocTotalBlocks();
 
                 for (int beam = 0; beam < maxBeamWidth; beam++)
                 {
@@ -3851,6 +3851,17 @@ struct FillKvCacheAndCompleteRequestsParameters
     KvCacheManagerInstantiationParameters kvCacheManagerInstantiationParameters;
     SizeType32 promptLength;
     SizeType32 maxOutputLength;
+};
+
+struct GetNeededBlocksOneStepOneRequestParameters
+{
+    KvCacheManagerInstantiationParameters kvCacheManagerInstantiationParameters;
+    SizeType32 promptLength;
+    SizeType32 draftLength;
+    bool contextStep;
+    SizeType32 previousGeneratedTokens;
+    bool twoStepsLookAhead;
+    SizeType32 expectedNeededBlocksOneStep;
 };
 
 std::shared_ptr<KVCacheManager> createKvCacheManager(
@@ -4066,58 +4077,314 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
             66,     // 1 extra block for sink tokens
         }));    
 
-// class NeededBlocksOneStepTest
-//     : public ::testing::TestWithParam<GetRemainingBlocksToCompletionOneRequestParameters>
-// {
-// protected:
-//     void SetUp() override
-//     {
-//         auto const stream = std::make_shared<tr::CudaStream>();
-//         auto const params = GetParam();
-//         kvCacheManager = createKvCacheManager(params.kvCacheManagerInstantiationParameters, stream);
-//         kvCacheManager->allocatePools(nvinfer1::DataType::kFLOAT);
-//     }
 
-//     void TearDown() override {}
+class NeededBlocksOneStepTest
+    : public ::testing::TestWithParam<GetNeededBlocksOneStepOneRequestParameters>
+{
+protected:
+    void SetUp() override
+    {
+        auto const stream = std::make_shared<tr::CudaStream>();
+        auto const params = GetParam();
+        kvCacheManager = createKvCacheManager(params.kvCacheManagerInstantiationParameters, stream);
+        kvCacheManager->allocatePools(nvinfer1::DataType::kFLOAT);
+    }
 
-//     std::shared_ptr<KVCacheManager> kvCacheManager;
-// };
+    void TearDown() override {}
 
-// TEST_P(NeededBlocksOneStepTest, NeededBlocksOneStepTestCorrectlyEstimated)
-// {
-//     auto const params = GetParam();
-//     auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(params.promptLength));
-//     auto const llmRequest = LlmRequest{
-//         0,
-//         params.maxOutputLength,
-//         inputTokens,
-//         tensorrt_llm::runtime::SamplingConfig{params.kvCacheManagerInstantiationParameters.maxBeamWidth},
-//         true,
-//     };
-//     auto const result = kvCacheManager->getRemainingBlocksToCompletion(llmRequest);
-//     ASSERT_EQ(result, params.expectedRemainingBlocksToCompletion);
-// }
+    std::shared_ptr<KVCacheManager> kvCacheManager;
+};
 
-// INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocksOneStepTest,
-//     ::testing::Values(
-//         // GetRemainingBlocksToCompletionOneRequestParameters{
-//         //     KvCacheManagerInstantiationParameters{
-//         //         1,
-//         //         1,
-//         //         1,
-//         //         64,
-//         //         4096,
-//         //         0,
-//         //         0,
-//         //         4096,
-//         //         1,
-//         //         4097,       // temporaryKvCacheLength = 0
-//         //         false,
-//         //     },
-//         //     5000,
-//         //     128,
-//         //     65,
-//         // }));
+TEST_P(NeededBlocksOneStepTest, NeededBlocksOneStepTestCorrectlyEstimated)
+{
+    auto const params = GetParam();
+    auto const requestId = 0;
+    auto const inputTokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(params.promptLength));
+    auto llmRequest = LlmRequest{
+        requestId,
+        128,
+        inputTokens,
+        tensorrt_llm::runtime::SamplingConfig{params.kvCacheManagerInstantiationParameters.maxBeamWidth},
+        true,
+    };
+    auto draftTokens = std::make_shared<std::vector<SizeType32>>(params.draftLength);
+    llmRequest.setDraftTokens(draftTokens);
+    if (params.contextStep)
+    {
+        auto neededBlocksOneStep = kvCacheManager->getNeededBlocksOneStep(llmRequest, false);
+        ASSERT_EQ(neededBlocksOneStep, params.expectedNeededBlocksOneStep);
+    }
+    else
+    {
+        llmRequest.setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+        for (int beam = 0; beam < params.kvCacheManagerInstantiationParameters.maxBeamWidth; beam++)
+        {
+            llmRequest.addNewToken(0, beam);
+            for (SizeType32 i = 0; i < params.previousGeneratedTokens; i++)
+            {
+                llmRequest.addNewToken(0, beam);
+            }
+        }
+
+        auto neededBlocksOneStep = kvCacheManager->getNeededBlocksOneStep(llmRequest, params.twoStepsLookAhead);
+        ASSERT_EQ(neededBlocksOneStep, params.expectedNeededBlocksOneStep);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocksOneStepTest,
+    ::testing::Values(
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            136,
+            0,
+            true,
+            0,
+            false,
+            9,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            512,
+            0,
+            true,
+            0,
+            false,
+            32,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            1024,
+            0,
+            true,
+            0,
+            false,
+            32,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            512,
+            0,
+            false,
+            0,
+            false,
+            1,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            512,
+            0,
+            false,
+            8,
+            false,
+            0,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            518,
+            0,
+            false,
+            0,
+            false,
+            0,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            512,
+            0,
+            false,
+            16,
+            false,
+            1,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            128,
+            0,
+            false,
+            15,
+            false,
+            0,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            128,
+            0,
+            false,
+            15,
+            true,
+            1,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                4,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            128,
+            0,
+            false,
+            15,
+            true,
+            4,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            302,        // 14 tokens in last block
+            3,
+            false,
+            0,
+            false,
+            1,
+        },
+        GetNeededBlocksOneStepOneRequestParameters{
+            KvCacheManagerInstantiationParameters{
+                1,
+                1,
+                1,
+                16,
+                256,
+                0,
+                0,
+                512,
+                1,
+                513,       // temporaryKvCacheLength = 0
+                false,
+            },
+            298,        // 10 tokens in last block
+            3,
+            false,
+            0,
+            false,
+            0,
+        }));
 
 class FillKvCacheAndCompleteRequestsTest : public ::testing::TestWithParam<FillKvCacheAndCompleteRequestsParameters>
 {
