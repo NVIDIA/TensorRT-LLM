@@ -515,15 +515,13 @@ def launchTestListCheck(pipeline)
 
     stageName = "Test List Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
-        stage("[${stageName}] Run") {
-            try {
-                echoNodeAndGpuInfo(pipeline, stageName)
-                stages()
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                throw e
-            }
+        try {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            stages()
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            throw e
         }
     })
 }
