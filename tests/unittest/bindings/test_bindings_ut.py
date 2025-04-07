@@ -579,3 +579,21 @@ def test_KvCache_events_binding():
 
     del stream
     torch.cuda.empty_cache()
+
+
+def test_ReqIdsSet_pickle():
+    ids = _tb.internal.batch_manager.ReqIdsSet()
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids.insert(0)
+    ids.insert(1)
+    ids.insert(2)
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids1.erase(0)
+    ids2 = _tb.internal.batch_manager.ReqIdsSet()
+    ids2.insert(1)
+    ids2.insert(2)
+    assert ids1 == ids2
