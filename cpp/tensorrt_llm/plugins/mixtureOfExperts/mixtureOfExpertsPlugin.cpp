@@ -332,12 +332,12 @@ void MixtureOfExpertsPlugin::init()
             static_cast<int>(mType), static_cast<int>(mWeightType), static_cast<int>(mOutputType));
     }
 
-    mMOERunner->use_deterministic_hopper_reduce_ = mExpertsPerToken > 2 && mUseDeterministicKernels;
+    mMOERunner->use_deterministic_reduce_ = mExpertsPerToken > 2 && mUseDeterministicKernels;
 
     mGemmId1 = GemmIDMoe{1, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_reduce_};
     mGemmId2 = GemmIDMoe{2, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
-        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_reduce_};
     mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mExpertsPerToken);
 
     if (hasLora())
