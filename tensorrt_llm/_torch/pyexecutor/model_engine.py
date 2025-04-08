@@ -738,7 +738,7 @@ class PyTorchModelEngine(ModelEngine):
     def __del__(self) -> None:
         if self.ub_buffers:
             for u in self.ub_buffers:
-                ub.ub_deallocate(u)
+                ub.ub_deallocate(u.addr)
         torch.cuda.empty_cache()
 
     def _load_model(self, checkpoint_dir: str, load_format: LoadFormat,
@@ -1744,11 +1744,10 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        ub.ub_initialize(self.mapping.tp_size)
-        if not ub.ub_is_initialized():
-            return False
-        self.ub_buffers = [
-            ub.ub_allocate(0, hidden_size * self.max_num_tokens * 2),
-            ub.ub_allocate(1, hidden_size * self.max_num_tokens * 2),
-        ]
+        ub.initialize_userbuffers_manager(self.mapping.tp_size,
+                                          self.mapping.pp_size,
+                                          self.mapping.cp_size,
+                                          self.mapping.rank,
+                                          self.mapping.gpus_per_node,
+                                          hidden_size * self.max_num_tokens * 2)
         return True

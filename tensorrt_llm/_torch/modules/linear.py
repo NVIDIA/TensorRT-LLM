@@ -310,7 +310,6 @@ class Linear(nn.Module):
                     scale_b=self.weight_scale,
                     bias=None,
                     out_dtype=self.dtype or input.dtype,
-                    userbuffers_id=-1,
                 )
                 if bias is not None:
                     output = output + bias

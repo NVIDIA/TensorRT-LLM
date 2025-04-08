@@ -11,14 +11,13 @@ import tensorrt_llm
 
 from .patterns.ar_residual_norm import register_ar_residual_norm
 from .patterns.residual_add_norm import register_add_norm
-from .patterns.ub_allreduce import (register_ub_allreduce,
-                                    register_ub_allreduce_finalize)
+from .patterns.ub_allreduce import register_ub_patterns
 from .recover_pass import recover_pass
 
 
 class Backend:
 
-    _custom_pass_instance: Optional[PatternMatcherPass] = None
+    _custom_pass_instances: List[PatternMatcherPass] = None
 
     def __init__(self, enable_inductor=True, enable_userbuffers=False) -> None:
         super().__init__()
@@ -26,7 +25,7 @@ class Backend:
         self.module_inference_event = []
         self.module_inference_time = 0
         self.call_count = 0
-        self.custom_pass = Backend.get_custom_pass(enable_userbuffers)
+        self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
 
@@ -42,21 +41,20 @@ class Backend:
     def get_custom_pass(cls, enable_userbuffers):
         # TODO: add pp + tp support
         world_size = tensorrt_llm.mpi_world_size()
-        if cls._custom_pass_instance == None:
+        if not cls._custom_pass_instances:
             # Really naive pass manager here
-            cls._custom_pass_instance = PatternMatcherPass()
+            cls._custom_pass_instances = [PatternMatcherPass()]
             if world_size > 1:
                 # Currently torch compile cannot work properly with lamport fusion kernel
                 # TO-DO: Fix this issue
                 os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
-                register_ar_residual_norm(cls._custom_pass_instance)
+                register_ar_residual_norm(cls._custom_pass_instances[0])
                 if enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
                 ):
-                    register_ub_allreduce(cls._custom_pass_instance)
-                    register_ub_allreduce_finalize(cls._custom_pass_instance)
+                    register_ub_patterns(cls._custom_pass_instances)
             else:
-                register_add_norm(cls._custom_pass_instance)
-        return cls._custom_pass_instance
+                register_add_norm(cls._custom_pass_instances[0])
+        return cls._custom_pass_instances
 
     def optimize(
         self,
@@ -64,9 +62,10 @@ class Backend:
         example_inputs: Optional[List[torch.Tensor]] = None,
     ):
         graph = gm.graph if isinstance(gm, GraphModule) else gm
-        self.match_count.append(self.custom_pass.apply(graph))
-        while self.match_count[-1]:
-            self.match_count.append(self.custom_pass.apply(graph))
+        for custom_pass in self.custom_passes:
+            self.match_count.append(custom_pass.apply(graph))
+            while self.match_count[-1]:
+                self.match_count.append(custom_pass.apply(graph))
         graph.eliminate_dead_code()
         if isinstance(gm, GraphModule):
             gm.recompile()
