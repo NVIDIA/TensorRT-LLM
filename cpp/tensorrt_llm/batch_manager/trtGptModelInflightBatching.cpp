@@ -582,7 +582,7 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
             break;
         }
     }
-    // Below assertion should be removed, tracked by: https://nvbugspro.nvidia.com/bug/5007059
+    // TODO(tasida) Below assertion should be removed once SWA/VSWA is no longer cyclic.
     TLLM_CHECK_WITH_INFO(
         getMaxBeamWidth() == 1 || !enableCyclicKvCache, "Can't support cyclic kv cache with beam search.");
 

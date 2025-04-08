@@ -341,6 +341,9 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 {
     kvCacheManager.startScheduling();
 
+    // The optimization of delaying requests won't work for variable window attention
+    bool skippingIsRelevant = !kvCacheManager.getBlockManager().isVariableWindow();
+
     // Keep track of number of requests and block needed for the scheduled requests
     auto scheduledBlocksManager
         = kv_cache_manager::MaxUtilizationScheduledBlocksManager(kvCacheManager, mManyMicroBatches);
@@ -378,7 +381,8 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         }
 
         // if context request can reuse blocks contributed by another context request, skip
-        if (beneficialToSkip(
+        if (skippingIsRelevant
+            && beneficialToSkip(
                 req, kvCacheManager, std::nullopt, newlyContributedContextBlocks, newlyContributedCrossContextBlocks))
         {
             reqIt++;
