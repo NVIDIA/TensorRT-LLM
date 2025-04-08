@@ -1633,6 +1633,25 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.spawn_processes == True
 
 
+def test_parallel_config_pickle():
+    comm_type = trtllm.CommunicationType.MPI
+    comm_mode = trtllm.CommunicationMode.LEADER
+    device_ids = [0, 1, 2, 3]
+    participant_ids = [4, 5, 6, 7]
+    num_nodes = 2
+    parallel_config = trtllm.ParallelConfig(comm_type,
+                                            comm_mode,
+                                            device_ids,
+                                            participant_ids,
+                                            num_nodes=num_nodes)
+    parallel_config_copy = pickle.loads(pickle.dumps(parallel_config))
+    assert parallel_config_copy.communication_type == comm_type
+    assert parallel_config_copy.communication_mode == comm_mode
+    assert parallel_config_copy.device_ids == device_ids
+    assert parallel_config_copy.participant_ids == participant_ids
+    assert parallel_config_copy.num_nodes == num_nodes
+
+
 def test_peft_cache_config():
     num_host_module_layer = 1
     num_device_module_layer = 2
