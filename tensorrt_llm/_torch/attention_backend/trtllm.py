@@ -604,6 +604,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
+            q_scaling (float): Scaling factor for QK. Defaults to 1.0 if None.
             pos_embd_params (PositionalEmbeddingParams): Optional parameters defining how positional embedding should be applied.
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
