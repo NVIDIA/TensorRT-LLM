@@ -95,6 +95,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
 
+    // 45 parameters, 52 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -136,7 +137,6 @@ public:
         , mLogitsPostProcessor(std::move(logitsPostProcessor))
         , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
@@ -152,21 +152,19 @@ public:
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
-        , mLookaheadConfig(lookaheadConfig)
+        , mLookaheadConfig(std::move(lookaheadConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mContextChunkSize{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
         , mDraftLogits(std::move(draftLogits))
-        , mNumTokensPerIteration(1)
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.beamWidth > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderTokens(std::move(encoderInputTokens))
         , mReturnEncoderOutput(returnEncoderOutput)
-        , mDecodingIter(0)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.beamWidth)
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
@@ -177,7 +175,6 @@ public:
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
         , mEagleConfig(std::move(eagleConfig))
-        , mSequenceIndex(0)
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
@@ -192,6 +189,7 @@ public:
         initialize(*inputTokens, returnLogProbs);
     }
 
+    // 32 parameters, 39 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -219,7 +217,6 @@ public:
         , mLogitsPostProcessor(logitsPostProcessor)
         , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
@@ -235,40 +232,22 @@ public:
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(lookaheadConfig)
         , mContextChunkSize(mPromptLen)
-        , mContextCurrentPosition(0)
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
+        , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
         , mDraftLogits(draftLogits)
-        , mNumTokensPerIteration(1)
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.beamWidth > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
+        , mEncoderTokens(std::make_shared<VecTokens>(encoderInputTokens.value_or(VecTokens())))
         , mReturnEncoderOutput(returnEncoderOutput)
-        , mDecodingIter(0)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.beamWidth)
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
-        , mSequenceIndex(0)
         , mLanguageAdapterUid(languageAdapterUid)
     {
-        if (draftTokens)
-        {
-            mDraftTokens = std::make_shared<VecTokens>(draftTokens.value());
-        }
-        else
-        {
-            mDraftTokens = std::make_shared<VecTokens>();
-        }
-        if (encoderInputTokens)
-        {
-            mEncoderTokens = std::make_shared<VecTokens>(encoderInputTokens.value());
-        }
-        else
-        {
-            mEncoderTokens = std::nullopt;
-        }
         if (mEncoderTokens.has_value())
         {
             mState = LlmRequestState::kENCODER_INIT;
@@ -276,6 +255,7 @@ public:
         initialize(inputTokens, returnLogProbs);
     }
 
+    // 29 items in initialization list
     GenericLlmRequest(RequestIdType requestId, executor::Request const& req)
         : mRequestId(requestId)
         , mPromptLen(req.getInputTokenIds().size())
@@ -284,46 +264,24 @@ public:
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mClientId(req.getClientId())
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mEmbeddingBias(std::nullopt)
-        , mBadWordsList(std::nullopt)
-        , mStopWordsList(std::nullopt)
-        , mPositionIds(std::nullopt)
-        , mPromptEmbeddingTable(std::nullopt)
-        , mPromptVocabSize(std::nullopt)
-        , mMropeRotaryCosSin(std::nullopt)
-        , mMropePositionDeltas(std::nullopt)
-        , mLoraTaskId(std::nullopt)
-        , mLoraWeights(std::nullopt)
-        , mLoraConfig(std::nullopt)
-        , mLookaheadConfig(std::nullopt)
-        , mKvCacheRetentionConfig(std::nullopt)
         , mContextChunkSize{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
         , mDraftTokens(std::make_shared<VecTokens>())
-        , mDraftLogits(std::nullopt)
-        , mNumTokensPerIteration(1)
         , mReturnAllGeneratedTokens(req.getReturnAllGeneratedTokens())
         , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
         , mReturnGenerationLogits(req.getOutputConfig().returnGenerationLogits)
         , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
-        , mEncoderTokens(std::nullopt)
         , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
-        , mDecodingIter(0)
         , mPriority(req.getPriority())
         , mFinishReasons(mSamplingConfig.beamWidth)
-        , mEncoderInputFeatures(std::nullopt)
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
-        , mInputTokenExtraIds(std::nullopt)
-        , mNumReturnSequences(1)
         , mEagleConfig(req.getEagleConfig())
-        , mSequenceIndex(0)
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
@@ -953,6 +911,11 @@ public:
         mLookaheadConfig = config;
     }
 
+    void clearLookaheadConfig()
+    {
+        mLookaheadConfig = std::nullopt;
+    }
+
     [[nodiscard]] std::optional<executor::KvCacheRetentionConfig> getKvCacheRetentionConfig() const
     {
         return mKvCacheRetentionConfig;
@@ -961,11 +924,6 @@ public:
     void setKvCacheRetentionConfig(executor::KvCacheRetentionConfig config)
     {
         mKvCacheRetentionConfig = config;
-    }
-
-    void clearLookaheadConfig()
-    {
-        mLookaheadConfig = std::nullopt;
     }
 
     [[nodiscard]] std::optional<executor::EagleConfig> getEagleConfig() const
@@ -1801,67 +1759,76 @@ public:
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
-    // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
-    std::optional<TokenIdType> mEndId;
-    std::optional<TokenIdType> mPadId;
-    std::optional<SizeType32> mSeqSlot;
-    std::optional<LogitsPostProcessor> mLogitsPostProcessor;
-    bool mApplyLogitsPostProcessorBatched;
-    std::optional<RequestIdType> mClientId;
+    std::optional<TokenIdType> mEndId{std::nullopt};
+    std::optional<TokenIdType> mPadId{std::nullopt};
+    std::optional<SizeType32> mSeqSlot{std::nullopt};
+    std::optional<LogitsPostProcessor> mLogitsPostProcessor{std::nullopt};
+    bool mApplyLogitsPostProcessorBatched{false};
+    std::optional<RequestIdType> mClientId{std::nullopt};
+
     // Position of mask token in GLM model inputs
     SizeType32 mMaskPosition{0};
-    LlmRequestState mState;
+
+    LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
 
 protected:
     bool mIsStreaming;
 
-    // A list of tokens generated at the current step.
-    // Used to pass the decoded tokens as the input to the next step.
-    // `mLastTokens[beam] != mTokens.back()[beam]` for streaming + beam search
+    // List of tokens generated at the current step, used as the input to the next step.
+    // `mLastTokens[beam] != mTokens.back()[beam]` in streaming + beam search
     // as `mTokens` will be overwritten by the gathered tokens.
-    VecTokens mLastTokens;
-    BeamTokens mTokens;
+    VecTokens mLastTokens; // [beamSize]
+
+    // List of tokens including input prompt and generated part.
+    BeamTokens mTokens; // [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
+
+                        // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
-    // A list of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.
+
+    // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.
     // It is introduced as a WAR to solve the hanging problem caused by overestimating the used KV cache on the last PP
     // rank (because new tokens are decoded earlier). By excluding the numbers of pre-decoded tokens, the used KV cache
     // can be estimated correctly.
     std::vector<SizeType32> mNumPreDecodedTokens;
+
     // Number of tokens already in KV cache before context phase.
     // A value > 0 indicates cached KV cache blocks were reused.
     // Up to inputLen - 1 tokens can be reused.
     SizeType32 mPrepopulatedPromptLen{0};
+
     SizeType32 mMaxSentTokenLen;
 
-    std::optional<TensorPtr> mEmbeddingBias;
-    std::optional<TensorPtr> mBadWordsList;
-    std::optional<TensorPtr> mStopWordsList;
+    std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
+    std::optional<TensorPtr> mBadWordsList{std::nullopt};
+    std::optional<TensorPtr> mStopWordsList{std::nullopt};
 
-    std::optional<std::shared_ptr<std::vector<SizeType32>>> mPositionIds;
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mPositionIds{std::nullopt};
 
-    std::optional<TensorPtr> mPromptEmbeddingTable;
-    std::optional<SizeType32> mPromptVocabSize;
-    std::optional<TensorPtr> mMropeRotaryCosSin;
-    std::optional<SizeType32> mMropePositionDeltas;
+    std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
+    std::optional<SizeType32> mPromptVocabSize{std::nullopt};
+    std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
+    std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
 
-    std::optional<LoraTaskIdType> mLoraTaskId;
-    std::optional<TensorPtr> mLoraWeights;
-    std::optional<TensorPtr> mLoraConfig;
-    std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig;
+    std::optional<LoraTaskIdType> mLoraTaskId{std::nullopt};
+    std::optional<TensorPtr> mLoraWeights{std::nullopt};
+    std::optional<TensorPtr> mLoraConfig{std::nullopt};
 
-    std::optional<executor::KvCacheRetentionConfig> mKvCacheRetentionConfig;
-    // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
-    // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
-    // of null value is that the context is not chunked.
+    std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig{std::nullopt};
+
+    std::optional<executor::KvCacheRetentionConfig> mKvCacheRetentionConfig{std::nullopt};
+
+    // Paged-KV-Cache must be enabled while enabling Chunked-Context.
+    // The size of the context chunk must be multiple of the KV-Cache block size except the last one.
+    // Value `0` means Chunked-Context is disabled.
     SizeType32 mContextChunkSize{0};
     SizeType32 mContextCurrentPosition{0};
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
-    std::shared_ptr<VecTokens> mDraftTokens;
-    std::optional<TensorPtr> mDraftLogits;
-    SizeType32 mNumTokensPerIteration;
+    std::shared_ptr<VecTokens> mDraftTokens{nullptr};
+    std::optional<TensorPtr> mDraftLogits{std::nullopt};
+    SizeType32 mNumTokensPerIteration{1};
 
     // whether to return the full beams on each iteration. True when doing streaming + beamsearch
     bool mReturnAllGeneratedTokens;
@@ -1869,63 +1836,87 @@ protected:
     bool mReturnContextLogits;
     bool mReturnGenerationLogits;
     bool mReturnLogProbs;
-    TensorPtr mContextLogitsHost;    // [mPromptLen, vocab_size_padded]
-    TensorPtr mGenerationLogitsHost; // [beam_size, mMaxNewTokens, vocab_size_padded]
+    TensorPtr mContextLogitsHost;    // [mPromptLen, vocabSizePadded]
+    TensorPtr mGenerationLogitsHost; // [beamSize, mMaxNewTokens, vocabSizePadded]
     std::vector<TensorPtr> mGenerationLogitsFragments;
 
     bool mExcludeInputFromOutput;
 
     // Encoder-only and Encoder-Decoder models
     // Encoder input tokens
-    std::optional<std::shared_ptr<VecTokens>> mEncoderTokens;
+    std::optional<std::shared_ptr<VecTokens>> mEncoderTokens{std::nullopt};
+
     bool mReturnEncoderOutput;
-    // Encoder output, used to compute cross attention KV Cache
+
+    // Encoder output, used to compute cross attention KV-Cache.
     TensorPtr mEncoderOutput;       // [numTokens, hidden_size]
-    TensorPtr mEncoderHiddenStates; // for pipeline parallelism, [numTokens, hiddenSize]
-    TensorPtr mEncoderOutputHost;
+    TensorPtr mEncoderHiddenStates; // [numTokens, hiddenSize] for for Pipeline-Parallelism
+    TensorPtr mEncoderOutputHost;   // [mEncoderOutputLength, encoderHiddenSize]
 
-    SizeType32 mDecodingIter;
+    SizeType32 mDecodingIter{0};
+
     executor::PriorityType mPriority;
+
     std::vector<executor::FinishReason> mFinishReasons;
-    std::optional<TensorPtr> mEncoderInputFeatures; // Input features of encoder for multimodal models
-    std::optional<SizeType32>
-        mEncoderOutputLength; // For some models like Whisper, encoder output shape cannot be inferred from encoder
-                              // input shape due to downsampling. Thus this is needed for setting buffer sizes correctly
-    std::optional<TensorPtr> mCrossAttentionMask; // Input cross attention mask
+
+    // Input features of encoder for multimodal models.
+    std::optional<TensorPtr> mEncoderInputFeatures{std::nullopt};
+
+    // Setting buffer sizes correctly for models like Whisper,
+    // which encoder output shape cannot be inferred from encoder input shape due to downsampling.
+    std::optional<SizeType32> mEncoderOutputLength{std::nullopt};
+
+    // Input cross attention mask.
+    std::optional<TensorPtr> mCrossAttentionMask{std::nullopt};
+
     LlmRequestType mLlmRequestType;
-    std::optional<executor::ContextPhaseParams> mContextPhaseParams;
-    std::shared_ptr<ContextProgress> mContextProgress;
 
-    std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds;
+    std::optional<executor::ContextPhaseParams> mContextPhaseParams{std::nullopt};
+
+    std::shared_ptr<ContextProgress> mContextProgress{nullptr};
+
+    std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds{std::nullopt};
+
     BeamUniqueTokens mUniqueTokens;
-    // TODO: add real extra id for encoder tokens
-    std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens;
 
-    SizeType32 mNumReturnSequences;
-    std::optional<executor::EagleConfig> mEagleConfig;
-    SizeType32 mSequenceIndex;
+    // TODO: add real extra id for encoder tokens.
+    std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens{std::nullopt};
+
+    SizeType32 mNumReturnSequences{1};
+
+    // Config for Eagle speculative decoding.
+    std::optional<executor::EagleConfig> mEagleConfig{std::nullopt};
+
+    SizeType32 mSequenceIndex{0};
+
     std::vector<RequestPtr> mChildRequests;
+
     RequestIdType mParentRequestId;
-    std::shared_ptr<std::vector<bool>> mSequenceFinalVec; // Indicators whether each sibling completes generation.
 
-    std::optional<TensorPtr> mSkipCrossAttnBlocks;
+    // Indicators whether each sibling completes generation.
+    std::shared_ptr<std::vector<bool>> mSequenceFinalVec;
 
-    // Performance metrics
-    bool mReturnPerfMetrics;
+    std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
+
+    // Performance metrics.
+    bool mReturnPerfMetrics{false};
     executor::RequestPerfMetrics mPerfMetrics;
 
-    // Guided decoding params
-    std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams;
+    // Guided decoding params.
+    std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
 
-    std::optional<SizeType32> mLanguageAdapterUid;
+    std::optional<SizeType32> mLanguageAdapterUid{std::nullopt};
 
-    // the timepoint at which the request started. Used for tracking the timeout
+    // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
-    std::optional<MillisecondsType> mAllottedTimeMs;
+    std::optional<MillisecondsType> mAllottedTimeMs{std::nullopt};
 
-    TensorMap mAdditionalContextOutputTensors;    // Tensors containing the additional context output.
-    TensorMap mAdditionalGenerationOutputTensors; // Tensors containing the additional generation output.
+    // Tensors containing the additional context output.
+    TensorMap mAdditionalContextOutputTensors;
+
+    // Tensors containing the additional generation output.
+    TensorMap mAdditionalGenerationOutputTensors;
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
     std::vector<size_t> mRequestedBlockHashes;
@@ -2074,6 +2065,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
+    // 45 parameters, 45 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2120,6 +2112,7 @@ public:
     {
     }
 
+    // 45 parameters, 45 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2173,6 +2166,7 @@ public:
     {
     }
 
+    // 32 parameters, 32 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
