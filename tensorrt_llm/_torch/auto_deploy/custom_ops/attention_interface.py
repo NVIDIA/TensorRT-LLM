@@ -48,11 +48,14 @@ class AttentionInfo:
 
     num_heads: int
     num_kv_heads: int
-    head_dim: int
+    head_dim: int  # embedding size of each head
     dtype: torch.dtype
 
     cache_config: CacheConfig
     pos_embd_config: PositionalEmbeddingConfig
+    # rope_dim represents embedding size of decoupled q/k that carry rope information
+    # when rope_dim != 0 the decoupled q/k tensor carrying rope information is the last part of the tensor [-rope_dim: ]
+    rope_dim: Optional[int] = 0
 
 
 @dataclass
@@ -394,10 +397,7 @@ Constant = Union[int, float, str, None]
 class MHACallable(Protocol):
     def __call__(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *metadata_and_caches: Union[torch.Tensor, Constant],
+        *qkv_metadata_and_caches: Union[torch.Tensor, Constant],
     ) -> torch.Tensor: ...
 
 
@@ -443,16 +443,14 @@ class AttentionDescriptor(ABC):
         """Return if the attention op is paged or not."""
 
     @classmethod
-    def get_attention_op(cls) -> MHACallable:
-        """Get the attention op.
+    def get_attention_op(cls) -> Tuple[MHACallable, int]:
+        """Get the attention op and the number of arguments corresponding to qkv.
 
         The attention_op should follow the below signature:
 
         ```
         def attention_op(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
+            *qkv,       # list of tensors corresponding to Q, K, V as in original op
             *metadata,  # global info about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
             *buffers,   # global buffers used by the attention op as provided by buffer initializers
@@ -462,6 +460,9 @@ class AttentionDescriptor(ABC):
 
         **Note that the attention op should be a valid torch custom op, which comes with
         restrictions on the supported types in the signature.**
+
+        **Note that the `qkv` tuple should be consistent across both the cached attention
+        op and the op that it is replacing.**
 
         """
         raise NotImplementedError
