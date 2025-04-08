@@ -443,9 +443,11 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNas(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nemotron-nas/DeciLM-7B"
-    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/DeciLM-7B"
+    MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
 
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_summarization(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -455,8 +457,14 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
 class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=
+        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
+    )
 
     def test_auto_dtype_summarization(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
