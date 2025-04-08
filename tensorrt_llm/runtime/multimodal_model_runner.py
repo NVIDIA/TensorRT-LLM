@@ -1586,19 +1586,7 @@ class MultimodalModelRunner:
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
 
-        # TODO: Just move to cpu for chunk context
-        # import torch
-        # torch.set_printoptions(edgeitems=torch.numel(image_embeds))
-        print(
-            "======================== Inside generate of multimodal_model_runner.py ======================"
-        )
         if self.args.ptable_offloading:
-            # # Artificially expand the embeddings by repeating them
-            # expansion_factor = 96  # Adjust this number to control size
-            # image_embeds = image_embeds.repeat_interleave(expansion_factor,
-            #                                               dim=1)
-            # print("image_embeds.shape after repeat:", image_embeds.shape)
-
             # Allocate pinned memory with same shape and dtype
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
@@ -1606,16 +1594,6 @@ class MultimodalModelRunner:
             # Copy directly from GPU to pinned memory
             pinned_embeds.copy_(image_embeds, non_blocking=True)
             image_embeds = pinned_embeds
-            # image_embeds = image_embeds.cpu()
-        print("image_embeds.shape:", image_embeds.shape)
-        # print("image_embeds:", image_embeds)
-        # print("\nFirst 5 elements of each row:")
-        # print(image_embeds[0, :, :5])  # Shows all rows, first 5 elements each
-
-        # # Artificially expand the embeddings by repeating them
-        # expansion_factor = 96  # Adjust this number to control size
-        # image_embeds = image_embeds.repeat_interleave(expansion_factor, dim=1)
-        # print("image_embeds.shape after repeat:", image_embeds.shape)
 
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
