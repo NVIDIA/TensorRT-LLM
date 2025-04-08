@@ -1,0 +1,18 @@
+version: 0.0.1
+l0_dgx_h200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/multi_gpu
+  

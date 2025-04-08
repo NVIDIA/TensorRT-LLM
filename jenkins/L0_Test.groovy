@@ -265,7 +265,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def cpuCount = "${TESTER_CORES}"
 
         // Multi-GPU only supports DGX-H100 due to the hardware stability.
-        if (type.contains("dgx-h100") && hasMultipleGPUs)
+        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
@@ -279,23 +279,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type == "b100-ts2" || type.contains("dgx-h100") || type == "gh200" ) {
+        if (type == "b100-ts2" || type.contains("dgx-h100") || type.contains("dgx-h200") || type == "gh200" ) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
-        } else if (perfMode && !hasMultipleGPUs) {
-        // Not using the "perf" node currently due to hardware resource constraint.
-        // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
-        // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'"""
-        }
-        else
-        {
+        } else {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -1211,6 +1200,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
         "H100_PCIe-TensorRT-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "DGX_H200-8_GPUs-PyTorch-[Post-Merge]": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
     ]
 
     parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
