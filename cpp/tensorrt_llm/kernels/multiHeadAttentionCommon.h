@@ -38,6 +38,24 @@ enum Data_type
     DATA_TYPE_E5M2
 };
 
+static inline std::string data_type_to_string(Data_type dtype)
+{
+    switch (dtype)
+    {
+    case DATA_TYPE_BOOL: return "bool";
+    case DATA_TYPE_FP16: return "fp16";
+    case DATA_TYPE_FP32: return "fp32";
+    case DATA_TYPE_INT4: return "int4";
+    case DATA_TYPE_INT8: return "int8";
+    case DATA_TYPE_INT32: return "int32";
+    case DATA_TYPE_BF16: return "bf16";
+    case DATA_TYPE_E2M1: return "e2m1";
+    case DATA_TYPE_E4M3: return "e4m3";
+    case DATA_TYPE_E5M2: return "e5m2";
+    default: return std::to_string(static_cast<int>(dtype)) + " (unknown)";
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static inline size_t get_size_in_bits(Data_type dtype)

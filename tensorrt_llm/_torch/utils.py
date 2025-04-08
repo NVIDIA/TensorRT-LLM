@@ -138,12 +138,16 @@ def next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+def nearest_in_buckets(x: int, buckets: List[int]) -> int:
+    return min(max(next_positive_power_of_2(x), buckets[0]), buckets[-1])
+
+
 def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     max_num_tokens = next_positive_power_of_2(max_num_tokens)
     num_token_buckets = []
-    m = 1
-    while m <= max_num_tokens:
+    m = max_num_tokens
+    while m >= 1:
         num_token_buckets.append(m)
-        m *= 2
+        m //= 2
 
     return num_token_buckets

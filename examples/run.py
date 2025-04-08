@@ -167,8 +167,7 @@ def parse_input(tokenizer,
 
     if num_prepend_vtokens:
         assert len(num_prepend_vtokens) == len(batch_input_ids)
-        base_vocab_size = tokenizer.vocab_size - len(
-            tokenizer.special_tokens_map.get('additional_special_tokens', []))
+        base_vocab_size = tokenizer.vocab_size
         for i, length in enumerate(num_prepend_vtokens):
             batch_input_ids[i] = list(
                 range(base_vocab_size,

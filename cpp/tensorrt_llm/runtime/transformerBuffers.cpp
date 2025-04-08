@@ -473,7 +473,7 @@ void TransformerBuffers::copyAttentionMasks(
     auto const batchSize = generationConfig.batchSize;
     auto const maxInputLength = generationConfig.maxInputLength;
 
-    // TODO(rkobus) include tiling
+    // TODO include tiling
     attentionMask = manager.gpu(ITensor::makeShape({batchSize, maxInputLength}), nvinfer1::DataType::kINT32);
 
     auto const numContextBatches = static_cast<SizeType32>(contextBatches.size());
@@ -557,7 +557,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
         copyAttentionMasks(runtimeBuffers, contextBuffers, manager);
     }
 
-    // TODO(rkobus) handle this more gracefully
+    // TODO handle this more gracefully
     positionIds = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     if (modelConfig.computeContextLogits())

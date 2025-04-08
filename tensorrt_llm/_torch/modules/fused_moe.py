@@ -8,8 +8,7 @@ from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                     get_power_of_2_num_tokens_buckets, is_torch_compiling,
-                     next_positive_power_of_2, reswizzle_sf)
+                     reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -305,7 +304,7 @@ class FusedMoE(nn.Module):
             self.intermediate_size_per_partition,
         )
 
-        self.quant_scales = None
+        self.quant_scales = []
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
@@ -486,17 +485,6 @@ class FusedMoE(nn.Module):
             outputs.append(output)
         return outputs
 
-    def _run_profiler(self, x, output_dtype, use_fp8_block_scaling,
-                      min_latency_mode):
-        profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-            x.dtype, self.w3_w1_weight.dtype, output_dtype,
-            use_fp8_block_scaling, min_latency_mode)
-        profiler.run_profile(
-            self.w2_weight, self.routing_method.experts_per_token, self.tp_size,
-            self.tp_rank, self.ep_size, self.ep_rank,
-            get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
-        return profiler
-
     def reducescatter_or_allreduce(self, inputs):
         outputs = inputs
         if self.parallel_size > 1:
@@ -573,27 +561,7 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if is_torch_compiling():
-            profile_ids = None
-        else:
-            if not self.has_been_profiled:
-                self.profiler = self._run_profiler(x, output_dtype,
-                                                   use_fp8_block_scaling, False)
-                self.has_been_profiled = True
-
-            if not self.has_been_profiled_min_latency and min_latency_mode:
-                self.profiler_min_latency = self._run_profiler(
-                    x, output_dtype, use_fp8_block_scaling, False)
-                self.has_been_profiled_min_latency = True
-
-            profiler = self.profiler_min_latency if min_latency_mode else self.profiler
-
-            profile_ids = profiler.get_profile_ids(
-                next_positive_power_of_2(x.shape[0]), self.w2_weight,
-                self.routing_method.experts_per_token, self.num_experts)
-
-        fused_moe_op = torch.ops.trtllm.fused_moe_min_latency if min_latency_mode else torch.ops.trtllm.fused_moe
-        final_hidden_states = fused_moe_op(
+        final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
@@ -606,11 +574,12 @@ class FusedMoE(nn.Module):
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            profile_ids=profile_ids,
             use_fp8_block_scaling=use_fp8_block_scaling,
+            min_latency_mode=min_latency_mode,
         )
 
-        return final_hidden_states
+        return final_hidden_states if min_latency_mode else final_hidden_states[
+            0]
 
     def forward(
         self,

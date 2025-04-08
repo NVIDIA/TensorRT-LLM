@@ -6,7 +6,6 @@ import click
 import torch
 import yaml
 from torch.cuda import device_count
-from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -86,16 +85,13 @@ def launch_server(host: str, port: int, llm_args: dict):
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-    tokenizer = llm_args["tokenizer"]
 
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
     else:
         llm = LLM(**llm_args)
 
-    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
-
-    server = OpenAIServer(llm=llm, model=model, hf_tokenizer=hf_tokenizer)
+    server = OpenAIServer(llm=llm, model=model)
 
     asyncio.run(server(host, port))
 

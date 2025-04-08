@@ -26,7 +26,6 @@ async def create_chat_completion(req: ChatCompletionRequest = Body(...), ):
     # TODO: Update the following logic to align `llm_name` with the `mtbench` convention:
     #  \w+\/\w+ (e.g., meta-llama/Llama-2-7b).
     #
-    # Refer to the Slack thread for more details: https://nvidia.slack.com/archives/C06DF9J4ZRA/p1721894616172659?thread_ts=1721881115.768169&cid=C06DF9J4ZRA
     # Currently, the `trtllm` server accepts `llm_name` in a format not supported by `mtbench`.
     # We can replace `/` with `-` to match the Hugging Face model naming conventions.
     #
@@ -89,7 +88,6 @@ async def create_completion(req: CompletionRequest = Body(...), ):
     # TODO: Update the following logic to align `llm_name` with the `mtbench` convention:
     #  \w+\/\w+ (e.g., meta-llama/Llama-2-7b).
     #
-    # Refer to the Slack thread for more details: https://nvidia.slack.com/archives/C06DF9J4ZRA/p1721894616172659?thread_ts=1721881115.768169&cid=C06DF9J4ZRA
     # Currently, the `trtllm` server accepts `llm_name` in a format not supported by `mtbench`.
     # We can replace `/` with `-` to match the Hugging Face model naming conventions.
     #

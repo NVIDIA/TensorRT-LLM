@@ -350,7 +350,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             assert max_batch_size <= model_config.max_batch_size
         if max_input_len is None:
             max_input_len = model_config.max_input_len
-        # NOTE{pengyunl}: remove assertion here for temp fix,
+        # NOTE: remove assertion here for temp fix,
         # model_config.max_input_len is not the upper bound of input length.
         # If runtime max_input_len is not properly set,
         # C++ runtime will throw an error when fetching new requests

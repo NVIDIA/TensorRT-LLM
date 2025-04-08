@@ -27,24 +27,15 @@ permissions:
 jobs:
   Bot-command-check:
     name: Bot command check
-    if: github.event_name == 'pull_request' || startsWith(github.event.comment.body, '/bot')
+    if: |
+      startsWith(github.event.comment.body, '/bot') &&
+      !(startsWith(github.event.comment.body, '/bot run') ||
+      startsWith(github.event.comment.body, '/bot skip --comment') ||
+      startsWith(github.event.comment.body, '/bot reuse-pipeline') ||
+      startsWith(github.event.comment.body, '/bot kill'))
     runs-on: ubuntu-latest
-    outputs:
-      status: ${{ steps.check.outputs.status }}
     steps:
-      - id: check
-        name: Check bot command
-        run: |
-          if [[ "${{ github.event.comment.body }}" == "/bot run"* ]] ||
-             [[ "${{ github.event.comment.body }}" == "/bot skip --comment"* ]] ||
-             [[ "${{ github.event.comment.body }}" == "/bot reuse-pipeline"* ]] ||
-             [[ "${{ github.event.comment.body }}" == "/bot kill"* ]]; then
-            echo 'status=success' >> $GITHUB_OUTPUT
-          else
-            echo 'status=failure' >> $GITHUB_OUTPUT
-          fi
       - name: Add bot help comment
-        if: steps.check.outputs.status == 'failure'
         uses: actions/github-script@v6
         with:
           script: |

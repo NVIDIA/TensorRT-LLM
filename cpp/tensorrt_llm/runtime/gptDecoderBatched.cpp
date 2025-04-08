@@ -218,7 +218,7 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder_batch::Output& output, decoder
     return eventStop;
 }
 
-// TODO(rkobus): produce new input and output
+// TODO: produce new input and output
 void GptDecoderBatched::prepareForward(
     SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input)
 {
