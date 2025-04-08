@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/fp8BlockScaleMoe/runner.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
@@ -129,8 +129,6 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be 2D.");
     TORCH_CHECK(
         hidden_states_scale.sizes()[0] == hidden_states.sizes()[1] / 128, "hidden_states_scale has incorrect shape.");
-    // TORCH_CHECK(hidden_states_scale.sizes()[1] == hidden_states.sizes()[0], "hidden_states_scale has incorrect
-    // shape.");
     TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights must be fp8.");
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");

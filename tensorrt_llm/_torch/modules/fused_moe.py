@@ -334,6 +334,7 @@ class FusedMoE(nn.Module):
                 fc2_weight_block=self.w2_weight_scale,
                 fc2_global=self.fc2_alpha,
             )
+
     def is_trtllm(self):
         return self.moe_backend == "TRTLLM" and self.quant_config is not None
 
@@ -677,7 +678,8 @@ class FusedMoE(nn.Module):
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits, min_latency_mode, output_dtype, all_rank_num_tokens)
+            return self.forward_cutlass(x, router_logits, min_latency_mode,
+                                        output_dtype, all_rank_num_tokens)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -772,14 +774,7 @@ class FusedMoE(nn.Module):
 
         if self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
         ):
-            # TODO: We need a new kernel to support fp8 block scaling for blackwell
             x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
-            m_4_align = (x.shape[0] + 3) // 4 * 4
-            kscal_128 = (x.shape[1] + 127) // 128
-            act_scal_elesize = kscal_128 * m_4_align
-            x_scale = x_scale[:act_scal_elesize]
-            x_scale = x_scale.view(kscal_128, m_4_align)
-            x_scale = x_scale[:kscal_128, :x.shape[0]].contiguous()
 
             final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
                 router_logits,
@@ -801,10 +796,11 @@ class FusedMoE(nn.Module):
                 routed_scaling_factor,
             )
         elif self.quant_config and self.quant_config.quant_mode.has_nvfp4():
-            sfUseUE8M0 = False
-            isSfSwizzledLayout = False
+            scale_factor_use_ue8m0 = False
+            is_scale_factor_swizzled = False  # use linear layout here
             hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
-                x, self.fc31_input_scale, 16, sfUseUE8M0, isSfSwizzledLayout)
+                x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
+                is_scale_factor_swizzled)
 
             final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,

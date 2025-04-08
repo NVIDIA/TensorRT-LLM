@@ -345,6 +345,7 @@ class MLA(nn.Module):
 
         if quant_mode.has_fp8_block_scales():
             mla_weight_dtype = torch.float8_e4m3fn
+            # TODO: remove hack for fp8 Deepseek on SM100
             if config.moe_backend == "TRTLLM":
                 mla_weight_dtype = dtype
         else:
@@ -361,6 +362,7 @@ class MLA(nn.Module):
                                 skip_create_weights=config.skip_create_weights)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
+        # Used in forward_generation only
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.v_head_dim, self.kv_lora_rank),
@@ -369,6 +371,7 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        # Use in forward_generation only
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
@@ -498,7 +501,6 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-        assert hidden_states.dtype == torch.bfloat16, "Just for TRTLLM FP8 E2E test"
         if self.is_lite:
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
