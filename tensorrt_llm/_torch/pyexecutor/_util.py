@@ -132,6 +132,8 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
         # Get the torch-managed peak memory
         torch_peak_memory = torch.cuda.memory_stats(
         )["allocated_bytes.all.peak"]
+        # Free memory before clearing the caching allocator
+        free_inter_mem, _ = torch.cuda.mem_get_info()
 
         # Clear the caching allocator before measuring the current memory usage
         torch.cuda.empty_cache()
@@ -142,6 +144,18 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
         total_used_bytes = total_gpu_memory - end
         # Get the non-torch memory which comes from NCCL and some other components
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
+        if model_engine._run_cuda_graphs:
+            extra_cost_cuda_graph = 0
+            # Each graph needs 60MB memory
+            extra_cost_cuda_graph += len(
+                model_engine._cuda_graph_batch_sizes) * 60 * (1 << 20)
+            for bs in model_engine._cuda_graph_batch_sizes:
+                # During CUDA graph capture, if the graph utilizes Torch's managed memory, that portion of memory becomes part of the CUDA graph.
+                # The additional memory within the CUDA graph is adjusted to match the size of PyTorch's caching allocator.
+                extra_per_graph = max(
+                    bs * (end - free_inter_mem) / max_num_tokens, 0)
+                extra_cost_cuda_graph += extra_per_graph
+            extra_cost += extra_cost_cuda_graph
         # Get the total peak memory
         peak_memory = torch_peak_memory + extra_cost
         logger.info(
