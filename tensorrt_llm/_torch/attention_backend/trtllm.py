@@ -717,7 +717,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
             max_sequence_length=metadata.max_seq_len,
-            max_context_length=min(metadata.kv_cache_manager.max_seq_len - 1,
+            max_context_length=min(metadata.max_seq_len - 1,
                                    metadata.max_num_tokens),
             attention_window_size=None,
             sink_token_length=0,
