@@ -13,8 +13,8 @@ def apply_rope_with_input_pos_flashinfer(
 
     Inputs:
     - q, k (torch.Tensor):
-        4D tensors of shape [batch, seq_len, n_head, head_dim] in half precision
-        (torch.float16 or torch.bfloat16). Note: head_dim must be a multiple of 64.
+        tensors of shape [batch, seq_len, n_head, head_dim] or [batch, seq_len, n_head*head_dim]
+        in half precision (torch.float16 or torch.bfloat16). Note: head_dim must be a multiple of 64.
     - cos, sin (torch.Tensor):
         Tensors of shape [seq_len, head_dim]. Only the first half of the last dimension (head_dim//2 values)
         is used. They are concatenated (cos[..., :head_dim//2] with sin[..., :head_dim//2]) to form the
@@ -26,18 +26,19 @@ def apply_rope_with_input_pos_flashinfer(
 
     Returns:
     A tuple of:
-        - Rotated query tensor of shape [batch, seq_len, n_head, head_dim](in half precision).
-        - Rotated key tensor of shape [batch, seq_len, n_head, head_dim] (in half precision).
+        - Rotated query tensor of shape same as input in half precision.
+        - Rotated key tensor of shape same as input in half precision.
     """
 
     q_shape = q.shape
-    batch_size, seq_len, _, head_dim = q_shape
+    batch_size, seq_len = q_shape[:2]
+    head_dim = cos.shape[-1]
     device = q.device
 
     q_flat = q.view(batch_size * seq_len, -1)
     k_flat = k.view(batch_size * seq_len, -1)
 
-    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch_size)])
+    positions = torch.arange(seq_len, device=device).view(1, -1).expand(batch_size, -1).flatten()
     cos_sin_cache = torch.cat([cos[..., : head_dim // 2], sin[..., : head_dim // 2]], dim=-1)
 
     query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
