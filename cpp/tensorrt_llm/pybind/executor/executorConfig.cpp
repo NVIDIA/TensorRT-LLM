@@ -455,7 +455,7 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[19].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
             cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
             cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
-            cpp_states[22].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalOutputNames
+            cpp_states[22].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
             cpp_states[23].cast<bool>(),                                                   // GatherGenerationLogits
             cpp_states[24].cast<bool>()                                                    // UseVariableBeamWidthSearch
         );
@@ -489,7 +489,7 @@ void initConfigBindings(pybind11::module_& m)
                  uint64_t,                                               // MaxSeqIdleMicroseconds
                  std::optional<tle::SpeculativeDecodingConfig>,          // SpecDecConfig
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
-                 std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalOutputNames
+                 std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
                  bool,                                                   // GatherGenerationLogits
                  bool                                                    // UseVariableBeamWidthSearch
                  >(),
@@ -509,7 +509,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
-            py::arg("additional_output_names") = py::none(), py::arg("gather_generation_logits") = false,
+            py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
             py::arg("use_variable_beam_width_search") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
@@ -552,7 +552,7 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setAdditionalModelOutputs)
         .def_property("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
             &tle::ExecutorConfig::setGatherGenerationLogits)
-        .def_property("gather_generation_logits", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
+        .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
