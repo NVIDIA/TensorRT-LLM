@@ -3925,11 +3925,11 @@ TEST_P(BlockRequirementsParamTest, TestCaculateMaxBlocksRequirement)
 
 INSTANTIATE_TEST_SUITE_P(CalculateMaxBlockRequirementsPerBeam, BlockRequirementsParamTest,
     testing::Values(std::make_tuple(512, 0, 1024, 64, 8), std::make_tuple(513, 0, 1024, 64, 9),
-        std::make_tuple(512, 0, 256, 64, 4), std::make_tuple(512, 0, 257, 64, 5), std::make_tuple(512, 64, 1024, 64, 8),
-        std::make_tuple(513, 64, 1024, 64, 9), std::make_tuple(512, 64, 256, 64, 4),
-        std::make_tuple(512, 64, 257, 64, 5), std::make_tuple(512, 65, 1024, 64, 9),
-        std::make_tuple(513, 65, 1024, 64, 9), std::make_tuple(512, 65, 256, 64, 5),
-        std::make_tuple(512, 65, 257, 64, 5)));
+        std::make_tuple(512, 0, 256, 64, 5), std::make_tuple(512, 0, 257, 64, 6), std::make_tuple(512, 64, 1024, 64, 8),
+        std::make_tuple(513, 64, 1024, 64, 9), std::make_tuple(512, 64, 256, 64, 5),
+        std::make_tuple(512, 64, 257, 64, 6), std::make_tuple(512, 65, 1024, 64, 9),
+        std::make_tuple(513, 65, 1024, 64, 9), std::make_tuple(512, 65, 256, 64, 6),
+        std::make_tuple(512, 65, 257, 64, 6)));
 
 // calculateMaxBlockRequirements
 TEST(CalculateMaxBlockRequirements, BeamWidthOneEqualRequirementsPerBeam)
@@ -3958,8 +3958,8 @@ TEST(CalculateMaxBlockRequirements, AttentionWindowOverlapsInputAndOutputReferen
     auto const result = KVCacheManager::calculateMaxBlockRequirements(257, 255, 0, attentionWindow, beamWidth, 64);
     auto const numContextBlocks = 2; // (412 - 255) / 64
     // There are 29 context tokens left over to be put in output blocks, so 284 tokens to fit in output blocks in total:
-    // 5 blocks
-    auto const numOutputBlocks = 5 * beamWidth;
+    // 5 blocks + kExtraBlockBuffer
+    auto const numOutputBlocks = (5 + kExtraBlockBuffer) * beamWidth;
     ASSERT_EQ(result, numContextBlocks + numOutputBlocks);
 }
 
@@ -3971,7 +3971,7 @@ TEST(CalculateMaxAttentionWindow, OutputTooLargeForCapacity)
     auto constexpr outputLength = 255;
     auto const result
         = KVCacheManager::calculateMaxAttentionWindow(1024, outputLength, 0, blockCapacity, beamWidth, 64);
-    ASSERT_EQ(result, 192);
+    ASSERT_EQ(result, 128);
 }
 
 TEST(CalculateMaxAttentionWindow, CapacityIsEnoughForWholeSequence)

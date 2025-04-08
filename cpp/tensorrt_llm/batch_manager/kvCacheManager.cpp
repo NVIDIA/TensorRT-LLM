@@ -1943,7 +1943,12 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const actualSeqLen = std::min(sequenceLength, maxAttentionWindow);
     auto actualMaxTokenNum = actualSeqLen + sinkBubbleLength;
-    return tc::ceilDiv(actualMaxTokenNum, tokensPerBlock);
+    auto numBlocks = tc::ceilDiv(actualMaxTokenNum, tokensPerBlock);
+    if (sequenceLength > maxAttentionWindow)
+    {
+        numBlocks += kExtraBlockBuffer;
+    }
+    return numBlocks;
 }
 
 SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
@@ -1962,7 +1967,7 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     if (maxAttentionWindow <= outputLength)
     {
         return KVCacheManager::calculateMaxBlockRequirementsPerBeam(
-                   maxAttentionWindow, sinkTokenLength, maxAttentionWindow, tokensPerBlock)
+                   outputLength, sinkTokenLength, maxAttentionWindow, tokensPerBlock)
             * beamWidth;
     }
 
@@ -1973,7 +1978,11 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const numContextBlocks = (numContextTokensInAttentionWindow + sinkBubbleLength) / tokensPerBlock;
     auto const leftoverContextToken = numContextTokensInAttentionWindow - numContextBlocks * tokensPerBlock;
-    auto const numOutputBlocks = tc::ceilDiv(outputLength + leftoverContextToken, tokensPerBlock);
+    auto numOutputBlocks = tc::ceilDiv(outputLength + leftoverContextToken, tokensPerBlock);
+    if (wholeSequenceLength > maxAttentionWindow)
+    {
+        numOutputBlocks += kExtraBlockBuffer;
+    }
     return numContextBlocks + numOutputBlocks * beamWidth;
 }
 
@@ -1987,13 +1996,13 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
         = calculateMaxBlockRequirements(0, outputLength, sinkTokenLength, outputLength, beamWidth, tokensPerBlock);
     if (outputBlockRequirements > blockCapacity)
     {
-        return (blockCapacity / beamWidth) * tokensPerBlock;
+        return ((blockCapacity / beamWidth) - kExtraBlockBuffer) * tokensPerBlock;
     }
 
     // Otherwise, we need to determine how many context tokens we can fit on top of the output tokens. First, there are
     // a few context tokens we might be able to fit 'for free' because the output is not a multiple of the number of
     // tokens per block.
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
-    return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
+    return std::min(outputLength + (leftoverBlockCapacity - kExtraBlockBuffer) * tokensPerBlock, inputLength + outputLength);
 }
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
