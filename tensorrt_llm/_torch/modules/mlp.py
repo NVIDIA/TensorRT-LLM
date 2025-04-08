@@ -4,9 +4,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from ..distributed import TensorParallelMode
 from ..model_config import ModelConfig
-from .linear import Linear, WeightMode, WeightsLoadingConfig
+from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 class MLP(nn.Module):
