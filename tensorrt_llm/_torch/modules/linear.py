@@ -324,15 +324,9 @@ class Linear(nn.Module):
                 if input.dtype == torch.float8_e4m3fn:
                     input = input.to(torch.bfloat16) * self.input_scale
                 assert input.dtype == torch.bfloat16
-                # TODO: We need a new kernel to support fp8 block scaling for blackwell
-                act_input_fp8, a_scale = torch.ops.trtllm.fp8_quantize_1x128(
+
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                m_4_align = (input.shape[0] + 3) // 4 * 4
-                kscal_128 = (input.shape[1] + 127) // 128
-                act_scal_elesize = kscal_128 * m_4_align
-                a_scale = a_scale[:act_scal_elesize]
-                a_scale = a_scale.view(kscal_128, m_4_align)
-                act_input_sf = a_scale[:kscal_128, :input.shape[0]].contiguous()
 
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
                     act_input_fp8, self.weight, act_input_sf, self.weight_scale)
@@ -407,11 +401,7 @@ class Linear(nn.Module):
         assert self._weights_created
 
         def copy(dst: Parameter, src: torch.Tensor):
-            # TODO: Update this once we have BMM FP8 working with blackwell
-            #assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
-            assert dst.dtype == src.dtype or (
-                dst.dtype == torch.bfloat16 and src.dtype == torch.float8_e4m3fn
-            ), f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
+            assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
             dst.data.copy_(src)
 
         weight_mode = self.weights_loading_config.weight_mode

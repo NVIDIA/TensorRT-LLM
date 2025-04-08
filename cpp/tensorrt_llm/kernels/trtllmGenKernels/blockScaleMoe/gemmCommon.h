@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -190,8 +190,8 @@ inline void checkAndUpdateGemmOptions(
     }
     if (options.mDtypeElt == tg::Dtype::E4m3 && options.mMmaK != 32)
     {
-        TLLM_LOG_WARNING(
-            "Unsupported MmaK (", options.mMmaK, ") for ", gemm::toString(options.mDtypeElt), ". Setting MmaK to 32");
+        TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK, ") for ", gemm::toString(options.mDtypeElt).c_str(),
+            ". Setting MmaK to 32");
         options.mMmaK = 32;
         options.mTileK = std::max(options.mMmaK, options.mTileK);
     }
@@ -205,7 +205,7 @@ inline void checkAndUpdateGemmOptions(
         if (options.mMmaK != 64)
         {
             int newTileK = 64 * divUp(options.mTileK, 64);
-            TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK, ") for ", gemm::toString(options.mDtypeElt),
+            TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK, ") for ", gemm::toString(options.mDtypeElt).c_str(),
                 ". Setting MmaK to 64 and TileK to ", newTileK);
             options.mMmaK = 64;
             options.mTileK = newTileK;
@@ -213,7 +213,7 @@ inline void checkAndUpdateGemmOptions(
         if (options.mMmaM != 128)
         {
             int newTileM = 128 * divUp(options.mTileM, 128);
-            TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM, ") for ", gemm::toString(options.mDtypeElt),
+            TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM, ") for ", gemm::toString(options.mDtypeElt).c_str(),
                 ". Setting MmaM to 128 and TileM to ", newTileM);
             options.mMmaM = 128;
             options.mTileM = newTileM;

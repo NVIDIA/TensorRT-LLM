@@ -183,7 +183,6 @@ def create_py_executor(executor_config: ExecutorConfig,
         executor_config.pytorch_backend_config.use_kv_cache = False
 
     kv_cache_max_tokens = None
-    # TODO: remove this once we have a loop fix for routing token limit
     if model_engine.model.model_config.is_generation:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             model_engine, executor_config, mapping)
