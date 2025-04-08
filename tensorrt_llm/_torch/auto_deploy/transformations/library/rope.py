@@ -141,53 +141,42 @@ def match_rope(
         q_node = q_match["raw_input"]
         k_node = k_match["raw_input"]
 
-        # Fetch original 4D shape
-        q_shape = q_node.meta.get("tensor_meta").shape if "tensor_meta" in q_node.meta else None
-        if q_shape is None:
-            raise RuntimeError("q_node does not have tensor_meta information.")
-        batch, n_head, seq_len, head_dim = q_shape
-
         cos_node = q_match["unsqueeze_cos"].args[0]
         sin_node = q_match["unsqueeze_sin"].args[0]
         # Sanity-check: ensure cos_node eventually comes from torch.ops.aten.cos
-        bfs(cos_node, lambda n: is_op(n, torch.ops.aten.cos), attr_next="all_input_nodes")
+        bfs(
+            cos_node,
+            lambda n: is_op(n, torch.ops.aten.cos),
+            attr_next="all_input_nodes",
+            boundary=start_boundary,
+        )
         # Sanity-check: ensure sin_node eventually comes from torch.ops.aten.sin
-        bfs(sin_node, lambda n: is_op(n, torch.ops.aten.sin), attr_next="all_input_nodes")
+        bfs(
+            sin_node,
+            lambda n: is_op(n, torch.ops.aten.sin),
+            attr_next="all_input_nodes",
+            boundary=start_boundary,
+        )
         # TODO: extract a concrete value and register as buffer to avoid recalculation
 
         with graph.inserting_before(q_match["add_node"]):
-            # Insert transpose nodes to change q and k layout from
-            # [batch, n_head, seq_len, head_dim] to [batch, seq_len, n_head, head_dim]
+            # q = q.transpose(1, 2).contiguous()
+            # k = k.transpose(1, 2).contiguous()
             q_transposed = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
             k_transposed = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            # Insert view nodes to flatten q and k [batch * seq_len, n_head * head_dim]
-            # as expected by the custom op.
-            q_flat = graph.call_function(
-                torch.ops.aten.view, args=(q_transposed, [batch * seq_len, n_head * head_dim])
-            )
-            k_flat = graph.call_function(
-                torch.ops.aten.view, args=(k_transposed, [batch * seq_len, n_head * head_dim])
-            )
+            q_transposed_contiguous = graph.call_method("contiguous", (q_transposed,))
+            k_transposed_contiguous = graph.call_method("contiguous", (k_transposed,))
             flash_node = graph.call_function(
                 torch.ops.rope.flashinfer,
-                args=(q_flat, k_flat, cos_node, sin_node),
+                args=(q_transposed_contiguous, k_transposed_contiguous, cos_node, sin_node),
             )
-
         with graph.inserting_after(flash_node):
             raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
             raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
         with graph.inserting_after(raw_q):
-            new_q_view = graph.call_function(
-                torch.ops.aten.view, args=(raw_q, [batch, seq_len, n_head, head_dim])
-            )
-        with graph.inserting_after(new_q_view):
-            new_q = graph.call_function(torch.ops.aten.transpose, args=(new_q_view, 1, 2))
+            new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
         with graph.inserting_after(raw_k):
-            new_k_view = graph.call_function(
-                torch.ops.aten.view, args=(raw_k, [batch, seq_len, n_head, head_dim])
-            )
-        with graph.inserting_after(new_k_view):
-            new_k = graph.call_function(torch.ops.aten.transpose, args=(new_k_view, 1, 2))
+            new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
 
         q_match["add_node"].replace_all_uses_with(new_q)
         k_match["add_node"].replace_all_uses_with(new_k)

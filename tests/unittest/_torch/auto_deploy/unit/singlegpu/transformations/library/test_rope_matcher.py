@@ -56,7 +56,7 @@ class RotaryModel(torch.nn.Module):
         sin = sin.to(q.device)
 
         q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
-        return q_embed + k_embed
+        return (q_embed + k_embed).to(torch.float16)
 
 
 @torch.inference_mode()

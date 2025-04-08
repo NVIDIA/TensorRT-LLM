@@ -67,18 +67,16 @@ def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
     k_for_hf = key.transpose(1, 2).clone()
     q_hf, k_hf = apply_rotary_pos_emb(q_for_hf, k_for_hf, cos_new, sin_new, unsqueeze_dim=0)
     # Convert outputs to [batch, seq_len, n_head, head_dim]
-    q_hf = q_hf.transpose(1, 2).to(torch.float32)
-    k_hf = k_hf.transpose(1, 2).to(torch.float32)
+    q_hf = q_hf.transpose(1, 2).to(dtype)
+    k_hf = k_hf.transpose(1, 2).to(dtype)
 
     # Custom op call
-    custom_q_flat, custom_k_flat = torch.ops.rope.flashinfer(query_flat, key_flat, cos_new, sin_new)
-    custom_q = custom_q_flat.view(batch, seq_len, n_head, head_dim)
-    custom_k = custom_k_flat.view(batch, seq_len, n_head, head_dim)
+    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_new, sin_new)
 
-    atol = 1e-3 if dtype == torch.float16 else 1e-2
-    rtol = 1e-3 if dtype == torch.float16 else 1e-2
+    atol = 5e-4 if dtype == torch.float16 else 1e-4
+    rtol = 5e-4 if dtype == torch.float16 else 1e-4
 
-    torch.testing.assert_close(q_hf, q_flash.to(torch.float32), rtol=rtol, atol=atol)
-    torch.testing.assert_close(k_hf, k_flash.to(torch.float32), rtol=rtol, atol=atol)
-    torch.testing.assert_close(q_hf, custom_q.to(torch.float32), rtol=rtol, atol=atol)
-    torch.testing.assert_close(k_hf, custom_k.to(torch.float32), rtol=rtol, atol=atol)
+    torch.testing.assert_close(q_hf, q_flash, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
+    torch.testing.assert_close(q_hf, custom_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k_hf, custom_k, rtol=rtol, atol=atol)

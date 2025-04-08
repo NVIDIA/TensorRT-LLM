@@ -289,11 +289,21 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def bfs(node: Node, target: Callable, attr_next: str = "users") -> Node:
+def bfs(
+    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
+) -> Node:
     queue = [node]
+    visited = set()
     while queue:
         cur_node = queue.pop(0)
+        if boundary is not None and cur_node == boundary:
+            continue  # Skip the boundary node.
         if target(cur_node):
             return cur_node
-        queue.extend(getattr(cur_node, attr_next))
+        for next_node in getattr(cur_node, attr_next):
+            if boundary is not None and next_node == boundary:
+                continue  # Do not expand past the boundary.
+            if next_node not in visited:
+                visited.add(next_node)
+                queue.append(next_node)
     raise RuntimeError(f"Could not find node with target condition {target}.")

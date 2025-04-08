@@ -13,8 +13,8 @@ def apply_rope_with_input_pos_flashinfer(
 
     Inputs:
     - q, k (torch.Tensor):
-        2D tensors of shape [batch * seq_len, n_head * head_dim] in half precision (torch.float16 or torch.bfloat16).
-        Note: head_dim must be a multiple of 64.
+        4D tensors of shape [batch, seq_len, n_head, head_dim] in half precision
+        (torch.float16 or torch.bfloat16). Note: head_dim must be a multiple of 64.
     - cos, sin (torch.Tensor):
         Tensors of shape [seq_len, head_dim]. Only the first half of the last dimension (head_dim//2 values)
         is used. They are concatenated (cos[..., :head_dim//2] with sin[..., :head_dim//2]) to form the
@@ -26,25 +26,26 @@ def apply_rope_with_input_pos_flashinfer(
 
     Returns:
     A tuple of:
-        - Rotated query tensor of shape [batch * seq_len, n_head * head_dim](converted to torch.float).
-        - Rotated key tensor of shape [batch * seq_len, n_head * head_dim] (converted to torch.float).
+        - Rotated query tensor of shape [batch, seq_len, n_head, head_dim](in half precision).
+        - Rotated key tensor of shape [batch, seq_len, n_head, head_dim] (in half precision).
     """
 
-    seq_len = cos.shape[0]
-    batch = q.shape[0] // seq_len
-    head_dim = cos.shape[1]
+    q_shape = q.shape
+    batch_size, seq_len, _, head_dim = q_shape
     device = q.device
 
-    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch)])
+    q_flat = q.view(batch_size * seq_len, -1)
+    k_flat = k.view(batch_size * seq_len, -1)
 
-    D = cos.shape[-1] // 2
-    cos_sin_cache = torch.cat([cos[..., :D], sin[..., :D]], dim=-1)
+    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch_size)])
+    cos_sin_cache = torch.cat([cos[..., : head_dim // 2], sin[..., : head_dim // 2]], dim=-1)
 
     query_rotated_flash, key_rotated_flash = flashinfer.rope.apply_rope_with_cos_sin_cache(
-        positions, q, k, head_dim, cos_sin_cache, is_neox=True
+        positions, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=True
     )
-
-    return query_rotated_flash.to(torch.float), key_rotated_flash.to(torch.float)
+    query_rotated_flash = query_rotated_flash.view(q_shape)
+    key_rotated_flash = key_rotated_flash.view(q_shape)
+    return query_rotated_flash, key_rotated_flash
 
 
 @apply_rope_with_input_pos_flashinfer.register_fake
