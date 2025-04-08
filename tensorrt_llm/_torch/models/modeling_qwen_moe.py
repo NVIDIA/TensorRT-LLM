@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +15,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, DefaultMoeRoutingMethod
+from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -74,11 +74,15 @@ class QwenMoE(nn.Module):
                                          dtype=config.torch_dtype,
                                          quant_config=None)
 
-    def forward(self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        
+
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
             max_num_token = max(all_rank_num_tokens)
@@ -86,7 +90,8 @@ class QwenMoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits, all_rank_num_tokens)
+        final_hidden_states = self.experts(hidden_states, router_logits,
+                                           all_rank_num_tokens)
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = F.sigmoid(
@@ -152,12 +157,8 @@ class QwenMoeAttention(Attention):
 
 class QwenMoeDecoderLayer(DecoderLayer):
 
-    def __init__(
-        self,
-        model_config: ModelConfig[Qwen2MoeConfig],
-        layer_idx: int,
-        aux_stream: torch.cuda.Stream
-    ):
+    def __init__(self, model_config: ModelConfig[Qwen2MoeConfig],
+                 layer_idx: int, aux_stream: torch.cuda.Stream):
         super().__init__()
         config = model_config.pretrained_config
         self.self_attn = QwenMoeAttention(
@@ -345,4 +346,3 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                         for n, p in module._parameters.items():
                             if p is not None:
                                 p.data.copy_(module_weights[n][:])
-

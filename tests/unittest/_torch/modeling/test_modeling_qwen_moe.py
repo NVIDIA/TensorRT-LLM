@@ -21,39 +21,37 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 QWEN2_57B_A14B_CONFIG = {
-    "architectures": [
-    "Qwen2MoeForCausalLM"
-  ],
-  "attention_dropout": 0.0,
-  "bos_token_id": 151643,
-  "decoder_sparse_step": 1,
-  "eos_token_id": 151643,
-  "hidden_act": "silu",
-  "hidden_size": 3584,
-  "initializer_range": 0.02,
-  "intermediate_size": 18944,
-  "max_position_embeddings": 131072,
-  "max_window_layers": 28,
-  "model_type": "qwen2_moe",
-  "moe_intermediate_size": 2560,
-  "norm_topk_prob": False,
-  "num_attention_heads": 28,
-  "num_experts": 64,
-  "num_experts_per_tok": 8,
-  "num_hidden_layers": 28,
-  "num_key_value_heads": 4,
-  "output_router_logits": False,
-  "rms_norm_eps": 1e-06,
-  "rope_theta": 1000000.0,
-  "router_aux_loss_coef": 0.001,
-  "shared_expert_intermediate_size": 20480,
-  "sliding_window": 131072,
-  "tie_word_embeddings": False,
-  "torch_dtype": "bfloat16",
-  "transformers_version": "4.40.1",
-  "use_cache": True,
-  "use_sliding_window": False,
-  "vocab_size": 151936
+    "architectures": ["Qwen2MoeForCausalLM"],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "decoder_sparse_step": 1,
+    "eos_token_id": 151643,
+    "hidden_act": "silu",
+    "hidden_size": 3584,
+    "initializer_range": 0.02,
+    "intermediate_size": 18944,
+    "max_position_embeddings": 131072,
+    "max_window_layers": 28,
+    "model_type": "qwen2_moe",
+    "moe_intermediate_size": 2560,
+    "norm_topk_prob": False,
+    "num_attention_heads": 28,
+    "num_experts": 64,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 4,
+    "output_router_logits": False,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000.0,
+    "router_aux_loss_coef": 0.001,
+    "shared_expert_intermediate_size": 20480,
+    "sliding_window": 131072,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.40.1",
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 151936
 }
 
 
@@ -108,7 +106,7 @@ class TestQwenMoe(unittest.TestCase):
         tokens_per_block = 128
         head_dim = qwen_moe.config.hidden_size // qwen_moe.config.num_attention_heads
         num_layers = qwen_moe.config.num_hidden_layers
-        num_heads = qwen_moe.config.num_attention_heads
+        qwen_moe.config.num_attention_heads
         num_kv_heads = qwen_moe.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = len(sequence_length)
@@ -166,16 +164,16 @@ class TestQwenMoe(unittest.TestCase):
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = qwen_moe.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
+                                      position_ids=position_ids,
+                                      attn_metadata=attn_metadata)
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = qwen_moe.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata,
-                                     return_context_logits=True)
+                                      position_ids=position_ids,
+                                      attn_metadata=attn_metadata,
+                                      return_context_logits=True)
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
@@ -218,7 +216,7 @@ class TestQwenMoe(unittest.TestCase):
         tokens_per_block = 128
         head_dim = qwen_moe.config.hidden_size // qwen_moe.config.num_attention_heads
         num_layers = qwen_moe.config.num_hidden_layers
-        num_heads = qwen_moe.config.num_attention_heads
+        qwen_moe.config.num_attention_heads
         num_kv_heads = qwen_moe.config.num_key_value_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
@@ -277,11 +275,11 @@ class TestQwenMoe(unittest.TestCase):
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = qwen_moe.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
+                                      position_ids=position_ids,
+                                      attn_metadata=attn_metadata)
             ref = hf_qwen_moe.forward(input_ids=input_ids.unsqueeze(0),
-                                     position_ids=position_ids,
-                                     use_cache=True)
+                                      position_ids=position_ids,
+                                      use_cache=True)
 
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
@@ -317,8 +315,8 @@ class TestQwenMoe(unittest.TestCase):
             attn_metadata.prepare()
             if not scenario.use_cuda_graph:
                 return qwen_moe.forward(input_ids=input_ids,
-                                       position_ids=position_ids,
-                                       attn_metadata=attn_metadata)
+                                        position_ids=position_ids,
+                                        attn_metadata=attn_metadata)
             else:
                 graph_runner = DecodingCUDAGraphRunner(
                     attn_metadata.max_num_requests, "cuda", attn_metadata)
@@ -343,9 +341,9 @@ class TestQwenMoe(unittest.TestCase):
                                  position_ids=gen_position_ids,
                                  attn_metadata=attn_metadata)
             ref = hf_qwen_moe.forward(input_ids=gen_input_ids.unsqueeze(0),
-                                     position_ids=gen_position_ids,
-                                     past_key_values=ref.past_key_values,
-                                     use_cache=True)
+                                      position_ids=gen_position_ids,
+                                      past_key_values=ref.past_key_values,
+                                      use_cache=True)
 
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
