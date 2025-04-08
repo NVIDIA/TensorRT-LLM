@@ -135,6 +135,12 @@ private:
 
 public:
     TensorPtr sequenceLengthsDevice;
+    bool runtimeIsChunkedContext;
+
+    std::unique_ptr<PromptTuningBuffers>& getPromptTuningBuffers()
+    {
+        return promptTuningBuffers;
+    }
 
 private:
     //! Runtime

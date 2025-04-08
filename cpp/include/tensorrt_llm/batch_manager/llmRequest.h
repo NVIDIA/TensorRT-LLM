@@ -553,6 +553,14 @@ public:
         return mTokens.at(beam);
     }
 
+    /// @brief Get mutable reference to tokens for a specific beam
+    /// @param beam The beam index
+    /// @return Mutable reference to the tokens vector
+    [[nodiscard]] VecTokens& getTokensMutable(SizeType32 beam)
+    {
+        return mTokens.at(beam);
+    }
+
     /// @brief Get all tokens (input+output) for all beams
     /// @return A vector of vector of tokens.
     [[nodiscard]] BeamTokens const& getTokens() const
@@ -1016,7 +1024,7 @@ public:
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
-
+        printf("setPrepopulatedPromptLen: %u\n", prepopulatedPromptLen);
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
@@ -1035,6 +1043,7 @@ public:
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
             setContextCurrentPosition(prepopulatedPromptLen);
+            printf("chunkSize = %u\n", chunkSize);
             setContextChunkSize(chunkSize);
 
             if (!isLastContextChunk())
@@ -1517,6 +1526,7 @@ public:
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
+        printf("setContextChunkSize: size = %u, new mContextChunkSize = %u\n", size, mContextChunkSize);
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
@@ -1536,6 +1546,7 @@ public:
     void moveToNextContextChunk()
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
+        printf("moveToNextContextChunk\n");
         mContextCurrentPosition += getContextChunkSize();
         setContextChunkSize(0);
     }
@@ -1771,6 +1782,9 @@ public:
     SizeType32 mMaskPosition{0};
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
+
+    // Position of current ptable index
+    SizeType32 mPtableCurrentPosition{0};
 
 protected:
     bool mIsStreaming;
