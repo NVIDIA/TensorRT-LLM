@@ -28,6 +28,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+enum class KvCacheDataType;
+
 struct MlaMetaParams
 {
     int32_t q_lora_rank = 0;
@@ -48,8 +50,9 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
-    T const* latent_cache;       // cKV + k_pe
-    T* attention_input_buf;      // [b, s, 3, h, d_h + r]
+    T const* latent_cache;  // cKV + k_pe
+    T* attention_input_buf; // [b, s, 3, h, d_h + r]
+    void* quant_attention_input_buf;
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 
@@ -68,6 +71,16 @@ struct MlaParams
     int32_t q_pe_stride;
     MlaMetaParams meta;
     int const* block_ids_per_seq;
+    KvCacheDataType cache_type;
+    // Scales for mla quantization
+    float* bmm1_scale;
+    float* bmm2_scale;
+    float const* quant_scale_o;
+    float const* quant_scale_q;
+    float const* quant_scale_kv;
+    float const* dequant_scale_q;
+    float const* dequant_scale_kv;
+    float host_bmm1_scale;
 };
 
 template <typename T, typename KVCacheBuffer>

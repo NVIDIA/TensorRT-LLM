@@ -1410,6 +1410,12 @@ class PyExecutor:
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
+        # For gen-only benchmarking, mark new gen request as transmission complete right away
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            for req in new_gen_reqs:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            return
+
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
@@ -1744,16 +1750,18 @@ class PyExecutor:
 
     @nvtx_range("_handle_cancelled_requests")
     def _handle_cancelled_requests(self):
-        if not self.canceled_req_ids:
-            return
-
         #TODO: properly handle canceled ids in pp case
-        if self.dist.has_tp and self.canceled_req_ids:
+        if self.dist.has_tp:
             self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
                                                         root=0)
 
+        if len(self.canceled_req_ids) == 0:
+            return
+
         cancelled_responses = {}
         left_requests = []
+        # Tracks canceled requests for proper handling in overlap mode during `decoder.update_requests`.
+        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
@@ -1762,6 +1770,8 @@ class PyExecutor:
                 request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
+                self.canceled_requests.append(request)
+                self.canceled_req_ids.erase(req_id)
             else:
                 left_requests.append(request)
         self.active_requests = left_requests

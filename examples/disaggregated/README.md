@@ -9,12 +9,14 @@ You can use multiple `trtllm-serve` commands to launch the context and generatio
 for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
 
 ```
+echo -e "pytorch_backend_config:\n  enable_overlap_scheduler: False" > extra-llm-api-config.yml
+
 export TRTLLM_USE_UCX_KVCACHE=1
 #Context servers
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhsot --port 8001 --backend pytorch &> log_ctx_0 &
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhsot --port 8002 --backend pytorch &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml &> log_ctx_1 &
 #Generation servers
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhsot --port 8003 --backend pytorch &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
@@ -30,10 +32,12 @@ hostname: localhost
 port: 8000
 backend: pytorch
 context_servers:
+  num_instances: 2
   urls:
       - "localhost:8001"
       - "localhost:8002"
 generation_servers:
+  num_instances: 1
   urls:
       - "localhost:8003"
 ```

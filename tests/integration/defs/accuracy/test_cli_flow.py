@@ -18,8 +18,8 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, skip_no_nvls, skip_pre_ada,
-                        skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_nvls,
+                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k,
                             PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
@@ -57,9 +57,8 @@ class TestGpt2(CliFlowAccuracyTestHarness):
     def test_int8_kv_cache(self):
         self.run(kv_cache_quant_algo=QuantAlgo.INT8)
 
-    @pytest.mark.parametrize("per_token,per_channel", [(False, False),
-                                                       (True, True)],
-                             ids=["", "per_token-per_channel"])
+    @parametrize_with_ids("per_token,per_channel", [(False, False),
+                                                    (True, True)])
     def test_smooth_quant(self, per_token: bool, per_channel: bool):
         if per_token:
             if per_channel:
@@ -297,8 +296,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  ],
                  extra_summarize_args=["--lookahead_config=[7,7,7]"])
 
-    @pytest.mark.parametrize("cuda_graph", [False, True],
-                             ids=["", "cuda_graph"])
+    @parametrize_with_ids("cuda_graph", [False, True])
     def test_medusa(self, cuda_graph, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
@@ -318,13 +316,9 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
 
-    @pytest.mark.parametrize("cuda_graph,chunked_context,typical_acceptance",
-                             [(False, False, False), (True, False, False),
-                              (True, True, False), (True, False, True)],
-                             ids=[
-                                 "", "cuda_graph", "cuda_graph-chunked_context",
-                                 "cuda_graph-typical_acceptance"
-                             ])
+    @parametrize_with_ids("cuda_graph,chunked_context,typical_acceptance",
+                          [(False, False, False), (True, False, False),
+                           (True, True, False), (True, False, True)])
     def test_eagle(self, cuda_graph, chunked_context, typical_acceptance,
                    mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")

@@ -505,7 +505,7 @@ void BlockManager::allocatePools(nvinfer1::DataType dtype, bool useUvm)
         if (useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
         else
-            pool.primaryPtr = mBufferManager.gpu(cacheShape, poolDtype);
+            pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
 
         if (mNumSecondaryBlocks > 0)
         {

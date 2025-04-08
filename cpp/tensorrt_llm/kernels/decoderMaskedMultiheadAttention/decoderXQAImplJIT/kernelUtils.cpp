@@ -50,7 +50,8 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
     {
         return false;
     }
-    bool is_vanilla_mha = xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads;
+    bool const is_vanilla_mha = !xqaParams.multi_query_tokens
+        && (xqaParams.num_kv_heads == 0 || xqaParams.num_q_heads == xqaParams.num_kv_heads);
     if (is_vanilla_mha && xqaParams.beam_width == 1)
     {
         // Do not use XQA kernel for vanilla MHA case for performance reasons.

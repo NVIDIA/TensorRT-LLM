@@ -57,8 +57,12 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     {
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type should be the same as input data type.");
-        TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeOut,
-            "Output data type should be the same as input data type.");
+
+        // For FP8 MLA generation, the output type is BF16, which could be different from the input type.
+        // So we shouldn't do this check anymore.
+        // TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeOut,
+        //     "Output data type should be the same as input data type.");
+
         mFMHARunner.reset(new FusedMHARunnerV2(fixedParams));
     }
 }
