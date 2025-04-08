@@ -431,7 +431,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
 accuracy/test_llm_api_pytorch.py::TestMinitron4BBaseInstruct::test_fp8_prequantized_summarization
-accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp2_summarization
+accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_summarization
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s

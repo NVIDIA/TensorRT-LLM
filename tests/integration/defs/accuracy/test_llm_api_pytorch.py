@@ -443,12 +443,10 @@ class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
 
 
 class TestNemotronNas(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+    MODEL_NAME = "nemotron-nas/DeciLM-7B"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/DeciLM-7B"
 
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype_tp2_summarization(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+    def test_auto_dtype_summarization(self):
+        with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
