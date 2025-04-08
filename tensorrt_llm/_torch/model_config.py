@@ -89,8 +89,8 @@ class ModelConfig(Generic[TConfig]):
         # Find the cache path by looking for the config.json file which should be in all
         # huggingface models
         model_dir = Path(
-            transformers.file_utils.get_file_from_repo(checkpoint_dir,
-                                                       'config.json')).parent
+            transformers.utils.hub.cached_file(checkpoint_dir,
+                                               'config.json')).parent
         quant_config = QuantConfig()
         layer_quant_config = None
         # quantized ckpt in modelopt format

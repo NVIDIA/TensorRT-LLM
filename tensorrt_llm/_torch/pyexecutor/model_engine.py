@@ -132,18 +132,12 @@ def load_weights(checkpoint_dir: str):
         for file in weight_files:
             # try mmap first, if failed, turn off mmap
             try:
-                part_weights = torch.load(file,
-                                          weights_only=True,
-                                          map_location='cpu',
-                                          mmap=True)
+                part_weights = torch.load(file, map_location='cpu', mmap=True)
             except Exception:
                 logger.warning(
                     f"Failed to load {file} with mmap=True, fallback to mmap=False"
                 )
-                part_weights = torch.load(file,
-                                          weights_only=True,
-                                          map_location='cpu',
-                                          mmap=False)
+                part_weights = torch.load(file, map_location='cpu', mmap=False)
             weights.update(part_weights)
         return weights
 
