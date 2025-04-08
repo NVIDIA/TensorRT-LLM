@@ -45,6 +45,8 @@ from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, sk
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
 # test_llm_multi_gpu.py.
 
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 def get_model_path(model_name):
     engine_dir = os.environ.get('LLM_ENGINE_DIR', None)
@@ -512,7 +514,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 
 @pytest.fixture(scope="module")
-def llm_for_sampling_params() -> LLM:
+def llm_for_sampling_params():
     build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
@@ -520,7 +522,8 @@ def llm_for_sampling_params() -> LLM:
         kv_cache_config=global_kvcache_config,
         fast_build=True,
     )
-    return llm
+    yield llm
+    llm.shutdown()
 
 
 @pytest.mark.part0

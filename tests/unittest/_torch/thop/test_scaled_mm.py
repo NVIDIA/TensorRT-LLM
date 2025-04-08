@@ -53,7 +53,6 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         scale_w,
         bias=None,
         out_dtype=output_dtype,
-        userbuffers_id=-1,
     )
     # set pytorch's cublas workspace size to 32MB to be aligned with trtllm
     old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")
