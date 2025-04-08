@@ -29,7 +29,7 @@ def _register_fake():
             scale_output = input.new_empty(scale_shape, dtype=torch.uint8)
             return [final_output, scale_output, inter_output]
         elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
-            final_output = input.new_empty(fp4_shape, dtype=torch.float8_e4m3fn)
+            final_output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
             inter_output = torch.empty_like(input)
             return [final_output, inter_output]
         elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
@@ -52,7 +52,7 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias,
         out_dtype,
-        userbuffers_id,
+        userbuffers_id=False,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
