@@ -788,7 +788,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     }
     if (modelConfig.usePromptTuning())
     {
-        printf("runtimeIsChunkedContext: %d\n", runtimeIsChunkedContext);
         promptTuningBuffers->runtimeIsChunkedContext = runtimeIsChunkedContext;
         promptTuningBuffers->fill(contextRequests, genRequests, manager, modelConfig.usePackedInput());
     }

@@ -1043,7 +1043,6 @@ public:
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
             setContextCurrentPosition(prepopulatedPromptLen);
-            printf("chunkSize = %u\n", chunkSize);
             setContextChunkSize(chunkSize);
 
             if (!isLastContextChunk())
@@ -1526,7 +1525,6 @@ public:
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
-        printf("setContextChunkSize: size = %u, new mContextChunkSize = %u\n", size, mContextChunkSize);
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
@@ -1546,7 +1544,6 @@ public:
     void moveToNextContextChunk()
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
-        printf("moveToNextContextChunk\n");
         mContextCurrentPosition += getContextChunkSize();
         setContextChunkSize(0);
     }

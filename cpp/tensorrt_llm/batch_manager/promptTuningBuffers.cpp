@@ -32,8 +32,6 @@ PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::Buffe
     // vocabSize and mMaxPromptVocabSize
     mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
-    printf("===== maxPromptEmbeddingTableSize = %d, maxBatchSize = %d, mMaxPromptVocabSize = %d =====\n",
-        maxPromptEmbeddingTableSize, maxBatchSize, mMaxPromptVocabSize);
 
     // optionalParams.enableChunkedContext || modelConfig.getContextFMHA()
 
@@ -123,22 +121,15 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
             // request This if statement is to check if the context chunk mode is enabled
             if (batchIdx < numContextRequests)
             {
-                printf("runtimeIsChunkedContext: %d\n", runtimeIsChunkedContext);
-                if (runtimeIsChunkedContext) // runtimeIsChunkedContext
+                if (runtimeIsChunkedContext)
                 {
-                    printf(
-                        "Context chunk mode!! Need to get prompt embedding table from current chunk ptable buffer\n");
                     optReqPromptEmbeddingTable = getChunkPtableBuffer(getChunkPtableCurrentIndex());
                     optReqPromptVocabSize = getChunkPtableBufferSliceSize(getChunkPtableCurrentIndex(), batchIdx);
-                    printf("optReqPromptEmbeddingTable.size = %ld, optReqPromptVocabSize = %d\n",
-                        optReqPromptEmbeddingTable.value()->getShape().d[0], optReqPromptVocabSize.value());
                 }
                 else
                 {
                     optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
                     optReqPromptVocabSize = llmReq->getPromptVocabSize();
-                    printf("optReqPromptEmbeddingTable.size = %ld, optReqPromptVocabSize = %d\n",
-                        optReqPromptEmbeddingTable.value()->getShape().d[1], optReqPromptVocabSize.value());
                 }
             }
             // auto optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
@@ -190,13 +181,6 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
             ++batchIdx;
         }
     }
-
-    // auto const batchSize = batchIdx;
-    // TensorPtr tasksHost = runtime::BufferManager::pinned(ITensor::makeShape({batchSize}),
-    // nvinfer1::DataType::kINT32); auto* tasksHostPtr = runtime::bufferCast<SizeType32>(*tasksHost);
-    // std::iota(tasksHostPtr, tasksHostPtr + batchSize, 0);
-    // mPromptTuningParams.fillTasksTensor(
-    //     tasksHost, batchSize, numContextRequests, reqBeamWidths, reqPromptLengths, manager, packed);
 
     auto const batchSize = batchIdx;
     std::vector<SizeType32> tasksHostVec(batchSize);

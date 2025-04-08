@@ -834,17 +834,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 f"Batch size of input_token_extra_ids ({len(input_token_extra_ids)}) must be the same as input batch size ({len(batch_input_ids_list)})"
         prompt_tuning_configs = len(batch_input_ids_list) * [None]
         if prompt_table is not None:
-            # TODO: Just move to cpu for chunk context
-            # prompt_table_data = self._prepare_embedding_table(
-            #     prompt_table).cuda()
-            print("Branch to see if it's ptable offloading or not")
             if ptable_offloading:
-                print("move to pin memory")
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).pin_memory()
-                # prompt_table_data = self._prepare_embedding_table(prompt_table)
             else:
-                print("move to cuda")
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).cuda()
             if prompt_tasks is not None:
