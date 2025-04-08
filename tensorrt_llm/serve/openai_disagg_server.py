@@ -7,7 +7,7 @@ import os
 import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Optional, Union
+from typing import List, Optional, Type, Union
 
 import aiohttp
 import uvicorn
@@ -94,7 +94,9 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
-    async def merge_streaming_responses(self, ctx_response, gen_server, gen_req):
+    async def merge_streaming_responses(self, ctx_response,
+                                        gen_server: str,
+                                        gen_req: Union[CompletionRequest, ChatCompletionRequest]):
         # First yield the context response if it's not None
         if ctx_response is not None:
             # Remove the disaggregated params from the context response
@@ -104,7 +106,13 @@ class OpenAIDisaggServer:
             yield f"data: {data}\n\n".encode('utf-8')
 
         # Then yield the generation responses
-        gen_response = await self.send_request(gen_server, gen_req)
+        if isinstance(gen_req, CompletionRequest):
+            gen_response = await self.send_completion_request(gen_server, gen_req)
+        elif isinstance(gen_req, ChatCompletionRequest):
+            gen_response = await self.send_chat_request(gen_server, gen_req)
+        else:
+            raise TypeError("Invalid request type: {type(gen_req).__name__}")
+
         async for chunk in gen_response.body_iterator:
             yield chunk
 
@@ -152,13 +160,9 @@ class OpenAIDisaggServer:
             # Pick a generation server and send request
             gen_server = self.get_next_server(self.gen_servers, "generation")
             logging.info("Sending request to gen server: %s", gen_server)
-<<<<<<< HEAD
-=======
-            gen_response = await self.send_completion_request(gen_server, gen_req)
->>>>>>> d45ef81e (Add support of chat completion in PD)
 
             if not gen_req.stream:
-                gen_response = await self.send_request(gen_server, gen_req)
+                gen_response = await self.send_completion_request(gen_server, gen_req)
                 return gen_response
             else:
                 # Return a streaming response that combines both context and generation responses
@@ -207,9 +211,17 @@ class OpenAIDisaggServer:
             # Pick a generation server and send request
             gen_server = self.get_next_server(self.gen_servers, "generation")
             logging.info("Sending request to gen server: %s", gen_server)
-            gen_response = await self.send_chat_request(gen_server, gen_req)
 
-            return gen_response
+            if not gen_req.stream:
+                gen_response = await self.send_chat_request(gen_server, gen_req)
+                return gen_response
+            else:
+                # Return a streaming response that combines both context and generation responses
+                return StreamingResponse(
+                    self.merge_streaming_responses(ctx_response, gen_server, gen_req),
+                    media_type="text/event-stream"
+                )
+
         except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
             logging.exception(e)
@@ -244,51 +256,40 @@ class OpenAIDisaggServer:
 
         return server
 
+    async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
+        async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if "text/event-stream" in content_type:
+                if not request.stream:
+                    raise ValueError("Received an event-stream although request stream was False")
+
+                try:
+                    async for line in response.content.iter_any():
+                        if line:
+                            yield line
+                            await asyncio.sleep(0)
+                except Exception as e:
+                    logging.error(f"Unexpected error in stream: {e}")
+                    raise
 
     async def create_completion_generator(self, url: str, request: CompletionRequest):
-        async with self.session.post(url + "/v1/completions", json=request.model_dump(exclude_unset=True)) as response:
-
-            content_type = response.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type:
-                if not request.stream:
-                    raise ValueError("Received an event-stream although request stream was False")
-
-                try:
-                    async for line in response.content.iter_any():
-                        if line:
-                            yield line
-                            await asyncio.sleep(0)
-
-                except Exception as e:
-                    logging.error(f"Unexpected error in stream: {e}")
-                    raise
+        async for chunk in self.create_generator(url, request, "/v1/completions"):
+            yield chunk
 
     async def create_chat_generator(self, url: str, request: ChatCompletionRequest):
-        async with self.session.post(url + "/v1/chat/completions", json=request.model_dump(exclude_unset=True)) as response:
-            content_type = response.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type:
-                if not request.stream:
-                    raise ValueError("Received an event-stream although request stream was False")
+        async for chunk in self.create_generator(url, request, "/v1/chat/completions"):
+            yield chunk
 
-                try:
-                    async for line in response.content.iter_any():
-                        if line:
-                            yield line
-                            await asyncio.sleep(0)
-
-                except Exception as e:
-                    logging.error(f"Unexpected error in stream: {e}")
-                    raise
-
-    async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
-
+    async def send_request(self, url: str,
+                           request: Union[CompletionRequest, ChatCompletionRequest],
+                           endpoint: str,
+                           response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
+                           create_generator: callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
         if request.stream:
-            response_generator = self.create_completion_generator(url, request)
+            response_generator = create_generator(url, request)
             return StreamingResponse(content=response_generator, media_type="text/event-stream")
         else:
-            """Send an asynchronous request and return JSON response"""
-            async with self.session.post(url + "/v1/completions", json=request.model_dump(exclude_unset=True)) as response:
-
+            async with self.session.post(url + endpoint, json=request.model_dump(exclude_unset=True)) as response:
                 content_type = response.headers.get("Content-Type", "")
                 if "text/event-stream" in content_type:
                     raise ValueError("Received an event-stream although request stream was False")
@@ -297,23 +298,13 @@ class OpenAIDisaggServer:
                 if not response.ok:
                     logging.error(f"Received failed response {response_dict}")
                     response.raise_for_status()
-                return CompletionResponse(**response_dict)
+                return response_type(**response_dict)
+
+    async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
+        return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator)
 
     async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
-
-        if request.stream:
-            response_generator = self.create_chat_generator(url, request)
-            return StreamingResponse(content=response_generator, media_type="text/event-stream")
-        else:
-            async with self.session.post(url + "/v1/chat/completions", json=request.model_dump(exclude_unset=True)) as response:
-
-                content_type = response.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    raise ValueError("Received an event-stream although request stream was False")
-
-                response_dict = await response.json()
-                response.raise_for_status()
-                return ChatCompletionResponse(**response_dict)
+        return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
 
     async def check_server_ready(self, server_url: str) -> bool:
         try:
