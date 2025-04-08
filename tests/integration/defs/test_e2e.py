@@ -715,7 +715,7 @@ def test_benchmark_sanity_enable_fp8(llm_root, llm_venv, model_name,
 
 
 def test_chatglm_6b_sanity(chatglm_6b_example_root, llm_venv, cmodel_dir,
-                           engine_dir, update_transformers):
+                           engine_dir):
     llm_models = llm_models_root()
 
     # skip when llm_models_root is None
