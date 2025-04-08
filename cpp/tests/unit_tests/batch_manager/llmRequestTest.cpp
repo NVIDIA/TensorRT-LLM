@@ -309,7 +309,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000, std::nullopt, false, true);
+        llmReq.validate(10, 60, 2, 32000, std::nullopt, false);
         auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
         EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
         EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);
@@ -327,7 +327,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000, std::nullopt, false, false);
+        llmReq.validate(10, 60, 2, 32000, std::nullopt, false);
         auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
         EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 0);
         EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);

@@ -71,7 +71,7 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
     auto randomLogits = tensorrt_llm::testing::randomLogits<std::mt19937, TLogits>(params.vocabSize, &rng);
     auto const decoderParameters = tensorrt_llm::testing::utils::engines::ConstantTrivialDecoderParameters<TLogits>{
         tensorrt_llm::testing::utils::engines::TrivialDecoderParameters{params.vocabSize, params.maxBatchSize,
-            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth},
+            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth, false},
         randomLogits};
     auto engineHostMemory
         = tensorrt_llm::testing::utils::engines::createConstantTrivialDecoder<TLogits>(decoderParameters, logger);

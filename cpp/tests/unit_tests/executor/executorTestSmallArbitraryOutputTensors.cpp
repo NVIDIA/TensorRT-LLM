@@ -92,11 +92,13 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
     auto randomLogits = tensorrt_llm::testing::randomLogits<std::mt19937, TLogits>(params.vocabSize, &rng);
     auto const decoderParameters = tensorrt_llm::testing::utils::engines::ConstantTrivialDecoderParameters<TLogits>{
         tensorrt_llm::testing::utils::engines::TrivialDecoderParameters{params.vocabSize, params.maxBatchSize,
-            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth},
+            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth,
+            params.gatherContext},
         randomLogits};
     auto engineHostMemory = tensorrt_llm::testing::utils::engines::createConstantTrivialDecoderWithTopKLogits<TLogits>(
         decoderParameters, params.numTopKLogits, DecoderTestShared<TLogits>::kTopKTensorName, logger);
     auto const engine = runtime::RawEngine(engineHostMemory.release());
+
     auto const dtype = runtime::TRTDataType<TLogits>::value;
     auto modelConfig = runtime::ModelConfig(params.vocabSize, 1, 1, 0, 1, 1, dtype);
     modelConfig.useGptAttentionPlugin(true);
@@ -111,7 +113,7 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
     modelConfig.setLayerTypes({runtime::ModelConfig::LayerType::kATTENTION});
     modelConfig.setTokensPerBlock(DecoderTestShared<TLogits>::kNumTokensPerBlock);
     modelConfig.setPagedContextFMHA(true);
-    modelConfig.computeContextLogits(true);
+    modelConfig.computeContextLogits(params.gatherContext);
 
     auto const worldConfig = runtime::WorldConfig();
 

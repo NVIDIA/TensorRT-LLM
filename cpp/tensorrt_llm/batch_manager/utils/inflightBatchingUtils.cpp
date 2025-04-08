@@ -191,6 +191,25 @@ void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& a
         srcTensorIndexWithContext += reqBeamWidth;
         srcTensorIndexWithoutContext += reqBeamWidth;
     }
+
+    // Check final indices
+    for (auto const& outputTensor : additionalModelOutputs)
+    {
+        auto const& outputTensorName = outputTensor.name;
+        auto const gatherContext = outputTensor.gatherContext;
+
+        auto const tensorIt = outputMap.find(outputTensorName);
+        TLLM_CHECK_WITH_INFO(
+            tensorIt != outputMap.end(), "Additional output tensor not found: %s", outputTensorName.c_str());
+
+        auto const& outputShape = tensorIt->second->getShape();
+        auto const outputSize = outputShape.d[0];
+        auto const finalIndex = gatherContext ? srcTensorIndexWithContext : srcTensorIndexWithoutContext;
+
+        TLLM_CHECK_WITH_INFO(finalIndex == outputSize, "Additional %s output tensor final index mismatch %d != %ld: %s",
+            gatherContext ? "context" : "generation", finalIndex, outputSize, outputTensorName.c_str());
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
