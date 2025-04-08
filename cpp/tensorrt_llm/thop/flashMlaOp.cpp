@@ -91,7 +91,7 @@ std::tuple<at::Tensor, at::Tensor> get_mla_metadata(
     int* tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
     int* num_splits_ptr = num_splits.data_ptr<int>();
 
-    at::cuda::CUDAGuard device_guard{(char) seqlens_k.get_device()};
+    at::cuda::CUDAGuard device_guard{seqlens_k.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     Mla_metadata_params params = {};
     params.seqlens_k_ptr = seqlens_k_ptr;
