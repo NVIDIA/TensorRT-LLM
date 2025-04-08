@@ -1623,7 +1623,7 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch != AARCH64_TRIPLE // Skip this stage if running on ARM architecture
+                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
                 }
             }
             steps
