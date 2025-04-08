@@ -733,6 +733,7 @@ BlockPtr WindowBlockManager::getFreeBlock(
 {
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel);
+    TLLM_CHECK(block->isLeaf());
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
@@ -1403,6 +1404,7 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence)
     auto const requestId = sequence.getRequestId();
 
     auto node = mAllocatedBlocksPerSeq.extract(requestId);
+    TLLM_CHECK(node);
     auto& allocatedBlocks = node.mapped();
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
@@ -1791,7 +1793,7 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
                     mBlockManager.releaseLastBlock(sequence, windowSize);
                 }
             }
-            else if (sequence.getBeamWidth() > 1 || mEnableBlockReuse)
+            else if (sequence.getBeamWidth() > 1)
             {
                 TLLM_CHECK_WITH_INFO(addToken, "Remove token is not supported with beam search");
                 // Get next block index
