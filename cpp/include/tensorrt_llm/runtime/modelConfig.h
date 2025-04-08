@@ -766,7 +766,7 @@ public:
         return mManageWeightsType;
     }
 
-    void setManageWeightsType(const ManageWeightsType manageWeightType) noexcept
+    void setManageWeightsType(ManageWeightsType const manageWeightType) noexcept
     {
         mManageWeightsType = manageWeightType;
     }
