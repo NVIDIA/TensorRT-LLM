@@ -450,3 +450,13 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
+
+    def test_auto_dtype_summarization(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
