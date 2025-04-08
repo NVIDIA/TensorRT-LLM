@@ -7,7 +7,6 @@ import cloudpickle
 import pytest
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.llm_data import llm_models_root
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch import LLM
@@ -29,10 +28,11 @@ MPI_RESULT = MPI_TAG + 1
 
 
 def model_path(model_name):
+    llm_models_root = os.environ["LLM_MODELS_ROOT"]
     if 'DeepSeek-V3-Lite-fp8' in model_name:
-        return os.path.join(llm_models_root(), 'DeepSeek-V3-Lite', 'fp8')
+        return os.path.join(llm_models_root, 'DeepSeek-V3-Lite', 'fp8')
     elif 'TinyLlama-1.1B-Chat-v1.0' in model_name:
-        return os.path.join(llm_models_root(), 'llama-models-v2',
+        return os.path.join(llm_models_root, 'llama-models-v2',
                             'TinyLlama-1.1B-Chat-v1.0')
     else:
         raise ValueError(f"Unknown model: {model_name}")
