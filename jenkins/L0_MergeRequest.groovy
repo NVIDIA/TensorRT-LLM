@@ -572,7 +572,6 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
         "tests/integration/defs/disaggregated/",
         "examples/pytorch/",
-        "jenkins/L0_MergeRequest.groovy", // for test
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
