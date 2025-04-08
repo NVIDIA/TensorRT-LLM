@@ -277,6 +277,32 @@ void invokeBatchedFP4Quantization(int b, int m, int n, __nv_fp8_e4m3 const* inpu
 }
 #endif
 
+__global__ void nvfp4_block_scale_interleave_kernel(
+    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput)
+{
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x)
+            {
+                int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
+                auto sf = SFIn[inOffset];
+
+                std::optional<int> batchIdxOpt = batchIdx;
+                std::optional<int> numRowsOpt = numRows;
+
+                // Without batching, the math in get_sf_out_offset is the same as
+                // int const numSfTilesK = (numCols + 4 - 1) / 4;
+                // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
+                // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
+                auto dstIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols * 16);
+                SFOutput[dstIdx] = sf;
+            }
+        }
+    }
+}
+
 // This is intended for weight loading, so m and n are large, b <= 256
 void invokeNVFP4BlockScaleInterleave(
     int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream)
