@@ -30,6 +30,7 @@ from typing import Iterable, Sequence
 import defs.ci_profiler
 import psutil
 import pytest
+import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
@@ -2113,6 +2114,11 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if test_prefix:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+
+def pytest_configure(config):
+    # avoid thread leak of tqdm's TMonitor
+    tqdm.tqdm.monitor_interval = 0
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
