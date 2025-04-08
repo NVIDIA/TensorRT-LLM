@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import asyncio
+import os
+import platform
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -123,6 +125,7 @@ class OpenAIServer:
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/shutdown", self.shutdown, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
@@ -139,6 +142,13 @@ class OpenAIServer:
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def shutdown(self) -> Response:
+        if platform.system() == "Windows":
+            os.kill(os.getpid(), signal.CTRL_C_EVENT)
+        else:
+            os.kill(os.getpid(), signal.SIGINT)
+        return Response(status_code=200)
 
     async def get_model(self) -> JSONResponse:
         model_list = ModelList(data=[ModelCard(id=self.model)])

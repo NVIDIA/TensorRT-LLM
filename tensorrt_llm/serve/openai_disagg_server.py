@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+from asyncio import Lock
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import List, Optional, Union
@@ -17,7 +18,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (AddRemoveServerRequest,
+                                                CompletionRequest,
                                                 CompletionResponse,
                                                 DisaggregatedParams,
                                                 ErrorResponse)
@@ -39,6 +41,8 @@ class OpenAIDisaggServer:
         self.gen_servers = gen_servers
         self.ctx_server_idx = 0
         self.gen_server_idx = 0
+        self.server_lock = Lock()
+        self.server_start_timeout_secs = server_start_timeout_secs
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
@@ -81,6 +85,12 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
+        self.app.add_api_route("/addserver",
+                               self.add_server,
+                               methods=["POST"])
+        self.app.add_api_route("/removeserver",
+                               self.remove_server,
+                               methods=["POST"])
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -88,6 +98,45 @@ class OpenAIDisaggServer:
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def add_server(self, req: AddRemoveServerRequest) -> Response:
+        async def wait_until_server_ready(ip_address: str, port: int):
+            while not await self.check_server_ready(f"{ip_address}:{port}"):
+                wait_time = 3
+                logging.info("Context and generation servers are not ready. Waiting...")
+                await asyncio.sleep(wait_time)
+            return True
+
+        try:
+            await asyncio.wait_for(wait_until_server_ready(req.ip_address, req.port),
+                                   timeout=self.server_start_timeout_secs)
+        except asyncio.TimeoutError:
+            return Response(status_code=500, content={"error": "Server failed to start within timeout"})
+
+        with self.server_lock:
+            if req.server_type == "context":
+                self.ctx_servers.append(f"{req.ip_address}:{req.port}")
+            elif req.server_type == "generation":
+                self.gen_servers.append(f"{req.ip_address}:{req.port}")
+        return Response(status_code=200)
+
+    async def remove_server(self, req: AddRemoveServerRequest) -> Response:
+        # Immediately remove the server from the list to avoid further request
+        # and let the selected server exit gracefully by itself
+        with self.server_lock:
+            if req.server_type == "context":
+                self.ctx_servers.remove(f"{req.ip_address}:{req.port}")
+            elif req.server_type == "generation":
+                self.gen_servers.remove(f"{req.ip_address}:{req.port}")
+
+        # Send a shutdown signal to the selected server
+        async with self.session.get(f"{req.ip_address}:{req.port}/shutdown") as response:
+            if response.status == 200:
+                logging.info(f"Shutdown signal sent to {req.ip_address}:{req.port}")
+                return Response(status_code=200)
+            else:
+                logging.error(f"Failed to send shutdown signal to {req.ip_address}:{req.port}")
+                return Response(status_code=500, content={"error": "Failed to send shutdown signal to the selected server"})
 
     async def merge_streaming_responses(self, ctx_response, gen_server, gen_req):
         # First yield the context response if it's not None
@@ -183,12 +232,13 @@ class OpenAIDisaggServer:
 
         # Pick context and gen servers in round-robin fashion
         # TODO: In future, use endpoint to monitor load and pick the least loaded server
-        if server_type == "context":
-            server = servers[self.ctx_server_idx]
-            self.ctx_server_idx = (self.ctx_server_idx + 1) % len(servers)
-        else:
-            server = servers[self.gen_server_idx]
-            self.gen_server_idx = (self.gen_server_idx + 1) % len(servers)
+        with self.server_lock:
+            if server_type == "context":
+                server = servers[self.ctx_server_idx]
+                self.ctx_server_idx = (self.ctx_server_idx + 1) % len(servers)
+            else:
+                server = servers[self.gen_server_idx]
+                self.gen_server_idx = (self.gen_server_idx + 1) % len(servers)
 
         return server
 
