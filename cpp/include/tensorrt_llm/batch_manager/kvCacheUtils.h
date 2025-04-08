@@ -31,12 +31,12 @@ public:
     {
     };
 
-    static BlockRange fromOldAllocatedBlockIds(
-        BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId, SizeType32 beam = SINGLE_BEAM)
+    static BlockRange fromOldAllocatedBlockIds(BaseKVCacheManager const& cacheManager,
+        LlmRequest::RequestIdType requestId, SizeType32 beam = kFIRST_AND_ONLY_BEAM)
     {
-        assert(SINGLE_BEAM == beam);
+        assert(kFIRST_AND_ONLY_BEAM == beam);
         auto const windowSize = firstWindowSize(cacheManager);
-        auto const blockIds = cacheManager.getSequence(requestId).getCacheBlockIds(windowSize).at(SINGLE_BEAM);
+        auto const blockIds = cacheManager.getSequence(requestId).getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
         return BlockRange(cacheManager, blockIds, requestId);
     }
 
@@ -96,13 +96,13 @@ public:
     void updatePoolIdx(SizeType32 poolIdx)
     {
         TLLM_CHECK(mManager);
-        TLLM_CHECK(poolIdx > FIRST_POOL_INDEX);
+        TLLM_CHECK(poolIdx > kFIRST_POOL_INDEX);
         mPool = mManager->getBlockManager().getPrimaryPool(poolIdx);
         auto const newWindowSize = mManager->getBlockManager().getPoolWindowSize(poolIdx);
         if (newWindowSize != mWindowSize)
         {
             mWindowSize = newWindowSize;
-            mBlockIds = mManager->getSequence(mRequestId).getCacheBlockIds(mWindowSize).at(SINGLE_BEAM);
+            mBlockIds = mManager->getSequence(mRequestId).getCacheBlockIds(mWindowSize).at(kFIRST_AND_ONLY_BEAM);
         }
     }
 
@@ -112,7 +112,7 @@ private:
     BlockRange(
         BaseKVCacheManager const& cacheManager, std::vector<SizeType32> blockIds, LlmRequest::RequestIdType requestId)
         : mManager(&cacheManager)
-        , mPool(cacheManager.getBlockManager().getPrimaryPool(FIRST_POOL_INDEX))
+        , mPool(cacheManager.getBlockManager().getPrimaryPool(kFIRST_POOL_INDEX))
         , mWindowSize(firstWindowSize(cacheManager))
         , mRequestId(requestId)
         , mBlockIds(std::move(blockIds))
@@ -132,8 +132,8 @@ private:
     const LlmRequest::RequestIdType mRequestId;
     std::vector<SizeType32> mBlockIds;
 
-    static constexpr SizeType32 SINGLE_BEAM = 0;
-    static constexpr SizeType32 FIRST_POOL_INDEX = 0;
+    static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
+    static constexpr SizeType32 kFIRST_POOL_INDEX = 0;
 };
 
 class BlockIterator

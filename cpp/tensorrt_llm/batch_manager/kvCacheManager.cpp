@@ -323,17 +323,27 @@ bool KVCacheBlock::isLeaf() const
     return mNextBlocks.empty();
 }
 
+/*
+Example:
+```
+totalBlocks = 16384, uniqueWindowSizeToLayers = {1024: [1], 4096: [0, 4, 5], 8192: [2, 3]}
+
+windowSizeToContribution = {1024: (1024*1=1024), 4096: (4096*3=12288), 8192: (8192*2)};
+windowSizesTotalSum = 1024 + 12288 + 16384 = 29696;
+
+return windowSizeToAllottedBlocks =  {
+        1024: (1024.0   /29696)*16384 + 1  = 565,
+        4096: (12288.0  /29696)*16384 + 1  = 6780,
+        8192: (16384.0  /29696)*16384      = 9039
+    };
+```
+*/
 std::map<SizeType32, SizeType32> BlockManager::blocksPerWindowSize(
-    // totalBlocks = 16384
-    SizeType32 totalBlocks,
-    // uniqueWindowSizeToLayers = {1024: [1], 4096: [0, 4, 5], 8192: [2, 3]}
-    std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers)
+    SizeType32 totalBlocks, std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers)
 {
     TLLM_CHECK(totalBlocks > 0);
-    // windowSizeToContribution = {1024: (1024*1=1024), 4096: (4096*3=12288), 8192: (8192*2)}
     std::map<SizeType32, SizeType32> windowSizeToContribution;
 
-    // windowSizesTotalSum = 1024 + 12288 + 16384 = 29696;
     auto windowSizesTotalSum = 0;
     for (auto const& [windowSize, layers] : uniqueWindowSizeToLayers)
     {
@@ -364,7 +374,6 @@ std::map<SizeType32, SizeType32> BlockManager::blocksPerWindowSize(
         allottedBlocks++;
         remainingBlocks--;
     }
-    // {1024: (1024.0/29696)*16384 + 1, 4096: (12288.0/29696)*16384 + 1, 8192: (16384.0/29696)*16384}
     return windowSizeToAllottedBlocks;
 }
 
