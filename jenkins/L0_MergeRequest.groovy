@@ -565,7 +565,6 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
         return false
     }
-    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
     def pytorchOnlyList = [
         "tensorrt_llm/_torch/",
         "tests/unittest/_torch/",
