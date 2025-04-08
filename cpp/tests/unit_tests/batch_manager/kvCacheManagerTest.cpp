@@ -1942,7 +1942,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     auto constexpr requestId = 7;
     auto constexpr maxNumTokens = tokensPerBlock * blockLengthPerSeq;
     auto constexpr maxAttentionWindow = maxNumTokens;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;    // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
     auto constexpr inputLength = maxNumTokens - tokensPerBlock - 1;
     auto constexpr numSharedBlocks = inputLength / tokensPerBlock;
     auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
@@ -2054,7 +2054,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - (numBlocksPerSeq - (inputLength + 2 > maxAttentionWindow ? 0 : maxBeamWidth)));   // TODO (tomer): explain this. Add it as a constant
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - (numBlocksPerSeq - (inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer*maxBeamWidth)));   // buffer block is needed if exceeding attention window
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
@@ -2069,7 +2069,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
         currentNumBlocks -= maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
     }
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), inputLength + 2 > maxAttentionWindow ? 0 : maxNumSequences*maxBeamWidth);    // TODO (tomer): explain this. Add it as a constant
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer*maxNumSequences*maxBeamWidth);    // buffer block is needed if exceeding attention window
 }
 
 TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
@@ -2177,7 +2177,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     auto constexpr maxAttentionWindow = inputLength;
     auto constexpr temporaryAttentionWindow = 0;
     auto constexpr numSharedBlocks = std::min(inputLength, maxAttentionWindow) / tokensPerBlock;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;    // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
     auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
 
     auto constexpr totalNumBlocks = maxNumSequences * numBlocksPerSeq;
@@ -2298,7 +2298,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerThanBlockSizeTe
     // Enable cyclic kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 16;
     auto constexpr temporaryAttentionWindow = 0;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     auto constexpr blocksInPrimaryPool = 16;
     auto constexpr blocksInSecondaryPool = 0;
@@ -2398,7 +2398,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultiple
     // Enable cyclic kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 10;
     auto constexpr temporaryAttentionWindow = 0;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     auto constexpr blocksInPrimaryPool = 16;
     auto constexpr blocksInSecondaryPool = 0;
@@ -2507,7 +2507,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     // Enable cyclic kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 3;
     auto constexpr temporaryAttentionWindow = 0;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     auto constexpr blocksInPrimaryPool = 16;
     auto constexpr blocksInSecondaryPool = 0;
@@ -2696,7 +2696,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     // Enable cyclic kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 16;
     auto constexpr temporaryAttentionWindow = 0;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     auto constexpr blocksInPrimaryPool = 16;
     auto constexpr blocksInSecondaryPool = 16;
@@ -3655,7 +3655,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
 
     auto constexpr maxNumTokens = tokensPerBlock * blockLengthPerSeq;
     auto constexpr maxAttentionWindow = maxNumTokens;
-    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;    // TODO (tomer): explain this +1. Add it as a constant
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
     auto constexpr inputLength = maxNumTokens - 2;
     auto constexpr numSharedBlocks = inputLength / tokensPerBlock;
     auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
@@ -3799,7 +3799,7 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
             auto constexpr blocksInSecondaryPool = 0;
             auto constexpr onboardBlocks = true;
 
-            auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;    // TODO (tomer): explain this +1. Add it as a constant
+            auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
             auto constexpr totalNumBlocks = maxNumSequences * maxBlocksPerSeq;
 
             KVCacheManager kvCacheManager = homogeneousLayers

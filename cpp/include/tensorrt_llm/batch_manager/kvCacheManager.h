@@ -51,6 +51,10 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+// Extra buffer block for sequences exceeding attention window, allowing to detach previous blocks only
+// when we'll be left with enough tokens to fill the attention window
+static constexpr SizeType32 kExtraBlockBuffer = 1;
+
 class KVCacheBlock;
 class KVCacheManager;
 class KVCacheTransferManager;

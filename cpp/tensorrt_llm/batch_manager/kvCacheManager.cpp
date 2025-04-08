@@ -1261,7 +1261,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     mNumNonSinkTokensInWindow = mMaxTokenNum - mSinkBlockTokenLength;     
 
     // Consider the mTemporaryAttentionWindow when allocating blocks.
-    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
     TLLM_LOG_DEBUG("Max KV cache pages per sequence: %d", mMaxBlocksPerSeq);
