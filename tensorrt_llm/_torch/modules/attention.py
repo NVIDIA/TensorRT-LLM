@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -210,6 +211,7 @@ class MLA(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -384,14 +386,25 @@ class MLA(nn.Module):
             skip_create_weights=config.skip_create_weights,
         )
 
+        def yarn_get_mscale(scale=1, mscale=1):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        mscale_all_dim = pos_embd_params.rope.mscale_all_dim
+        scaling_factor = pos_embd_params.rope.scale
+        mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+        q_scaling = 1.0 / (mscale * mscale)
+
         self.mha = create_attention(
             config.attn_backend,
             self.layer_idx,
             self.num_heads,
-            self.qk_nope_head_dim + self.qk_rope_head_dim,
-            self.num_key_value_heads,
+            head_dim=self.qk_head_dim,
+            num_kv_heads=self.num_key_value_heads,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -405,10 +418,11 @@ class MLA(nn.Module):
             config.attn_backend,
             self.layer_idx,
             self.num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            1,  # num_kv_heads
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
