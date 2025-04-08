@@ -1,6 +1,7 @@
 import copy
 import datetime
 import enum
+import hashlib
 import json
 import os
 import time
@@ -537,21 +538,38 @@ def worker_main(
         # Only set the log level for the leader process, the other processes will
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
+
+        # Initialize HMAC key
+        hmac_key_path = '/tmp/hmac_key'
+        if os.path.exists(hmac_key_path):
+            with open(hmac_key_path, 'rb') as f:
+                random_hmac_key = f.read()
+        else:
+            seed = f"tensorrt_llm_{time.time()}_{os.getpid()}".encode()
+            random_hmac_key = hashlib.sha256(seed).digest()
+            with open(hmac_key_path, 'wb') as f:
+                f.write(random_hmac_key)
+
+
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
-                                 name="worker_request_queue")
+                                 name="worker_request_queue",
+                                 hmac_key=random_hmac_key)
         request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
                                        is_server=False,
-                                       name="worker_request_error_queue")
+                                       name="worker_request_error_queue",
+                                       hmac_key=random_hmac_key)
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
                                        fuse_message=True,
-                                       name="worker_stats_queue")
+                                       name="worker_stats_queue",
+                                       hmac_key=random_hmac_key)
         kv_cache_events_queue = FusedIpcQueue(
             worker_queues.kv_cache_events_queue_addr,
             is_server=False,
             fuse_message=False,
-            name="worker_kv_cache_events_queue")
+            name="worker_kv_cache_events_queue",
+            hmac_key=random_hmac_key)
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -559,7 +577,8 @@ def worker_main(
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                              name=f"postprocess_{i}_feedin_queue")
+                              name=f"postprocess_{i}_feedin_queue",
+                              hmac_key=random_hmac_key)
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
@@ -568,7 +587,8 @@ def worker_main(
             result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
                                          is_server=False,
                                          fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                                         name="worker_result_queue")
+                                         name="worker_result_queue",
+                                         hmac_key=random_hmac_key)
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
