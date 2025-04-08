@@ -805,17 +805,6 @@ def multimodal_model_root(request, llm_venv):
         llm_venv.run_cmd(['-m', 'pip', 'uninstall', 'llava', '-y'])
 
 
-@pytest.fixture(scope="function")
-def update_transformers(llm_venv, llm_root):
-
-    yield
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
-
-
 def remove_file(fn):
     if os.path.isfile(fn) or os.path.islink(fn):
         os.remove(fn)
