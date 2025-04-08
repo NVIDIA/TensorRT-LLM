@@ -10,7 +10,10 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import Flas
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonWithFlattenedInputs
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library import insert_mha_with_kv_cache
+from tensorrt_llm._torch.auto_deploy.transformations.library import (
+    check_in_out_nodes,
+    insert_mha_with_kv_cache,
+)
 
 
 # Class that inherits from GQA but uses fused_mha directly
@@ -69,8 +72,8 @@ class GQAWithFusedMHA(GQA):
 )
 @pytest.mark.parametrize(
     "attention_op",
-    [TritonWithFlattenedInputs, FlashInferAttention],
-    ids=["triton", "flashinfer"],
+    [FlashInferAttention, TritonWithFlattenedInputs],
+    ids=["flashinfer", "triton"],
 )
 @torch.inference_mode()
 def test_model_with_kv_cache(use_rope, atol, rtol, dtype, attention_op):
@@ -125,8 +128,10 @@ def test_model_with_kv_cache(use_rope, atol, rtol, dtype, attention_op):
     # Since we're already using fused_mha, we can skip the fusion step
     # and directly insert KV cache
     cache_config = CacheConfig()
+    # get input node
+    input_node = check_in_out_nodes(gm)
     gm_transformed = insert_mha_with_kv_cache(
-        gm, cm, attention_op=attention_op, cache_config=cache_config
+        gm, cm, attention_op=attention_op, cache_config=cache_config, input_node=input_node
     )
     gm_transformed.to("cuda")
     cm.initialize_caches()
