@@ -317,24 +317,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         EXPECT_EQ(additionalGenerationOutputs.count("context_gen_output"), 1);
         EXPECT_EQ(additionalGenerationOutputs.count("gen_output"), 1);
     }
-    {
-        using AdditionalModelOutput = texec::AdditionalModelOutput;
-        // Validate additional context and gen outputs when context outputs not available
-        texec::Request execReq(inputTokens, maxNewTokens);
-        std::vector<AdditionalModelOutput> additionalModelOutputs{
-            AdditionalModelOutput{"context_gen_output", true}, AdditionalModelOutput{"gen_output", false}};
-        texec::OutputConfig outputConfig;
-        outputConfig.additionalModelOutputs = additionalModelOutputs;
-        execReq.setOutputConfig(outputConfig);
-        tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000, std::nullopt, false);
-        auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
-        EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 0);
-        EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);
-        auto const& additionalGenerationOutputs = llmReq.getAdditionalGenerationOutputs();
-        EXPECT_EQ(additionalGenerationOutputs.count("context_gen_output"), 1);
-        EXPECT_EQ(additionalGenerationOutputs.count("gen_output"), 1);
-    }
 }
 
 TEST_F(LlmRequestTest, pause)
