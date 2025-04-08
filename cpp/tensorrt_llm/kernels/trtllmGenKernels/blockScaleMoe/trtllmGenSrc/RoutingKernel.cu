@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -398,6 +398,8 @@ __global__ void routingMainKernel(KernelParams params)
     // get the score with bias
     // note that with invalid values, because sigmoid is < 1 and bias is -1,
     // we must get a negative value, which is smaller than any valid value
+    // TODO: verify bf16 scoreBias accuracy before changing it back to bf16
+    // auto scoreBias = TypeExpW{scoreSigmoid + float{biasVal}}; // TypeExpW is bf16
     auto scoreBias = float{scoreSigmoid + float{biasVal}};
     if (expertSelected)
     {
