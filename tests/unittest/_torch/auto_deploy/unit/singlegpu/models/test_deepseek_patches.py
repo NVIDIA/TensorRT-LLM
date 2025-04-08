@@ -72,9 +72,7 @@ def _generate_ds_attention_mask(b, s):
                 _generate_ds_attention_mask(2, 6),
                 torch.tensor([[0, 1, 2, 3, 4, 5]]),
             ],
-            marks_extra=[
-                pytest.mark.skip(reason="TODO: Debug CI pipeline failing"),
-            ],
+            marks=pytest.mark.skip(reason="TODO: Debug CI pipeline failing"),
         ),  # attention requires  inputs [hidden_states, attention_mask, position_ids]
         pytest.param(
             "deepseek-ai/DeepSeek-V3",
@@ -82,9 +80,7 @@ def _generate_ds_attention_mask(b, s):
             deepseek_v3_moe_exact,
             False,
             [torch.randn(2, 6, 7168)],
-            marks_extra=[
-                pytest.mark.skip(reason="TODO: Debug CI pipeline failing"),
-            ],
+            marks=pytest.mark.skip(reason="TODO: Debug CI pipeline failing"),
         ),  # moe requires  inputs [hidden_states]
     ],
 )
