@@ -38,6 +38,7 @@
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
@@ -144,6 +145,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}
     , mGatherGenerationLogits{optionalParams.gatherGenerationLogits}
+    , mIsChunkedContext{optionalParams.enableChunkedContext}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -1008,7 +1010,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 {
                     if (llmReq->isContextInitState())
                     {
+                        printf("llmReq->getContextRemainingLength() = %d before move\n",
+                            llmReq->getContextRemainingLength());
                         llmReq->moveToNextContextChunk();
+                        printf("llmReq->getContextRemainingLength() = %d after move\n",
+                            llmReq->getContextRemainingLength());
                         if (llmReq->getContextRemainingLength() == 0)
                         {
                             TLLM_LOG_DEBUG("[RANK %d] request with ID %lu finishes decoder ctx phase",
@@ -1571,6 +1577,7 @@ TrtGptModelInflightBatching::prepareBuffers(
     NVTX3_SCOPED_RANGE(prepareBuffers);
 
     auto& runtimeBuffers = *mBuffers[bufferId];
+    runtimeBuffers.runtimeIsChunkedContext = mIsChunkedContext;
 
     auto [optProfileId, inputMap, outputMap]
         = runtimeBuffers.prepareStep(contextRequests, generationRequests, mOperatingBeamWidth, getMaxAttentionWindow(),
@@ -1615,6 +1622,72 @@ void TrtGptModelInflightBatching::executeStep(
         "executeStep: " + std::to_string(contextRequests.size()) + " ctx reqs, "
             + std::to_string(generationRequests.size()) + " gen reqs");
 
+    // Logic starts here
+    if (mIsChunkedContext)
+    {
+        printf("Before prepareBuffers, contextRequests.size() = %ld\n", contextRequests.size());
+        prefetchPromptTableChunk(contextRequests, true, bufferId);
+    }
+
+    // Print the first 5 elements from current GPU ping-pong buffer
+    for (auto const& llmReq : contextRequests)
+    {
+        printf("================== Add debug printing before prepareBuffers 1 ==================\n");
+
+        auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+
+        auto currentIndex = promptTuningBuffers->getChunkPtableCurrentIndex();
+        auto& positions = promptTuningBuffers->mChunkPtableBufferStartPositions.value()[currentIndex];
+        printf("chunkPtableCurrentIndex = %ld\n", currentIndex);
+        printf("numRows: [");
+        for (size_t i = 0; i < positions.size(); ++i)
+        {
+            printf("%d%s", positions[i], i < positions.size() - 1 ? ", " : "");
+        }
+        printf("]\n");
+        printf("Request %lu's GPU buffer (first 5 elements):\n", llmReq->mRequestId);
+
+        /////////////////////////////////////////////////////////////////////////////////////////
+        auto const& gpuBuffer = promptTuningBuffers->getChunkPtableBuffer(currentIndex);
+        auto hiddenSize = mModelConfig.getHiddenSize();
+
+        // Create host buffer once
+        constexpr size_t numElementsToPrint = 5;
+        std::vector<half> hostBuffer(numElementsToPrint);
+
+        // Iterate through each chunk
+        for (size_t batchIdx = 0; batchIdx < positions.size() - 1; batchIdx++)
+        {
+            auto numRows = promptTuningBuffers->getChunkPtableBufferSliceSize(currentIndex, batchIdx);
+            printf("Batch %zu numRows %d: (request %lu)\n", batchIdx, numRows, llmReq->mRequestId);
+            SizeType32 cumulativeOffset = promptTuningBuffers->getChunkPtableBufferStartPosition(currentIndex,
+            batchIdx); printf("Batch %zu starting at cumulativeOffset %d: (request %lu)\n",
+                    batchIdx, cumulativeOffset, llmReq->mRequestId);
+            // For each row in this chunk
+            for (SizeType32 row = 0; row < numRows; row++)
+            {
+                auto offset = cumulativeOffset * hiddenSize + row * hiddenSize;
+
+                TLLM_CUDA_CHECK(cudaMemcpy(
+                    hostBuffer.data(),
+                    static_cast<half*>(gpuBuffer->data()) + offset,
+                    numElementsToPrint * sizeof(half),
+                    cudaMemcpyDeviceToHost));
+
+                printf("  Row %u: [", row);
+                for (size_t i = 0; i < numElementsToPrint; i++)
+                {
+                    printf("%.6f%s",
+                        static_cast<float>(hostBuffer[i]),
+                        i < numElementsToPrint - 1 ? ", " : "");
+                }
+                printf("]\n");
+            }
+        }
+
+        printf("================================================================================\n");
+    }
+
     auto [optProfileId, inputMap, outputMap] = prepareBuffers(contextRequests, generationRequests, bufferId);
 
     if (mBuffers[bufferId]->transformerBuffers)
@@ -1647,6 +1720,60 @@ void TrtGptModelInflightBatching::executeStep(
             mCacheTransceiver->respondAndSendLayerWise(layerWiseRequests, progress);
         }
     }
+
+    // Logic starts here
+    if (mIsChunkedContext)
+    {
+        printf("After prepareBuffers, contextRequests.size() = %ld\n", contextRequests.size());
+        prefetchPromptTableChunk(contextRequests, false, bufferId);
+    }
+
+    // ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // // Print the first 5 elements from current GPU ping-pong buffer
+    // for (auto const& llmReq : contextRequests)
+    // {
+    //     printf("================== Add debug printing before executeContext 2 ==================\n");
+
+    //     auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+
+    //     auto currentIndex = promptTuningBuffers->getChunkPtableCurrentIndex();
+    //     auto& positions = promptTuningBuffers->mChunkPtableBufferStartPositions.value()[currentIndex];
+    //     printf("chunkPtableCurrentIndex = %ld\n", currentIndex);
+    //     printf("numRows: [");
+    //     for (size_t i = 0; i < positions.size(); ++i)
+    //     {
+    //         printf("%d%s", positions[i], i < positions.size() - 1 ? ", " : "");
+    //     }
+    //     printf("]\n");
+    //     printf("Request %lu's GPU buffer (first 5 elements):\n", llmReq->mRequestId);
+
+    //     printf("================================================================================\n");
+    // }
+    // ////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // // for (auto const& llmReq : currRequests.contextRequests)
+    // // {
+    // //     // Debug print all input tokens before executeContext
+    // //     printf("\n==================== Input Tokens Before executeContext ======================\n");
+    // //     auto inputTokens = llmReq->getTokens(0);
+    // //     printf("Total input tokens: %zu\n", inputTokens.size());
+    // //     for (size_t i = 0; i < inputTokens.size(); i++)
+    // //     {
+    // //         printf("%d ", inputTokens[i]);
+    // //         if ((i + 1) % 16 == 0)
+    // //         { // Line break every 16 tokens
+    // //             printf("\n");
+    // //         }
+    // //     }
+    // //     // Add final newline if not already added
+    // //     if (inputTokens.size() % 16 != 0)
+    // //     {
+    // //         printf("\n");
+    // //     }
+    // //     printf("====================================================================\n\n");
+    // // }
+    // // Make runtime stream wait for copy to complete
+    // // mRuntime->getBufferManager().getStream().wait(mPtableCopyDoneEvent);
 
     executeContext(optProfileId, bufferId);
 
@@ -2600,6 +2727,288 @@ nvinfer1::Dims TrtGptModelInflightBatching::getTensorShape(std::string const& na
 SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const
 {
     return mKvCacheManager->getMaxCapacityBatchSize(inputLength, outputLength);
+}
+
+void TrtGptModelInflightBatching::prefetchPromptTableChunk(
+    RequestVector const& contextRequests, bool isBeforePrepareBuffers, SizeType32 bufferId)
+{
+    printf("~~~~~~~~~~~~~~~~~~~~~~Prefetching prompt table chunk, num of requests = %ld~~~~~~~~~~~~~~~~~~~~~~\n",
+        contextRequests.size());
+    NVTX3_SCOPED_RANGE_WITH_NAME(range, "prefetchPromptTableChunk");
+    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+
+    if (!isBeforePrepareBuffers)
+    {
+        // Only switch buffer after prepareBuffer()
+        promptTuningBuffers->moveToNextChunkPtableBuffer();
+    }
+
+    SizeType32 contextId = 0;
+    for (auto const& llmReq : contextRequests)
+    {
+        ///////////////////////////// Debug Print ////////////////////////////////////
+        if (llmReq->getPromptVocabSize().has_value())
+        {
+            printf("Request %lu's promptVocabSize = %d\n", llmReq->mRequestId, llmReq->getPromptVocabSize().value());
+        }
+        else
+        {
+            printf("Request %lu's promptVocabSize not set\n", llmReq->mRequestId);
+        }
+
+        if (llmReq->isFirstContextChunk())
+        {
+            printf("This is request %lu's first context chunk\n", llmReq->mRequestId);
+        }
+        else
+        {
+            printf("This is request %lu's subsequent context chunk\n", llmReq->mRequestId);
+        }
+        printf("Current chunk position: %d, Using buffer: %ld\n", llmReq->getContextCurrentPosition(),
+            promptTuningBuffers->getChunkPtableCurrentIndex());
+        ////////////////////////////////////////////////////////////////////////////////
+
+        if (llmReq->isFirstContextChunk() && isBeforePrepareBuffers)
+        {
+            printf("=========This is the first chunk for request %lu========\n", llmReq->mRequestId);
+            // For first chunk: Blocking prefetch on runtime stream to ensure data is ready
+            processPromptTableChunk(llmReq, true, bufferId, contextId);
+            printf("First chunk prefetching done on runtime stream\n");
+        }
+        else if (!isBeforePrepareBuffers) // prefetching for subsequent chunks
+        {
+            printf("........... Starting to prefetch for request %lu's subsequent chunks ...........\n",
+                llmReq->mRequestId);
+
+            // For the first prefetch chunk, don't need to wait for previous prefetch to complete
+            // For subsequent chunks: Need to wait for previous prefetch to complete
+            if (!llmReq->isFirstContextChunk())
+            {
+                printf("Request %lu's subsequent prefetch chunk\n", llmReq->mRequestId);
+                mRuntime->getBufferManager().getStream().wait(mPtableCopyDoneEvent);
+            }
+
+            // Non-blocking prefetch on copy stream to prepare next chunk in pong buffer
+            if (llmReq->getContextRemainingLength() > 0)
+            {
+                processPromptTableChunk(llmReq, false, bufferId, contextId);
+                printf("Next chunk prefetching enqueued on copy stream\n");
+            }
+        }
+
+        ++contextId;
+
+        ///////////////////////////// Debug Print ////////////////////////////////////
+        printf("Current chunk position: %d, Using buffer: %ld\n", llmReq->getContextCurrentPosition(),
+            promptTuningBuffers->getChunkPtableCurrentIndex());
+        ////////////////////////////////////////////////////////////////////////////////
+    }
+    printf(
+        "-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-.-"
+        "\n");
+}
+
+void TrtGptModelInflightBatching::processPromptTableChunk(
+    std::shared_ptr<LlmRequest> const& llmReq, bool isBeforePrepareBuffers, SizeType32 bufferId, SizeType32 contextId)
+{
+    NVTX3_SCOPED_RANGE_WITH_NAME(range, "processPromptTableChunk");
+    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+    auto const chunkSize = llmReq->getContextChunkSize();
+    auto& inputTokensMutable = llmReq->getTokensMutable(0);
+    auto vocabSize = mModelConfig.getVocabSize();
+
+    // For first chunk's initialization
+    if (isBeforePrepareBuffers)
+    {
+        promptTuningBuffers->initializeChunkPtableBuffers(mRuntime->getBufferManager(), mModelConfig, chunkSize);
+    }
+
+    // Calculate positions and sizes
+    // auto const beginCompute = llmReq->getContextCurrentPosition();
+    size_t processChunkSize;
+    size_t beginPos;
+
+    if (!isBeforePrepareBuffers)
+    {
+        processChunkSize = std::min(chunkSize, llmReq->getContextRemainingLength() - chunkSize);
+    }
+    else
+    {
+        processChunkSize = std::min(chunkSize, llmReq->getContextRemainingLength());
+    }
+
+    if (!isBeforePrepareBuffers)
+    {
+        // For prefetching next chunk
+        if (llmReq->getContextRemainingLength() - chunkSize <= 0)
+        {
+            promptTuningBuffers->updateBufferStartPosition(promptTuningBuffers->getChunkPtableCurrentIndex(), 0);
+            return; // No more chunks to prefetch
+        }
+        beginPos = llmReq->getContextCurrentPosition() + chunkSize;
+    }
+    else
+    {
+        // For current chunk
+        beginPos = llmReq->getContextCurrentPosition();
+    }
+
+    // Bounds check
+    if (beginPos + processChunkSize > inputTokensMutable.size())
+    {
+        TLLM_THROW("Invalid chunk access: beginPos(%zu) + processChunkSize(%zu) > totalSize(%zu)", beginPos,
+            processChunkSize, inputTokensMutable.size());
+        return;
+    }
+
+    // Process tokens
+    auto inputTokensChunk = inputTokensMutable.begin() + beginPos;
+    std::vector<SizeType32> outOfVocabTokens;
+    SizeType32 chunkedPTableOffset = 0;
+    for (size_t i = 0; i < processChunkSize; i++)
+    {
+        if (inputTokensChunk[i] >= vocabSize)
+        {
+            outOfVocabTokens.push_back(inputTokensChunk[i]);
+            inputTokensChunk[i] = vocabSize + chunkedPTableOffset;
+            chunkedPTableOffset++;
+        }
+    }
+
+    ///////////////////////////// Debug Print ////////////////////////////////////
+    // printf("Tokens in this chunk after modification:\n");
+    // for (size_t i = 0; i < processChunkSize; i++)
+    // {
+    //     printf("%d ", inputTokensChunk[i]);
+    //     if ((i + 1) % 16 == 0)
+    //     { // Add linebreak every 16 elements
+    //         printf("\n");
+    //     }
+    // }
+    // // Add final newline if not already added
+    // if (processChunkSize % 16 != 0)
+    // {
+    //     printf("\n");
+    // }
+    ////////////////////////////////////////////////////////////////////////////////
+
+    ///////////////////////////// Debug Print ////////////////////////////////////
+    // Debug prints
+    printf("-------------- processPromptTableChunk ---------------\n");
+    printf("Chunk processing details:\n");
+    printf("- Context remaining length: %u\n", llmReq->getContextRemainingLength());
+    printf("- Process chunk size: %lu, chunk size: %u\n", processChunkSize, chunkSize);
+    printf("- Begin position: %zu\n", beginPos);
+    printf("- Out-of-vocab tokens found: %zu\n", outOfVocabTokens.size());
+    printf("- %s chunk: vocabSize=%d, chunkPtableCurrentIndex=%ld\n", isBeforePrepareBuffers ? "First" : "Next",
+        vocabSize, promptTuningBuffers->getChunkPtableCurrentIndex());
+    printf("-------------------------------------------------------\n");
+    ////////////////////////////////////////////////////////////////////////////////
+
+    prefetchPromptTableChunkToGpu(llmReq, outOfVocabTokens, isBeforePrepareBuffers, bufferId, contextId);
+}
+
+void TrtGptModelInflightBatching::prefetchPromptTableChunkToGpu(std::shared_ptr<LlmRequest> const& llmReq,
+    std::vector<int32_t> const& outOfVocabTokens, bool isBeforePrepareBuffers, SizeType32 bufferId,
+    SizeType32 contextId) // Add parameter to choose which buffer to use
+{
+    TLLM_LOG_INFO("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE_WITH_NAME(range, "prefetchPromptTableChunkToGpu");
+    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+
+    if (outOfVocabTokens.empty())
+    {
+        return;
+    }
+
+    auto const& promptTable = llmReq->getPromptEmbeddingTable();
+    TLLM_CHECK_WITH_INFO(promptTable.has_value(), "promptTable is empty but there's fake_prompt");
+    TLLM_CHECK_WITH_INFO(promptTable.value() != nullptr, "promptTable value is null but there's fake_prompt");
+
+    ///////////////////////////// Debug Print ////////////////////////////////////
+    // Check memory type
+    auto memType = promptTable.value()->getMemoryType();
+    printf("Debug - Prompt table memory type: %s\n",
+        memType == runtime::MemoryType::kCPU          ? "CPU"
+            : memType == runtime::MemoryType::kGPU    ? "GPU"
+            : memType == runtime::MemoryType::kPINNED ? "PINNED"
+            : memType == runtime::MemoryType::kUVM    ? "UVM"
+                                                      : "OTHER");
+    ////////////////////////////////////////////////////////////////////////////////
+
+    auto currentBufferManager = isBeforePrepareBuffers ? mRuntime->getBufferManager() : mCopyBufferManager;
+    auto const hiddenSize = mModelConfig.getHiddenSize();
+    auto numRows = outOfVocabTokens.size();
+    std::size_t sliceSize = static_cast<size_t>(numRows * hiddenSize);
+    auto currentIndex = promptTuningBuffers->getChunkPtableCurrentIndex();
+
+    // Calculate the offset based on current position
+    size_t srcOffset = llmReq->mPtableCurrentPosition * hiddenSize;
+    size_t dstOffset = promptTuningBuffers->getChunkPtableBufferStartPosition(currentIndex, contextId);
+    // // Get the appropriate buffer based on isBeforePrepareBuffers flag
+    // auto gpuBuffer = isBeforePrepareBuffers ? promptTuningBuffers->getChunkPtableBuffer(currentIndex)
+    //                                   : promptTuningBuffers->getChunkPtableBuffer(1 - currentIndex);
+    // Get the appropriate buffer based on isBeforePrepareBuffers flag
+    auto gpuBuffer = promptTuningBuffers->getChunkPtableBuffer(currentIndex);
+
+    ///////////////////////////// Debug Print ////////////////////////////////////
+    // Add debug prints to understand the sizes
+    printf("numRows = %zu, %s pTable size = %zu\n", numRows, isBeforePrepareBuffers ? "Fetching" : "NextPrefetching",
+        sliceSize);
+    printf("-- llmReq->mPtableCurrentPosition = %d\n", llmReq->mPtableCurrentPosition);
+    printf("Debug - promptTable size: %zu bytes\n", promptTable.value()->getSize());
+    printf("Debug - Attempting to access: srcOffset = %zu, size needed = %zu\n", srcOffset, sliceSize);
+    printf("Debug - hiddenSize: %d\n", hiddenSize);
+    printf("Debug - srcOffset: %zu, dstOffset: %zu\n", srcOffset, dstOffset);
+    printf("Debug - numRows: %zu\n", numRows);
+    printf("Debug - total elements needed: %zu\n", sliceSize);
+    ////////////////////////////////////////////////////////////////////////////////
+
+    // First view as 1D tensor of elements
+    auto totalElements = promptTable.value()->getSize();
+    auto table1D = runtime::ITensor::view(
+        promptTable.value(), runtime::ITensor::makeShape({static_cast<int64_t>(totalElements)}));
+
+    // Add bounds checking
+    if (srcOffset + sliceSize > totalElements)
+    {
+        printf("ERROR: Would access beyond buffer bounds!\n");
+        printf("Total elements: %zu, Trying to access up to: %zu\n", totalElements, srcOffset + (sliceSize));
+    }
+
+    // Convert UniquePtr to SharedPtr
+    auto table1DShared = runtime::ITensor::SharedPtr(table1D.release());
+
+    // Then slice and reshape
+    auto pTableView = runtime::ITensor::slice(table1DShared, srcOffset, sliceSize);
+    // pTableView->reshape(currentShape);
+
+    auto gpuBufferSlice = runtime::ITensor::slice(gpuBuffer, dstOffset, numRows);
+    printf("Successfully created GPU buffer slice of size %zu\n", gpuBufferSlice->getSize());
+
+    // Copy the slice to GPU buffer using BufferManager
+
+    // mCopyBufferManager.copy(*pTableView, *gpuBufferSlice);
+    currentBufferManager.copy(*pTableView, *gpuBufferSlice);
+    printf("Copied block of %zu rows from prompt table to GPU buffer\n", numRows);
+
+    // Update buffer sizes
+    promptTuningBuffers->updateBufferStartPosition(currentIndex, outOfVocabTokens.size());
+    // if (isBeforePrepareBuffers)
+    // {
+    //     promptTuningBuffers->updateBufferStartPosition(currentIndex, outOfVocabTokens.size());
+    // }
+    // else
+    // {
+    //     // Record event after copy is queued
+    //     currentBufferManager.getStream().record(mPtableCopyDoneEvent);
+    //     promptTuningBuffers->updateBufferStartPosition(1 - currentIndex, outOfVocabTokens.size());
+    // }
+
+    // Update position for next chunk
+    llmReq->mPtableCurrentPosition += outOfVocabTokens.size();
+
+    TLLM_LOG_INFO("%s stop", __PRETTY_FUNCTION__);
 }
 
 } // namespace tensorrt_llm::batch_manager
