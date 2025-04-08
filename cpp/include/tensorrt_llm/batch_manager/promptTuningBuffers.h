@@ -62,8 +62,6 @@ public:
             return;
         }
 
-        // Initialize GPU ping-pong buffers
-        printf("Initialize chunk ptable buffers\n");
         std::array<TensorPtr, 2> buffers;
         std::vector<std::vector<SizeType32>> startPositions(2);
 
@@ -74,17 +72,6 @@ public:
 
             buffers[i] = manager.gpu(runtime::ITensor::makeShape({contextChunkSize, modelConfig.getHiddenSize()}),
                 nvinfer1::DataType::kHALF); // TODO: change to embedding table data type
-
-            // debug print, can be removed
-            auto pTableSize = contextChunkSize * modelConfig.getHiddenSize();
-            if (buffers[i]->getMemoryType() == runtime::MemoryType::kGPU)
-            {
-                printf("Chunk ptable buffer %d on GPU, created with size %u\n", i, pTableSize);
-            }
-            else
-            {
-                printf("Chunk ptable buffer %d on CPU, created with size %u\n", i, pTableSize);
-            }
         }
 
         // Assign to optional members
