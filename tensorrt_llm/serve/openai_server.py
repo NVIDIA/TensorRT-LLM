@@ -12,7 +12,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai.types.chat import ChatCompletionMessageParam
-from transformers import PreTrainedTokenizer
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -71,10 +70,9 @@ class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
-                 model: str,
-                 hf_tokenizer: PreTrainedTokenizer = None):
+                 model: str):
         self.llm = llm
-        self.tokenizer = hf_tokenizer
+        self.tokenizer = llm.tokenizer
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
