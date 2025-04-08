@@ -177,7 +177,7 @@ python3 inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py \
     --prompt "What is Ubuntu operation system?"
 ```
 
-+ You can receive the following results ff everything goes smoothly.
++ You can receive the following results if everything goes smoothly.
 
 ```txt
 Final text:
@@ -218,7 +218,7 @@ python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
     --verbose
 ```
 
-+ You can receive the following results ff everything goes smoothly.
++ You can receive the following results if everything goes smoothly.
 
 ```txt
 Ubuntu is a free and open source operating system. It is a Linux based operating system. ...
