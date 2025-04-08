@@ -17,9 +17,10 @@ import pytest
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids,
+from ..conftest import (llm_models_root, parametrize_with_ids, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
@@ -28,6 +29,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
 
+    @pytest.mark.skip_less_device_memory(32000)
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -41,6 +43,121 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         with LLM(model_path) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    def test_bfloat16(self, attn_backend, torch_compile):
+        pytorch_config = PyTorchConfig(
+            torch_compile_enabled=torch_compile,
+            cuda_graph_padding_enabled=torch_compile,
+            cuda_graph_batch_sizes=[4],
+            attn_backend=attn_backend,
+        )
+        llm = LLM(self.MODEL_PATH, pytorch_backend_config=pytorch_config)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2)],
+                             ids=["tp4", "tp2pp2"])
+    def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
+                            torch_compile):
+        if torch_compile and pp_size > 1:
+            pytest.skip(
+                "Pipeline parallel with torch.compile is not supported yet.\n"
+                "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
+                "discarded at graph breaks.")
+        pytorch_config = PyTorchConfig(
+            torch_compile_enabled=torch_compile,
+            cuda_graph_padding_enabled=torch_compile,
+            cuda_graph_batch_sizes=[4],
+            attn_backend=attn_backend,
+        )
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  pytorch_backend_config=pytorch_config)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @parametrize_with_ids("fp8kv", [False, True])
+    def test_fp8(self, fp8kv, attn_backend, torch_compile):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        pytorch_config = PyTorchConfig(
+            torch_compile_enabled=torch_compile,
+            cuda_graph_padding_enabled=torch_compile,
+            cuda_graph_batch_sizes=[4],
+            attn_backend=attn_backend,
+        )
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+        llm = LLM(
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+            quant_config=quant_config,
+            pytorch_backend_config=pytorch_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @parametrize_with_ids("fp8kv", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size", [(4, 1), (2, 2)],
+                             ids=["tp4", "tp2pp2"])
+    def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
+                       torch_compile):
+        if torch_compile and pp_size > 1:
+            pytest.skip(
+                "Pipeline parallel with torch.compile is not supported yet.\n"
+                "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
+                "discarded at graph breaks.")
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        pytorch_config = PyTorchConfig(
+            torch_compile_enabled=torch_compile,
+            cuda_graph_padding_enabled=torch_compile,
+            cuda_graph_batch_sizes=[4],
+            attn_backend=attn_backend,
+        )
+        if fp8kv:
+            quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            pytorch_config.kv_cache_dtype = "fp8"
+        llm = LLM(
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            quant_config=quant_config,
+            pytorch_backend_config=pytorch_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+        if fp8kv:
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+        with llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
