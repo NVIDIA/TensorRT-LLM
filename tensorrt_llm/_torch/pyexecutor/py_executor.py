@@ -309,6 +309,7 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        del self.model_engine
 
     def can_enqueue_requests(self) -> bool:
         """

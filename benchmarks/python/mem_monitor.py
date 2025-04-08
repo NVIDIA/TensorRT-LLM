@@ -67,6 +67,9 @@ class MemoryMonitor:
         self.mem_monitor_process.join(timeout=20)
         self.mem_monitor_process = None
         logger.debug("Memory monitor subprocess joined.")
+        self.peak_mem_queue.close()
+        self.peak_mem_queue.join_thread()
+        logger.debug("Peak memory queue closed and joined.")
 
     def _upd_peak_memory_usage(self, signal_event, peak_mem_queue):
         peak_host_used, peak_device_used = self.get_memory_usage()
