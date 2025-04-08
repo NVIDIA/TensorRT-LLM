@@ -77,6 +77,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         guided_decoding_config=executor_config.guided_decoding_config,
     )
 
+    draft_model_engine = None
     if has_draft_model_engine:
         draft_model_engine = PyTorchModelEngine(
             spec_config.eagle_weights_path,
@@ -90,8 +91,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             spec_config=copy.copy(spec_config),
         )
         draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
-    else:
-        draft_model_engine = None
 
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
@@ -136,7 +135,6 @@ def create_py_executor(executor_config: ExecutorConfig,
     kv_cache_manager = None
     draft_kv_cache_manager = None
     origin_executor_config = copy.deepcopy(executor_config)
-    start_worker = True
     if executor_config.pytorch_backend_config.use_kv_cache:
         if 'cp_type' not in mapping.cp_config:
             executor_config.kv_cache_config.max_tokens = get_token_num_for_estimation(
@@ -147,7 +145,6 @@ def create_py_executor(executor_config: ExecutorConfig,
         draft_kv_cache_manager = create_kv_cache_manager(
             draft_model_engine, mapping,
             executor_config) if draft_model_engine is not None else None
-        start_worker = False
 
     # KVCacheManager modifies these fields, update them to executor_config
     if kv_cache_manager is not None:
@@ -158,7 +155,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              start_worker)
+                                              False)
 
     if executor_config.pytorch_backend_config.use_kv_cache:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
@@ -172,15 +169,24 @@ def create_py_executor(executor_config: ExecutorConfig,
                                                        executor_config)
 
             if model_engine.attn_metadata is not None and kv_cache_manager is not None:
-                model_engine.attn_metadata.kv_cache_manager = kv_cache_manager
+                if pytorch_backend_config.use_cuda_graph:
+                    model_engine._release_cuda_graphs()
+                del model_engine.attn_metadata
+                model_engine.attn_metadata = None
 
-            draft_kv_cache_manager = create_kv_cache_manager(
-                draft_model_engine, mapping,
-                executor_config) if draft_model_engine is not None else None
+            if draft_model_engine is not None:
+                draft_kv_cache_manager = create_kv_cache_manager(
+                    draft_model_engine, mapping, executor_config)
+                if draft_model_engine.attn_metadata is not None and draft_kv_cache_manager is not None:
+                    if pytorch_backend_config.use_cuda_graph:
+                        draft_model_engine._release_cuda_graphs()
+                    del draft_model_engine.attn_metadata
+                    draft_model_engine.attn_metadata = None
 
             py_executor = create_py_executor_instance(
                 dist, kv_cache_manager, draft_kv_cache_manager, mapping,
                 pytorch_backend_config, executor_config, ctx_chunk_config,
                 model_engine, draft_model_engine, True)
 
+    py_executor.start_worker()
     return py_executor

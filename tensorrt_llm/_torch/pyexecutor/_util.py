@@ -138,7 +138,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    py_executor.set_dist_response(True)
+    py_executor.set_gather_responses(True)
     origin_iter_stats = py_executor.enable_iter_perf_stats
     py_executor.enable_iter_perf_stats = False
     req_ids = []
@@ -176,7 +176,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         kv_cache_max_tokens = min(kv_cache_max_tokens, kv_cache_max_tokens_in)
 
     logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
-    py_executor.set_dist_response(False)
+    py_executor.set_gather_responses(False)
     py_executor.enable_iter_perf_stats = origin_iter_stats
 
     py_executor.resource_manager.resource_managers.get(

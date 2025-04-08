@@ -824,6 +824,11 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
+    def _release_cuda_graphs(self):
+        self._cuda_graphs.clear()
+        del self._cuda_graph_mem_pool
+        self._cuda_graph_mem_pool = None
+
     def get_max_num_sequences(self) -> int:
         """
         Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
