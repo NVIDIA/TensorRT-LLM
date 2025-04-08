@@ -155,7 +155,7 @@ python3 scripts/launch_triton_server.py \
     --log &
 ```
 
-+ Triton server launches successfully if you see the output below in the file:
++ You can see the output below in the file if Triton server launches successfully:
 
 ```txt
 Started HTTPService at 0.0.0.0:8000
@@ -163,21 +163,43 @@ Started GRPCInferenceService at 0.0.0.0:8001
 Started Metrics Service at 0.0.0.0:8002
 ```
 
-5. Test DTM with a script
+1. Send a request for inference
+
+```bash
+python3 inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py \
+    --url-target=localhost:8001 \
+    --draft-tensorrt-llm-model-name=${DRAFT_MODEL_NAME} \
+    --target-tensorrt-llm-model-name=${TARGET_MODEL_NAME} \
+    --output-len=100 \
+    --num-draft-tokens=4 \
+    --end-id=2 \
+    --pad-id=2 \
+    --prompt "What is Ubuntu operation system?"
+```
+
++ You can receive the following results ff everything goes smoothly.
+
+```txt
+Final text:
+ What is Ubuntu operation system?
+Ubuntu is a free and open source operating system that runs from the desktop, to the cloud, to all your internet connected things. Ubuntu is used by millions of people around the world who want to explore new ideas and discover new opportunities.
+Ubuntu is a community developed operating system that is perfect for laptops, desktops, servers, and cloud. It is used by millions of people around the world who want to explore new ideas and discover new opportunities.
+```
+
+6. Test DTM with a script
 + Prepare a JSON file `input_data.json` containing input data as below (more requests are acceptable).
 
 ```json
 [
   {
-      "input": "James Best, best known for his ",
-      "instruction": "Continue writing the following story:",
+      "input": "What is Ubuntu operation system?",
+      "instruction": "Answer the question shortly.",
       "output": "                                                                "
   }
 ]
 ```
 
 + Use command below to launch requests for inference.
-+ `--num-draft-tokens` can be modified by runtime draft lengths, 4 is used in this example.
 
 ```bash
 python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
@@ -196,13 +218,19 @@ python3 tools/inflight_batcher_llm/speculative_decoding_test.py \
     --verbose
 ```
 
-6. Stop triton inference server after all work is done
++ You can receive the following results ff everything goes smoothly.
+
+```txt
+Ubuntu is a free and open source operating system. It is a Linux based operating system. ...
+```
+
+7. Stop triton inference server after all work is done
 
 ```bash
 pkill tritonserver
 ```
 
-7. Advanced usage: Fast logits D2D transfer.
+8. Advanced usage: Fast logits D2D transfer.
 
 + Fast logits boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine supported since TensorRT-LLM-0.15.0.
 
