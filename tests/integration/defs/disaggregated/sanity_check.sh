@@ -40,6 +40,12 @@ elif [[ "${TEST_DESC}" == "4_ranks" ]]; then
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_overlap_cuda_graph" ]]; then
+  NUM_RANKS=4
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_overlap_cuda_graph.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph" ]]; then
+  NUM_RANKS=4
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml
