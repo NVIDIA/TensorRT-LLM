@@ -16,7 +16,8 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
 
-BATCH_RESP_IN_AWAIT = os.getenv("TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT") == "1"
+PERIODICAL_RESP_IN_AWAIT = os.getenv(
+    "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT") == "1"
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
@@ -29,8 +30,8 @@ def get_spawn_proxy_process_env() -> bool:
     return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
 
 
-if BATCH_RESP_IN_AWAIT:
-    logger.info("Using batched responses in await_responses")
+if PERIODICAL_RESP_IN_AWAIT:
+    logger.info("Using periodical responses in await_responses")
 
 
 def create_mpi_comm_session(
