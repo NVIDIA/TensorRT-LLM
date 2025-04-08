@@ -327,10 +327,7 @@ bool KVCacheBlock::isLeaf() const
 Example:
 ```
 totalBlocks = 16384, uniqueWindowSizeToLayers = {1024: [1], 4096: [0, 4, 5], 8192: [2, 3]}
-
 windowSizeToContribution = {1024: (1024*1=1024), 4096: (4096*3=12288), 8192: (8192*2)};
-windowSizesTotalSum = 1024 + 12288 + 16384 = 29696;
-
 return windowSizeToAllottedBlocks =  {
         1024: (1024.0   /29696)*16384 + 1  = 565,
         4096: (12288.0  /29696)*16384 + 1  = 6780,
@@ -344,13 +341,12 @@ std::map<SizeType32, SizeType32> BlockManager::blocksPerWindowSize(
     TLLM_CHECK(totalBlocks > 0);
     std::map<SizeType32, SizeType32> windowSizeToContribution;
 
-    auto windowSizesTotalSum = 0;
     for (auto const& [windowSize, layers] : uniqueWindowSizeToLayers)
     {
-        auto const windowSizeContribution = windowSize * layers.size();
-        windowSizeToContribution[windowSize] = windowSizeContribution;
-        windowSizesTotalSum += windowSizeContribution;
+        windowSizeToContribution[windowSize] = windowSize * layers.size();
     }
+    auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
+        SizeType32{0}, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
 
     std::map<SizeType32, SizeType32> windowSizeToAllottedBlocks;
     SizeType32 remainingBlocks = totalBlocks;
