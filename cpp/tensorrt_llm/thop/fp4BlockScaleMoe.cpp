@@ -15,7 +15,7 @@
  */
 
 #include "tensorrt_llm/kernels/quantization.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/fp8BlockScaleMoe/runner.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
@@ -86,9 +86,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
         = at::empty({}, at::TensorOptions().device(routing_logits.device()).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
         {args.num_tokens * args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    // at::Tensor permuted_idx_to_expanded_idx
-    //     = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(),
-    //     std::nullopt);
+
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
     at::Tensor expert_weights = at::detail::empty_cuda(
@@ -105,12 +103,6 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
 
     at::Tensor gemm1_output_scale = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 16},
         at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
-
-    // FusedAct for FP4 (not used)
-    // at::Tensor activation_output = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 2},
-    //     at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
-    // at::Tensor activation_output_scale = at::detail::empty_cuda({max_num_padded_tokens, intermediate_size / 16},
-    //     at::ScalarType::Float8_e4m3fn, hidden_states.device(), std::nullopt);
 
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
@@ -219,9 +211,7 @@ torch::Tensor fp4_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     // gemm1 intermediate ws
     workspace.gemm1_output = gemm1_output.data_ptr();
     workspace.gemm1_output_scale = reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
-    // activation intermediate ws (fusedAct for FP4)
-    // workspace.activation_output = activation_output.data_ptr();
-    // workspace.activation_output_scale = reinterpret_cast<float*>(activation_output_scale.data_ptr());
+
     // gemm2 intermediate ws
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;

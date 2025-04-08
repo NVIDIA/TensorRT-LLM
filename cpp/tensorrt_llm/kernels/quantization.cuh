@@ -527,8 +527,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-    float outputScale
-        = SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+    float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValue) : 0.0f;
 
     if (SFout)
     {
@@ -826,30 +825,7 @@ cvt_fp8_to_fp4(
 #endif
 }
 
-inline __global__ void nvfp4_block_scale_interleave_kernel(
-    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput)
-{
-    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
-    {
-        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
-        {
-            for (int colIdx = threadIdx.x; colIdx < numCols; colIdx += blockDim.x)
-            {
-                int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
-                auto sf = SFIn[inOffset];
-
-                std::optional<int> batchIdxOpt = batchIdx;
-                std::optional<int> numRowsOpt = numRows;
-
-                // Without batching, the math in get_sf_out_offset is the same as
-                // int const numSfTilesK = (numCols + 4 - 1) / 4;
-                // int const tileOffset = ((mi / 128) * numSfTilesK + ki / 4) * 512;
-                // int const dstIdx = tileOffset + (mi % 32) * 16 + ((mi % 128) / 32) * 4 + ki % 4;
-                auto dstIdx = get_sf_out_offset_128x4(batchIdxOpt, rowIdx, colIdx, numRowsOpt, numCols * 16);
-                SFOutput[dstIdx] = sf;
-            }
-        }
-    }
-}
+__global__ void nvfp4_block_scale_interleave_kernel(
+    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@
 #include "gemmList.h"
 #include "runner.h"
 #include "trtllmGenSrc/DevKernel.h"
-#include "trtllmGenSrc/MixtureOfExpertsInterface.h"
 #include "trtllmGenSrc/RoutingKernel.h"
 #include <iostream>
 
@@ -135,43 +134,6 @@ void Runner::run(void* hidden_state, void* hidden_state_scale, void* weight, voi
     TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
     auto const& kernelInfo = gemmList[*selectedIndex.begin()];
 
-    // TODO: remove this once we find the way to shuffle the weights offline
-    // if (kernelInfo.shuffledMatrixA || kernelInfo.useFusedAct)
-    // {
-    //     // Allocate temporary buffers for shuffled weights using vectors
-    //     auto numBitsPerElt = trtllm::gen::dtypeGetNumBits(mDtypeElt);
-    //     const size_t numBytesA = num_experts * hidden_size * intermediate_size * 2 * numBitsPerElt / /* bits */ 8;
-    //     std::vector<uint8_t> hShuffledA(numBytesA);
-
-    //     auto numBitsPerSf = trtllm::gen::dtypeGetNumBits(tg::dtypeBlockSfType(mDtypeElt));
-    //     const size_t numSfBytes = num_experts * hidden_size * intermediate_size / 16 * 2 * numBitsPerSf / /* bits */
-    //     8; std::vector<uint8_t> hShuffledASf(numSfBytes);
-
-    //     // Copy weights to host
-    //     cudaMemcpy(hShuffledA.data(), weight, numBytesA, cudaMemcpyDeviceToHost);
-    //     cudaMemcpy(hShuffledASf.data(), weight_scale, numSfBytes, cudaMemcpyDeviceToHost);
-
-    //     // Prepare and shuffle the weights
-    //     prepareBatchWeightsOnHost(hShuffledA.data(), // wIn
-    //         hShuffledASf.data(),                     // wSfIn
-    //         hShuffledA.data(),                       // wOut (in-place)
-    //         hShuffledASf.data(),                     // wSfOut (in-place)
-    //         mDtypeElt,                               // dtypeElt
-    //         intermediate_size * 2,                   // m (2x for gated activation)
-    //         hidden_size,                             // k
-    //         kernelInfo.epilogueTileM,                // epilogueTileM (from tileN)
-    //         num_experts,                             // numBatches
-    //         kernelInfo.shuffledMatrixA,              // useShuffleMatrix
-    //         kernelInfo.useFusedAct,                  // useFusedAct (for gated activation)
-    //         mDtypeElt == tg::Dtype::E2m1,            // useBlockScaling
-    //         16                                       // numEltsPerSf (for E2m1)
-    //     );
-
-    //     // Copy shuffled weights back to device
-    //     // cudaMemcpy(weight, hShuffledA.data(), numBytesA, cudaMemcpyHostToDevice);
-    //     // cudaMemcpy(weight_scale, hShuffledASf.data(), numSfBytes, cudaMemcpyHostToDevice);
-    // }
-
     gemmCommon::MyOptions options;
     options.mTopK = top_k;
     options.mBatchM = false;
@@ -238,43 +200,6 @@ void Runner::run(void* permuted_hidden_state, void* permuted_hidden_state_scale,
     TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element and output types");
     TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element and output types");
     auto const& kernelInfo = gemmList[*selectedIndex.begin()];
-
-    // TODO: remove this once we find the way to shuffle the weights offline
-    // if (kernelInfo.shuffledMatrixA)
-    // {
-    //     // Allocate temporary buffers for shuffled weights using vectors
-    //     auto numBitsPerElt = trtllm::gen::dtypeGetNumBits(mDtypeElt);
-    //     const size_t numBytesA = num_experts * hidden_size * intermediate_size * numBitsPerElt / /* bits */ 8;
-    //     std::vector<uint8_t> hShuffledA(numBytesA);
-
-    //     auto numBitsPerSf = trtllm::gen::dtypeGetNumBits(tg::dtypeBlockSfType(mDtypeElt));
-    //     const size_t numSfBytes = num_experts * hidden_size * intermediate_size / 16 * numBitsPerSf / /* bits */ 8;
-    //     std::vector<uint8_t> hShuffledASf(numSfBytes);
-
-    //     // Copy weights to host
-    //     cudaMemcpy(hShuffledA.data(), weight, numBytesA, cudaMemcpyDeviceToHost);
-    //     cudaMemcpy(hShuffledASf.data(), weight_scale, numSfBytes, cudaMemcpyDeviceToHost);
-
-    //     // Prepare and shuffle the weights
-    //     prepareBatchWeightsOnHost(hShuffledA.data(), // wIn
-    //         hShuffledASf.data(),                     // wSfIn
-    //         hShuffledA.data(),                       // wOut (in-place)
-    //         hShuffledASf.data(),                     // wSfOut (in-place)
-    //         mDtypeElt,                               // dtypeElt
-    //         hidden_size,                             // m
-    //         intermediate_size,                       // k
-    //         kernelInfo.epilogueTileM,                // epilogueTileM (from tileN)
-    //         num_experts,                             // numBatches
-    //         kernelInfo.shuffledMatrixA,              // useShuffleMatrix
-    //         false,                                   // useFusedAct (for gated activation)
-    //         mDtypeElt == tg::Dtype::E2m1,            // useBlockScaling
-    //         16                                       // numEltsPerSf (for E2m1)
-    //     );
-
-    //     // Copy shuffled weights back to device
-    //     // cudaMemcpy(weight, hShuffledA.data(), numBytesA, cudaMemcpyHostToDevice);
-    //     // cudaMemcpy(weight_scale, hShuffledASf.data(), numSfBytes, cudaMemcpyHostToDevice);
-    // }
 
     gemmCommon::MyOptions options;
     options.mTopK = top_k;
@@ -373,16 +298,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaS
 
     setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
-    // Calling routing outside to properly allocate workspace
-    // moe::dev::routing::run(routingData, stream);
-
     void* hidden_states_scale_linear{args.hidden_states_scale};
-    // FIXME check that we receive r128c4 sf layout
-    // if (args.mDtypeElt == tg::Dtype::E2m1)
-    // {
-    //     hidden_states_scale_linear = workspace.hidden_states_scale_linear;
-    //     moe::dev::convertsf::run(convertSfData, stream);
-    // }
 
     PermuteGemm1::Runner permuteGemm1(args.mDtypeElt);
     permuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
@@ -411,36 +327,6 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaS
 
     // Run finalize
     moe::dev::finalize::run(finalizeData, stream);
-
-    // std::vector<uint8_t> gemm1_output_fp8(64 * args.intermediate_size / 2);
-    // printf("array addr 0x%lx\n", &gemm1_output_fp8[0]);
-    // printf("local_num_experts addr 0x%lx\n", &args.local_num_experts);
-    // cudaMemcpy(gemm1_output_fp8.data(), workspace.gemm1_output, gemm1_output_fp8.size() * sizeof(uint8_t),
-    //     cudaMemcpyDeviceToHost);
-    // std::cout << "args.local_num_experts: " << args.local_num_experts << std::endl;
-    // std::cout << "gemm1 output (hex):" << std::endl;
-    // for (int offset = 0; offset < 8; offset++)
-    // {
-    //     int base = offset * 2048;
-    //     for (int i = 0; i < args.num_tokens; i++)
-    //     {
-    //         for (int j = 0; j < args.intermediate_size / 2; j += 16)
-    //         {
-    //             std::cout << "Token " << i << " [" << std::dec << base + j << "]: ";
-    //             for (int k = 0; k < 16 && (j + k) < args.intermediate_size / 2; k++)
-    //             {
-    //                 // std::cout << "offset: " << std::dec << base + i * args.intermediate_size / 2 + j + k <<
-    //                 // std::endl;
-    //                 std::cout << "0x" << std::hex << std::setw(2) << std::setfill('0')
-    //                           << static_cast<uint>(gemm1_output_fp8[base + i * args.intermediate_size / 2 + j + k])
-    //                           << " ";
-    //             }
-    //             std::cout << std::endl;
-    //         }
-    //         std::cout << std::endl;
-    //     }
-    // }
-    // std::cout << "args.local_num_experts: " << args.local_num_experts << std::endl;
 }
 } // namespace MoE
 

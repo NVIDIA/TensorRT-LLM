@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -269,8 +272,7 @@ def run_moe_dequant(args, use_fp4=False):
 
     if use_fp4:
         activation_output, c_global_sf = quant_dequant_fp4(
-            activation_output.to(torch.bfloat16), False, True, args.num_tokens,
-            args.intermediate_size)
+            activation_output.to(torch.bfloat16), False, True)
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
 
@@ -347,9 +349,6 @@ def run_moe_reference_fp4(args):
         args.hidden_states, args.hidden_states_scale,
         1 / args.hidden_states_scale_global, sf_vec_size).cuda()
 
-    # torch.set_printoptions(profile="full")  # This prevents truncation
-    # torch.set_printoptions(linewidth=1000)
-    # print("args.gemm1_weights: ", args.gemm1_weights[0])
     gemm1_weights_dequant = e2m1_and_ufp8_scale_batches(
         args.gemm1_weights, args.gemm1_scales, 1 / args.gemm1_scales_global,
         sf_vec_size).cuda()
@@ -357,13 +356,6 @@ def run_moe_reference_fp4(args):
     gemm2_weights_dequant = e2m1_and_ufp8_scale_batches(
         args.gemm2_weights, args.gemm2_scales, 1 / args.gemm2_scales_global,
         sf_vec_size).cuda()
-
-    # print("hidden_states_dequant: ", hidden_states_dequant)
-    # torch.set_printoptions(profile="full")  # This prevents truncation
-    # torch.set_printoptions(linewidth=1000)
-    # print("gemm1_weights_dequant: ", gemm1_weights_dequant[0])
-    # print("args.gemm1_weights: ", args.gemm1_weights[0])
-    # print("gemm2_weights_dequant: ", gemm2_weights_dequant)
 
     args_dequant = moe_args_dequant(args.num_tokens, args.num_experts,
                                     args.hidden_size, args.intermediate_size,
@@ -409,7 +401,6 @@ def quant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
     a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.cuda(), a_global_sf.cuda(),
                                                 sf_vec_size, use_ue8m0,
                                                 is_sf_swizzled_layout)
-    # a_sf[:] = 126
 
     return a_fp4, a_sf, a_global_sf
 
@@ -435,28 +426,13 @@ def quant_fp4_batches(a,
     return result_quant_a, result_sfs, result_global_sfs
 
 
-def quant_dequant_fp4(a,
-                      use_ue8m0=False,
-                      is_sf_swizzled_layout=True,
-                      num_tokens=0,
-                      intermediate_size=0):
+def quant_dequant_fp4(a, use_ue8m0=False, is_sf_swizzled_layout=True):
     a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
     sf_vec_size = 16
 
     a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.cuda(), a_global_sf.cuda(),
                                                 sf_vec_size, use_ue8m0,
                                                 is_sf_swizzled_layout)
-
-    # torch.set_printoptions(profile="full")  # This prevents truncation
-    # torch.set_printoptions(linewidth=1000)
-    # bytes_list = [
-    #     hex(x) for x in a_fp4.view(torch.uint8).cpu().numpy().reshape(-1)
-    #     [:num_tokens * intermediate_size // 2]
-    # ]
-    # for i in range(0, len(bytes_list), 16):
-    #     print(f"reference gemm1 output[{i}]: ", " ".join(bytes_list[i:i + 16]))
-    # for i in range(0, 256, 4):
-    #     print(f"reference gemm1 scales[{i}]: ", a_sf[i:i + 4])
 
     a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
                                                   1 / a_global_sf, sf_vec_size)
@@ -497,8 +473,6 @@ def test_moe_fp8(num_tokens, num_experts, hidden_size, intermediate_size):
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
     routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
-    # print("expert_logits: ", expert_logits)
-    # print("routing_bias: ", routing_bias)
 
     hidden_states = torch.randn((num_tokens, hidden_size),
                                 device='cuda').to(torch.float8_e4m3fn)
@@ -597,8 +571,6 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
     expert_logits = torch.randn((num_tokens, num_experts),
                                 device='cuda').to(torch.float)
     routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
-    # print("expert_logits: ", expert_logits)
-    # print("routing_bias: ", routing_bias)
 
     hidden_states = 2 * torch.randn(
         (num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
@@ -610,26 +582,6 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
                                 device='cuda',
                                 dtype=torch.bfloat16)
 
-    # hidden_states[:, :] = 0
-    # hidden_states[:, :] = 1
-    # hidden_states[:, :] = 1
-
-    # for i in range(num_experts):
-    #     for j in range(2 * intermediate_size):
-    #         gemm1_weights[i, j, :] = (j) % 16
-    # print("gemm1_weights: ", gemm1_weights)
-    # gemm1_weights[:, :, :] = 0
-    # gemm1_weights[:, 0, :] = 1
-    # gemm1_weights[:, 1, :] = 1
-    # gemm1_weights[:, intermediate_size, :] = 1
-    # gemm1_weights[:, intermediate_size+1, :] = 1
-    # # gemm1_weights[:, 0, :] = 1
-    # # gemm1_weights[:, intermediate_size, :] = 1
-    # gemm2_weights[:, :, :] = 1
-    # # for i in range(intermediate_size):
-    # #     gemm1_weights[:, i,:] = i % 3
-    # #     gemm1_weights[:, intermediate_size + i, :] = -(i % 3)
-
     use_ue8m0 = False
     # Quantize hidden states. Produces scales for activations in 128x4 layout for ref impl.
     hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, hidden_states_scale_global = quant_fp4(
@@ -640,9 +592,9 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
 
     hidden_states_fp4 = hidden_states_fp4_bytes.reshape(
         num_tokens, hidden_size // 2)  # packed fp4
+
     hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4_bytes.view(
-        torch.float8_e4m3fn).reshape(-1,
-                                     hidden_size // 16)  # fp8 scaling factors
+        torch.float8_e4m3fn)  # fp8 scaling factors
 
     # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
     gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = quant_fp4_batches(
@@ -677,7 +629,6 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
                                                     top_k, n_groups,
                                                     top_k_groups,
                                                     routed_scaling, padding)
-    # print("scores: ", scores)
     args = moe_args(
         num_tokens,
         num_experts,

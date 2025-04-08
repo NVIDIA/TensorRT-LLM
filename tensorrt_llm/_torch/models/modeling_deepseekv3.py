@@ -1,3 +1,30 @@
+# --------------------------------------------------
+# Portions of this code were derived from DeepSeek‑V3:
+#   https://github.com/deepseek-ai/DeepSeek-V3
+#
+# MIT License
+
+# Copyright (c) 2023 DeepSeek
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# --------------------------------------------------
+
 import math
 import os
 import warnings
@@ -256,13 +283,13 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
                                    requires_grad=False)
         self.moe_backend = moe_backend
         if moe_backend == 'TRTLLM':
-            self.e_score_correction_bias = nn.Parameter(torch.empty(
-                (num_experts), dtype=torch.bfloat16),
-                                                        requires_grad=False)
+            bias_dtype = torch.bfloat16
         else:
-            self.e_score_correction_bias = nn.Parameter(torch.empty(
-                (num_experts), dtype=torch.float32),
-                                                        requires_grad=False)
+            bias_dtype = torch.float32
+
+        self.e_score_correction_bias = nn.Parameter(torch.empty(
+            (num_experts), dtype=bias_dtype),
+                                                    requires_grad=False)
 
         assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
 
@@ -289,12 +316,9 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
 
         self.weight.copy_(weights[0]["weight"][:])
 
-        if self.moe_backend == 'TRTLLM':
-            self.e_score_correction_bias.copy_(
-                weights[0]["e_score_correction_bias"][:].to(torch.bfloat16))
-        else:
-            self.e_score_correction_bias.copy_(
-                weights[0]["e_score_correction_bias"][:].to(torch.float32))
+        self.e_score_correction_bias.copy_(
+            weights[0]["e_score_correction_bias"][:].to(
+                self.e_score_correction_bias.dtype))
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # topk routing
@@ -1255,12 +1279,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
                 if names[-1] == "kv_b_proj":
-                    dequant_kv_b_proj = False
                     # TODO: remove weight_dequant after enabling fp8_bmm
-                    should_dequant_weights = self.model_config.moe_backend == 'TRTLLM' and check_weight_dtype(
-                        name, torch.float8_e4m3fn)
-                    if should_dequant_weights:
-                        dequant_kv_b_proj = True
+                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
+                        names[-1])
+                    if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
                             name)
                     else:

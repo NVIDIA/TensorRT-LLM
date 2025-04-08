@@ -28,7 +28,7 @@ class ModelConfig(Generic[TConfig]):
     moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
-    moe_backend: str = 'TRTLLM'  # options can be CUTLASS, TRTLLM, NAIVE
+    moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
 
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
@@ -78,9 +78,6 @@ class ModelConfig(Generic[TConfig]):
         pretrained_config = transformers.AutoConfig.from_pretrained(
             checkpoint_dir,
             trust_remote_code=trust_remote_code,
-            num_experts_per_tok=8,
-            topk_group=4,
-            n_group=8,
         )
 
         # Find the cache path by looking for the config.json file which should be in all
@@ -123,7 +120,7 @@ class ModelConfig(Generic[TConfig]):
 
             if kwargs.get(
                     'moe_backend'
-            ) == 'TRTLLM' and quant_config.exclude_modules is None:
+            ) == 'TRTLLM' and quant_config.quant_algo == "FP8_BLOCK_SCALES" and quant_config.exclude_modules is None:
                 quant_config.exclude_modules = [
                     "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
                 ]
@@ -139,7 +136,7 @@ class ModelConfig(Generic[TConfig]):
                 if kwargs.get('moe_backend') == 'TRTLLM':
                     # TODO: This is a hack. Remove after fp8 bmm is integrated.
                     quant_config.exclude_modules = [
-                        "*eh_proj", "*kv_b_proj*", "*k_b_proj*"
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
                     ]
                 else:
                     quant_config.exclude_modules = ["*eh_proj"]
