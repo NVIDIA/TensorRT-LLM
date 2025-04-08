@@ -915,8 +915,8 @@ def test_llm_gpt2_next_1gpu(gpt_example_root, llm_venv,
                          ids=["use_cpp_session", "use_py_session"])
 def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
                                      llm_gpt2_next_model_root, cmodel_dir,
-                                     engine_dir, update_transformers,
-                                     tensor_parallel, use_py_session):
+                                     engine_dir, tensor_parallel,
+                                     use_py_session):
     f"gpt-next prompt tuning on {tensor_parallel} gpu(s)"
     dtype = "bfloat16"
     ckpt_dir = convert_weights(llm_venv=llm_venv,

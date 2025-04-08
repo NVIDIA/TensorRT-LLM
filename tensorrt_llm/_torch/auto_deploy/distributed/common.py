@@ -263,5 +263,8 @@ class MultiProcessExecutor:
             self.input_queues[i].put(None)
         _join_multiprocess_job(self.processes)
         self.processes = None
-        del self.input_queues
-        del self.output_queue
+        for q in self.input_queues:
+            q.close()
+            q.join_thread()
+        self.output_queue.close()
+        self.output_queue.join_thread()

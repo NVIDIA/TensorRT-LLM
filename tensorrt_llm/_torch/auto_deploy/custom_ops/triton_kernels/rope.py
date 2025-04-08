@@ -101,7 +101,7 @@ def rope_fwd_flattened_kernel(
     input_pos_ptr,  # [B]
     f_ptr,
     output_ptr,
-    H,  # number of heads
+    H: tl.constexpr,  # number of heads
     D: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
@@ -147,7 +147,7 @@ def rope_fwd_flattened_kernel(
     nohead_mask2 = row_mask[None, :, None] * col_mask2[None, None, :]
 
     mask1 = head_mask[:, None, None] * nohead_mask1
-    mask2 = head_mask[:, None, None] * nohead_mask1
+    mask2 = head_mask[:, None, None] * nohead_mask2
 
     a = tl.load(x_ptr + offsets1, mask=mask1).to(tl.float32)
     b = tl.load(x_ptr + offsets2, mask=mask2).to(tl.float32)

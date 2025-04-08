@@ -715,7 +715,7 @@ def test_benchmark_sanity_enable_fp8(llm_root, llm_venv, model_name,
 
 
 def test_chatglm_6b_sanity(chatglm_6b_example_root, llm_venv, cmodel_dir,
-                           engine_dir, update_transformers):
+                           engine_dir):
     llm_models = llm_models_root()
 
     # skip when llm_models_root is None
@@ -1089,7 +1089,6 @@ def test_llmapi_load_engine_from_build_command_with_lora(
 ])
 def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    from tensorrt_llm._utils import release_gc
     from tensorrt_llm.llmapi import LLM
     from tensorrt_llm.llmapi.llm_utils import BuildConfig
     llama_example_root = os.path.join(llm_root, "examples", model_name)
@@ -1148,8 +1147,6 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
             llm_api_engine_cfg["build_config"]).to_dict()
 
     assert build_cmd_cfg == build_llmapi_cfg
-    del LLM
-    release_gc()
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
