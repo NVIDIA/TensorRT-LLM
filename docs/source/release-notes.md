@@ -5,6 +5,15 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.18.1
+
+### Key Features and Enhancements
+  - **The 0.18.x series of releases builds upon the 0.17.0 release, focusing exclusively on dependency updates without incorporating features from the previous 0.18.0.dev pre-releases. These features will be included in future stable releases**.
+
+### Infrastructure Changes
+  - The dependent `transformers` package version is updated to 4.48.3.
+
+
 ## TensorRT-LLM Release 0.18.0
 
 ### Key Features and Enhancements
