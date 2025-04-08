@@ -1523,7 +1523,7 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
     }
 
     auto const isBlockBoundary = (currNumTokens % getTokensPerBlock() == 0);
-    auto const shouldAllocateBlock = isBlockBoundary && (!isCrossKv() || newNumTokens < mMaxTokenNum);
+    auto const shouldAllocateBlock = isBlockBoundary && (!isCrossKv() || newNumTokens <= mMaxTokenNum);
     if (addToken)
     {
         auto const numTokensWithoutSink = newNumTokens - mSinkBlockTokenLength;
@@ -1587,14 +1587,10 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
             cacheNewBlockOffsets(sequence);
         }
     }
-    else
+    else if (isBlockBoundary && newNumTokens <= mMaxTokenNum)
     {
-        if (isBlockBoundary)
-        {
-            // TODO (tomer): in main, releaseLastBlock is called only if newNumTokens <= mMaxTokenNum
-            TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
-            mBlockManager.releaseLastBlock(sequence);
-        }
+        TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
+        mBlockManager.releaseLastBlock(sequence);
     }
 }
 
