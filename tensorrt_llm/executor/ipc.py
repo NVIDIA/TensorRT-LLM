@@ -177,11 +177,6 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
-
-        if self.verbose:
-            logger.info(f"Received signed data: {signed_data}")
-            tmp_obj = pickle.loads(signed_data[:-32])
-            logger.info(f"Received signed data after decoding: {tmp_obj}")
         
         if self.hmac_key is not None:
             # Receive signed data with HMAC

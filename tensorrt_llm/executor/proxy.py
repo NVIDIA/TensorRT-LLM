@@ -1,5 +1,4 @@
 import concurrent.futures
-import hashlib
 import os
 import time
 import weakref
@@ -77,6 +76,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         else:
             print_colored("Using MpiPoolSession to spawn MPI processes\n",
                           "yellow")
+            
+        # Initialize HMAC key for pickle encryption
+        logger.info(f"Generating a new HMAC key")
+        self.random_hmac_key = os.urandom(32)
 
         self._results: Dict[int, GenerationResult] = {}
 
@@ -96,24 +99,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._start_executor_workers(worker_kwargs)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
-
-        # Initialize HMAC key
-        hmac_key_path = '/tmp/hmac_key'
-        if os.path.exists(hmac_key_path):
-            with open(hmac_key_path, 'rb') as f:
-                random_hmac_key = f.read()
-        else:
-            seed = f"tensorrt_llm_{time.time()}_{os.getpid()}".encode()
-            random_hmac_key = hashlib.sha256(seed).digest()
-            with open(hmac_key_path, 'wb') as f:
-                f.write(random_hmac_key)
-
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue",
-                                      hmac_key=random_hmac_key)
+                                      hmac_key=self.random_hmac_key)
         self.request_error_queue = IpcQueue(is_server=True,
                                             name="proxy_request_error_queue",
-                                            hmac_key=random_hmac_key)
+                                            hmac_key=self.random_hmac_key)
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -123,16 +114,16 @@ class ExecutorBindingsProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue",
-            hmac_key=random_hmac_key)
+            hmac_key=self.random_hmac_key)
         self.mp_stats_queue = FusedIpcQueue(is_server=True,
                                             fuse_message=False,
                                             name="proxy_stats_queue",
-                                            hmac_key=random_hmac_key)
+                                            hmac_key=self.random_hmac_key)
         self.kv_cache_events_queue = FusedIpcQueue(
             is_server=True,
             fuse_message=False,
             name="proxy_kv_cache_events_queue",
-            hmac_key=random_hmac_key)
+            hmac_key=self.random_hmac_key)
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             request_error_queue_addr=self.request_error_queue.address,
@@ -300,6 +291,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
+            random_hmac_key=self.random_hmac_key,
         )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)

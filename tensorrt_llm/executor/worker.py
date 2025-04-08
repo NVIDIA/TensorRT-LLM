@@ -1,7 +1,6 @@
 import copy
 import datetime
 import enum
-import hashlib
 import json
 import os
 import time
@@ -500,8 +499,8 @@ def worker_main(
         _torch_model_class_mapping: Optional[dict] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+        is_llm_executor: Optional[bool] = True,  # whether it's the main executor instance
+        random_hmac_key: Optional[bytes] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -539,17 +538,10 @@ def worker_main(
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
 
-        # Initialize HMAC key
-        hmac_key_path = '/tmp/hmac_key'
-        if os.path.exists(hmac_key_path):
-            with open(hmac_key_path, 'rb') as f:
-                random_hmac_key = f.read()
-        else:
-            seed = f"tensorrt_llm_{time.time()}_{os.getpid()}".encode()
-            random_hmac_key = hashlib.sha256(seed).digest()
-            with open(hmac_key_path, 'wb') as f:
-                f.write(random_hmac_key)
-
+        # If HMAC key is not provided, initialize a new HMAC key
+        if not random_hmac_key:
+            logger.warning("HMAC key not found in worker queues, generating new one")
+            random_hmac_key = os.urandom(32)
 
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
@@ -620,6 +612,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                random_hmac_key,
             )
             postprocess_worker_futures.append(fut)
 
