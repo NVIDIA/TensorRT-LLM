@@ -18,6 +18,13 @@ meta-llama/Llama-3.1-8B:
   - quant_algo: MIXED_PRECISION
     extra_acc_spec: autoq_format=int4_awq,fp8,w4a8_awq;auto_quantize_bits=5.8
     accuracy: 64.99
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 68.17
+  - quant_algo: FP8
+    accuracy: 67.93
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 67.87
 meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
