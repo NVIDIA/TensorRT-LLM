@@ -57,8 +57,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_batched_quantize(
     outputShape[rank - 1] = k / 2;
 
     at::Tensor valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
-    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, tensorrt_llm::computeSFSize(m, k / sfVecSize)}, SF_DTYPE,
-        self.device(), /* stride */ std::nullopt); // 2D tensor
+    at::Tensor scaleFP8SF = at::detail::empty_cuda({b, tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)},
+        SF_DTYPE, self.device(), /* stride */ std::nullopt); // 2D tensor
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 

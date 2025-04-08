@@ -461,7 +461,7 @@ class GenerationMixin:
             )
 
         if use_gpt_attention_plugin:
-            # TODO(rkobus): change shape to [1]
+            # TODO: change shape to [1]
             host_max_attention_window_sizes = Tensor(
                 name=f'host_max_attention_window_sizes',
                 dtype=trt.int32,

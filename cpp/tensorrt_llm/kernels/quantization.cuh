@@ -558,8 +558,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(
-    std::optional<int> batchIdx, int rowIdx, int colIdx, std::optional<int> numRows, int numCols, SFType* SFout)
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx, int colIdx,
+    std::optional<int> numRows, int numCols, SFType* SFout, FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
@@ -569,45 +569,66 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(
     // is it better than STG.8 from 4 threads ?
     if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0)
     {
-        // SF vector index (16 elements share one SF in the K dimension).
-        int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
-        int32_t mIdx = rowIdx;
+        if (layout == FP4QuantizationSFLayout::SWIZZLED)
+        {
+            // SF vector index (16 elements share one SF in the K dimension).
+            // numRows and numCols are unpadded.
+            int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+            int32_t mIdx = rowIdx;
 
-        // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-        // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+            // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+            // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
-        // batched tensor
-        // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-        // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+            // batched tensor
+            // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+            // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
-        int32_t innerKIdx = (kIdx % 4);
-        int64_t innerKStride = 1;
+            int32_t innerKIdx = (kIdx % 4);
+            int64_t innerKStride = 1;
 
-        int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-        int64_t innerMStride = 4 * innerKStride; // 4
+            int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+            int64_t innerMStride = 4 * innerKStride; // 4
 
-        // M tile layout [32, 4] is column-major.
-        int32_t outerMIdx = (mIdx % 32);
-        int64_t outerMStride = 4 * innerMStride; // 16
+            // M tile layout [32, 4] is column-major.
+            int32_t outerMIdx = (mIdx % 32);
+            int64_t outerMStride = 4 * innerMStride; // 16
 
-        int32_t kTileIdx = (kIdx / 4);
-        int64_t kTileStride = 32 * outerMStride; // 512
+            int32_t kTileIdx = (kIdx / 4);
+            int64_t kTileStride = 32 * outerMStride; // 512
 
-        // SF vector size 16. We round the "numCols" up to a multiple of 64.
-        int factor = CVT_FP4_SF_VEC_SIZE * 4;
-        int32_t numKTiles = (numCols + factor - 1) / factor;
-        int32_t mTileIdx = mIdx / (32 * 4);
-        int64_t mTileStride = numKTiles * kTileStride;
+            // SF vector size 16. We round the "numCols" up to a multiple of 64.
+            int factor = CVT_FP4_SF_VEC_SIZE * 4;
+            int32_t numKTiles = (numCols + factor - 1) / factor;
+            int32_t mTileIdx = mIdx / (32 * 4);
+            int64_t mTileStride = numKTiles * kTileStride;
 
-        // Each SF block has 128 rows so pad rows to the multiple of 128.
-        int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
-        int64_t bTileStride = numMTiles * mTileStride;
+            // Each SF block has 128 rows so pad rows to the multiple of 128.
+            int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+            int64_t bTileStride = numMTiles * mTileStride;
 
-        // Compute the global offset.
-        int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride
-            + outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
+            // Compute the global offset.
+            int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride
+                + outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
 
-        return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+            return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+        }
+        else if (layout == FP4QuantizationSFLayout::LINEAR)
+        {
+            // Linear row-major layout, no padding required.
+            int32_t KTileIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+
+            int32_t numKTiles = numCols / CVT_FP4_SF_VEC_SIZE;
+            int64_t mTileStride = numKTiles;
+
+            int64_t BTileStride = numRows.value_or(0) * mTileStride;
+
+            int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+            return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+        }
+        else
+        {
+            return nullptr;
+        }
     }
 #endif
     return nullptr;
@@ -622,7 +643,7 @@ __global__ void
 cvt_fp16_to_fp4_3d(
 #endif
         int32_t numbatches, int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
-        uint32_t* SFout)
+        uint32_t* SFout, FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
@@ -654,7 +675,7 @@ cvt_fp16_to_fp4_3d(
                 std::optional<int> optionalNumRows = numRows;
 
                 auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout);
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout, layout);
 
                 out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
             }
@@ -673,7 +694,7 @@ __global__ void
 cvt_fp8_to_fp4_3d(
 #endif
         int32_t numbatches, int32_t numRows, int32_t numCols, __nv_fp8_e4m3 const* in, float const* SFScale,
-        uint32_t* out, uint32_t* SFout)
+        uint32_t* out, uint32_t* SFout, FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<__nv_fp8_e4m3>;
@@ -704,7 +725,7 @@ cvt_fp8_to_fp4_3d(
                 std::optional<int> optionalNumRows = numRows;
 
                 auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout);
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout, layout);
 
                 out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
             }
@@ -721,7 +742,8 @@ __global__ void
 #else
 cvt_fp16_to_fp4(
 #endif
-        int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out, uint32_t* SFout)
+        int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out, uint32_t* SFout,
+        FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<Type>;
@@ -746,7 +768,7 @@ cvt_fp16_to_fp4(
             auto& out_pos = out[outOffset];
 
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout);
+                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, layout);
 
             out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
         }
@@ -763,7 +785,8 @@ __global__ void
 #else
 cvt_fp8_to_fp4(
 #endif
-        int32_t numRows, int32_t numCols, __nv_fp8_e4m3 const* in, float const* SFScale, uint64_t* out, uint32_t* SFout)
+        int32_t numRows, int32_t numCols, __nv_fp8_e4m3 const* in, float const* SFScale, uint64_t* out, uint32_t* SFout,
+        FP4QuantizationSFLayout layout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<__nv_fp8_e4m3>;
@@ -788,7 +811,7 @@ cvt_fp8_to_fp4(
             auto& out_pos = out[outOffset];
 
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout);
+                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, layout);
 
             out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
         }

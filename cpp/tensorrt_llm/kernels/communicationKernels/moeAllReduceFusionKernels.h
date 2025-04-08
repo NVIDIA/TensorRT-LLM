@@ -21,9 +21,10 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+namespace tensorrt_llm::kernels::ar_fusion::moe
 {
 static constexpr int kElemsPerAccess = 8;
 static constexpr int kOneShotMaxToken = 128;
@@ -54,29 +55,9 @@ struct AllReduceFusionParams
     void* rms_gamma;
     float rms_eps;
     float* scale_factor;
+    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
 };
-
-void allreduce_fusion_op(AllReduceFusionParams const& params);
-
-class Workspace
-{
-public:
-    Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
-        std::shared_ptr<tensorrt_llm::runtime::CudaStream> stream_ptr);
-    ~Workspace();
-    void** get_workspace();
-
-private:
-    tensorrt_llm::runtime::WorldConfig m_world_config;
-    std::shared_ptr<tensorrt_llm::runtime::BufferManager> m_buffer_mgr;
-    std::vector<tensorrt_llm::runtime::IpcMemory> m_ipc_mem_handles;
-    void* m_workspace;
-    std::shared_ptr<tensorrt_llm::runtime::CudaStream> m_cuda_stream;
-    void* m_flag_d_ptr;
-};
-
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
 
 /////////////////////////////////////////////////////////////////
 //                  * MoE Reduction Fusion *                   //
@@ -104,4 +85,4 @@ struct MoeReductionAllReduceFusionParams : public AllReduceFusionParams
 
 void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& params);
 
-} // namespace tensorrt_llm::kernels::ar_fusion
+} // namespace tensorrt_llm::kernels::ar_fusion::moe

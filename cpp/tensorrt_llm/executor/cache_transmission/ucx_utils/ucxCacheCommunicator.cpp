@@ -64,9 +64,17 @@ static std::string getLocalIp()
         if (ifa->ifa_addr == nullptr)
             continue;
 
-        // Skip the loopback interface
-        if (strcmp(ifa->ifa_name, "docker0") == 0 || strcmp(ifa->ifa_name, "lo") == 0)
+        std::string ucxInterface = common::getEnvUCXInterface();
+        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        {
             continue;
+        }
+
+        // Skip the loopback interface
+        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        {
+            continue;
+        }
 
         // Check if the address family is AF_INET (IPv4)
         // TODO: USER CAN SPECIFY THE IP ADDRESS
@@ -76,18 +84,16 @@ static std::string getLocalIp()
             char address_buffer[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
 
-            // Check if the address is not a private IP (optional)
-            // You might want to skip private IPs if you need a public IP
-            // if (std::string(address_buffer).find("10.") == 0 ||
-            //     std::string(address_buffer).find("172.16.") == 0 ||
-            //     std::string(address_buffer).find("192.168.") == 0)
-            //     continue;
-
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
                 address_buffer);
             ip = address_buffer;
             break;
         }
+    }
+    if (ifa == nullptr)
+    {
+        TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
+            "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
     }
 
     freeifaddrs(ifaddr);
@@ -234,8 +240,8 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     }
     catch (std::exception const& e)
     {
-        std::string error
-            = "Error in addConnection(ip) for rank " + ip + " port: " + std::to_string(port) + ": " + e.what();
+        std::string error = "Error in addConnection(ip) for rank " + std::to_string(mpi::MpiComm::world().getRank())
+            + " ip: " + ip + " port: " + std::to_string(port) + ": " + e.what();
         TLLM_THROW(error);
     }
 }

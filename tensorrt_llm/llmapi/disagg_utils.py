@@ -114,16 +114,13 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
     return cfgs
 
 
-def split_world_comm(
-        server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
+def get_server_configs_dict(
+        server_configs: List[CtxGenServerConfig]) -> Tuple[int, dict]:
 
-    # Check that MPI_COMM_WORLD size is compatible with the number of workers
-    global_size = global_mpi_size()
-    global_rank = global_mpi_rank()
     num_workers = 0
+    server_dict = {}
 
     # check for duplicate server configs
-    server_dict = {}
     for cfg in server_configs:
         url = (cfg.hostname, cfg.port)
         if url in server_dict:
@@ -140,6 +137,17 @@ def split_world_comm(
             server_dict[url] = cfg
             num_workers += cfg.instance_num_ranks
 
+    return num_workers, server_dict
+
+
+def split_world_comm(
+        server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
+
+    # Check that MPI_COMM_WORLD size is compatible with the number of workers
+    global_size = global_mpi_size()
+    global_rank = global_mpi_rank()
+
+    [num_workers, server_dict] = get_server_configs_dict(server_configs)
     assert global_size == num_workers, f"global_size ({global_size}) should be equal to the number of distinct workers ({num_workers})"
 
     # Identify the leader ranks and the instance idx for each rank

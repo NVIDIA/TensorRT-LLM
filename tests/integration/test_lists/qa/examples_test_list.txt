@@ -16,7 +16,9 @@ examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weig
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[enable_weight_only]
 examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only]
 examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[enable_weight_only]
-examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
@@ -180,6 +182,7 @@ examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-in
 examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int8-nb:4]
 examples/test_mixtral.py::test_llm_mixtral_1gpu_fp4_llmapi[Mixtral-8x7B-Instruct-v0.1]
 examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[mixtral-8x7b-v0.1-AWQ]
+examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[Mixtral-8x7B-Instruct-v0.1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
@@ -422,9 +425,9 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s
@@ -439,8 +442,6 @@ test_e2e.py::test_falcon_e2e[gpu_percent_0_8-use_cpp_session-mqa]
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session]
-test_e2e.py::test_llmapi_load_engine_from_build_command[falcon-falcon-7b-instruct] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[gptj-gpt-j-6b] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
 test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
@@ -466,7 +467,8 @@ test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-video]
 test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image]
 test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-image]
 test_e2e.py::test_ptp_quickstart_multimodal[qwen2-vl-7b-instruct-Qwen2-VL-7B-Instruct-video]
-test_e2e.py::test_ptp_quickstart_bert[BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-hf-nvfp4-False-False]
 test_e2e.py::test_trtllm_bench_mgmn

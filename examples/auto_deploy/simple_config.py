@@ -44,6 +44,7 @@ class SimpleConfig:
     runtime: str = "demollm"  # chose from "demollm" or "trtllm" (production-grade runtime)
     compile_backend: str = "torch-opt"  # choose from "torch-simple", "torch-opt"
     attn_backend: str = "TritonWithFlattenedInputs"  # "TritonWithFlattenedInputs" or "FlashInfer"
+    mla_backend: str = "MultiHeadLatentAttention"  # only option for now
     max_seq_len: int = 512  # max sequence length for inference/cache
     max_batch_size: int = 8  # max dimension for statically allocated kv cache
     page_size: int = 64  # page size for attention
@@ -106,7 +107,7 @@ class SimpleConfig:
             self.max_seq_len = max(self.max_seq_len, self.benchmark_isl + self.benchmark_osl)
 
         # No paging allowed in TritonWithFlattenedInputs
-        if self.attn_backend == "TritonWithFlattenedInputs":
+        if self.attn_backend in ["TritonWithFlattenedInputs"]:
             self.page_size = self.max_seq_len
 
         # use min instead of max to avoid OOM for large batch size

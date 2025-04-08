@@ -228,7 +228,7 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, GenerationOutpu
             }
             badWordsLensRange[bi] = badWordsLen;
         }
-        // NOTE(nkorobov): dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
+        // NOTE: dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
         // allocated
         dInput.badWordsLists.at(0) = badWordsList;
     }
@@ -245,7 +245,7 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, GenerationOutpu
             stopWordsPtrsRange[bi] = bufferCast<TokenIdType>(*stopWordsList) + bi * 2 * stopWordsLen;
             stopWordsLensRange[bi] = stopWordsLen;
         }
-        // NOTE(nkorobov): dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
+        // NOTE: dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
         // allocated
         dInput.stopWordsLists.at(0) = stopWordsList;
     }
@@ -361,7 +361,7 @@ void StatefulGptDecoder::forwardSync()
 
 void StatefulGptDecoder::finalize(SamplingConfig const& samplingConfig) const
 {
-    // TODO (rkobus) can we do this inplace?
+    // TODO can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
     kernels::gatherTree(*mDecodingOutput, *mDecodingInput, samplingConfig, mBufferManager.getStream());

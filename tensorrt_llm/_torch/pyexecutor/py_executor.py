@@ -19,7 +19,8 @@ import torch
 
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats)
+                                            IterationStats, KvCacheStats,
+                                            RequestType)
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
@@ -139,6 +140,7 @@ class PyExecutor:
                  enable_overlap_scheduler: bool = False,
                  max_input_len: int = 2048,
                  max_batch_size: int = 8,
+                 max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None):
         super(PyExecutor, self).__init__()
@@ -166,6 +168,7 @@ class PyExecutor:
         self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.max_draft_tokens = max_draft_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.num_fetch_requests_cur_rank = 0
@@ -306,6 +309,7 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        del self.model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -513,11 +517,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     # TODO: add pause_requests together with inflight_req_ids and handle draft_tokens
@@ -606,11 +611,12 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
+                    if not can_queue:
+                        assert len(self.inflight_req_ids) > 0, (
+                            "fail to schedule any pending request, probably run out of resource"
+                        )
 
                 if not can_queue:
-                    assert len(self.inflight_req_ids) > 0, (
-                        "fail to schedule any pending request, probably run out of resource"
-                    )
                     self.micro_batches[microbatch_id] = None
                 else:
                     self._add_inflight_ids(scheduled_batch)
@@ -1132,7 +1138,16 @@ class PyExecutor:
                     heapq.heappush(all_ranks_new_requests_heap, val)
                 elif val.rank == self.dist.tp_rank:
                     break
-            self.has_context_request = len(new_requests_cur_rank) > 0
+
+            # In disaggregated serving, we might get either context request or
+            # generation request. In IFB, we only get context request from request queue
+            if self.kv_cache_transceiver:
+                for req in new_requests_cur_rank:
+                    if req[1].request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+                        self.has_context_request = True
+                        break
+            else:
+                self.has_context_request = len(new_requests_cur_rank) > 0
             self._update_new_active_requests_queue_latency(
                 new_requests_cur_rank)
 
@@ -1182,6 +1197,8 @@ class PyExecutor:
             request_ids=list(range(num_dummy_request)),
             is_gen=not self.has_context_request,
             prepare_resource=not self.has_context_request,
+            max_num_draft_tokens=0
+            if self.has_context_request else self.max_draft_tokens,
         )
         for llm_request in llm_request_list:
             llm_request.is_dummy = True
@@ -1393,6 +1410,12 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+
+        # For gen-only benchmarking, mark new gen request as transmission complete right away
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            for req in new_gen_reqs:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
@@ -1728,23 +1751,28 @@ class PyExecutor:
 
     @nvtx_range("_handle_cancelled_requests")
     def _handle_cancelled_requests(self):
-        if not self.canceled_req_ids:
-            return
-
         #TODO: properly handle canceled ids in pp case
-        if self.dist.has_tp and self.canceled_req_ids:
+        if self.dist.has_tp:
             self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
                                                         root=0)
 
+        if len(self.canceled_req_ids) == 0:
+            return
+
         cancelled_responses = {}
         left_requests = []
+        # Tracks canceled requests for proper handling in overlap mode during `decoder.update_requests`.
+        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
                 request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
+                self.canceled_requests.append(request)
+                self.canceled_req_ids.erase(req_id)
             else:
                 left_requests.append(request)
         self.active_requests = left_requests
@@ -1794,6 +1822,7 @@ class PyExecutor:
                 continue
 
             request.draft_tokens = request.py_draft_tokens
+            request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
 

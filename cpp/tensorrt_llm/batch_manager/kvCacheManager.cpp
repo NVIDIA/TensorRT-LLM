@@ -670,7 +670,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
         if (useUvm)
             pool.primaryPtr = BufferManager::managed(cacheShape, poolDtype);
         else
-            pool.primaryPtr = mBufferManager.gpu(cacheShape, poolDtype);
+            pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
 
         if (mNumSecondaryBlocks > 0)
         {
@@ -1399,7 +1399,7 @@ void WindowBlockManager::storeBlocksForReuse(GenerationRequest& sequence, Option
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
     auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
 
-    // TODO (jdebache): get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
+    // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
     // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
     // the last token's state is not filled yet.
     auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
