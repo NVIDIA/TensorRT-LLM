@@ -361,6 +361,15 @@ private:
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
 
+    // void prefetchPromptTableChunk(ScheduledRequests const& currRequests);
+    void prefetchPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
+
+    void processPromptTableChunk(
+        std::shared_ptr<LlmRequest> const& llmReq, bool isCurrentChunk, SizeType32 bufferId, SizeType32 contextId);
+
+    void prefetchPromptTableChunkToGpu(std::shared_ptr<LlmRequest> const& llmReq,
+        std::vector<int32_t> const& outOfVocabTokens, bool useCurrentBuffer, SizeType32 bufferId, SizeType32 contextId);
+
 protected:
     std::shared_ptr<BaseKVCacheManager> getKVCacheManager() override
     {
@@ -448,6 +457,8 @@ private:
     std::shared_ptr<BasePeftCacheManager> mPeftCacheManager;
     // BufferManager using a separate stream for async copy operations.
     runtime::BufferManager mCopyBufferManager;
+    // Event for async data transfers
+    runtime::CudaEvent mPtableCopyDoneEvent;
 
     /******************** Logits Post-Processor ********************/
     std::optional<LogitsPostProcessorBatched> mLogitsPostProcessorBatched;
@@ -498,6 +509,8 @@ private:
     std::optional<SizeType32> mMaxNumTokensRuntime;
     // Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
+    // Whether the context is chunked
+    bool mIsChunkedContext;
 
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.

@@ -357,6 +357,9 @@ class MultimodalModelRunner:
         self.stream = torch.cuda.Stream(torch.cuda.current_device())
         torch.cuda.set_stream(self.stream)
 
+        if self.args.ptable_offloading is None:
+            self.args.ptable_offloading = self.args.enable_chunked_context
+
         # parse model type from visual engine config
         with open(os.path.join(self.visual_engine_dir, "config.json"),
                   "r") as f:
@@ -1336,12 +1339,36 @@ class MultimodalModelRunner:
             prompt_tasks = None
             prompt_table = None
             if not self.cpp_e2e:
+                # Duplicate input_ids if it's a single sample
+                if len(input_ids) == 1:
+                    input_ids = input_ids.expand(2, -1)
+
+                # Ensure input_lengths matches batch size
+                if len(input_lengths) == 1:
+                    input_lengths = input_lengths.expand(2)
+
+                # Duplicate prompt table for batching
                 batch_size = len(input_ids)
                 prompt_tasks = ",".join(
                     np.arange(batch_size, dtype=np.int32).astype(str))
-                prompt_table = torch.stack([ptuning_args[0]])
-                prompt_table = prompt_table.view(batch_size, -1,
-                                                 prompt_table.shape[-1])
+
+                # Duplicate visual features/prompt table
+                if isinstance(ptuning_args[0], torch.Tensor):
+                    if ptuning_args[0].dim(
+                    ) == 2:  # [num_visual_tokens, hidden_size]
+                        prompt_table = ptuning_args[0].unsqueeze(0).expand(
+                            batch_size, -1, -1)
+                    elif ptuning_args[0].dim(
+                    ) == 3:  # [1, num_visual_tokens, hidden_size]
+                        prompt_table = ptuning_args[0].expand(
+                            batch_size, -1, -1)
+
+                # batch_size = len(input_ids)
+                # prompt_tasks = ",".join(
+                #     np.arange(batch_size, dtype=np.int32).astype(str))
+                # prompt_table = torch.stack([ptuning_args[0]])
+                # prompt_table = prompt_table.view(batch_size, -1,
+                #                                  prompt_table.shape[-1])
 
             output_ids = self.model.generate(
                 input_ids,
@@ -1366,7 +1393,8 @@ class MultimodalModelRunner:
                 num_beams=self.args.num_beams,
                 lora_uids=self.args.lora_task_uids,
                 output_sequence_lengths=False,
-                return_dict=False)
+                return_dict=False,
+                ptable_offloading=self.args.ptable_offloading)
         elif self.model_type == "mllama":
             # When image is passed:
             # the shape of visual_features is [bs, 1, 4, 1025, hidden_size]
@@ -1557,6 +1585,38 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
+
+        # TODO: Just move to cpu for chunk context
+        # import torch
+        # torch.set_printoptions(edgeitems=torch.numel(image_embeds))
+        print(
+            "======================== Inside generate of multimodal_model_runner.py ======================"
+        )
+        if self.args.ptable_offloading:
+            # # Artificially expand the embeddings by repeating them
+            # expansion_factor = 96  # Adjust this number to control size
+            # image_embeds = image_embeds.repeat_interleave(expansion_factor,
+            #                                               dim=1)
+            # print("image_embeds.shape after repeat:", image_embeds.shape)
+
+            # Allocate pinned memory with same shape and dtype
+            pinned_embeds = torch.empty_like(image_embeds,
+                                             device='cpu',
+                                             pin_memory=True)
+            # Copy directly from GPU to pinned memory
+            pinned_embeds.copy_(image_embeds, non_blocking=True)
+            image_embeds = pinned_embeds
+            # image_embeds = image_embeds.cpu()
+        print("image_embeds.shape:", image_embeds.shape)
+        # print("image_embeds:", image_embeds)
+        # print("\nFirst 5 elements of each row:")
+        # print(image_embeds[0, :, :5])  # Shows all rows, first 5 elements each
+
+        # # Artificially expand the embeddings by repeating them
+        # expansion_factor = 96  # Adjust this number to control size
+        # image_embeds = image_embeds.repeat_interleave(expansion_factor, dim=1)
+        # print("image_embeds.shape after repeat:", image_embeds.shape)
+
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -2021,7 +2081,12 @@ class MultimodalModelRunner:
                 prompt_table = prompt_table.cuda().to(
                     dtype=str_dtype_to_torch(self.model_config.dtype))
             else:
-                prompt_table = prompt_table.cuda().to(dtype=self.model.dtype)
+                if self.args.ptable_offloading:
+                    prompt_table = prompt_table.pin_memory().to(
+                        dtype=self.model.dtype)
+                else:
+                    prompt_table = prompt_table.cuda().to(
+                        dtype=self.model.dtype)
         else:
             prompt_table = torch.empty([1, hidden_size]).cuda()
             task_vocab_size = torch.zeros([1]).cuda()

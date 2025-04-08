@@ -291,9 +291,10 @@ void LlmRequest::movePromptEmbeddingTableToGpu(runtime::BufferManager const& man
     if (!mPromptEmbeddingTable.has_value()
         || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
     {
+        TLLM_LOG_DEBUG("Prompt embedding table already on GPU");
         return;
     }
-
+    TLLM_LOG_DEBUG("Moving prompt embedding table to GPU");
     TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
     mPromptEmbeddingTable = gpuPromptEmbeddingTable;
 }
