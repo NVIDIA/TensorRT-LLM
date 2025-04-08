@@ -38,34 +38,40 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
         if (mFromRequester)
         {
 
-            auto recvRequest = mEndpoint->amRecv();
+            // since the tag don't contain the information of the connection id or mConnectionIdInPeer, we need to
+            // lock the mutex ,to ensure only one tagRecv is called in the same time.
+            std::shared_ptr<ucxx::Request> recvRequest
+                = mEndpoint->tagRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer),
+                    ucxx::Tag(ResponserTag), ucxx::TagMaskFull);
             while (!recvRequest->isCompleted())
                 ;
-            recvRequest->checkError();
-            TLLM_CHECK_WITH_INFO(recvRequest->getRecvBuffer()->getSize() == sizeof(mConnectionIdInPeer),
-                "recvConnectionId should receive sizeof(mConnectionIdInPeer) bytes");
-            mConnectionIdInPeer = *reinterpret_cast<ConnectionIdType*>(recvRequest->getRecvBuffer()->data());
 
-            auto sendRequest = mEndpoint->amSend(
-                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), UCS_MEMORY_TYPE_HOST);
+            recvRequest->checkError();
+
+            auto sendTag = ucxx::Tag(mConnectionIdInPeer << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> sendRequest
+                = mEndpoint->tagSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), sendTag);
             while (!sendRequest->isCompleted())
                 ;
+            sendRequest->checkError();
         }
         else
         {
-            auto sendRequest = mEndpoint->amSend(
-                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), UCS_MEMORY_TYPE_HOST);
+
+            // Since Responder may recv from multiple Requesters, we need to send the mConnectionId to the Reqester
+            // first and use ConnectionId as the tag to recv the mConnectionIdInPeer from the Requester
+            std::shared_ptr<ucxx::Request> sendRequest = mEndpoint->tagSend(
+                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), ucxx::Tag(ResponserTag));
             while (!sendRequest->isCompleted())
                 ;
             sendRequest->checkError();
 
-            auto recvRequest = mEndpoint->amRecv();
+            auto recvTag = ucxx::Tag(mConnectionId << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> recvRequest = mEndpoint->tagRecv(
+                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), recvTag, ucxx::TagMaskFull);
             while (!recvRequest->isCompleted())
                 ;
             recvRequest->checkError();
-            TLLM_CHECK_WITH_INFO(recvRequest->getRecvBuffer()->getSize() == sizeof(mConnectionIdInPeer),
-                "recvConnectionId should receive sizeof(mConnectionIdInPeer) bytes");
-            mConnectionIdInPeer = *reinterpret_cast<ConnectionIdType*>(recvRequest->getRecvBuffer()->data());
         }
     }
     catch (std::exception const& e)
