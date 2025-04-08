@@ -2284,7 +2284,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), maxNumSequences);
 }
 
-TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowNoReuseTest)
+TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerThanBlockSizeTest)
 {
     auto constexpr numLayers = 2;
     auto constexpr numHeads = 2;
@@ -2323,9 +2323,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowNoReuseTest)
     bool constexpr isStreaming{false};
 
     ///////////////////////////////////////////////////////////////////////////
-    // add a request shorter than the max attention window and then remove it
+    // add a request that starts shorter and gets longer than the max attention window and then remove it
     SizeType32 requestId = 0;
-    int inputLength = 7;
+    int inputLength = 14;
     auto inputTokens = std::make_shared<VecTokens>(inputLength);
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
@@ -2334,101 +2334,265 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowNoReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3}));
 
-    // add tokens, still less than max attention window
-    llmRequest->addNewToken(1007, beamIdx);
+    // add tokens, reaching max attention window
+    llmRequest->addNewToken(1014, beamIdx);
     kvCacheManager.addToken(requestId);
-    llmRequest->addNewToken(1008, beamIdx);
+    llmRequest->addNewToken(1015, beamIdx);
     kvCacheManager.addToken(requestId);
-    auto numTokens = llmRequest->getNumTokens(beamIdx);
     auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, 3);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
-
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
-    // no blocks stored because reuse is disabled
-    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
-
-    ///////////////////////////////////////////////////////////////////////////
-    // add a request that gets longer than the max attention window and then remove it
-    requestId = 1;
-    inputLength = 16;
-    inputTokens = std::make_shared<VecTokens>(inputLength);
-    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
-    llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
-
-    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId);
-    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({3, 4, 5, 6}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3}));
 
     // add new tokens to allocate another block, but not enough to detach block
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1017, beamIdx);
     kvCacheManager.addToken(requestId);
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = seq1.getCacheBlockIds()[beamIdx].size();
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
     EXPECT_EQ(numBlocks, maxBlocksPerSeq);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({3, 4, 5, 6, 7}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3, 4}));
 
     // add more new tokens, enough to detach block without allocating a new one
     llmRequest->addNewToken(1018, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1019, beamIdx);
     kvCacheManager.addToken(requestId);
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = seq1.getCacheBlockIds()[beamIdx].size();
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
     EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({4, 5, 6, 7}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3, 4}));
 
     // add more new tokens, to allocate a new block
     llmRequest->addNewToken(1020, beamIdx);
     kvCacheManager.addToken(requestId);
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = seq1.getCacheBlockIds()[beamIdx].size();
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
     EXPECT_EQ(numBlocks, maxBlocksPerSeq);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({4, 5, 6, 7, 8}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3, 4, 5}));
 
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
     // no blocks stored because reuse is disabled
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultipleOfBlockSizeTest)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    // Enable cyclic kv cache for long input tokens.
+    auto constexpr maxAttentionWindow = 10;
+    auto constexpr temporaryAttentionWindow = 0;
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto constexpr enableBlockReuse = false;
+    auto constexpr onboardBlocks = true;
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksInPrimaryPool,
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, {maxAttentionWindow}, temporaryAttentionWindow,
+        sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks);
+    kvCacheManager.allocatePools(nvinfer1::DataType::kHALF, false);
+
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    SizeType32 constexpr maxNewTokens = 40;
+
+    // prepare tokens with token[i] = 1000 + i
+    TokenIdType constexpr firstToken = 1000;
+
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
 
     ///////////////////////////////////////////////////////////////////////////
-    // add a request much longer than the max attention window and then remove it
-    requestId = 2;
-    inputLength = 24;
-    inputTokens = std::make_shared<VecTokens>(inputLength);
+    // add a request that starts shorter and gets longer than the max attention window and then remove it
+    SizeType32 requestId = 0;
+    int inputLength = 9;
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
-    llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    auto constexpr beamIdx = 0;
 
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
+    GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq2.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({9, 10, 11, 12}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
 
-    // add new tokens to allocate another block, but not enough to detach block
-    llmRequest->addNewToken(1024, beamIdx);
+    // add tokens, reaching max attention window
+    llmRequest->addNewToken(1009, beamIdx);
     kvCacheManager.addToken(requestId);
-    llmRequest->addNewToken(1025, beamIdx);
+    auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
+
+    // add new tokens exceeding max attention window, but not enough to allocate another block
+    llmRequest->addNewToken(1010, beamIdx);
     kvCacheManager.addToken(requestId);
-    numTokens = llmRequest->getNumTokens(beamIdx);
-    numBlocks = seq2.getCacheBlockIds()[beamIdx].size();
+    llmRequest->addNewToken(1011, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
+
+    // add more new tokens, enough to allocate a new block but not enough to detach block
+    llmRequest->addNewToken(1012, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
     EXPECT_EQ(numBlocks, maxBlocksPerSeq);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    EXPECT_THAT(seq2.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({9, 10, 11, 12, 13}));
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3}));
+
+    // add more new tokens, enough to detach block without allocating a new one
+    llmRequest->addNewToken(1013, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3}));
+
+    // add more new tokens, to allocate a new block
+    llmRequest->addNewToken(1014, beamIdx);
+    kvCacheManager.addToken(requestId);
+    llmRequest->addNewToken(1015, beamIdx);
+    kvCacheManager.addToken(requestId);
+    llmRequest->addNewToken(1016, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3, 4}));
+
+    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
+    // no blocks stored because reuse is disabled
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeTest)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    // Enable cyclic kv cache for long input tokens.
+    auto constexpr maxAttentionWindow = 3;
+    auto constexpr temporaryAttentionWindow = 0;
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + 1;   // TODO (tomer): explain this +1. Add it as a constant
+
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto constexpr enableBlockReuse = false;
+    auto constexpr onboardBlocks = true;
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksInPrimaryPool,
+        blocksInSecondaryPool, maxNumSequences, maxBeamWidth, {maxAttentionWindow}, temporaryAttentionWindow,
+        sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks);
+    kvCacheManager.allocatePools(nvinfer1::DataType::kHALF, false);
+
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    SizeType32 constexpr maxNewTokens = 40;
+
+    // prepare tokens with token[i] = 1000 + i
+    TokenIdType constexpr firstToken = 1000;
+
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    ///////////////////////////////////////////////////////////////////////////
+    // add a request that starts shorter and gets longer than the max attention window and then remove it
+    SizeType32 requestId = 0;
+    int inputLength = 2;
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
+    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    auto constexpr beamIdx = 0;
+
+    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
+    GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
+    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0}));
+
+    // add tokens, reaching max attention window
+    llmRequest->addNewToken(1002, beamIdx);
+    kvCacheManager.addToken(requestId);
+    auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0}));
+
+    // add new tokens exceeding max attention window, but not enough to allocate another block
+    llmRequest->addNewToken(1003, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0}));
+
+    // add more new tokens, enough to allocate a new block but not enough to detach block
+    llmRequest->addNewToken(1004, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1}));
+
+    // add more new tokens, enough to detach block without allocating a new one
+    llmRequest->addNewToken(1005, beamIdx);
+    kvCacheManager.addToken(requestId);
+    llmRequest->addNewToken(1006, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1}));
+
+    // add more new tokens, to allocate a new block
+    llmRequest->addNewToken(1007, beamIdx);
+    kvCacheManager.addToken(requestId);
+    llmRequest->addNewToken(1008, beamIdx);
+    kvCacheManager.addToken(requestId);
+    numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq);
+    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
+    EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2}));
 
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
     // no blocks stored because reuse is disabled
