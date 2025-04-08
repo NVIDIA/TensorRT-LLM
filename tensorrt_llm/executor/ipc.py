@@ -1,5 +1,9 @@
 import time
 import traceback
+import hmac
+import os
+import pickle
+import hashlib
 from queue import Queue
 from typing import Any, Optional
 
@@ -28,7 +32,8 @@ class ZeroMqQueue:
                  socket_type: int = zmq.PAIR,
                  is_server: bool,
                  is_async: bool = False,
-                 name: Optional[str] = None):
+                 name: Optional[str] = None,
+                 hmac_key: Optional[bytes] = None):
         '''
         Parameters:
             address (Tuple[str, str], optional): The address (tcp-ip_port, authkey) for the IPC. Defaults to None.
@@ -44,9 +49,14 @@ class ZeroMqQueue:
 
         self._setup_done = False
         self.name = name
-        self.socket_type = socket_type
-
+        self.hmac_key = hmac_key
         self.socket = self.context.socket(socket_type)
+
+        self.verbose = False
+
+        if self.verbose: # for debugging
+            logger.debug(f"In ZeroMqQueue init, HMAC key: {self.hmac_key}")
+            logger.debug(f"In ZeroMqQueue init, self.name: {self.name}")
 
         if (socket_type == zmq.PAIR
                 and self.is_server) or socket_type == zmq.PULL:
@@ -57,6 +67,26 @@ class ZeroMqQueue:
             print_colored_debug(
                 f"Server [{name}] bound to {self.address} in {self.socket_type_str[socket_type]}\n",
                 "green")
+
+    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
+        """Verify the HMAC of received pickle data."""
+        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
+        if self.verbose: # for debugging
+            logger.debug("in _verify_hmac")
+            logger.debug(f"Data: {data}")
+            logger.debug(f"HMAC key: {self.hmac_key}")
+            logger.debug(f"Expected HMAC: {expected_hmac}")
+            logger.debug(f"Actual HMAC: {actual_hmac}")
+        return hmac.compare_digest(expected_hmac, actual_hmac)
+
+    def _sign_data(self, data_before_encoding: bytes) -> bytes:
+        """Generate HMAC for data."""
+        if self.verbose: # for debugging
+            logger.debug("in _sign_data")
+            logger.debug(f"Signing data: {data_before_encoding}")
+            logger.debug(f"HMAC key: {self.hmac_key}")
+        hmac_signature = hmac.new(self.hmac_key, data_before_encoding, hashlib.sha256).digest()
+        return data_before_encoding + hmac_signature
 
     def setup_lazily(self):
         if self._setup_done:
@@ -88,12 +118,26 @@ class ZeroMqQueue:
     def put(self, obj: Any):
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
-            self.socket.send_pyobj(obj)
+            if self.hmac_key is not None:
+                # Send data with HMAC appended
+                data = pickle.dumps(obj)
+                signed_data = self._sign_data(data)
+                self.socket.send(signed_data)
+            else:
+                # Send data without HMAC
+                self.socket.send_pyobj(obj)
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
         try:
-            await self.socket.send_pyobj(obj)
+            # Send data with HMAC appended
+            if self.hmac_key is not None:
+                data = pickle.dumps(obj)
+                signed_data = self._sign_data(data)
+                await self.socket.send(signed_data)
+            else:
+                # Send data without HMAC
+                await self.socket.send_pyobj(obj)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -106,13 +150,45 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
+        
+        if self.hmac_key is not None:
+            # Receive signed data with HMAC
+            signed_data = self.socket.recv()
 
-        return self.socket.recv_pyobj()
+            # Split data and HMAC
+            data = signed_data[:-32]
+            actual_hmac = signed_data[-32:]
+            
+            # Verify HMAC
+            if not self._verify_hmac(data, actual_hmac):
+                raise ValueError("HMAC verification failed")
+                
+            obj = pickle.loads(data)
+        else:
+            # Receive data without HMAC
+            obj = self.socket.recv_pyobj()
+        return obj
 
     async def get_async(self) -> Any:
         self.setup_lazily()
 
-        return await self.socket.recv_pyobj()
+        if self.hmac_key is not None:
+            # Receive signed data with HMAC
+            signed_data = await self.socket.recv()
+
+            # Split data and HMAC
+            data = signed_data[:-32]
+            actual_hmac = signed_data[-32:]
+            
+            # Verify HMAC
+            if not self._verify_hmac(data, actual_hmac):
+                raise ValueError("HMAC verification failed")
+            
+            obj = pickle.loads(data)
+        else:
+            # Receive data without HMAC
+            obj = await self.socket.recv_pyobj()
+        return obj
 
     def close(self):
         if self.socket:

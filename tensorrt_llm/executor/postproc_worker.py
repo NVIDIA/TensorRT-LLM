@@ -76,6 +76,7 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
+        hmac_key: Optional[bytes] = None,
     ):
         '''
         Args:
@@ -91,12 +92,14 @@ class PostprocWorker:
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
                                       is_server=False,
-                                      name="postprocess_pull_pipe")
+                                      name="postprocess_pull_pipe",
+                                      hmac_key=hmac_key)
         self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
                                       is_async=True,
                                       is_server=False,
                                       socket_type=zmq.PUSH,
-                                      name="postprocess_push_pipe")
+                                      name="postprocess_push_pipe",
+                                      hmac_key=hmac_key)
         self._to_stop = asyncio.Event()
 
         self._q = deque()

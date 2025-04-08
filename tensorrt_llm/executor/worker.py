@@ -499,8 +499,8 @@ def worker_main(
         _torch_model_class_mapping: Optional[dict] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+        is_llm_executor: Optional[bool] = True,  # whether it's the main executor instance
+        random_hmac_key: Optional[bytes] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -537,21 +537,31 @@ def worker_main(
         # Only set the log level for the leader process, the other processes will
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
+
+        # If HMAC key is not provided, initialize a new HMAC key
+        if not random_hmac_key:
+            logger.warning("HMAC key not found in worker queues, generating new one")
+            random_hmac_key = os.urandom(32)
+
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
-                                 name="worker_request_queue")
+                                 name="worker_request_queue",
+                                 hmac_key=random_hmac_key)
         request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
                                        is_server=False,
-                                       name="worker_request_error_queue")
+                                       name="worker_request_error_queue",
+                                       hmac_key=random_hmac_key)
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
                                        fuse_message=True,
-                                       name="worker_stats_queue")
+                                       name="worker_stats_queue",
+                                       hmac_key=random_hmac_key)
         kv_cache_events_queue = FusedIpcQueue(
             worker_queues.kv_cache_events_queue_addr,
             is_server=False,
             fuse_message=False,
-            name="worker_kv_cache_events_queue")
+            name="worker_kv_cache_events_queue",
+            hmac_key=random_hmac_key)
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -559,7 +569,8 @@ def worker_main(
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                              name=f"postprocess_{i}_feedin_queue")
+                              name=f"postprocess_{i}_feedin_queue",
+                              hmac_key=random_hmac_key)
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
@@ -568,7 +579,8 @@ def worker_main(
             result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
                                          is_server=False,
                                          fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                                         name="worker_result_queue")
+                                         name="worker_result_queue",
+                                         hmac_key=random_hmac_key)
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -600,6 +612,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                random_hmac_key,
             )
             postprocess_worker_futures.append(fut)
 
