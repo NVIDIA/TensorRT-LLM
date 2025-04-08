@@ -87,7 +87,7 @@ class ProcessPoolExecutorSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self):
-        self.mpi_pool.shutdown(wait=False)
+        self.mpi_pool.shutdown(wait=True)
 
 
 class ExecutorResponseTensors(NamedTuple):
