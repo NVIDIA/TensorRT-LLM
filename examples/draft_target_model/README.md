@@ -163,7 +163,7 @@ Started GRPCInferenceService at 0.0.0.0:8001
 Started Metrics Service at 0.0.0.0:8002
 ```
 
-1. Send a request for inference
+5. Send a request for inference
 
 ```bash
 python3 inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py \
