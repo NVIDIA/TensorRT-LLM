@@ -218,9 +218,8 @@ void BeamSearchLayer<T>::configureBeamSearchLayer()
         size_t const nByteD = (bUseGlobalMemoryStage3) ? nByteDynamicSharedMemoryStage3 : 0;
         this->mWorkspaceSize = nByteA + std::max(nByteB + nByteC, nByteD);
     }
-    else
+    else // V2 workflow for large beam width or VBWS
     {
-        // V2 workflow for large beam width or VBWS
         this->mV2 = true;
         switch (paddedBeamWidth)
         {
