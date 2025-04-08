@@ -23,10 +23,10 @@ tensorrt~=10.8.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01 uses 2.6.0a0.
 torch>=2.6.0a0,<=2.6.0
 torchvision
-nvidia-modelopt[torch]~=0.25.0
+nvidia-modelopt[torch]~=0.27.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-transformers==4.48.3
+transformers==4.51.0
 pydantic>=2.9.1
 pillow==10.3.0
 wheel
