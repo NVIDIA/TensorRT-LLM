@@ -566,6 +566,13 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
     def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+    def pytorchOnlyList = [
+        "tensorrt_llm/_torch/",
+        "tests/unittest/_torch/",
+        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+        "tests/integration/defs/disaggregated/",
+        "examples/pytorch/",
+    ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
 
@@ -573,12 +580,20 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
 
-    def result = changedFileList.every { file ->
-        def isPytorchFile = file =~ pytorchOnlyPattern
+    def result = true
+    for (file in changedFileList) {
+        def isPytorchFile = false
+        for (prefix in pytorchOnlyList) {
+            if (file.startsWith(prefix)) {
+                isPytorchFile = true
+                break
+            }
+        }
         if (!isPytorchFile) {
             pipeline.echo("Found non-PyTorch file: ${file}")
+            result = false
+            break
         }
-        return isPytorchFile
     }
 
     pipeline.echo("Only PyTorch files changed: ${result}")
