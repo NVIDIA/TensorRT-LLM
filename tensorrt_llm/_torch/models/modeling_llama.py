@@ -8,13 +8,13 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
+                              WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
@@ -145,8 +145,6 @@ class Eagle3LlamaAttention(LlamaAttention):
         config = model_config.pretrained_config
 
         tp_size = model_config.mapping.tp_size
-        tp_rank = model_config.mapping.tp_rank
-        gpus_per_node = model_config.mapping.gpus_per_node
 
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
@@ -155,13 +153,8 @@ class Eagle3LlamaAttention(LlamaAttention):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=config.attention_bias,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tp_size,
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=model_config.get_quant_config(),
@@ -242,15 +235,9 @@ class LlamaModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank,
-                gather_output=True,
-                gpus_per_node=model_config.mapping.gpus_per_node,
-            ),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
