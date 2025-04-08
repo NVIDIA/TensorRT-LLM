@@ -135,8 +135,11 @@ class ModelConfig(BaseModel):
             AliasPath("text_config", "num_key_value_heads"),
         ),
     )
-    hidden_size: int = Field(
-        validation_alias=AliasChoices("hidden_size", "n_embd"))
+    hidden_size: int = Field(validation_alias=AliasChoices(
+        "hidden_size",
+        "n_embd",
+        AliasPath("text_config", "hidden_size"),
+    ))
     head_size: Optional[int] = Field(default=None,
                                      validation_alias=AliasChoices(
                                          "head_size",
