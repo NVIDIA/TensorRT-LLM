@@ -365,8 +365,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-    bool const use_flash_mla, torch::optional<torch::Tensor> tile_scheduler_metadata,
-    torch::optional<torch::Tensor> num_splits)
+    bool const use_flash_mla, torch::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
+    torch::optional<torch::Tensor> flash_mla_num_splits)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -474,8 +474,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
         op->mUseFlashMLA = use_flash_mla;
         if (op->mUseFlashMLA)
         {
-            TLLM_CHECK(tile_scheduler_metadata.has_value());
-            op->mFlashMlaNumSmParts = tile_scheduler_metadata.value().size(0);
+            TLLM_CHECK(flash_mla_tile_scheduler_metadata.has_value());
+            op->mFlashMlaNumSmParts = flash_mla_tile_scheduler_metadata.value().size(0);
         }
     }
 
@@ -563,7 +563,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, tile_scheduler_metadata, num_splits);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -578,7 +579,8 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, tile_scheduler_metadata, num_splits);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -651,8 +653,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
         ", bool use_flash_mla"
-        ", Tensor? tile_scheduler_metadata"
-        ", Tensor? num_splits"
+        ", Tensor? flash_mla_tile_scheduler_metadata"
+        ", Tensor? flash_mla_num_splits"
         ") -> Tensor");
 }
 

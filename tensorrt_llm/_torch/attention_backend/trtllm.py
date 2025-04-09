@@ -278,8 +278,8 @@ class TrtllmAttentionWrapper:
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
         self.use_flash_mla = use_flash_mla and self.attention_input_type == AttentionInputType.generation_only
-        self.tile_scheduler_metadata = None
-        self.num_splits = None
+        self.flash_mla_tile_scheduler_metadata = None
+        self.flash_mla_num_splits = None
         if self.is_mla_enable:
             # max_context_length will increment 1 when overlap scheduler enabled
             if self.max_context_length > (self.rotary_cos_sin.shape[1] /
@@ -305,9 +305,10 @@ class TrtllmAttentionWrapper:
                     flash_mla_cache.clear_cache()
                 # get_flash_mla_metadata is a cached function,
                 # the actual computation is only performed once per iter rather than per layer.
-                self.tile_scheduler_metadata, self.num_splits = flash_mla_cache.get_metadata(
+                self.flash_mla_tile_scheduler_metadata, self.flash_mla_num_splits = flash_mla_cache.get_metadata(
                     self.sequence_length,
-                    self.num_heads,
+                    self.predicted_tokens_per_seq * self.num_heads //
+                    self.num_kv_heads,
                     self.num_kv_heads,
                 )
 
@@ -459,8 +460,8 @@ class TrtllmAttentionWrapper:
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
             self.use_flash_mla,
-            self.tile_scheduler_metadata,
-            self.num_splits,
+            self.flash_mla_tile_scheduler_metadata,
+            self.flash_mla_num_splits,
         )
         return output
 
