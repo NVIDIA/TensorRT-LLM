@@ -221,7 +221,7 @@ class LlavaNextModel(PreTrainedModel):
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = fuse_input_embeds(self.llm, input_ids, mm_embed)
+        input_ids, inputs_embeds = fuse_input_embeds(self.llm.model.embed_tokens, input_ids, mm_embed)
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits
