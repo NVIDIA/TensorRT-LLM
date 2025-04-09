@@ -147,6 +147,7 @@ _GlobalFlashInferPlanner = _FlashInferPlanner()
 @torch.library.custom_op("attention::prepare_flashinfer_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -187,7 +188,7 @@ def prepare_flashinfer_metadata(
 
 @prepare_flashinfer_metadata.register_fake
 def prepare_flashinfer_metadata_fake(
-    input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     qo_indptr = torch.empty(len(seq_len) + 1, dtype=seq_len.dtype, device=seq_len.device)
     return (

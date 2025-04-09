@@ -110,6 +110,8 @@ class SequenceInfo:
     ## [UPDATE WITH CARE] TENSOR FIELDS THAT WILL BE PASSED TO PREPARE_METADATA OP #################
     # input_ids MUST ALWAYS BE THE FIRST FIELD
     input_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+    position_ids: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, dtype=torch.int))
+
     seq_len: torch.Tensor = field(default_factory=lambda: torch.ones(1, dtype=torch.int))
     input_pos: torch.Tensor = field(default_factory=lambda: torch.zeros(1, dtype=torch.int))
     cache_loc: torch.Tensor = field(default_factory=lambda: torch.arange(1, dtype=torch.int))
@@ -130,6 +132,7 @@ class SequenceInfo:
         total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
+        self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.int)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
@@ -159,8 +162,8 @@ class SequenceInfo:
 
     @property
     def extra_arg_names(self) -> List[str]:
-        """Return extra arg names for the prepare_metadata op beyond input_ids."""
-        return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][1:]
+        """Return extra arg names for the prepare_metadata op beyond input_ids and position_ids."""
+        return [f.name for f in fields(self) if isinstance(getattr(self, f.name), torch.Tensor)][2:]
 
     @property
     def dynamic_shapes(self) -> Tuple[Dict[str, Dim]]:
@@ -169,10 +172,14 @@ class SequenceInfo:
         NOTE: will be lazily initialized since the Dim object is not picklable for multi-processing.
         """
         if self._dynamic_shapes is None:
-            dynamic_shapes = ({},)
+            # set up shape for input_ids and position_ids
+            dynamic_shapes = ({}, {})
             if self.max_batch_size > 1:
                 dynamic_shapes[0][0] = Dim("batch_size", max=self.max_batch_size)
             dynamic_shapes[0][1] = Dim("seq_len", max=self.max_seq_len)
+            # set up shape for position_ids (same as input_ids)
+            dynamic_shapes[1].update(dynamic_shapes[0])
+            # set up shape for extra args
             dynamic_shapes += ({},) * len(self.extra_arg_names)
             self._dynamic_shapes = dynamic_shapes
         return self._dynamic_shapes
@@ -283,7 +290,7 @@ class SequenceInfo:
         for f in fields(self):
             val = getattr(self, f.name)
             val_other = getattr(other, f.name)
-            if f.name == "input_ids":
+            if f.name in ["input_ids", "position_ids"]:
                 setattr(self, f.name, val_other.to(self.device))
             elif f.name == "_sequence_lengths":
                 self._sequence_lengths = val_other
@@ -298,25 +305,29 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        # set a dummy sequence corresponding to a generate-only batch
+        # reset input_pos
+        self.input_pos.zero_()
+
+        # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
         self.nest_sequences(torch.zeros(self.max_batch_size, 1, dtype=torch.int))
 
         # reset cache information
-        self.input_pos.zero_()
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq.fill_(1)
 
     def _set_example_sequence(self) -> None:
-        """Set an example sequence for export purposes."""
+        """Set an example sequence for export purposes with shape [bs, seq_len]."""
         self.reset()
+        bs, seq_len = min(2, self.max_batch_size), min(4, self.max_seq_len)
         input_ids = torch.ones(
-            min(2, self.max_batch_size),
-            min(4, self.max_seq_len),
+            bs,
+            seq_len,
             dtype=torch.int,
             device=self.device,
         )
         self.nest_sequences(input_ids)
-        self.input_ids = input_ids
+        self.input_ids = self.input_ids.view(bs, seq_len)
+        self.position_ids = self.position_ids.view(bs, seq_len)
 
     def _set_max_num_tokens_sample(self) -> None:
         """Set an example sequence with max_num_tokens."""
@@ -335,6 +346,20 @@ class SequenceInfo:
         """Set an example sequence for generate-only batch."""
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
+
+    def _update_position_ids(self) -> None:
+        # set new position_ids as new tensor from input_pos and seq_len via torch.arange
+        position_ids_list = [
+            torch.arange(in_pos, in_pos + seq_len, dtype=torch.int)
+            for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
+        ]
+        self.position_ids = torch.cat(position_ids_list, dim=0).to(self.device)
+
+        # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
+        if self.is_generate:
+            self.position_ids = self.position_ids.view(-1, 1)
+        else:
+            self.position_ids = self.position_ids.view(1, -1)
 
     def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
@@ -362,6 +387,9 @@ class SequenceInfo:
         else:
             self.input_ids = self.input_ids.view(1, -1, *self.input_ids.shape[1:])
 
+        # update position_ids
+        self._update_position_ids()
+
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
@@ -379,6 +407,9 @@ class SequenceInfo:
             self.input_pos[:bs] = seq_len.to(self.device)
         else:
             self.input_pos[:bs] += seq_len.to(self.device)
+
+        # update position_ids
+        self._update_position_ids()
 
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
@@ -405,6 +436,7 @@ class PrepareMetadataCallable(Protocol):
     def __call__(
         self,
         input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
         seq_len: torch.Tensor,
         input_pos: torch.Tensor,
         cache_loc: torch.Tensor,
@@ -477,6 +509,7 @@ class AttentionDescriptor(ABC):
         ```
         def prepare_metadata(
             input_ids: torch.Tensor,
+            position_ids: torch.Tensor,
             seq_len: torch.Tensor,
             input_pos: torch.Tensor,
             cache_loc: torch.Tensor,

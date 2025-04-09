@@ -212,6 +212,7 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     # TODO: continue updating this list
     shardable_nodes = {
         torch.ops.attention.fused_mha,
+        torch.ops.attention.flattened_mha_with_cache,
         torch.ops.aten.gelu,
         torch.ops.aten.leaky_relu,
         torch.ops.aten.mul,

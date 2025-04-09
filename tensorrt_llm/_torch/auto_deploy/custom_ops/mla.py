@@ -157,6 +157,7 @@ def fused_flattened_mla_with_cache_fake(
 @torch.library.custom_op("attention::prepare_fused_mla_metadata", mutates_args=())
 def prepare_fused_mla_metadata(
     input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -176,7 +177,7 @@ def prepare_fused_mla_metadata(
 
 @prepare_fused_mla_metadata.register_fake
 def prepare_fused_mla_metadata_fake(
-    input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     return (
         torch.empty_like(seq_len),

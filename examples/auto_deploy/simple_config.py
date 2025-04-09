@@ -116,7 +116,7 @@ class SimpleConfig:
             self.max_seq_len = max(self.max_seq_len, self.benchmark_isl + self.benchmark_osl)
 
         # No paging allowed in TritonWithFlattenedInputs
-        if self.attn_backend in ["TritonWithFlattenedInputs"]:
+        if self.attn_backend in ["TritonWithFlattenedInputs", "UnfusedTritonWithFlattenedInputs"]:
             self.page_size = self.max_seq_len
 
         # use min instead of max to avoid OOM for large batch size

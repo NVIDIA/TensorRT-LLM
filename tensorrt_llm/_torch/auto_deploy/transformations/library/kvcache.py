@@ -1,7 +1,7 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Callable, Dict, Set
+from typing import Callable, Dict, List, Set
 
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -85,20 +85,20 @@ def _extract_mla_info(node: Node, egm: GraphModule, cache_config: CacheConfig) -
     return _get_info
 
 
-def check_in_out_nodes(egm: GraphModule) -> Node:
+def check_in_out_nodes(egm: GraphModule) -> List[Node]:
     """Check for input and output nodes in the graph and return 1st input node."""
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
 
     # we only expect one input node
-    assert len(input_nodes) == 1, "Expected exactly one input node."
+    assert len(input_nodes) == 2, "Expected exactly two input nodes (input_ids, position_ids)."
 
     # NOTE: for now, we wanna make sure we *only* return the final output and no hidden states.
     # Later on, we can revisit how to support returning hidden states.
     assert len(output_nodes) == 1, "Expected exactly one output node!"
     assert len(output_nodes[0].all_input_nodes) == 1, "Expected to only return final tensor output!"
 
-    return input_nodes[0]
+    return input_nodes
 
 
 def _insert_cached_nodes(
@@ -106,7 +106,7 @@ def _insert_cached_nodes(
     cm: CachedSequenceInterface,
     attention_op: AttentionDescriptor,
     attn_lookup: Dict[Node, GetAttentionInfo],
-    input_node: Node,
+    input_nodes: List[Node],
 ) -> None:
     """Insert all input nodes and cached attention nodes."""
     # pick up graph
@@ -119,7 +119,7 @@ def _insert_cached_nodes(
         ret_node = graph.call_function(
             get_metadata,
             args=(
-                input_node,
+                *input_nodes,
                 *(add_graph_input(egm, name) for name in cm.info.extra_arg_names),
                 cm.info.page_size,
             ),
@@ -175,7 +175,7 @@ def _insert_with_kv_cache(
     fused_ops: Set[Callable],
     info_extractor: Callable,
     op_name: str,
-    input_node: Node,
+    input_nodes: List[Node],
 ) -> GraphModule:
     """Shared logic to replace vanilla fused_mha/fused_mla node with corresponding custom op with KV cache."""
     # Get all attention nodes and their info objects
@@ -191,7 +191,7 @@ def _insert_with_kv_cache(
     ad_logger.info(f"Inserting {op_name} with KV cache and AttentionOp as {attention_op.__name__}")
     ad_logger.debug(f"Before inserting {op_name} with KV cache: {egm}")
 
-    _insert_cached_nodes(egm, cm, attention_op, attn_node_lookup, input_node)
+    _insert_cached_nodes(egm, cm, attention_op, attn_node_lookup, input_nodes)
 
     egm = canonicalize_graph(egm, shape_prop=False)
     ad_logger.debug(f"After inserting {op_name} with KV cache: {egm}")
@@ -204,12 +204,12 @@ def insert_mha_with_kv_cache(
     cm: CachedSequenceInterface,
     attention_op: AttentionDescriptor,
     cache_config: CacheConfig,
-    input_node: Node,
+    input_nodes: List[Node],
 ) -> GraphModule:
     """Replaces the vanilla fused_mha node in the graph with a custom MHA op with KV cache."""
     fused_mha_ops = {torch.ops.attention.fused_mha}
     return _insert_with_kv_cache(
-        egm, cm, attention_op, cache_config, fused_mha_ops, _extract_mha_info, "MHA", input_node
+        egm, cm, attention_op, cache_config, fused_mha_ops, _extract_mha_info, "MHA", input_nodes
     )
 
 
@@ -218,12 +218,12 @@ def insert_mla_with_kv_cache(
     cm: CachedSequenceInterface,
     attention_op: AttentionDescriptor,
     cache_config: CacheConfig,
-    input_node: Node,
+    input_nodes: List[Node],
 ) -> GraphModule:
     """Replaces the vanilla fused_mha node in the graph with a custom MLA op with KV cache."""
     fused_mla_ops = {torch.ops.deepseek.fused_mla}
     return _insert_with_kv_cache(
-        egm, cm, attention_op, cache_config, fused_mla_ops, _extract_mla_info, "MLA", input_node
+        egm, cm, attention_op, cache_config, fused_mla_ops, _extract_mla_info, "MLA", input_nodes
     )
 
 
