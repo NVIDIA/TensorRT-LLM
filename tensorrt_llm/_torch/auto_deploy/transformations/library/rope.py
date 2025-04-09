@@ -9,61 +9,81 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
-def match_rope(gm: GraphModule) -> GraphModule:
+def match_rope_v1(gm: GraphModule) -> GraphModule:
     """
-    Identify subgraphs corresponding to rotary positional embeddings in each region.
-    For each region we search for two branches implementing one of the following patterns:
-      Version 1 (explicit cos/sin multiplication):
-         (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
-      Version 2 (complex multiplication):
-         xq_out = type_as( flatten( view_as_real( view_as_complex(reshape(to_dtype(xq))) * unsqueeze(freqs_cis) ) ) )
-         (and similarly for xk)
-    If exactly two such patterns are found in a region and they use the same pattern,
-    a heuristic is used to decide which one is query and which is key. The cosine-sine
-    (or frequency) arguments are then processed appropriately and the subgraph is replaced
-    with a call to torch.ops.rope.flashinfer.
+    Identify and replace legacy RoPE subgraphs (explicit cos/sin multiplication pattern):
+
+      output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
+
+    If exactly two such branches (query and key) are detected within each region, they're replaced
+    by a call to `torch.ops.rope.flashinfer`.
     """
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        region_matches = []  # Will hold tuples (version, match_dict)
+        matches = []
         node = start_boundary
         while node != end_boundary:
             if is_op(node, torch.ops.aten.add):
                 match_info = _match_rotary_subpattern_V1(node)
-                if match_info is not None:
-                    region_matches.append(("v1", match_info))
-            elif is_op(node, torch.ops.aten.type_as):
-                match_info = _match_rotary_subpattern_V2(node)
-                if match_info is not None:
-                    region_matches.append(("v2", match_info))
+                if match_info:
+                    matches.append(match_info)
             node = node.next
 
-        if len(region_matches) == 0:
+        if not matches:
             continue
-        if len(region_matches) != 2:
+        if len(matches) != 2:
             raise RuntimeError(
-                f"Expected to find exactly 2 rotary embedding branches in region "
-                f"between {start_boundary} and {end_boundary}, but found {len(region_matches)}."
+                f"Expected exactly 2 legacy RoPE branches between {start_boundary} and {end_boundary}, "
+                f"found {len(matches)}."
             )
 
-        # Ensure that the two branch matches use the same pattern version.
-        version_set = {version for version, _ in region_matches}
-        if len(version_set) != 1:
-            raise RuntimeError("Mixed rotary embedding patterns detected in the same region.")
-        version = version_set.pop()
-
-        # Assume the first matched branch corresponds to query (q), and the second to key (k).
+        # Assume the first matched branch is query (q), second is key (k).
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
-        if version == "v1":
-            q_match, k_match = region_matches[0][1], region_matches[1][1]
-            _process_rope_v1(graph, q_match, k_match, start_boundary)
+        q_match, k_match = matches
+        _process_rope_v1(graph, q_match, k_match, start_boundary)
 
-        elif version == "v2":
-            q_match, k_match = region_matches[0][1], region_matches[1][1]
-            _process_rope_v2(graph, q_match, k_match, start_boundary)
+    gm = canonicalize_graph(gm)
+    return gm
+
+
+def match_rope_v2(gm: GraphModule) -> GraphModule:
+    """
+    Identify and replace RoPE subgraphs using complex multiplication pattern:
+
+      output = type_as(flatten(view_as_real(mul(view_as_complex(reshape(to_dtype(x))), unsqueeze(freqs_cis, 2)))), x)
+
+    If exactly two such branches (query and key) are detected within each region, they're replaced
+    by a call to `torch.ops.rope.flashinfer`.
+    """
+    graph = gm.graph
+    boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
+
+    for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
+        matches = []
+        node = start_boundary
+        while node != end_boundary:
+            if is_op(node, torch.ops.aten.type_as):
+                match_info = _match_rotary_subpattern_V2(node)
+                if match_info:
+                    matches.append(match_info)
+            node = node.next
+
+        if not matches:
+            continue
+        if len(matches) != 2:
+            raise RuntimeError(
+                f"Expected exactly 2 complex RoPE branches between {start_boundary} and {end_boundary}, "
+                f"found {len(matches)}."
+            )
+
+        # Assume the first matched branch is query (q), second is key (k).
+        # This assumption is based on the default ordering in the exported graph,
+        # since node naming conventions don't reliably indicate q/k branches.
+        q_match, k_match = matches
+        _process_rope_v2(graph, q_match, k_match, start_boundary)
 
     gm = canonicalize_graph(gm)
     return gm
