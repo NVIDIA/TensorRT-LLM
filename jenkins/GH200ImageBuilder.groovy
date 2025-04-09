@@ -1,3 +1,5 @@
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
 import java.lang.Exception
 import groovy.transform.Field
 
@@ -10,37 +12,6 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
 LLM_ROOT = "llm"
-
-// Utilities
-def checkoutSource(String repo, String branch, String directory) {
-    def extensionsList = [
-        [$class: 'CleanCheckout'],
-        [$class: 'RelativeTargetDirectory',
-            relativeTargetDir: directory],
-        [$class: 'SubmoduleOption',
-            parentCredentials: true,
-            recursiveSubmodules: true,
-            timeout: 60
-            ]
-    ]
-    def scmSpec = [
-        $class: "GitSCM",
-        doGenerateSubmoduleConfigurations: false,
-        submoduleCfg: [],
-        branches: [[name: branch]],
-        userRemoteConfigs: [
-            [
-                credentialsId: "svc_tensorrt_gitlab_api_token",
-                name: "origin",
-                url: repo,
-            ]
-        ],
-        extensions: extensionsList,
-    ]
-    echo "Cloning with SCM spec: ${scmSpec.toString()}"
-    checkout(scm: scmSpec, changelog: true)
-}
-
 
 def buildImage(action, type)
 {
@@ -63,7 +34,7 @@ def buildImage(action, type)
         sh 'ls -lah'
     }
 
-    checkoutSource(LLM_REPO, branch, LLM_ROOT)
+    trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
 
     // Step 2: building wheels in container
     docker.image(DOCKER_IMAGE).inside('-v /var/run/docker.sock:/var/run/docker.sock --privileged') {

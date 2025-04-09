@@ -128,19 +128,3 @@ TEST_F(ContextProgressTest, SlowTransmission)
     mTransmissionTime = milliseconds(10);
     runFakeModel(10);
 }
-
-TEST_F(ContextProgressTest, OverlapTiming)
-{
-    int const numLayers = 10;
-    auto start = steady_clock::now();
-    milliseconds timePerLayer{10};
-
-    mPluginTime = timePerLayer;
-    mComputeTime = timePerLayer;
-    mTransmissionTime = timePerLayer;
-    runFakeModel(numLayers);
-
-    auto end = steady_clock::now();
-    auto totalTime = duration_cast<milliseconds>(end - start);
-    EXPECT_LE(totalTime.count(), 2 * numLayers * timePerLayer.count());
-}

@@ -25,7 +25,9 @@
  */
 
 #pragma once
+#ifndef NVRTC_JIT_COMPILATION
 #include <cstdint>
+#endif
 
 #include "utils.cuh"
 
@@ -60,6 +62,42 @@ __device__ __forceinline__ void get_swizzled_block_idx(
     n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
 }
 
+struct NormalSchedulerInput
+{
+    uint32_t shape_m;
+    int* grouped_layout; // no use
+};
+
+struct GroupedContiguousSchedulerInput
+{
+    uint32_t shape_m;
+    int* grouped_layout;
+};
+
+struct GroupedMaskedSchedulerInput
+{
+    uint32_t shape_m;
+    int* grouped_layout;
+};
+
+struct GroupedWithOffsetSchedulerInput
+{
+    uint32_t shape_m;
+    int64_t* problem_m_offsets;
+    int64_t* problem_m_padded_offsets;
+};
+
+struct StridedBatchedSchedulerInput
+{
+    uint32_t shape_m;
+    uint64_t ld_a;
+    uint64_t stride_a;
+    uint64_t ld_b;
+    uint64_t stride_b;
+    uint64_t ld_d;
+    uint64_t stride_d;
+};
+
 template <uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups, uint32_t kNumTMAMulticast,
     uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N), uint32_t kNumNBlocksPerGroup = 16>
 struct NormalScheduler
@@ -70,11 +108,8 @@ struct NormalScheduler
     uint32_t num_aligned_m_blocks;
     uint32_t num_blocks;
 
-    struct Input
-    {
-        uint32_t shape_m;
-        int* grouped_layout; // no use
-    };
+    using Input = NormalSchedulerInput;
+    Input input;
 
     NormalScheduler() {}
 
@@ -132,11 +167,8 @@ struct GroupedContiguousScheduler
     uint32_t num_blocks;
     uint32_t shape_m;
 
-    struct Input
-    {
-        uint32_t shape_m;
-        int* grouped_layout;
-    };
+    using Input = GroupedContiguousSchedulerInput;
+    Input input;
 
     GroupedContiguousScheduler() {}
 
@@ -198,11 +230,8 @@ struct GroupedMaskedScheduler
     uint32_t shape_m;
     int* grouped_layout;
 
-    struct Input
-    {
-        uint32_t shape_m;
-        int* grouped_layout;
-    };
+    using Input = GroupedMaskedSchedulerInput;
+    Input input;
 
     GroupedMaskedScheduler() {}
 
@@ -281,12 +310,8 @@ struct GroupedWithOffsetScheduler
     int64_t* problem_m_offsets;
     int64_t* problem_m_padded_offsets;
 
-    struct Input
-    {
-        uint32_t shape_m;
-        int64_t* problem_m_offsets;
-        int64_t* problem_m_padded_offsets;
-    };
+    using Input = GroupedWithOffsetSchedulerInput;
+    Input input;
 
     GroupedWithOffsetScheduler() {}
 
@@ -363,16 +388,8 @@ struct StridedBatchedScheduler
     int64_t m_offset;
     int64_t m_boundary;
 
-    struct Input
-    {
-        uint32_t shape_m;
-        uint64_t ld_a;
-        uint64_t stride_a;
-        uint64_t ld_b;
-        uint64_t stride_b;
-        uint64_t ld_d;
-        uint64_t stride_d;
-    } input;
+    using Input = StridedBatchedSchedulerInput;
+    Input input;
 
     StridedBatchedScheduler() {}
 

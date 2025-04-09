@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -13,6 +14,24 @@ from ..model_config import ModelConfig
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
+
+
+class L2Norm(torch.nn.Module):
+
+    def __init__(self, dtype: Optional[torch.dtype] = None, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.dtype = dtype
+
+    def _norm(self, x):
+        flash_infer_kernel = RMSNorm(hidden_size=x.shape[-1],
+                                     eps=self.eps,
+                                     dtype=self.dtype,
+                                     device=x.device)
+        return flash_infer_kernel(x)
+
+    def forward(self, x):
+        return self._norm(x).type_as(x)
 
 
 class Attention(nn.Module):
@@ -31,6 +50,8 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        use_qk_norm: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -43,6 +64,10 @@ class Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
+        self.use_qk_norm = use_qk_norm
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -66,6 +91,11 @@ class Attention(nn.Module):
                                     1) // tp_size
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
+
+        if self.use_qk_norm:
+            self.qk_norm = L2Norm(dtype=dtype)
+        else:
+            self.qk_norm = None
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -126,6 +156,7 @@ class Attention(nn.Module):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         mrope_config: Optional[dict] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
@@ -133,17 +164,31 @@ class Attention(nn.Module):
         if isinstance(self.attn, TrtllmAttention):
             is_fused_qkv = True
 
+        if self.qk_norm is not None:
+            # TODO: make this more efficient.
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+            do_multi_stream = torch.cuda.is_current_stream_capturing(
+            ) and self.aux_stream is not None
+            if do_multi_stream:
+                self.ln_events[0].record()
+                k = self.qk_norm(k)
+                with torch.cuda.stream(self.aux_stream):
+                    self.ln_events[0].wait()
+                    q = self.qk_norm(q)
+                    self.ln_events[1].record()
+                self.ln_events[1].wait()
+            else:
+                q = self.qk_norm(q)
+                k = self.qk_norm(k)
+            qkv = torch.concat([q, k, v], dim=-1)
+
         if is_fused_qkv:
             if self.pos_embd_params is None and position_ids is not None:
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                     dim=-1)
-                q, k = self.rotary_emb(
-                    position_ids,
-                    [q.contiguous(), k.contiguous()], attn_metadata)
-                qkv = torch.concat(
-                    [q.contiguous(),
-                     k.contiguous(),
-                     v.contiguous()], dim=-1)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+                qkv = torch.concat([q, k, v], dim=-1)
 
             out_scale = None
             if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
@@ -160,9 +205,7 @@ class Attention(nn.Module):
                                 dim=-1)
 
             if self.pos_embd_params is None and position_ids is not None:
-                q, k = self.rotary_emb(
-                    position_ids,
-                    [q.contiguous(), k.contiguous()], attn_metadata)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
 
             attn_output = self.attn.forward(q.contiguous(),
                                             k.contiguous(),
@@ -171,7 +214,8 @@ class Attention(nn.Module):
                                             attention_mask=attention_mask,
                                             mrope_config=mrope_config)
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output,
+                                  all_reduce_params=all_reduce_params)
 
         return attn_output
 
@@ -210,6 +254,7 @@ class MLA(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -384,14 +429,25 @@ class MLA(nn.Module):
             skip_create_weights=config.skip_create_weights,
         )
 
+        def yarn_get_mscale(scale=1, mscale=1):
+            if scale <= 1:
+                return 1.0
+            return 0.1 * mscale * math.log(scale) + 1.0
+
+        mscale_all_dim = pos_embd_params.rope.mscale_all_dim
+        scaling_factor = pos_embd_params.rope.scale
+        mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+        q_scaling = 1.0 / (mscale * mscale)
+
         self.mha = create_attention(
             config.attn_backend,
             self.layer_idx,
             self.num_heads,
-            self.qk_nope_head_dim + self.qk_rope_head_dim,
-            self.num_key_value_heads,
+            head_dim=self.qk_head_dim,
+            num_kv_heads=self.num_key_value_heads,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -405,10 +461,11 @@ class MLA(nn.Module):
             config.attn_backend,
             self.layer_idx,
             self.num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            1,  # num_kv_heads
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_kv_heads=1,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            q_scaling=q_scaling,
             is_mla_enable=True,
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -531,7 +588,9 @@ class MLA(nn.Module):
         # Concat q(including q_pe), k + k_pe, v together as input_qkv
         input_qkv = torch.cat([q, k, v], dim=-1)
 
-        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
         attn_output = self.mha.forward(
             input_qkv,
             None,
@@ -599,7 +658,9 @@ class MLA(nn.Module):
             self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
         ])
 
-        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
+
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,

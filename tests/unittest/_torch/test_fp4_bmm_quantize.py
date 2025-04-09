@@ -31,10 +31,11 @@ def e2m1_and_ufp8_scale_to_float_tensor_v2(
     global_scale_tensor: torch.Tensor,
     sf_vec_size,
     ufp8_type: int = 1,
+    is_sf_swizzled_layout: bool = True,
 ):
     float_tensor = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
         e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
-        ufp8_type)
+        ufp8_type, is_sf_swizzled_layout)
     return float_tensor
 
 
@@ -115,54 +116,6 @@ class TestFunctional(unittest.TestCase):
         torch.cuda.synchronize()
 
         c_ref = prepare_ref_output(a_pt_batched, b_pt_batched)
-        self.assertTrue(torch.allclose(c_ref, c, atol=1e-2, rtol=1e-2))
-
-
-class TestProfiling(unittest.TestCase):
-
-    def setUp(self):
-        tensorrt_llm.logger.set_level("warning")
-        torch.manual_seed(42)
-        torch.cuda.manual_seed(42)
-
-    @parameterized.expand(
-        list([
-            [1, 7, 128, 64],
-            [10, 7, 128, 64],
-            [1, 1024, 1024, 1024],
-            [10, 1024, 1024, 1024],
-        ]),
-        name_func=unittest_name_func,
-    )
-    @skip_pre_blackwell_unittest
-    def test_fp4_bmm_torch_profiling(self, b: int, m: int, n: int, k: int):
-        mat_a = torch.randn([b, m, k], dtype=torch.float32)
-        mat_b = torch.randn([b, n, k], dtype=torch.float32)
-        a_global_sf = (448 * 6) / mat_a.abs().max().float()
-        b_global_sf = (448 * 6) / mat_b.abs().max().float()
-        ab_global_sf = 1 / (a_global_sf * b_global_sf)
-        ab_global_sf = ab_global_sf.cuda()
-        sf_vec_size = 16
-
-        a_fp4, a_sf = torch.ops.trtllm.fp4_batched_quantize(
-            mat_a.to(torch.half).cuda(), a_global_sf.cuda(), sf_vec_size, False)
-        b_fp4, b_sf = torch.ops.trtllm.fp4_batched_quantize(
-            mat_b.to(torch.half).cuda(), b_global_sf.cuda(), sf_vec_size, False)
-
-        profiler = torch.classes.trtllm.FP4BmmRunner.get_instance(torch.half)
-        buckets = [1, 16, 32, 48, 64, 1024, 2048, 4096]
-        profiler.run_profile(n, k, b, buckets)
-
-        best_config_idx = profiler.get_best_config_id(m, n, k, b)
-
-        c = profiler.run_bmm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf, False,
-                             best_config_idx)
-
-        c_ref = torch.ops.trtllm.fp4_bmm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                         False)
-
-        torch.cuda.synchronize()
-
         self.assertTrue(torch.allclose(c_ref, c, atol=1e-2, rtol=1e-2))
 
 

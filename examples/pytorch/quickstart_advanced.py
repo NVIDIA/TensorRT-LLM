@@ -3,8 +3,8 @@ import argparse
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import EagleDecodingConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
+                                 MTPDecodingConfig)
 
 example_prompts = [
     "Hello, my name is",

@@ -3,6 +3,9 @@ hostname: localhost
 port: 8000
 backend: "pytorch"
 free_gpu_memory_fraction: 0.2
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
 context_servers:
   num_instances: 1
   max_batch_size: 1

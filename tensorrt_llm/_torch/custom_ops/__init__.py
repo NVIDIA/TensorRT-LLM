@@ -1,13 +1,15 @@
 from .cpp_custom_ops import _register_fake
 from .flashinfer_custom_ops import IS_FLASHINFER_AVAIABLE
 from .torch_custom_ops import bmm_out
-from .userbuffers_custom_ops import ub_scaled_mm_allreduce_quant_scaled_mm_op
+from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
 __all__ = [
     'IS_FLASHINFER_AVAIABLE',
     '_register_fake',
     'bmm_out',
-    'ub_scaled_mm_allreduce_quant_scaled_mm_op',
+    'add_to_ub',
+    'copy_to_userbuffers',
+    'matmul_to_ub',
 ]
 
 if IS_FLASHINFER_AVAIABLE:

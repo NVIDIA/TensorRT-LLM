@@ -12,9 +12,11 @@ class RMSNorm(nn.Module):
                  *,
                  hidden_size: int,
                  eps: float,
-                 dtype: Optional[torch.dtype] = None):
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=dtype, device=device))
         self.variance_epsilon = eps
 
     def forward(

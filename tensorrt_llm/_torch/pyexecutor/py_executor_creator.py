@@ -47,7 +47,8 @@ def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
     num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
     # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
-    if config.architectures[0] == "Nemotron5ForCausalLM":
+    if config.architectures and config.architectures[
+            0] == "Nemotron5ForCausalLM":
         # attention layers are derived from configuration (hybrid_override_pattern)
         num_hidden_layers = config.hybrid_override_pattern.count("*")
 
@@ -312,8 +313,10 @@ def create_py_executor(executor_config: ExecutorConfig,
                              dist=dist,
                              enable_overlap_scheduler=pytorch_backend_config.
                              enable_overlap_scheduler,
-                             max_batch_size=executor_config.max_batch_size,
                              max_input_len=executor_config.max_input_len,
+                             max_batch_size=executor_config.max_batch_size,
+                             max_draft_tokens=spec_config.max_draft_tokens
+                             if spec_config is not None else 0,
                              kv_cache_transceiver=kv_cache_transceiver,
                              draft_model_engine=draft_model_engine)
     return py_executor

@@ -18,7 +18,8 @@
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
@@ -92,8 +93,8 @@ public:
             outputShape[r - 1] = k / 2;
 
             quant_out = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda(
-                {tensorrt_llm::computeSFSize(m, k / sfVecSize)}, SF_DTYPE, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sfVecSize)},
+                SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(reduce_fusion_inputs[0]);
 
             allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
@@ -104,6 +105,13 @@ public:
             {
                 norm_out = torch::empty_like(input);
                 allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+                allreduce_fusion_params.pattern
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+            }
+            else
+            {
+                allreduce_fusion_params.pattern
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant;
             }
         }
         else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM)
@@ -113,10 +121,11 @@ public:
 
             allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
             allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            allreduce_fusion_params.pattern
+                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm;
         }
         else
         {
-
             return std::vector<torch::Tensor>();
         }
 
@@ -170,7 +179,7 @@ public:
         TORCH_CHECK(fusion_op_type == AllReduceFusionOp::MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
             "Only support MOE_ALLREDUCE_RESIDUAL_RMS_NORM");
 
-        auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::MoeReductionAllReduceFusionParams();
+        auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeReductionAllReduceFusionParams();
 
         allreduce_fusion_params.quant_out = nullptr;
         allreduce_fusion_params.scale_out = nullptr;
@@ -215,7 +224,7 @@ public:
         allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
         allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
 
-        tensorrt_llm::kernels::ar_fusion::moereduction_allreduce_fusion_op(allreduce_fusion_params);
+        tensorrt_llm::kernels::ar_fusion::moe::moereduction_allreduce_fusion_op(allreduce_fusion_params);
 
         return std::vector<torch::Tensor>({norm_out, residual_out});
     }

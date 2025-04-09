@@ -18,6 +18,11 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [04/05] TensorRT-LLM can run Llama 4 at over 40,000 tokens per second on B200 GPUs!
+
+![L4_perf](./docs/source/media/l4_launch_perf.png)
+
+
 * [03/22] TensorRT-LLM is now fully open-source, with developments moved to GitHub!
 * [03/18]  🚀🚀 NVIDIA Blackwell Delivers World-Record DeepSeek-R1 Inference Performance with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
 * [02/28] 🌟 NAVER Place Optimizes SLM-Based Vertical Services with TensorRT-LLM [➡️ Link](https://developer.nvidia.com/blog/spotlight-naver-place-optimizes-slm-based-vertical-services-with-nvidia-tensorrt-llm/)

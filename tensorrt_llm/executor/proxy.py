@@ -293,6 +293,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         ready_signal = self.request_error_queue.get()
         if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
+            self.mpi_session.shutdown()
             raise ready_signal
 
     def _abort_all_requests(self):

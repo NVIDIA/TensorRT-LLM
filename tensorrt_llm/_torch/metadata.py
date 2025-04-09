@@ -14,7 +14,7 @@ class KVCacheParams:
     use_cache: bool
 
     # The number of the cached tokens of each sequence
-    num_cached_tokens_per_seq: List[int]
+    num_cached_tokens_per_seq: Optional[List[int]] = None
     # Block IDs of the each sequence
     # The shape is depending on the cache type:
     # - LINEAR: (1)

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -ex
+set -e
 
 task_with_command="${@:1}"
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
