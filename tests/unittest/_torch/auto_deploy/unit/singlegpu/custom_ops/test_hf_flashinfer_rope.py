@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import flashinfer
 import pytest
 import torch
@@ -74,7 +76,7 @@ def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
     k_hf = k_hf.transpose(1, 2).to(dtype)
 
     # Custom op call
-    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_new, sin_new)
+    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_new, sin_new, True)
 
     atol = 5e-4 if dtype == torch.float16 else 1e-4
     rtol = 5e-4 if dtype == torch.float16 else 1e-4
@@ -83,3 +85,50 @@ def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
     torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(q_hf, custom_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_hf, custom_k, rtol=rtol, atol=atol)
+
+
+# Version 2: complex multiplication approach
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    xq_out = torch.view_as_real(xq_ * freqs_cis[:, :, None, :]).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+@pytest.mark.parametrize("head_dim", [64, 256])  # Must be a multiple of 64
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_flashinfer_complex_rotary(dtype, head_dim):
+    device = "cuda"
+    batch = 2
+    seq_len = 4
+    n_head = 3
+
+    inv_freq = 1.0 / (
+        10000
+        ** (torch.arange(0, head_dim // 2, dtype=torch.float32, device=device) / (head_dim // 2))
+    )
+    positions_range = torch.arange(seq_len, dtype=torch.float32, device=device)
+    angles = positions_range.unsqueeze(1) * inv_freq.unsqueeze(0)  # shape: (seq_len, head_dim//2)
+    freqs_cis = torch.polar(torch.ones((seq_len, head_dim // 2), device=device), angles)
+    freqs_cis = freqs_cis.unsqueeze(0).expand(batch, -1, -1)  # shape: (B, seq, head_dim//2)
+
+    query = torch.randn(batch, seq_len, n_head, head_dim, dtype=dtype, device=device)
+    key = torch.randn(batch, seq_len, n_head, head_dim, dtype=dtype, device=device)
+
+    out_q_v2, out_k_v2 = apply_rotary_emb(query, key, freqs_cis)
+
+    cos_from_freqs = torch.real(freqs_cis)  # (B, seq, head_dim//2)
+    sin_from_freqs = torch.imag(freqs_cis)  # (B, seq, head_dim//2)
+    cos_flash = torch.cat((cos_from_freqs, cos_from_freqs), dim=-1)  # (B, seq, head_dim)
+    sin_flash = torch.cat((sin_from_freqs, sin_from_freqs), dim=-1)  # (B, seq, head_dim)
+
+    # q/k of llama4 rope is interleaved
+    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_flash, sin_flash, False)
+
+    torch.testing.assert_close(out_q_v2, custom_q, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(out_k_v2, custom_k, rtol=1e-3, atol=1e-3)

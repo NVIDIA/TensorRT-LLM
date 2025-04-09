@@ -184,7 +184,7 @@ def match_rope(gm: GraphModule) -> GraphModule:
                 k_for_op_contig = k_node
             flash_node = graph.call_function(
                 torch.ops.rope.flashinfer,
-                args=(q_for_op_contig, k_for_op_contig, cos_node, sin_node),
+                args=(q_for_op_contig, k_for_op_contig, cos_node, sin_node, True),
             )
         with graph.inserting_after(flash_node):
             raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
