@@ -29,6 +29,7 @@ class LMHead(Linear):
         embedding_dim: int,
         dtype: torch.dtype = None,
         mapping: Optional[Mapping] = None,
+        gather_output: bool = False,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
     ):
         local_in_features = embedding_dim
@@ -49,6 +50,7 @@ class LMHead(Linear):
             bias=False,
             dtype=dtype,
             mapping=mapping,
+            gather_output=gather_output,
             tensor_parallel_mode=tensor_parallel_mode,
         )
 
@@ -125,6 +127,7 @@ class Embedding(LMHead):
         embedding_dim: int,
         dtype: Optional[torch.dtype] = None,
         mapping: Optional[Mapping] = None,
+        gather_output: bool = False,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
     ):
         super().__init__(

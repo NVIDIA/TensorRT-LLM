@@ -514,6 +514,7 @@ class DecoderModelForCausalLM(nn.Module,
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
         }
+
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
@@ -527,6 +528,9 @@ class DecoderModelForCausalLM(nn.Module,
                     continue
 
                 names = name.split('.')
+                # WAR: better solution is that llama has its own load_weights function.
+                if names[-1] == 'next_layer_layernorm':
+                    continue
                 if names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -542,6 +546,7 @@ class DecoderModelForCausalLM(nn.Module,
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()
                             }
+
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
                 else:
