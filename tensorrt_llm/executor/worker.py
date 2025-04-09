@@ -34,7 +34,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig, postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
-from .result import GenerationResult, IterationResult
+from .result import GenerationResult, IterationResult, compute_logprobs
 from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     RequestError, WorkerCommIpcAddrs, has_event_loop)
 
@@ -747,16 +747,27 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
+            # TODO: pass in k
+            prompt_logprobs, logprobs = compute_logprobs(
+                response.result.context_logits,
+                response.result.generation_logits,
+                response.result.output_token_ids[0])  #TODO: need change
+
+            additional_outputs = {
+                "prompt_logprobs": prompt_logprobs,
+                "generation_logprobs": logprobs,
+            }
+
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
                 global_tracer().log_instant("worker-rsp.put")
-                queue.put_nowait(response)
+                queue.put_nowait((response, additional_outputs))
                 async_queues.append(queue)
                 # all the loops are identical
                 event_loop = event_loop or queue.loop
             else:
-                queue.put(response)
+                queue.put((response, additional_outputs))
 
             if response.result.is_final:
                 self.worker._pop_result(response.client_id)
@@ -806,6 +817,18 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
 
+            # TODO: pass in k
+            prompt_logprobs, logprobs = compute_logprobs(
+                response.result.context_logits,
+                response.result.generation_logits,
+                response.result.output_token_ids[0])  #TODO: need change
+
+            additional_outputs = {
+                "prompt_logprobs": prompt_logprobs,
+                "generation_logprobs": logprobs,
+            }
+
+            # TODO: need change
             _send_rsp(self.worker,
                       response,
                       postproc_batches=postproc_batches,

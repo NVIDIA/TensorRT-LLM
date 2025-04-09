@@ -447,6 +447,12 @@ class LLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
+            if sampling_params.prompt_logprobs:
+                # Context logits are required to compute prompt_logprobs
+                sampling_params.return_context_logits = True
+                # TODO: need a way to know whether to drop context logits at worker later
+            if sampling_params.logprobs:
+                sampling_params.return_generation_logits = True
             return sampling_params
         else:
             raise TypeError(
@@ -479,6 +485,18 @@ class LLM:
             raise ValueError(
                 f"sampling_params's beam_width ({sampling_params.beam_width}) should not exceed max_beam_width ({build_config.max_beam_width})"
             )
+
+        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
+            raise ValueError(
+                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
+                f"in the `BuildConfig` when constructing the LLM. "
+                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
+            )
+
+        if sampling_params.logprobs and not self.args.gather_generation_logits:
+            raise ValueError(
+                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
+                f"to be passed explicitly to the `LLM()` constructor.")
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
