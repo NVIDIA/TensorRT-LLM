@@ -325,11 +325,9 @@ std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(std::shared_
 }
 
 std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(
-    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer)
+    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer) const
 {
-    auto decSlotAsyncSndHdl = std::make_unique<DecoderSlotAsyncSend>(
-        commSession, outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, peer);
-    return decSlotAsyncSndHdl;
+    return asyncSend(commSession, outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, peer);
 }
 
 void SlotDecoderBuffers::recv(

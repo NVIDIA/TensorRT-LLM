@@ -182,7 +182,7 @@ public:
         TensorPtr const& logProbsView, bool returnLogProbs, int peer);
 
     std::unique_ptr<DecoderSlotAsyncSend> asyncSend(
-        std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer);
+        std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer) const;
 
     void recv(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer);
 };
