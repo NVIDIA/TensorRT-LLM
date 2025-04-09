@@ -475,49 +475,22 @@ def runLLMDocBuild(pipeline, config)
 
 def launchTestListCheck(pipeline)
 {
-    stages = {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
-            libffi-dev \
-            -y""")
-        sh "nvidia-smi -q"
-        // download TRT-LLM tarfile
-        def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
-        sh "tar -zxf ${tarName}"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd TensorRT-LLM/src && pip3 install --retries 1 -r requirements-dev.txt")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
-        sh "pip3 install --extra-index-url https://urm-rn.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-        // Verify L0 test lists
-        def llmPath = sh (script: "realpath .", returnStdout: true).trim()
-        println "llmPath: ${llmPath}"
-        def llmSrc = "${llmPath}/TensorRT-LLM/src"
-        def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
-        def testList = "${llmSrc}/l0_test.txt"
-        // Remove perf test from test list since they are dynamical generated
-        sh """
-            touch ${testList}
-            rm ${testDBPath}/*perf*
-            trt-test-db -d ${testDBPath} --test-names --output ${testList}
-            cd ${llmSrc}/tests/integration/defs
-            pytest --apply-test-list-correction --test-list=${testList} --co -q
-        """
-        //Verify QA test lists
-        def testQAPath = "${llmSrc}/tests/integration/test_lists/qa"
-        def testDefFiles = sh (script: "ls -d ${testQAPath}/*.txt",returnStdout: true).trim().split('\n')
-        testDefFiles.each { testDefFile ->
-            sh """
-                cd ${llmSrc}/tests/integration/defs
-                pytest --apply-test-list-correction --test-list=$testDefFile --co -q
-            """
-        }
-    }
-
     stageName = "Test List Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
-            stages()
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
+            libffi-dev \
+            -y""")
+            sh "nvidia-smi -q"
+            // download TRT-LLM tarfile
+            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
+            sh "tar -zxf ${tarName}"
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            sh "python3 ${llmSrc}/scripts/check_test_lists.py --l0 --qa"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
