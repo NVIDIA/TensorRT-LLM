@@ -50,7 +50,7 @@ tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
 ## Draft-Target-Model
 
-The Draft-Target-Model involves the use of two distinct models (a smaller Draft model and a larger Target model) trained independently but sharing the same vocabulary. For example, GPT 125M / 6.7B models serves as the Draft / Target model.
+The Draft-Target-Model involves the use of two distinct models (a smaller Draft model and a larger Target model) trained independently but sharing the same vocabulary. For example, GPT 125M / 6.7B models serve as the Draft / Target model.
 
 The management of Draft and Target models is facilitated through two separate `Executor` instances.
 It is essential that you to coordinate the interactions between the Draft and Target models effectively.

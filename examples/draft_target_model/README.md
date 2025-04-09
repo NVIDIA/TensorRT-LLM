@@ -86,7 +86,7 @@ python3 examples/run.py \
     --tokenizer_dir=${TARGET_MODEL_PATH} \
     --draft_engine_dir=/workspace/engine-draft \
     --engine_dir=/workspace/engine-target \
-    --draft_target_model_config="[4,[0],[1],True]" \
+    --draft_target_model_config="[4,[0],[1],False]" \
     --max_output_len=256 \
     --kv_cache_enable_block_reuse \
     --kv_cache_free_gpu_memory_fraction=0.5 \
