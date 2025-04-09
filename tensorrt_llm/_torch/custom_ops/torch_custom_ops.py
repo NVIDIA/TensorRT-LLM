@@ -111,6 +111,8 @@ def fused_moe(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
 ) -> List[torch.Tensor]:
@@ -171,6 +173,8 @@ def fused_moe(
         tp_rank,
         ep_size,
         ep_rank,
+        cluster_size,
+        cluster_rank,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
     )
@@ -192,6 +196,8 @@ def _(
     tp_rank: int = 0,
     ep_size: int = 1,
     ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
 ):
