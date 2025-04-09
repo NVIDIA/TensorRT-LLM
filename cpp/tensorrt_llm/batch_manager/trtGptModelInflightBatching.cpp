@@ -2618,7 +2618,7 @@ SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 input
 void TrtGptModelInflightBatching::prefetchPromptTableChunk(
     RequestVector const& contextRequests, bool isBeforePrepareBuffers, SizeType32 bufferId)
 {
-    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+    auto& promptTuningBuffers = mBuffers[bufferId]->promptTuningBuffers;
 
     if (!isBeforePrepareBuffers)
     {
@@ -2658,7 +2658,7 @@ void TrtGptModelInflightBatching::processPromptTableChunk(
     std::shared_ptr<LlmRequest> const& llmReq, bool isBeforePrepareBuffers, SizeType32 bufferId, SizeType32 contextId)
 {
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "processPromptTableChunk");
-    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+    auto& promptTuningBuffers = mBuffers[bufferId]->promptTuningBuffers;
     auto const chunkSize = llmReq->getContextChunkSize();
     auto& inputTokensMutable = llmReq->getTokensMutable(0);
     auto vocabSize = mModelConfig.getVocabSize();
@@ -2666,7 +2666,8 @@ void TrtGptModelInflightBatching::processPromptTableChunk(
     // For first chunk's initialization
     if (isBeforePrepareBuffers)
     {
-        promptTuningBuffers->initializeChunkPtableBuffers(mRuntime->getBufferManager(), mModelConfig, chunkSize);
+        promptTuningBuffers->initializeChunkPtableBuffers(
+            mRuntime->getBufferManager(), mModelConfig, chunkSize, llmReq);
     }
 
     size_t processChunkSize;
@@ -2708,14 +2709,13 @@ void TrtGptModelInflightBatching::processPromptTableChunk(
     // Process tokens
     auto inputTokensChunk = inputTokensMutable.begin() + beginPos;
     std::vector<SizeType32> outOfVocabTokens;
-    SizeType32 chunkedPTableOffset = 0;
+    SizeType32 ptableTokenId = vocabSize;
     for (size_t i = 0; i < processChunkSize; i++)
     {
         if (inputTokensChunk[i] >= vocabSize)
         {
             outOfVocabTokens.push_back(inputTokensChunk[i]);
-            inputTokensChunk[i] = vocabSize + chunkedPTableOffset;
-            chunkedPTableOffset++;
+            inputTokensChunk[i] = ptableTokenId++;
         }
     }
 
@@ -2728,7 +2728,7 @@ void TrtGptModelInflightBatching::prefetchPromptTableChunkToGpu(std::shared_ptr<
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "prefetchPromptTableChunkToGpu");
-    auto& promptTuningBuffers = mBuffers[bufferId]->getPromptTuningBuffers();
+    auto& promptTuningBuffers = mBuffers[bufferId]->promptTuningBuffers;
 
     if (outOfVocabTokens.empty())
     {

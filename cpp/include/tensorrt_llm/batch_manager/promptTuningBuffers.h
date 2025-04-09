@@ -54,124 +54,49 @@ public:
     void fill(RequestVector const& contextRequests, RequestVector const& genRequests,
         runtime::BufferManager const& manager, bool packed);
 
-    void initializeChunkPtableBuffers(
-        runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig, SizeType32 contextChunkSize)
-    {
-        if (mChunkPtableInitialized)
-        {
-            return;
-        }
+    /*
+     * The below functions are specific for Chunked Prefill mode
+     * Chunk Ptable with Ping-Pong Buffer Implementation
+     * -----------------------------------------------
+     *
+     * Overview:
+     * The chunk ptable (prompt tuning table) system uses a ping-pong buffer mechanism to efficiently
+     * manage large embedding tables when operating in context Prefill mode. This allows
+     * for processing of large embedding tables by loading them in chunks from CPU to GPU memory,
+     * enabling support for tables that exceed available GPU memory.
+     *
+     * Key Components:
+     * 1. Ping-Pong Buffers (mChunkPtableBuffers):
+     *    - Two alternating GPU buffers that store chunks of the embedding table
+     *    - While the current buffer is being processed by the model,
+     *      the next chunk can be asynchronously loaded into the other buffer
+     *    - Managed through mChunkPtableCurrentIndex (toggles between 0 and 1)
+     * 2. Start Positions Tracking (mChunkPtableBufferStartPositions):
+     *    - Mainly used for multi-batch processing
+     *    - Maintains the starting position of each batch's data within each buffer
+     *    - Maintained separately for each ping-pong buffer
+     *
+     * Memory Optimization:
+     * - Only two GPU buffers are maintained regardless of total embedding table size
+     * - Each buffer size is limited to contextChunkSize * hiddenSize
+     * - Efficient memory usage through chunk-based processing
+     */
+    void initializeChunkPtableBuffers(runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
+        SizeType32 contextChunkSize, std::shared_ptr<LlmRequest> const&);
 
-        std::array<TensorPtr, 2> buffers;
-        std::vector<std::vector<SizeType32>> startPositions(2);
+    void moveToNextChunkPtableBuffer();
 
-        for (int i = 0; i < 2; i++)
-        {
-            // Initialize each buffer's positions with 0
-            startPositions[i].emplace_back(0);
+    size_t getChunkPtableCurrentIndex();
 
-            buffers[i] = manager.gpu(runtime::ITensor::makeShape({contextChunkSize, modelConfig.getHiddenSize()}),
-                nvinfer1::DataType::kHALF); // TODO: change to embedding table data type
-        }
+    [[nodiscard]] TensorPtr& getChunkPtableBuffer(size_t index);
 
-        // Assign to optional members
-        mChunkPtableBuffers = std::move(buffers);
-        mChunkPtableBufferStartPositions = std::move(startPositions);
+    [[nodiscard]] SizeType32 getChunkPtableBufferSliceSize(size_t index, size_t batchIdx);
 
-        // Initialize position
-        mChunkPtableCurrentIndex = 0;
-        mChunkPtableInitialized = true;
-    }
+    [[nodiscard]] SizeType32 getChunkPtableBufferStartPosition(size_t index, size_t batchIdx);
 
-    // GPU ping-pong buffer
-    void moveToNextChunkPtableBuffer()
-    {
-        // Switch ping-pong buffer
-        mChunkPtableCurrentIndex = 1 - mChunkPtableCurrentIndex;
-        clearBufferStartPositions(mChunkPtableCurrentIndex);
-    }
+    void updateBufferStartPosition(size_t index, SizeType32 numRows);
 
-    size_t getChunkPtableCurrentIndex()
-    {
-        return mChunkPtableCurrentIndex;
-    }
-
-    [[nodiscard]] TensorPtr& getChunkPtableBuffer(size_t index)
-    {
-        if (!mChunkPtableBuffers.has_value())
-        {
-            TLLM_THROW("Chunk ptable buffers not initialized");
-        }
-        if (!mChunkPtableBuffers.value()[index])
-        {
-            TLLM_THROW("Chunk ptable buffer at index %zu is null", index);
-        }
-        return mChunkPtableBuffers.value()[index];
-    }
-
-    [[nodiscard]] SizeType32 getChunkPtableBufferSliceSize(size_t index, size_t batchIdx)
-    {
-        if (!mChunkPtableBufferStartPositions.has_value())
-        {
-            return 0;
-        }
-
-        // Check if batchIdx is within bounds
-        if (batchIdx + 1 >= mChunkPtableBufferStartPositions.value()[index].size())
-        {
-            TLLM_THROW("Batch index %zu + 1 out of bounds for buffer %zu (size: %zu)", batchIdx, index,
-                mChunkPtableBufferStartPositions.value()[index].size());
-        }
-
-        // For other batches, return difference from previous position
-        return mChunkPtableBufferStartPositions.value()[index][batchIdx + 1]
-            - mChunkPtableBufferStartPositions.value()[index][batchIdx];
-    }
-
-    [[nodiscard]] SizeType32 getChunkPtableBufferStartPosition(size_t index, size_t batchIdx)
-    {
-        if (!mChunkPtableBufferStartPositions.has_value())
-        {
-            return 0;
-        }
-
-        // Check if batchIdx is within bounds
-        if (batchIdx >= mChunkPtableBufferStartPositions.value()[index].size())
-        {
-            TLLM_THROW("Batch index %zu out of bounds for buffer %zu (size: %zu)", batchIdx, index,
-                mChunkPtableBufferStartPositions.value()[index].size());
-        }
-
-        // For first batch, return the value directly
-        if (batchIdx == 0)
-        {
-            return mChunkPtableBufferStartPositions.value()[index][0];
-        }
-
-        // For other batches, return difference from previous position
-        return mChunkPtableBufferStartPositions.value()[index][batchIdx]
-            - mChunkPtableBufferStartPositions.value()[index][batchIdx - 1];
-    }
-
-    void updateBufferStartPosition(size_t index, SizeType32 numRows)
-    {
-        if (!mChunkPtableBufferStartPositions.has_value())
-        {
-            return;
-        }
-        // Add new position as sum of previous position plus new tokens
-        auto& positions = mChunkPtableBufferStartPositions.value()[index];
-        positions.push_back(positions.back() + numRows);
-    }
-
-    void clearBufferStartPositions(size_t index)
-    {
-        if (mChunkPtableBufferStartPositions.has_value())
-        {
-            mChunkPtableBufferStartPositions.value()[index].clear();
-            mChunkPtableBufferStartPositions.value()[index].emplace_back(0);
-        }
-    }
+    void clearBufferStartPositions(size_t index);
 };
 
 } // namespace tensorrt_llm::batch_manager

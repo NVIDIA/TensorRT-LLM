@@ -361,7 +361,6 @@ private:
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
 
-    // void prefetchPromptTableChunk(ScheduledRequests const& currRequests);
     void prefetchPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
 
     void processPromptTableChunk(

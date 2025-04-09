@@ -22,6 +22,8 @@
 
 namespace tensorrt_llm::batch_manager
 {
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using TensorPtr = runtime::ITensor::SharedPtr;
 
 PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
@@ -192,6 +194,114 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
 
     mPromptTuningParams.fillTasksTensor(
         tasksHost, batchSize, numContextRequests, reqBeamWidths, reqPromptLengths, manager, packed);
+}
+
+void PromptTuningBuffers::initializeChunkPtableBuffers(runtime::BufferManager const& manager,
+    runtime::ModelConfig const& modelConfig, SizeType32 contextChunkSize, std::shared_ptr<LlmRequest> const& llmReq)
+{
+    if (mChunkPtableInitialized)
+    {
+        return;
+    }
+
+    std::array<TensorPtr, 2> buffers;
+    std::vector<std::vector<SizeType32>> startPositions(2);
+    for (int i = 0; i < 2; i++)
+    {
+        startPositions[i].emplace_back(0);
+        auto memType = llmReq->getPromptEmbeddingTable().value()->getDataType();
+        buffers[i] = manager.gpu(runtime::ITensor::makeShape({contextChunkSize, modelConfig.getHiddenSize()}), memType);
+    }
+
+    mChunkPtableBuffers = std::move(buffers);
+    mChunkPtableBufferStartPositions = std::move(startPositions);
+
+    mChunkPtableCurrentIndex = 0;
+    mChunkPtableInitialized = true;
+}
+
+void PromptTuningBuffers::moveToNextChunkPtableBuffer()
+{
+    mChunkPtableCurrentIndex = 1 - mChunkPtableCurrentIndex;
+    clearBufferStartPositions(mChunkPtableCurrentIndex);
+}
+
+size_t PromptTuningBuffers::getChunkPtableCurrentIndex()
+{
+    return mChunkPtableCurrentIndex;
+}
+
+TensorPtr& PromptTuningBuffers::getChunkPtableBuffer(size_t index)
+{
+    if (!mChunkPtableBuffers.has_value())
+    {
+        TLLM_THROW("Chunk ptable buffers not initialized");
+    }
+    if (!mChunkPtableBuffers.value()[index])
+    {
+        TLLM_THROW("Chunk ptable buffer at index %zu is null", index);
+    }
+    return mChunkPtableBuffers.value()[index];
+}
+
+SizeType32 PromptTuningBuffers::getChunkPtableBufferSliceSize(size_t index, size_t batchIdx)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return 0;
+    }
+
+    if (batchIdx + 1 >= mChunkPtableBufferStartPositions.value()[index].size())
+    {
+        TLLM_THROW("Batch index %zu + 1 out of bounds for buffer %zu (size: %zu)", batchIdx, index,
+            mChunkPtableBufferStartPositions.value()[index].size());
+    }
+
+    return mChunkPtableBufferStartPositions.value()[index][batchIdx + 1]
+        - mChunkPtableBufferStartPositions.value()[index][batchIdx];
+}
+
+SizeType32 PromptTuningBuffers::getChunkPtableBufferStartPosition(size_t index, size_t batchIdx)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return 0;
+    }
+
+    if (batchIdx >= mChunkPtableBufferStartPositions.value()[index].size())
+    {
+        TLLM_THROW("Batch index %zu out of bounds for buffer %zu (size: %zu)", batchIdx, index,
+            mChunkPtableBufferStartPositions.value()[index].size());
+    }
+
+    // For first batch, return the value directly
+    if (batchIdx == 0)
+    {
+        return mChunkPtableBufferStartPositions.value()[index][0];
+    }
+
+    // For other batches, return difference from previous position
+    return mChunkPtableBufferStartPositions.value()[index][batchIdx]
+        - mChunkPtableBufferStartPositions.value()[index][batchIdx - 1];
+}
+
+void PromptTuningBuffers::updateBufferStartPosition(size_t index, SizeType32 numRows)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return;
+    }
+    auto& positions = mChunkPtableBufferStartPositions.value()[index];
+    positions.push_back(positions.back() + numRows);
+}
+
+void PromptTuningBuffers::clearBufferStartPositions(size_t index)
+{
+    if (mChunkPtableBufferStartPositions.has_value())
+    {
+        mChunkPtableBufferStartPositions.value()[index].clear();
+        mChunkPtableBufferStartPositions.value()[index].emplace_back(0);
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager
