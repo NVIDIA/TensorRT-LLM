@@ -111,7 +111,7 @@ fi
 
 if [[ "${TEST_DESC}" != "gen_only" ]]; then
   expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")
-  no_expected_strings=("Berlin Berlin")
+  not_expected_strings=("Berlin Berlin")
   if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
     expected_strings=("Berlin" "Asyncio is a powerful tool")
   fi
