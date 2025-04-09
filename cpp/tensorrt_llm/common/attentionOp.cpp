@@ -2289,13 +2289,6 @@ int AttentionOp::initialize() noexcept
             "MLA(Deepseek v2) do not support custom mask right now");
         TLLM_CHECK_WITH_INFO(mMLAParams.qk_rope_head_dim == 64 && mMLAParams.kv_lora_rank == 512,
             "MLA(Deepseek v2) only support fixed kv_lora_rank(512) and fixed qk_rope_head_dim(64) right now.");
-        if (mUseFlashMLA)
-        {
-            constexpr int block_size_m = 64;
-            int num_heads_per_head_k = mMLAParams.predicted_tokens_per_seq * mNumAttnHeads / mNumAttnKVHeads;
-            mFlashMlaNumSmParts
-                = mMultiProcessorCount / mNumAttnKVHeads / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
-        }
     }
 
     mDriver = CUDADriverWrapper::getInstance();
