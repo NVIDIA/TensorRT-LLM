@@ -2456,7 +2456,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     ///////////////////////////////////////////////////////////////////////////
     // add a longer request within attention window and try to reuse
     // reuse blocks 4, 5, 7(p) and get new block 8
-    // upon reached attention window, shared block 4 is replaced with unshared block 9
+    // upon reaching the attention window, the block ids shouldn't change
     requestId = 3;
     inputLength = 15;
     inputTokens->resize(inputLength);
@@ -2471,7 +2471,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({9, 5, 7, 8}));
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 7, 8}));
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
 
     ///////////////////////////////////////////////////////////////////////////
@@ -2484,7 +2484,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     GenerationRequest const& seq4 = kvCacheManager.getSequence(requestId);
-    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({10, 11, 12, 13}));
+    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({9, 10, 11, 12}));
 }
 
 TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)

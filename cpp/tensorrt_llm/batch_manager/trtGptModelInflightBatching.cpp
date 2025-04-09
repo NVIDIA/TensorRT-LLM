@@ -1062,11 +1062,20 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         mMicroBatchId = getNextMicroBatchId(mMicroBatchId);
     }
     // In case of error, we need to free the batch slot associated with those requests
-    catch (std::exception const& e)
+    catch (std::exception const&)
     {
-        for (auto const& llmReq : activeRequests)
+        try
         {
-            terminateRequest(llmReq);
+            for (auto const& llmReq : activeRequests)
+            {
+                terminateRequest(llmReq);
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("forwardAsync catch-all catch block that runs `terminateRequest` has failed with:");
+            TLLM_LOG_EXCEPTION(e);
+            TLLM_LOG_ERROR("Rethrowing *outer* exception:");
         }
         throw;
     }

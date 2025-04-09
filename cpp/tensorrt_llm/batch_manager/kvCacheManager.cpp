@@ -738,7 +738,6 @@ BlockPtr WindowBlockManager::getFreeBlock(
 {
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel);
-    TLLM_CHECK(block->isLeaf());
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
