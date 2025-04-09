@@ -126,78 +126,61 @@ class OpenAIDisaggServer:
                 elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
                     raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
 
-            ctx_response = None
-            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
-                # Hard-code first token, ctx_request_id for testing
-                gen_req.disaggregated_params = DisaggregatedParams(request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1, encoded_opaque_state=None, draft_tokens=None)
-                # Since KV cache for prompt tokens will be uninitialized, need to ignore eos
-                gen_req.ignore_eos = True
-            else:
-                # Pick a context server
-                ctx_server = self.get_next_server(self.ctx_servers, "context")
-                logging.info("Sending request to ctx server: %s", ctx_server)
+            ctx_response = await self._process_context_server_request(req, "completion")
 
-                # Send request to context server
-                req.max_tokens = 1
-                req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-                # Disable streaming for context server
-                req.stream = False
-                req.stream_options = None
-                ctx_response = await self.send_completion_request(ctx_server, req)
+            return await self._process_generation_server_request(gen_req, ctx_response)
 
-                #TODO: Context server should skip de-tokenization and return raw tokens
-                choices = ctx_response.choices
-                if len(choices) > 1:
-                    raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
-                if choices[0].disaggregated_params is None:
-                    raise ValueError("Context server did not return disaggregated params")
-
-                # Append disaggregates parameters to generation request
-                gen_req.disaggregated_params = choices[0].disaggregated_params
-
-            gen_req.disaggregated_params.request_type = "generation_only"
-
-            # Pick a generation server and send request
-            gen_server = self.get_next_server(self.gen_servers, "generation")
-            logging.info("Sending request to gen server: %s", gen_server)
-
-            if not gen_req.stream:
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-                return gen_response
-            else:
-                # Return a streaming response that combines both context and generation responses
-                return StreamingResponse(
-                    self.merge_streaming_responses(ctx_response, gen_server, gen_req),
-                    media_type="text/event-stream"
-                )
-
-        except CppExecutorError as e:
-            # If internal executor error is raised, shutdown the server
-            logging.exception(e)
-            signal.raise_signal(signal.SIGINT)
-        except HTTPException as e:
-            raise e  # Re-raise HTTP exceptions properly
         except Exception as e:
-            logging.exception(e)
-            raise HTTPException(status_code=500, detail=f"Internal server error {str(e)}")
+            await self._handle_exception(e)
 
     async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
 
         try:
             gen_req = copy.deepcopy(req)
+            ctx_response = await self._process_context_server_request(req, "chat")
 
-            # Pick a context server
-            ctx_server = self.get_next_server(self.ctx_servers, "context")
-            logging.info("Sending request to ctx server: %s", ctx_server)
+            return await self._process_generation_server_request(gen_req, ctx_response)
+        except Exception as e:
+            await self._handle_exception(e)
 
-            # Send request to context server
-            req.max_completion_tokens = 1
-            req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-            # Disable streaming for context server
-            req.stream = False
-            req.stream_options = None
-            ctx_response = await self.send_chat_request(ctx_server, req)
+    async def _handle_exception(self, exception):
+        if isinstance(exception, CppExecutorError):
+            logging.exception(exception)
+            signal.raise_signal(signal.SIGINT)
+        elif isinstance(exception, HTTPException):
+            raise exception  # Re-raise HTTP exceptions properly
+        else:
+            logging.exception(exception)
+            raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
+    async def _process_context_server_request(self, ctx_req, request_type: str):
+        # No need to send request to context server if we are benchmarking generation only
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            return None
+
+        ctx_server = self.get_next_server(self.ctx_servers, "context")
+        logging.info("Sending request to ctx server: %s", ctx_server)
+
+        if request_type == "chat":
+            ctx_req.max_completion_tokens = 1
+        elif request_type == "completion":
+            ctx_req.max_tokens = 1
+        ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        ctx_req.stream = False
+        ctx_req.stream_options = None
+
+        if request_type == "chat":
+            return await self.send_chat_request(ctx_server, ctx_req)
+        elif request_type == "completion":
+            return await self.send_completion_request(ctx_server, ctx_req)
+
+    async def _process_generation_server_request(self, gen_req, ctx_response):
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            # Hard-code first token, ctx_request_id for testing
+            gen_req.disaggregated_params = DisaggregatedParams(request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1, encoded_opaque_state=None, draft_tokens=None)
+            # Since KV cache for prompt tokens will be uninitialized, need to ignore eos
+            gen_req.ignore_eos = True
+        else:
             choices = ctx_response.choices
             if len(choices) > 1:
                 raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
@@ -206,31 +189,25 @@ class OpenAIDisaggServer:
 
             # Append disaggregates parameters to generation request
             gen_req.disaggregated_params = choices[0].disaggregated_params
-            gen_req.disaggregated_params.request_type = "generation_only"
+        gen_req.disaggregated_params.request_type = "generation_only"
 
-            # Pick a generation server and send request
-            gen_server = self.get_next_server(self.gen_servers, "generation")
-            logging.info("Sending request to gen server: %s", gen_server)
+        # Pick a generation server and send request
+        gen_server = self.get_next_server(self.gen_servers, "generation")
+        logging.info("Sending request to gen server: %s", gen_server)
 
-            if not gen_req.stream:
+        if not gen_req.stream:
+            if isinstance(gen_req, CompletionRequest):
+                gen_response = await self.send_completion_request(gen_server, gen_req)
+            elif isinstance(gen_req, ChatCompletionRequest):
                 gen_response = await self.send_chat_request(gen_server, gen_req)
-                return gen_response
-            else:
-                # Return a streaming response that combines both context and generation responses
-                return StreamingResponse(
-                    self.merge_streaming_responses(ctx_response, gen_server, gen_req),
-                    media_type="text/event-stream"
-                )
 
-        except CppExecutorError as e:
-            # If internal executor error is raised, shutdown the server
-            logging.exception(e)
-            signal.raise_signal(signal.SIGINT)
-        except HTTPException as e:
-            raise e  # Re-raise HTTP exceptions properly
-        except Exception as e:
-            logging.exception(e)
-            raise HTTPException(status_code=500, detail=f"Internal server error {str(e)}")
+            return gen_response
+        else:
+            # Return a streaming response that combines both context and generation responses
+            return StreamingResponse(
+                self.merge_streaming_responses(ctx_response, gen_server, gen_req),
+                media_type="text/event-stream"
+            )
 
     async def __call__(self, host, port):
         config = uvicorn.Config(self.app,
