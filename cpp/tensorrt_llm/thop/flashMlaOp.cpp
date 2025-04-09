@@ -37,11 +37,8 @@
  *
  * reference: https://github.com/deepseek-ai/FlashMLA
  */
-
-// Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- ******************************************************************************/
+// Adapted from https://github.com/deepseek-ai/FlashMLA/blob/main/csrc/flash_api.cpp
+// which is itself adapted from https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/flash_api.cpp
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -50,16 +47,12 @@
 
 #include <cutlass/fast_math.h>
 
-#include "../kernels/flashMLA/flash_mla.h"
-
-#define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
-#define CHECK_SHAPE(x, ...)                                                                                            \
-    TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 /**
  * @brief Get metadata for MLA computation
- * @param cache_seqlens Tensor of shape (batch_size) containing sequence lengths, dtype int32
+ * @param seqlens_k Tensor of shape (batch_size) containing sequence lengths, dtype int32
  * @param num_heads_per_head_k Equal to seq_len_q * num_heads_q / num_heads_k
  * @param num_heads_k Number of key heads
  * @return Tuple containing:
@@ -69,14 +62,12 @@
 std::tuple<at::Tensor, at::Tensor> get_mla_metadata(
     at::Tensor& seqlens_k, int64_t const num_heads_per_head_k, int64_t const num_heads_k)
 {
-    // This should match the logic in the MLA kernel.
+    // This should match the logic in the MLA kernel, see cpp/tensorrt_llm/kernels/flashMLA/
     static constexpr int block_size_m = 64;
     static constexpr int block_size_n = 64;
     static constexpr int fixed_overhead_num_blocks = 5;
 
-    CHECK_DEVICE(seqlens_k);
-    TORCH_CHECK(seqlens_k.is_contiguous());
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+    CHECK_INPUT(seqlens_k, torch::kInt32);
 
     int batch_size = seqlens_k.size(0);
     int* seqlens_k_ptr = seqlens_k.data_ptr<int>();
