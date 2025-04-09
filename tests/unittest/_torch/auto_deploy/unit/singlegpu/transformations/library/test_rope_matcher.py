@@ -1,7 +1,8 @@
+import pytest
 import torch
 from _graph_test_helpers import run_test
+from torch.export import Dim
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import PositionalEmbeddingConfig
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import match_rope
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -36,38 +37,58 @@ def _precompute_freqs_cis(seq_len: int, head_dim: int, rope_theta: float):
 
 
 class RotaryModel(torch.nn.Module):
-    def __init__(self, hidden_size: int, max_seq_len: int):
+    def __init__(self, hidden_size: int, max_seq_len: int, layout: str = "BNSD"):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_seq_len = max_seq_len
+        self.layout = layout
         self.linear = torch.nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q = self.linear(x)
         k = self.linear(x)
-        # Simulate a single-head scenario by unsqueezing dimension 1:
+        # Simulate a single-head scenario by unsqueezing the head dimension.
         q = q.unsqueeze(1)
         k = k.unsqueeze(1)  # [B, 1, S, D]
-        batch, heads, seq, hidden = q.shape
+        batch, _, seq, hidden = q.shape
+        if self.layout == "BSND":
+            # Transpose to [B, S, N, D]
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            unsqueeze_dim = 2
+        else:
+            # For BNSD, layout remains [B, N, S, D]
+            unsqueeze_dim = 1
 
-        # Precompute cosine-sine cache. Returns shape [max_seq_len, hidden]
-        cos, sin = _precompute_freqs_cis(self.max_seq_len, hidden, 10000)
-        cos = cos.to(q.device)  # [S, D]
+        # Precompute cosine-sine cache. shape: [max_seq_len, hidden].
+        cos, sin = _precompute_freqs_cis(seq, hidden, rope_theta=10000)
+        cos = cos.to(q.device)
         sin = sin.to(q.device)
+        cos = cos.unsqueeze(0).expand(batch, -1, -1)  # [B, max_seq_len, hidden]
+        sin = sin.unsqueeze(0).expand(batch, -1, -1)
 
-        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
+        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
         return (q_embed + k_embed).to(torch.float16)
 
+    def get_dynamic_shapes(self):
+        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
+
+@pytest.mark.parametrize(
+    "layout",
+    ["BNSD", "BSND"],
+)
 @torch.inference_mode()
-def test_match_rope():
+def test_match_rope(layout):
     batch_size, seq_len = 8, 16
     hidden_size = 64
     max_position_embeddings = seq_len
 
-    model = RotaryModel(hidden_size, max_position_embeddings).to("cuda", dtype=torch.float16)
+    model = RotaryModel(hidden_size, max_position_embeddings, layout=layout).to(
+        "cuda", dtype=torch.float16
+    )
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    pos_embd_config = PositionalEmbeddingConfig(rope_theta=1e4)
+    dynamic_shapes = model.get_dynamic_shapes()
 
     _ = run_test(
         model,
@@ -75,10 +96,9 @@ def test_match_rope():
         match_rope,
         lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
-        1e-3,  # atol
-        1e-3,  # rtol
-        True,  # test_load_hook
-        False,  # strict_loading
-        pos_embd_config,
-        max_position_embeddings,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=True,
+        strict_loading=True,
+        dynamic_shapes=dynamic_shapes,
     )

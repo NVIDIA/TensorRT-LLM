@@ -16,8 +16,9 @@ def apply_rope_with_input_pos_flashinfer(
         tensors of shape [batch, seq_len, n_head, head_dim] or [batch, seq_len, n_head*head_dim]
         in half precision (torch.float16 or torch.bfloat16). Note: head_dim must be a multiple of 64.
     - cos, sin (torch.Tensor):
-        Tensors of shape [seq_len, head_dim]. Only the first half of the last dimension (head_dim//2 values)
-        is used. They are concatenated (cos[..., :head_dim//2] with sin[..., :head_dim//2]) to form the
+        Tensors of shape [seq_len, head_dim]. For 3D Tensors, first dimension is discarded.
+        Only the first half of the last dimension (head_dim//2 values) is used.
+        They are concatenated (cos[..., :head_dim//2] with sin[..., :head_dim//2]) to form the
         non-interleaved cos-sin cache required by the FlashInfer kernel.
 
     Internal Processing:
@@ -29,6 +30,8 @@ def apply_rope_with_input_pos_flashinfer(
         - Rotated query tensor of shape same as input in half precision.
         - Rotated key tensor of shape same as input in half precision.
     """
+    cos = cos[0] if cos.dim() == 3 else cos
+    sin = sin[0] if sin.dim() == 3 else sin
 
     q_shape = q.shape
     batch_size, seq_len = q_shape[:2]

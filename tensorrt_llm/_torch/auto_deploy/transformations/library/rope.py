@@ -4,7 +4,7 @@ from typing import List
 import torch
 from torch.fx import GraphModule
 
-from ...models.factory import PositionalEmbeddingConfig
+from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
@@ -95,9 +95,7 @@ def _match_rotary_subpattern(add_node):
     }
 
 
-def match_rope(
-    gm: GraphModule, pos_embd_config: PositionalEmbeddingConfig, max_seq_len: int
-) -> GraphModule:
+def match_rope(gm: GraphModule) -> GraphModule:
     """
     Identify the subgraph corresponding to rotary positional embeddings in each region.
     For each region, we search for the two branches implementing:
@@ -159,24 +157,45 @@ def match_rope(
         )
         # TODO: extract a concrete value and register as buffer to avoid recalculation
 
+        # We expect the tensor shape to be either:
+        #   [b, n, s, d]  if q_fake.shape[1] is an integer
+        #   [b, s, n, d]  if q_fake.shape[1] is symbolic
+        q_fake = q_node.meta.get("val", None)
+        if q_fake is not None and len(q_fake.shape) > 2:
+            if isinstance(q_fake.shape[1], int):
+                need_transpose = True
+                ad_logger.debug("Infer RoPE input has layout: [b, n, s, d]")
+            else:
+                need_transpose = False
+                ad_logger.debug("Infer RoPE input has layout: [b, s, n, d]")
+        else:
+            ad_logger.warning("Unable to infer layout of q node. Defaulting to [b, n, s, d].")
+            need_transpose = True
+
         with graph.inserting_before(q_match["add_node"]):
-            # q = q.transpose(1, 2).contiguous()
-            # k = k.transpose(1, 2).contiguous()
-            q_transposed = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
-            k_transposed = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_transposed_contiguous = graph.call_method("contiguous", (q_transposed,))
-            k_transposed_contiguous = graph.call_method("contiguous", (k_transposed,))
+            if need_transpose:
+                # Input is [b, n, s, d]; transpose to [b, s, n, d] for the custom op.
+                q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+                k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
+                q_for_op_contig = graph.call_method("contiguous", (q_for_op,))
+                k_for_op_contig = graph.call_method("contiguous", (k_for_op,))
+            else:
+                q_for_op_contig = q_node
+                k_for_op_contig = k_node
             flash_node = graph.call_function(
                 torch.ops.rope.flashinfer,
-                args=(q_transposed_contiguous, k_transposed_contiguous, cos_node, sin_node),
+                args=(q_for_op_contig, k_for_op_contig, cos_node, sin_node),
             )
         with graph.inserting_after(flash_node):
             raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
             raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
-        with graph.inserting_after(raw_q):
-            new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
-        with graph.inserting_after(raw_k):
-            new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
+        if need_transpose:
+            with graph.inserting_after(raw_q):
+                new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
+            with graph.inserting_after(raw_k):
+                new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
+        else:
+            new_q, new_k = raw_q, raw_k
 
         q_match["add_node"].replace_all_uses_with(new_q)
         k_match["add_node"].replace_all_uses_with(new_k)

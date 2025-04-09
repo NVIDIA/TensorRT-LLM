@@ -62,10 +62,13 @@ def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
     k_flash = k_flash.view(batch, seq_len, n_head, head_dim)
 
     # HF implementation using apply_rotary_pos_emb.
-    # HF expects [batch, n_head, seq_len, head_dim]
+    # HF expects [batch, n_head, seq_len, head_dim] for unsqueeze_dim=1
     q_for_hf = query.transpose(1, 2).clone()
     k_for_hf = key.transpose(1, 2).clone()
-    q_hf, k_hf = apply_rotary_pos_emb(q_for_hf, k_for_hf, cos_new, sin_new, unsqueeze_dim=0)
+    cos_expand = cos_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
+    sin_expand = sin_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
+    q_hf, k_hf = apply_rotary_pos_emb(q_for_hf, k_for_hf, cos_expand, sin_expand, unsqueeze_dim=1)
+
     # Convert outputs to [batch, seq_len, n_head, head_dim]
     q_hf = q_hf.transpose(1, 2).to(dtype)
     k_hf = k_hf.transpose(1, 2).to(dtype)
