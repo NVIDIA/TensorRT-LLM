@@ -23,6 +23,12 @@ def is_mla(config):
     return False
 
 
+def is_nemotron_hybrid(config):
+    if hasattr(config, "hybrid_override_pattern"):
+        return True
+    return False
+
+
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping):
     # TODO: take space occupied by draft KV cache manager into account.
