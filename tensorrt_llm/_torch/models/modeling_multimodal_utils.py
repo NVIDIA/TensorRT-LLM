@@ -23,11 +23,12 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
+from tensorrt_llm._torch.modules.embedding import Embedding
 from torchvision.transforms import Normalize, Resize, ToTensor
 
 
 def fuse_input_embeds(
-    model,
+    embedding_layer: Embedding,
     input_ids: torch.LongTensor,
     mm_embeds: List[torch.Tensor],
 ) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
@@ -44,20 +45,20 @@ def fuse_input_embeds(
     if len(mm_embeds) == 0:
         return input_ids, None
 
-    vocab_size = model.model_config.pretrained_config.vocab_size
+    vocab_size = embedding_layer.num_embeddings
     mm_embed = torch.cat(mm_embeds, dim=0)
 
     text_token_indices = torch.where(input_ids < vocab_size)[0]
     mm_token_indices = torch.where(input_ids >= vocab_size)[0]
 
-    text_embed = model.model.embed_tokens(input_ids[text_token_indices])
+    text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],
                                mm_embed.shape[-1],
                                device=text_embed.device,
                                dtype=text_embed.dtype)
     
-    input_embeds[text_token_indices, :] = text_embed.to(text_embed.dtype, input_embeds.device)
-    input_embeds[mm_token_indices, :] = mm_embed.to(text_embed.dtype, input_embeds.device)
+    input_embeds[text_token_indices, :] = text_embed.to(dtype=input_embeds.dtype, device=input_embeds.device)
+    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device)
 
     return None, input_embeds
 

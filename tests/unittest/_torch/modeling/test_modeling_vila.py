@@ -603,7 +603,7 @@ class TestVila(unittest.TestCase):
                                  device=device,
                                  dtype=torch.int)
         images = [torch.rand(196, 2560, dtype=dtype, device=device)]
-        input_ids, input_embeds = fuse_input_embeds(model, input_ids, images)
+        input_ids, input_embeds = fuse_input_embeds(model.llm.model.embed_tokens, input_ids, images)
         self.assertIsNone(input_ids)
         self.assertEqual(list(input_embeds.shape), [233, 2560])
 
