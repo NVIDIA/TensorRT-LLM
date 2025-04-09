@@ -179,7 +179,7 @@ class GenerationResultBase:
         # Skip output the first generated token in generation response
         # TODO: We should have a better way to handle this when enable
         # beam search with PD.
-        if not self.sampling_params.use_beam_search and \
+        if self.disaggregated_params is not None and \
             len(response_tensors.output_token_ids[src_idx]) == 2:
             output._last_token_ids_len = 1
 
@@ -352,10 +352,12 @@ class GenerationResult(GenerationResultBase):
         executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
     '''
 
-    def __init__(self,
-                 generation_request: "GenerationRequest",
-                 background_error_handler: Optional[Callable] = None,
-                 executor: Optional["GenerationExecutor"] = None) -> None:
+    def __init__(
+            self,
+            generation_request: "GenerationRequest",
+            background_error_handler: Optional[Callable] = None,
+            executor: Optional["GenerationExecutor"] = None,
+            disaggregated_params: Optional[DisaggregatedParams] = None) -> None:
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
@@ -364,6 +366,7 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
+        self.disaggregated_params = disaggregated_params
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
