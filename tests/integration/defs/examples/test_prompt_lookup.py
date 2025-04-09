@@ -32,15 +32,15 @@ from defs.trt_test_alternative import check_call
 @pytest.mark.parametrize(
     "max_matching_ngram_size", [2, 4],
     ids=['max_matching_ngram_size_2', 'max_matching_ngram_size_4'])
-@pytest.mark.parametrize("use_logits", [False, True],
-                         ids=['use_tokens', 'use_logits'])  # useless yet
-@pytest.mark.parametrize("use_py_session", [False], ids=["use_cpp_session"])
+@pytest.mark.parametrize("candidate_set_size", [4, 1],
+                         ids=['candidate_set_size_4', 'candidate_set_size_1'])
+@pytest.mark.parametrize("is_v2_workflow", [False, True], ids=['v1', 'v2'])
 @pytest.mark.parametrize("prompt_lookup_root", ["gpt2"], indirect=True)
 @pytest.mark.parametrize("streaming", [False, True],
                          ids=["no_streaming", "streaming"])
 def test_llm_prompt_lookup_1gpu(batch_size, data_type, prompt_lookup_num_tokens,
-                                max_matching_ngram_size, use_logits,
-                                use_py_session, prompt_lookup_root, streaming,
+                                max_matching_ngram_size, candidate_set_size,
+                                is_v2_workflow, prompt_lookup_root, streaming,
                                 prompt_lookup_example_root, llm_datasets_root,
                                 llm_rouge_root, llm_venv, cmodel_dir,
                                 engine_dir):
@@ -102,10 +102,14 @@ def test_llm_prompt_lookup_1gpu(batch_size, data_type, prompt_lookup_num_tokens,
         common_run_cmd.extend(["--input_text", "'Hello'", "'How are you?'"])
     else:
         assert False, "Only batch_size <=2 is supported in test."
-    assert not use_py_session, "Only CPP session is supported in Draft-Target-Model."
+
+    prompt_lookup_config = f"[{prompt_lookup_num_tokens},{max_matching_ngram_size},{candidate_set_size}"
+    if is_v2_workflow:
+        prompt_lookup_config += "]"
+    else:
+        prompt_lookup_config += ",[0]]"
 
     run_cmd = deepcopy(common_run_cmd)
-    prompt_lookup_config = f"[{prompt_lookup_num_tokens},{max_matching_ngram_size},[0]]"
     run_cmd.extend([
         f"--engine_dir={target_engine_dir}",
         f"--prompt_lookup_config={prompt_lookup_config}",
@@ -138,7 +142,6 @@ def test_llm_prompt_lookup_1gpu(batch_size, data_type, prompt_lookup_num_tokens,
         return
 
     print("Run summarize...")
-    prompt_lookup_config = f"[{prompt_lookup_num_tokens},{max_matching_ngram_size},[0]]"
 
     run_cmd = [
         f"{prompt_lookup_example_root}/../summarize.py",

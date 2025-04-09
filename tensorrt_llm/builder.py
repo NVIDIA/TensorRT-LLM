@@ -1262,8 +1262,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             "max_draft_len":
             build_config.max_draft_len,
             "speculative_decoding_draft_tokens_external":
-            build_config.speculative_decoding_mode ==
-            SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+            (build_config.speculative_decoding_mode in [
+                SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+                SpeculativeDecodingMode.PROMPT_LOOKUP,
+            ]),
             "gather_context_logits":
             build_config.gather_context_logits,
             "lora_target_modules":
@@ -1279,7 +1281,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_encoder_input_len"] = build_config.max_encoder_input_len
 
         if model.config.architecture == "WhisperEncoder":
-
             prepare_input_args = {
                 "max_batch_size": build_config.max_batch_size,
             }

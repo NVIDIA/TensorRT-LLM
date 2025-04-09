@@ -72,6 +72,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
             beamWidth, maxBeamWidth));
     auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
+    auto const originalInputLength = request.originalInputLen;
     auto const numDecodingEngineTokens = request.generatedTokensPerEngineStep;
     auto const numDecodingDraftEngineTokens = numDecodingEngineTokens - 1;
     auto const maxNewTokens
@@ -138,7 +139,9 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         dJointInput.maxBadWordsLen, batchSlot);
 
     TensorPtr sequenceLimitLength{ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
-    runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, *decoderStream);
+    SizeType32 sequenceLimitLengthValue = maxNewTokens
+        + (modelConfig.getSpeculativeDecodingMode().isPromptLookup() ? originalInputLength : inputLength);
+    runtime::kernels::invokeFill(*sequenceLimitLength, sequenceLimitLengthValue, *decoderStream);
 
     TensorPtr inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
     runtime::kernels::invokeFill(*inputLengths, inputLength, *decoderStream);
@@ -203,7 +206,8 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     }
 
     // Speculative execution
-    if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal())
+    if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal()
+        || decoderState.getSpeculativeDecodingMode().isPromptLookup())
     {
         TLLM_CHECK(beamWidth == 1);
         newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig,
@@ -255,7 +259,7 @@ void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx
         }
     }
 
-    if (speculativeDecodingMode.isDraftTokensExternal())
+    if (speculativeDecodingMode.isDraftTokensExternal() || speculativeDecodingMode.isPromptLookup())
     {
         newRequestDraftTokensExternal(batchIdx, request, samplingConfig, jointDecodingInput, decoderStream);
     }

@@ -336,7 +336,7 @@ def test_unit_tests(build_google_tests, build_dir, lora_setup):
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
     "gpt_executor", "llama", "mamba", "medusa", "recurrentgemma", "redrafter",
-    "t5"
+    "t5", "prompt_lookup"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,

@@ -181,7 +181,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             !mModelConfig.getPagedContextFMHA(), "KV cache blocks need to be onboarded if context FMHA.");
     }
 
-    if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+    if (mModelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+        || mModelConfig.getSpeculativeDecodingMode().isPromptLookup())
     {
         TLLM_CHECK_WITH_INFO(optionalParams.kvCacheConfig.enableBlockReuse,
             "KV cache block reuse must be enabled for speculative decoding target model");
@@ -930,6 +931,24 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
 
             utils::sortByLoraId(currRequests);
 
+            if (mModelConfig.getSpeculativeDecodingMode().isPromptLookup())
+            {
+                for (auto& request : currRequests.contextRequests)
+                {
+                    if (request->getOrigPromptLen() == request->getPromptLen())
+                    {
+                        // Assign PromptLookupConfig to requests in the first context phase
+                        request->setPromptLookupConfig(mDecodingConfig.getPromptLookupConfig().value());
+                    }
+                    // Update draft tokens every time
+                    mBuffers[getContextBufferId()]->promptLookupBuffers->updateDraftTokens(request);
+                }
+                if (tensorrt_llm::common::Logger::getLogger()->isEnabled(tensorrt_llm::common::Logger::DEBUG))
+                {
+                    mBuffers[getContextBufferId()]->promptLookupBuffers->printPool();
+                }
+            }
+
             (*mAssignReqSeqSlots)(*mSeqSlotManager, currRequests.contextRequests, currRequests.generationRequests);
 
             if (mKvCacheManager)
@@ -999,13 +1018,30 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 {
                     if (llmReq->isContextInitState())
                     {
-                        llmReq->moveToNextContextChunk();
+                        if (llmReq->getPromptLookupConfig().has_value())
+                        {
+                            // Remove the sequence to update reuse blocks
+                            getKVCacheManager()->removeSequence(llmReq->mRequestId, llmReq);
+                        }
+                        else
+                        {
+                            llmReq->moveToNextContextChunk();
+                        }
+
                         if (llmReq->getContextRemainingLength() == 0)
                         {
-                            TLLM_LOG_DEBUG("[RANK %d] request with ID %lu finishes decoder ctx phase",
-                                COMM_SESSION.getRank(), llmReq->mRequestId);
-
-                            llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+                            if (llmReq->getPromptLookupConfig().has_value())
+                            {
+                                // Always use context phase for Prompt-Lookup
+                                TLLM_LOG_DEBUG("[RANK %d] request with ID %lu keeps in decoder ctx phase",
+                                    COMM_SESSION.getRank(), llmReq->mRequestId);
+                            }
+                            else
+                            {
+                                TLLM_LOG_DEBUG("[RANK %d] request with ID %lu finishes decoder ctx phase",
+                                    COMM_SESSION.getRank(), llmReq->mRequestId);
+                                llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+                            }
 
                             // for encoder-decoder models, free encoder output buffers after decoder context phase is
                             // completed
@@ -1309,6 +1345,19 @@ executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
     {
         TLLM_LOG_WARNING("Overwriting decoding mode to external draft token");
         decodingMode = executor::DecodingMode::ExternalDraftTokens();
+    }
+    // Overwrite decoding mode when Prompt-Lookup decoding is used.
+    if (specDecodingMode.isPromptLookup() && !decodingMode.isPromptLookup())
+    {
+        TLLM_LOG_WARNING(
+            "Model is Prompt-Lookup, but decoding mode is not Prompt-Lookup. Overwriting decoding mode to "
+            "Prompt-Lookup.");
+        decodingMode = executor::DecodingMode::PromptLookup();
+    }
+    // Overwrite decoding mode when Prompt-Lookup decoding is not used.
+    if (!specDecodingMode.isPromptLookup() && decodingMode.isPromptLookup())
+    {
+        TLLM_LOG_ERROR("Model is not built with Prompt-Lookup decoding, but decoding mode is Prompt-Lookup.");
     }
     return decodingMode;
 }
@@ -2102,7 +2151,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         for (auto const& llmReq : requests)
         {
             auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-            if (llmReq->isContextInitState())
+            if (llmReq->isContextInitState() && !mModelConfig.getSpeculativeDecodingMode().isPromptLookup())
             {
                 continue;
             }
@@ -2231,6 +2280,10 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                     else
                     {
                         terminateRequest(llmReq);
+                        if (mModelConfig.getSpeculativeDecodingMode().isPromptLookup())
+                        {
+                            mBuffers[getContextBufferId()]->promptLookupBuffers->removePool(llmReq->mRequestId);
+                        }
                     }
                     llmReq->setState(LlmRequestState::kGENERATION_COMPLETE);
                 }
@@ -2246,7 +2299,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                 {
                     postProcessRequest(*llmReq, numDroppedTokens);
                 }
-                if (llmReq->isContextInitState())
+                if (llmReq->isContextInitState() && !mModelConfig.getSpeculativeDecodingMode().isPromptLookup())
                 {
                     llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 }

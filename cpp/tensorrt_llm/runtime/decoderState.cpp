@@ -148,7 +148,7 @@ void DecoderState::allocateSpeculativeDecodingBuffers(
     }
     dOutput->speculativeDecodingOutputs = speculativeDecodingOutputs;
 
-    if (speculativeDecodingMode.isDraftTokensExternal())
+    if (speculativeDecodingMode.isDraftTokensExternal() || speculativeDecodingMode.isPromptLookup())
     {
         DecodingInput::ExternalDraftTokensInputs externalDraftTokensInputs;
 
@@ -309,12 +309,13 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
 
     auto const maxBatchSizeShape = ITensor::makeShape({mMaxBatchSize});
 
-    if (speculativeDecodingMode.isDraftTokensExternal())
+    if (speculativeDecodingMode.isDraftTokensExternal() || speculativeDecodingMode.isPromptLookup())
     {
         auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
         auto const probsShape = ITensor::makeShape(
             {mMaxBatchSize, mMaxBeamWidth, mMaxSequenceLength, static_cast<SizeType32>(vocabSizePadded)});
+
         dInput.externalDraftTokensInputs->draftProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->targetProbs->reshape(probsShape);
         dInput.externalDraftTokensInputs->draftLogits->reshape(

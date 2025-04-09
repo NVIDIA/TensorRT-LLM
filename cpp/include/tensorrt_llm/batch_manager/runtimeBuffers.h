@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/promptLookupBuffers.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <cstddef>
@@ -175,6 +176,8 @@ public:
     std::optional<runtime::ExplicitDraftTokensBuffers> explicitDraftTokensBuffers;
     //! Eagle decoding
     std::optional<runtime::EagleBuffers> eagleBuffers;
+    // Prompt-Lookup speculative decoding
+    std::optional<runtime::PromptLookupBuffers> promptLookupBuffers;
 
     //! Language adapter routing information if language adapter is presented.
     TensorPtr languageAdapterRoutings; // [numTokens, numLanguages]

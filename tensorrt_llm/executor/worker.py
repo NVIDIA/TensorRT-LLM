@@ -371,6 +371,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 # convert python config into pybind config
                 lookahead_config=PybindMirror.maybe_to_pybind(
                     request.sampling_params.lookahead_config),
+                prompt_lookup_config=PybindMirror.maybe_to_pybind(
+                    request.sampling_params.prompt_lookup_config),
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),

@@ -26,6 +26,7 @@ set(SRCS
     eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
+    promptLookupBuffers.cpp
     layerProfiler.cpp
     loraManager.cpp
     loraUtils.cpp

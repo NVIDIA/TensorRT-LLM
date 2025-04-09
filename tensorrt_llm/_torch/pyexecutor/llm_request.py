@@ -128,6 +128,7 @@ def executor_request_to_llm_request(req_id: int,
         lora_weights=None,
         lora_config=None,
         lookahead_config=None,
+        prompt_lookup_config=None,
         return_log_probs=False,
         return_context_logits=executor_request.output_config.
         return_context_logits,

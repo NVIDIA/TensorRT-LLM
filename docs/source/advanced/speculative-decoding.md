@@ -11,6 +11,7 @@
 - [ReDrafter](#redrafter)
 - [EAGLE](#eagle)
 - [Lookahead decoding](#lookahead-decoding)
+- [Prompt Lookup](#prompt-lookup)
 
 ## About Speculative Sampling
 
@@ -48,6 +49,7 @@ may prove simpler than generating a summary for an article.
 Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
+
 ## Draft-Target-Model
 
 The Draft-Target-Model involves the use of two distinct models (a smaller Draft model and a larger Target model) trained independently but sharing the same vocabulary. For example, GPT 125M / 6.7B models serve as the Draft / Target model.
@@ -61,13 +63,15 @@ Subsequently, the prompt, now updated with the accepted tokens, is sent back to 
 This iterative process continues until a predefined stop conditions are met.
 An example of this orchestration process can be found in the [TensorRT-LLM Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py).
 
-We provide two styles of running Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
+We provide two styles of workflow to run Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
 
-## Prompt-Lookup-Decoding
+
+## Prompt-Lookup
 
 The Prompt-Lookup speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning. The Prompt-Lookup profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
 
-See document in [examples/prompt_lookup/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
+We provide two styles of workflow to run Prompt-Lookup (named V1 and V2 respectively) now. Detailed steps of running can be found in [examples/prompt_lookup/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
+
 
 ## Medusa
 

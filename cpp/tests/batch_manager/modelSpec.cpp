@@ -46,17 +46,17 @@ std::string ModelSpec::getKVCacheTypeString() const
 
 std::string ModelSpec::getSpeculativeDecodingModeString() const
 {
-    if (mSpecDecodingMode.isLookaheadDecoding())
+    if (mSpecDecodingMode.isNone())
+    {
+        // Bypass here.
+    }
+    else if (mSpecDecodingMode.isLookaheadDecoding())
     {
         return "la-decoding";
     }
     else if (mSpecDecodingMode.isDraftTokensExternal())
     {
         return "draft-tokens";
-    }
-    else if (mSpecDecodingMode.isNone())
-    {
-        // Bypass here.
     }
     else if (mSpecDecodingMode.isExplicitDraftTokens())
     {
@@ -69,6 +69,10 @@ std::string ModelSpec::getSpeculativeDecodingModeString() const
     else if (mSpecDecodingMode.isEagle())
     {
         return "eagle";
+    }
+    else if (mSpecDecodingMode.isPromptLookup())
+    {
+        return "prompt-lookup";
     }
     else
     {

@@ -368,6 +368,34 @@ private:
     SizeType32 mVerificationSetSize;
 };
 
+/// @brief Configuration for Prompt-Lookup speculative decoding.
+/// Allows to include prompt-lookup num tokens, max matching ngram size, and candidate set size
+struct PromptLookupConfig
+{
+    PromptLookupConfig(SizeType32 promptLookupNumTokens, SizeType32 maxMatchingNgramSize, SizeType32 candidateSetSize);
+
+    explicit PromptLookupConfig()
+        : PromptLookupConfig(kDefaultPromptLookupNumTokens, kDefaultMaxMatchingNgramSize, kDefaultCandidateSetSize)
+    {
+    }
+
+    bool operator==(PromptLookupConfig const& other) const;
+    [[nodiscard]] SizeType32 getPromptLookupNumTokens() const;
+    [[nodiscard]] SizeType32 getMaxMatchingNgramSize() const;
+    [[nodiscard]] SizeType32 getCandidateSetSize() const;
+
+private:
+    friend class Serialization;
+
+    static constexpr SizeType32 kDefaultPromptLookupNumTokens = 4;
+    static constexpr SizeType32 kDefaultMaxMatchingNgramSize = 2;
+    static constexpr SizeType32 kDefaultCandidateSetSize = 2;
+
+    SizeType32 mPromptLookupNumTokens;
+    SizeType32 mMaxMatchingNgramSize;
+    SizeType32 mCandidateSetSize;
+};
+
 struct EagleConfig
 {
     explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
@@ -675,7 +703,8 @@ public:
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<PromptLookupConfig> PromptLookupConfig = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -723,6 +752,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
+    [[nodiscard]] std::optional<PromptLookupConfig> getPromptLookupConfig() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setStreaming(bool streaming);
@@ -757,6 +787,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+    void setPromptLookupConfig(PromptLookupConfig const& promptLookupConfig);
 
 private:
     friend class Serialization;
@@ -1279,7 +1310,8 @@ public:
     explicit DecodingConfig(std::optional<DecodingMode> decodingMode = std::nullopt,
         std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig = std::nullopt,
         std::optional<MedusaChoices> medusaChoices = std::nullopt,
-        std::optional<EagleConfig> eagleConfig = std::nullopt);
+        std::optional<EagleConfig> eagleConfig = std::nullopt,
+        std::optional<PromptLookupConfig> promptLookupConfig = std::nullopt);
 
     bool operator==(DecodingConfig const& other) const;
 
@@ -1305,6 +1337,11 @@ public:
     void setEagleConfig(EagleConfig const&);
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
 
+    // Prompt-Lookup methods.
+    /// @brief Sets Prompt-Lookup decoding mode and config.
+    void setPromptLookupConfig(PromptLookupConfig const&);
+    [[nodiscard]] std::optional<PromptLookupConfig> getPromptLookupConfig() const;
+
 private:
     friend class Serialization;
 
@@ -1316,6 +1353,9 @@ private:
     std::optional<MedusaChoices> mMedusaChoices;
     // Eagle config.
     std::optional<EagleConfig> mEagleConfig;
+    // Prompt-Lookup params.
+    std::optional<PromptLookupConfig> mPromptLookupConfig;
+
     // The max number of requests that can support running with lookahead decoding
     static constexpr SizeType32 mLookaheadDecodingMaxNumRequest = 8;
 };

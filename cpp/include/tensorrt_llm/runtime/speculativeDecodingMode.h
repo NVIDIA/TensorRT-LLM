@@ -55,6 +55,11 @@ public:
         return SpeculativeDecodingMode{kEagle};
     }
 
+    static auto constexpr PromptLookup()
+    {
+        return SpeculativeDecodingMode{kPromptLookup};
+    }
+
     [[nodiscard]] bool constexpr isNone() const
     {
         return anyBitSet(kNone);
@@ -85,6 +90,11 @@ public:
         return anyBitSet(kEagle);
     }
 
+    [[nodiscard]] bool constexpr isPromptLookup() const
+    {
+        return anyBitSet(kPromptLookup);
+    }
+
     [[nodiscard]] bool constexpr updatesPositionIds() const
     {
         return anyBitSet(kLookaheadDecoding | kExplicitDraftTokens);
@@ -107,7 +117,7 @@ public:
 
     [[nodiscard]] bool constexpr variableDraftLength() const
     {
-        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding | kEagle);
+        return anyBitSet(kDraftTokensExternal | kExplicitDraftTokens | kLookaheadDecoding | kEagle | kPromptLookup);
     }
 
     [[nodiscard]] bool constexpr hasDraftLogits() const
@@ -140,6 +150,7 @@ private:
     static UnderlyingType constexpr kLookaheadDecoding{1U << 3U};
     static UnderlyingType constexpr kExplicitDraftTokens{1U << 4U};
     static UnderlyingType constexpr kEagle{1U << 5U};
+    static UnderlyingType constexpr kPromptLookup{1U << 6U};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
     {
@@ -159,30 +170,40 @@ static_assert(!SpeculativeDecodingMode::None().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::None().isMedusa());
 static_assert(!SpeculativeDecodingMode::None().isLookaheadDecoding());
 static_assert(!SpeculativeDecodingMode::None().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::None().isEagle());
+static_assert(!SpeculativeDecodingMode::None().isPromptLookup());
 
 static_assert(SpeculativeDecodingMode::DraftTokensExternal().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isNone());
 static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isMedusa());
 static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isLookaheadDecoding());
 static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isEagle());
+static_assert(!SpeculativeDecodingMode::DraftTokensExternal().isPromptLookup());
 
 static_assert(SpeculativeDecodingMode::Medusa().isMedusa());
 static_assert(!SpeculativeDecodingMode::Medusa().isNone());
 static_assert(!SpeculativeDecodingMode::Medusa().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::Medusa().isLookaheadDecoding());
 static_assert(!SpeculativeDecodingMode::Medusa().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::Medusa().isEagle());
+static_assert(!SpeculativeDecodingMode::Medusa().isPromptLookup());
 
 static_assert(SpeculativeDecodingMode::LookaheadDecoding().isLookaheadDecoding());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isNone());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isMedusa());
 static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isEagle());
+static_assert(!SpeculativeDecodingMode::LookaheadDecoding().isPromptLookup());
 
 static_assert(SpeculativeDecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isNone());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isMedusa());
 static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isLookaheadDecoding());
+static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isEagle());
+static_assert(!SpeculativeDecodingMode::ExplicitDraftTokens().isPromptLookup());
 
 static_assert(SpeculativeDecodingMode::Eagle().isEagle());
 static_assert(!SpeculativeDecodingMode::Eagle().isNone());
@@ -190,5 +211,14 @@ static_assert(!SpeculativeDecodingMode::Eagle().isDraftTokensExternal());
 static_assert(!SpeculativeDecodingMode::Eagle().isMedusa());
 static_assert(!SpeculativeDecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!SpeculativeDecodingMode::Eagle().isLookaheadDecoding());
+static_assert(!SpeculativeDecodingMode::Eagle().isPromptLookup());
+
+static_assert(!SpeculativeDecodingMode::PromptLookup().isNone());
+static_assert(!SpeculativeDecodingMode::PromptLookup().isDraftTokensExternal());
+static_assert(!SpeculativeDecodingMode::PromptLookup().isMedusa());
+static_assert(!SpeculativeDecodingMode::PromptLookup().isLookaheadDecoding());
+static_assert(!SpeculativeDecodingMode::PromptLookup().isExplicitDraftTokens());
+static_assert(!SpeculativeDecodingMode::PromptLookup().isEagle());
+static_assert(SpeculativeDecodingMode::PromptLookup().isPromptLookup());
 
 } // namespace tensorrt_llm::runtime

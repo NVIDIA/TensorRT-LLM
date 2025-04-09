@@ -227,7 +227,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         lookaheadParams->attentionPackedMasks = output->lookaheadOutputs->packedMasks;
         setupParams->decodingParams = std::move(lookaheadParams);
     }
-    else if (mDecodingMode.isExternalDraftTokens())
+    else if (mDecodingMode.isExternalDraftTokens() || mDecodingMode.isPromptLookup())
     {
         auto externalDraftTokensParams = std::make_shared<tl::ExternalDraftTokensSetupParams>();
         // signed to unsigned
@@ -453,7 +453,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams
             = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSlots, input.batchSize);
     }
-    else if (decodingMode.isExternalDraftTokens())
+    else if (decodingMode.isExternalDraftTokens() || decodingMode.isPromptLookup())
     {
         forwardParams = std::make_shared<tl::ExternalDraftTokensInputs>(
             input.endIds, input.batchSlots, input.step, ite, input.batchSize);
@@ -533,7 +533,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams->localBatchSize = input.batchSize;
     }
 
-    if (decodingMode.isExternalDraftTokens())
+    if (decodingMode.isExternalDraftTokens() || decodingMode.isPromptLookup())
     {
         prepareExternalDraftTokensInputs(input, forwardParams);
     }

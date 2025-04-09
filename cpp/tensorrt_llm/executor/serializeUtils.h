@@ -112,6 +112,7 @@ static_assert(hasSerializedSize<PeftCacheConfig>(size_t()));
 static_assert(hasSerializedSize<DecodingMode>(size_t()));
 static_assert(hasSerializedSize<LookaheadDecodingConfig>(size_t()));
 static_assert(hasSerializedSize<EagleConfig>(size_t()));
+static_assert(hasSerializedSize<PromptLookupConfig>(size_t()));
 static_assert(hasSerializedSize<KvCacheRetentionConfig>(size_t()));
 static_assert(hasSerializedSize<DecodingConfig>(size_t()));
 static_assert(hasSerializedSize<DebugConfig>(size_t()));
@@ -203,6 +204,7 @@ static_assert(hasSerialize<PeftCacheConfig>(nullptr));
 static_assert(hasSerialize<DecodingMode>(nullptr));
 static_assert(hasSerialize<LookaheadDecodingConfig>(nullptr));
 static_assert(hasSerialize<EagleConfig>(nullptr));
+static_assert(hasSerialize<PromptLookupConfig>(nullptr));
 static_assert(hasSerialize<SpeculativeDecodingConfig>(nullptr));
 static_assert(hasSerialize<GuidedDecodingConfig>(nullptr));
 static_assert(hasSerialize<GuidedDecodingParams>(nullptr));
@@ -422,6 +424,10 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::EagleConfig>)
     {
         return Serialization::deserializeEagleConfig(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::PromptLookupConfig>)
+    {
+        return Serialization::deserializePromptLookupConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpeculativeDecodingConfig>)
     {

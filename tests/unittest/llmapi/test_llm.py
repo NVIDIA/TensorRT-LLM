@@ -2116,5 +2116,7 @@ def test_llm_api_draft_target():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
+# TODO: add `def test_llm_api_prompt_lookup()` here.
+
 if __name__ == '__main__':
     test_llm_with_postprocess_parallel_and_result_handler(True, "pytorch")

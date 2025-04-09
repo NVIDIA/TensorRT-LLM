@@ -73,15 +73,18 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         }
 
         auto const promptLen = llmReq->getPromptLen();
+        auto const origPromptLen = llmReq->getOrigPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
         TensorPtr inputView = ITensor::slice(inputBuffers.inputsIds, inputOffset, promptLen);
         bufferManager.copy(reqTokens.data(), *inputView);
 
-        auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
+        auto decoderRequest
+            = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId, origPromptLen};
 
         llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
-        if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+        if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+            || modelConfig.getSpeculativeDecodingMode().isPromptLookup())
         {
             if (llmReq->hasDraftTokens())
             {
@@ -129,6 +132,13 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             decoderRequest.eagleConfig
                 = llmReq->getEagleConfig() ? llmReq->getEagleConfig() : decodingConfig.getEagleConfig();
         }
+        else if (modelConfig.getSpeculativeDecodingMode().isPromptLookup())
+        {
+            decoderRequest.promptLookupRuntimeConfig = llmReq->getPromptLookupConfig()
+                ? llmReq->getPromptLookupConfig()
+                : decodingConfig.getPromptLookupConfig();
+        }
+
         if (llmReq->getEmbeddingBias().has_value())
         {
             decoderRequest.embeddingBias = getEmbeddingBias(logitsType, llmReq->getEmbeddingBias().value());

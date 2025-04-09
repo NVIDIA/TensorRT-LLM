@@ -249,31 +249,36 @@ void initConfigBindings(pybind11::module_& m)
 
     auto decodingConfigGetstate = [](tle::DecodingConfig const& self)
     {
-        return py::make_tuple(
-            self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices(), self.getEagleConfig());
+        return py::make_tuple(self.getDecodingMode(), self.getLookaheadDecodingConfig(), self.getMedusaChoices(),
+            self.getEagleConfig(), self.getPromptLookupConfig());
     };
     auto decodingConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 5)
         {
             throw std::runtime_error("Invalid state!");
         }
         return tle::DecodingConfig(state[0].cast<std::optional<tle::DecodingMode>>(), // DecodingMode
             state[1].cast<std::optional<tle::LookaheadDecodingConfig>>(),             // LookaheadDecodingConfig
             state[2].cast<std::optional<tle::MedusaChoices>>(),                       // MedusaChoices
-            state[3].cast<std::optional<tle::EagleConfig>>()                          // EagleConfig
+            state[3].cast<std::optional<tle::EagleConfig>>(),                         // EagleConfig
+            state[4].cast<std::optional<tle::PromptLookupConfig>>()                   // PromptLookupConfig
         );
     };
     py::class_<tle::DecodingConfig>(m, "DecodingConfig")
         .def(py::init<std::optional<tle::DecodingMode>, std::optional<tle::LookaheadDecodingConfig>,
-                 std::optional<tle::MedusaChoices>, std::optional<tle::EagleConfig>>(),
+                 std::optional<tle::MedusaChoices>, std::optional<tle::EagleConfig>,
+                 std::optional<tle::PromptLookupConfig>>(),
             py::arg("decoding_mode") = py::none(), py::arg("lookahead_decoding_config") = py::none(),
-            py::arg("medusa_choices") = py::none(), py::arg("eagle_config") = py::none())
+            py::arg("medusa_choices") = py::none(), py::arg("eagle_config") = py::none(),
+            py::arg("prompt_lookup_config") = py::none())
         .def_property("decoding_mode", &tle::DecodingConfig::getDecodingMode, &tle::DecodingConfig::setDecodingMode)
         .def_property("lookahead_decoding_config", &tle::DecodingConfig::getLookaheadDecodingConfig,
             &tle::DecodingConfig::setLookaheadDecodingConfig)
         .def_property("medusa_choices", &tle::DecodingConfig::getMedusaChoices, &tle::DecodingConfig::setMedusaChoices)
         .def_property("eagle_config", &tle::DecodingConfig::getEagleConfig, &tle::DecodingConfig::setEagleConfig)
+        .def_property("prompt_lookup_config", &tle::DecodingConfig::getPromptLookupConfig,
+            &tle::DecodingConfig::setPromptLookupConfig)
         .def(py::pickle(decodingConfigGetstate, decodingConfigSetstate));
 
     auto debugConfigGetstate = [](tle::DebugConfig const& self)

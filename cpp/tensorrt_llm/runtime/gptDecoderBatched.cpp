@@ -252,7 +252,7 @@ void GptDecoderBatched::prepareForward(
         dInput.medusaInputs->medusaLogits = input.predictedDraftLogits;
     }
 
-    if (speculativeDecodingMode.isDraftTokensExternal())
+    if (speculativeDecodingMode.isDraftTokensExternal() || speculativeDecodingMode.isPromptLookup())
     {
         dInput.externalDraftTokensInputs->step = step;
 

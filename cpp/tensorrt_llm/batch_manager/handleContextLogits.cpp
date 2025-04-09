@@ -92,8 +92,9 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         {
             // Since the computational graph has been modified, only the last token is needed.
             TLLM_CHECK_WITH_INFO(!modelConfig.getSpeculativeDecodingMode().isMedusa()
-                    && !modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding(),
-                "Return context logits is not supported with Medusa and Lookahead decoding");
+                    && !modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding()
+                    && !modelConfig.getSpeculativeDecodingMode().isPromptLookup(),
+                "Return context logits is not supported with Medusa, Lookahead or Prompt-Lookup decoding");
 
             if (llmReq->getReturnContextLogits())
             {

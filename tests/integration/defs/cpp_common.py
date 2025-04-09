@@ -35,7 +35,8 @@ include_test_map = {
         "T5Beam2Test",
     ),
     "enc_dec_language_adapter": ("LanguageAdapterBasicTest", ),
-    "redrafter": ("ExplicitDraftTokens", )
+    "redrafter": ("ExplicitDraftTokens", ),
+    "prompt_lookup": ("PromptLookup", ),
 }
 
 
@@ -53,6 +54,7 @@ def generate_excluded_model_tests() -> Generator[str, None, None]:
     yield "Encoder"
     yield "EncDec"
     yield "SpeculativeDecoding"
+    yield "PromptLookup"
 
 
 def generate_included_model_tests(

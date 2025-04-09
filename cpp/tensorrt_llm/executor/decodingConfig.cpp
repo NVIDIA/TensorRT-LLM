@@ -207,13 +207,49 @@ std::optional<SizeType32> EagleConfig::getDynamicTreeMaxTopK() const
     return mDynamicTreeMaxTopK;
 }
 
+PromptLookupConfig::PromptLookupConfig(
+    SizeType32 promptLookupNumTokens, SizeType32 maxMatchingNgramSize, SizeType32 candidateSetSize)
+    : mPromptLookupNumTokens(promptLookupNumTokens)
+    , mMaxMatchingNgramSize(maxMatchingNgramSize)
+    , mCandidateSetSize(candidateSetSize)
+{
+    TLLM_CHECK_WITH_INFO(promptLookupNumTokens >= 1, "promptLookupNumTokens requires >= 1");
+    TLLM_CHECK_WITH_INFO(maxMatchingNgramSize >= 1, "ngramSize requires >= 1");
+    TLLM_CHECK_WITH_INFO(candidateSetSize >= 1, "candidateSetSize requires >=0");
+}
+
+bool PromptLookupConfig::operator==(PromptLookupConfig const& other) const
+{
+    return mPromptLookupNumTokens == other.mPromptLookupNumTokens
+        && mMaxMatchingNgramSize == other.mMaxMatchingNgramSize && mCandidateSetSize == other.mCandidateSetSize;
+}
+
+SizeType32 PromptLookupConfig::getPromptLookupNumTokens() const
+{
+
+    return mPromptLookupNumTokens;
+}
+
+SizeType32 PromptLookupConfig::getMaxMatchingNgramSize() const
+{
+
+    return mMaxMatchingNgramSize;
+}
+
+SizeType32 PromptLookupConfig::getCandidateSetSize() const
+{
+
+    return mCandidateSetSize;
+}
+
 DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
     std::optional<LookaheadDecodingConfig> lookaheadDecodingConfig, std::optional<MedusaChoices> medusaChoices,
-    std::optional<EagleConfig> eagleConfig)
+    std::optional<EagleConfig> eagleConfig, std::optional<PromptLookupConfig> promptLookupConfig)
     : mDecodingMode{decodingMode}
     , mLookaheadDecodingConfig{lookaheadDecodingConfig}
     , mMedusaChoices{std::move(medusaChoices)}
     , mEagleConfig{std::move(eagleConfig)}
+    , mPromptLookupConfig{promptLookupConfig}
 {
     if (mLookaheadDecodingConfig)
     {
@@ -233,12 +269,19 @@ DecodingConfig::DecodingConfig(std::optional<DecodingMode> decodingMode,
         TLLM_CHECK_WITH_INFO(
             mDecodingMode.value().isEagle(), "EagleConfig is set, but DecodingMode is not set to Eagle");
     }
+    if (mPromptLookupConfig)
+    {
+        TLLM_CHECK_WITH_INFO(mDecodingMode, "PromptLookupConfig is set, but DecodingMode is not set");
+        TLLM_CHECK_WITH_INFO(mDecodingMode.value().isPromptLookup(),
+            "PromptLookupConfig is set, but DecodingMode is not set to PromptLookup");
+    }
 }
 
 bool DecodingConfig::operator==(DecodingConfig const& other) const
 {
     return mDecodingMode == other.mDecodingMode && mLookaheadDecodingConfig == other.mLookaheadDecodingConfig
-        && mMedusaChoices == other.mMedusaChoices && mEagleConfig == other.mEagleConfig;
+        && mMedusaChoices == other.mMedusaChoices && mEagleConfig == other.mEagleConfig
+        && mPromptLookupConfig == other.mPromptLookupConfig;
 }
 
 std::optional<DecodingMode> DecodingConfig::getDecodingMode() const
@@ -248,11 +291,13 @@ std::optional<DecodingMode> DecodingConfig::getDecodingMode() const
 
 void DecodingConfig::setDecodingMode(DecodingMode const& decodingMode)
 {
-    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens())
+    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens()
+        || decodingMode.isPromptLookup())
     {
         TLLM_THROW(
-            "Decoding mode must not be set with `setDecodingMode` for Medusa, Lookahead or explicit draft tokens. "
-            "Please, use setters for the respective configs or set decoding mode at the DecodingConfig constructor");
+            "Decoding mode must not be set with `setDecodingMode` for Medusa, Lookahead, explicit draft tokens or "
+            "Prompt-Lookup. Please, use setters for the respective configs or set decoding mode at the DecodingConfig "
+            "constructor");
     }
     mDecodingMode = decodingMode;
 }
@@ -302,6 +347,17 @@ void DecodingConfig::setEagleConfig(EagleConfig const& eagleConfig)
 {
     mEagleConfig = eagleConfig;
     mDecodingMode = DecodingMode::Eagle();
+}
+
+std::optional<PromptLookupConfig> DecodingConfig::getPromptLookupConfig() const
+{
+    return mPromptLookupConfig;
+}
+
+void DecodingConfig::setPromptLookupConfig(PromptLookupConfig const& promptLookupConfig)
+{
+    mPromptLookupConfig = promptLookupConfig;
+    mDecodingMode = DecodingMode::PromptLookup();
 }
 
 } // namespace tensorrt_llm::executor

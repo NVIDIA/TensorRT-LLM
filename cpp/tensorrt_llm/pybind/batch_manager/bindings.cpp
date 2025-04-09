@@ -210,6 +210,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_property_readonly("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_property_readonly("lookahead_config", &GenLlmReq::getLookaheadConfig)
+        .def_property_readonly("prompt_lookup_config", &GenLlmReq::getPromptLookupConfig)
         .def_property("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_property("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
         .def_readwrite("request_id", &GenLlmReq::mRequestId)
@@ -337,7 +338,8 @@ void initBindings(pybind11::module_& m)
                      std::optional<executor::GuidedDecodingParams> guided_decoding_params,
                      std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                      std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
-                     std::optional<executor::ContextPhaseParams> context_phase_params)
+                     std::optional<executor::ContextPhaseParams> context_phase_params,
+                     std::optional<executor::PromptLookupConfig> prompt_lookup_config)
                  {
                      auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                      {
@@ -377,7 +379,7 @@ void initBindings(pybind11::module_& m)
                          encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                          llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
                          skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                         language_adapter_uid, allotted_time_ms, context_phase_params};
+                         language_adapter_uid, allotted_time_ms, context_phase_params, prompt_lookup_config};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
@@ -401,7 +403,7 @@ void initBindings(pybind11::module_& m)
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
-            py::arg("context_phase_params") = std::nullopt)
+            py::arg("context_phase_params") = std::nullopt, py::arg("prompt_lookup_config") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false)

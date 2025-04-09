@@ -36,9 +36,10 @@ public:
     using BufferPtr = IBuffer::SharedPtr;
 
     explicit Request(TensorConstPtr ids, SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt,
-        std::optional<SizeType32> endId = std::nullopt)
+        std::optional<SizeType32> endId = std::nullopt, SizeType32 originalInputLen = 0)
         : ids{std::move(ids)}
         , inputLen(inputLen)
+        , originalInputLen(originalInputLen == 0 ? inputLen : originalInputLen)
         , maxNewTokens{maxNewTokens}
         , endId{endId}
         , generatedTokensPerEngineStep(1)
@@ -46,10 +47,11 @@ public:
     }
 
     //! Mandatory parameters
-    TensorConstPtr ids;  // The input sequence of token ids, [inputSeqLen], on gpu
-    SizeType32 inputLen; // Input length without draft tokens, increasing with generation steps
+    TensorConstPtr ids;          // The input sequence of token ids, [inputSeqLen], on gpu
+    SizeType32 inputLen;         // Input length without draft tokens, increasing with generation steps
+    SizeType32 originalInputLen; // Original input length without draft tokens, not changing with generation steps
 
-    // optional parameters
+    //! Optional parameters
     std::optional<SizeType32> maxNewTokens;  // maximum number of tokens to generate for this request
     std::optional<SizeType32> endId;         // end token id
     SizeType32 generatedTokensPerEngineStep; //
@@ -65,6 +67,7 @@ public:
     nvinfer1::DataType dtype;             // Request data type, only used by explicit draft tokens.
     std::optional<executor::LookaheadDecodingConfig> lookaheadRuntimeConfig;
     std::optional<executor::EagleConfig> eagleConfig;
+    std::optional<executor::PromptLookupConfig> promptLookupRuntimeConfig;
 };
 
 } // namespace tensorrt_llm::runtime::decoder_batch
