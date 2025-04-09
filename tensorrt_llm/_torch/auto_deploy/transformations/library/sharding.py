@@ -287,3 +287,93 @@ def column_row_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule
     gm = canonicalize_graph(gm)
     ad_logger.debug("After sharding: " + str(gm))
     return gm
+
+def bmm_shard(gm: GraphModule, rank: int, world_size: int) -> GraphModule:
+    """A transformation to apply sharding to batched matrix multiplications in the graph.
+
+    We'll shard the BMM nodes by slicing the batch dimension of the weight tensor into world_size number of slices.
+    After sharding each BMM node, we'll insert an all_gather node to gather the results across the different devices.
+    This is likely not the most optimal sharding strategy, but it's a simple way to shard the BMM nodes.
+    Subsequent sharding strategies can remove redundant all_gathers.
+    
+    We'll also assume that the input to BMM are broadcasted across the devices already.
+    """
+    ad_logger.info("Sharding graph for BMM")
+    ad_logger.debug("Before sharding graph: " + str(gm))
+
+    if world_size < 2:
+        ad_logger.info("Skipping sharding for single device")
+        return gm
+    
+    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+    for node in gm.graph.nodes:
+        if is_op(node, {torch.ops.aten.bmm}):
+            ad_logger.debug(f"Found BMM node: {node}")
+            
+            # Get the input tensors
+            # we'll assume that the first argument is the input tensor and the second argument is the weight tensor.
+            input_tensor = node.args[0]
+            weight_tensor = node.args[1]
+            # Check that weight_tensor is a get_attr node
+            if not weight_tensor.op == "get_attr":
+                ad_logger.warning(f"Skipping BMM node {node}: weight tensor is not a get_attr node")
+                continue
+
+            # Get the weight parameter key and module
+            weight_key = weight_tensor.target
+            modname = weight_key.rpartition(".")[0]
+            submod = gm.get_submodule(modname)
+            
+            # Define split function for the hook
+            def split_tensor(
+                t: torch.Tensor, r: int = rank, ws: int = world_size
+            ) -> torch.Tensor:
+                return torch.tensor_split(t, ws, dim=0)[r]
+            
+            # Update the weight parameter with its shard
+            param_new = nn.Parameter(
+                split_tensor(gm.get_parameter(weight_key)).detach().clone(),
+                requires_grad=True
+            )
+            param_name = weight_key.rpartition(".")[-1]
+            setattr(submod, param_name, param_new)
+            weight_new_shape = param_new.shape
+
+            # Register load state dict hook
+            gm._register_load_state_dict_pre_hook(
+                partial(
+                    _load_hook,
+                    f_split=split_tensor,
+                    param_key=weight_key,
+                    param_shape=weight_new_shape
+                )
+            )
+            
+            # Insert slicing for input tensor
+            with gm.graph.inserting_before(node):
+                input_split = gm.graph.call_function(
+                    torch.tensor_split,
+                    args=(input_tensor, world_size, 0),  # Split along batch dimension (0)
+                )
+                input_slice = gm.graph.call_function(
+                    lambda x, i: x[i],
+                    args=(input_split, rank),
+                )
+
+            # Update BMM node to use the sharded weight directly
+            node.update_arg(0, input_slice)
+
+            # Add all_gather node after BMM to collect results
+            with gm.graph.inserting_after(node):
+                gather_node = gm.graph.call_function(
+                    torch.ops.dist.all_gather,
+                    args=(node, 0),  # Gather along batch dimension (0)
+                )
+                node.replace_all_uses_with(gather_node)
+                gather_node.replace_input_with(gather_node, node)
+
+    # Canonicalize and return
+    gm = canonicalize_graph(gm)
+    ad_logger.debug("After sharding BMM: " + str(gm))
+    return gm
