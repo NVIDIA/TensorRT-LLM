@@ -1247,7 +1247,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     mMaxTokenNum = mMaxAttentionWindow + mSinkBubbleLength;
 
     // If maxBeamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
-    // tokens, when enabling cyclic kv cache.
+    // tokens, when enabling slidins window kv cache.
     mUseOneMoreBlock
         = maxSequenceLength.has_value() && maxSequenceLength.value() > mMaxAttentionWindow && maxBeamWidth > 1;
     TLLM_CHECK_WITH_INFO(!mUseOneMoreBlock || mTemporaryAttentionWindow == 0,

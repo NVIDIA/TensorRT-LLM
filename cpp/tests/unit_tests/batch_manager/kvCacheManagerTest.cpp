@@ -2295,7 +2295,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerThanBlockSizeTe
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 16;
     auto constexpr temporaryAttentionWindow = 0;
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
@@ -2395,7 +2395,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultiple
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 10;
     auto constexpr temporaryAttentionWindow = 0;
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
@@ -2504,7 +2504,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 3;
     auto constexpr temporaryAttentionWindow = 0;
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
@@ -2610,7 +2610,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSinkTest)
     auto constexpr maxBeamWidth = 1;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 16;
     auto constexpr temporaryAttentionWindow = 0;
 
@@ -2693,7 +2693,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr maxAttentionWindow = 16;
     auto constexpr temporaryAttentionWindow = 0;
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
@@ -2842,7 +2842,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    // Enable cyclic kv cache for long input tokens.
+    // Enable sliding window kv cache for long input tokens.
     auto constexpr minAttentionWindow = 8;
     auto constexpr maxAttentionWindow = 16;
     auto const maxAttentionWindowVec = std::vector<SizeType32>{maxAttentionWindow, minAttentionWindow};
@@ -2886,7 +2886,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1}));
 
-    // add tokens to enable cyclic kv cache
+    // add tokens to enable sliding window kv cache
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1017, beamIdx);
@@ -2896,7 +2896,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
-    // no blocks stored because cyclic KV cache was enabled
+    // no blocks stored because sliding window KV cache was enabled
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 

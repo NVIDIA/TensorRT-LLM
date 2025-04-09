@@ -426,7 +426,7 @@ private:
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
 
-    // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
+    // A value indicating whether or not the context is long enough to warrant the use of sliding window kv-cache.
     bool mContextRequiresSlidingWindowKvCache{false};
 };
 
