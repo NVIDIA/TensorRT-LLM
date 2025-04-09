@@ -20,9 +20,7 @@
 #include "cubin/GemmKernel_Bfloat16_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1x1_dsFp8_sm100a_cubin.h"
 #include "cubin/GemmKernel_E4m3_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin.h"
 #include "cubin/GemmKernel_Fp32_E4m3_Fp32_tile128x128x128_epilogueTile128x64_mma128x64x32_cluster1x1_dsFp8_sm100a_cubin.h"
-
 #include "kernelParams.h"
-
 #include <vector>
 
 namespace tensorrt_llm
