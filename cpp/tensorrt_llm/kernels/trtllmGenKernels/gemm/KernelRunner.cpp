@@ -16,8 +16,6 @@
 
 #include <vector>
 
-#include <ATen/cuda/EmptyTensor.h>
-
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
 #include "trtllmGen_export/GemmInterface.h"
