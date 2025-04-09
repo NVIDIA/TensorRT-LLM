@@ -61,11 +61,11 @@ bool getEnvDisaggLayerwise();
 
 bool getEnvParallelCacheSend();
 
-bool getEnvRequestKVCacheSerial();
+bool getEnvRequestKVCacheConcurrent();
 
 bool getEnvDisableKVCacheTransferOverlap();
 
-bool getEnvDisableReceiveKVCacheParallel();
+bool getEnvEnableReceiveKVCacheParallel();
 
 std::string getEnvKVCacheTransferOutputPath();
 

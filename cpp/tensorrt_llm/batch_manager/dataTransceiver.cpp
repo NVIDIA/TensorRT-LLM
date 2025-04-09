@@ -317,10 +317,10 @@ public:
             auto promise = std::make_unique<std::promise<void>>();
             auto future = promise->get_future();
             TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
-            std::string processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
-            if (common::getEnvRequestKVCacheSerial())
+            std::string processInfo = "default";
+            if (common::getEnvRequestKVCacheConcurrent())
             {
-                processInfo = "default";
+                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
             }
             if (mInstanceToAsyncResource.find(processInfo) == mInstanceToAsyncResource.end())
             {
