@@ -472,20 +472,26 @@ def test_KvCacheConfig_pickle():
 
 
 def test_TrtGptModelOptionalParams_pickle():
-    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
-    params1 = _tb.TrtGptModelOptionalParams(
-        kv_cache_config=cache,
-        enable_trt_overlap=True,
-    )
-    params1.enable_chunked_context = True
+    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
+    enable_trt_overlap = True
+    device_ids = [0, 1]
+    normalize_log_probs = False
+    enable_chunked_context = True
+    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+
+    params1 = _tb.TrtGptModelOptionalParams(kv_cache_config, enable_trt_overlap,
+                                            device_ids, normalize_log_probs,
+                                            enable_chunked_context,
+                                            peft_cache_manager_config)
+
     params2 = pickle.loads(pickle.dumps(params1))
 
-    assert params2 == params1
-
-    params1 = _tb.TrtGptModelOptionalParams()
-    params2 = pickle.loads(pickle.dumps(params1))
-
-    assert params2 == params1
+    assert params2.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
+    assert params2.enable_trt_overlap
+    assert params2.device_ids == device_ids
+    assert params2.normalize_log_probs == normalize_log_probs
+    assert params2.enable_chunked_context == enable_chunked_context
+    assert params2.gpu_weights_percent == 1
 
 
 def test_Mpicomm():
