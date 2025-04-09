@@ -42,6 +42,16 @@ with open(FULL_RESULT_LOG, 'r') as file:
 
         # Remove from left to first '/' in the first column
         test_name = first_column.split('/', 1)[-1]
+        # Replace \"\" with \" and ]\" with ] in case we got these in names from report.csv
+        # which will broken the json parse
+        test_name = test_name.replace(']\"', ']').replace('\"\"', '\"')
+
+        try:
+            last_column = float(last_column)
+        except ValueError:
+            print(
+                f"Warning: Could not convert {last_column} to float. Skipping.")
+            continue
 
         # Add to the test duration dictionary
         test_durations[test_name] = last_column
