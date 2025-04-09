@@ -156,6 +156,7 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_CHECK(size > 0);
+    TLLM_CHECK_WITH_INFO(ipcNvlsSupported(), "Switch multicast is not supported on this system.");
 
     std::vector<int> ranks(group.begin(), group.end());
 

@@ -127,6 +127,52 @@ void GemmAllReducePlugin::allocatePersistentWorkspace()
     TLLM_CHECK(mWorkspace != nullptr);
 }
 
+LaunchConfig GemmAllReducePlugin::getStaticHeuristicLaunchConfig(int M) const
+{
+    // This is only applicable when we swap and transpose A & B.
+    // When M is small we want to select tile that best fits it to maximize MMA efficiency.
+    auto filterByM = [&](std::vector<LaunchConfig> candidateConfigs)
+    {
+        std::vector<LaunchConfig> result;
+        if (M <= 16)
+        {
+            std::copy_if(candidateConfigs.begin(), candidateConfigs.end(), std::back_inserter(result),
+                [](const LaunchConfig& config)
+                { return config.tile_shape == TileShape::TileShape_128x16x128 and config.transposed; });
+        }
+        else if (M <= 32)
+        {
+            std::copy_if(candidateConfigs.begin(), candidateConfigs.end(), std::back_inserter(result),
+                [](const LaunchConfig& config)
+                { return config.tile_shape == TileShape::TileShape_128x32x128 and config.transposed; });
+        }
+        else if (M <= 64)
+        {
+            std::copy_if(candidateConfigs.begin(), candidateConfigs.end(), std::back_inserter(result),
+                [](const LaunchConfig& config)
+                { return config.tile_shape == TileShape::TileShape_128x64x128 and config.transposed; });
+        }
+        else
+        {
+            std::copy_if(candidateConfigs.begin(), candidateConfigs.end(), std::back_inserter(result),
+                [](const LaunchConfig& config)
+                { return config.tile_shape == TileShape::TileShape_128x128x128 and config.transposed; });
+        }
+        // If result empty then use any.
+        if (result.empty())
+        {
+            result = candidateConfigs;
+        }
+        return result;
+    };
+
+    auto bestLaunchConfigs = mGemm->getSupportedLaunchConfigs();
+    bestLaunchConfigs = filterByM(bestLaunchConfigs);
+    TLLM_CHECK(!bestLaunchConfigs.empty());
+    // Return first one, because who knows which is best.
+    return bestLaunchConfigs.front();
+}
+
 static GemmAllReducePluginOptions deserializeOptions(void const*& data, size_t length)
 {
     char const* begin = reinterpret_cast<char const*>(data);
@@ -164,8 +210,10 @@ static GemmAllReducePluginOptions deserializeOptions(void const*& data, size_t l
 GemmAllReducePlugin::GemmAllReducePlugin(void const* data, size_t length)
     : GemmAllReducePlugin(deserializeOptions(std::ref(data), length))
 {
-    // char const* end = reinterpret_cast<char const*>(data);
-    mProfiler->deserializeFromOwnFile(mGemmId, mOptions.maxProblemShape);
+    if (mProfiler->useProfiler())
+    {
+        mProfiler->deserializeFromOwnFile(mGemmId, mOptions.maxProblemShape);
+    }
 }
 
 //////////////////////////////////
@@ -351,7 +399,15 @@ int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     TLLM_CHECK_WITH_INFO(K > 0, "GemmAllReducePlugin K is 0.");
     TLLM_CHECK_WITH_INFO(mWorkspace != nullptr, "GemmAllReducePlugin workspace is null.");
 
-    auto bestLaunchConfig = mProfiler->getBestConfig(M, mGemmId).value();
+    LaunchConfig bestLaunchConfig;
+    if (mProfiler->useProfiler())
+    {
+        bestLaunchConfig = mProfiler->getBestConfig(M, mGemmId).value();
+    }
+    else
+    {
+        bestLaunchConfig = getStaticHeuristicLaunchConfig(M);
+    }
 
     void const* activation = inputs[mArgInvMap[TensorArg::IN_ACTIVATION]];
     void const* weight = inputs[mArgInvMap[TensorArg::IN_WEIGHT]];
@@ -435,7 +491,7 @@ int GemmAllReducePlugin::getNbOutputs() const noexcept
 
 int GemmAllReducePlugin::initialize() noexcept
 {
-    if (isBuilding())
+    if (isBuilding() && mProfiler->useProfiler())
     {
         // TODO (xsimmons): interfaces between GemmPluginProfiler and Plugin
         // needs to be relooked at - current interface implicitly assigns runner to profiler
@@ -509,7 +565,7 @@ void GemmAllReducePlugin::serialize(void* buffer) const noexcept
     // Since by default each rank will generate and serialize its own profiler mapping
     // this can lead to different mappings between ranks which will result in fatal
     // error. Therefore only generate and use profiler mapping for single rank.
-    if (COMM_SESSION.getRank() == 0)
+    if (mProfiler->useProfiler() && COMM_SESSION.getRank() == 0)
     {
         mProfiler->serializeToOwnFile(mGemmId);
     }

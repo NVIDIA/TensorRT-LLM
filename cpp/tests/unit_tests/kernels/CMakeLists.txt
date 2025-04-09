@@ -33,10 +33,11 @@ add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
   add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
   add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
-  # add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
-  # if(USING_OSS_CUTLASS_ALLREDUCE_GEMM) target_link_libraries(gemmAllReduceTest
-  # PRIVATE ar_gemm_src) target_compile_definitions(gemmAllReduceTest PRIVATE
-  # USING_OSS_CUTLASS_ALLREDUCE_GEMM) endif()
+  add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
+  if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+    target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
+    target_compile_definitions(gemmAllReduceTest PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  endif()
 endif()
 
 add_gtest(

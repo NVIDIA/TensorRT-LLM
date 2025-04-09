@@ -58,10 +58,18 @@ void GemmAllReducePluginProfiler::deserializeFromOwnFile(GemmIdCore gemmId, Gemm
     assert(end == begin + size);
 }
 
+bool GemmAllReducePluginProfiler::useProfiler()
+{
+    char const* envDir = getenv("GEMM_AR_PLUGIN_ENGINE_DIR");
+    return envDir != nullptr;
+}
+
 std::string GemmAllReducePluginProfiler::getCacheFileName(GemmIdCore gemmId)
 {
     std::stringstream fileName;
-    fileName << "/tmp/gemm-AR";
+    char const* envDir = getenv("GEMM_AR_PLUGIN_ENGINE_DIR");
+    std::string directory = envDir ? std::string(envDir) : "/tmp/";
+    fileName << directory + "/gemm-AR";
     fileName << "-n" << std::to_string(gemmId.n);
     fileName << "-k" << std::to_string(gemmId.k);
     fileName << "-" << tc::getDtypeString(gemmId.dtype);
