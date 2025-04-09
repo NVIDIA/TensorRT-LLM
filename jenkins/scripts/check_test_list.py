@@ -9,7 +9,7 @@ def install_python_dependencies(llm_src):
         shell=True,
         check=True)
     subprocess.run(
-        f"pip3 install --force-reinstall --no-deps {llm_src}/tensorrt_llm-*.whl",
+        f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
         shell=True,
         check=True)
     subprocess.run(
@@ -24,11 +24,13 @@ def verify_l0_test_lists(llm_src):
     test_list = f"{llm_src}/l0_test.txt"
 
     # Remove dynamically generated perf tests
-    subprocess.run(f"touch {test_list} && rm {test_db_path}/*perf*",
-                   shell=True,
-                   check=True)
+    subprocess.run(f"rm -f {test_db_path}/*perf*", shell=True, check=True)
     subprocess.run(
-        f"trt-test-db -d {test_db_path} --test-names --output {test_list} && "
+        f"trt-test-db -d {test_db_path} --test-names --output {test_list}",
+        shell=True,
+        check=True)
+
+    subprocess.run(
         f"cd {llm_src}/tests/integration/defs && "
         f"pytest --apply-test-list-correction --test-list={test_list} --co -q",
         shell=True,
@@ -50,8 +52,12 @@ def verify_qa_test_lists(llm_src):
 def main():
     parser = argparse.ArgumentParser(
         description="Check test lists for L0 and QA.")
-    parser.add_argument("--l0", required=False, help="Check the L0 test list.")
-    parser.add_argument("--qa", required=True, help="Check the qa test list.")
+    parser.add_argument("--l0",
+                        action="store_true",
+                        help="Enable L0 test list verification.")
+    parser.add_argument("--qa",
+                        action="store_true",
+                        help="Enable QA test list verification.")
     args = parser.parse_args()
     llm_src = os.path.realpath("TensorRT-LLM/src")
 
@@ -63,7 +69,7 @@ def main():
         print("Skipping L0 test list verification.")
     # Verify QA test lists
     if args.qa:
-        verify_qa_test_lists(llm_src, args.qa)
+        verify_qa_test_lists(llm_src)
     else:
         print("Skipping QA test list verification.")
 
