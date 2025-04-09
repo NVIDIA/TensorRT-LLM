@@ -858,9 +858,9 @@ public:
         bool enablePartialReuse = true, bool copyOnPartialReuse = true);
 
     //! \brief Calculate the number of blocks each window size heap receives of blocksIn{Primary/Secondary}Pool
-    //! \details Example: (total=16384, uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
-    //! \details ->  {1024: 565, 4096: 6780, 8192: 9039} [sums to total].
-    //! \details See: TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize).
+    //! \details Example:       (total=16384, uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
+    //!          Would Return:  {1024: 565, 4096: 6780, 8192: 9039} [sums to total].
+    //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestBlocksPerWindowSize).
     //! \return Map<windowSize, numBlocks>
     static std::map<SizeType32, SizeType32> blocksPerWindowSize(
         SizeType32 totalBlocks, std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers);
