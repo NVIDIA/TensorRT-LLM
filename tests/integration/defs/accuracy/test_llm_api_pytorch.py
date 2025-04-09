@@ -447,9 +447,9 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_device_memory(40000)
     def test_auto_dtype_summarization(self):
-        with LLM(self.MODEL_PATH) as llm:
+        with LLM(self.MODEL_PATH, tensor_parallel_size=8) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
