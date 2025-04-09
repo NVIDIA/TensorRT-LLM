@@ -113,7 +113,7 @@ private:
         return numContextTokens + numGenTokens;
     };
 
-    // sizes
+    //! Sizes
     SizeType32 numContextRequests{};
     SizeType32 numGenRequests{};
     SizeType32 numGenSequences{};
@@ -122,14 +122,14 @@ private:
     SizeType32 numLogits{};
     SizeType32 maxKvCacheLengthRounded{};
 
-    // general
+    //! General
     TensorPtr inputsIds;
 
     TensorPtr contextLengthsHost;
     TensorPtr contextLengthsDevice;
     TensorPtr sequenceLengthsHost;
 
-    /// @brief Index of selected runtime context.
+    //! Index of selected runtime context.
     SizeType32 contextIndex{};
     SizeType32 maxContextLength{};
 
@@ -137,71 +137,79 @@ public:
     TensorPtr sequenceLengthsDevice;
 
 private:
-    // runtime
-    TensorPtr requestTypes; // Host tensor, 0: context, 1: generation
+    //! Runtime
+    //! Type of host tensor: 0 for context, 1 for generation
+    TensorPtr requestTypes;
+
     TensorPtr lastTokenIdsHost;
     TensorPtr lastTokenIdsDevice;
     TensorPtr logitsIdsHost;
     TensorPtr logitsIdsDevice;
 
-    // pipeline parallelism
+    //! Pipeline-Parallelism
     TensorPtr hiddenStates;
 
-    // Prompt tuning
+    //! Prompt-Tuning
     std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
 
-    // Mrope
+    //! Mrope
     TensorPtr mropeRotaryCosSin;
     TensorPtr mropePositionDeltas;
 
-    // LoRA
+    //! LoRA
     std::unique_ptr<LoraBuffers> loraBuffers;
 
 public:
-    // additional buffers depending on model type
+    //! Additional buffers depending on model type
     std::unique_ptr<TransformerBuffers> transformerBuffers;
     std::unique_ptr<RnnStateBuffers> rnnStateBuffers;
 
-    // Encoder-Decoder
+    //! Encoder-Decoder
     std::unique_ptr<EncoderBuffers> encoderBuffers;
 
-    // Medusa
+    //! Medusa
     std::unique_ptr<MedusaBuffers> medusaBuffers;
 
-    // Lookahead decoding
+    //! Lookahead decoding
     std::optional<runtime::LookaheadRuntimeBuffers> lookaheadBuffers;
-    // Explicit draft tokens decoding
+    //! Explicit draft tokens decoding
     std::optional<runtime::ExplicitDraftTokensBuffers> explicitDraftTokensBuffers;
-    // Eagle decoding
+    //! Eagle decoding
     std::optional<runtime::EagleBuffers> eagleBuffers;
 
-    // language adapter routing information if language adapter is presented.
+    //! Language adapter routing information if language adapter is presented.
     TensorPtr languageAdapterRoutings; // [numTokens, numLanguages]
 
     TensorPtr cacheIndirDecoderIOBatchedCopySrcOffsets;
     TensorPtr cacheIndirDecoderIOBatchedCopyDstOffsets;
     TensorPtr cacheIndirDecoderIOBatchedCopySizes;
 
-    // logits
+    //! Logits
     std::vector<SizeType32> numContextLogits;
     TensorPtr logits;
 
-    // Helper cache for store generation logits
+    //! Helper cache for store generation logits
     struct GenerationLogitsCache
     {
         static constexpr auto kCACHE_LENGTH = 8;
 
-        TensorPtr logits; // [kCACHE_LENGTH, maxBatchSize * maxBeamWidth, vocabSizePadded], Buffer for logits between
-                          // steps to prevent from being overwritten.
-        SizeType32 offset{0};       // Record the usage offset of the cacheGenerationLogits buffer.
+        //! Buffer for logits between steps to prevent from being overwritten
+        //! [kCACHE_LENGTH, maxBatchSize * maxBeamWidth, vocabSizePadded]
+        TensorPtr logits;
+        //! Record the usage offset of the cacheGenerationLogits buffer
+        SizeType32 offset{0};
 
-        TensorPtr transposedLogits; // [maxBeamWidth, kCACHE_LENGTH], Temporarily store the transposed results of
-                                    // multiple fragment logits.
-        TensorPtr
-            fragmentPointerDevice;  // [kCACHE_LENGTH], Temporarily store logits buffer address during the transposing.
-        TensorPtr fragmentPointerHost; // [maxBatchSize, kCACHE_LENGTH], Temporarily store logits buffer address during
-                                       // the transposing.
-        size_t workIdx{0};             // Cycling index for workspace
+        //! Temporarily store the transposed results of multiple fragment logits, [maxBeamWidth, kCACHE_LENGTH]
+        TensorPtr transposedLogits;
+
+        //! Temporarily store logits buffer address during the transposing, [kCACHE_LENGTH]
+        TensorPtr fragmentPointerDevice;
+
+        //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
+        TensorPtr fragmentPointerHost;
+
+        //! Cycling index for workspace
+        size_t workIdx{0};
 
         void cycleWorkIdx()
         {
@@ -218,30 +226,31 @@ public:
 
     GenerationLogitsCache generationLogitsCache;
 
-    // Helper for KV cache rewind
+    //! Helper for KV cache rewind
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
     TensorPtr sortedSeqSlots;
-    // TODO: move into decoderBuffers.DraftBuffers
-    TensorPtr seqSlotRemappingHost;                                 // [numSequences]
-    TensorPtr seqSlotRemappingDevice;                               // [numSequences]
+    //! TODO: move into decoderBuffers.DraftBuffers
+    TensorPtr seqSlotRemappingHost;   // [numSequences]
+    TensorPtr seqSlotRemappingDevice; // [numSequences]
 
-    TensorPtr mCacheIndirDecoderIOBatchedCopySrcOffsetsSliceDevice; // [mMaxNumRequests], device: explicitly
-                                                                    // device-copied src offsets to reduce warp stalls
-                                                                    // in copy batch kernel invocation.
-    TensorPtr mCacheIndirDecoderIOBatchedCopyDstOffsetsSliceDevice; // [mMaxNumRequests], device: explicitly
-                                                                    // device-copied dst offsets to reduce warp stalls
-                                                                    // in copy batch kernel invocation.
-    TensorPtr
-        mCacheIndirDecoderIOBatchedCopyCopySizesDevice; // [mMaxNumRequests], device: explicitly device-copied slice
-                                                        // sizes to reduce warp stalls in copy batch kernel invocation.
+    //! Explicitly device-copy src offsets to reduce warp stalls in copy batch kernel invocation
+    //! [mMaxNumRequests], on gpu
+    TensorPtr mCacheIndirDecoderIOBatchedCopySrcOffsetsSliceDevice;
+    //! Explicitly device-copy dst offsets to reduce warp stalls in copy batch kernel invocation
+    //! [mMaxNumRequests], on gpu
+    TensorPtr mCacheIndirDecoderIOBatchedCopyDstOffsetsSliceDevice;
+    //! Explicitly device-copy size to reduce warp stalls in copy batch kernel invocation
+    //! [mMaxNumRequests], on gpu
+    TensorPtr mCacheIndirDecoderIOBatchedCopyCopySizesDevice;
+
 private:
-    // Re-capture cuda graph when max kv cache len of the batch has changed on kKV_CACHE_LEN_CUDA_GRAPH_ROUND_SIZE.
+    //! Re-capture cuda graph when max kv cache len of the batch has changed on kKV_CACHE_LEN_CUDA_GRAPH_ROUND_SIZE.
     static SizeType32 constexpr kKV_CACHE_LEN_CUDA_GRAPH_ROUND_SIZE{256};
 
     TensorMap mAdditionalOutputTensors; // Tensors storing additional output tensors.
 
-    // engine I/O
+    //! Engine I/O
     TensorMap inputMap;
     TensorMap outputMap;
 
