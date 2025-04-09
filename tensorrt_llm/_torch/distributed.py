@@ -73,8 +73,8 @@ def allreduce(
     Returns:
         The reduced tensor and an optional intermediate tensor if fused.
     '''
-    if mapping.world_size == 1 or (all_reduce_params is not None and
-                                   all_reduce_params.enable_allreduce == False):
+    if mapping.tp_size == 1 or (all_reduce_params is not None and
+                                all_reduce_params.enable_allreduce == False):
         return input
 
     if all_reduce_params is None:

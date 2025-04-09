@@ -82,18 +82,16 @@ class Attention(nn.Module):
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
-        rank = config.mapping.rank
         if config.mapping.enable_attention_dp:
             tp_size = 1
-            pp_size = 1
-            rank = 0
 
         mapping = Mapping(
             world_size=tp_size * pp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            rank=rank,
+            rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
+            enable_attention_dp=config.mapping.enable_attention_dp,
         )
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
@@ -280,18 +278,16 @@ class MLA(nn.Module):
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
-        rank = config.mapping.rank
         if config.mapping.enable_attention_dp:
             tp_size = 1
-            pp_size = 1
-            rank = 0
 
         mapping = Mapping(
             world_size=tp_size * pp_size,
             tp_size=tp_size,
             pp_size=pp_size,
-            rank=rank,
+            rank=config.mapping.rank,
             gpus_per_node=config.mapping.gpus_per_node,
+            enable_attention_dp=config.mapping.enable_attention_dp,
         )
 
         assert self.num_heads % tp_size == 0
