@@ -77,12 +77,10 @@ StatefulGptDecoder::StatefulGptDecoder(std::size_t vocabSize, std::size_t vocabS
 }
 
 void StatefulGptDecoder::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_CHECK(maxTokensPerStep == 1);
     mDecoder = IGptDecoder::create(
         mode, dtype, maxBatchSize, maxBeamWidth, mVocabSize, mVocabSizePadded, maxSequenceLength, mStream);
 
@@ -230,7 +228,7 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, GenerationOutpu
             }
             badWordsLensRange[bi] = badWordsLen;
         }
-        // NOTE(nkorobov): dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
+        // NOTE: dInput->badWordsList is not used in gptDecoder, but required to keep badWordsList memory
         // allocated
         dInput.badWordsLists.at(0) = badWordsList;
     }
@@ -247,7 +245,7 @@ void StatefulGptDecoder::newBatch(GenerationInput const& inputs, GenerationOutpu
             stopWordsPtrsRange[bi] = bufferCast<TokenIdType>(*stopWordsList) + bi * 2 * stopWordsLen;
             stopWordsLensRange[bi] = stopWordsLen;
         }
-        // NOTE(nkorobov): dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
+        // NOTE: dInput->stopWordsList is not used in gptDecoder, but required to keep stopWordsList memory
         // allocated
         dInput.stopWordsLists.at(0) = stopWordsList;
     }
@@ -363,11 +361,10 @@ void StatefulGptDecoder::forwardSync()
 
 void StatefulGptDecoder::finalize(SamplingConfig const& samplingConfig) const
 {
-    // TODO (rkobus) can we do this inplace?
+    // TODO can we do this inplace?
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& outputIds = mDecodingOutput->ids;
-    kernels::gatherTree(*mDecodingOutput, *mDecodingInput, mBufferManager, samplingConfig);
+    kernels::gatherTree(*mDecodingOutput, *mDecodingInput, samplingConfig, mBufferManager.getStream());
     mBufferManager.copy(*(mDecodingOutput->gatheredIds), *outputIds);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return;
 }

@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -15,8 +13,6 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_bert import \
     BertForSequenceClassification
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
 BERT_CONFIG = {
     "architectures": ["BertForSequenceClassification"],
@@ -55,10 +51,10 @@ class TestBertForSequenceClassification(unittest.TestCase):
         super().setUp()
         torch.random.manual_seed(1234)
 
-    @parameterized.expand([
-        Scenario(backend="VANILLA"),
-    ], lambda testcase_func, param_num, param:
-                          f"{testcase_func.__name__}[{param.args[0]}]")
+    @parameterized.expand(
+        [Scenario(backend="VANILLA"),
+         Scenario(backend='TRTLLM')], lambda testcase_func, param_num, param:
+        f"{testcase_func.__name__}[{param.args[0]}]")
     def test_bert_allclose_to_hf(self, scenario: Scenario):
         """Compare output to HF"""
         backend = scenario.backend
@@ -105,15 +101,18 @@ class TestBertForSequenceClassification(unittest.TestCase):
         # Fill the metadata for tllm attn
         request_ids = [1]
         prompt_lens = [input_ids.size(-1)]
+
         attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
-            num_contexts=1,
             max_num_requests=1,
             max_num_tokens=8192,
             kv_cache_manager=None,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
         )
+        attn_metadata.max_seq_len = input_ids.size(-1)
+        attn_metadata.prepare()
 
         # Flat the inputs for tllm model
         input_ids = input_ids.squeeze(0)
@@ -121,7 +120,6 @@ class TestBertForSequenceClassification(unittest.TestCase):
 
         # Run inference
         with torch.inference_mode():
-            #NOTE:attn_metadata.prepare is not needed for no cache case
             # TRT-LLM model forward
             tllm_outputs = tllm_model(
                 input_ids=input_ids,

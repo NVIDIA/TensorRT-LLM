@@ -17,24 +17,52 @@
 
 #pragma once
 
+#include "ucxx/api.h"
+#include "ucxx/utils/sockaddr.h"
+#include "ucxx/utils/ucx.h"
+#include <cstdint>
+#if __linux__
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#endif
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include <memory>
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
+class UcxConnectionManager;
 
-extern "C"
+class UcxConnection : public Connection
 {
-    [[nodiscard]] std::unique_ptr<ConnectionManager> makeUcxConnectionManager(mpi::MpiComm const* comm);
-}
+public:
+    using ConnectionIdType = uint64_t;
 
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
+    UcxConnection() = default;
+    explicit UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
+        UcxConnectionManager* manager, bool fromRequester);
+    ~UcxConnection();
+    void sendConnectionId(DataContext const& ctx, void const* data, size_t size) const;
+    void send(DataContext const& ctx, void const* data, size_t size) const override;
+    void recv(DataContext const& ctx, void* data, size_t size) const override;
+    friend class UcxConnectionManager;
+
+private:
+    uint64_t mSendTagPrefix{0};
+    uint64_t mRecvTagPrefix{0};
+
+    ConnectionIdType mConnectionId;
+    ConnectionIdType mConnectionIdInPeer;
+    std::shared_ptr<ucxx::Endpoint> mEndpoint;
+    UcxConnectionManager* mManager;
+    bool mFromRequester;
+
+    bool isFromRequester() const
+    {
+        return mFromRequester;
+    }
+};
 
 } // namespace tensorrt_llm::executor::kv_cache

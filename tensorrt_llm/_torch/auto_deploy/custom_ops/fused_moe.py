@@ -3,7 +3,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.fused_moe import FusedMoE  # noqa: F401
+from ...modules.fused_moe import FusedMoE  # noqa: F401
 
 
 @torch.library.custom_op("moe::torch_moe", mutates_args=())
@@ -151,6 +151,7 @@ def trtllm_fused_moe(
 ) -> torch.Tensor:
     routing_weights = routing_weights.to(torch.float32)
     selected_experts = selected_experts.to(torch.int32)
+    quant_scales = []
 
     return torch.ops.trtllm.fused_moe(
         x,
@@ -159,11 +160,12 @@ def trtllm_fused_moe(
         w3_w1_stacked_weight,
         w2_stacked_weight,
         x.dtype,
+        quant_scales,
         tp_size=1,
         tp_rank=0,
         ep_size=1,
         ep_rank=0,
-    )
+    )[0]
 
 
 @trtllm_fused_moe.register_fake

@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/types.h"
+#include <cstdint>
+#include <limits>
+#include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
 
 #if defined(_WIN32)
@@ -124,21 +128,44 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI)
+    if (mCommType == CommType::MPI || mCommType == CommType::UCX)
     {
+        if (mCommType == CommType::UCX)
+        {
+            std::lock_guard<std::mutex> lock(mDllMutex);
+            mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
+            TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+            auto load_sym = [](void* handle, char const* name)
+            {
+                void* ret = dllGetSym(handle, name);
+                TLLM_CHECK_WITH_INFO(ret != nullptr,
+                    "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+                    "built with UCX support, please rebuild in UCX-enabled environment.");
+                return ret;
+            };
+            std::unique_ptr<tensorrt_llm::executor::kv_cache::ConnectionManager> (*makeUcxConnectionManager)();
+            *(void**) (&makeUcxConnectionManager) = load_sym(mWrapperLibHandle, "makeUcxConnectionManager");
+            mManager = makeUcxConnectionManager();
+            TLLM_LOG_INFO("UCX Connection Manager created");
+        }
+        else
+        {
+            mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
+            mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
+            TLLM_LOG_INFO("MPI Connection Manager created");
+        }
+
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-        mMpiWorldComm = std::addressof(tensorrt_llm::mpi::MpiComm::world());
-        mManager = std::make_unique<executor::kv_cache::MpiConnectionManager>(mMpiWorldComm);
-        mDataResponder = isMLA
-            ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
-        mDataRequester = isMLA
-            ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<MLACacheFormatter>(cacheManager)))
-            : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mManager.get(), *mCacheState, worldConfig.getRank(), std::make_unique<CacheFormatter>(cacheManager)));
+        auto makeFormatter = [cacheManager, isMLA]() -> std::unique_ptr<IOFormatter>
+        {
+            return isMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(cacheManager))
+                         : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(cacheManager));
+        };
+
+        mDataResponder = std::make_unique<DataResponder>(
+            std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        mDataRequester = std::make_unique<DataRequester>(
+            std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
     }
     else
     {
@@ -258,6 +285,56 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     mpiComm.allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
         sizes, displs, mpi::MpiType::kUINT64);
     return retData;
+}
+
+void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
+{
+    namespace su = executor::serialize_utils;
+    int worldSize = mpiComm.getSize();
+
+    std::ostringstream oStream;
+    su::serialize(request->getKvCacheTransferStart(), oStream);
+    su::serialize(request->getKvCacheTransferEnd(), oStream);
+
+    auto str = oStream.str();
+    std::vector<char> sendBuffer(str.begin(), str.end());
+    auto sendBufferSize = sendBuffer.size();
+    auto recvBufferSize = sendBufferSize * worldSize;
+    std::vector<char> recvBuffer(recvBufferSize);
+
+    mpiComm.allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+
+    su::VectorWrapBuf<char> strbuf(recvBuffer);
+    std::istream is(&strbuf);
+
+    auto minStartTime = executor::RequestPerfMetrics::TimePoint::max();
+    auto maxEndTime = executor::RequestPerfMetrics::TimePoint::min();
+
+    for (int rank = 0; rank < worldSize; rank++)
+    {
+        minStartTime = std::min(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), minStartTime);
+        maxEndTime = std::max(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), maxEndTime);
+    }
+
+    // Handle KV cache size separately - gather all sizes to the leader rank
+    std::size_t localKVCacheSize = request->getKvCacheSize();
+    std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
+
+    mpiComm.allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
+
+    std::size_t totalKVCacheSize = 0;
+    for (int rank = 0; rank < worldSize; rank++)
+    {
+        totalKVCacheSize += allKVCacheSizes[rank];
+    }
+
+    // Update the latest KV cache transfer time for leader rank
+    if (mpiComm.getRank() == 0)
+    {
+        request->setKvCacheTransferStart(minStartTime);
+        request->setKvCacheTransferEnd(maxEndTime);
+        request->setKvCacheSize(totalKVCacheSize);
+    }
 }
 
 void CacheTransceiver::checkContextTransferStatus(bool blocking)
@@ -403,6 +480,11 @@ void CacheTransceiver::checkGenTransferStatus(int atLeastRequestNum)
         {
             it->second.get();
 
+            // Gather the kv cache transfer time from all workers and update to leader rank
+            if (!common::getEnvKVCacheTransferOutputPath().empty())
+            {
+                updateKVCacheTransferBW(*mMpiGroupComm, it->first);
+            }
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                 "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                 it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());

@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from test_llm import get_model_path
+import pytest
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -11,6 +11,8 @@ from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi import LLM, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
+
+from .test_llm import get_model_path
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 llama_model_path = get_model_path(default_model_name)
@@ -119,6 +121,7 @@ def test_expected_kv_cache_events():
                 assert event[0]["data"]["type"] == "stored"
 
 
+@pytest.mark.skip("https://nvbugs/5150466: flaky fail")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)

@@ -70,10 +70,9 @@ SamplingConfig extractSamplingConfig(SamplingConfig const& batchSamplingConfig, 
 
 } // namespace
 
-StatefulGptDecoderBatched::StatefulGptDecoderBatched(
-    CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype)
+StatefulGptDecoderBatched::StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype)
 {
-    mDecoder = std::make_unique<GptDecoderBatched>(stream, speculativeDecodingMode, dtype);
+    mDecoder = std::make_unique<GptDecoderBatched>(stream, SpeculativeDecodingMode::None(), dtype);
 
     auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
 
@@ -86,11 +85,11 @@ StatefulGptDecoderBatched::StatefulGptDecoderBatched(
 
 StatefulGptDecoderBatched::~StatefulGptDecoderBatched() = default;
 
-void StatefulGptDecoderBatched::setup(tensorrt_llm::executor::DecodingMode const& mode, SizeType32 maxBatchSize,
+void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize,
     SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-    SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
+    constexpr SizeType32 maxTokensPerStep = 1;
     mDecoder->setup(mode, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength, maxSequenceLength,
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
@@ -105,9 +104,10 @@ void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, Generati
     // split batch into single requests
     auto const& inputLengths = inputs.lengths;
     mDecoder->getDecoderState().setActualBatchSize(inputLengths->getShape().d[0]);
-    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.clear();
-    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.resize(
-        mDecoder->getDecoderState().getActualBatchSize(), 1);
+    for (auto i = 0; i < mDecoder->getDecoderState().getActualBatchSize(); ++i)
+    {
+        mDecoder->getDecoderState().setNumDecodingEngineTokens(i, 1);
+    }
 
     auto const& jointOutputIdsShape = mDecoder->getDecoderState().getJointDecodingOutput().ids->getShape();
     auto const maxBatchSize = jointOutputIdsShape.d[0];
@@ -238,7 +238,7 @@ void StatefulGptDecoderBatched::forwardSync()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mDecoderFinishEvent->event.synchronize();
+    mDecoderFinishEvent.synchronize();
 
     // wait for mFinishedSum to be updated
     mForwardEvent.synchronize();
@@ -263,7 +263,7 @@ void StatefulGptDecoderBatched::finalize(SamplingConfig const& samplingConfig) c
     {
         auto slot = batchSlots[batchIdx];
         auto requestSamplingConfig = extractSamplingConfig(samplingConfig, slot);
-        auto event = mDecoder->finalize(slot, requestSamplingConfig, /*streaming*/ false);
+        auto event = mDecoder->finalize(mDecoder->getDecoderState(), slot, requestSamplingConfig, /*streaming*/ false);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

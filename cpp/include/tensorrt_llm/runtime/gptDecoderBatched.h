@@ -46,12 +46,6 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using SharedConstPtr = ITensor::SharedConstPtr;
 
-    enum class ForwardType
-    {
-        kASYNC,
-        kSYNC
-    };
-
     GptDecoderBatched(
         CudaStreamPtr stream, SpeculativeDecodingMode const& speculativeDecodingMode, nvinfer1::DataType dtype);
 
@@ -60,18 +54,22 @@ public:
         SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig) override;
 
-    void disableLookahead(
-        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots) override;
+    void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 
-    DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
+    CudaEvent forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
     void forward(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
     //! @brief Gather final beam search results for request `batchSlot`.
     //! Result will only be available after event returned.
-    [[nodiscard]] CudaEvent finalize(
-        SizeType32 batchSlot, SamplingConfig const& samplingConfig, bool streaming) const override;
+    [[nodiscard]] CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+        SamplingConfig const& samplingConfig, bool streaming) const override;
 
-    decoder::DecoderState& getDecoderState() const
+    decoder::DecoderState& getDecoderState()
+    {
+        return *mDecoderState;
+    }
+
+    decoder::DecoderState const& getDecoderState() const
     {
         return *mDecoderState;
     }
@@ -99,13 +97,10 @@ private:
     void setEagleInputs(decoder_batch::Input const& input);
 
     //! @brief Calls decoders for tokens per engine step
-    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);
+    void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input);
 
     //! @brief Prepare Input and Output for decoder step
     void prepareForward(SizeType32 step, decoder_batch::Output& output, decoder_batch::Input const& input);
-
-    //! @brief Calls decoder for whole batch
-    void forwardDecoder(DecodingOutput& output, DecodingInput const& input, ForwardType forwardType);
 
 private:
     CudaStreamPtr mRuntimeStream;

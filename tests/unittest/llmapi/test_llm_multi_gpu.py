@@ -15,7 +15,7 @@ from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 # isort: off
-from test_llm import (
+from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, default_model_name, get_model_path,
@@ -27,10 +27,12 @@ from test_llm import (
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
-from test_llm_kv_cache_events import create_llm
+from .test_llm_kv_cache_events import create_llm
 from utils.util import (skip_gpu_memory_less_than, skip_single_gpu,
                         unittest_name_func, force_ampere)
 # isort: on
+
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 # shrink the kv_cache_config to avoid OOM in CI
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
@@ -63,7 +65,8 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
         assert llm.args.parallel_config.tp_size == tp_size
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     return tmpdir
 
@@ -91,7 +94,7 @@ def test_llm_generate_tp2():
 
 
 def test_llm_explicit_shutdown():
-    # with-statement will invoke _shutdown() explicitly
+    # with-statement will invoke `shutdown()` explicitly
     with LLM(model=llama_model_path,
              tensor_parallel_size=2,
              kv_cache_config=global_kv_cache_config,
@@ -156,7 +159,8 @@ def test_llm_generate_mixtral_for_ep2():
         print(output)
 
     tmpdir = tempfile.TemporaryDirectory()
-    llm.save(tmpdir.name)
+    with llm:
+        llm.save(tmpdir.name)
 
     with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
         # read the build_config and check if the parameters are correctly saved
@@ -396,11 +400,10 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
     # test in streaming mode
     async def task():
         with pytest.raises(DummyError):
-            with llm:
-                async for output in llm.generate_async(
-                        prompts[0], streaming=True,
-                        sampling_params=sampling_params):
-                    print(output)
+            async for output in llm.generate_async(
+                    prompts[0], streaming=True,
+                    sampling_params=sampling_params):
+                print(output)
 
     asyncio.run(task())
 
@@ -484,7 +487,7 @@ def test_llm_get_kv_cache_events_tp2():
 
 
 @pytest.fixture(scope="module")
-def llm_for_sampling_params_tp2() -> LLM:
+def llm_for_sampling_params_tp2():
     build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
@@ -493,7 +496,8 @@ def llm_for_sampling_params_tp2() -> LLM:
         kv_cache_config=global_kv_cache_config,
         tensor_parallel_size=2,
     )
-    return llm
+    yield llm
+    llm.shutdown()
 
 
 @pytest.mark.parametrize("sampling_params",

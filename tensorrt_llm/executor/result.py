@@ -106,6 +106,7 @@ class GenerationResultBase:
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
         self.disaggregated_params = None
+        self.decoding_iter = 0
         self._done = False
 
         if has_event_loop():
@@ -173,6 +174,15 @@ class GenerationResultBase:
             output.token_ids = response_tensors.output_token_ids[src_idx]
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+
+        # In PD, the first generation response will return 2 tokens
+        # Skip output the first generated token in generation response
+        # TODO: We should have a better way to handle this when enable
+        # beam search with PD.
+        if not self.sampling_params.use_beam_search and \
+            len(response_tensors.output_token_ids[src_idx]) == 2:
+            output._last_token_ids_len = 1
+
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
         if response_tensors.log_probs is not None:
@@ -238,6 +248,7 @@ class GenerationResultBase:
             response_result = response.result
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
+            self.decoding_iter = response_result.decoding_iter
             if context_phase_params is not None:
                 self.disaggregated_params = DisaggregatedParams(
                     request_type="context_only",
@@ -292,6 +303,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
+    @nvtx_range("handle_response",
+                color="red",
+                category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 

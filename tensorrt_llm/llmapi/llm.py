@@ -19,7 +19,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.utils import create_mpi_comm_session
+from ..executor.utils import (create_mpi_comm_session,
+                              get_spawn_proxy_process_env)
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -87,8 +88,8 @@ LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
 class LLM:
     """LLM class is the main class for running a LLM model.
 
-    Args:
-    """
+    Parameters:
+"""
 
     def __init__(self,
                  model: Union[str, Path],
@@ -98,7 +99,6 @@ class LLM:
                  skip_tokenizer_init: bool = False,
                  trust_remote_code: bool = False,
                  tensor_parallel_size: int = 1,
-                 pipeline_parallel_size: int = 1,
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
@@ -116,7 +116,6 @@ class LLM:
                 skip_tokenizer_init=skip_tokenizer_init,
                 trust_remote_code=trust_remote_code,
                 tensor_parallel_size=tensor_parallel_size,
-                pipeline_parallel_size=pipeline_parallel_size,
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
@@ -127,7 +126,9 @@ class LLM:
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
 
-        self.mpi_session = self.args._mpi_session
+        print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
+                            "yellow")
+        self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
             if get_device_count(
@@ -140,11 +141,15 @@ class LLM:
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
             if not self.mpi_session:
-                if not external_mpi_comm_available(
-                        self.args.parallel_config.world_size):
+                mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+                if not mpi_process_pre_spawned:
+                    print_colored_debug(f"LLM create MpiPoolSession\n",
+                                        "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
+                    print_colored_debug(f"LLM create MpiCommSession\n",
+                                        "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
 
@@ -351,11 +356,9 @@ class LLM:
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
         )
-        #For dis serving context only requests, skip post-processing
-        tokenizer = None if (disaggregated_params
-                             and disaggregated_params.request_type
-                             == "context_only") else self.tokenizer
-        return RequestOutput._from_generation_result(result, prompt, tokenizer)
+
+        return RequestOutput._from_generation_result(result, prompt,
+                                                     self.tokenizer)
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
@@ -505,7 +508,8 @@ class LLM:
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=self.args.batching_type or tllm.BatchingType.INFLIGHT,
+            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
+            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits)
@@ -542,9 +546,10 @@ class LLM:
 
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
-        executor_config.max_beam_width = self.args.build_config.max_beam_width
+        executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
         if self.args.extended_runtime_perf_knob_config is not None:
-            executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
+            executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
+                self.args.extended_runtime_perf_knob_config)
 
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         update_executor_config(
@@ -555,7 +560,9 @@ class LLM:
             build_config=self.args.build_config,
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
-            trt_engine_dir=self._engine_dir)
+            trt_engine_dir=self._engine_dir,
+            max_input_len=self.args.max_input_len,
+            max_seq_len=self.args.max_seq_len)
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
             self.args.build_config
@@ -570,8 +577,8 @@ class LLM:
                 self.args.parallel_config.world_size),
             return_logits=return_logits,
             postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args._num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
+                num_postprocess_workers=self.args.num_postprocess_workers,
+                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True)
 

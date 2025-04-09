@@ -8,12 +8,13 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.lora_manager import PeftConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest
+from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -28,6 +29,10 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
 KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
+PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
+PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
+LoraModule = tensorrt_llm.bindings.LoraModule
+LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -210,6 +215,7 @@ class KVCacheManager(BaseResourceManager):
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
+        self.enable_block_reuse = kv_cache_config.enable_block_reuse
 
     def shutdown(self):
         self.impl.release_pools()
@@ -291,6 +297,7 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
     ):
         beam_width = 1
@@ -303,18 +310,18 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=1,
-                input_tokens=[1] * token_num,
-                sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                    sampling_params._get_sampling_config()),
-                is_streaming=False,
-                encoder_input_tokens=encoder_input_tokens)
+            req = LlmRequest(request_id=req_id,
+                             max_new_tokens=1,
+                             input_tokens=[1] * token_num,
+                             sampling_config=SamplingConfig(
+                                 sampling_params._get_sampling_config()),
+                             is_streaming=False,
+                             encoder_input_tokens=encoder_input_tokens)
             req.paged_kv_block_ids = []
-            self.impl.add_sequence(req_id, token_num, beam_width, req)
+            if prepare_resource:
+                self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
-                req.state = tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1 + max_num_draft_tokens
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
@@ -325,7 +332,7 @@ class KVCacheManager(BaseResourceManager):
     def update_resources(self, scheduled_batch: ScheduledRequests):
         # rewind kv cache
         for request in scheduled_batch.generation_requests:
-            if request.state != tensorrt_llm.bindings.LlmRequestState.GENERATION_COMPLETE:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
 
@@ -432,6 +439,16 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer[layer_idx],
             self.head_dim,
         )
+
+    def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq_tensors = [
+            torch.tensor(sublist, dtype=torch.int)
+            for sublist in block_ids_per_seq
+        ]
+        padded_tensor = torch.nn.utils.rnn.pad_sequence(
+            block_ids_per_seq_tensors, batch_first=True, padding_value=0)
+        return padded_tensor
 
     def flush_iteration_events(self):
         self.impl.flush_iteration_events()
@@ -548,3 +565,235 @@ class ResourceManager:
         assert set(resource_manager_list) == set(self.resource_managers.keys())
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)
+
+
+class PeftCacheManager(BaseResourceManager):
+
+    def __init__(self, peft_cache_config: PeftCacheConfig,
+                 model_config: ModelConfig, peft_config: PeftConfig):
+        import tensorrt_llm.bindings as _tb
+
+        peft_cache_manager_config = _tb.PeftCacheManagerConfig(
+            num_host_module_layer=peft_cache_config.num_host_module_layer,
+            num_device_module_layer=peft_cache_config.num_device_module_layer,
+            optimal_adapter_size=peft_cache_config.optimal_adapter_size,
+            max_adapter_size=peft_cache_config.max_adapter_size,
+            num_put_workers=peft_cache_config.num_put_workers,
+            num_ensure_workers=peft_cache_config.num_ensure_workers,
+            num_copy_streams=peft_cache_config.num_copy_streams,
+            max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
+            max_pages_per_block_device=peft_cache_config.
+            max_pages_per_block_device,
+            device_cache_percent=(peft_config.device_cache_percent
+                                  if peft_config.device_cache_percent else
+                                  peft_cache_config.device_cache_percent),
+            host_cache_size=peft_cache_config.host_cache_size,
+            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
+        )
+        _model_config = _tb.ModelConfig(
+            vocab_size=model_config.vocab_size,
+            num_layers=model_config.num_hidden_layers,
+            num_attention_layers=model_config.num_attention_layers,
+            num_rnn_layers=model_config.num_rnn_layers,
+            num_heads=model_config.num_attention_heads,
+            hidden_size=model_config.hidden_size,
+            data_type=DataType.HALF)
+        # TODO smor- remove other manual settings once configuration is finalized
+
+        # TODO smor- change this. Currently copied from cpp tests definition
+        lora_modules = [
+            LoraModule(module_type=LoraModuleType.ATTN_QKV,
+                       in_dim=16,
+                       out_dim=3 * 16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_Q,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_K,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_V,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_DENSE,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+            LoraModule(module_type=LoraModuleType.MLP_H_TO_4H,
+                       in_dim=16,
+                       out_dim=32,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.MLP_4H_TO_H,
+                       in_dim=32,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+            LoraModule(module_type=LoraModuleType.MLP_GATE,
+                       in_dim=16,
+                       out_dim=32,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_QKV,
+                       in_dim=16,
+                       out_dim=3 * 16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_Q,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_K,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_V,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_DENSE,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+        ]
+
+        # TODO smor- prettify this
+        # lora_modules = [LoraModule(
+        #         module_type=LoraModuleType.ATTN_QKV,
+        #         in_dim=model_config.hidden_size,
+        #         out_dim=model_config.hidden_size * 3,
+        #         in_dim_first=False,
+        #         out_dim_first=True,
+        #         in_tp_split_dim=-1,
+        #         out_tp_split_dim=0,
+        #     ),
+        #     LoraModule(
+        #         module_type=LoraModuleType.CROSS_ATTN_QKV,
+        #         in_dim=model_config.hidden_size,
+        #         out_dim=model_config.hidden_size * 3,
+        #         in_dim_first=False,
+        #         out_dim_first=True,
+        #         in_tp_split_dim=-1,
+        #         out_tp_split_dim=0,
+        #     ),
+        #     ]
+
+        # for module_type, rank in module_types:
+        #     module_cpp = LoraModule(
+        #         module_type=module_type,
+        #         in_dim=model_config.hidden_size,
+        #         out_dim=model_config.hidden_size,
+        #         in_dim_first=False,
+        #         out_dim_first=True,
+        #         in_tp_split_dim=-1,
+        #         out_tp_split_dim=rank,
+        #     )
+        #     lora_modules.append(module_cpp)
+
+        # FIXME
+        _model_config.lora_modules = lora_modules
+        _model_config.use_lora_plugin = True
+        _model_config.max_lora_rank = 64  # TODO smor- currently set manually, automate
+
+        # TODO smor- currently set manually, change that
+        world_config = _tb.WorldConfig()
+
+        BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
+        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
+        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
+        cuda_stream = CudaStream(self._stream)
+        buffer_manager = BufferManager(cuda_stream, True)
+        self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
+                                        model_config=_model_config,
+                                        world_config=world_config,
+                                        buffer_manager=buffer_manager)
+
+    def add_request_peft(self, request: LlmRequest):
+        # TODO smor- a helper function to add a request to the peft cache manager.
+        # Cosnider replacing in favor of prepare_resources
+        self.impl.add_request_peft(request, True)
+
+    def ensure_batch(self,
+                     context_batch: List[LlmRequest],
+                     generation_batch: List[LlmRequest],
+                     reset_gpu_cache: bool = False) -> List[LlmRequest]:
+        return self.impl.ensure_batch(context_batch, generation_batch,
+                                      reset_gpu_cache)
+
+    def get_max_resource_count(self) -> int:
+        return 0
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return 0
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        context_batch = scheduled_batch.context_requests
+        generation_batch = scheduled_batch.generation_requests
+        for req in context_batch:
+            if req.lora_weights is not None and req.lora_config is not None:
+                req.lora_weights = req.lora_weights.reshape(
+                    [1] + list(req.lora_weights.shape))
+                req.lora_config = req.lora_config.reshape(
+                    [1] + list(req.lora_config.shape))
+            self.impl.add_request_peft(req, True)
+            import time
+            time.sleep(0.1)  # FIXME
+
+        py_lora_task_layer_module_configs = self.impl.ensure_batch(
+            context_batch, generation_batch, False)
+
+        for req in context_batch:
+            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                req.
+                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+        for req in generation_batch:
+            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                req.
+                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+
+    def update_resources(self, scheduled_batch: ScheduledRequests):
+        pass
+
+    def free_resources(self, request: LlmRequest):
+        pass
+
+    def shutdown(self):
+        pass

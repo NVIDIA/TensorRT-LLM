@@ -28,8 +28,8 @@ using tensorrt_llm::plugins::GPTAttentionPluginCreatorCommon;
 using tensorrt_llm::plugins::GPTAttentionPluginCommon;
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
-    int num_kv_heads, int head_size, int unidirectional, float q_scaling, float attn_logit_softcapping_scale,
-    tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    int num_kv_heads, int num_kv_heads_origin, int head_size, int unidirectional, float q_scaling,
+    float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
@@ -52,6 +52,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mVisionStart = vision_start;
     mVisionLength = vision_length;
     mNumKVHeads = num_kv_heads;
+    mNumKVHeadsOrigin = num_kv_heads_origin;
     mHeadSize = head_size;
     mUnidirectional = unidirectional;
     mQScaling = q_scaling;
@@ -114,6 +115,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mVisionStart);
     read(d, mVisionLength);
     read(d, mNumKVHeads);
+    read(d, mNumKVHeadsOrigin);
     read(d, mHeadSize);
     read(d, mUnidirectional);
     read(d, mQScaling);
@@ -201,13 +203,13 @@ void GPTAttentionPluginCommon::destroy() noexcept
 size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
 {
     return sizeof(mLayerIdx) + sizeof(mNumHeads) + +sizeof(mVisionStart) + sizeof(mVisionLength) + sizeof(mNumKVHeads)
-        + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling) + sizeof(mAttnLogitSoftcappingScale)
-        + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim) + sizeof(mRotaryEmbeddingBase)
-        + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale) + sizeof(mRotaryEmbeddingShortMscale)
-        + sizeof(mRotaryEmbeddingLongMscale) + sizeof(mRotaryEmbeddingMaxPositions)
-        + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize) + sizeof(mTpRank) + sizeof(mEnableContextFMHA)
-        + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode) + sizeof(mEnableXQA)
-        + sizeof(unsigned int) // mKVCacheQuantMode
+        + sizeof(mNumKVHeadsOrigin) + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling)
+        + sizeof(mAttnLogitSoftcappingScale) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
+        + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
+        + sizeof(mRotaryEmbeddingShortMscale) + sizeof(mRotaryEmbeddingLongMscale)
+        + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize)
+        + sizeof(mTpRank) + sizeof(mEnableContextFMHA) + sizeof(mFMHAForceFP32Acc) + sizeof(mMultiBlockMode)
+        + sizeof(mEnableXQA) + sizeof(unsigned int) // mKVCacheQuantMode
         + sizeof(mRemovePadding) + sizeof(mMaskType) + sizeof(mBlockSparseParams) + sizeof(mPagedKVCache)
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
@@ -228,6 +230,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mVisionStart);
     write(d, mVisionLength);
     write(d, mNumKVHeads);
+    write(d, mNumKVHeadsOrigin);
     write(d, mHeadSize);
     write(d, mUnidirectional);
     write(d, mQScaling);
@@ -307,6 +310,7 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("vision_start", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("vision_length", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("num_kv_heads_origin", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("layer_idx_in_cache_pool", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32));

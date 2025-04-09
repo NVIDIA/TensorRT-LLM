@@ -199,7 +199,7 @@ protected:
 
     static constexpr SizeType32 mMaxSeqLen{16};
     static constexpr SizeType32 mVocabSizePadded{32};
-    // TODO(nkorobov): add beam width
+    // TODO: add beam width
     static constexpr SizeType32 mBeamWidth{1};
 };
 

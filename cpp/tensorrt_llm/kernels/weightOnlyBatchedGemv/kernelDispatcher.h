@@ -15,6 +15,7 @@
  */
 
 #pragma once
+
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernel.h"
 

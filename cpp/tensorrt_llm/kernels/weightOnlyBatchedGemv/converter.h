@@ -15,11 +15,10 @@
  */
 
 #pragma once
-#include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
 
-#include "cutlass/cutlass.h"
-#include "cutlass/numeric_conversion.h"
-#include "cutlass_extensions/interleaved_numeric_conversion.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass_extensions/interleaved_numeric_conversion.h>
 
 namespace tensorrt_llm
 {

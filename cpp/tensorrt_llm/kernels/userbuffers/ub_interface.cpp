@@ -39,9 +39,9 @@ bool ub_is_initialized()
     return UserBufferAllocator::Instance().is_initialized();
 }
 
-void* ub_allocate(int idx, size_t bytes)
+UBBuffer ub_allocate(size_t bytes)
 {
-    return UserBufferAllocator::Instance().allocate(idx, bytes);
+    return UserBufferAllocator::Instance().allocate(bytes);
 }
 
 void ub_deallocate(void* addr)
@@ -89,12 +89,12 @@ int allgather2_userbuff_residual_launcher(int const handler, size_t const offset
         handler, offset, elements, hidden_size, residual, dataType, comm, stream, force_enable);
 }
 
-int allreduce2_userbuff_inplace_rmsnorm_launcher(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* beta, void* gamma, float eps, void* residual_in, void* residual_out,
-    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+int allreduce2_userbuff_rmsnorm_launcher(int const handler, size_t const offset, int const out_handler,
+    size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
-    return allreduce2_userbuff_inplace_rmsnorm_impl(
-        handler, offset, elements, hidden_size, beta, gamma, eps, residual_in, residual_out, dataType, comm, stream);
+    return allreduce2_userbuff_rmsnorm_impl(handler, offset, out_handler, out_offset, elements, hidden_size, beta,
+        gamma, eps, residual_in, residual_out, dataType, comm, stream);
 }
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t const offset, int const out_handler,
@@ -128,9 +128,9 @@ bool ub_is_initialized()
     return false;
 }
 
-void* ub_allocate(int idx, size_t bytes)
+UBBuffer ub_allocate(size_t bytes)
 {
-    return nullptr;
+    return UBBuffer();
 }
 
 void ub_deallocate(void* addr) {}

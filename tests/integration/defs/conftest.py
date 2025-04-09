@@ -25,11 +25,14 @@ import time
 import urllib.request
 from functools import wraps
 from pathlib import Path
+from typing import Iterable, Sequence
 
 import defs.ci_profiler
 import psutil
 import pytest
+import tqdm
 import yaml
+from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 
@@ -219,7 +222,8 @@ def whisper_example_root(llm_root, llm_venv):
 def opt_example_root(llm_root, llm_venv):
     "Get opt example root"
 
-    example_root = os.path.join(llm_root, "examples", "opt")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "opt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -367,45 +371,10 @@ def gpt_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def chatglm_6b_example_root(llm_root, llm_venv):
-    "Get chatglm-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def chatglm2_6b_example_root(llm_root, llm_venv):
-    "Get chatglm2-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def chatglm3_6b_example_root(llm_root, llm_venv):
-    "Get chatglm3-6b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def glm_10b_example_root(llm_root, llm_venv):
-    "Get glm-10b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
+def gptj_example_root(llm_root, llm_venv):
+    "Get gptj example root"
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "gptj")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -417,7 +386,7 @@ def glm_10b_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def glm_4_9b_example_root(llm_root, llm_venv):
     "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "chatglm")
+    example_root = os.path.join(llm_root, "examples", "glm-4-9b")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -439,10 +408,13 @@ def llm_exaone_model_root(request) -> str:
     "Get EXAONE model root"
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert request.param == "exaone", "Is the name of model root is exaone?"
 
-    exaone_model_root = os.path.join(models_root, request.param)
-    assert exists(exaone_model_root), f"{exaone_model_root} does not exist!"
+    exaone_model_root = os.path.join(models_root, "exaone")
+    if hasattr(request, "param"):
+        if request.param == "exaone_3.0_7.8b_instruct":
+            exaone_model_root = os.path.join(models_root, "exaone")
+        elif request.param == "exaone_deep_2.4b":
+            exaone_model_root = os.path.join(models_root, "EXAONE-Deep-2.4B")
 
     return exaone_model_root
 
@@ -450,7 +422,8 @@ def llm_exaone_model_root(request) -> str:
 @pytest.fixture(scope="module")
 def falcon_example_root(llm_root, llm_venv):
     "Get falcon example root"
-    example_root = os.path.join(llm_root, "examples", "falcon")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "falcon")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -551,18 +524,6 @@ def eagle_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def skywork_example_root(llm_root, llm_venv):
-    "Get skywork example root"
-    example_root = os.path.join(llm_root, "examples", "skywork")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
     example_root = os.path.join(llm_root, "examples", "mamba")
@@ -577,30 +538,6 @@ def mamba_example_root(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(llm_root, "requirements.txt")
     ])
-
-
-@pytest.fixture(scope="module")
-def dbrx_example_root(llm_root, llm_venv):
-    "Get dbrx example root"
-    example_root = os.path.join(llm_root, "examples", "dbrx")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def jais_example_root(llm_root, llm_venv):
-    "Get jais example root"
-    example_root = os.path.join(llm_root, "examples", "jais")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
 
 
 @pytest.fixture(scope="module")
@@ -653,20 +590,10 @@ def commandr_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def sdxl_example_root(llm_root, llm_venv):
-    "Get stable diffusion example root"
-    example_root = os.path.join(llm_root, "examples", "sdxl")
-
-    llm_venv.run_cmd(
-        ["-m", "pip", "install", "numpy", "pillow", "torchmetrics"])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def deepseek_v2_example_root(llm_root, llm_venv):
     "Get deepseek v2 example root"
-    example_root = os.path.join(llm_root, "examples", "deepseek_v2")
+    example_root = os.path.join(llm_root, "examples", "models", "contrib",
+                                "deepseek_v2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -877,17 +804,6 @@ def multimodal_model_root(request, llm_venv):
 
     if 'llava-onevision' in tllm_model_name:
         llm_venv.run_cmd(['-m', 'pip', 'uninstall', 'llava', '-y'])
-
-
-@pytest.fixture(scope="function")
-def update_transformers(llm_venv, llm_root):
-
-    yield
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
 
 
 def remove_file(fn):
@@ -1248,25 +1164,6 @@ def eagle_model_roots(request):
 
 
 @pytest.fixture(scope="function")
-def skywork_model_root(request):
-    models_root = llm_models_root()
-
-    skywork_model_root = None
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "Skywork-13B-base":
-        skywork_model_root = os.path.join(models_root, "Skywork-13B-base")
-    elif request.param == "Skywork-13B-Math":
-        skywork_model_root = os.path.join(models_root, "Skywork-13B-Math")
-    else:
-        raise NotImplementedError("The model is not yet supported in Skywork")
-
-    assert os.path.exists(
-        skywork_model_root,
-    ), f"{skywork_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return skywork_model_root
-
-
-@pytest.fixture(scope="function")
 def mamba_model_root(request):
     "get mamba model data"
     models_root = llm_models_root()
@@ -1353,45 +1250,6 @@ def nemotron_nas_model_root(request):
         nemotron_nas_model_root), f"{nemotron_nas_model_root} doesn't exist!"
 
     return nemotron_nas_model_root
-
-
-@pytest.fixture(scope='module')
-def smaug_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    smaug_model_root = os.path.join(models_root, "Smaug-72B-v0.1")
-    assert os.path.exists(
-        smaug_model_root
-    ), f"{smaug_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return smaug_model_root
-
-
-@pytest.fixture(scope="function")
-def jais_model_root(request):
-    models_root = llm_models_root()
-
-    jais_model_root = None
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    supported_models = [
-        "jais-13b",
-        "jais-13b-chat",
-        "jais-30b-v1",
-        "jais-30b-chat-v1",
-        "jais-30b-v3",
-        "jais-30b-chat-v3",
-    ]
-    for model_name in supported_models:
-        if request.param == model_name:
-            jais_model_root = os.path.join(models_root, model_name)
-            break
-    else:
-        raise NotImplementedError("The model is not yet supported in jais")
-
-    assert os.path.exists(
-        jais_model_root,
-    ), f"{jais_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return jais_model_root
 
 
 @pytest.fixture(scope="function")
@@ -1580,46 +1438,6 @@ def llm_gpt2_next_8b_model_root():
     raise RuntimeError("gpt-next 8b must be cached")
 
 
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("chatglm-6b", True)
-def llm_chatglm_6b_model_root(llm_venv):
-    "prepare chatglm-6b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "chatglm-6b")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_chatglm2_6b_model_root(request):
-    "prepare chatglm2_6b models"
-    model_name = request.param
-    models_root = llm_models_root()
-    if model_name == "chatglm2-6b":
-        model_root = os.path.join(models_root, "chatglm2-6b")
-    elif model_name == "chatglm2-6b-32k":
-        model_root = os.path.join(models_root, "chatglm2-6b-32k")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_chatglm3_6b_model_root(request):
-    "prepare chatglm3-6b model & return model path"
-    model_name = request.param
-    models_root = llm_models_root()
-    if model_name == "chatglm3-6b":
-        model_root = os.path.join(models_root, "chatglm3-6b")
-    elif model_name == "chatglm3-6b-32k":
-        model_root = os.path.join(models_root, "chatglm3-6b-32k")
-    elif model_name == "chatglm3-6b-base":
-        model_root = os.path.join(models_root, "chatglm3-6b-base")
-    elif model_name == "chatglm3-6b-128k":
-        model_root = os.path.join(models_root, "chatglm3-6b-128k")
-
-    return model_root
-
-
 @pytest.fixture(scope="function")
 def llm_glm_4_9b_model_root(request):
     "prepare glm-4-9b model & return model path"
@@ -1633,16 +1451,6 @@ def llm_glm_4_9b_model_root(request):
         model_root = os.path.join(models_root, "glm-4-9b-chat-1m")
     elif model_name == "glm-4v-9b":
         model_root = os.path.join(models_root, "glm-4v-9b")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("glm-10b", True)
-def llm_glm_10b_model_root(llm_venv):
-    "prepare glm-10b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "glm-10b")
 
     return model_root
 
@@ -1766,15 +1574,6 @@ def llm_qwen_model_root(request, llm_venv):
     assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
 
     return qwen_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_dbrx_model_root(request):
-    models_root = llm_models_root()
-    model_name = request.param
-    dbrx_model_root = os.path.join(models_root, model_name)
-    assert exists(dbrx_model_root), f"{dbrx_model_root} does not exist!"
-    return dbrx_model_root
 
 
 @pytest.fixture(scope="function")
@@ -1933,103 +1732,6 @@ def evaltool_root(llm_venv):
     return clone_dir
 
 
-@pytest.fixture(scope='module')
-def grok_model_root():
-    "get grok model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    model_root = os.path.join(models_root, "grok-1")
-
-    return model_root
-
-
-@pytest.fixture(scope='module')
-def grok_code_root(llm_venv):
-    "get grok model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    workspace = llm_venv.get_working_directory()
-    code_root_src = os.path.join(models_root, "grok-github")
-    code_root = os.path.join(workspace, "grok-github")
-    shutil.copytree(code_root_src, code_root, dirs_exist_ok=True)
-
-    ckpt_file = os.path.join(code_root, "checkpoint.py")
-    assert exists(ckpt_file)
-
-    with open(ckpt_file, 'r', encoding='UTF-8') as file:
-        filedata = file.read()
-
-    filedata = filedata.replace('/dev/shm', workspace)
-
-    with open(ckpt_file, 'w', encoding='UTF-8') as file:
-        file.write(filedata)
-
-    return code_root
-
-
-@pytest.fixture(scope="function")
-def llm_dit_model_root(request):
-    "return dit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if 'fp8' in request.param and '512' in request.param:
-        dit_model_root = os.path.join(models_root,
-                                      "DiT-XL-2-512x512.FP8.Linear.pt")
-    else:
-        if '512' in request.param:
-            dit_model_root = os.path.join(models_root, "DiT-XL-2-512x512.pt")
-        else:
-            dit_model_root = os.path.join(models_root, "DiT-XL-2-256x256.pt")
-
-    assert os.path.exists(
-        dit_model_root
-    ), f"{dit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return dit_model_root
-
-
-@pytest.fixture(scope="function")
-def mmdit_model_root(request):
-    "return mmdit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    mmdit_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        mmdit_model_root
-    ), f"{mmdit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return mmdit_model_root
-
-
-@pytest.fixture(scope="function")
-def stdit_model_root(request):
-    "return stdit model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    stdit_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        stdit_model_root
-    ), f"{stdit_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return stdit_model_root
-
-
-@pytest.fixture(scope="function")
-def sdxl_model_root(request):
-    "return Stable Diffusion XL model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    return os.path.join(models_root, "stable-diffusion-xl-base-1.0")
-
-
 @pytest.fixture(scope="function")
 def engine_dir(llm_venv, capfd):
     "Get engine dir"
@@ -2118,6 +1820,37 @@ def star_attention_input_root(llm_root):
     star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
 
     return star_attention_input_root
+
+
+def parametrize_with_ids(argnames: str | Sequence[str],
+                         argvalues: Iterable[ParameterSet | Sequence[object]
+                                             | object], **kwargs):
+    if isinstance(argnames, str):
+        argname_list = [n.strip() for n in argnames.split(",")]
+    else:
+        argname_list = argnames
+
+    case_ids = []
+    for case_argvalues in argvalues:
+        if isinstance(case_argvalues, ParameterSet):
+            case_argvalues = case_argvalues.values
+        elif case_argvalues is None or isinstance(case_argvalues,
+                                                  (str, float, int, bool)):
+            case_argvalues = (case_argvalues, )
+        assert len(case_argvalues) == len(argname_list)
+
+        case_id = []
+        for name, value in zip(argname_list, case_argvalues):
+            if value is None:
+                pass
+            elif isinstance(value, bool):
+                if value:
+                    case_id.append(name)
+            else:
+                case_id.append(f"{name}={value}")
+        case_ids.append("-".join(case_id))
+
+    return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -2381,6 +2114,11 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if test_prefix:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+
+def pytest_configure(config):
+    # avoid thread leak of tqdm's TMonitor
+    tqdm.tqdm.monitor_interval = 0
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):

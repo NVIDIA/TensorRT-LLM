@@ -1407,7 +1407,7 @@ public:
             auto shape = getTensorShape(outputTensorName);
             TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
                 outputTensorName.c_str());
-            shape.d[0] = mMaxNewTokens - 1;
+            shape.d[0] = mMaxNewTokens;
             shape = runtime::ITensor::unsqueeze(shape, 0);
             shape.d[0] = mSamplingConfig.beamWidth;
             auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
@@ -1649,6 +1649,16 @@ public:
         mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
     }
 
+    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    {
+        return mPerfMetrics.timingMetrics.kvCacheTransferStart;
+    }
+
+    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    {
+        return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
+    }
+
     [[nodiscard]] double getKvCacheTransferTimeMS() const
     {
         // get max with 0 in case this function is called while end time is not recorded
@@ -1656,6 +1666,21 @@ public:
             std::chrono::duration<double, std::milli>(
                 mPerfMetrics.timingMetrics.kvCacheTransferEnd - mPerfMetrics.timingMetrics.kvCacheTransferStart)
                 .count());
+    }
+
+    void updateKvCacheSize(size_t targetBufferSize) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheSize += targetBufferSize;
+    }
+
+    void setKvCacheSize(size_t targetBufferSize) const
+    {
+        mPerfMetrics.timingMetrics.kvCacheSize = targetBufferSize;
+    }
+
+    [[nodiscard]] size_t getKvCacheSize() const
+    {
+        return mPerfMetrics.timingMetrics.kvCacheSize;
     }
 
     void updateAllocTotalBlocksPerRequest(SizeType32 allocTotalBlocksPerRequest)
