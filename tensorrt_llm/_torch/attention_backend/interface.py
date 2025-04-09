@@ -531,7 +531,7 @@ class MLAParams:
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
 
-    
+
 @torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
 def dummy_forward(q: torch.Tensor, k: torch.Tensor,
                   v: torch.Tensor) -> torch.Tensor:
