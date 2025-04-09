@@ -45,8 +45,14 @@ class ModelList(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    # type must be "json_object" or "text" or "json_schema"
+    # Allow extra fields so that json_schema responses can include additional keys
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    type: Literal["text", "json_object", "json_schema"]
+    strict: Optional[bool] = False
+    name: Optional[str] = None
+    description: Optional[str] = None
+    schema: Optional[Dict[str, Any]] = None
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -76,8 +82,6 @@ class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
     logprobs: Optional[CompletionLogProbs] = None
-    context_logits: Optional[Union[List[float], List[List[
-        float]]]] = None  # For reward models, the output is score logits instead of text.
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(
         default=None,
@@ -90,19 +94,20 @@ class CompletionResponseChoice(OpenAIBaseModel):
 
     @staticmethod
     def to_disaggregated_params(
-            tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+        tllm_disagg_params: LlmDisaggregatedParams, ) -> DisaggregatedParams:
         if tllm_disagg_params is None:
             return None
         else:
-            encoded_opaque_state = base64.b64encode(
-                tllm_disagg_params.opaque_state).decode(
-                    "utf-8") if tllm_disagg_params is not None else None
+            encoded_opaque_state = (base64.b64encode(
+                tllm_disagg_params.opaque_state).decode("utf-8")
+                                    if tllm_disagg_params is not None else None)
             return DisaggregatedParams(
                 request_type=tllm_disagg_params.request_type,
                 first_gen_tokens=tllm_disagg_params.first_gen_tokens,
                 ctx_request_id=tllm_disagg_params.ctx_request_id,
                 encoded_opaque_state=encoded_opaque_state,
-                draft_tokens=tllm_disagg_params.draft_tokens)
+                draft_tokens=tllm_disagg_params.draft_tokens,
+            )
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -186,10 +191,10 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=(
-            "Similar to chat completion, this parameter specifies the format of "
-            "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-            "supported."),
+        description=
+        ("Similar to chat completion, this parameter specifies the format of "
+         "output. Only {'type': 'json_object'} or {'type': 'text' } or {'type': 'json_schema'} is "
+         "supported."),
     )
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(
@@ -211,7 +216,6 @@ class CompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             temperature=self.temperature,
             top_p=self.top_p,
-
             # completion-sampling-params
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,
@@ -228,7 +232,6 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
-
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -238,16 +241,18 @@ class CompletionRequest(OpenAIBaseModel):
         if self.disaggregated_params is None:
             return None
         else:
-            opaque_state = base64.b64decode(
-                self.disaggregated_params.encoded_opaque_state
-            ) if self.disaggregated_params.encoded_opaque_state is not None else None
+            opaque_state = (base64.b64decode(
+                self.disaggregated_params.encoded_opaque_state)
+                            if self.disaggregated_params.encoded_opaque_state
+                            is not None else None)
 
             return LlmDisaggregatedParams(
                 request_type=self.disaggregated_params.request_type,
                 first_gen_tokens=self.disaggregated_params.first_gen_tokens,
                 ctx_request_id=self.disaggregated_params.ctx_request_id,
                 opaque_state=opaque_state,
-                draft_tokens=self.disaggregated_params.draft_tokens)
+                draft_tokens=self.disaggregated_params.draft_tokens,
+            )
 
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
@@ -263,8 +268,9 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if ("top_logprobs" in data and data.get("top_logprobs")) or \
-            ("logprobs" in data and data.get("logprobs")):
+        if ("top_logprobs" in data
+                and data.get("top_logprobs")) or ("logprobs" in data
+                                                  and data.get("logprobs")):
             raise ValueError("returning log probs is not supported")
         return data
 
@@ -302,8 +308,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
+        if (data.get("skip_special_tokens") or data.get("add_special_tokens")
+                or data.get("spaces_between_special_tokens")):
             raise ValueError(
                 "special_tokens related settings are not supported")
         return data
@@ -350,6 +356,7 @@ ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam,
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
     """Enables custom roles in the Chat Completion API."""
+
     role: Required[str]
     """The role of the message's author."""
 
@@ -442,7 +449,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
     max_completion_tokens: int = Field(default=16,
-                                       validation_alias='max_tokens')
+                                       validation_alias="max_tokens")
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
@@ -453,7 +460,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
+    tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
 
@@ -505,7 +512,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "the model if it is performing RAG (retrieval-augmented generation)."
          " If the template does not support RAG, this argument will have no "
          "effect. We recommend that each document should be a dict containing "
-         "\"title\" and \"text\" keys."),
+         '"title" and "text" keys.'),
     )
     chat_template: Optional[str] = Field(
         default=None,
@@ -533,7 +540,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             temperature=self.temperature,
-
             # chat-completion-sampling-params
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
@@ -551,7 +557,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -568,24 +573,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "Only support one response per prompt without beam search")
         return self
 
-    @model_validator(mode='before')
-    @classmethod
-    def validate_stream_options(cls, values):
-        if (values.get('stream_options') is not None
-                and not values.get('stream')):
-            raise ValueError("stream_options can only be set if stream is true")
-        return values
-
     @model_validator(mode="before")
     @classmethod
-    def check_tool_choice(cls, data):
-        if "tool_choice" in data and data["tool_choice"] != "none":
-            if not isinstance(data["tool_choice"], dict):
-                raise ValueError("Currently only named tools are supported.")
-            if "tools" not in data or data["tools"] is None:
-                raise ValueError(
-                    "When using `tool_choice`, `tools` must be set.")
-        return data
+    def validate_stream_options(cls, values):
+        if values.get(
+                "stream_options") is not None and not values.get("stream"):
+            raise ValueError("stream_options can only be set if stream is true")
+        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -612,13 +606,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def check_response_format(cls, data):
-        if data.get("response_format"):
-            raise ValueError("response_format is not supported")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
@@ -627,8 +614,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_special_tokens(cls, data):
-        if data.get("skip_special_tokens") or data.get("add_special_tokens") or \
-            data.get("spaces_between_special_tokens"):
+        if (data.get("skip_special_tokens") or data.get("add_special_tokens")
+                or data.get("spaces_between_special_tokens")):
             raise ValueError(
                 "special_tokens related settings are not supported")
         return data
