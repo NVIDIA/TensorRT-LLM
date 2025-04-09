@@ -1706,7 +1706,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ],
             ],
         },
-        "qwen2-5-vl-7b-instruct": {
+        "qwen2.5-vl-7b-instruct": {
             "image":
             [[
                 "The image depicts a dramatic and moody natural environment, featuring a large wave breaking on the shore. The sky is overcast with dark, heavy clouds, suggesting an impending storm or a generally stormy weather condition. The ocean appears turbulent, with the wave creating a frothy white crest as it crashes. The overall atmosphere",
