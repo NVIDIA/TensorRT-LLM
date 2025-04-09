@@ -175,8 +175,29 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
     for output in rsp.outputs:
         # Handle explicit function call
         if args.tool_choice and isinstance(args.tool_choice, ChatCompletionNamedToolChoiceParam):
-            # Handle explicit function call (existing code)
-            pass
+            text = output.text
+            # Create a tool call with the specified function name from tool_choice
+            tool_calls = [
+                ToolCall(
+                    function=FunctionCall(
+                        name=args.tool_choice.function.name,
+                        arguments=text
+                    ),
+                    id=f"call_{output.index}"
+                )
+            ]
+            # Create message with the tool calls
+            message = ChatMessage(
+                role=role, 
+                content="",  # Empty content since we're using tool calls
+                tool_calls=tool_calls
+            )
+            choice = ChatCompletionResponseChoice(
+                index=output.index,
+                message=message,
+                finish_reason="tool_calls",  # Explicit tool calls always have this finish reason
+                stop_reason=output.stop_reason,
+            )
         else:
             # Check for tool calls in the text regardless of tool_choice setting
             text = output.text
@@ -194,12 +215,12 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
             
             message = ChatMessage(role=role, content=text, tool_calls=tool_calls)
             
-        choice = ChatCompletionResponseChoice(
-            index=output.index,
-            message=message,
-            finish_reason="tool_calls" if message.tool_calls else output.finish_reason,
-            stop_reason=output.stop_reason,
-        )
+            choice = ChatCompletionResponseChoice(
+                index=output.index,
+                message=message,
+                finish_reason="tool_calls" if message.tool_calls else output.finish_reason,
+                stop_reason=output.stop_reason,
+            )
         
         if args.return_logprobs:
             # Handle logprobs (existing code)

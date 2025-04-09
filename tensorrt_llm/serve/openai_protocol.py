@@ -186,6 +186,7 @@ class CompletionRequest(OpenAIBaseModel):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    return_context_logits: bool = False
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -239,6 +240,8 @@ class CompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            return_context_logits=self.return_context_logits,
+            
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -573,6 +576,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
+            
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -595,16 +599,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError("stream_options can only be set if stream is true")
         return values
 
-    # @model_validator(mode="before")
-    # @classmethod
-    # def check_tool_choice(cls, data):
-    #     if "tool_choice" in data and data["tool_choice"] != "none":
-    #         if not isinstance(data["tool_choice"], dict):
-    #             raise ValueError("Currently only named tools are supported.")
-    #         if "tools" not in data or data["tools"] is None:
-    #             raise ValueError(
-    #                 "When using `tool_choice`, `tools` must be set.")
-    #     return data
 
     @model_validator(mode="before")
     @classmethod
@@ -628,13 +622,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if data.get("logit_bias"):
             raise ValueError("logit bias is not supported")
         return data
-
-    # @model_validator(mode="before")
-    # @classmethod
-    # def check_response_format(cls, data):
-    #     if data.get("response_format"):
-    #         raise ValueError("response_format is not supported")
-    #     return data
 
     @model_validator(mode="before")
     @classmethod
