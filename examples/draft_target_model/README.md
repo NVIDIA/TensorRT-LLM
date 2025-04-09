@@ -4,7 +4,7 @@ This document shows how to build and run a model using DTM speculative decoding 
 
 ## Overview
 
-We provide two styles of runnig DTM now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Here we introduce the detailed steps of running DTM in both workflows.
+We provide two styles of running DTM now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Here we introduce the detailed steps of running DTM in both workflows.
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
