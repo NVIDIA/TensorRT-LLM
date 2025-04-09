@@ -8,8 +8,7 @@ import torch
 from flashinfer.jit.core import check_cuda_arch
 
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend, AttentionMask, AttentionMetadata, PredefinedAttentionMask,
-    dummy_forward)
+    AttentionBackend, AttentionMask, AttentionMetadata, PredefinedAttentionMask)
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
