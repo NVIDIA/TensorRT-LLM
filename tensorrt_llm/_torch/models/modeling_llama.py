@@ -22,9 +22,11 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
+from ..pipeline_interface import PipelineInterface
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -526,6 +528,55 @@ class LlamaModel(DecoderModel):
 
         return hidden_states
 
+    def _pp_forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+    ) -> torch.Tensor:
+        if self.pp_rank != 0:
+            if pipeline_interface is None:
+                raise ValueError(
+                    "pipeline_interface is required for non-first pp rank.")
+            hidden_states, residual = pipeline_interface
+        else:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            hidden_states = inputs_embeds
+            residual = hidden_states
+
+        local_decoder_layers = ([
+            self.layers[layer_id] for layer_id in self.pp_layer_list
+        ] if self.pp_size > 1 else self.layers)
+
+        if self.pp_rank == 0:
+            hidden_states = local_decoder_layers[0].input_layernorm(
+                hidden_states)
+        else:
+            hidden_states, residual = local_decoder_layers[0].input_layernorm(
+                hidden_states, residual)
+
+        for decoder_layer in local_decoder_layers:
+            hidden_states, residual = decoder_layer(position_ids=position_ids,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    residual=residual,
+                                                    spec_metadata=spec_metadata)
+
+        if not self.pp_rank == self.pp_size - 1:
+            return PipelineInterface(hidden_states, residual)
+        else:
+            return hidden_states
+
 
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
@@ -546,7 +597,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -580,7 +631,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -604,7 +655,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
