@@ -1,4 +1,3 @@
-import math
 import random
 from collections.abc import Iterable
 
@@ -98,19 +97,20 @@ def create_dummy_context_requests(max_num_tokens: int, max_seq_len: int,
                                   vocab_size: int):
     requests = []
     max_seq_len = min(max_num_tokens, max_seq_len)
-    batch_size = math.ceil(max_num_tokens / max_seq_len)
-    for idx in range(batch_size):
+    remaining_tokens = max_num_tokens
+    while remaining_tokens > 0:
+        input_len = min(max_seq_len, remaining_tokens)
         input_tokens = [
-            random.randint(0, vocab_size - 1) for _ in range(max_seq_len)
+            random.randint(0, vocab_size - 1) for _ in range(input_len)
         ]
-        output_config = trtllm.OutputConfig()
         request = trtllm.Request(input_tokens,
                                  max_tokens=1,
                                  streaming=False,
                                  sampling_config=trtllm.SamplingConfig(),
-                                 output_config=output_config,
+                                 output_config=trtllm.OutputConfig(),
                                  end_id=-1)
         requests.append(request)
+        remaining_tokens -= input_len
     return requests
 
 
@@ -122,8 +122,8 @@ def get_token_num_for_estimation(executor_config, model_config):
         kv_size_per_token = get_cache_size_per_token(model_config, mapping)
         max_tokens_limit = int(end * fraction // kv_size_per_token)
         return min(
-            max(executor_config.max_batch_size, executor_config.max_num_tokens),
-            max_tokens_limit)
+            max(executor_config.max_batch_size, executor_config.max_num_tokens,
+                executor_config.max_seq_len), max_tokens_limit)
     else:
         return None
 
