@@ -2,30 +2,32 @@ import copy
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel,
-                          Qwen2VLConfig, Qwen2VLForConditionalGeneration,
-                          Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)
+from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
+                          PreTrainedModel, Qwen2_5_VLConfig,
+                          Qwen2_5_VLForConditionalGeneration, Qwen2VLConfig,
+                          Qwen2VLForConditionalGeneration)
 
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
 from ...logger import logger
+from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_utils import register_auto_model
-from ...sampling_params import SamplingParams
+
 
 class Qwen2VLInputProcessorBase(InputProcessor):
-    def __init__(self, 
-                 model_path: str, 
-                 model_config: PretrainedConfig, 
+
+    def __init__(self, model_path: str, model_config: PretrainedConfig,
                  tokenizer: AutoTokenizer):
         self.model_config = model_config
         self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
-        
+        self.processor = AutoProcessor.from_pretrained(model_path,
+                                                       use_fast=False)
+
         # NOTE
         # Using attn_implementation='flash_attention_2' to avoid the issue of
         # vision model's GPU OOM.
@@ -42,13 +44,15 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         raise NotImplementedError()
 
     @classmethod
-    def get_rope_index(cls, 
-                      model_config: PretrainedConfig, 
-                      input_ids: torch.LongTensor, 
-                      image_grid_thw: torch.LongTensor, 
-                      video_grid_thw: torch.LongTensor,
-                      attention_mask: torch.Tensor, 
-                      second_per_grid_ts: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_rope_index(
+        cls,
+        model_config: PretrainedConfig,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        video_grid_thw: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        second_per_grid_ts: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
     def _post_init_(self):
@@ -78,7 +82,8 @@ class Qwen2VLInputProcessorBase(InputProcessor):
 
     def _process(self, pixel_values: torch.Tensor,
                  pixel_values_videos: torch.Tensor,
-                 image_grid_thw: torch.Tensor, video_grid_thw: torch.Tensor) -> torch.Tensor:
+                 image_grid_thw: torch.Tensor,
+                 video_grid_thw: torch.Tensor) -> torch.Tensor:
         embeds = []
 
         if pixel_values is not None:
@@ -107,11 +112,13 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         input_ids[masks] = values[masks]
         return input_ids
 
-    def get_mrope_config(self, input_ids: torch.LongTensor, 
-                         image_grid_thw: torch.LongTensor, 
-                         video_grid_thw: torch.LongTensor, 
-                         attention_mask: torch.Tensor, 
-                         second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
+    def get_mrope_config(
+            self,
+            input_ids: torch.LongTensor,
+            image_grid_thw: torch.LongTensor,
+            video_grid_thw: torch.LongTensor,
+            attention_mask: torch.Tensor,
+            second_per_grid_ts: torch.Tensor = None) -> dict[str, torch.Tensor]:
         mrope_position_ids, mrope_position_deltas = self.__class__.get_rope_index(
             self.model_config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
@@ -144,10 +151,11 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         return mrope_config
 
     @torch.inference_mode()
-    def __call__(self,
-            inputs: TextPrompt,
-            sampling_params: SamplingParams,
-        ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+    def __call__(
+        self,
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data"), inputs.get("mm_processor_kwargs", {})
 
@@ -178,7 +186,9 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             "mrope_config": mrope_config
         }
 
+
 class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
+
     @classmethod
     def get_model_class(cls):
         return Qwen2VLForConditionalGeneration
@@ -187,14 +197,15 @@ class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
     # 'second_per_grid_ts' is not used in Qwen2VL but added for compatibility with Qwen2_5_VLInputProcessor
     # other than that, the implementation is copied from https://github.com/QwenLM/Qwen2-VL/blob/main/qwen2_vl/models/qwen2_vl.py
     @classmethod
-    def get_rope_index(cls, 
-                       model_config: Qwen2VLConfig,
-                       input_ids: Optional[torch.LongTensor] = None,
-                       image_grid_thw: Optional[torch.LongTensor] = None,
-                       video_grid_thw: Optional[torch.LongTensor] = None,
-                       attention_mask: Optional[torch.Tensor] = None,
-                       second_per_grid_ts: Optional[torch.Tensor] = None,
-                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_rope_index(
+        cls,
+        model_config: Qwen2VLConfig,
+        input_ids: Optional[torch.LongTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
 
@@ -247,10 +258,10 @@ class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
         if image_grid_thw is not None or video_grid_thw is not None:
             total_input_ids = input_ids
             position_ids = torch.ones(3,
-                                    input_ids.shape[0],
-                                    input_ids.shape[1],
-                                    dtype=input_ids.dtype,
-                                    device=input_ids.device)
+                                      input_ids.shape[0],
+                                      input_ids.shape[1],
+                                      dtype=input_ids.dtype,
+                                      device=input_ids.device)
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
                 # if attention_mask is not None:
@@ -302,7 +313,8 @@ class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(
                         llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
 
                     t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
                         -1, llm_grid_h * llm_grid_w).flatten()
@@ -320,13 +332,15 @@ class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
                         llm_pos_ids_list) > 0 else 0
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
 
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                llm_positions = torch.cat(llm_pos_ids_list,
+                                          dim=1).reshape(3, -1)
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
                     position_ids.device)
                 mrope_position_deltas.append(llm_positions.max() + 1 -
-                                            len(total_input_ids[i]))
+                                             len(total_input_ids[i]))
             mrope_position_deltas = torch.tensor(
                 mrope_position_deltas, device=input_ids.device).unsqueeze(1)
             return position_ids, mrope_position_deltas
@@ -342,10 +356,9 @@ class Qwen2VLInputProcessor(Qwen2VLInputProcessorBase):
                     -1]
             else:
                 position_ids = (torch.arange(input_ids.shape[1],
-                                            device=input_ids.device).view(
-                                                1, 1,
-                                                -1).expand(3, input_ids.shape[0],
-                                                            -1))
+                                             device=input_ids.device).view(
+                                                 1, 1, -1).expand(
+                                                     3, input_ids.shape[0], -1))
                 mrope_position_deltas = torch.zeros(
                     [input_ids.shape[0], 1],
                     device=input_ids.device,
@@ -363,14 +376,15 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
 
     # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py
     @classmethod
-    def get_rope_index(cls, 
-                       model_config: Qwen2_5_VLConfig,
-                       input_ids: Optional[torch.LongTensor] = None,
-                       image_grid_thw: Optional[torch.LongTensor] = None,
-                       video_grid_thw: Optional[torch.LongTensor] = None,
-                       attention_mask: Optional[torch.Tensor] = None,
-                       second_per_grid_ts: Optional[torch.Tensor] = None,
-                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_rope_index(
+        cls,
+        model_config: Qwen2_5_VLConfig,
+        input_ids: Optional[torch.LongTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
 
@@ -385,7 +399,7 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
                 width position_ids: [0, 1, 2, 3, 4]
 
             For vision and text embedding sequence, we calculate 3D rotary position embedding for vision part
-            and 1D rotary position embeddin for text part.
+            and 1D rotary position embedding for text part.
             Examples:
                 Temporal (Time): 3 patches, representing different segments of the video in time.
                 Height: 2 patches, dividing each frame vertically.
@@ -429,7 +443,8 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
         video_token_id = model_config.video_token_id
         vision_start_token_id = model_config.vision_start_token_id
         mrope_position_deltas = []
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        if input_ids is not None and (image_grid_thw is not None
+                                      or video_grid_thw is not None):
             total_input_ids = input_ids
             if attention_mask is None:
                 attention_mask = torch.ones_like(total_input_ids)
@@ -445,7 +460,8 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
             for i, input_ids in enumerate(total_input_ids):
                 input_ids = input_ids[attention_mask[i] == 1]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+                vision_start_indices = torch.argwhere(
+                    input_ids == vision_start_token_id).squeeze(1)
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
                 video_nums = (vision_tokens == video_token_id).sum()
@@ -493,45 +509,62 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
                     )
                     text_len = ed - st
 
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(
+                        llm_pos_ids_list) > 0 else 0
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
 
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
+                    expanded_range = range_tensor.expand(
+                        -1, llm_grid_h * llm_grid_w)
 
                     time_tensor = expanded_range * second_per_grid_t * model_config.vision_config.tokens_per_second
 
                     time_tensor_long = time_tensor.long()
                     t_index = time_tensor_long.flatten()
 
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
-                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
+                        llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
+                        llm_grid_t, llm_grid_h, -1).flatten()
+                    llm_pos_ids_list.append(
+                        torch.stack([t_index, h_index, w_index]) + text_len +
+                        st_idx)
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
                 if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(
+                        llm_pos_ids_list) > 0 else 0
                     text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len).view(1, -1).expand(3, -1) +
+                        st_idx)
 
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
-            mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+                llm_positions = torch.cat(llm_pos_ids_list,
+                                          dim=1).reshape(3, -1)
+                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
+                    position_ids.device)
+                mrope_position_deltas.append(llm_positions.max() + 1 -
+                                             len(total_input_ids[i]))
+            mrope_position_deltas = torch.tensor(
+                mrope_position_deltas, device=input_ids.device).unsqueeze(1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(
+                    attention_mask.device)
+                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                    -1, keepdim=True)[0]
+                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[
+                    -1]
             else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
+                position_ids = (torch.arange(input_ids.shape[1],
+                                             device=input_ids.device).view(
+                                                 1, 1, -1).expand(
+                                                     3, input_ids.shape[0], -1))
                 mrope_position_deltas = torch.zeros(
                     [input_ids.shape[0], 1],
                     device=input_ids.device,
@@ -539,6 +572,7 @@ class Qwen2_5_VLInputProcessor(Qwen2VLInputProcessorBase):
                 )
 
             return position_ids, mrope_position_deltas
+
 
 class Qwen2VLModelBase(PreTrainedModel):
 
@@ -628,10 +662,12 @@ class Qwen2VLModelBase(PreTrainedModel):
         logger.info(f'output shape: {output_prob.shape}')
         return output_prob
 
+
 @register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessor)
 class Qwen2VLModel(Qwen2VLModelBase):
     pass
+
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(Qwen2_5_VLInputProcessor)
