@@ -380,10 +380,11 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
         }
     }
 
-    size_t idx = 0;
+    // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
+    // This will preserve the order of insertion for KVCache transfer requests.
     for (auto it = mResponderFutures.begin();
          atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
-         ++it, ++idx)
+         ++it)
     {
         toCompleteIdSet.insert(it->first->mRequestId);
     }
