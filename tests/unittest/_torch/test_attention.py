@@ -516,6 +516,10 @@ def test_attention_backend(s: Scenario):
         },
     )
 
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    torch.cuda.empty_cache()
+
 
 def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
     causal_masks = []
@@ -696,6 +700,11 @@ def test_attention_backend_ifb(s: PagedScenario):
                               vanilla_outputs[i],
                               atol=fp8_atol if is_fp8 else atol,
                               rtol=rtol)
+
+    del flashinfer_kv_cache
+    del ref_kv_cache
+    del vanilla_kv_cache
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

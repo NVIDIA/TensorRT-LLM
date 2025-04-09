@@ -523,6 +523,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
@@ -564,7 +565,13 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
         return false
     }
-    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+    def pytorchOnlyList = [
+        "tensorrt_llm/_torch/",
+        "tests/unittest/_torch/",
+        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+        "tests/integration/defs/disaggregated/",
+        "examples/pytorch/",
+    ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
 
@@ -572,12 +579,20 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
 
-    def result = changedFileList.every { file ->
-        def isPytorchFile = file =~ pytorchOnlyPattern
+    def result = true
+    for (file in changedFileList) {
+        def isPytorchFile = false
+        for (prefix in pytorchOnlyList) {
+            if (file.startsWith(prefix)) {
+                isPytorchFile = true
+                break
+            }
+        }
         if (!isPytorchFile) {
             pipeline.echo("Found non-PyTorch file: ${file}")
+            result = false
+            break
         }
-        return isPytorchFile
     }
 
     pipeline.echo("Only PyTorch files changed: ${result}")

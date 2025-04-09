@@ -65,14 +65,15 @@ def test_llama_eagle3():
     ]
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
 
-    del llm_spec
     llm_ref = LLM(model=target_model_dir,
                   pytorch_backend_config=pytorch_config,
                   kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
