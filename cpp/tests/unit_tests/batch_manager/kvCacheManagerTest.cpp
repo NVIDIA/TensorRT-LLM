@@ -2054,7 +2054,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - (numBlocksPerSeq - (inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer*maxBeamWidth)));   // buffer block is needed if exceeding attention window
+    // buffer block is needed if exceeding attention window
+    auto const expectedUsedBlocks
+        = numBlocksPerSeq - (inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer * maxBeamWidth);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - expectedUsedBlocks);
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
@@ -2069,7 +2072,9 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
         currentNumBlocks -= maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
     }
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer*maxNumSequences*maxBeamWidth);    // buffer block is needed if exceeding attention window
+    // buffer block was used per sequence if exceeding attention window
+    EXPECT_EQ(blockManager.getNumFreeBlocks(),
+        inputLength + 2 > maxAttentionWindow ? 0 : kExtraBlockBuffer * maxNumSequences * maxBeamWidth);
 }
 
 TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
@@ -2266,9 +2271,9 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     }
 
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq + 1);       // first token fills current block
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq + 1); // first token fills current block
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq);           // another token needs new block
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq);     // another token needs new block
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
@@ -2342,7 +2347,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerThanBlockSizeTe
     llmRequest->addNewToken(1015, beamIdx);
     kvCacheManager.addToken(requestId);
     auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 3}));
@@ -2364,7 +2369,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerThanBlockSizeTe
     llmRequest->addNewToken(1019, beamIdx);
     kvCacheManager.addToken(requestId);
     numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3, 4}));
@@ -2440,7 +2445,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultiple
     llmRequest->addNewToken(1009, beamIdx);
     kvCacheManager.addToken(requestId);
     auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
@@ -2451,7 +2456,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultiple
     llmRequest->addNewToken(1011, beamIdx);
     kvCacheManager.addToken(requestId);
     numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 1, 2}));
@@ -2469,7 +2474,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowLargerAndNotAMultiple
     llmRequest->addNewToken(1013, beamIdx);
     kvCacheManager.addToken(requestId);
     numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1, 2, 3}));
@@ -2549,7 +2554,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     llmRequest->addNewToken(1002, beamIdx);
     kvCacheManager.addToken(requestId);
     auto numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0}));
@@ -2558,7 +2563,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     llmRequest->addNewToken(1003, beamIdx);
     kvCacheManager.addToken(requestId);
     numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0}));
@@ -2578,7 +2583,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowSmallerThanBlockSizeT
     llmRequest->addNewToken(1006, beamIdx);
     kvCacheManager.addToken(requestId);
     numBlocks = seq0.getCacheBlockIds()[beamIdx].size();
-    EXPECT_EQ(numBlocks, maxBlocksPerSeq-1);
+    EXPECT_EQ(numBlocks, maxBlocksPerSeq - 1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
     EXPECT_THAT(seq0.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({1}));
@@ -2720,7 +2725,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
 
-   ///////////////////////////////////////////////////////////////////////////
+    ///////////////////////////////////////////////////////////////////////////
     // add a long request and then remove it
     SizeType32 requestId = 0;
     int inputLength = 16;
@@ -2769,7 +2774,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 6);
-    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({0, 6})); // Can't use 5 since it's used to onboard block, so 6 is the next free block.
+    EXPECT_THAT(seq1.getCacheBlockIds().at(beamIdx),
+        ::testing::ElementsAreArray(
+            {0, 6})); // Can't use 5 since it's used to onboard block, so 6 is the next free block.
 
     llmRequest->addNewToken(1007, beamIdx);
     kvCacheManager.addToken(requestId);
@@ -2850,7 +2857,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock);
 
     auto constexpr blocksInPrimaryPool = 16;
-    auto constexpr blocksInSecondaryPool = 0;       // Test without secondary pool. Blocks stored for reuse will be kept in primary pool.
+    auto constexpr blocksInSecondaryPool
+        = 0; // Test without secondary pool. Blocks stored for reuse will be kept in primary pool.
 
     auto constexpr enableBlockReuse = true;
     auto constexpr onboardBlocks = true;
@@ -2931,7 +2939,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 3);
-    EXPECT_THAT(seq2.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({6}));     // copying block 0 to a new block 6 since it's not a leaf block and is partially used.
+    EXPECT_THAT(seq2.getCacheBlockIds().at(beamIdx),
+        ::testing::ElementsAreArray(
+            {6})); // copying block 0 to a new block 6 since it's not a leaf block and is partially used.
 
     numTokens = llmRequest->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
@@ -2948,7 +2958,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq3 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 3);
-    EXPECT_THAT(seq3.getCacheBlockIds().at(beamIdx), ::testing::ElementsAreArray({6}));     // Now block 6 is a leaf block and reused.
+    EXPECT_THAT(seq3.getCacheBlockIds().at(beamIdx),
+        ::testing::ElementsAreArray({6})); // Now block 6 is a leaf block and reused.
 }
 
 namespace
@@ -3611,9 +3622,11 @@ TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
     }
 
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocksCtx - maxBeamWidth);     // first token fills current block
+    EXPECT_EQ(blockManager.getNumFreeBlocks(),
+        totalNumBlocks - numSharedBlocksCtx - maxBeamWidth); // first token fills current block
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocksCtx - maxBeamWidth * 2);     // another token needs new block (for all beams)
+    EXPECT_EQ(blockManager.getNumFreeBlocks(),
+        totalNumBlocks - numSharedBlocksCtx - maxBeamWidth * 2); // another token needs new block (for all beams)
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
@@ -3625,7 +3638,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
         currentNumBlocks -= numSharedBlocksCtx + maxBeamWidth;
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
         EXPECT_NO_THROW(kvCacheManager.addToken(nextRequestId));
-        currentNumBlocks -= 0;      // Adding 1 token just fills the current block
+        currentNumBlocks -= 0; // Adding 1 token just fills the current block
         EXPECT_EQ(blockManager.getNumFreeBlocks(), currentNumBlocks);
     }
     auto numUsedBlocks = maxNumSequences * (numSharedBlocksCtx + maxBeamWidth);
@@ -3872,15 +3885,18 @@ void testNeededBlocksOneStep(bool kv_cache_block_reuse, int beamWidth, int draft
                 }
                 else
                 {
-                    // This test calculates neededBlocksOneStep for the entire step (which may exceed maxAttentionWindow), 
-                    // but adds tokens only up to maxAttentionWindow.
-                    // In this case, numUsedBlocksThisStep may be smaller than neededBlocksOneStep by 1 block.
-                    ASSERT_THAT(numUsedBlocksThisStep, testing::AnyOf(testing::Eq(neededBlocksOneStep), testing::Eq(neededBlocksOneStep - 1)));
+                    // This test calculates neededBlocksOneStep for the entire step (which may exceed
+                    // maxAttentionWindow), but adds tokens only up to maxAttentionWindow. In this case,
+                    // numUsedBlocksThisStep may be smaller than neededBlocksOneStep by 1 block.
+                    ASSERT_THAT(numUsedBlocksThisStep,
+                        testing::AnyOf(testing::Eq(neededBlocksOneStep), testing::Eq(neededBlocksOneStep - 1)));
                 }
             }
 
-            // After adding tokens, initial remainingBlocksToCompletion should match current state + new remainingBlocksToCompletion
-            EXPECT_EQ(remainingBlocksToCompletion, kvCacheManager.getNumAllocTotalBlocks() + kvCacheManager.getRemainingBlocksToCompletion(*llmRequest));
+            // After adding tokens, initial remainingBlocksToCompletion should match current state + new
+            // remainingBlocksToCompletion
+            EXPECT_EQ(remainingBlocksToCompletion,
+                kvCacheManager.getNumAllocTotalBlocks() + kvCacheManager.getRemainingBlocksToCompletion(*llmRequest));
         }
     }
 }
@@ -4045,8 +4061,9 @@ std::shared_ptr<KVCacheManager> createKvCacheManager(
         return std::make_shared<KVCacheManager>(numHeadsPerLayerVec, kvCacheInstantiationParameters.sizePerHead,
             kvCacheInstantiationParameters.tokensPerBlock, kvCacheInstantiationParameters.numBlocksInPrimaryPool,
             numBlocksInSecondaryPool, kvCacheInstantiationParameters.numBlocksInPrimaryPool,
-            kvCacheInstantiationParameters.maxBeamWidth, std::vector<SizeType32>{kvCacheInstantiationParameters.maxAttentionWindow},
-            temporaryKvCacheLength, kvCacheInstantiationParameters.sinkTokenLength, stream, std::nullopt,
+            kvCacheInstantiationParameters.maxBeamWidth,
+            std::vector<SizeType32>{kvCacheInstantiationParameters.maxAttentionWindow}, temporaryKvCacheLength,
+            kvCacheInstantiationParameters.sinkTokenLength, stream, std::nullopt,
             kvCacheInstantiationParameters.kvCacheBlockReuse, true);
     }
     if (std::holds_alternative<std::vector<SizeType32>>(kvCacheInstantiationParameters.numHeadsPerLayer))
@@ -4056,8 +4073,9 @@ std::shared_ptr<KVCacheManager> createKvCacheManager(
         return std::make_shared<KVCacheManager>(numHeadsPerLayer, kvCacheInstantiationParameters.sizePerHead,
             kvCacheInstantiationParameters.tokensPerBlock, kvCacheInstantiationParameters.numBlocksInPrimaryPool,
             numBlocksInSecondaryPool, kvCacheInstantiationParameters.numBlocksInPrimaryPool,
-            kvCacheInstantiationParameters.maxBeamWidth, std::vector<SizeType32>{kvCacheInstantiationParameters.maxAttentionWindow},
-            temporaryKvCacheLength, kvCacheInstantiationParameters.sinkTokenLength, stream, std::nullopt,
+            kvCacheInstantiationParameters.maxBeamWidth,
+            std::vector<SizeType32>{kvCacheInstantiationParameters.maxAttentionWindow}, temporaryKvCacheLength,
+            kvCacheInstantiationParameters.sinkTokenLength, stream, std::nullopt,
             kvCacheInstantiationParameters.kvCacheBlockReuse, true);
     }
     TLLM_THROW("Unhandled type of num heads per layer provided.");
@@ -4215,7 +4233,7 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
                 0,
                 4096,
                 1,
-                4097,       // temporaryKvCacheLength = 0
+                4097, // temporaryKvCacheLength = 0
                 false,
             },
             5000,
@@ -4233,17 +4251,14 @@ INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, Remainin
                 4,
                 4096,
                 1,
-                4097,       // temporaryKvCacheLength = 0
+                4097, // temporaryKvCacheLength = 0
                 false,
             },
-            5000,
-            128,
-            66,     // 1 extra block for sink tokens
-        }));    
+            5000, 128,
+            66, // 1 extra block for sink tokens
+        }));
 
-
-class NeededBlocksOneStepTest
-    : public ::testing::TestWithParam<GetNeededBlocksOneStepOneRequestParameters>
+class NeededBlocksOneStepTest : public ::testing::TestWithParam<GetNeededBlocksOneStepOneRequestParameters>
 {
 protected:
     void SetUp() override
@@ -4308,7 +4323,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             136,
@@ -4329,7 +4344,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             512,
@@ -4350,7 +4365,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             1024,
@@ -4371,7 +4386,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             512,
@@ -4392,7 +4407,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             512,
@@ -4413,7 +4428,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             518,
@@ -4434,7 +4449,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             512,
@@ -4455,7 +4470,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             128,
@@ -4476,7 +4491,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             128,
@@ -4497,7 +4512,7 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 4,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
             128,
@@ -4518,10 +4533,10 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
-            302,        // 14 tokens in last block
+            302, // 14 tokens in last block
             3,
             false,
             0,
@@ -4539,10 +4554,10 @@ INSTANTIATE_TEST_SUITE_P(NeededBlocksOneStepTestCorrectlyEstimated, NeededBlocks
                 0,
                 512,
                 1,
-                513,       // temporaryKvCacheLength = 0
+                513, // temporaryKvCacheLength = 0
                 false,
             },
-            298,        // 10 tokens in last block
+            298, // 10 tokens in last block
             3,
             false,
             0,
