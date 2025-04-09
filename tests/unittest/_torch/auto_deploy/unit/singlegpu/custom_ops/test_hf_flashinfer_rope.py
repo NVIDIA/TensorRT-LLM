@@ -27,8 +27,15 @@ def apply_rotary_pos_emb(
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # head_dim must be a multiple of 64
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])  # q/k must be in half precision
-def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (torch.bfloat16, 1e-4, 1e-4),
+        (torch.float16, 5e-4, 5e-4),
+    ],
+    ids=["bfloat16", "float16"],  # q/k must be in half precision
+)
+def test_flashinfer_and_custom_rope_ops(dtype, atol, rtol, head_dim):
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -78,9 +85,6 @@ def test_flashinfer_and_custom_rope_ops(dtype, head_dim):
     # Custom op call
     custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_new, sin_new, True)
 
-    atol = 5e-4 if dtype == torch.float16 else 1e-4
-    rtol = 5e-4 if dtype == torch.float16 else 1e-4
-
     torch.testing.assert_close(q_hf, q_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(q_hf, custom_q, rtol=rtol, atol=atol)
@@ -101,8 +105,15 @@ def apply_rotary_emb(
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # Must be a multiple of 64
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_flashinfer_complex_rotary(dtype, head_dim):
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (torch.bfloat16, 1e-5, 1e-5),
+        (torch.float16, 5e-4, 5e-4),
+    ],
+    ids=["bfloat16", "float16"],  # q/k must be in half precision
+)
+def test_flashinfer_complex_rotary(dtype, atol, rtol, head_dim):
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -130,5 +141,5 @@ def test_flashinfer_complex_rotary(dtype, head_dim):
     # q/k of llama4 rope is interleaved
     custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_flash, sin_flash, False)
 
-    torch.testing.assert_close(out_q_v2, custom_q, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(out_k_v2, custom_k, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(out_q_v2, custom_q, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out_k_v2, custom_k, rtol=rtol, atol=atol)

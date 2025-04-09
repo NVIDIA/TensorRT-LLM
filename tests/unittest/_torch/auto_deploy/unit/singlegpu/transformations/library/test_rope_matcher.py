@@ -36,6 +36,35 @@ def _precompute_freqs_cis(seq_len: int, head_dim: int, rope_theta: float):
     return cos, sin
 
 
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2) and complex dtype.
+):
+    # Reshape the inputs to pair the last dimension.
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
+    xq_out = torch.view_as_real(xq_complex * freqs_cis[:, :, None, :]).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_cis[:, :, None, :]).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def _precompute_freqs_cis_v2(seq_len: int, head_dim: int, rope_theta: float):
+    """
+    Compute the frequency tensor for the complex multiplication RoPE variant.
+    Returns a complex tensor of shape (seq_len, head_dim//2).
+    """
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim // 2, dtype=torch.float32) / (head_dim // 2))
+    )
+    positions = torch.arange(seq_len, dtype=torch.float32)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # (seq_len, head_dim//2)
+    # Create a complex tensor from magnitude=1 and the computed angles.
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+    return freqs_cis
+
+
 class RotaryModel(torch.nn.Module):
     def __init__(self, hidden_size: int, max_seq_len: int, layout: str = "BNSD"):
         super().__init__()
@@ -74,6 +103,34 @@ class RotaryModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
 
+class RotaryModelV2(torch.nn.Module):
+    def __init__(self, hidden_size: int, max_seq_len: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_seq_len = max_seq_len
+        self.linear = torch.nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.linear(x)
+        k = self.linear(x)
+        q = q.unsqueeze(2)
+        k = k.unsqueeze(2)  # [B, S, 1, D]
+        batch, seq, n_head, hidden = q.shape
+
+        # Precompute the complex frequency tensor.
+        freqs_cis = _precompute_freqs_cis_v2(seq, hidden, rope_theta=10000)
+        freqs_cis = freqs_cis.to(q.device)  # [seq, hidden//2]
+        # Expand to batch dimension; expected shape: [B, seq, hidden//2]
+        freqs_cis = freqs_cis.unsqueeze(0).expand(batch, -1, -1)
+
+        q_embed, k_embed = apply_rotary_emb(q, k, freqs_cis)
+        out = (q_embed + k_embed).to(torch.float16)
+        return out
+
+    def get_dynamic_shapes(self):
+        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
+
+
 @pytest.mark.parametrize(
     "layout",
     ["BNSD", "BSND"],
@@ -87,6 +144,30 @@ def test_match_rope(layout):
     model = RotaryModel(hidden_size, max_position_embeddings, layout=layout).to(
         "cuda", dtype=torch.float16
     )
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+
+    _ = run_test(
+        model,
+        x,
+        match_rope,
+        lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
+        lambda num_p_og: num_p_og,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=True,
+        strict_loading=True,
+        dynamic_shapes=dynamic_shapes,
+    )
+
+
+@torch.inference_mode()
+def test_match_rope_v2():
+    batch_size, seq_len = 8, 16
+    hidden_size = 64
+    max_position_embeddings = seq_len
+
+    model = RotaryModelV2(hidden_size, max_position_embeddings).to("cuda", dtype=torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 

@@ -6,7 +6,7 @@ import torch
 
 @torch.library.custom_op("rope::flashinfer", mutates_args=())
 def apply_rope_with_input_pos_flashinfer(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies rotary positional embeddings (RoPE) to query and key tensors using the FlashInfer kernel.
@@ -56,6 +56,6 @@ def apply_rope_with_input_pos_flashinfer(
 
 @apply_rope_with_input_pos_flashinfer.register_fake
 def apply_rope_with_input_pos_flashinfer_fake(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return q, k
