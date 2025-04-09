@@ -4,7 +4,9 @@ from typing import Dict, Optional, Tuple, List
 
 import torch
 from torch import nn
-from transformers import Llama4Config, LlamaConfig, AutoModel, AutoProcessor, Llama4VisionModel, Llama4MultiModalProjector
+from transformers import Llama4Config, LlamaConfig, AutoModel, AutoProcessor, Llama4VisionModel
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.modeling_utils import load_sharded_checkpoint
 from safetensors import safe_open
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
@@ -743,15 +745,11 @@ class Llama4InputProcessor(InputProcessor):
         self.vocab_size = model_config.text_config.vocab_size
         self.image_token_index = model_config.image_token_index
 
-        self.vision_model = Llama4VisionModel.from_pretrained(model_path).cuda()
-        self.multi_modal_projector = Llama4MultiModalProjector(model_config).cuda()
-        state_dict = self.multi_modal_projector.state_dict()
-        
-        with safe_open(Path(model_path) / "model.safetensors", framework="pt") as f:
-            for k in state_dict.keys():
-                state_dict[k] = f.get_tensor("multi_modal_projector." + k)
-
-        self.multi_modal_projector.load_state_dict(state_dict)
+        self.encoder = nn.ModuleDict({
+            "vision_model": Llama4VisionModel(model_config.vision_config),
+            "multi_modal_projector": Llama4MultiModalProjector(model_config)
+        }).cuda()
+        load_sharded_checkpoint(self.encoder, model_path, strict=False)
 
     @torch.inference_mode()
     def __call__(
@@ -772,8 +770,8 @@ class Llama4InputProcessor(InputProcessor):
             do_rescale=(img_type == Image)
         )
         token_ids, pixel_values = processed["input_ids"].squeeze(), processed["pixel_values"]
-        mm_embeds = self.vision_model(pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
-        mm_embeds = self.multi_modal_projector(mm_embeds)
+        mm_embeds = self.encoder.vision_model(pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
+        mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
         # for fuse_input_embeds
         token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
         return token_ids.tolist(), {"prompt_tuning_config": [mm_embeds, None, None]}
