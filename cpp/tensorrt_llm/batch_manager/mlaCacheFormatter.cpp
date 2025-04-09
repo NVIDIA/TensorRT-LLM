@@ -61,11 +61,11 @@ bool MLACacheFormatter::needSendCache(
 {
     int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
 
-    if (selfConfig.getParallelConfig().mEnableAttenionDP)
+    if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
         int selfTPNumInDPGroup
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttenionDP
+        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
             ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
             : destConfig.getParallelConfig().mTensorParallelism;
         int selfTPrankINDPGroup = selfTpRank % selfTPNumInDPGroup;
@@ -76,7 +76,7 @@ bool MLACacheFormatter::needSendCache(
         return selfTPrankINDPGroup % (selfTPNumInDPGroup / destTPNumInDPGroup) == 0;
     }
 
-    int destTPNum = destConfig.getParallelConfig().mEnableAttenionDP
+    int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
         ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
         : destConfig.getParallelConfig().mTensorParallelism;
     int selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
@@ -589,18 +589,18 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
-    if (selfConfig.getParallelConfig().mEnableAttenionDP
+    if (selfConfig.getParallelConfig().mEnableAttentionDP
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
 
         return false;
     }
-    if (destConfig.getParallelConfig().mEnableAttenionDP
+    if (destConfig.getParallelConfig().mEnableAttentionDP
         && (destConfig.getParallelConfig().mTensorParallelism % destConfig.getParallelConfig().mDPsize != 0))
     {
         return false;
     }
-    if ((destConfig.getParallelConfig().mEnableAttenionDP)
+    if ((destConfig.getParallelConfig().mEnableAttentionDP)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
         return false;

@@ -108,7 +108,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     mCacheState = std::make_unique<executor::kv_cache::CacheState>(
         cacheStateModelCfg, worldConfig, dataType, attentionType, kvFactor);
 
-    if (mCacheState->getParallelConfig().mEnableAttenionDP)
+    if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
         int TPSizeInDPGroup
             = mCacheState->getParallelConfig().mTensorParallelism / mCacheState->getParallelConfig().mDPsize;
@@ -340,7 +340,7 @@ void updateKVCacheTransferBW(mpi::MpiComm const& mpiComm, LlmRequest* request)
 void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttenionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupTPInDPComm : mMpiGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mResponderFutures)
     {
@@ -419,7 +419,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
 
     std::vector<LlmRequest::RequestIdType> toBlockRequestIds;
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttenionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
+    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mMpiGroupDataComm.get() : mMpiGroupComm;
     if ((syncComm) && syncComm->getSize() > 1)
     {
         auto gatherRequestIdVec = gatherRequestIds(*syncComm, genTransferReadyRequestIds);
