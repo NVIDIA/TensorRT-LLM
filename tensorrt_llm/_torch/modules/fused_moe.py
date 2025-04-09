@@ -243,6 +243,7 @@ class FusedMoE(nn.Module):
         aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        apply_router_weight_on_input: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -309,6 +310,9 @@ class FusedMoE(nn.Module):
         self._weights_created = False
         if not model_config.skip_create_weights:
             self.create_weights()
+
+        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -596,6 +600,12 @@ class FusedMoE(nn.Module):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            token_final_scales = torch.ones_like(token_final_scales)
+
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq:
@@ -673,6 +683,7 @@ class FusedMoE(nn.Module):
             return self.forward_cutlass(x, router_logits, min_latency_mode,
                                         output_dtype, all_rank_num_tokens)
         elif self.is_trtllm():
+            assert not self.apply_router_weight_on_input, "TRTLLM backend does not support applying router weight on input yet."
             return self.forward_trtllmgen(x, router_logits)
         else:
             raise NotImplementedError(
