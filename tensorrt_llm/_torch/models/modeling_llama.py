@@ -1,10 +1,11 @@
 import copy
+from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 import torch
 from torch import nn
-from transformers import Llama4Config, LlamaConfig, AutoModel, AutoProcessor
-
+from transformers import Llama4Config, LlamaConfig, AutoModel, AutoProcessor, Llama4VisionModel, Llama4MultiModalProjector
+from safetensors import safe_open
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce,
                                              ParallelConfig, TensorParallelMode)
@@ -600,13 +601,16 @@ class Llama4InputProcessor(InputProcessor):
         self.tokenizer = tokenizer
         self.vocab_size = model_config.text_config.vocab_size
         self.image_token_index = model_config.image_token_index
-        # TODO: don't load the whole model again
-        model = AutoModel.from_pretrained(
-            model_path,
-            device_map="cpu",
-        )
-        self.vision_model = model.vision_model.cuda()
-        self.multi_modal_projector = model.multi_modal_projector.cuda()
+
+        self.vision_model = Llama4VisionModel.from_pretrained(model_path).cuda()
+        self.multi_modal_projector = Llama4MultiModalProjector(model_config).cuda()
+        state_dict = self.multi_modal_projector.state_dict()
+        
+        with safe_open(Path(model_path) / "model.safetensors", framework="pt") as f:
+            for k in state_dict.keys():
+                state_dict[k] = f.get_tensor("multi_modal_projector." + k)
+
+        self.multi_modal_projector.load_state_dict(state_dict)
 
     @torch.inference_mode()
     def __call__(
