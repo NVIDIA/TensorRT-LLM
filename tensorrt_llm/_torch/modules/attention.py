@@ -83,13 +83,18 @@ class Attention(nn.Module):
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
         rank = config.mapping.rank
-        gpus_per_node = config.mapping.gpus_per_node
         if config.mapping.enable_attention_dp:
             tp_size = 1
             pp_size = 1
             rank = 0
 
-        self.mapping = config.mapping
+        mapping = Mapping(
+            world_size=tp_size * pp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            rank=rank,
+            gpus_per_node=config.mapping.gpus_per_node,
+        )
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
@@ -107,13 +112,7 @@ class Attention(nn.Module):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
-            mapping=Mapping(
-                world_size=tp_size * pp_size,
-                tp_size=tp_size,
-                pp_size=pp_size,
-                rank=rank,
-                gpus_per_node=gpus_per_node,
-            ),
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
@@ -125,13 +124,7 @@ class Attention(nn.Module):
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            mapping=Mapping(
-                world_size=tp_size * pp_size,
-                tp_size=tp_size,
-                pp_size=pp_size,
-                rank=rank,
-                gpus_per_node=gpus_per_node,
-            ),
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
@@ -288,7 +281,6 @@ class MLA(nn.Module):
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
         rank = config.mapping.rank
-        gpus_per_node = config.mapping.gpus_per_node
         if config.mapping.enable_attention_dp:
             tp_size = 1
             pp_size = 1
@@ -299,7 +291,7 @@ class MLA(nn.Module):
             tp_size=tp_size,
             pp_size=pp_size,
             rank=rank,
-            gpus_per_node=gpus_per_node,
+            gpus_per_node=config.mapping.gpus_per_node,
         )
 
         assert self.num_heads % tp_size == 0

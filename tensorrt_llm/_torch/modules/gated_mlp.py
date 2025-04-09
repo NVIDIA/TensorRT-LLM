@@ -52,16 +52,20 @@ class GatedMLP(nn.Module):
             tp_size = config.mapping.tp_size
             pp_size = config.mapping.pp_size
 
+        mapping = Mapping(
+            world_size=tp_size * pp_size,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            tp_size=tp_size,
+            pp_size=pp_size,
+        )
+
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
             bias=bias,
             dtype=dtype,
-            mapping=Mapping(world_size=tp_size * pp_size,
-                            rank=self.mapping.rank,
-                            gpus_per_node=self.mapping.gpus_per_node,
-                            tp_size=tp_size,
-                            pp_size=pp_size),
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
@@ -74,11 +78,7 @@ class GatedMLP(nn.Module):
             self.hidden_size,
             bias=bias,
             dtype=dtype,
-            mapping=Mapping(world_size=tp_size * pp_size,
-                            rank=self.mapping.rank,
-                            gpus_per_node=self.mapping.gpus_per_node,
-                            tp_size=tp_size,
-                            pp_size=pp_size),
+            mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
