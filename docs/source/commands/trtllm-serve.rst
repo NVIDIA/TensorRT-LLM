@@ -66,6 +66,27 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+Benchmark
+---------
+
+You can use any benchmark clients to test the serving performance of ``trtllm_serve``, in the following example, we use ``genai-perf`` as an example.
+
+First, install ``genai-perf`` with ``pip``:
+
+.. code-block:: bash
+
+   pip install genai-perf
+
+Then, :ref:`start a server<Starting a Server>` with ``trtllm-serve``.
+
+Finally, run performance benchmark with the following command:
+
+.. literalinclude:: ../../../examples/serve/genai_perf_client.sh
+    :language: bash
+    :linenos:
+
+Refer to `README <https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md>`_ of ``genai-perf`` for more guidance.
+
 Metrics Endpoint
 ----------------
 
@@ -127,3 +148,4 @@ Syntax
 
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve
+   :nested: full
