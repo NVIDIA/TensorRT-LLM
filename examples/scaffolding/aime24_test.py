@@ -1,11 +1,10 @@
 import argparse
 import json
 
-from tensorrt_llm.scaffolding.controller import (MajorityVoteController,
-                                                 NativeGenerationController)
-from tensorrt_llm.scaffolding.math_utils import *
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.worker import TRTLLMWorker
+from tensorrt_llm.scaffolding import (MajorityVoteController,
+                                      NativeGenerationController,
+                                      ScaffoldingLlm, TRTLLMWorker,
+                                      extract_answer_from_boxed)
 
 
 def parse_arguments():
@@ -77,7 +76,7 @@ def main():
         ref_answer = int(test_case["answer"])
         result.result()
         output = result.output
-        extracted_answer = extract_answer(output.output_str)
+        extracted_answer = extract_answer_from_boxed(output.output_str)
         try:
             # print(f"[QUESTION]:\n{prompt}\n\n[OUTPUT]\n\n{output.output_str}\n\n")
             answer = int(extracted_answer)
