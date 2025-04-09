@@ -24,6 +24,8 @@ from .library import (
     fuse_gemms,
     fuse_moe,
     match_moe_pattern,
+    match_rope_v1,
+    match_rope_v2,
     quantize,
     resize_kv_cache,
 )
@@ -94,6 +96,10 @@ class InferenceOptimizer:
 
         # Match MoE pattern
         egm = match_moe_pattern(egm)
+
+        # Match Rope pattern
+        egm = match_rope_v1(egm)
+        egm = match_rope_v2(egm)
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
