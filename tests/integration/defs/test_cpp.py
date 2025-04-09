@@ -341,6 +341,11 @@ def test_unit_tests(build_google_tests, build_dir, lora_setup):
 def test_model(build_google_tests, model, prepare_model, run_model_tests,
                run_fp8):
 
+    if model == "recurrentgemma":
+        pytest.skip(
+            "TODO: fix recurrentgemma OOM with newest version of transformers")
+        return
+
     prepare_model(model, run_fp8)
 
     run_model_tests(model, run_fp8)

@@ -104,9 +104,10 @@ void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, Generati
     // split batch into single requests
     auto const& inputLengths = inputs.lengths;
     mDecoder->getDecoderState().setActualBatchSize(inputLengths->getShape().d[0]);
-    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.clear();
-    mDecoder->getDecoderState().getJointDecodingInput().numDecodingEngineTokens.resize(
-        mDecoder->getDecoderState().getActualBatchSize(), 1);
+    for (auto i = 0; i < mDecoder->getDecoderState().getActualBatchSize(); ++i)
+    {
+        mDecoder->getDecoderState().setNumDecodingEngineTokens(i, 1);
+    }
 
     auto const& jointOutputIdsShape = mDecoder->getDecoderState().getJointDecodingOutput().ids->getShape();
     auto const maxBatchSize = jointOutputIdsShape.d[0];
@@ -237,7 +238,7 @@ void StatefulGptDecoderBatched::forwardSync()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    mDecoderFinishEvent->event.synchronize();
+    mDecoderFinishEvent.synchronize();
 
     // wait for mFinishedSum to be updated
     mForwardEvent.synchronize();

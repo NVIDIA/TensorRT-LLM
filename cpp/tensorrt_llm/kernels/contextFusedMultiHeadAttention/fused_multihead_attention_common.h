@@ -97,7 +97,7 @@ struct MHARunnerFixedParams
     Data_type dataTypeOut;
 
     // Do we use fp32 accumulation ?
-    // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
+    // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
     // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
     bool forceFp32Acc;
     // The attention mask type.
@@ -140,47 +140,91 @@ struct MHARunnerFixedParams
     // Convert to string for debug.
     std::string convertToStrOutput()
     {
-        // Data type.
-        std::string output = "data_type = ";
-        switch (dataType)
-        {
-        case DATA_TYPE_FP16: output += forceFp32Acc ? "fp16_fp32" : "fp16"; break;
-        case DATA_TYPE_BF16: output += "bf16"; break;
-        case DATA_TYPE_E4M3: output += "e4m3"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
-        }
-        // Head size.
-        output += ", head_size = " + std::to_string(headSize);
-        output += ", head_size_V = " + std::to_string(headSizeV);
-        // Attention mask type.
-        output += ", attention_mask_type = ";
+        std::string output = "dataType = ";
+        output += data_type_to_string(dataType);
+
+        output += ", dataTypeKv = ";
+        output += data_type_to_string(dataTypeKv);
+
+        output += ", dataTypeOut = ";
+        output += data_type_to_string(dataTypeOut);
+
+        output += ", forceFp32Acc = " + std::string(forceFp32Acc ? "true" : "false");
+
+        output += ", attentionMaskType = ";
         switch (attentionMaskType)
         {
         case ContextAttentionMaskType::PADDING: output += "padding"; break;
         case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
         case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: output += "sliding_window_causal"; break;
         case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        default: output += std::to_string(static_cast<int>(attentionMaskType)) + " (unknown)"; break;
         }
-        // Attention mask type.
-        output += ", attention_input_layout = ";
+
+        output += ", attentionInputLayout = ";
         switch (attentionInputLayout)
         {
-        case AttentionInputLayout::PACKED_QKV:
-            output += "packed_qkv, num_tokens_per_block = " + std::to_string(numTokensPerBlock);
-            break;
+        case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
-        default: TLLM_CHECK_WITH_INFO(false, "not supported.");
+        default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
-        // Alibi.
-        output += ", alibi = ";
-        output += (hasAlibi ? "true" : "false");
-        // Attention logit softcapping scale.
-        output += ", attn_logit_softcapping_scale = ";
-        output += (attnLogitSoftcappingScale != 0.f ? "true" : "false");
+
+        output += ", isSPadded = " + std::string(isSPadded ? "true" : "false");
+        output += ", numQHeads = " + std::to_string(numQHeads);
+        output += ", numKvHeads = " + std::to_string(numKvHeads);
+        output += ", numTokensPerBlock = " + std::to_string(numTokensPerBlock);
+        output += ", headSize = " + std::to_string(headSize);
+        output += ", headSizeV = " + std::to_string(headSizeV);
+        output += ", qScaling = " + std::to_string(qScaling);
+        output += ", attnLogitSoftcappingScale = " + std::to_string(attnLogitSoftcappingScale);
+        output += ", hasAlibi = " + std::string(hasAlibi ? "true" : "false");
+        output += ", scaleAlibi = " + std::string(scaleAlibi ? "true" : "false");
+        output += ", tpSize = " + std::to_string(tpSize);
+        output += ", tpRank = " + std::to_string(tpRank);
+        output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
+        output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
+        output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
 
         return output;
+    }
+
+    /**
+     * Set attention mask type from AttentionMaskType enum
+     * @param maskType The AttentionMaskType to use
+     * @return Reference to this object for method chaining
+     * @throws If the maskType cannot be mapped to ContextAttentionMaskType
+     */
+    MHARunnerFixedParams& setAttentionMaskType(std::int8_t maskType)
+    {
+        switch (maskType)
+        {
+        case 0: // tensorrt_llm::kernels::AttentionMaskType::PADDING
+            attentionMaskType = ContextAttentionMaskType::PADDING;
+            break;
+        case 1: // tensorrt_llm::kernels::AttentionMaskType::CAUSAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
+            attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
+            break;
+        // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used
+        case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 4: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONALGLM
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 5: // tensorrt_llm::kernels::AttentionMaskType::BLOCKSPARSE
+            attentionMaskType = ContextAttentionMaskType::CAUSAL;
+            break;
+        case 6: // tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK
+            attentionMaskType = ContextAttentionMaskType::CUSTOM_MASK;
+            break;
+        default:
+            TLLM_THROW("AttentionMaskType %d cannot be mapped to ContextAttentionMaskType", static_cast<int>(maskType));
+        }
+        return *this;
     }
 };
 

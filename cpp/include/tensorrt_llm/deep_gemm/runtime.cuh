@@ -25,17 +25,31 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
-
 #include "jit_utils.cuh"
 #include "scheduler.cuh"
 
 namespace deep_gemm::jit
 {
+
+static bool kJitDebugging = []()
+{
+    char const* env_var = getenv("TRTLLM_DG_JIT_DEBUG");
+    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+}();
+
+static bool kJitUseNvcc = []()
+{
+    char const* env_var = getenv("TRTLLM_DG_JIT_USE_NVCC");
+    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+}();
+
+static bool kJitDumpCubin = []()
+{
+    char const* env_var = getenv("TRTLLM_DG_JIT_DUMP_CUBIN");
+    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
+}();
+
+static std::string kKernelName = kJitUseNvcc ? "nvcc_kernel.cubin" : "nvrtc_kernel.cubin";
 
 /**
  * C++ implementation of the Runtime class from runtime.py
@@ -44,170 +58,84 @@ namespace deep_gemm::jit
 class Runtime
 {
 public:
-    Runtime(std::string const& path, deep_gemm::GemmType gemm_type);
-    ~Runtime();
+    Runtime(std::string const& path, std::vector<char> const& cubin, deep_gemm::GemmType gemm_type)
+        : path_(path)
+        , cubin_(cubin)
+        , gemm_type_(gemm_type)
+        , lib_(nullptr)
+        , kernel_(nullptr)
+    {
+        DG_HOST_ASSERT(!cubin.empty() || isPathValid(path_));
+    }
 
-    static bool isPathValid(std::string const& path);
+    ~Runtime()
+    {
+        if (lib_ != nullptr)
+        {
+            CHECK_CUDA(cuLibraryUnload(lib_));
+        }
+    }
 
-    template <typename... Args>
-    void operator()(Args&&... args)
+    static bool isPathValid(std::string const& path)
+    {
+        // Check if path exists and is a directory
+        if (!std::filesystem::exists(path) || !std::filesystem::is_directory(path))
+        {
+            return false;
+        }
+
+        // Check if all necessary files exist
+        return std::filesystem::exists(std::filesystem::path(path) / kKernelName);
+    }
+
+    CUkernel getKernel()
     {
         // Load shared object if not already loaded
-        if (!lib_)
+        if (kernel_ == nullptr)
         {
-            std::filesystem::path libPath = std::filesystem::path(path_);
-#ifdef _WIN32
-            libPath /= "kernel.dll";
-            lib_ = LoadLibraryA(libPath.string().c_str());
-            if (!lib_)
+            if (cubin_.empty())
             {
-                throw std::runtime_error("Failed to load DLL: " + std::to_string(GetLastError()));
+                std::filesystem::path cubinPath = std::filesystem::path(path_);
+                cubinPath /= kKernelName;
+                std::ifstream cubinFile(cubinPath.string(), std::ios::binary);
+                cubin_ = std::vector<char>(std::istreambuf_iterator<char>(cubinFile), {});
             }
 
-            // Load launch function
-            switch (gemm_type_)
+            CHECK_CUDA(cuLibraryLoadData(&lib_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+
+            unsigned int numKernels = 0;
+            CHECK_CUDA(cuLibraryGetKernelCount(&numKernels, lib_));
+
+            std::vector<CUkernel> kernels(numKernels);
+            CHECK_CUDA(cuLibraryEnumerateKernels(kernels.data(), numKernels, lib_));
+
+            for (auto kernel : kernels)
             {
-            case deep_gemm::GemmType::Normal:
-                launchFuncNormal_ = reinterpret_cast<LaunchFuncNormal>(GetProcAddress((HMODULE) lib_, "launch"));
-                if (!launchFuncNormal_)
+                char const* kernelName;
+                CHECK_CUDA(cuKernelGetName(&kernelName, kernel));
+                std::string kernelNameStr(kernelName);
+                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos)
                 {
-                    throw std::runtime_error("Failed to find launch function: " + std::to_string(GetLastError()));
+                    kernel_ = kernel;
+                    break;
                 }
-                break;
-            case deep_gemm::GemmType::GroupedWithOffset:
-                launchFuncGroupedWithOffset_
-                    = reinterpret_cast<LaunchFuncGroupedWithOffset>(GetProcAddress((HMODULE) lib_, "launch"));
-                if (!launchFuncGroupedWithOffset_)
-                {
-                    throw std::runtime_error("Failed to find launch function: " + std::to_string(GetLastError()));
-                }
-                break;
-            case deep_gemm::GemmType::StridedBatched:
-                launchFuncStridedBatched_
-                    = reinterpret_cast<LaunchFuncStridedBatched>(GetProcAddress((HMODULE) lib_, "launch"));
-                if (!launchFuncStridedBatched_)
-                {
-                    throw std::runtime_error("Failed to find launch function: " + std::to_string(GetLastError()));
-                }
-                break;
-            default: throw std::runtime_error("Unsupported gemm type: " + gemm_type_to_string(gemm_type_));
-            }
-#else
-            libPath /= "kernel.so";
-            lib_ = dlopen(libPath.c_str(), RTLD_LAZY);
-            if (!lib_)
-            {
-                throw std::runtime_error("Failed to load shared object: " + std::string(dlerror()));
             }
 
-            // Load launch function
-            switch (gemm_type_)
+            if (!kernel_)
             {
-            case deep_gemm::GemmType::Normal:
-                launchFuncNormal_ = reinterpret_cast<LaunchFuncNormal>(dlsym(lib_, "launch"));
-                if (!launchFuncNormal_)
-                {
-                    throw std::runtime_error("Failed to find launch function: " + std::string(dlerror()));
-                }
-                break;
-            case deep_gemm::GemmType::GroupedWithOffset:
-                launchFuncGroupedWithOffset_ = reinterpret_cast<LaunchFuncGroupedWithOffset>(dlsym(lib_, "launch"));
-                if (!launchFuncGroupedWithOffset_)
-                {
-                    throw std::runtime_error("Failed to find launch function: " + std::string(dlerror()));
-                }
-                break;
-            case deep_gemm::GemmType::StridedBatched:
-                launchFuncStridedBatched_ = reinterpret_cast<LaunchFuncStridedBatched>(dlsym(lib_, "launch"));
-                if (!launchFuncStridedBatched_)
-                {
-                    throw std::runtime_error("Failed to find launch function: " + std::string(dlerror()));
-                }
-                break;
-            default: throw std::runtime_error("Unsupported gemm type: " + gemm_type_to_string(gemm_type_));
+                throw std::runtime_error("Failed to find fp8_gemm_kernel");
             }
-#endif
         }
 
-        // Call the launch function with the provided arguments
-        switch (gemm_type_)
-        {
-        case deep_gemm::GemmType::Normal: callNormal(std::forward<Args>(args)...); break;
-        case deep_gemm::GemmType::GroupedWithOffset: callGroupedWithOffset(std::forward<Args>(args)...); break;
-        case deep_gemm::GemmType::StridedBatched: callStridedBatched(std::forward<Args>(args)...); break;
-        default: throw std::runtime_error("Unsupported gemm type: " + gemm_type_to_string(gemm_type_));
-        }
+        return kernel_;
     }
 
 private:
-    using LaunchFuncNormal
-        = void (*)(void*, int, void*, int, void*, int, float*, float*, uint32_t, int*, cudaStream_t, int, uint32_t);
-    using LaunchFuncGroupedWithOffset = void (*)(
-        void*, int, void*, int, void*, int, float*, float*, int64_t*, int64_t*, cudaStream_t, int, uint32_t, uint32_t);
-
-    using LaunchFuncStridedBatched = void (*)(void*, uint64_t, uint64_t, void*, uint64_t, uint64_t, void*, uint64_t,
-        uint64_t, float*, float*, uint32_t, uint32_t, cudaStream_t, int, uint32_t);
-
     std::string path_;
-    void* lib_;
+    std::vector<char> cubin_;
+    CUlibrary lib_;
+    CUkernel kernel_;
     deep_gemm::GemmType gemm_type_;
-    LaunchFuncNormal launchFuncNormal_;
-    LaunchFuncGroupedWithOffset launchFuncGroupedWithOffset_;
-    LaunchFuncStridedBatched launchFuncStridedBatched_;
-
-    // Helper method for Normal GEMM - checks for correct number of arguments
-    template <typename... ArgsT>
-    void callNormal(ArgsT&&... args)
-    {
-        constexpr size_t expected_args = 13;
-        constexpr size_t actual_args = sizeof...(args);
-
-        if constexpr (actual_args != expected_args)
-        {
-            throw std::invalid_argument(
-                "Normal GEMM requires exactly 13 arguments, but " + std::to_string(actual_args) + " were provided");
-        }
-        else
-        {
-            launchFuncNormal_(std::forward<ArgsT>(args)...);
-        }
-    }
-
-    // Helper method for GroupedWithOffset GEMM - checks for correct number of arguments
-    template <typename... ArgsT>
-    void callGroupedWithOffset(ArgsT&&... args)
-    {
-        constexpr size_t expected_args = 14;
-        constexpr size_t actual_args = sizeof...(args);
-
-        if constexpr (actual_args != expected_args)
-        {
-            throw std::invalid_argument("GroupedWithOffset GEMM requires exactly 14 arguments, but "
-                + std::to_string(actual_args) + " were provided");
-        }
-        else
-        {
-            launchFuncGroupedWithOffset_(std::forward<ArgsT>(args)...);
-        }
-    }
-
-    // Helper method for StridedBatched GEMM - checks for correct number of arguments
-    template <typename... ArgsT>
-    void callStridedBatched(ArgsT&&... args)
-    {
-        constexpr size_t expected_args = 16;
-        constexpr size_t actual_args = sizeof...(args);
-
-        if constexpr (actual_args != expected_args)
-        {
-            throw std::invalid_argument("StridedBatched GEMM requires exactly 16 arguments, but "
-                + std::to_string(actual_args) + " were provided");
-        }
-        else
-        {
-            launchFuncStridedBatched_(std::forward<ArgsT>(args)...);
-        }
-    }
 };
 
 /**
@@ -217,9 +145,57 @@ private:
 class RuntimeCache
 {
 public:
-    static RuntimeCache& getInstance();
-    Runtime* operator[](std::string const& path);
-    void set(std::string const& path, std::unique_ptr<Runtime> runtime);
+    static RuntimeCache& getInstance()
+    {
+        static RuntimeCache instance;
+        return instance;
+    }
+
+    Runtime* operator[](std::string const& path)
+    {
+        // Check if already in cache
+        auto it = cache_.find(path);
+        if (it != cache_.end())
+        {
+            return it->second.get();
+        }
+
+        // Check if already compiled
+        if (Runtime::isPathValid(path))
+        {
+            // Parse path to get gemm type
+            std::string gemm_type_str = path.substr(path.find_last_of('_') + 1);
+            deep_gemm::GemmType gemm_type;
+            if (gemm_type_str == "Normal")
+            {
+                gemm_type = deep_gemm::GemmType::Normal;
+            }
+            else if (gemm_type_str == "GroupedWithOffset")
+            {
+                gemm_type = deep_gemm::GemmType::GroupedWithOffset;
+            }
+            else if (gemm_type_str == "StridedBatched")
+            {
+                gemm_type = deep_gemm::GemmType::StridedBatched;
+            }
+            else
+            {
+                throw std::runtime_error("Unsupported gemm type: " + gemm_type_str);
+            }
+
+            auto runtime = std::make_unique<Runtime>(path, std::vector<char>(), gemm_type);
+            Runtime* result = runtime.get();
+            cache_[path] = std::move(runtime);
+            return result;
+        }
+
+        return nullptr;
+    }
+
+    void set(std::string const& path, std::unique_ptr<Runtime>&& runtime)
+    {
+        cache_[path] = std::move(runtime);
+    }
 
 private:
     // Private constructor for singleton pattern
@@ -233,112 +209,6 @@ private:
 };
 
 // Global function to access the singleton
-RuntimeCache& getGlobalRuntimeCache();
-
-} // namespace deep_gemm::jit
-
-namespace deep_gemm::jit
-{
-// Runtime implementation
-Runtime::Runtime(std::string const& path, deep_gemm::GemmType gemm_type)
-    : path_(path)
-    , gemm_type_(gemm_type)
-    , lib_(nullptr)
-{
-    assert(isPathValid(path_));
-}
-
-Runtime::~Runtime()
-{
-    if (lib_)
-    {
-#ifdef _WIN32
-        FreeLibrary(static_cast<HMODULE>(lib_));
-#else
-        dlclose(lib_);
-#endif
-    }
-}
-
-bool Runtime::isPathValid(std::string const& path)
-{
-    // Check if path exists and is a directory
-    if (!std::filesystem::exists(path) || !std::filesystem::is_directory(path))
-    {
-        return false;
-    }
-
-    // Check if all necessary files exist
-#ifdef _WIN32
-    std::string soName = "kernel.dll";
-#else
-    std::string soName = "kernel.so";
-#endif
-    std::vector<std::string> requiredFiles = {"kernel.cu", soName};
-    for (auto const& file : requiredFiles)
-    {
-        if (!std::filesystem::exists(std::filesystem::path(path) / file))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-// RuntimeCache implementation
-RuntimeCache& RuntimeCache::getInstance()
-{
-    static RuntimeCache instance;
-    return instance;
-}
-
-Runtime* RuntimeCache::operator[](std::string const& path)
-{
-    // Check if already in cache
-    auto it = cache_.find(path);
-    if (it != cache_.end())
-    {
-        return it->second.get();
-    }
-
-    // Check if already compiled
-    if (Runtime::isPathValid(path))
-    {
-        // Parse path to get gemm type
-        std::string gemm_type_str = path.substr(path.find_last_of('_') + 1);
-        deep_gemm::GemmType gemm_type;
-        if (gemm_type_str == "Normal")
-        {
-            gemm_type = deep_gemm::GemmType::Normal;
-        }
-        else if (gemm_type_str == "GroupedWithOffset")
-        {
-            gemm_type = deep_gemm::GemmType::GroupedWithOffset;
-        }
-        else if (gemm_type_str == "StridedBatched")
-        {
-            gemm_type = deep_gemm::GemmType::StridedBatched;
-        }
-        else
-        {
-            throw std::runtime_error("Unsupported gemm type: " + gemm_type_str);
-        }
-
-        auto runtime = std::make_unique<Runtime>(path, gemm_type);
-        Runtime* result = runtime.get();
-        cache_[path] = std::move(runtime);
-        return result;
-    }
-
-    return nullptr;
-}
-
-void RuntimeCache::set(std::string const& path, std::unique_ptr<Runtime> runtime)
-{
-    cache_[path] = std::move(runtime);
-}
-
-// Global function to access the RuntimeCache singleton
 RuntimeCache& getGlobalRuntimeCache()
 {
     return RuntimeCache::getInstance();

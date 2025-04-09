@@ -324,6 +324,8 @@ private:
     std::optional<Tensor> mConfig;
 };
 
+/// @brief Configuration for Look-Ahead speculative decoding.
+/// Allows to include window size, ngram size and verification set size
 struct LookaheadDecodingConfig
 {
     LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
@@ -624,30 +626,31 @@ public:
     /// @param mRopeConfig The mrope configuration
     /// @param loraConfig The LoRA configuration
     /// @param lookaheadConfig The lookahead speculative decoding configuration
+    /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
     /// @param logitsPostProcessorName The logits postprocessor name. Must correspond to one of the logits postprocessor
+    /// name provided to the ExecutorConfig.
     /// @param logitsPostProcessor The logits postprocessor dynamically specified per request; only supported with
     /// replicate=false or no tensor parallelism.
-    /// @param kvCacheRetentionConfig The configuration used for KV cache block eviction.
-    /// name provided to the ExecutorConfig.
     /// @param encoderInputTokenIds The encoder input token ids for encoder-decoder models, or encoder-only models
+    /// @param clientId
     /// @param returnAllGeneratedTokens Indicates whether to return the full beams or just the newly generated tokens
     /// after every streaming step.
     /// @param priority Sets the execution priority of this request.
+    /// @param type Indicate the request type for disaggregated serving mode.
+    /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param encoderInputFeatures Encoder input features for multimodal models.
     /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
     /// convolution down-sampling, etc.)
     /// @param crossAttentionMask Cross attention mask.
-    /// @param type Indicate the request type for disaggregated serving mode.
-    /// @param contextPhaseParams Generated token ID  from context only executor.
     /// @param numReturnSequences The number of returning sequences.
     /// @param eagleConfig The EAGLE speculative decoding configuration
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     /// @param guidedDecodingParams The guided decoding parameters.
+    /// @param languageAdapterUid Task Uid for language adapter.
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
     /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
     /// be timed-out before ever being scheduled.
-    /// @param languageAdapterUid Task Uid for language adapter.
-
+    // 34 parameters
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -718,9 +721,9 @@ public:
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
+    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
-    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -752,8 +755,8 @@ public:
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
-    void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
+    void setAllottedTimeMs(MillisecondsType allottedTimeMs);
 
 private:
     friend class Serialization;
@@ -1279,7 +1282,7 @@ public:
 
     // Lookahead methods.
     /// @brief Sets lookahead decoding mode and config.
-    void setLookaheadDecoding(LookaheadDecodingConfig const& lookaheadDecodingConfig);
+    void setLookaheadDecodingConfig(LookaheadDecodingConfig const& lookaheadDecodingConfig);
     void enableSeamlessLookaheadDecoding();
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
     [[nodiscard]] SizeType32 getLookaheadDecodingMaxNumRequest() const;
@@ -1411,7 +1414,7 @@ public:
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
-        bool gatherGenerationLogits = false);
+        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1442,6 +1445,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
+    [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1467,6 +1471,7 @@ public:
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
+    void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
 
 private:
     friend class Serialization;
@@ -1526,8 +1531,8 @@ private:
     /// @brief The time in ms between polls for new communication in orchestrator mode. Use 0 for busy loop.
     SizeType32 mRecvPollPeriodMs;
 
-    /// @brief The maximum time in microseconds a scheduled request can remain idle before getting terminated. Default
-    /// is 3 minutes.
+    /// @brief The maximum time in microseconds a scheduled request can remain idle before getting terminated.
+    /// Default value is 3 minutes.
     uint64_t mMaxSeqIdleMicroseconds;
 
     /// @brief The speculative decoding configuration
@@ -1540,8 +1545,10 @@ private:
     std::optional<std::vector<std::string>> mAdditionalOutputNames;
 
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
-    /// Default is false.
-    bool mGatherGenerationLogits;
+    bool mGatherGenerationLogits{false};
+
+    /// @brief Controls if Variable-Beam-Width-Search is enabled.
+    bool mUseVariableBeamWidthSearch{false};
 };
 
 struct KVCacheCreatedData

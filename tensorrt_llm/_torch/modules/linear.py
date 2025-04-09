@@ -13,7 +13,7 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 
 from ...models.modeling_utils import QuantConfig
 from ..distributed import ParallelConfig, TensorParallelMode
-from ..utils import Fp4QuantizedTensor, is_torch_compiling
+from ..utils import Fp4QuantizedTensor
 
 E2M1_MAX = 6.0
 
@@ -275,11 +275,6 @@ class Linear(nn.Module):
                                                    dtype=torch.float32,
                                                    device=device),
                                        requires_grad=False)
-
-                self.profiler = torch.classes.trtllm.FP4GemmRunner.get_instance(
-                    self.dtype)
-                self.needs_profiling = True
-
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
@@ -315,7 +310,6 @@ class Linear(nn.Module):
                     scale_b=self.weight_scale,
                     bias=None,
                     out_dtype=self.dtype or input.dtype,
-                    userbuffers_id=-1,
                 )
                 if bias is not None:
                     output = output + bias
@@ -329,7 +323,8 @@ class Linear(nn.Module):
 
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
                     act_input_fp8, self.weight, act_input_sf, self.weight_scale)
-
+                if bias is not None:
+                    output = output + bias
             elif self.has_nv_fp4:
                 if isinstance(input, Fp4QuantizedTensor):
                     act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
@@ -338,27 +333,12 @@ class Linear(nn.Module):
                         input, self.input_scale, self.scaling_vector_size,
                         False)
 
-                # This is a workaround to avoid the issue that torch compile cannot handle the profiler.
-                if is_torch_compiling():
-                    output = torch.ops.trtllm.fp4_gemm(act_fp4, self.weight,
-                                                       act_sf,
-                                                       self.weight_scale,
-                                                       self.alpha, False,
-                                                       self.dtype)
-                else:
-                    m = math.prod(act_fp4.shape[:-1])
-                    n = self.weight.shape[0]
-                    k = self.weight.shape[1] * 2
-
-                    if self.needs_profiling:
-                        self.needs_profiling = False
-                        self.profiler.run_profile(n, k, fp4_utils.fp4_buckets)
-
-                    best_config_id = self.profiler.get_best_config_id(m, n, k)
-                    output = self.profiler.run_gemm(act_fp4, self.weight,
-                                                    act_sf, self.weight_scale,
-                                                    self.alpha, False,
-                                                    best_config_id)
+                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, self.weight,
+                                                     act_sf, self.weight_scale,
+                                                     self.alpha, False,
+                                                     self.dtype)
+                if bias is not None:
+                    output = output + bias
             else:
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')

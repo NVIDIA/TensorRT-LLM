@@ -1705,14 +1705,16 @@ def preprocess_perlayer_weights(weights,
                 dtype = torch.float16
                 if model_config.dtype == "bfloat16":
                     dtype = torch.bfloat16
-                weights[name] = preprocessor(param.T, torch.quint4x2,
+                weights[name] = preprocessor(param.transpose(-1, -2),
+                                             torch.quint4x2,
                                              activation_type).view(dtype)
-            if name.endswith('weights_scaling_factor'
-                             ) and param.shape[0] > param.shape[1]:
-                # TODO: refine on supporting ModelOpt HF-AWQ
-                weights[name] = param.T.contiguous().to(
+            if name.endswith('weights_scaling_factor'):
+                weights[name] = param.transpose(-1, -2).contiguous().to(
                     str_dtype_to_torch(model_config.dtype))
             if name.endswith('prequant_scaling_factor'):
+                if len(weights[name].shape) == 2:
+                    # MoE experts share the same scaling factor.
+                    param = param[0, :]
                 weights[name] = param.reshape(1, -1)
             if model_config.mapping.tp_rank > 0:
                 if name.endswith('attention.dense.bias') or name.endswith(

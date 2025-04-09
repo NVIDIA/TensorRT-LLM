@@ -362,7 +362,7 @@ def test_qwen_medusa_1gpu(llm_qwen_model_root,
 
 @pytest.mark.parametrize("llm_phi_model_root", [
     "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct"
+    "Phi-3.5-mini-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_phi_medusa_1gpu(llm_phi_model_root,

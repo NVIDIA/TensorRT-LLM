@@ -106,20 +106,20 @@ public:
         TLLM_CHECK_WITH_INFO(static_cast<bool>(this->lengths), "Invalid lengths tensor");
     }
 
-    // mandatory parameters
+    //! Mandatory parameters
     SizeType32 endId;
     SizeType32 padId;
     TensorPtr ids;     // [packedLength] or [batchSize, maxInputLength], on gpu
     TensorPtr lengths; // [batchSize], on gpu
     bool packed;       // indicates if ids are packed or padded to maxInputLength
 
-    // optional parameters
+    //! Optional parameters
     TensorPtr embeddingBias;                // [vocabSizePadded], on gpu
     TensorPtr badWordsList;                 // [2, badWordsLength] or [batchSize, 2, badWordsLength], on gpu
     TensorPtr stopWordsList;                // [batchSize, 2, stopWordsLength], on gpu
     std::optional<SizeType32> maxNewTokens; // max number of tokens to generate
 
-    // Ptuning parameters
+    //! Ptuning parameters
     PromptTuningParams promptTuningParams; // See promptTuningParams.h for expected shapes
 };
 

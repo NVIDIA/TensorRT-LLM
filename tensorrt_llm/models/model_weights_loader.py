@@ -194,7 +194,11 @@ class ModelWeightsLoader:
         if key in self.shard_map:
             ptr_idx = self.shard_map[key]
         else:
-            return None
+            if "language_model." + key in self.shard_map:
+                key = "language_model." + key
+                ptr_idx = self.shard_map[key]
+            else:
+                return None
 
         if self.format == ModelWeightsFormat.SAFETENSORS:
             tensor = self.shards[ptr_idx].get_slice(key)

@@ -88,6 +88,7 @@ class AutoDeployConfig(PyTorchConfig):
 
     # attention backend to choose from
     attn_backend: str = "TritonWithFlattenedInputs"
+    mla_backend: str = "MultiHeadLatentAttention"
 
     # check if we should skip loading weights
     skip_loading_weights: bool = False

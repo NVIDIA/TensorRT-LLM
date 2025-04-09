@@ -14,10 +14,9 @@ from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
@@ -157,7 +156,7 @@ def latency_command(
     exec_settings["settings_config"]["beam_width"] = 1
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
-        "scheduler_policy"] = IFBSchedulingPolicy.NO_EVICT
+        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     # Set environment variables for setting runtime options.
     # TODO: Once passing of variables is fixed, these should work

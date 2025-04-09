@@ -2214,7 +2214,7 @@ def load_weights_from_meta_ckpt(meta_ckpt_dir: str, config: LLaMAConfig):
         gathered = {}
         for k in ckpts[0]:
             d = 0
-            # TODO(bhsueh) not sure should we consider tok here.
+            # TODO not sure should we consider tok here.
             if any([n in k for n in ["wo", "w2"]]):
                 d = 1
             if "norm" in k or "rope" in k:  # no TP

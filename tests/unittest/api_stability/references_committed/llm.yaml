@@ -1,6 +1,7 @@
 methods:
   __init__:
     parameters:
+      # Explicit arguments
       model:
         annotation: Union[str, pathlib.Path]
         default: inspect._empty
@@ -29,9 +30,87 @@ methods:
       tokenizer_revision:
         annotation: Optional[str]
         default: null
-      kwargs:
-        annotation: Any
-        default: inspect._empty
+      # Parallelism
+      pipeline_parallel_size:
+        annotation: int
+        default: 1
+      context_parallel_size:
+        annotation: int
+        default: 1
+      moe_tensor_parallel_size:
+        annotation: Optional[int]
+        default: null
+      moe_expert_parallel_size:
+        annotation: Optional[int]
+        default: null
+      # LoRA
+      enable_lora:
+        annotation: bool
+        default: false
+      max_lora_rank:
+        annotation: Optional[int]
+        default: null
+      max_loras:
+        annotation: int
+        default: 4
+      max_cpu_loras:
+        annotation: int
+        default: 4
+      # Prompt tuning
+      enable_prompt_adapter:
+        annotation: bool
+        default: false
+      max_prompt_adapter_token:
+        annotation: int
+        default: 0
+      # Logits processor and guided decoding
+      batched_logits_processor:
+        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
+        default: null
+      guided_decoding_backend:
+        annotation: Optional[str]
+        default: null
+      # Quantization and calibration
+      quant_config:
+        annotation: Optional[tensorrt_llm.models.modeling_utils.QuantConfig]
+        default: null
+      calib_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_utils.CalibConfig]
+        default: null
+      # Speculative decoding
+      speculative_config:
+        annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
+          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
+        default: null
+      # generation constraints
+      max_batch_size:
+        annotation: Optional[int]
+        default: null
+      max_input_len:
+        annotation: int
+        default: 1024
+      max_seq_len:
+        annotation: Optional[int]
+        default: null
+      max_beam_width:
+        annotation: int
+        default: 1
+      max_num_tokens:
+        annotation: Optional[int]
+        default: null
+      # Misc
+      load_format:
+        annotation: Literal['auto', 'dummy']
+        default: auto
+      enable_tqdm:
+        annotation: bool
+        default: false
+      enable_chunked_prefill:
+        annotation: bool
+        default: false
+      kv_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
+        default: null
     return_annotation: None
   generate:
     parameters:

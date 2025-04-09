@@ -145,6 +145,7 @@ TransformerBuffers::TransformerBuffers(SizeType32 maxBatchSize, SizeType32 maxBe
 void TransformerBuffers::reshape(SizeType32 numSequences, SizeType32 numInputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     pastKeyValueLengths->reshape(ITensor::makeShape({numSequences}));
 
     if (kvCacheBlockOffsetsHost)
@@ -210,6 +211,7 @@ void TransformerBuffers::reshape(SizeType32 numSequences, SizeType32 numInputTok
             TLLM_LOG_DEBUG("crossAttentionPackedMaskDevice not allocated yet");
         }
     }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -354,8 +356,8 @@ void TransformerBuffers::resetCacheIndirection(RequestVector const& contextReque
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(resetCacheIndirection);
-    auto const& stream = manager.getStream();
 
+    auto const& stream = manager.getStream();
     auto const numContextRequests = contextRequests.size();
 
     std::fill_n(bufferCast<SizeType32>(*fillValuesAlt), numContextRequests, 0);
@@ -370,6 +372,7 @@ void TransformerBuffers::resetCacheIndirection(RequestVector const& contextReque
         static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
     runtime::kernels::invokeFillBatch(*decoderCacheIndirectionOutput, *seqSlotsDeviceView,
         static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -445,6 +448,8 @@ void TransformerBuffers::copyCacheIndirection(
     auto batchedCopySizes = BufferRange<SizeType64>(*cacheIndirBatchedCopySizes);
 
     auto cacheIndirShape = decoderCacheIndirectionOutput->getShape();
+
+    // Get size of copying from shape of `CacheIndirectionOutput`
     cacheIndirShape.d[0] = 1;
     auto const copySize = static_cast<SizeType64>(ITensor::volume(cacheIndirShape));
 
@@ -459,6 +464,7 @@ void TransformerBuffers::copyCacheIndirection(
     auto const batchedCopySizesSlice = ITensor::slice(cacheIndirBatchedCopySizes, 0, numGenerationRequests);
     runtime::kernels::invokeCopyBatch(*decoderCacheIndirectionOutput, *cacheIndirection, *batchedCopySrcOffsetsSlice,
         *batchedCopyDstOffsetsSlice, *batchedCopySizesSlice, copySize, stream);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

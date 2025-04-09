@@ -3,6 +3,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -60,8 +61,10 @@ def test_fp4_linear(dtype):
     alpha_ref = 1.0 / (w_sf_global * x_sf_global)
     torch.testing.assert_close(l_fp4.alpha[0], alpha_ref)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), autotune():
         output = l_fp4.forward(x)
+
+    output_ref = l_fp4.forward(x)
 
     # ref linear
     with torch.inference_mode():

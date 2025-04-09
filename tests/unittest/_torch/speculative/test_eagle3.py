@@ -5,8 +5,7 @@ import unittest
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.llmapi import EagleDecodingConfig
+from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
@@ -66,14 +65,15 @@ def test_llama_eagle3():
     ]
     results_spec = llm_spec.generate(prompts, sampling_params)
     generated_text_spec = [result.outputs[0].text for result in results_spec]
+    llm_spec.shutdown()
 
-    del llm_spec
     llm_ref = LLM(model=target_model_dir,
                   pytorch_backend_config=pytorch_config,
                   kv_cache_config=kv_cache_config)
 
     results_ref = llm_ref.generate(prompts, sampling_params)
     generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results

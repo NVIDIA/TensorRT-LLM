@@ -132,6 +132,7 @@ class RotaryEmbedding(nn.Module):
         This is useful if q_len = k_len, in which case we may RoPE q and k with the same cos and sin values.
         However, if k is cached without positional embedding, we need to apply rope to q and k with different values, so we need a separate call for each.
         """
+        use_gptj_style_rope = self.config.model_type == "llama4_text"
         if IS_FLASHINFER_AVAIABLE:
             from ..attention_backend import FlashInferAttentionMetadata
             if attn_metadata is not None:
@@ -154,7 +155,8 @@ class RotaryEmbedding(nn.Module):
                             attn_metadata.qo_indptr,
                             attn_metadata.cached_token_lens,
                             rope_theta=rope_theta,
-                            rotary_dim=self.rotary_dim)
+                            rotary_dim=self.rotary_dim,
+                            interleave=use_gptj_style_rope)
                     else:
                         # TODO(qijun): support apply_llama31_rope_inplace
                         raise ValueError(
@@ -177,6 +179,9 @@ class RotaryEmbedding(nn.Module):
                     k = k.view(seq_len, -1)
                     return [q, k]
 
+        if use_gptj_style_rope:
+            raise ValueError(
+                "Must have flashinfer installed to use gptj style RoPE")
         # it is assumed all targets are of the same rank
         q_or_k = targets[0]
         remove_input_padding = (len(q_or_k.size()) == 2)

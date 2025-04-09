@@ -1665,7 +1665,7 @@ TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByLogitsKernelLarge)
                       .setAcceptMode(AcceptKernelMode::BY_LOGITS));
 }
 
-// FIXME(nkorobov): test is incorrect and too complicated.
+// FIXME: test is incorrect and too complicated.
 TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelSmall)
 {
     this->runTest(DecodingKernelTestParam()
@@ -1678,7 +1678,7 @@ TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelSm
                       .setAcceptMode(AcceptKernelMode::BY_IDS_WITH_PATH));
 }
 
-// FIXME(nkorobov): test is incorrect and too complicated.
+// FIXME: test is incorrect and too complicated.
 TYPED_TEST(DecodingKernelsTest, DISABLED_acceptDraftTokensByIdsWithPathsKernelLarge)
 {
     this->runTest(DecodingKernelTestParam()

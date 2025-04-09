@@ -566,6 +566,8 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
     if concurrency:
         benchmark_cmd += " --concurrency 100"
 
+    print(f"cmd: {benchmark_cmd}")
+
     if request_rate and concurrency:
         # negative test, request rate and concurrency should not be turned on at the same time
         check_call_negative_test(benchmark_cmd, shell=True)
@@ -713,7 +715,7 @@ def test_benchmark_sanity_enable_fp8(llm_root, llm_venv, model_name,
 
 
 def test_chatglm_6b_sanity(chatglm_6b_example_root, llm_venv, cmodel_dir,
-                           engine_dir, update_transformers):
+                           engine_dir):
     llm_models = llm_models_root()
 
     # skip when llm_models_root is None
@@ -1087,7 +1089,6 @@ def test_llmapi_load_engine_from_build_command_with_lora(
 ])
 def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    from tensorrt_llm._utils import release_gc
     from tensorrt_llm.llmapi import LLM
     from tensorrt_llm.llmapi.llm_utils import BuildConfig
     llama_example_root = os.path.join(llm_root, "examples", model_name)
@@ -1146,8 +1147,6 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
             llm_api_engine_cfg["build_config"]).to_dict()
 
     assert build_cmd_cfg == build_llmapi_cfg
-    del LLM
-    release_gc()
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
@@ -1213,14 +1212,19 @@ def test_llmapi_server_example(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_llm_server.py")])
 
 
+def test_trtllm_serve_example(llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_example.py")])
+
+
 def test_openai_misc_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_misc.py")])
 
 
 def test_openai_completions_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
         ["-m", "pytest",
@@ -1228,7 +1232,6 @@ def test_openai_completions_example(llm_root, llm_venv):
 
 
 def test_openai_chat_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1242,7 +1245,6 @@ def test_openai_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1259,7 +1261,6 @@ def test_openai_multi_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_consistent_chat(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1276,7 +1277,6 @@ def test_openai_consistent_chat(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1294,7 +1294,6 @@ def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1791,12 +1790,10 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("model_name,model_path", [
     ("BertForSequenceClassification", "bert/bert-base-uncased-yelp-polarity"),
 ])
-def test_ptp_quickstart_bert(llm_root,
-                             llm_venv,
-                             model_name,
-                             model_path,
-                             backend='VANILLA'):
-    print(f"Testing {model_name}.")
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
+                             backend):
+    print(f"Testing {model_name} with {backend} backend.")
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
