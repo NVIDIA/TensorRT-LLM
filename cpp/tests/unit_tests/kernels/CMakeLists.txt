@@ -11,6 +11,7 @@
 
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
+
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
 add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
 add_gtest(ropeTest ropeTest.cu)
