@@ -289,11 +289,14 @@ class LlamaDecoderLayer(DecoderLayer):
 
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
-        major, minor = torch.cuda.get_device_capability()
-        is_blackwell = (major * 10 + minor) >= 100
-        min_latency_mode = hidden_states.size(
-            0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
+        # major, minor = torch.cuda.get_device_capability()
+        # is_blackwell = (major * 10 + minor) >= 100
+        # min_latency_mode = hidden_states.size(
+        #     0
+        # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
+
+        # Temporarily disable min-latency mode for Llama4
+        min_latency_mode = False
 
         # Self Attention
         # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
