@@ -125,7 +125,7 @@ def column_lm_head_forward(x, vocab_size, hidden_size, dtype,
             tp_size=tensor_parallel_size,
             rank=tensor_parallel_rank,
         ),
-        tensor_parallel_mode=TensorParallelMode.ROW,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
         gather_output=True,
     )
     lm_head.load_weights([dict(weight=weight)])
