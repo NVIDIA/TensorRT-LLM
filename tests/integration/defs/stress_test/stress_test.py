@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,12 +31,13 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import pytest
 import requests
+import yaml
 from defs.conftest import get_device_count, get_device_memory, llm_models_root
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
 
 # Define a constant for process termination timeouts
-GRACEFUL_TERMINATION_TIMEOUT = 60  # seconds - set longer when stress large model
+GRACEFUL_TERMINATION_TIMEOUT = 10  # seconds - set longer when stress large model
 
 
 @dataclass(frozen=True)
@@ -44,13 +46,14 @@ class ServerConfig:
     port: int = 8000
     host: str = "localhost"
     pp_size: int = 1
-    ep_size: Optional[int] = 4
-    max_batch_size: Optional[int] = 161  # 2048 is default value in BuildConfig
-    max_num_tokens: Optional[int] = 1160  # 8192 is default value in BuildConfig
+    ep_size: Optional[int] = 1
+    max_batch_size: Optional[int] = 1024  # 2048 is default value in BuildConfig
+    max_num_tokens: Optional[int] = 8192  # 8192 is default value in BuildConfig
     kv_cache_free_gpu_memory_fraction: Optional[
-        float] = 0.95  # 0.9 is default value in BuildConfig
+        float] = 0.9  # 0.9 is default value in BuildConfig
+    capacity_scheduler_policy: str = "GUARANTEED_NO_EVICT"
     wait_interval: int = 10  # seconds
-    max_wait_seconds: int = 7200  # 120 mins <- Larger model need longer model loading time
+    max_wait_seconds: int = 600  # 10 mins <- Larger model need longer model loading time
     health_check_timeout: float = 8  # seconds <- Make it smaller than wait_interval
 
     @property
@@ -85,17 +88,17 @@ class StressTestConfig:
     server_config: ServerConfig
     # Stress test parameters for stress-test mode
     # stress_time:
-    # Used as control parameter to get request count for stress test in phase3
-    stress_time: int = 3600  # 60 mins for deepseek v3
+    # Used as control parameter to get request count for stress test in stage3
+    stress_time: int = 300  # 5 mins
     # stress_timeout:
     # Maximum time allowed for stress test to run; to prevent hanging tests
     # Must be greater than stress_time to account for initialization, warmup, etc.
-    stress_timeout: int = 5400  # 90 mins for deepseek v3
+    stress_timeout: int = 480  # 8 mins
 
     # Customized stress test parameters for stress-stage-alone mode
     customized_stress_test: bool = True
     # customized_stress_time:
-    # Used as control parameter to get request count for customized stress test in phase3 alone
+    # Used as control parameter to get request count for customized stress test in stage3 alone
     customized_stress_time: int = 180  # 3 mins
     # customized_stress_timeout:
     # Maximum time allowed for customized stress test to complete
@@ -115,14 +118,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for genai-perf"""
-    input_len_mean: int = 1000  # request from deepseek v3
+    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
     input_len_std: int = 16
-    output_len_mean: int = 2000  # request from deepseek v3
+    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 36000  # 10 hours for deepseek v3
+    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
     concurrency_list: List[int] = field(
         default_factory=lambda:
         [8, 16, 32, 64, 128, 256, 384, 512, 640, 768, 896, 1024])
@@ -262,6 +265,9 @@ def check_server_health(server_url: str,
 @pytest.mark.parametrize("test_mode", ["stress-test", "stress-stage-alone"],
                          ids=lambda x: x)
 @pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
+@pytest.mark.parametrize("capacity_scheduler_policy",
+                         ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
+                         ids=lambda x: x)
 @pytest.mark.parametrize(
     "config",
     [
@@ -277,7 +283,7 @@ def check_server_health(server_url: str,
         ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
-def test_run_stress_test(config, backend, test_mode):
+def test_run_stress_test(config, backend, capacity_scheduler_policy, test_mode):
     """Run the stress test with the provided configuration, backend, and test mode.
 
     This test function calls the stress_test function with the given parameters.
@@ -286,6 +292,7 @@ def test_run_stress_test(config, backend, test_mode):
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         backend: Backend to use ("trt" or "pytorch")
+        capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
     # Create a new ModelConfig with the backend parameter
@@ -297,11 +304,15 @@ def test_run_stress_test(config, backend, test_mode):
                              memory_requirement=config.memory_requirement,
                              backend=backend_param)
 
+    # Initialize server config with specified capacity scheduler policy
+    server_config = ServerConfig(
+        capacity_scheduler_policy=capacity_scheduler_policy)
+
     # Call the existing stress_test function with the new config and test mode
-    stress_test(new_config, test_mode)
+    stress_test(new_config, test_mode, server_config)
 
 
-def stress_test(config, test_mode):
+def stress_test(config, test_mode, server_config=None):
     """Test LLM model performance using trtllm-serve and genai-perf.
 
     This function supports multiple testing modes controlled by the --test-mode option:
@@ -311,6 +322,7 @@ def stress_test(config, test_mode):
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         test_mode: Test mode from the --test-mode option ("stress-test" or "stress-stage-alone")
+        server_config: Optional server configuration to use, if None a default will be created
     """
     # Test mode handling - determine which tests to run
     if test_mode == "stress-test":
@@ -323,7 +335,7 @@ def stress_test(config, test_mode):
         pytest.skip(
             f"Skipping test for unsupported mode: {test_mode}. Supported modes: stress-test, stress-stage-alone"
         )
-        return  # Exit early
+        return
 
     # Skip if not enough GPU memory
     if get_device_memory() < config.memory_requirement:
@@ -338,8 +350,9 @@ def stress_test(config, test_mode):
     model_path = get_model_path(config.model_dir)
     model_name = config.model_name
 
-    # Initialize server config that will be used for all tests
-    test_server_config = ServerConfig()
+    # Initialize server config that will be used for all tests if not provided
+    test_server_config = server_config if server_config is not None else ServerConfig(
+    )
 
     # Define test configurations
     performance_config = PerformanceParams() if run_performance else None
@@ -362,6 +375,19 @@ def stress_test(config, test_mode):
     # Verify that model path exists
     if not os.path.exists(model_path):
         raise RuntimeError(f"Model path does not exist: {model_path}")
+
+    # Create a temporary YAML file for 'capacity_scheduler_policy'
+    extra_llm_options = {
+        "scheduler_config": {
+            "capacity_scheduler_policy":
+            test_server_config.capacity_scheduler_policy
+        }
+    }
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                     delete=False) as temp_file:
+        yaml.dump(extra_llm_options, temp_file)
+        extra_llm_options_path = temp_file.name
 
     # Build server command
     server_cmd = [
@@ -389,6 +415,8 @@ def stress_test(config, test_mode):
         str(test_server_config.max_num_tokens),
         "--kv_cache_free_gpu_memory_fraction",
         str(test_server_config.kv_cache_free_gpu_memory_fraction),
+        "--extra_llm_api_options",
+        extra_llm_options_path,
     ])
 
     # Add backend option only if specified
@@ -400,88 +428,95 @@ def stress_test(config, test_mode):
     # Log the command we're about to run
     print_info(f"Running command: {' '.join(server_cmd)}")
 
-    # Start server with the launch_process context manager and filtered output
-    # HTTP access log pattern to filter out
-    http_log_pattern = r'INFO: .+ - "POST /v1/completions HTTP/1.1" 200 OK'
-    with launch_process(server_cmd,
-                        start_new_session=True,
-                        filter_pattern=http_log_pattern) as server_process:
-        server_pid = server_process.pid
-        print_info(f"Server started with PID: {server_pid}")
+    try:
+        # Start server with the launch_process context manager and filtered output
+        # HTTP access log pattern to filter out
+        http_log_pattern = r'INFO: .+ - "POST /v1/completions HTTP/1.1" 200 OK'
+        with launch_process(server_cmd,
+                            start_new_session=True,
+                            filter_pattern=http_log_pattern) as server_process:
+            server_pid = server_process.pid
+            print_info(f"Server started with PID: {server_pid}")
 
-        # Wait for server to initialize
-        print_info("Waiting for server to initialize...")
-        server_ready = False
-        for wait_sec in range(0, test_server_config.max_wait_seconds,
-                              test_server_config.wait_interval):
-            deadline = time.time() + test_server_config.wait_interval
-            is_healthy, error_msg = check_server_health(
-                test_server_config.url, test_server_config.health_check_timeout)
+            # Wait for server to initialize
+            print_info("Waiting for server to initialize...")
+            server_ready = False
+            for wait_sec in range(0, test_server_config.max_wait_seconds,
+                                  test_server_config.wait_interval):
+                deadline = time.time() + test_server_config.wait_interval
+                is_healthy, error_msg = check_server_health(
+                    test_server_config.url,
+                    test_server_config.health_check_timeout)
 
-            if is_healthy:
-                print_info(f"Server is ready after {wait_sec} seconds!")
-                server_ready = True
-                break
-            else:
-                if wait_sec >= test_server_config.max_wait_seconds - test_server_config.wait_interval:
-                    print_warning(error_msg)
+                if is_healthy:
+                    print_info(f"Server is ready after {wait_sec} seconds!")
+                    server_ready = True
+                    break
+                else:
+                    if wait_sec >= test_server_config.max_wait_seconds - test_server_config.wait_interval:
+                        print_warning(error_msg)
 
-            # Check if process is still running
-            if server_process.poll() is not None:
-                print_warning(
-                    f"ERROR: Server process died. Exit code: {server_process.returncode}"
-                )
-                try:
-                    # Try to get process stderr if available
-                    stderr_output = server_process.stderr.read(
-                    ) if server_process.stderr else "No stderr available"
-                    print_warning(f"Server stderr output: {stderr_output}")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"Server process died. Exit code: {server_process.returncode}"
-                )
+                # Check if process is still running
+                if server_process.poll() is not None:
+                    print_warning(
+                        f"ERROR: Server process died. Exit code: {server_process.returncode}"
+                    )
+                    try:
+                        # Try to get process stderr if available
+                        stderr_output = server_process.stderr.read(
+                        ) if server_process.stderr else "No stderr available"
+                        print_warning(f"Server stderr output: {stderr_output}")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Server process died. Exit code: {server_process.returncode}"
+                    )
 
+                print_info(
+                    f"Still waiting for server... ({wait_sec} seconds elapsed)")
+
+                time.sleep(max(0, deadline - time.time()))
+
+            # Final check if we didn't already confirm server is ready
+            if not server_ready:
+                is_healthy, error_msg = check_server_health(
+                    test_server_config.url,
+                    test_server_config.health_check_timeout)
+                if not is_healthy:
+                    print_warning(
+                        f"ERROR: Server failed to start properly after {test_server_config.max_wait_seconds} seconds."
+                    )
+                    raise RuntimeError(f"Server failed to start: {error_msg}")
+
+            # Run performance tests only if server is healthy
             print_info(
-                f"Still waiting for server... ({wait_sec} seconds elapsed)")
+                f"Server is running with model {model_name}. Starting tests...")
 
-            time.sleep(max(0, deadline - time.time()))
+            # Run performance test first if enabled
+            stage2_output = None  # Initialize stage2_output to None
+            if run_performance:
+                print_info("=== Running STAGE 1 PERFORMANCE TEST ===")
+                measure_capacity_stage(model_name, model_path,
+                                       test_server_config, performance_config)
+                print_info("=== Running STAGE 2 ANALYSIS ===")
+                stage2_output = extract_stress_test_metrics(
+                    current_model=model_name)
+                print_info(f"Stage 2 output: {stage2_output}")
+                print_info("=== Running STAGE 3 STRESS TEST ===")
+                stress_stage(model_name, model_path, test_server_config,
+                             stress_config, stage2_output)
 
-        # Final check if we didn't already confirm server is ready
-        if not server_ready:
-            is_healthy, error_msg = check_server_health(
-                test_server_config.url, test_server_config.health_check_timeout)
-            if not is_healthy:
-                print_warning(
-                    f"ERROR: Server failed to start properly after {test_server_config.max_wait_seconds} seconds."
+            # Then run stress test if enabled (will run after performance test if both are enabled)
+            if run_stress and not run_performance:  # Only run here if not already run above
+                print_info(
+                    "=== Running STAGE 3 STRESS TEST WITH CUSTOMIZED PARAMETERS ==="
                 )
-                raise RuntimeError(f"Server failed to start: {error_msg}")
-
-        # Run performance tests only if server is healthy
-        print_info(
-            f"Server is running with model {model_name}. Starting tests...")
-
-        # Run performance test first if enabled
-        phase2_output = None  # Initialize phase2_output to None
-        if run_performance:
-            print_info("=== Running PHASE 1 PERFORMANCE TEST ===")
-            measure_capacity_stage(model_name, model_path, test_server_config,
-                                   performance_config)
-            print_info("=== Running PHASE 2 ANALYSIS ===")
-            phase2_output = extract_stress_test_metrics(
-                current_model=model_name)
-            print_info(f"Phase 2 output: {phase2_output}")
-            print_info("=== Running PHASE 3 STRESS TEST ===")
-            stress_stage(model_name, model_path, test_server_config,
-                         stress_config, phase2_output)
-
-        # Then run stress test if enabled (will run after performance test if both are enabled)
-        if run_stress and not run_performance:  # Only run here if not already run above
-            print_info(
-                "=== Running PHASE 3 STRESS TEST WITH CUSTOMIZED PARAMETERS ==="
-            )
-            stress_stage(model_name, model_path, test_server_config,
-                         stress_config, None)
+                stress_stage(model_name, model_path, test_server_config,
+                             stress_config, None)
+    finally:
+        # Clean up temp yaml file
+        if os.path.exists(extra_llm_options_path):
+            os.unlink(extra_llm_options_path)
 
 
 def create_genai_perf_command(model_name,
@@ -684,7 +719,7 @@ def stress_stage(model_name,
                  model_path,
                  server_config,
                  stress_config,
-                 phase2_output=None):
+                 stage2_output=None):
     """Run a single stress test with the configured parameters"""
     # Validate inputs
     if not model_name or not model_path:
@@ -694,21 +729,21 @@ def stress_stage(model_name,
         raise ValueError(f"Model path does not exist: {model_path}")
 
     # Determine stress test parameters
-    if phase2_output is None:
+    if stage2_output is None:
         if stress_config.customized_stress_test:
-            # Use customized parameters when phase2_output is None but customized test is enabled
+            # Use customized parameters when stage2_output is None but customized test is enabled
             stress_concurrency = stress_config.customized_stress_concurrency
             request_count = stress_config.request_count_stress_test
             test_timeout = stress_config.customized_stress_timeout
         else:
             raise ValueError(
-                "phase2_output is required when not using customized stress test"
+                "stage2_output is required when not using customized stress test"
             )
     else:
-        if model_name not in phase2_output:
-            raise ValueError(f"No data for model {model_name} in phase2_output")
+        if model_name not in stage2_output:
+            raise ValueError(f"No data for model {model_name} in stage2_output")
 
-        model_results = phase2_output[model_name]
+        model_results = stage2_output[model_name]
         stress_concurrency = model_results["concurrency"]
         stress_request_rate = model_results["request_rate"]
         stress_time = stress_config.stress_time
