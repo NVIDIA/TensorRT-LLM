@@ -2048,6 +2048,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
+    multiGpuJobsPostMerge = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && it.key.contains("Post-Merge")}
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
@@ -2095,7 +2096,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Check --only-multi-gpu-test, if true, only run multi-GPU test stages.
     if (testFilter[(ONLY_MULTI_GPU_TEST)]) {
-        parallelJobsFiltered = multiGpuJobs
+        if (testFilter[(IS_POST_MERGE)]) {
+            parallelJobsFiltered = multiGpuJobsPostMerge
+        } else {
+            parallelJobsFiltered = multiGpuJobs
+        }
     }
 
     // Check --disable-multi-gpu-test, if true, remove multi-GPU test stages.

@@ -181,12 +181,16 @@ endif()
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(
     ar_gemm_src STATIC
-    ${ARGEMM_SRC_CU}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cpp)
+    ${ARGEMM_SRC_CU} ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/ipcNvlsMemory.cu)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)
-  set_property(TARGET ar_gemm_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+  if(ENABLE_NVSHMEM)
+    target_link_libraries(ar_gemm_src PRIVATE nvshmem::nvshmem_host
+                                              nvshmem::nvshmem_device)
+  endif()
+  set_property(TARGET ar_gemm_src PROPERTY CUDA_ARCHITECTURES
+                                           "90-real;100f-real")
 endif()
 
 function(process_target target_name enable_hopper enable_blackwell)
