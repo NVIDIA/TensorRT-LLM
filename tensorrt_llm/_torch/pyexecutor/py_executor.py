@@ -913,6 +913,18 @@ class PyExecutor:
                 if scheduled_batch.batch_size > 0:
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                    generation_requests = scheduled_batch.generation_requests
+                    # Reorder generation requests
+                    new_generation_requests = []
+                    for req in generation_requests:
+                        if req.py_batch_idx is None:
+                            new_generation_requests.append(req)
+
+                    for req in generation_requests:
+                        if req.py_batch_idx is not None:
+                            new_generation_requests.append(req)
+                    scheduled_batch.generation_requests = new_generation_requests
+
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
