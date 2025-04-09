@@ -192,10 +192,7 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: begin-completion-extra-params
     add_special_tokens: bool = Field(
         default=True,
-        description=(
-            "If true (the default), special tokens (e.g. BOS) will be added to "
-            "the prompt."
-        ),
+        description=("If true (the default), special tokens (e.g. BOS) will be added to " "the prompt."),
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
@@ -241,7 +238,6 @@ class CompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             return_context_logits=self.return_context_logits,
-            
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -278,9 +274,7 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if ("top_logprobs" in data and data.get("top_logprobs")) or (
-            "logprobs" in data and data.get("logprobs")
-        ):
+        if ("top_logprobs" in data and data.get("top_logprobs")) or ("logprobs" in data and data.get("logprobs")):
             raise ValueError("returning log probs is not supported")
         return data
 
@@ -360,9 +354,7 @@ class CustomChatCompletionContentPartParam(TypedDict, total=False):
     """The type of the content part."""
 
 
-ChatCompletionContentPartParam = Union[
-    OpenAIChatCompletionContentPartParam, CustomChatCompletionContentPartParam
-]
+ChatCompletionContentPartParam = Union[OpenAIChatCompletionContentPartParam, CustomChatCompletionContentPartParam]
 
 
 class CustomChatCompletionMessageParam(TypedDict, total=False):
@@ -382,9 +374,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     """
 
 
-ChatCompletionMessageParam = Union[
-    OpenAIChatCompletionMessageParam, CustomChatCompletionMessageParam
-]
+ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam, CustomChatCompletionMessageParam]
 
 
 class ChatCompletionLogProbs(OpenAIBaseModel):
@@ -471,9 +461,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[
-        Union[Literal["none", "auto"], ChatCompletionNamedToolChoiceParam]
-    ] = "none"
+    tool_choice: Optional[Union[Literal["none", "auto"], ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
 
     # doc: begin-chat-completion-sampling-params
@@ -498,8 +486,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     echo: bool = Field(
         default=False,
         description=(
-            "If true, the new message will be prepended with the last message "
-            "if they belong to the same role."
+            "If true, the new message will be prepended with the last message " "if they belong to the same role."
         ),
     )
     add_generation_prompt: bool = Field(
@@ -540,10 +527,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     chat_template_kwargs: Optional[Dict[str, Any]] = Field(
         default=None,
-        description=(
-            "Additional kwargs to pass to the template renderer. "
-            "Will be accessible by the chat template."
-        ),
+        description=("Additional kwargs to pass to the template renderer. " "Will be accessible by the chat template."),
     )
 
     # doc: end-chat-completion-extra-params
@@ -576,7 +560,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
@@ -598,7 +581,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if values.get("stream_options") is not None and not values.get("stream"):
             raise ValueError("stream_options can only be set if stream is true")
         return values
-
 
     @model_validator(mode="before")
     @classmethod
