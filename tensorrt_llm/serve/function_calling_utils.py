@@ -1,6 +1,6 @@
 import json
 import re
-from typing import List, Optional, Dict, Any
+from typing import List
 
 from .openai_protocol import ToolCall, FunctionCall, ChatCompletionToolsParam
 
@@ -58,8 +58,6 @@ def validate_function_arguments(
         # Parse arguments string to JSON
         args_json = json.loads(arguments)
 
-        # TODO: Implement JSON schema validation against function_def.parameters
-        # This requires a JSON schema validation library
         # For now, just check if the required parameters are present
         required = function_def.parameters.get("required", [])
         for param in required:

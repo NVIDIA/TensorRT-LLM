@@ -226,14 +226,14 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
             )
         
         if args.return_logprobs:
-            # Handle logprobs (existing code)
-            pass
+            choice.logprobs = create_logprobs(output.token_ids, args.tokenizer, output.logprobs)
             
         choices.append(choice)
     
     if args.echo and args.last_message_content:
-        # Handle echo (existing code)
-        pass
+        for choice in choices:
+            full_message = args.last_message_content + choice.message.content
+            choice.message.content = full_message
 
     # Rest of the function remains the same
     num_prompt_tokens = args.num_prompt_tokens
