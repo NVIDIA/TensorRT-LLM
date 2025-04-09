@@ -350,10 +350,7 @@ class PyTorchModelEngine(ModelEngine):
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
             self.previous_pos_id_offsets_cuda = torch.zeros(
                 (self.max_num_tokens, ), dtype=torch.int, device='cuda')
-            self.previous_draft_lens_cuda = torch.empty((batch_size, ),
-                                                        dtype=torch.int,
-                                                        device='cuda')
-            self.previous_new_tokens_lens_cuda = torch.zeros((batch_size, ),
+            self.previous_kv_lens_offsets_cuda = torch.zeros((batch_size, ),
                                                              dtype=torch.int,
                                                              device='cuda')
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
@@ -950,7 +947,6 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch incices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
-        previous_draft_lens = []
         for request in extend_requests:
             if next_draft_tokens_device is None or request.py_batch_idx is None:
                 num_draft_tokens = len(request.py_draft_tokens)
@@ -993,15 +989,9 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + self.max_draft_len)))
                 # previous tensor
-                num_draft_tokens = 0
-                if request.py_draft_tokens is not None:
-                    # only get the number of valid draft tokens, ignore the dummy draft tokens
-                    num_draft_tokens = len(
-                        [i for i in request.py_draft_tokens if i > 0])
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             (1 + self.max_draft_len))
-                previous_draft_lens.append(num_draft_tokens)
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.max_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
@@ -1069,28 +1059,24 @@ class PyTorchModelEngine(ModelEngine):
                     flatten(),
                     non_blocking=True)
                 # prepare data for the preprocess inputs
+                kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
                 previous_pos_indices = torch.tensor(previous_pos_indices,
                                                     dtype=torch.int,
                                                     pin_memory=True)
                 self.previous_pos_indices_cuda[:previous_batch_tokens].copy_(
                     previous_pos_indices, non_blocking=True)
-                previous_draft_lens = torch.tensor(previous_draft_lens,
-                                                   dtype=torch.int)
-                self.previous_draft_lens_cuda[:previous_batchs].copy_(
-                    previous_draft_lens, non_blocking=True)
                 self.previous_pos_id_offsets_cuda[:previous_batch_tokens].copy_(
                     new_tokens_lens_device[
                         self.previous_pos_indices_cuda[:previous_batch_tokens]],
                     non_blocking=True)
-                self.previous_new_tokens_lens_cuda[:previous_batchs].copy_(
-                    new_tokens_lens_device[
+                self.previous_kv_lens_offsets_cuda[:previous_batchs].copy_(
+                    kv_len_offsets_device[
                         self.previous_batch_indices_cuda[:previous_batchs]],
                     non_blocking=True)
             else:
                 # change the data to zeros to skip the value changes in _preprocess_inputs
                 self.previous_pos_id_offsets_cuda *= 0
-                self.previous_new_tokens_lens_cuda *= 0
-                self.previous_draft_lens_cuda *= 0
+                self.previous_kv_lens_offsets_cuda *= 0
         elif new_tokens_device is not None:
             previous_batch_tokens = len(previous_batch_indices)
             previous_batch_indices = torch.tensor(previous_batch_indices,

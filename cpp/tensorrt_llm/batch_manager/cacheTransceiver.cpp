@@ -267,23 +267,6 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
 }
 
-void CacheTransceiver::resetKvCache(kv_cache_manager::BaseKVCacheManager* cacheManager)
-{
-    using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
-    using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
-    auto tmpDataResponser = mIsMLA ? std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                                mManager.get(), *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
-                                   : std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mManager.get(),
-                                       *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
-    auto tmpDataRequester = mIsMLA ? std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                                mManager.get(), *mCacheState, mRank, std::make_unique<MLACacheFormatter>(cacheManager)))
-                                   : std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mManager.get(),
-                                       *mCacheState, mRank, std::make_unique<CacheFormatter>(cacheManager)));
-    mDataResponder.reset(tmpDataResponser.release());
-    mDataRequester.reset(tmpDataRequester.release());
-    initializeCommState();
-}
-
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     mpi::MpiComm const& mpiComm, std::vector<LlmRequest::RequestIdType> const& requestIds)
 {
