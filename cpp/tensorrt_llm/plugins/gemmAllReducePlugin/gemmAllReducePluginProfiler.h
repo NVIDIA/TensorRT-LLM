@@ -29,6 +29,8 @@ namespace tensorrt_llm::plugins
  * Used for tuning to find best GEMM configs for different problem shapes.
  * WARNING: Tuning GEMM+AR kernel may not be fully representable of real
  * multi-GPU workloads as tuning only runs on single-GPU.
+ * IMPORTANT: TRT-LLM does not support deterministic tuning across ranks.
+ * Because of this, we have to serialize/deserialize our own configuration file.
  */
 
 #if defined(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
@@ -44,6 +46,8 @@ public:
     void serializeToOwnFile(GemmIdCore gemmId);
 
     void deserializeFromOwnFile(GemmIdCore gemmId, GemmDims problemShape);
+
+    bool useProfiler();
 
 protected:
     ////////////////////////////////////
