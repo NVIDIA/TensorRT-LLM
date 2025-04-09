@@ -80,7 +80,7 @@ methods:
       # Speculative decoding
       speculative_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
+          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.llm_args.PromptLookupConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
       # generation constraints
       max_batch_size:

@@ -430,13 +430,13 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
-        # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
-        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
+    if args.draft_target_model_config is not None or \
+        (args.prompt_lookup_config is not None and len(ast.literal_eval(args.prompt_lookup_config)) == 4):
+        # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD) V1 workflow
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
+        assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
         assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
         assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
-        assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
 
         outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
                               pad_id, stop_words_list, bad_words_list,
@@ -454,7 +454,8 @@ def main(args):
             lora_ckpt_source=args.lora_ckpt_source,
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+        )
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -481,6 +482,13 @@ def main(args):
                 args.lookahead_config
             ) == 3, "Lookahead needs [max_window_size, max_ngram_size, max_verification_set_size]"
             runner_kwargs.update(lookahead_config=args.lookahead_config)
+        elif args.prompt_lookup_config is not None:
+            args.prompt_lookup_config = ast.literal_eval(
+                args.prompt_lookup_config)
+            assert len(args.prompt_lookup_config) == 3, \
+                "Prompt-Lookup V2 workflow needs [prompt_lookup_num_tokens, max_matching_ngram_size, candidate_set_size]"
+            runner_kwargs.update(prompt_lookup_config=args.prompt_lookup_config)
+
         if not args.use_py_session:
             runner_kwargs.update(
                 is_enc_dec=is_enc_dec,
@@ -537,6 +545,7 @@ def main(args):
                 output_log_probs=(args.output_log_probs_npy != None),
                 random_seed=args.random_seed,
                 lora_uids=args.lora_task_uids,
+                lookahead_config=args.lookahead_config,
                 prompt_table=args.prompt_table_path,
                 prompt_tasks=args.prompt_tasks,
                 streaming=args.streaming,

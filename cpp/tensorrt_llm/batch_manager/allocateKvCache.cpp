@@ -28,7 +28,9 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
 
     for (auto const& llmReq : contextRequests)
     {
-        if (llmReq->isFirstContextChunk())
+        bool const isPLD = modelConfig.getSpeculativeDecodingMode().isPromptLookup();
+
+        if ((!isPLD && llmReq->isFirstContextChunk()) || isPLD)
         {
             auto const requestId = llmReq->mRequestId;
             auto const promptLen = llmReq->mPromptLen;

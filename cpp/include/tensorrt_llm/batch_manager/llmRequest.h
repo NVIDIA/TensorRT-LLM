@@ -127,7 +127,8 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+        std::optional<executor::PromptLookupConfig> promptLookupConfig = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -180,6 +181,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
+        , mPromptLookupConfig(std::move(promptLookupConfig))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -207,7 +209,8 @@ public:
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+        std::optional<executor::PromptLookupConfig> promptLookupConfig = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -247,6 +250,7 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
+        , mPromptLookupConfig(promptLookupConfig)
     {
         if (mEncoderTokens.has_value())
         {
@@ -286,6 +290,7 @@ public:
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
+        , mPromptLookupConfig(req.getPromptLookupConfig())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -914,6 +919,21 @@ public:
     void clearLookaheadConfig()
     {
         mLookaheadConfig = std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<executor::PromptLookupConfig> getPromptLookupConfig() const
+    {
+        return mPromptLookupConfig;
+    }
+
+    void setPromptLookupConfig(executor::PromptLookupConfig config)
+    {
+        mPromptLookupConfig = config;
+    }
+
+    void clearPromptLookupConfig()
+    {
+        mPromptLookupConfig = std::nullopt;
     }
 
     [[nodiscard]] std::optional<executor::KvCacheRetentionConfig> getKvCacheRetentionConfig() const
@@ -1783,7 +1803,7 @@ protected:
     // List of tokens including input prompt and generated part.
     BeamTokens mTokens; // [beamSize, mPromptLen + getMaxNumGeneratedTokens()]
 
-                        // Length of input prompt tokens, never changes during generation process.
+    // Length of input prompt tokens, never changes during generation process.
     SizeType32 mOrigPromptLen;
 
     // List of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.
@@ -1917,6 +1937,8 @@ protected:
 
     // Tensors containing the additional generation output.
     TensorMap mAdditionalGenerationOutputTensors;
+
+    std::optional<executor::PromptLookupConfig> mPromptLookupConfig{std::nullopt};
 
     // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
     std::vector<size_t> mRequestedBlockHashes;
@@ -2097,7 +2119,8 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+        std::optional<executor::PromptLookupConfig> promptLookupConfig = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
@@ -2108,7 +2131,7 @@ public:
             std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
             llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
             std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid,
-            allottedTimeMs, contextPhaseParams)
+            allottedTimeMs, contextPhaseParams, std::move(promptLookupConfig))
     {
     }
 
@@ -2142,7 +2165,8 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+        std::optional<executor::PromptLookupConfig> promptLookupConfig = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2162,7 +2186,7 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams)
+            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, promptLookupConfig)
     {
     }
 
@@ -2204,6 +2228,7 @@ public:
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
         mLookaheadConfig = request.getLookaheadConfig();
         mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
+        mPromptLookupConfig = request.getPromptLookupConfig();
     }
 
     /// @brief  Create a Response from the current state of the request

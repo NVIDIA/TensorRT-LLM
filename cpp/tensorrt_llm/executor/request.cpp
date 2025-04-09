@@ -40,7 +40,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs)
+    std::optional<MillisecondsType> allottedTimeMs, std::optional<PromptLookupConfig> promptLookupConfig)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(mRopeConfig), std::move(loraConfig),
@@ -48,7 +48,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         crossAttentionMask, numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams),
-        languageAdapterUid, allottedTimeMs))
+        languageAdapterUid, allottedTimeMs, std::move(promptLookupConfig)))
 {
 }
 
@@ -156,6 +156,11 @@ std::optional<LoraConfig> Request::getLoraConfig() const
 std::optional<LookaheadDecodingConfig> Request::getLookaheadConfig() const
 {
     return mImpl->getLookaheadConfig();
+}
+
+std::optional<PromptLookupConfig> Request::getPromptLookupConfig() const
+{
+    return mImpl->getPromptLookupConfig();
 }
 
 std::optional<KvCacheRetentionConfig> Request::getKvCacheRetentionConfig() const
@@ -319,6 +324,11 @@ void Request::setLoraConfig(LoraConfig const& loraConfig)
 void Request::setLookaheadConfig(LookaheadDecodingConfig const& lookaheadConfig)
 {
     return mImpl->setLookaheadConfig(lookaheadConfig);
+}
+
+void Request::setPromptLookupConfig(PromptLookupConfig const& promptLookupConfig)
+{
+    return mImpl->setPromptLookupConfig(promptLookupConfig);
 }
 
 void Request::setKvCacheRetentionConfig(KvCacheRetentionConfig const& kvCacheRetentionConfig)

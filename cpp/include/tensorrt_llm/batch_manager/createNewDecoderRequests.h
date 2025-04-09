@@ -91,6 +91,11 @@ private:
     void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
         runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput,
         CudaStream const& runtimeStream) const;
+
+    //! @brief Setups decoder internal tensors for new Prompt-Lookup request
+    void newRequestPromptLookup(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+        runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput,
+        CudaStream const& runtimeStream) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

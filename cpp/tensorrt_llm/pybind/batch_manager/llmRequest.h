@@ -80,7 +80,8 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+        std::optional<executor::PromptLookupConfig> promptLookupConfig = std::nullopt)
         : Base(requestId,                                                                                        //
             maxNewTokens,                                                                                        //
             std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                  //
@@ -130,7 +131,8 @@ public:
             guidedDecodingParams,                                                                                //
             languageAdapterUid,                                                                                  //
             allottedTimeMs,                                                                                      //
-            contextPhaseParams                                                                                   //
+            contextPhaseParams,                                                                                  //
+            promptLookupConfig                                                                                   //
         )
     {
     }

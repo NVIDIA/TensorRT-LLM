@@ -179,6 +179,12 @@ public:
         return *this;
     }
 
+    ModelSpec& usePromptLookup()
+    {
+        mSpecDecodingMode = SpeculativeDecodingMode::PromptLookup();
+        return *this;
+    }
+
     [[nodiscard]] bool useLogits() const
     {
         return mGatherLogits || mReplaceLogits;

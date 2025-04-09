@@ -103,6 +103,9 @@ methods:
       lookahead_config:
         annotation: Optional[tensorrt_llm.bindings.executor.LookaheadDecodingConfig]
         default: null
+      prompt_lookup_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.PromptLookupConfig]
+        default: null
       # Tokenizer behavior
       ignore_eos:
         annotation: bool
