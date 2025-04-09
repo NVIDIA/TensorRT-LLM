@@ -14,6 +14,7 @@ from ..utils.logger import ad_logger
 from ._graph import canonicalize_graph, move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    bmm_shard,
     check_in_out_nodes,
     column_row_shard,
     eliminate_redundant_transposes,
@@ -135,6 +136,9 @@ class InferenceOptimizer:
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
+
+        # run BMM sharding across ranks
+        egm = bmm_shard(egm, local_rank, world_size)
 
         # let's run a shape propagation pass to update the graph with correct meta values for
         # subsequent optimization passes
