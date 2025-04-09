@@ -234,7 +234,7 @@ nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 25.72
-nemotron-nas/DeciLM-7B:
+nemotron-nas/Llama-3_1-Nemotron-51B-Instruct:
   - accuracy: 20.0
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 26.465
