@@ -132,8 +132,8 @@ rm -rf ${TRITON_MODEL_REPO}
 cp -r all_models/inflight_batcher_llm/ ${TRITON_MODEL_REPO}
 
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/ensemble/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},logits_datatype:TYPE_FP32
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${HF_LLAMA_MODEL},preprocessing_instance_count:1
-python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${HF_LLAMA_MODEL},postprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/preprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${TARGET_MODEL_PATH},preprocessing_instance_count:1
+python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/postprocessing/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},tokenizer_dir:${TARGET_MODEL_PATH},postprocessing_instance_count:1
 python3 tools/fill_template.py -i ${TRITON_MODEL_REPO}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${MAX_BATCH_SIZE},decoupled_mode:False,bls_instance_count:1,accumulate_tokens:False,tensorrt_llm_model_name:${TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:${DRAFT_MODEL_NAME},logits_datatype:TYPE_FP32
 
 cp -r ${TRITON_MODEL_REPO}/tensorrt_llm ${TRITON_MODEL_REPO}/tensorrt_llm_draft
