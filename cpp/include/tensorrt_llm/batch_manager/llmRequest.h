@@ -1024,7 +1024,7 @@ public:
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
-        printf("setPrepopulatedPromptLen: %u\n", prepopulatedPromptLen);
+
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
@@ -1780,7 +1780,7 @@ public:
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
 
-    // Position of current ptable index
+    // current position of the prompt tuning table
     SizeType32 mPtableCurrentPosition{0};
 
 protected:

@@ -137,10 +137,8 @@ public:
     TensorPtr sequenceLengthsDevice;
     bool runtimeIsChunkedContext;
 
-    std::unique_ptr<PromptTuningBuffers>& getPromptTuningBuffers()
-    {
-        return promptTuningBuffers;
-    }
+    //! Prompt-Tuning
+    std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
 
 private:
     //! Runtime
@@ -153,9 +151,6 @@ private:
 
     //! Pipeline-Parallelism
     TensorPtr hiddenStates;
-
-    //! Prompt-Tuning
-    std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
 
     //! Mrope
     TensorPtr mropeRotaryCosSin;
