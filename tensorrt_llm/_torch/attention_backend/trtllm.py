@@ -276,7 +276,7 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
-        self.use_flash_mla = use_flash_mla and self.attention_input_type == AttentionInputType.generation_only
+        self.use_flash_mla = use_flash_mla
         self.flash_mla_tile_scheduler_metadata = None
         self.flash_mla_num_splits = None
         if self.is_mla_enable:
@@ -793,7 +793,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
-            use_flash_mla=metadata.enable_flash_mla,
+            use_flash_mla=metadata.enable_flash_mla
+            and attention_input_type == AttentionInputType.generation_only,
         )
         out_dtype = None
         if out_scale is not None:
