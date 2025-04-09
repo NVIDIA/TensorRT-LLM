@@ -62,23 +62,23 @@ def _generate_ds_attention_mask(b, s):
 @pytest.mark.parametrize(
     "model_name, module_name, patch, yarn, inputs",
     [
-        (
+        pytest.param(
             "deepseek-ai/DeepSeek-V3",
             "layers.0.self_attn",
             deepseek_v3_attention,
             False,
             [
-                torch.randn(2, 6, 7168),
+                torch.randn(2, 6, 7168, dtype=torch.bfloat16),
                 _generate_ds_attention_mask(2, 6),
                 torch.tensor([[0, 1, 2, 3, 4, 5]]),
             ],
         ),  # attention requires  inputs [hidden_states, attention_mask, position_ids]
-        (
+        pytest.param(
             "deepseek-ai/DeepSeek-V3",
             "layers.0.mlp",
             deepseek_v3_moe_exact,
             False,
-            [torch.randn(2, 6, 7168)],
+            [torch.randn(2, 6, 7168, dtype=torch.bfloat16)],
         ),  # moe requires  inputs [hidden_states]
     ],
 )
