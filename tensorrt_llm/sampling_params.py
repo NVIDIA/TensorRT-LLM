@@ -118,7 +118,6 @@ class SamplingParams:
         end_id (int, optional): The end token id. Defaults to None.
         pad_id (int, optional): The pad token id. Defaults to None.
         max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
-        max_new_tokens (int, optional): The maximum number of tokens to generate. This argument is being deprecated; please use max_tokens instead. Defaults to None.
         bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
         bad_token_ids (List[int], optional): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Defaults to None.
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
@@ -134,8 +133,7 @@ class SamplingParams:
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
         use_beam_search (bool): Whether to use beam search. Defaults to False.
 
-        beam_width (int): The beam width. Setting 1 disables beam search. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to 1.
-        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
+        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `n`. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
 
         top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.
         top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.
@@ -189,8 +187,6 @@ class SamplingParams:
     end_id: Optional[int] = None
     pad_id: Optional[int] = None
     max_tokens: int = 32
-    max_new_tokens: Optional[int] = None
-
     bad: Optional[Union[str, List[str]]] = None
     bad_token_ids: Optional[List[int]] = None
     _bad_word_ids: Optional[List[List[int]]] = field(default=None,
@@ -213,7 +209,6 @@ class SamplingParams:
     use_beam_search: bool = False
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
-    beam_width: int = 1
     num_return_sequences: Optional[int] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
@@ -224,6 +219,7 @@ class SamplingParams:
     random_seed: Optional[int] = None
     temperature: Optional[float] = None
     min_tokens: Optional[int] = None
+    beam_width: Optional[int] = None
     min_length: Optional[int] = None
     beam_search_diversity_rate: Optional[float] = None
     repetition_penalty: Optional[float] = None
@@ -264,6 +260,13 @@ class SamplingParams:
     truncate_prompt_tokens: Optional[int] = None
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
+
+    @property
+    def beam_width(self) -> int:
+        if self.use_beam_search:
+            return self.best_of
+        else:
+            return 1
 
     def __post_init__(self):
         if self.pad_id is None:
