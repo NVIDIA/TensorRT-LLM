@@ -96,7 +96,7 @@ from utils.llm_data import llm_models_root
                 pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5178508"),
             ],
         ),
-        # full NVSmall (Llama-3.1-Nemotron-51B) with torch-opt backend + simple runtime
+        # full NemotronNAS (Llama-3.1-Nemotron-51B) with torch-opt backend + simple runtime
         param_with_device_count(
             4,
             {
