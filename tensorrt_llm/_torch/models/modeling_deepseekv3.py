@@ -414,9 +414,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
 
-        pp_layer_offset = model_config.mapping.pp_layers_torch(
-            config.num_hidden_layers)[0]
-        global_layer_idx = pp_layer_offset + layer_idx
+        pp_layers = model_config.mapping.pp_layers_torch(
+            config.num_hidden_layers)
+        global_layer_idx = pp_layers[0] + layer_idx
+        is_boundary_pp_layer = (not model_config.mapping.is_last_pp_rank()
+                                ) and layer_idx == len(pp_layers) - 1
 
         self.is_nvfp4 = model_config.quant_config.layer_quant_mode.has_nvfp4()
 
@@ -426,8 +428,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
             ) and not self.enable_attention_dp
             self.fusion_config.POST_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and not model_config.mapping.has_pp(
-            )
+            ) and not self.enable_attention_dp and not is_boundary_pp_layer
             self.mlp = Deepseekv3MoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
@@ -453,8 +454,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 )
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and model_config.mapping.has_tp(
             ) and self.is_nvfp4 and not self.enable_attention_dp
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not self.enable_attention_dp and not model_config.mapping.has_pp(
-            )
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not self.enable_attention_dp and not is_boundary_pp_layer
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,
                                 bias=False,
