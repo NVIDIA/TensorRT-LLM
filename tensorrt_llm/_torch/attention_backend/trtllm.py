@@ -33,22 +33,23 @@ def get_flash_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k):
     """
     Get the Flash MLA metadata. If not cached or cache is None, compute and cache it.
     """
-    if not hasattr(_thread_local,
-                   'mla_metadata') or _thread_local.mla_metadata is None:
-        _thread_local.mla_metadata = torch.ops.trtllm.get_mla_metadata(
+    if not hasattr(
+            _thread_local,
+            'flash_mla_metadata') or _thread_local.flash_mla_metadata is None:
+        _thread_local.flash_mla_metadata = torch.ops.trtllm.get_mla_metadata(
             cache_seqlens,
             num_heads_per_head_k,
             num_heads_k,
         )
-    return _thread_local.mla_metadata
+    return _thread_local.flash_mla_metadata
 
 
 def clear_flash_mla_metadata():
     """
     Clear the cached metadata.
     """
-    if hasattr(_thread_local, 'mla_metadata'):
-        _thread_local.mla_metadata = None
+    if hasattr(_thread_local, 'flash_mla_metadata'):
+        _thread_local.flash_mla_metadata = None
 
 
 @dataclass(kw_only=True, init=False)
