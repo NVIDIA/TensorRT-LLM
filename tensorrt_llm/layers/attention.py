@@ -175,6 +175,13 @@ class AttentionParams(object):
         self.embed_positions = None
         self.rotary_inv_freq = None
         self.embed_positions_for_gpt_attention = None
+
+        # auxiliary params to support models with non-homegeneous attn layers requiring
+        # a different set of rope params. e.g. Gemma3.
+        self.embed_positions_local = None
+        self.rotary_inv_freq_local = None
+        self.embed_positions_for_gpt_attention_local = None
+
         # long rope const parameters
         self.long_rope_embed_positions = None
         self.long_rope_rotary_inv_freq = None
@@ -186,10 +193,16 @@ class AttentionParams(object):
             self,
             embed_positions: Tensor = None,
             rotary_inv_freq: Tensor = None,
-            embed_positions_for_gpt_attention: Tensor = None):
+            embed_positions_for_gpt_attention: Tensor = None,
+            embed_positions_local: Tensor = None,
+            rotary_inv_freq_local: Tensor = None,
+            embed_positions_for_gpt_attention_local: Tensor = None):
         self.embed_positions = embed_positions
         self.rotary_inv_freq = rotary_inv_freq
         self.embed_positions_for_gpt_attention = embed_positions_for_gpt_attention
+        self.embed_positions_local = embed_positions_local
+        self.rotary_inv_freq_local = rotary_inv_freq_local
+        self.embed_positions_for_gpt_attention_local = embed_positions_for_gpt_attention_local
         return self
 
     def fill_attention_const_params_for_long_rope(
@@ -359,6 +372,7 @@ class Attention(Module):
                  dtype=None,
                  position_embedding_type=PositionEmbeddingType.learned_absolute,
                  rotary_embedding_base=10000.0,
+                 rotary_embedding_base_local=1.0,
                  rotary_embedding_scaling=None,
                  rotary_embedding_percentage=1.0,
                  rope_scaling_short_factors=None,
@@ -388,7 +402,8 @@ class Attention(Module):
                  cp_size=1,
                  cp_rank=0,
                  max_seqlen_for_logn_scaling=8192,
-                 use_logn_scaling=False):
+                 use_logn_scaling=False,
+                 is_local=False):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -417,6 +432,7 @@ class Attention(Module):
         self.cp_group = cp_group
         self.cp_size = cp_size
         self.cp_rank = cp_rank
+        self.is_local = is_local
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -437,6 +453,7 @@ class Attention(Module):
         self.max_distance = max_distance
         self.num_buckets = num_buckets
         self.rotary_embedding_base = rotary_embedding_base
+        self.rotary_embedding_base_local = rotary_embedding_base_local
         self.rotary_embedding_scaling = rotary_embedding_scaling
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
@@ -656,26 +673,45 @@ class Attention(Module):
                 model_cls.short_mscale = short_mscale
                 model_cls.long_mscale = long_mscale
         else:
-            # Rotary const weights.
-            embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
-                max_position_embeddings,
-                rotary_embedding_dim,
-            )
-            rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-                max_position_embeddings, rotary_embedding_dim,
-                rotary_embedding_base, rotary_embedding_scale,
-                rotary_embedding_scale_type, rotary_embedding_scaling)
-            model_cls.register_parameter(
-                'embed_positions',
-                Parameter(embed_positions, dtype='float32', is_buffer=True))
-            model_cls.register_parameter(
-                'rotary_inv_freq',
-                Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
-            model_cls.register_parameter(
-                'embed_positions_for_gpt_attention',
-                Parameter(embed_positions_for_gpt_attention,
-                          dtype='float32',
-                          is_buffer=True))
+
+            def register_rope_params(rotary_base, names_to_register):
+                # Rotary const weights.
+                embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
+                    max_position_embeddings,
+                    rotary_embedding_dim,
+                )
+                rotary_inv_freq, embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                    max_position_embeddings, rotary_embedding_dim, rotary_base,
+                    rotary_embedding_scale, rotary_embedding_scale_type,
+                    rotary_embedding_scaling)
+                model_cls.register_parameter(
+                    names_to_register[0],
+                    Parameter(embed_positions, dtype='float32', is_buffer=True))
+                model_cls.register_parameter(
+                    names_to_register[1],
+                    Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
+                model_cls.register_parameter(
+                    names_to_register[2],
+                    Parameter(embed_positions_for_gpt_attention,
+                              dtype='float32',
+                              is_buffer=True))
+
+            register_rope_params(rotary_base=rotary_embedding_base,
+                                 names_to_register=[
+                                     'embed_positions', 'rotary_inv_freq',
+                                     'embed_positions_for_gpt_attention'
+                                 ])
+
+            # For models with non-homegeneous attention layers requiring a second set of rope params. e.g. Gemma3.
+            rotary_embedding_base_local = getattr(config,
+                                                  'rope_local_base_freq', None)
+            if rotary_embedding_base_local is not None:
+                register_rope_params(
+                    rotary_base=rotary_embedding_base_local,
+                    names_to_register=[
+                        'embed_positions_local', 'rotary_inv_freq_local',
+                        'embed_positions_for_gpt_attention_local'
+                    ])
 
     @staticmethod
     def fill_attention_params(model_cls, attention_params):
@@ -695,7 +731,15 @@ class Attention(Module):
                 return attention_params.fill_attention_const_params_for_rope(
                     model_cls.embed_positions.value,
                     model_cls.rotary_inv_freq.value,
-                    model_cls.embed_positions_for_gpt_attention.value)
+                    model_cls.embed_positions_for_gpt_attention.value,
+                    model_cls.embed_positions_local.value if hasattr(
+                        model_cls, "embed_positions_local") else None,
+                    model_cls.rotary_inv_freq_local.value if hasattr(
+                        model_cls, "rotary_inv_freq_local") else None,
+                    model_cls.embed_positions_for_gpt_attention_local.value
+                    if hasattr(
+                        model_cls,
+                        "embed_positions_for_gpt_attention_local") else None)
         # Fill nothing.
         return attention_params
 
@@ -1020,6 +1064,11 @@ class Attention(Module):
             # Rotary cos/sin cache.
             rotary_cos_sin = getattr(attention_params,
                                      "embed_positions_for_gpt_attention", None)
+            rotary_inv_freq_local = getattr(attention_params,
+                                            "rotary_inv_freq_local", None)
+            rotary_cos_sin_local = getattr(
+                attention_params, "embed_positions_for_gpt_attention_local",
+                None)
 
             long_rope_rotary_inv_freq = getattr(attention_params,
                                                 "long_rope_rotary_inv_freq",
@@ -1062,7 +1111,8 @@ class Attention(Module):
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
-                rotary_embedding_base=self.rotary_embedding_base,
+                rotary_embedding_base=self.rotary_embedding_base
+                if not self.is_local else self.rotary_embedding_base_local,
                 rotary_embedding_scale_type=self.rotary_embedding_scale_type,
                 rotary_embedding_short_m_scale=attention_params.short_mscale,
                 rotary_embedding_long_m_scale=attention_params.long_mscale,
@@ -1071,8 +1121,10 @@ class Attention(Module):
                 rotary_embedding_original_max_positions=self.
                 original_max_position_embeddings,
                 position_embedding_type=self.position_embedding_type,
-                rotary_inv_freq=rotary_inv_freq,
-                rotary_cos_sin=rotary_cos_sin,
+                rotary_inv_freq=rotary_inv_freq
+                if not self.is_local else rotary_inv_freq_local,
+                rotary_cos_sin=rotary_cos_sin
+                if not self.is_local else rotary_cos_sin_local,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
                 attention_output_orig_quant_scale=self.

@@ -520,12 +520,11 @@ class MLA(nn.Module):
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
-            compressed_q = hidden_states
+            q = hidden_states
         else:
-            compressed_q, compressed_kv, k_pe = self.fused_a(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-                ], -1)
+            q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
+                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+                -1)
             do_multi_stream = torch.cuda.is_current_stream_capturing(
             ) and self.aux_stream is not None
             if do_multi_stream:
@@ -533,14 +532,14 @@ class MLA(nn.Module):
                 compressed_kv = self.kv_a_layernorm(compressed_kv)
                 with torch.cuda.stream(self.aux_stream):
                     self.ln_events[0].wait()
-                    compressed_q = self.q_a_layernorm(compressed_q)
+                    q = self.q_a_layernorm(q)
                     self.ln_events[1].record()
                 self.ln_events[1].wait()
             else:
-                compressed_q = self.q_a_layernorm(compressed_q)
+                q = self.q_a_layernorm(q)
                 compressed_kv = self.kv_a_layernorm(compressed_kv)
 
-        q = self.q_b_proj(compressed_q)
+        q = self.q_b_proj(q)
 
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -571,6 +570,11 @@ class MLA(nn.Module):
         else:
             attn_output_gen = None
 
+        # release pytorch activation memory
+        q = None
+        compressed_kv = None
+        k_pe = None
+
         # merge context and gen batches
         if attn_output_context is not None and attn_output_gen is not None:
             assert (
@@ -581,6 +585,9 @@ class MLA(nn.Module):
             ), f"attn_output_gen must be rank 2, not {len(attn_output_gen.shape)}"
             attn_output = torch.cat([attn_output_context, attn_output_gen],
                                     dim=0)
+            # release pytorch activation memory
+            attn_output_context = None
+            attn_output_gen = None
         elif attn_output_gen is None:
             attn_output = attn_output_context
         else:
@@ -680,6 +687,7 @@ class MLA(nn.Module):
             torch.ops.trtllm.fp8_block_scaling_bmm_out(
                 q_nope, self.k_b_proj_trans, q_nope_scales,
                 self.k_b_proj_trans_scale, q_nope_out)
+            q_nope_scales = None
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -702,6 +710,8 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
         )
+        fused_q = None
+
         assert (attn_out_latent.shape[0] == q.shape[0] and
                 attn_out_latent.shape[1] == self.num_heads * self.kv_lora_rank)
 
@@ -726,11 +736,10 @@ class MLA(nn.Module):
             torch.ops.trtllm.fp8_block_scaling_bmm_out(
                 attn_out_latent, self.v_b_proj, attn_out_latent_scales,
                 self.v_b_proj_scale, attn_output.transpose(0, 1))
+            attn_out_latent_scales = None
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         # [seq, num_heads * v_head_dim]
-        attn_output_flatten = attn_output.flatten(1, 2)
-
-        return attn_output_flatten
+        return attn_output.flatten(1, 2)
