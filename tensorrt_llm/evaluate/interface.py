@@ -12,9 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import random
 from abc import ABC, abstractmethod, abstractstaticmethod
 from typing import Iterable, List, Optional, Union
 
+import numpy as np
+import torch
 from tqdm import tqdm
 
 import tensorrt_llm.profiler as profiler
@@ -28,8 +31,12 @@ from ..sampling_params import SamplingParams
 class Evaluator(ABC):
 
     def __init__(self,
+                 random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        torch.manual_seed(random_seed)
         self.apply_chat_template = apply_chat_template
         self.system_prompt = system_prompt
 
