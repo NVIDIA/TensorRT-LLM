@@ -19,13 +19,17 @@ from .rotary_embedding import RotaryEmbedding
 
 class L2Norm(torch.nn.Module):
 
-    def __init__(self, dtype: Optional[torch.dtype] = None, eps: float = 1e-6):
+    def __init__(self,
+                 hidden_size: int,
+                 dtype: Optional[torch.dtype] = None,
+                 eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.dtype = dtype
+        self.hidden_size = hidden_size
 
     def _norm(self, x):
-        flash_infer_kernel = RMSNorm(hidden_size=x.shape[-1],
+        flash_infer_kernel = RMSNorm(hidden_size=self.hidden_size,
                                      eps=self.eps,
                                      dtype=self.dtype,
                                      device=x.device)
@@ -53,7 +57,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        attn_scale: bool = False,
+        attn_temperature_tuning: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -95,7 +99,7 @@ class Attention(nn.Module):
         self.kv_size = self.num_key_value_heads * self.head_dim
 
         if self.use_qk_norm:
-            self.qk_norm = L2Norm(dtype=dtype)
+            self.qk_norm = L2Norm(hidden_size=self.head_dim, dtype=dtype)
         else:
             self.qk_norm = None
 
@@ -151,7 +155,12 @@ class Attention(nn.Module):
 
         if not config.skip_create_weights:
             self.create_weights()
-        self.attn_scale = attn_scale
+
+        # Llama4 attention configs
+        self.attn_temperature_tuning = attn_temperature_tuning
+        self.floor_scale = getattr(config.pretrained_config, "floor_scale",
+                                   8192.0)
+        self.attn_scale = getattr(config.pretrained_config, "attn_scale", 0.1)
 
     def create_weights(self):
         self.attn = create_attention(
@@ -165,14 +174,9 @@ class Attention(nn.Module):
         )
 
     def _get_attn_scale(self, position_ids: torch.Tensor) -> torch.Tensor:
-        # FIXME: use hf config instead of hardcoded values
-        # self.floor_scale = getattr(config, "floor_scale", 8192.0)
-        # self.attn_scale = getattr(config, "attn_scale", 0.1)
         positions = position_ids.view(-1)
-        floor_scale = 8192.0
-        attn_scale = 0.1
-        floor = torch.floor((positions + 1.0) / floor_scale)
-        attn_scale = torch.log(floor + 1.0) * attn_scale + 1.0
+        floor = torch.floor((positions + 1.0) / self.floor_scale)
+        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
         return attn_scale.unsqueeze(-1)
 
     def forward(
@@ -193,6 +197,15 @@ class Attention(nn.Module):
             is_fused_qkv = True
 
         if self.qk_norm is not None:
+            assert self.attn_backend == "FLASHINFER", "attention qk_norm is only supported w/ flashinfer backend"
+            # Apply rope ahead of qk_norm
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None:
+
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                    dim=-1)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+                qkv = torch.concat([q, k, v], dim=-1)
+
             # TODO: make this more efficient.
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
@@ -200,18 +213,24 @@ class Attention(nn.Module):
             ) and self.aux_stream is not None
             if do_multi_stream:
                 self.ln_events[0].record()
-                k = self.qk_norm(k)
+                k = k.reshape(-1, self.head_dim)
+                k = self.qk_norm(k).reshape(-1, self.kv_size)
                 with torch.cuda.stream(self.aux_stream):
                     self.ln_events[0].wait()
-                    q = self.qk_norm(q)
+                    q = q.reshape(-1, self.head_dim)
+                    q = self.qk_norm(q).reshape(-1, self.q_size)
                     self.ln_events[1].record()
                 self.ln_events[1].wait()
             else:
-                q = self.qk_norm(q)
-                k = self.qk_norm(k)
+                q = q.reshape(-1, self.head_dim)
+                k = k.reshape(-1, self.head_dim)
+                q = self.qk_norm(q).reshape(-1, self.q_size)
+                k = self.qk_norm(k).reshape(-1, self.kv_size)
             qkv = torch.concat([q, k, v], dim=-1)
 
-        if self.attn_scale:
+        if self.attn_temperature_tuning:
+            # this must be a nope layer
+            assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
             attn_scale = self._get_attn_scale(position_ids)
@@ -219,7 +238,6 @@ class Attention(nn.Module):
             qkv = torch.concat(
                 [q.contiguous(), k.contiguous(),
                  v.contiguous()], dim=-1)
-            position_ids = None  # For NOPE layers (like in Llama4), after applying attn_scale, disable the rotary embedding.
 
         if lora_params is not None:
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -233,7 +251,7 @@ class Attention(nn.Module):
                 qkv = qkv + qkv_lora
 
         if is_fused_qkv:
-            if self.pos_embd_params is None and position_ids is not None:
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None and self.qk_norm is None:
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                     dim=-1)
                 q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
@@ -253,7 +271,7 @@ class Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
 
-            if self.pos_embd_params is None and position_ids is not None:
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None and self.qk_norm is None:
                 q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
 
             attn_output = self.attn.forward(q.contiguous(),

@@ -140,6 +140,7 @@ class RotaryEmbedding(nn.Module):
                                                  StarAttentionMetadata)
                 if isinstance(attn_metadata, StarAttentionMetadata):
                     pass
+                # TODO: Support RoPE when RoPE is unfused in attention for TRTLLM backend
                 elif isinstance(attn_metadata, FlashInferAttentionMetadata):
                     from ..custom_ops import flashinfer_apply_rope_inplace
                     assert len(targets) == 2
