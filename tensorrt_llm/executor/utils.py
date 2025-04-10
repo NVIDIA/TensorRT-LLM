@@ -154,8 +154,8 @@ class IntraProcessQueue:
 
 class WorkerCommIpcAddrs(NamedTuple):
     ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
-    request_queue_addr: tuple[str, bytes]
-    request_error_queue_addr: tuple[str, bytes]
-    result_queue_addr: tuple[str, bytes]
-    stats_queue_addr: tuple[str, bytes]
-    kv_cache_events_queue_addr: tuple[str, bytes]
+    request_queue_addr: tuple[str, Optional[bytes]]
+    request_error_queue_addr: tuple[str, Optional[bytes]]
+    result_queue_addr: tuple[str, Optional[bytes]]
+    stats_queue_addr: tuple[str, Optional[bytes]]
+    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
