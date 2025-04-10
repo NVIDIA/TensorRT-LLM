@@ -11,8 +11,7 @@ genai-perf profile \
     --synthetic-input-tokens-stddev 0 \
     --output-tokens-mean 128 \
     --output-tokens-stddev 0 \
-    --concurrency 1 \
-    --measurement-interval 4000 \
+    --request-rate 1 \
     --profile-export-file my_profile_export.json \
     --url localhost:8000 \
     --streaming
