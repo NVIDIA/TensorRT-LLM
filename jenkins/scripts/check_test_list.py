@@ -38,9 +38,9 @@ def verify_l0_test_lists(llm_src):
 
 
 def verify_qa_test_lists(llm_src):
-    test_qa_path = "${llmSrc}/tests/integration/test_lists/qa"
+    test_qa_path = f"{llm_src}/tests/integration/test_lists/qa"
     test_def_files = subprocess.check_output(
-        f"ls -d ${test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
+        f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
     for test_def_file in test_def_files:
         subprocess.run(
             f"cd {llm_src}/tests/integration/defs && "
