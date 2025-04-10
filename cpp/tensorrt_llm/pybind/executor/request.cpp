@@ -507,11 +507,11 @@ void initRequestBindings(pybind11::module_& m)
             self.getEncoderInputTokenIds(), self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(),
             self.getRequestType(), self.getContextPhaseParams(), self.getEncoderInputFeatures(),
             self.getEncoderOutputLength(), self.getCrossAttentionMask(), self.getEagleConfig(),
-            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams());
+            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(), self.getNumVocabs());
     };
     auto requestSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 31)
+        if (state.size() != 32)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -530,7 +530,8 @@ void initRequestBindings(pybind11::module_& m)
             state[23].cast<tle::RequestType>(), state[24].cast<std::optional<tle::ContextPhaseParams>>(),
             state[25].cast<std::optional<tle::Tensor>>(), state[26].cast<std::optional<SizeType32>>(),
             state[27].cast<std::optional<tle::Tensor>>(), 1, state[28].cast<std::optional<tle::EagleConfig>>(),
-            state[29].cast<std::optional<tle::Tensor>>(), state[30].cast<std::optional<tle::GuidedDecodingParams>>());
+            state[29].cast<std::optional<tle::Tensor>>(), state[30].cast<std::optional<tle::GuidedDecodingParams>>(),
+            state[31].cast<SizeType32>());
     };
 
     py::class_<tle::Request> request(m, "Request");
@@ -563,7 +564,8 @@ void initRequestBindings(pybind11::module_& m)
                      std::optional<tle::EagleConfig> const& eagleConfig,
                      std::optional<tle::Tensor> const& skipCrossAttnBlocks,
                      std::optional<tle::GuidedDecodingParams> const& guidedDecodingParams,
-                     std::optional<tle::SizeType32> const& languageAdapterUid)
+                     std::optional<tle::SizeType32> const& languageAdapterUid,
+                     tle::SizeType32 numVocabs)
                  {
                      if (maxNewTokens.has_value())
                      {
@@ -580,7 +582,7 @@ void initRequestBindings(pybind11::module_& m)
                          kvCacheRetentionConfig, logitsPostProcessorName, logitsPostProcessor, encoderInputTokenIds,
                          clientId, returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
                          encoderOutputLength, crossAttentionMask, 1, eagleConfig, skipCrossAttnBlocks,
-                         guidedDecodingParams, languageAdapterUid);
+                         guidedDecodingParams, languageAdapterUid, std::nullopt, numVocabs);
                  }),
             py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
             py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
@@ -599,7 +601,7 @@ void initRequestBindings(pybind11::module_& m)
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
             py::arg("encoder_output_length") = py::none(), py::arg("cross_attention_mask") = py::none(),
             py::arg("eagle_config") = py::none(), py::arg("skip_cross_attn_blocks") = py::none(),
-            py::arg("guided_decoding_params") = py::none(), py::arg("language_adapter_uid") = py::none())
+            py::arg("guided_decoding_params") = py::none(), py::arg("language_adapter_uid") = py::none(), py::arg("num_vocabs") = 8)
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
@@ -643,6 +645,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_property("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
         .def_property(
             "context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+        .def_property("num_vocabs", &tle::Request::getNumVocabs, &tle::Request::setNumVocabs)
         .def(py::pickle(requestGetstate, requestSetstate));
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 

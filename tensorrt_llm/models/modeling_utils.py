@@ -873,7 +873,8 @@ class PretrainedModel(Module,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
             pp_reduce_scatter=pp_reduce_scatter,
-            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size)
+            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size,
+            num_vocabs=self.config.num_vocabs)
 
         result = {
             'input_ids':

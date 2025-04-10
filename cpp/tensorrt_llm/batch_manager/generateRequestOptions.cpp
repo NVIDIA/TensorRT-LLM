@@ -20,6 +20,12 @@
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
+
+#include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/runtimeKernels.h"
+#include "tensorrt_llm/runtime/tllmRuntime.h"
+
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -45,7 +51,6 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
     {
         for (auto const& llmReq : contextRequests)
         {
-            auto const& reqTokens = llmReq->getTokens(0);
             if (llmReq->isLastContextChunk())
             {
                 ++batchSize;
@@ -92,8 +97,9 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
         TensorPtr inputView = ITensor::slice(inputIdsFlatView, ITensor::makeShape({vocabId, inputOffset}), promptLen);
         if (numVocabs > 1) {
+            SizeType32 vocabShift = -modelConfig.getVocabSize() * vocabId;
             runtime::kernels::invokeAdd<TokenIdType>(
-                *inputView, -modelConfig.getVocabSize() * vocabId, bufferManager.getStream()); // restore original input ids
+                *inputView, vocabShift, bufferManager.getStream()); // restore original input ids
         }
         bufferManager.copy(reqTokens.data(), *inputView);
 

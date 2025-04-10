@@ -47,7 +47,7 @@ public:
 
     void operator()(tr::SizeType32 logitsIndex, RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
         tr::ModelConfig const& modelConfig, tr::BufferManager const& manager, tr::ITensor::SharedPtr const& logits,
-        OptionalRef<RuntimeBuffers> genRuntimeBuffers, SizeType32 vocabId = 0) const;
+        OptionalRef<RuntimeBuffers> genRuntimeBuffers, tr::SizeType32 vocabId = 0) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

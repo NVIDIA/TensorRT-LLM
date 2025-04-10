@@ -636,7 +636,8 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
     /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
     /// be timed-out before ever being scheduled.
-    // 34 parameters
+    /// @param numVocabs The number of vocabs.
+
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -661,7 +662,7 @@ public:
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt, SizeType32 numVocabs = 1);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -710,7 +711,12 @@ public:
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+<<<<<<< HEAD
 
+=======
+    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
+    [[nodiscard]] SizeType32 getNumVocabs() const;
+>>>>>>> Fixes to compilation
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
     void setOutputConfig(OutputConfig const& outputConfig);
@@ -742,8 +748,12 @@ public:
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
+<<<<<<< HEAD
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
 
+=======
+    void setNumVocabs(SizeType32 numVocabs);
+>>>>>>> Fixes to compilation
 private:
     friend class Serialization;
     class Impl;

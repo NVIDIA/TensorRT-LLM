@@ -1056,6 +1056,7 @@ def load_weights_from_hf_model(hf_model,
     vocab_embedding = get_weight(
         model_params, f'{model_prefix}.{param_name_map["vocab_embedding"]}',
         dtype)
+    # TODO: update according to num_vocabs
 
     if mapping.is_first_pp_rank():
         if config.use_parallel_embedding:
@@ -1074,6 +1075,7 @@ def load_weights_from_hf_model(hf_model,
         else:
             lm_head_weights = get_weight(model_params,
                                          param_name_map["lm_head"], dtype)
+            # TODO: update according to num_vocabs
 
         if config.vocab_size % mapping.tp_size != 0:
             # padding
@@ -1541,7 +1543,7 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
     num_hidden_layers = config.num_hidden_layers
     vocab_size = config.vocab_size
     pad_vocab = vocab_size % mapping.tp_size != 0
-    vocab_size_padded = pad_vocab_size(config.vocab_size, mapping.tp_size)
+    vocab_size_padded = pad_vocab_size(config.vocab_size, mapping.tp_size) * config.num_vocabs
     dtype = config.dtype
 
     moe_config = config.moe
@@ -1616,9 +1618,13 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 weights[target.replace("weight", "bias")] = bias
 
     if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = load(
+        v = load(
             param_name_map["vocab_embedding"], config.embedding_sharding_dim
             if config.use_parallel_embedding else -1)  # vocab_embedding
+        if config.num_vocabs > 1:
+            v = torch.nn.functional.pad(
+                v, (0, 0, 0, (config.num_vocabs - 1) * vocab_size), 'constant', 0)
+        weights['transformer.vocab_embedding.weight'] = v
 
     if mapping.is_last_pp_rank():
         v = load(param_name_map["lm_head"], -1, 1) if pad_vocab else load(
@@ -1626,10 +1632,20 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         if v is None:
             v = load(param_name_map["vocab_embedding"],
                      -1 if pad_vocab else 0).clone().detach()
+        if config.num_vocabs > 1:
+            # Create a padding tensor that will always predict token 100000
+            padding_shape = (vocab_size * (config.num_vocabs - 1), v.shape[1])
+            padding = torch.zeros(padding_shape, dtype=v.dtype, device=v.device)
+            # Set a large value at index 100000 for each row to ensure it's always predicted
+            token_idx = 100000
+            if token_idx < padding.shape[1]:
+                padding[:, token_idx] = 1000.0  # Large value but not max
+            # Concatenate the original tensor with the padding
+            v = torch.cat([v, padding], dim=0)
 
         if pad_vocab:
             v = torch.nn.functional.pad(
-                v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
+                v, (0, 0, 0, vocab_size_padded - vocab_size * config.num_vocabs), 'constant', 0)
             v = split(v, mapping.tp_size, mapping.tp_rank)
         weights['lm_head.weight'] = v
         weights['transformer.ln_f.weight'] = load(

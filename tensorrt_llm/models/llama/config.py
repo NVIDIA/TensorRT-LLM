@@ -188,6 +188,8 @@ class LLaMAConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
+        num_vocabs = getattr(hf_config, 'num_vocabs', 1)
+
         return cls(
             architecture=hf_config.architectures[0],
             dtype=dtype,
@@ -217,6 +219,7 @@ class LLaMAConfig(PretrainedConfig):
             attention_multiplier=attention_multiplier,
             residual_multiplier=residual_multiplier,
             output_multiplier_scale=output_multiplier_scale,
+            num_vocabs=num_vocabs,
             **kwargs)
 
     @classmethod

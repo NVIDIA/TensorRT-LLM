@@ -141,7 +141,7 @@ public:
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
         , mNumLanguages(0)
-	, mNumVocabs{numVocabs}
+	    , mNumVocabs{numVocabs}
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -937,10 +937,12 @@ private:
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
     bool mSkipCrossAttnBlocks;
-    SizeType32 mNumVocabs;
 
     // Language adapter info
     std::optional<SizeType32> mNumLanguages;
+
+    // Number of vocabs
+    SizeType32 mNumVocabs;
 };
 
 } // namespace tensorrt_llm::runtime

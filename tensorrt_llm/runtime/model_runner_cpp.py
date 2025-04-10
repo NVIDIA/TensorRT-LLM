@@ -450,7 +450,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             len(x) for x in encoder_input_ids
         ] if encoder_input_ids else [len(x) for x in batch_input_ids]
         max_length = max(input_lengths)
-        if max_length > self.max_input_len:
+        if max_length > self.max_input_len * self.model_config.num_vocabs:
             raise RuntimeError(
                 f"Maximum input length ({max_length}) exceeds the engine or specified limit ({self.max_input_len})"
             )
@@ -461,7 +461,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     f"Decoder prefix tokens ({decoder_max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
                 )
         else:
-            if max_length + max_new_tokens > self.max_seq_len:
+            if max_length + max_new_tokens > self.max_seq_len * self.model_config.num_vocabs:
                 raise RuntimeError(
                     f"Maximum input length ({max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
                 )
@@ -766,6 +766,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 external_draft_tokens_config=external_draft_tokens_config,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
                 language_adapter_uid=language_adapter_uid,
+                num_vocabs=self.model_config.num_vocabs,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
              mrope_config, lora_config, logits_post_processor_name,

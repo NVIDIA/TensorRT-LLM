@@ -21,7 +21,7 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                            allgather, concat, constant, div, non_gated_version,
-                           recv, send, unsqueeze, shape, sum, view)
+                           recv, send, unsqueeze, shape, sum, view, select)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
@@ -315,7 +315,7 @@ class LLaMAModel(Module):
         self.hidden_size = config.hidden_size
         self.num_vocabs = config.num_vocabs
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(config.vocab_size,
+            self.vocab_embedding = Embedding(config.vocab_size * config.num_vocabs,
                                              config.hidden_size,
                                              dtype=config.dtype)
             self.embedding_multiplier = config.embedding_multiplier
@@ -367,7 +367,8 @@ class LLaMAModel(Module):
             # in the future:
             # hidden_states = sum(hidden_states, 1, keepdim=False)
             # shape [totalSeqLen, embDim]
-            hidden_states = hidden_states[:, 0, :]
+            # hidden_states[:, 0, :]
+            hidden_states = select(hidden_states, 1, 0) 
             hidden_states *= self.embedding_multiplier
         else:
             # TODO: not supported for multi-vocab yet
@@ -421,7 +422,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
+                                   vocab_size_padded * config.num_vocabs,
                                    bias=False,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,

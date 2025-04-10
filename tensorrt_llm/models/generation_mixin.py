@@ -91,7 +91,8 @@ class GenerationMixin:
             opt_num_tokens,
             enable_ctx_gen_opt_profiles,
             multiple_profiles,
-            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS):
+            kv_cache_type: KVCacheType = KVCacheType.CONTINUOUS,
+            num_vocabs: int = 1):
         default_range = GenerationMixin.default_range
         if opt_batch_size:
             bb_range_cxt = [1, opt_batch_size, max_batch_size]
@@ -167,6 +168,10 @@ class GenerationMixin:
                     lambda x:
                     [math.ceil(x[0] / (max_draft_len + 1)), x[1], x[2]],
                     num_tokens_range))
+
+
+        num_tokens_range = [[rr * num_vocabs for rr in r]
+                            for r in num_tokens_range]
 
         ranges = {
             'bb_range': bb_range,
@@ -547,6 +552,7 @@ class GenerationMixin:
         opt_batch_size=None,
         pp_reduce_scatter: bool = False,
         mrope_rotary_cos_sin_size: int = None,
+        num_vocabs: int = 1,
     ):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
@@ -565,7 +571,8 @@ class GenerationMixin:
             opt_num_tokens=opt_num_tokens,
             enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
             multiple_profiles=multiple_profiles,
-            kv_cache_type=kv_cache_type)
+            kv_cache_type=kv_cache_type,
+            num_vocabs=num_vocabs)
         bb_range = ranges['bb_range']
         bbd_range = ranges['bbd_range']
         inlen_range = ranges['inlen_range']

@@ -121,7 +121,7 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         {
             TLLM_CHECK(medusaBuffers);
             // speculative decoding is not supported for numVocabs > 1
-            auto& medusaLogitsHeads = decoderBuffers.front()->draftBuffers.predictedDraftLogits.at(seqSlot);
+            auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
             setupMedusaLogits(medusaLogitsHeads, medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex - numDecoderLogits,
                 numDecoderLogits);
@@ -137,7 +137,7 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
 
-        auto& decoderLogits = mDecoderBuffers.logits.at(seqSlot);
+        auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
         auto const vocabSize = modelConfig.getVocabSize();
 
         if (reqBeamWidth > 1)
@@ -152,16 +152,17 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
         else
         {
             auto curVocablogitsView = logitsView;
-            auto const logitsViewShape = logitsView->getShape();
+            const auto logitsViewShape = logitsView->getShape();
             if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
             {
-                TLLM_LOG_INFO("Ctx Request: logitsViewShape has only 1 token. VocabOffset = %d", vocabOffset);
                 curVocablogitsView = ITensor::slice(logitsView, {0, vocabId * vocabSize}, vocabSize); // [vocabSize,]
                 curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSize}));
             }
-            logitsViewShape = curVocablogitsView->getShape();
+            const auto updateLogitsViewShape = curVocablogitsView->getShape();
             decoderLogits
-                = ITensor::view(curVocablogitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
+                = ITensor::view(curVocablogitsView, ITensor::makeShape(
+                    {updateLogitsViewShape.d[0], 1, updateLogitsViewShape.d[1]}
+                ));
         }
         ++batchIndex;
     }

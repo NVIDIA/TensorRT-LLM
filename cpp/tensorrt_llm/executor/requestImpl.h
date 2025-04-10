@@ -47,7 +47,7 @@ public:
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
-        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs)
+        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs, SizeType32 numVocabs = 1)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -82,6 +82,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
+        , mNumVocabs(numVocabs)
     {
         validate();
     }
@@ -283,6 +284,11 @@ public:
         return mLanguageAdapterUid;
     }
 
+    [[nodiscard]] SizeType32 getNumVocabs() const
+    {
+        return mNumVocabs;
+    }
+
     void setStreaming(bool streaming)
     {
         mStreaming = streaming;
@@ -447,6 +453,11 @@ public:
         mLanguageAdapterUid = languageAdapterUid;
     }
 
+    void setNumVocabs(SizeType32 numVocabs)
+    {
+        mNumVocabs = numVocabs;
+    }
+
 private:
     void validate()
     {
@@ -518,6 +529,7 @@ private:
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
+        lambda(mNumVocabs);
     }
 
     VecTokens mInputTokenIds;
@@ -554,6 +566,7 @@ private:
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
+    SizeType32 mNumVocabs;
 };
 
 } // namespace tensorrt_llm::executor

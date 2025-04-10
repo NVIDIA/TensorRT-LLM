@@ -40,7 +40,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs)
+    std::optional<MillisecondsType> allottedTimeMs, SizeType32 numVocabs)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(mRopeConfig), std::move(loraConfig),
@@ -48,7 +48,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         crossAttentionMask, numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams),
-        languageAdapterUid, allottedTimeMs))
+        languageAdapterUid, allottedTimeMs, numVocabs))
 {
 }
 
@@ -251,6 +251,11 @@ std::optional<SizeType32> Request::getLanguageAdapterUid() const
     return mImpl->getLanguageAdapterUid();
 }
 
+SizeType32 Request::getNumVocabs() const
+{
+    return mImpl->getNumVocabs();
+}
+
 void Request::setStreaming(bool streaming)
 {
     return mImpl->setStreaming(streaming);
@@ -412,5 +417,10 @@ void Request::setAllottedTimeMs(MillisecondsType allottedTimeMs)
 void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
 {
     return mImpl->setLanguageAdapterUid(languageAdapterUid);
+}
+
+void Request::setNumVocabs(SizeType32 numVocabs)
+{
+    return mImpl->setNumVocabs(numVocabs);
 }
 } // namespace tensorrt_llm::executor

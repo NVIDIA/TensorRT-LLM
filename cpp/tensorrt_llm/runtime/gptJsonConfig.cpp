@@ -193,7 +193,7 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
     auto const vocabSize = config.at("vocab_size").template get<SizeType32>();
     auto const hiddenSize = config.at("hidden_size").template get<SizeType32>() / tensorParallelism;
     auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
-    auto const numVocabs = parseJsonFieldOptional<SizeType32>(config, "num_vocabs");
+    auto const numVocabs = config.at("num_vocabs").template get<SizeType32>();
 
     // Logits datatype
     auto const logitsDtypeStr = parseJsonFieldOr(config, "logits_dtype", std::string("float32"));
