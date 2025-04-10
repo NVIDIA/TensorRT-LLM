@@ -21,6 +21,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_nvsmall"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_qwen"
+  - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/auto_deploy/unit/singlegpu
