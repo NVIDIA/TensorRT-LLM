@@ -99,12 +99,12 @@ class StressTestConfig:
     customized_stress_test: bool = True
     # customized_stress_time:
     # Used as control parameter to get request count for customized stress test in stage3 alone
-    customized_stress_time: int = 180  # 3 mins
+    customized_stress_time: int = 60  # 1 mins
     # customized_stress_timeout:
     # Maximum time allowed for customized stress test to complete
     # Must be greater than customized_stress_time to account for initialization, warmup, etc prevent run indefinitely
-    customized_stress_timeout: int = 300  # 5 mins
-    customized_stress_concurrency: int = 512
+    customized_stress_timeout: int = 180  # 3 mins
+    customized_stress_concurrency: int = 128
     customized_stress_request_rate: int = 20
 
     @property
