@@ -173,18 +173,21 @@ value for a given parameter, the vector can be limited to a single element
 
 ***Beam-search***
 
-|      Name in TRT-LLM      |           Description           |   Data type   |      Range of value      |       Default value       |     Name in HF      |
-| :-----------------------: | :-----------------------------: | :-----------: | :----------------------: | :-----------------------: | :-----------------: |
-|        `beamWidth`        | width for beam-search algorithm |      Int      |        \[0, 1024\]       | `0` (disable beam search) |    `beam_width`     |
-| `beamSearchDiversityRate` |  diversity of generated tokens  | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           | `diversity_penalty` |
-|      `lengthPenalty`      |    penalize longer sequences    | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           |  `length_penalty`   |
-|      `earlyStopping`      |      see description below      |  List\[Int\]  | \($-\infty$, $+\infty$\) |            `0`            |  `early_stopping`   |
+|      Name in TRT-LLM      |           Description           |      Data type      |      Range of value      |       Default value       |     Name in HF      |
+| :-----------------------: | :-----------------------------: | :-----------------: | :----------------------: | :-----------------------: | :-----------------: |
+|        `beamWidth`        | width for beam-search algorithm |         Int         |       \[0, 1024\]        | `0` (disable beam search) |    `beam_width`     |
+| `beamSearchDiversityRate` |  diversity of generated tokens  |    List\[Float\]    |     \[0, $+\infty$\)     |          `0.0f`           | `diversity_penalty` |
+|      `lengthPenalty`      |    penalize longer sequences    |    List\[Float\]    |     \[0, $+\infty$\)     |          `0.0f`           |  `length_penalty`   |
+|      `earlyStopping`      |      see description below      |     List\[Int\]     | \($-\infty$, $+\infty$\) |            `0`            |  `early_stopping`   |
+|     `beamWidthArray`      |      see description below      | List\[List\[Int\]\] |       \[0, 1024\]        |            ``             |         no          |
 
  * Beam-search algorithm: [beam search](https://en.wikipedia.org/wiki/Beam_search).
  * Parameter `diversity_penalty` in HF is only used for `diverse beam-search decoding` (or named `Group-Beam-Search`), which is not supported by TRT-LLM yet.
  * If setting `earlyStopping = 1`, decoding will stop once `beamWidth` finished sentences are generated.
  * If setting `earlyStopping = 0`, decoding will keep going until no better sentences (with better score) can be generated.
  * If setting `earlyStopping` to other values, decoding will stop only depending on `lengthlengthPenalty`.
+ * `beamWidthArray` is a list of beam width for each step. Using `beamWidthArray = [20,40,80]` as an example,
+beam width will be 20 for the first step, 40 for second step, 80 for the later all steps.
  * The `beamWidth` parameter is a scalar value. It means that in this release of
 TensorRT-LLM, it is not possible to specify a different width for each input
 sequence. This limitation is likely to be removed in a future release.

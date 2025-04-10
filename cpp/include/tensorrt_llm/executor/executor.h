@@ -1485,7 +1485,7 @@ private:
     /// @brief The KV cache configuration.
     KvCacheConfig mKvCacheConfig;
 
-    /// @brief The KV cache configuration.
+    /// @brief Controls if chunk context is used or not.
     bool mEnableChunkedContext;
 
     /// @brief Controls if log probabilities should be normalized or not.

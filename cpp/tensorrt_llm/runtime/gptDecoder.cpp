@@ -49,8 +49,8 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
-        maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
+    auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(maxBatchSize, maxBeamWidth, vocabSize,
+        vocabSizePadded, speculativeDecodingModule, mode.isUseVariableBeamWidthSearch());
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
 
     mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
@@ -439,6 +439,12 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     {
         forwardParams = std::make_shared<tl::DecodingInputs>(input.endIds, input.batchSlots, input.step, ite,
             input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
+
+        if (input.cacheIndirection)
+        {
+            forwardParams->srcCacheIndirection = input.cacheIndirection;
+        }
+        forwardParams->beamSearchSteps = input.steps;
     }
     else if (decodingMode.isMedusa())
     {
@@ -491,11 +497,6 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         }
     }
 
-    if (input.cacheIndirection)
-    {
-        forwardParams->srcCacheIndirection = input.cacheIndirection;
-    }
-
     if (input.embeddingBias)
     {
         forwardParams->embeddingBias = input.embeddingBias;
@@ -515,30 +516,25 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams->finished = input.finishReasons;
     }
 
-    // Medusa
+    // Speculative decoding
     if (decodingMode.isMedusa())
     {
         prepareMedusaInputs(input, maxBatchSize, forwardParams);
     }
-
-    // Explicit draft tokens
-    if (decodingMode.isExplicitDraftTokens())
+    else if (decodingMode.isExplicitDraftTokens())
     {
         prepareExplicitDraftTokensInput(input, forwardParams);
     }
-
-    if (decodingMode.isLookahead() && input.lookaheadInputs)
+    else if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
         prepareLookaheadInputs(input, maxBatchSize, forwardParams);
         forwardParams->localBatchSize = input.batchSize;
     }
-
-    if (decodingMode.isExternalDraftTokens())
+    else if (decodingMode.isExternalDraftTokens())
     {
         prepareExternalDraftTokensInputs(input, forwardParams);
     }
-
-    if (decodingMode.isEagle())
+    else if (decodingMode.isEagle())
     {
         prepareEagleInput(input, forwardParams);
     }

@@ -147,6 +147,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}
     , mGatherGenerationLogits{optionalParams.gatherGenerationLogits}
+    , mUseVariableBeamWidthSearch{optionalParams.useVariableBeamWidthSearch}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -1226,9 +1227,11 @@ namespace
 {
 // TODO: move this somewhere else?
 executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
-    std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 const beamWidth)
+    std::optional<executor::DecodingMode> const& decodingModeOpt, runtime::SizeType32 const beamWidth,
+    bool const useVariableBeamWidthSearch)
 {
-    auto getDefaultDecodingMode = [beamWidth](std::optional<executor::DecodingMode> const& decodingModeOpt)
+    auto getDefaultDecodingMode
+        = [beamWidth, useVariableBeamWidthSearch](std::optional<executor::DecodingMode> const& decodingModeOpt)
     {
         if (decodingModeOpt.has_value() && !decodingModeOpt->isAuto())
         {
@@ -1238,7 +1241,7 @@ executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
         {
             return executor::DecodingMode::TopKTopP();
         }
-        return executor::DecodingMode::BeamSearch();
+        return executor::DecodingMode::BeamSearch().useVariableBeamWidthSearch(useVariableBeamWidthSearch);
     };
 
     auto decodingMode = getDefaultDecodingMode(decodingModeOpt);
@@ -1322,8 +1325,8 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
     {
         auto decoderType = mRuntime->getEngine().getTensorDataType("logits");
 
-        auto const decodingMode
-            = getDecodingMode(mModelConfig.getSpeculativeDecodingMode(), decodingModeOpt, mOperatingBeamWidth);
+        auto const decodingMode = getDecodingMode(mModelConfig.getSpeculativeDecodingMode(), decodingModeOpt,
+            mOperatingBeamWidth, mUseVariableBeamWidthSearch);
         if (decodingMode.isExplicitDraftTokens())
         {
             // There are no logits in Explicit draft tokens model.
@@ -1559,6 +1562,7 @@ TrtGptModelInflightBatching::prepareBuffers(
             *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
             mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
 
+    mRuntime->setCurrentBeamWidths(contextRequests, generationRequests);
     mRuntime->setInputTensors(optProfileId, inputMap);
     mRuntime->setOutputTensors(optProfileId, outputMap);
 
@@ -1696,7 +1700,7 @@ void TrtGptModelInflightBatching::postProcessRequest(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const seqSlot = llmReq.mSeqSlot.value();
-    auto const reqBeamWidth = llmReq.mSamplingConfig.beamWidth;
+    auto const reqBeamWidth = llmReq.mSamplingConfig.getBeamWidthByIter(llmReq.getDecodingIter());
     auto const& bufferManager = getBufferManager();
 
     if (llmReq.getReturnGenerationLogits() && !llmReq.getGenerationLogitsFragments().empty())
@@ -1947,7 +1951,7 @@ void TrtGptModelInflightBatching::copyCacheIndirectionFromOutputsToInputs(
     {
         for (auto const& llmReq : requests)
         {
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+            auto const reqBeamWidth = llmReq->mSamplingConfig.getBeamWidthByIter(llmReq->getDecodingIter());
             auto const seqSlot = llmReq->mSeqSlot.value();
             auto const copySize = static_cast<SizeType64>(cacheIndirShape.d[2]) * reqBeamWidth;
             srcOffsetsPtr[batchIdx] = seqSlot * copySize;
@@ -2111,7 +2115,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
     {
         for (auto const& llmReq : requests)
         {
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+            auto const reqBeamWidth = llmReq->mSamplingConfig.getBeamWidthByIter(llmReq->getDecodingIter());
             if (llmReq->isContextInitState())
             {
                 continue;

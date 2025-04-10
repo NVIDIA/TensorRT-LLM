@@ -33,25 +33,24 @@ using TensorPtr = MakeDecodingBatchInputOutput::TensorPtr;
 
 namespace
 {
-std::vector<bool> computeActiveVec(
+std::pair<std::vector<bool>, std::vector<SizeType32>> computeActiveAndStepVec(
     RequestVector const& contextRequests, RequestVector const& generationRequests, SizeType32 maxNumSequences)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     std::vector<bool> active(maxNumSequences, false);
+    std::vector<SizeType32> steps(maxNumSequences, 0);
     for (auto const& requests : {contextRequests, generationRequests})
     {
         for (auto const& llmReq : requests)
         {
             auto const seqSlot = llmReq->mSeqSlot.value();
-            if (llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk())
-            {
-                active[seqSlot] = true;
-            }
+            active[seqSlot] = llmReq->isGenerationInProgressState() || llmReq->isLastContextChunk();
+            steps[seqSlot] = llmReq->getDecodingIter();
         }
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return active;
+    return {active, steps};
 }
 
 void copySequenceLengths(RequestVector const& contextRequests, RequestVector const& generationRequests,
@@ -100,11 +99,12 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const active = computeActiveVec(contextRequests, generationRequests, maxNumSequences);
+    auto const [active, steps] = computeActiveAndStepVec(contextRequests, generationRequests, maxNumSequences);
     auto decodingInput = std::make_unique<tr::decoder_batch::Input>(decoderBuffers.logits, active);
     decodingInput->batchSlots = inputBuffers.forwardBatchSlots;
 
     decodingInput->cacheIndirection = decoderBuffers.cacheIndirectionInput;
+    decodingInput->steps = steps;
 
     if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
     {
