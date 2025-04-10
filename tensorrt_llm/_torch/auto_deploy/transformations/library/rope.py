@@ -1,17 +1,13 @@
 import operator
 from collections import defaultdict
-from typing import List
+from typing import Any, DefaultDict, Dict, List, Optional
 
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
-
-# Caches for fused cosine-sine tensors and position IDs.
-_rope_flash_cache = defaultdict(lambda: None)
-_rope_position_ids = None
 
 
 def match_rope_v1(gm: GraphModule) -> GraphModule:
@@ -25,6 +21,9 @@ def match_rope_v1(gm: GraphModule) -> GraphModule:
     """
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
+
+    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
+    rope_position_ids_cache: Dict[str, Node] = {}
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []
@@ -48,7 +47,14 @@ def match_rope_v1(gm: GraphModule) -> GraphModule:
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_rope_v1(graph, q_match, k_match, start_boundary)
+        _process_rope_v1(
+            graph,
+            q_match,
+            k_match,
+            start_boundary,
+            rope_flash_cache,
+            rope_position_ids_cache,
+        )
 
     gm = canonicalize_graph(gm)
     return gm
@@ -65,6 +71,9 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
     """
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
+
+    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
+    rope_position_ids_cache: Dict[str, Node] = {}
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []
@@ -88,13 +97,19 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_rope_v2(graph, q_match, k_match)
+        _process_rope_v2(
+            graph,
+            q_match,
+            k_match,
+            rope_flash_cache,
+            rope_position_ids_cache,
+        )
 
     gm = canonicalize_graph(gm)
     return gm
 
 
-def _match_rotary_subpattern_V1(add_node):
+def _match_rotary_subpattern_V1(add_node: Node) -> Optional[Dict[str, Node]]:
     """
     Given an aten.add.Tensor node that is expected to compute:
       output = (raw_input * unsqueeze(cos)) + (rotate_half(raw_input) * unsqueeze(sin))
@@ -180,7 +195,7 @@ def _match_rotary_subpattern_V1(add_node):
     }
 
 
-def _match_rotary_subpattern_V2(type_as_node):
+def _match_rotary_subpattern_V2(type_as_node: Node) -> Optional[Dict[str, Node]]:
     """
     Given a type_as node, this function inspects the graph
     structure and returns a dictionary with:
@@ -261,7 +276,14 @@ def _match_rotary_subpattern_V2(type_as_node):
     }
 
 
-def _process_rope_v1(graph, q_match, k_match, start_boundary):
+def _process_rope_v1(
+    graph: GraphModule,
+    q_match: Dict[str, Node],
+    k_match: Dict[str, Node],
+    start_boundary: Node,
+    rope_flash_cache: DefaultDict[Any, Optional[Node]],
+    rope_position_ids_cache: Dict[str, Node],
+) -> None:
     """
     Process a region that matched the legacy RoPE pattern (v1).
     Inserts the custom op (flashinfer) and replaces the original add nodes.
@@ -321,10 +343,9 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
             q_for_op_contig, k_for_op_contig = q_node, k_node
 
         head_dim = cos_node.meta["val"].shape[-1]
-
         half_head_dim = head_dim // 2
-        # Use cache for fused cosine-sine flash tensor
-        cache = _rope_flash_cache
+
+        cache = rope_flash_cache
         cache_key = (cos_node, sin_node)
         if cache_key in cache:
             fused_cos_sin = cache[cache_key]
@@ -342,7 +363,13 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
             fused_cos_sin = graph.call_method("to", (fused_cos_sin, torch.float32))
             cache[cache_key] = fused_cos_sin
 
-        position_ids = _get_position_ids(graph, q_for_op_contig, batch_dim=0, seq_dim=1)
+        position_ids = _get_position_ids(
+            graph,
+            q_for_op_contig,
+            batch_dim=0,
+            seq_dim=1,
+            rope_position_ids_cache=rope_position_ids_cache,
+        )
 
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
@@ -368,7 +395,13 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
     k_match["add_node"].replace_all_uses_with(new_k)
 
 
-def _process_rope_v2(graph, q_match, k_match):
+def _process_rope_v2(
+    graph: GraphModule,
+    q_match: Dict[str, Node],
+    k_match: Dict[str, Node],
+    rope_flash_cache: DefaultDict[Any, Optional[Node]],
+    rope_position_ids_cache: Dict[str, Node],
+) -> None:
     """
     Process a region that matched the complex-multiplication RoPE pattern (v2).
     Inserts the custom op (flashinfer) after extracting frequency information,
@@ -397,7 +430,7 @@ def _process_rope_v2(graph, q_match, k_match):
         )
 
     # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
-    cache = _rope_flash_cache
+    cache = rope_flash_cache
     if inv_freq_node in cache:
         cos_sin_flash = cache[inv_freq_node]
     else:
@@ -416,7 +449,9 @@ def _process_rope_v2(graph, q_match, k_match):
         cache[inv_freq_node] = cos_sin_flash
 
     with graph.inserting_before(q_match["out"]):
-        position_ids = _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1)
+        position_ids = _get_position_ids(
+            graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=rope_position_ids_cache
+        )
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
             args=(q_node, k_node, position_ids, cos_sin_flash, False),
@@ -433,14 +468,22 @@ def _process_rope_v2(graph, q_match, k_match):
     k_match["out"].replace_all_uses_with(raw_k)
 
 
-def _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1):
+def _get_position_ids(
+    graph: GraphModule,
+    q_node: Node,
+    batch_dim: int = 0,
+    seq_dim: int = 1,
+    rope_position_ids_cache: Dict[str, Node] = None,
+) -> Node:
     """
     Retrieves the cached position_ids from the graph if available, or computes and caches them.
     It uses the symbolic batch and sequence sizes from q_node with the provided dimension indices.
     """
-    global _rope_position_ids
-    if _rope_position_ids is not None:
-        return _rope_position_ids
+    if rope_position_ids_cache is None:
+        rope_position_ids_cache = {}
+
+    if "position_ids" in rope_position_ids_cache:
+        return rope_position_ids_cache["position_ids"]
 
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
@@ -461,5 +504,5 @@ def _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1):
         torch.ops.aten.expand, args=(positions_node, (sym_batch, -1))
     )
     position_ids = graph.call_function(torch.ops.aten.flatten, args=(positions_node,))
-    graph.rope_position_ids = position_ids
+    rope_position_ids_cache["position_ids"] = position_ids
     return position_ids
