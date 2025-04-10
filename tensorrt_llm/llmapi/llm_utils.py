@@ -619,29 +619,6 @@ class CachedModelLoader:
 
         self.model_loader = ModelLoader(self.llm_args)
 
-        if self.build_cache_enabled:
-            print_colored("Build cache is enabled.\n", 'yellow')
-            if self.model_loader.model_obj.is_hub_model:
-                # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
-                # cache key.
-                self._hf_model_dir = download_hf_pretrained_config(
-                    self.model_loader.model_obj.model_name,
-                    revision=self.llm_args.revision)
-
-            elif self.model_loader.model_obj.is_local_model:
-                self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
-
-            self.engine_cache_stage = self._get_engine_cache_stage()
-            if self.engine_cache_stage.is_cached():
-                self.llm_build_stats.cache_hitted = True
-                print_colored(
-                    f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
-                    'grey')
-                self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
-                )
-                self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
-                return self.llm_build_stats.engine_dir, self._hf_model_dir
-
         if self.llm_args.backend is not None:
             if self.llm_args.backend not in ["pytorch", "autodeploy"]:
                 raise ValueError(
@@ -664,6 +641,29 @@ class CachedModelLoader:
             self.model_loader._update_from_hf_quant_config()
 
             return None, self._hf_model_dir
+
+        if self.build_cache_enabled:
+            print_colored("Build cache is enabled.\n", 'yellow')
+            if self.model_loader.model_obj.is_hub_model:
+                # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
+                # cache key.
+                self._hf_model_dir = download_hf_pretrained_config(
+                    self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
+
+            elif self.model_loader.model_obj.is_local_model:
+                self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
+
+            self.engine_cache_stage = self._get_engine_cache_stage()
+            if self.engine_cache_stage.is_cached():
+                self.llm_build_stats.cache_hitted = True
+                print_colored(
+                    f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
+                    'grey')
+                self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
+                )
+                self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
+                return self.llm_build_stats.engine_dir, self._hf_model_dir
 
         return self._build_model(), self._hf_model_dir
 
