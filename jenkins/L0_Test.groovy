@@ -458,7 +458,9 @@ def runLLMDocBuild(pipeline, config)
                 pip3 install -r requirements.txt && \
                 pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
                 doxygen Doxygen && \
-                make html
+                make html && \
+                cd build/html && \
+                touch .nojekyll
             """
         )
     }

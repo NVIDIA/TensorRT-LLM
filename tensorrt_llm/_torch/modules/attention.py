@@ -11,6 +11,7 @@ from ..attention_backend.interface import (PositionalEmbeddingParams,
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
@@ -134,6 +135,19 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.rotary_emb = rotary_emb
 
+        # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
+        # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
+        # handles them as a single fused operation.
+        self.splitted_qkv_lora = LoraLayer([
+            LoraModuleType.ATTENTION_Q, LoraModuleType.ATTENTION_K,
+            LoraModuleType.ATTENTION_V
+        ], [self.q_size, self.kv_size, self.kv_size])
+        self.fused_qkv_lora = LoraLayer([LoraModuleType.ATTENTION_QKV],
+                                        [self.q_size + 2 * self.kv_size])
+
+        self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
+                                [self.hidden_size])
+
         if not config.skip_create_weights:
             self.create_weights()
 
@@ -157,6 +171,7 @@ class Attention(nn.Module):
         CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
@@ -182,6 +197,17 @@ class Attention(nn.Module):
                 q = self.qk_norm(q)
                 k = self.qk_norm(k)
             qkv = torch.concat([q, k, v], dim=-1)
+
+        if lora_params is not None:
+            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
+                                              self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
+
+            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
+                                           self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
 
         if is_fused_qkv:
             if self.pos_embd_params is None and position_ids is not None:
@@ -216,6 +242,11 @@ class Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
+        if lora_params is not None:
+            attn_lora_output = self.o_lora(attn_output, lora_params,
+                                           self.layer_idx)
+            if attn_lora_output is not None:
+                attn_output = attn_output + attn_lora_output
 
         return attn_output
 
