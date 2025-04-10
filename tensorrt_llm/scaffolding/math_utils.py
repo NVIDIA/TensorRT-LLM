@@ -3,15 +3,17 @@ from collections import Counter
 from typing import List
 
 
-def extract_answer(string: str,
-                   extract_from_boxed: bool = True,
-                   extract_regex: str = r"The final answer is (.+)$"):
+def extract_answer_with_regex(string: str,
+                              extract_regex: str = r"The final answer is (.+)$"
+                              ):
+    match = re.search(extract_regex, string)
+    if match:
+        return match.group(1)
+    return None
+
+
+def extract_answer_from_boxed(string: str):
     """Extract Answer String from \\boxed expression or based on regex"""
-    if not extract_from_boxed:
-        match = re.search(extract_regex, string)
-        if match:
-            return match.group(1)
-        return None
 
     if "\\boxed" not in string:
         return None
@@ -72,12 +74,13 @@ def get_majority_result(
 def get_digit_majority_vote_result(results: List[str]) -> str:
 
     def is_digit(result: str):
-        extracted_answer = extract_answer(result)
+        extracted_answer = extract_answer_from_boxed(result)
         if extracted_answer is None:
             return False
         return extracted_answer.isdigit()
 
-    vote_result = get_majority_result(results,
-                                      result_extractor=extract_answer,
-                                      result_validator=is_digit)[0]
+    vote_result = get_majority_result(
+        results,
+        result_extractor=extract_answer_from_boxed,
+        result_validator=is_digit)[0]
     return vote_result if vote_result else results[0]

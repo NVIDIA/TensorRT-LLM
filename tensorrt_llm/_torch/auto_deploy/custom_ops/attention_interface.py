@@ -6,6 +6,7 @@ object-oriented interface to the high-level runtime via the SequenceInfo datacla
 is also responsible for functionalizing information about the sequence and pass it on the the
 various attention interface. The AttentionDescriptor is the main interface to the attention operator
 and operates on a purely functional paradigm that is compatible with the torch custom op system.
+
 """
 
 from abc import ABC, abstractmethod
@@ -47,11 +48,14 @@ class AttentionInfo:
 
     num_heads: int
     num_kv_heads: int
-    head_dim: int
+    head_dim: int  # embedding size of each head
     dtype: torch.dtype
 
     cache_config: CacheConfig
     pos_embd_config: PositionalEmbeddingConfig
+    # rope_dim represents embedding size of decoupled q/k that carry rope information
+    # when rope_dim != 0 the decoupled q/k tensor carrying rope information is the last part of the tensor [-rope_dim: ]
+    rope_dim: Optional[int] = 0
 
 
 @dataclass
@@ -121,7 +125,9 @@ class SequenceInfo:
             self.page_size = self.max_seq_len
         if self.max_num_tokens < 1:
             self.max_num_tokens = self.max_batch_size * self.max_seq_len
-        total_tokens = self.max_batch_size * self.page_size
+        # if the provided max_num_tokens is less than the max_batch_size * max_seq_len,
+        # we use the provided max_num_tokens to calculate the number of pages
+        total_tokens = min(self.max_num_tokens, self.max_batch_size * self.max_seq_len)
         self._num_pages = (total_tokens) // self.page_size + (total_tokens % self.page_size > 0)
         self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
@@ -191,6 +197,12 @@ class SequenceInfo:
     def num_pages(self) -> int:
         return self._num_pages
 
+    @num_pages.setter
+    def num_pages(self, value):
+        self._num_pages = value
+        # update the cache_loc tensor
+        self.cache_loc.resize_(value)
+
     @property
     def is_paged(self) -> bool:
         return self.page_size < self.max_seq_len
@@ -228,7 +240,7 @@ class SequenceInfo:
             Here b <= b_cudagraph. We want to make sure that the seq_len is one-padded to
             b_cudagraph.
 
-            # TODO (lliebenwein): I could see one possible issue with this approach in the future.
+            # TODO: I could see one possible issue with this approach in the future.
             # If we have b < b_cudagraph we now one-pad. However, we don't pad the cache location
             # information. What could happen is that the for the padded sequences the cache location
             # tensors point to allocated pages. This could lead to a situation where we write into
@@ -306,6 +318,19 @@ class SequenceInfo:
         self.nest_sequences(input_ids)
         self.input_ids = input_ids
 
+    def _set_max_num_tokens_sample(self) -> None:
+        """Set an example sequence with max_num_tokens."""
+        self.reset()
+        seq_len = self.max_num_tokens // self.max_batch_size
+        input_ids = torch.ones(
+            self.max_batch_size,
+            seq_len,
+            dtype=torch.int,
+            device=self.device,
+        )
+        self.pages_per_seq.fill_(seq_len // self.page_size)
+        self.nest_sequences(input_ids)
+
     def _set_generate_only_batch(self) -> None:
         """Set an example sequence for generate-only batch."""
         self.reset()
@@ -319,16 +344,14 @@ class SequenceInfo:
         # set new sequence lengths
         seq_lens = [len(ids) for ids in input_ids]
         self.seq_len.zero_()
-        self.seq_len[: len(seq_lens)] = torch.tensor(seq_lens, device=self.device)
+        self.seq_len[: len(seq_lens)].copy_(torch.tensor(seq_lens), non_blocking=True)
 
         # set new input_ids as new tensor from flattened input_ids
         ids_tnsr_list = [
-            lst.detach().to(self.device)
-            if isinstance(lst, torch.Tensor)
-            else torch.tensor(lst, dtype=torch.int, device=self.device)
+            lst.detach() if isinstance(lst, torch.Tensor) else torch.tensor(lst, dtype=torch.int)
             for lst in input_ids
         ]
-        self.input_ids = torch.cat(ids_tnsr_list, dim=0)
+        self.input_ids = torch.cat(ids_tnsr_list, dim=0).to(self.device)
 
         # set derivative properties
         self._sequence_lengths = seq_lens
@@ -362,10 +385,10 @@ class SequenceInfo:
         cache_loc_flat = torch.tensor(
             [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
         )
-        self.cache_loc[: len(cache_loc_flat)] = cache_loc_flat.to(self.device)
+        self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
         pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
-        self.pages_per_seq[: len(pages_per_seq)] = pages_per_seq.to(self.device)
+        self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 
 Constant = Union[int, float, str, None]
@@ -374,10 +397,7 @@ Constant = Union[int, float, str, None]
 class MHACallable(Protocol):
     def __call__(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *metadata_and_caches: Union[torch.Tensor, Constant],
+        *qkv_metadata_and_caches: Union[torch.Tensor, Constant],
     ) -> torch.Tensor: ...
 
 
@@ -423,16 +443,14 @@ class AttentionDescriptor(ABC):
         """Return if the attention op is paged or not."""
 
     @classmethod
-    def get_attention_op(cls) -> MHACallable:
-        """Get the attention op.
+    def get_attention_op(cls) -> Tuple[MHACallable, int]:
+        """Get the attention op and the number of arguments corresponding to qkv.
 
         The attention_op should follow the below signature:
 
         ```
         def attention_op(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
+            *qkv,       # list of tensors corresponding to Q, K, V as in original op
             *metadata,  # global info about the sequences as returned by the prepare_metadata op
             *caches,    # contains layer-specific caches per provided cache initializers
             *buffers,   # global buffers used by the attention op as provided by buffer initializers
@@ -442,6 +460,9 @@ class AttentionDescriptor(ABC):
 
         **Note that the attention op should be a valid torch custom op, which comes with
         restrictions on the supported types in the signature.**
+
+        **Note that the `qkv` tuple should be consistent across both the cached attention
+        op and the op that it is replacing.**
 
         """
         raise NotImplementedError

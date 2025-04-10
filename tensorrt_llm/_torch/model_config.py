@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
+import torch
 import transformers
 
 from tensorrt_llm import logger
@@ -22,6 +23,8 @@ class ModelConfig(Generic[TConfig]):
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     skip_create_weights: bool = False
     is_generation: bool = True
+    max_num_tokens: int = 8192
+    moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
 
@@ -37,6 +40,17 @@ class ModelConfig(Generic[TConfig]):
             return True
         elif self.attn_backend == 'FLASHINFER':
             return False
+        return False
+
+    @property
+    def enable_flash_mla(self):
+        if self.attn_backend == 'TRTLLM':
+            if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(
+                    self.pretrained_config, "qk_rope_head_dim"):
+                head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
+                if head_dim == 576 and torch.cuda.get_device_capability() == (
+                        9, 0):
+                    return True
         return False
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
@@ -75,8 +89,8 @@ class ModelConfig(Generic[TConfig]):
         # Find the cache path by looking for the config.json file which should be in all
         # huggingface models
         model_dir = Path(
-            transformers.file_utils.get_file_from_repo(checkpoint_dir,
-                                                       'config.json')).parent
+            transformers.utils.hub.cached_file(checkpoint_dir,
+                                               'config.json')).parent
         quant_config = QuantConfig()
         layer_quant_config = None
         # quantized ckpt in modelopt format

@@ -13,15 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import sys
 from warnings import warn
 
 import numpy as np
 import pytest
 import torch
 from utils.util import getSMVersion
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.skipif(
@@ -56,7 +53,6 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         scale_w,
         bias=None,
         out_dtype=output_dtype,
-        userbuffers_id=-1,
     )
     # set pytorch's cublas workspace size to 32MB to be aligned with trtllm
     old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")

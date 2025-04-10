@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 import asyncio
 import copy
+import json
 import logging
+import os
 import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Union
+from typing import List, Optional, Union
 
 import aiohttp
 import uvicorn
@@ -38,11 +40,14 @@ class OpenAIDisaggServer:
         self.ctx_server_idx = 0
         self.gen_server_idx = 0
 
-        if (len(self.ctx_servers) == 0) or (len(self.gen_servers) == 0):
-            raise ValueError("At least one context server and one generation server must be provided")
+        if (len(self.gen_servers) == 0):
+            raise ValueError("At least one generation server must be provided")
+
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
+            raise ValueError("At least one context server must be provided")
 
         # Session will be initialized in lifespan
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -84,8 +89,21 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
-    async def openai_completion(self, req: CompletionRequest) -> Response:
+    async def merge_streaming_responses(self, ctx_response, gen_server, gen_req):
+        # First yield the context response if it's not None
+        if ctx_response is not None:
+            # Remove the disaggregated params from the context response
+            data = ctx_response.model_dump()
+            del data['choices'][0]['disaggregated_params']
+            data = json.dumps(data)
+            yield f"data: {data}\n\n".encode('utf-8')
 
+        # Then yield the generation responses
+        gen_response = await self.send_request(gen_server, gen_req)
+        async for chunk in gen_response.body_iterator:
+            yield chunk
+
+    async def openai_completion(self, req: CompletionRequest) -> Response:
         try:
             gen_req = copy.deepcopy(req)
             if not isinstance(req.prompt, str):
@@ -95,34 +113,50 @@ class OpenAIDisaggServer:
                 elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
                     raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
 
-            # Pick a context server
-            ctx_server = self.get_next_server(self.ctx_servers, "context")
-            logging.info("Sending request to ctx server: %s", ctx_server)
+            ctx_response = None
+            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                # Hard-code first token, ctx_request_id for testing
+                gen_req.disaggregated_params = DisaggregatedParams(request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1, encoded_opaque_state=None, draft_tokens=None)
+                # Since KV cache for prompt tokens will be uninitialized, need to ignore eos
+                gen_req.ignore_eos = True
+            else:
+                # Pick a context server
+                ctx_server = self.get_next_server(self.ctx_servers, "context")
+                logging.info("Sending request to ctx server: %s", ctx_server)
 
-            # Send request to context server
-            req.max_tokens = 1
-            req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-            # Disable streaming for context server
-            req.stream = False
-            ctx_response = await self.send_request(ctx_server, req)
+                # Send request to context server
+                req.max_tokens = 1
+                req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+                # Disable streaming for context server
+                req.stream = False
+                req.stream_options = None
+                ctx_response = await self.send_request(ctx_server, req)
 
-            #TODO: Context server should skip de-tokenization and return raw tokens
-            choices = ctx_response.choices
-            if len(choices) > 1:
-                raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
-            if choices[0].disaggregated_params is None:
-                raise ValueError("Context server did not return disaggregated params")
+                #TODO: Context server should skip de-tokenization and return raw tokens
+                choices = ctx_response.choices
+                if len(choices) > 1:
+                    raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
+                if choices[0].disaggregated_params is None:
+                    raise ValueError("Context server did not return disaggregated params")
 
-            # Append disaggregates parameters to generation request
-            gen_req.disaggregated_params = choices[0].disaggregated_params
+                # Append disaggregates parameters to generation request
+                gen_req.disaggregated_params = choices[0].disaggregated_params
+
             gen_req.disaggregated_params.request_type = "generation_only"
 
             # Pick a generation server and send request
             gen_server = self.get_next_server(self.gen_servers, "generation")
             logging.info("Sending request to gen server: %s", gen_server)
-            gen_response = await self.send_request(gen_server, gen_req)
 
-            return gen_response
+            if not gen_req.stream:
+                gen_response = await self.send_request(gen_server, gen_req)
+                return gen_response
+            else:
+                # Return a streaming response that combines both context and generation responses
+                return StreamingResponse(
+                    self.merge_streaming_responses(ctx_response, gen_server, gen_req),
+                    media_type="text/event-stream"
+                )
 
         except CppExecutorError as e:
             # If internal executor error is raised, shutdown the server
@@ -191,7 +225,9 @@ class OpenAIDisaggServer:
                     raise ValueError("Received an event-stream although request stream was False")
 
                 response_dict = await response.json()
-                response.raise_for_status()
+                if not response.ok:
+                    logging.error(f"Received failed response {response_dict}")
+                    response.raise_for_status()
                 return CompletionResponse(**response_dict)
 
     async def check_server_ready(self, server_url: str) -> bool:

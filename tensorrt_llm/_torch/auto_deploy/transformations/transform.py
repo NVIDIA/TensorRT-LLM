@@ -1,16 +1,20 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+import gc
+
+import torch
 from torch.fx import GraphModule
 
 from ..compile import compile_and_capture
 from ..custom_ops.attention_interface import AttentionRegistry
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
-from ..shim.interface import CachedSequenceInterface
+from ..shim.interface import AutoDeployConfig, CachedSequenceInterface
 from ..utils.logger import ad_logger
 from ._graph import move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    check_in_out_nodes,
     column_row_shard,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
@@ -19,8 +23,10 @@ from .library import (
     fuse_moe,
     identify_and_fuse_mha,
     insert_mha_with_kv_cache,
+    insert_mla_with_kv_cache,
     match_moe_pattern,
     quantize,
+    resize_kv_cache,
 )
 
 
@@ -28,18 +34,26 @@ class InferenceOptimizer:
     def __init__(
         self,
         factory: ModelFactory,
-        *,  # TODO (lliebenwein): temporary until we have a better config system
-        attn_backend: str,
-        compile_backend: str,
+        *,  # TODO: temporary until we have a better config system
+        ad_config: AutoDeployConfig,
         visualize: bool = False,
     ):
         self.factory = factory
-        self.attn_backend = attn_backend
+        self.attn_backend = ad_config.attn_backend
+        self.mla_backend = ad_config.mla_backend
+        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
+        # and torch compile so we can follow the PyTorchConfig here and enable it separately.
+        self.ad_config = ad_config
+        if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
+            compile_backend = "torch-opt"
+        else:
+            compile_backend = "torch-simple"
         self.compile_backend = compile_backend
         self.visualize = visualize
 
         # look up attention op
         self.attention_op = AttentionRegistry.get(self.attn_backend)
+        self.mla_op = AttentionRegistry.get(self.mla_backend)
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -87,8 +101,17 @@ class InferenceOptimizer:
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
 
+        input_node = check_in_out_nodes(egm)
+
         # insert MHA with KV cache
-        egm = insert_mha_with_kv_cache(egm, cm, self.attention_op, self.factory.get_cache_config())
+        egm = insert_mha_with_kv_cache(
+            egm, cm, self.attention_op, self.factory.get_cache_config(), input_node
+        )
+
+        # insert MLA with KV cache
+        egm = insert_mla_with_kv_cache(
+            egm, cm, self.mla_op, self.factory.get_cache_config(), input_node
+        )
 
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)
@@ -103,6 +126,7 @@ class InferenceOptimizer:
         # initialize caches, load weights, and map to correct device
         cm.initialize_caches()
 
+        # load weights
         self.factory.load_or_random_init(egm, mmap=True, map_location=cm.device)
         move_to_device(egm, cm.device)
 
@@ -136,13 +160,26 @@ class InferenceOptimizer:
                 pass
 
         ############################################################################################
+        # RESIZE CACHE
+        ############################################################################################
+        # Free memory ratio is hardcoded to 0.8 for now to ensure we have enough memory for graph capture.
+        resize_kv_cache(egm, cm, free_mem_ratio=0.8)
+
+        ############################################################################################
         # COMPILE MODEL
         ############################################################################################
 
         cm.info._set_generate_only_batch()
+        compiler_kwargs = {"cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes}
         egm_compiled = compile_and_capture(
-            egm, self.compile_backend, args=cm.args, dynamic_shapes=cm.dynamic_shapes
+            egm,
+            self.compile_backend,
+            args=cm.args,
+            dynamic_shapes=cm.dynamic_shapes,
+            compiler_kwargs=compiler_kwargs,
         )
         cm.info.reset()
 
+        torch.cuda.empty_cache()
+        gc.collect()
         return egm_compiled

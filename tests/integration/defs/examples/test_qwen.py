@@ -980,7 +980,7 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={cmodel_dir}",
         f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
-        f"--gpt_attention_plugin={dtype}", "--max_seq_len=2048",
+        f"--gpt_attention_plugin={dtype}", "--max_seq_len=4096",
         f"--max_batch_size={8}", "--use_fp8_context_fmha=disable",
         "--use_paged_context_fmha=disable"
     ]

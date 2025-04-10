@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
@@ -384,6 +385,7 @@ Executor::Impl::~Impl()
 void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mShutdown = false;
     mShutdownCalled = false;
     mIterStatsMaxIterations = executorConfig.getIterStatsMaxIterations();
@@ -1426,6 +1428,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(fetchNewRequests);
+
     // If grab requests from queue, do exchange between ranks
     auto reqWithIds = getNewReqWithIds(numActiveRequests, lowestPriorityActive);
     RequestList newRequests;
@@ -1805,7 +1808,8 @@ RequestStatsPerIteration Executor::Impl::getCurrentRequestStats(
         if (requestType == batch_manager::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY
             || requestType == batch_manager::LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
         {
-            requestStats.disServingStats = executor::DisServingRequestStats{request->getKvCacheTransferTimeMS()};
+            requestStats.disServingStats
+                = executor::DisServingRequestStats{request->getKvCacheTransferTimeMS(), request->getKvCacheSize()};
         }
     };
 

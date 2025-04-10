@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
@@ -393,6 +394,53 @@ public:
             return std::min(numReturnSequences.value(), beamWidth);
         }
         return beamWidth;
+    }
+
+    // @brief Get the beam width of a request in a given generation step `decodingIter`.
+    // @details This function is only called for network iteration part (not for decoder part) in generation phase.
+    // The return `beamWidth` could be understood as "beamWidth of the input tokens".
+    // For normal beam search (Variable-Beam-Width-Search, VBWS is disabled), it just return its member `beamWidth`.
+    // For VBWS, it get beam width by indexing proper value in its member `beamWidthArray`.
+    // For example, we have a request with beamWidthArray = [2,3,4], the generation process can be like:
+    // input_ids --->
+    // ---> [Forward, step == 0] ---> logits[1, 1, vocabSize]   // Context Phase, forward process uses beamWidth = 1
+    // ---> [BeamSearchDecoder] ---> tokens[1, 2]               // Decoder uses beamWidth = 2
+    // ---> [Forward, step == 1] ---> logits[1, 2, vocabSize]   // decodingIter=1, beamWidth = beamWidthArray[0] = 2
+    // ---> [BeamSearchDecoder] ---> tokens[1, 3]               // Decoder changes beamWidth to 3
+    // ---> [Forward, step == 2] ---> logits[1, 3, vocabSize]   // decodingIter=2, beamWidth = beamWidthArray[1] = 3
+    // ---> [BeamSearchDecoder] ---> tokens[1, 4]               // Decoder changes beamWidth to 4
+    // ---> [Forward, step == 3] ---> logits[1, 3, vocabSize]   // decodingIter=2, beamWidth = beamWidthArray[2] = 4
+    // ...                                                      // Both forward process and decoder use beamWidth = 4
+    SizeType32 getBeamWidthByIter(int const decodingIter, int const indexSC = 0) const noexcept
+    {
+        SizeType32 reqBeamWidth = this->beamWidth; // For non-Variable-Beam-Width-Search
+        auto const& beamWidthArray = this->beamWidthArray;
+        if (beamWidthArray.has_value())
+        {
+            TLLM_CHECK_WITH_INFO(decodingIter > 0, "getBeamWidthByIter should only be called in generation phase.");
+            // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
+            int const index
+                = std::min(decodingIter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1;
+            reqBeamWidth = beamWidthArray.value()[indexSC][index];
+        }
+        return reqBeamWidth;
+    }
+
+    // Get the maximum beam width of a whole SamplingConfig
+    SizeType32 getMaxBeamWidth() const noexcept
+    {
+        SizeType32 maxBeamWidth = this->beamWidth; // For non-Variable-Beam-Width-Search
+        auto const& beamWidthArray = this->beamWidthArray;
+        if (beamWidthArray.has_value())
+        {
+            for (size_t indexSC = 0; indexSC < beamWidthArray->size(); ++indexSC)
+            {
+                auto const& array = beamWidthArray.value()[indexSC];
+                auto arrayMax = *std::max_element(array.begin(), array.end());
+                maxBeamWidth = std::max(maxBeamWidth, arrayMax);
+            }
+        }
+        return maxBeamWidth;
     }
 };
 

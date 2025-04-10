@@ -1,19 +1,15 @@
 import json
-import os
 import pickle
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
 from tensorrt_llm.mapping import Mapping
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 
 def test_quant_mode():
@@ -583,3 +579,21 @@ def test_KvCache_events_binding():
 
     del stream
     torch.cuda.empty_cache()
+
+
+def test_ReqIdsSet_pickle():
+    ids = _tb.internal.batch_manager.ReqIdsSet()
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids.insert(0)
+    ids.insert(1)
+    ids.insert(2)
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids1.erase(0)
+    ids2 = _tb.internal.batch_manager.ReqIdsSet()
+    ids2.insert(1)
+    ids2.insert(2)
+    assert ids1 == ids2

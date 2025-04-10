@@ -55,7 +55,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_accuracy.py::TestGpt2CnnDailymail::test_auto_dtype"
+pytest "accuracy/test_cli_flow.py::TestGpt2CnnDailymail::test_auto_dtype"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
@@ -145,7 +145,7 @@ The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_ge
 In `integration/test_lists/test-db`, cases with prefix `unittest/` are treated as unit test bridges. Each of them generates an instance of `test_unittests_v2` which executes a `pytest` subprocess in `tests/unittest` directory.
 The entire line will be passed as commandline arguments of `pytest` subprocess.
 
-For example, `unittest/attention/test_gpt_attention.py -k "partition0"` is equivalent to `cd tests; pytest unittest/attention/test_gpt_attention.py -k "partition0"`.
+For example, `unittest/trt/attention/test_gpt_attention.py -k "partition0"` is equivalent to `cd tests; pytest unittest/trt/attention/test_gpt_attention.py -k "partition0"`.
 
 New unit tests can be added to CI as follows:
 
@@ -212,5 +212,6 @@ test_cpp.py::test_model[eagle-86]
 3. Invoke `pytest` with TRT-LLM custom option `--test-list`:
 
 ```shell
-pytest integration --test-list="a10_list.txt"
+cd tests/integration/defs
+pytest . --test-list="a10_list.txt" --output-dir=/tmp/llm_integration_test
 ```

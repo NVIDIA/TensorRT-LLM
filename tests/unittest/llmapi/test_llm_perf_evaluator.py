@@ -9,7 +9,7 @@ from tensorrt_llm.llmapi._perf_evaluator import (LLMPerfEvaluator,
                                                  MemoryContinuousMonitorThread)
 
 # isort: off
-from test_llm import llama_model_path
+from .test_llm import llama_model_path
 from utils.util import force_ampere
 # isort: on
 

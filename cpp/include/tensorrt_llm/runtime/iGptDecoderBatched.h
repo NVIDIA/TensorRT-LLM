@@ -35,6 +35,10 @@ class LlmRequest;
 
 namespace tensorrt_llm::runtime
 {
+namespace decoder
+{
+class DecoderState;
+}
 
 namespace decoder_batch
 {
@@ -58,46 +62,33 @@ public:
     {
     }
 
-    // mandatory parameters
-    std::vector<TensorPtr>
-        logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
-
-    // control activity of decoder slots in batch
+    //! Mandatory parameters
+    //! [batchSize][1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
+    std::vector<TensorPtr> logits;
+    //! Control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
-    TensorPtr
-        batchSlots; // [maxTokensPerEngineStep, batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
-    TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
+    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep, batchSize]
+    TensorPtr batchSlots;
+    //! Filled with slots in request order, [batchSize]
+    TensorPtr batchSlotsRequestOrder;
 
-    // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
-                                // within one beam for beam search, on gpu
-    std::vector<std::vector<TensorPtr>>
-        predictedDraftLogits;   // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    //! For beam search
+    //! Indices into KV cache of different rays within one beam
+    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    std::vector<std::vector<TensorPtr>> predictedDraftLogits;
 
-    // explicit draft tokens data.
+    //! Explicit draft tokens data
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
     std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
 
-    // eagle data
+    //! Eagle data
     std::optional<EagleBuffers::EngineOutputs> eagleInputs;
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
 using Output = decoder::Output;
 
-// used just as a container for easy returning / passing to function
-class DecoderFinishedEvent
-{
-public:
-    explicit DecoderFinishedEvent(CudaEvent&& event, std::vector<bool> const& active)
-        : event(std::move(event))
-        , active(active)
-    {
-    }
-
-    CudaEvent event;
-    std::vector<bool> active;
-};
 } // namespace decoder_batch
 
 //! GPT decoder class with support for in-flight batching
@@ -108,7 +99,6 @@ public:
     using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = std::shared_ptr<ITensor>;
-    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
     //! @brief Setup the decoder before calling `forward()`
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -118,20 +108,18 @@ public:
         = 0;
 
     //! @brief Disable Lookahead decoding.
-    virtual void disableLookahead(
-        SizeType32 maxBatchSize, RequestVector const& genRequests, TensorPtr const& batchSlots)
-        = 0;
+    virtual void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
-    virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
+    virtual CudaEvent forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
     //! @brief Run one step for all requests and wait for completion on the host.
     virtual void forward(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
 
     //! @brief Gather final beam search results for request `batchIdx`.
     //! Result will only be available after event returned
-    [[nodiscard]] virtual CudaEvent finalize(
-        SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const
+    [[nodiscard]] virtual CudaEvent finalize(decoder::DecoderState const& decoderState, SizeType32 batchSlot,
+        SamplingConfig const& samplingConfig, bool streaming) const
         = 0;
 
 protected:

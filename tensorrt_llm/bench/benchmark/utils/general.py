@@ -7,7 +7,6 @@ from random import choices, shuffle
 from typing import Dict, List, Tuple, Union
 
 import yaml
-from torch.cuda import device_count
 
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
@@ -98,7 +97,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
         "ep_size": params.get("ep"),
-        "gpus_per_node": device_count()
     }
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):
@@ -144,6 +142,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "enable_overlap_scheduler": True,
         "kv_cache_dtype": kv_cache_dtype,
     }
+    backend = params.get("backend", "pytorch")
 
     return {
         "sw_version": version("tensorrt_llm"),
@@ -154,7 +153,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "chunking": False,
         },
         "world_config": world_config,
-        "backend": "pytorch",
+        "backend": backend,
         "decoding_config": {},
         "performance_options": {
             "cuda_graphs": True,

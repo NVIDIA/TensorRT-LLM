@@ -283,8 +283,8 @@ def trtllm_bench_prolog(
     if llm_models is None:
         return
 
-    model_path = model_subdir if skip_engine_build else Path(
-        llm_models, model_subdir).absolute()
+    model_path = Path(llm_models, model_subdir).absolute()
+    engine_path = None
     quant_name = quant if quant is not None else "FP16"
     stream_mode = "streaming" if streaming else "non-streaming"
     benchmark_name = f"trtllm-bench-sanity-{quant_name}-{stream_mode}"
@@ -294,6 +294,8 @@ def trtllm_bench_prolog(
     work_dir = Path(tempfile.TemporaryDirectory().name
                     ) if skip_engine_build else Path(engine_dir)
     dataset_path = Path(work_dir, f"{benchmark_name}.txt")
+    # Clean up an existing directory if it exists
+    shutil.rmtree(work_dir, ignore_errors=True)
     # Generate a small dataset to run a test.
     work_dir.mkdir(parents=True)
     dataset_output = llm_venv.run_cmd(
@@ -320,29 +322,25 @@ def trtllm_bench_prolog(
     with open(dataset_path, "w") as dataset:
         dataset.write(dataset_output)
 
-    if skip_engine_build:
-        return dataset_path
+    if not skip_engine_build:
+        build_cmd = \
+            f"trtllm-bench " \
+            f"--model {model_name} " \
+            f"--model_path {model_path} " \
+            f"--workspace {work_dir} " \
+            f"build --tp_size 1"
 
-    build_cmd = \
-        f"trtllm-bench " \
-        f"--model {model_name} " \
-        f"--model_path {model_path} " \
-        f"--workspace {work_dir} " \
-        f"build --tp_size 1"
+        if quant is not None:
+            build_cmd = f"{build_cmd} --quantization {quant}"
 
-    if quant is not None:
-        build_cmd = f"{build_cmd} --quantization {quant}"
+        build_cmd = f"{build_cmd} --dataset {dataset_path}"
+        build_output = check_output(build_cmd, shell=True)
 
-    build_cmd = f"{build_cmd} --dataset {dataset_path}"
-    build_output = check_output(build_cmd, shell=True)
+        for line in build_output.split("\n")[::-1]:
+            if line.startswith("ENGINE SAVED:"):
+                engine_path = Path(line.split(":")[1])
+                break
 
-    engine_path = None
-    for line in build_output.split("\n")[::-1]:
-        if line.startswith("ENGINE SAVED:"):
-            engine_path = Path(line.split(":")[1])
-            break
-
-    assert engine_path is not None
     return model_path, engine_path, dataset_path
 
 
@@ -447,22 +445,43 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
     '''
     sanity check on latency benchmark for LLM API with PyTorch backend
     '''
-    dataset_path = trtllm_bench_prolog(llm_root,
-                                       llm_venv,
-                                       None,
-                                       llama_model_root,
-                                       model_name,
-                                       False,
-                                       False,
-                                       skip_engine_build=True)
+    model_path, _, dataset_path = trtllm_bench_prolog(llm_root,
+                                                      llm_venv,
+                                                      None,
+                                                      llama_model_root,
+                                                      model_name,
+                                                      False,
+                                                      False,
+                                                      skip_engine_build=True)
 
     benchmark_cmd = \
-        f"trtllm-bench --model {model_name} --model_path {llama_model_root} " \
+        f"trtllm-bench --model {model_name} --model_path {model_path} " \
         f"throughput " \
         f"--dataset {dataset_path} --backend 'pytorch'"
 
     if use_extra_config:
         benchmark_cmd += f" --extra_llm_api_options {temp_extra_llm_api_options_file}"
+
+    check_call(benchmark_cmd, shell=True)
+
+
+def test_trtllm_bench_mgmn(llm_root, llm_venv):
+    model_name = "meta-llama/Llama-3.1-8B"
+    llama_model_dir = Path(
+        llm_models_root()) / "llama-3.1-model/Llama-3.1-8B-Instruct"
+    dataset_path = trtllm_bench_prolog(llm_root,
+                                       llm_venv,
+                                       engine_dir=None,
+                                       model_subdir=llama_model_dir,
+                                       model_name=model_name,
+                                       quant=None,
+                                       streaming=False,
+                                       skip_engine_build=True)
+    benchmark_cmd = \
+        f"mpirun -n 2 trtllm-llmapi-launch trtllm-bench --model {model_name} " \
+        f"--model_path {llama_model_dir} " \
+        f"throughput " \
+        f"--dataset {dataset_path} --backend pytorch --tp 2"
 
     check_call(benchmark_cmd, shell=True)
 
@@ -547,11 +566,79 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
     if concurrency:
         benchmark_cmd += " --concurrency 100"
 
+    print(f"cmd: {benchmark_cmd}")
+
     if request_rate and concurrency:
         # negative test, request rate and concurrency should not be turned on at the same time
         check_call_negative_test(benchmark_cmd, shell=True)
     else:
         check_call(benchmark_cmd, shell=True)
+
+
+@pytest.mark.parametrize("model_subdir", [
+    "llama-3.1-model/Meta-Llama-3.1-8B",
+],
+                         ids=lambda x: x.strip("-"))
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "meta-llama/Llama-3.1-8B",
+    ],
+)
+@pytest.mark.parametrize("streaming", [True, False],
+                         ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize("backend", [None, "pytorch"], ids=["TRT", "PyTorch"])
+def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
+                                    model_subdir, streaming, backend):
+    '''
+    Test the iteration log functionality with necessary options
+    '''
+    iteration_log = None
+    engine_dir = None
+
+    try:
+        skip_engine_build = backend is not None
+        iteration_log = tempfile.mkstemp(dir="/tmp", suffix=".txt")[1]
+        if not skip_engine_build:
+            engine_dir = tempfile.mkdtemp(dir="/tmp")
+
+        model_path, engine_path, dataset_path = trtllm_bench_prolog(
+            llm_root,
+            llm_venv,
+            engine_dir,
+            model_subdir,
+            model_name,
+            quant=None,
+            skip_engine_build=skip_engine_build,
+            streaming=streaming)
+
+        benchmark_cmd = \
+            f"trtllm-bench --model {model_path} throughput " \
+            f"--dataset {dataset_path} --iteration_log {iteration_log}"
+
+        if streaming:
+            benchmark_cmd += " --streaming"
+
+        if skip_engine_build:
+            assert engine_path is None, "Engine path should be None"
+            benchmark_cmd += f" --backend {backend}"
+        else:
+            assert engine_path is not None, "Engine path should not be None"
+            benchmark_cmd += f" --engine_dir {engine_path}"
+
+        check_call(benchmark_cmd, shell=True)
+
+        assert os.path.exists(
+            iteration_log
+        ), f"Iteration log file {iteration_log} was not created."
+        if os.path.getsize(iteration_log) == 0:
+            raise AssertionError(
+                f"Iteration log file {iteration_log} is empty.")
+    finally:
+        if iteration_log:
+            shutil.rmtree(iteration_log, ignore_errors=True)
+        if engine_dir:
+            shutil.rmtree(engine_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("model_name", [
@@ -628,7 +715,7 @@ def test_benchmark_sanity_enable_fp8(llm_root, llm_venv, model_name,
 
 
 def test_chatglm_6b_sanity(chatglm_6b_example_root, llm_venv, cmodel_dir,
-                           engine_dir, update_transformers):
+                           engine_dir):
     llm_models = llm_models_root()
 
     # skip when llm_models_root is None
@@ -1002,7 +1089,6 @@ def test_llmapi_load_engine_from_build_command_with_lora(
 ])
 def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    from tensorrt_llm._utils import release_gc
     from tensorrt_llm.llmapi import LLM
     from tensorrt_llm.llmapi.llm_utils import BuildConfig
     llama_example_root = os.path.join(llm_root, "examples", model_name)
@@ -1061,8 +1147,6 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
             llm_api_engine_cfg["build_config"]).to_dict()
 
     assert build_cmd_cfg == build_llmapi_cfg
-    del LLM
-    release_gc()
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
@@ -1128,14 +1212,19 @@ def test_llmapi_server_example(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_llm_server.py")])
 
 
+def test_trtllm_serve_example(llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_example.py")])
+
+
 def test_openai_misc_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_misc.py")])
 
 
 def test_openai_completions_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
         ["-m", "pytest",
@@ -1143,7 +1232,6 @@ def test_openai_completions_example(llm_root, llm_venv):
 
 
 def test_openai_chat_example(llm_root, llm_venv):
-    # Test for the examples/apps/openai_server.py
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1157,7 +1245,6 @@ def test_openai_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1174,7 +1261,6 @@ def test_openai_multi_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_consistent_chat(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1191,7 +1277,6 @@ def test_openai_consistent_chat(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1209,7 +1294,6 @@ def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
-    "Test for the examples/apps/openai_server.py"
     example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1419,10 +1503,34 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         str(example_root / "quickstart_advanced.py"),
         "--enable_overlap_scheduler",
         "--use_cuda_graph",
-        "--mtp_nextn",
+        "--spec_decode_nextn",
         "1",  # test 1 MTP module
+        "--spec_decode_algo",
+        "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    ("Llama-3.1-8b-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct",
+     "EAGLE3-LLaMA3.1-Instruct-8B"),
+])
+def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
+                                        model_path, eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--spec_decode_nextn",
+        "4",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--eagle_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--kv_cache_enable_block_reuse",
     ])
 
 
@@ -1498,6 +1606,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
+    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
@@ -1597,6 +1706,31 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ],
             ],
         },
+        "qwen2.5-vl-7b-instruct": {
+            "image":
+            [[
+                "The image depicts a dramatic and moody natural environment, featuring a large wave breaking on the shore. The sky is overcast with dark, heavy clouds, suggesting an impending storm or a generally stormy weather condition. The ocean appears turbulent, with the wave creating a frothy white crest as it crashes. The overall atmosphere",
+                "The image depicts a dramatic and moody seascape. The sky is filled with dark, heavy clouds, suggesting an overcast or stormy weather condition. The ocean is turbulent, with large waves crashing and creating white foam, indicating strong winds and possibly rough seas. The overall atmosphere is one of intensity and natural power"
+            ],
+             [
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground curves gently, and there are trees on either",
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground is empty, and the trees on either side",
+                 "The image features a large, prominent rock formation, likely Half Dome, which is a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground is empty, and the trees on either side of",
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground curves gently, and there are trees on both",
+                 "The image features a large, iconic granite rock formation, which appears to be Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The foreground shows a paved road curving around the base of the",
+             ],
+             [
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus in the right lane, a police car in the middle lane, and a few other vehicles scattered across the lanes. The traffic seems to be",
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident."
+             ]],
+            "video":
+            [[
+                "The video depicts a woman walking down a vibrant, neon-lit street at night. She is dressed in a stylish outfit, featuring a black leather jacket, a red dress, and red boots. She carries a small handbag and wears large sunglasses. The street is wet, reflecting the colorful lights from the surrounding buildings,",
+            ],
+             [
+                 "The video shows a rotating Earth at night. The illuminated areas represent cities and populated regions, with lights visible in various parts of the world. The Earth is depicted with a dark blue ocean and a lighter blue landmass, and the night sky is black. The rotation of the Earth is smooth, giving a sense of continuous",
+             ]],
+        },
     }
 
     cmd = [
@@ -1611,8 +1745,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["media"],
     ]
     # NOTE
-    # Qwen2-VL model need larger max_num_tokens.
-    if model_name == "qwen2-vl-7b-instruct" and modality == "video":
+    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
+    if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
+                      ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -1682,12 +1817,10 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("model_name,model_path", [
     ("BertForSequenceClassification", "bert/bert-base-uncased-yelp-polarity"),
 ])
-def test_ptp_quickstart_bert(llm_root,
-                             llm_venv,
-                             model_name,
-                             model_path,
-                             backend='VANILLA'):
-    print(f"Testing {model_name}.")
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
+                             backend):
+    print(f"Testing {model_name} with {backend} backend.")
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 

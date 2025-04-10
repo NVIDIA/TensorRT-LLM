@@ -129,7 +129,10 @@ class MTPSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
         # update batch indeices
-        batch_indices = torch.arange(num_seqs, dtype=torch.int, device='cpu')
+        batch_indices = torch.arange(num_seqs,
+                                     dtype=torch.int,
+                                     device='cpu',
+                                     pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # MTP module need different number of input tokens in generation phase
@@ -153,10 +156,14 @@ class MTPSpecMetadata(SpecMetadata):
                     mtp_past_tokens_pool[slot_id].data_ptr())
                 mtp_slot_ids.append(slot_id)
             mtp_hidden_states_ptrs = torch.tensor(mtp_hidden_states_ptrs,
-                                                  dtype=torch.int64)
+                                                  dtype=torch.int64,
+                                                  pin_memory=True)
             mtp_past_tokens_ptrs = torch.tensor(mtp_past_tokens_ptrs,
-                                                dtype=torch.int64)
-            mtp_slot_ids = torch.tensor(mtp_slot_ids, dtype=torch.int)
+                                                dtype=torch.int64,
+                                                pin_memory=True)
+            mtp_slot_ids = torch.tensor(mtp_slot_ids,
+                                        dtype=torch.int,
+                                        pin_memory=True)
 
             self.mtp_hidden_states_ptrs[:num_seqs].copy_(mtp_hidden_states_ptrs,
                                                          non_blocking=True)
@@ -208,6 +215,7 @@ class MTPDecoder(TorchDecoder):
                     should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
+                request.py_decoding_iter += 1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -228,6 +236,7 @@ class MTPDecoder(TorchDecoder):
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
+                request.py_decoding_iter += 1
             idx += 1
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
@@ -918,6 +927,7 @@ class MTPEagleWorker(MTPWorker):
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
 
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -967,6 +977,14 @@ class MTPEagleWorker(MTPWorker):
                 attn_metadata.host_request_types[:attn_metadata.
                                                  num_contexts].fill_(1)
                 attn_metadata.num_contexts = 0
+                if i == 0 and num_contexts > 0 and attn_metadata.enable_flash_mla:
+                    reorder_block_ids_per_seq = torch.cat([
+                        attn_metadata.
+                        kv_block_ids_per_seq[num_contexts:batch_size],
+                        attn_metadata.kv_block_ids_per_seq[:num_contexts]
+                    ])
+                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                        reorder_block_ids_per_seq, non_blocking=True)
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
@@ -984,6 +1002,7 @@ class MTPEagleWorker(MTPWorker):
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
             attn_metadata.num_contexts = num_contexts
+            attn_metadata.num_generations = num_generations
             attn_metadata._seq_lens[:batch_size].copy_(seq_len)
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()

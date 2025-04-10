@@ -1,19 +1,15 @@
 import asyncio
 import os
 import re
-import sys
 import time
 
 import openai
 import pytest
 import torch
-from openai_server import RemoteOpenAIServer
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from test_llm import get_model_path, prompts
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from utils.util import skip_num_gpus_less_than, skip_nvlink_inactive
+
+from ..test_llm import get_model_path, prompts
+from .openai_server import RemoteOpenAIServer
 
 RANK = os.environ.get("SLURM_PROCID", 0)
 MESSAGES = [{
