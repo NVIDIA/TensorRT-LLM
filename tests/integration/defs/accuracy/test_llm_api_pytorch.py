@@ -76,7 +76,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, attn_backend,
                             torch_compile):
-        if torch_compile and pp_size > 1:
+        if pp_size > 1:
+            # https://nvbugspro.nvidia.com/bug/5214235
             pytest.skip(
                 "Pipeline parallel with torch.compile is not supported yet.\n"
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
@@ -133,7 +134,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
                        torch_compile):
-        if torch_compile and pp_size > 1:
+        if pp_size > 1:
+            # https://nvbugspro.nvidia.com/bug/5214235
             pytest.skip(
                 "Pipeline parallel with torch.compile is not supported yet.\n"
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "

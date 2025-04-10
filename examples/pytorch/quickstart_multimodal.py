@@ -105,6 +105,7 @@ MODEL_TYPE_MAP = {
     "llava_llama": prepare_vila,
     "llava_next": prepare_llava_next,
     "qwen2_vl": prepare_qwen2_vl,
+    "qwen2_5_vl": prepare_qwen2_vl,
 }
 
 
