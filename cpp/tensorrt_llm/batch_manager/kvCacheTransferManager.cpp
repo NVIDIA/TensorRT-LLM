@@ -160,7 +160,7 @@ void KVCacheTransferManager::copyBlock(
     std::vector<KVCacheBlockPool> const& pools,
     bool isOffload,
     int numTokensToCopy,
-    KVCacheTransferMode mode)
+    KVCacheTransferMode mode = KVCacheTransferMode::DRAM)
 {
     // Based on PR #3209 feedback, I'm replacing raw printf with TLLM_LOG_* macros
     // and also switching from the old boolean approach to an enum (KVCacheTransferMode).
@@ -278,7 +278,6 @@ void KVCacheTransferManager::copyBlock(
             continue;
         }
 
-        // I replaced the memset with a modern brace-init per the review suggestions in PR #3209.
         CUfileDescr_t cufileDesc = {};
         cufileDesc.type          = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         cufileDesc.handle.fd     = fd;
@@ -288,7 +287,6 @@ void KVCacheTransferManager::copyBlock(
 
         if (status.err == CU_FILE_SUCCESS)
         {
-            // If cuFile is successful, I log a debug message.
             TLLM_LOG_DEBUG("GDS: Using cuFile for %s", filename.c_str());
             ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
 
