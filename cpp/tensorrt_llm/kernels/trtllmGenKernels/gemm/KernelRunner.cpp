@@ -52,7 +52,8 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(tg::Dtype eltType, tg::Dtype outputType
     mGemmConfig = &configs[selectedIndex[0]];
 }
 
-size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k) const
+size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(
+    int32_t m, int32_t n, int32_t k, tg::Dtype eltType, tg::Dtype outputType) const
 {
     gemm::GemmData gemmData;
     gemmData.mProblemDimensions.mM = m;

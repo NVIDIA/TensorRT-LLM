@@ -33,7 +33,8 @@ class TrtllmGenGemmRunner
 public:
     explicit TrtllmGenGemmRunner(tg::Dtype eltType, tg::Dtype outputType);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k) const;
+    [[nodiscard]] size_t getWorkspaceSizeInBytes(
+        int32_t m, int32_t n, int32_t k, tg::Dtype eltType, tg::Dtype outputType) const;
 
     void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b, float const* bScale,
         void* c, float* cScale, void* workspace, CUstream stream, int device);

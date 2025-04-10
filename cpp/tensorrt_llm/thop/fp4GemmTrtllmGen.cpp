@@ -39,7 +39,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(eltType, out_dtype);
 
-    int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(m, n, k);
+    int64_t const numBytesWorkspace = runner.getWorkspaceSizeInBytes(m, n, k, eltType, out_dtype);
     at::Tensor workspace
         = at::detail::empty_cuda({numBytesWorkspace}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
 
