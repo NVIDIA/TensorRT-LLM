@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import abstractmethod
+from contextlib import contextmanager
 from typing import Iterable, List, Optional, Tuple, Union
 
 import click
@@ -77,13 +78,37 @@ class LmEvalEvaluator(Evaluator):
     def __init__(self,
                  task_name: str,
                  dataset_path: str = None,
-                 num_samples: int = None,
+                 num_samples: Optional[int] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
-        super().__init__(apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
-        self.task_dict = lm_eval.tasks.get_task_dict(task_name)
+        if system_prompt is not None:
+            raise NotImplementedError("lm-eval does not support system_prompt.")
+        super().__init__(random_seed=random_seed,
+                         apply_chat_template=apply_chat_template)
+        self.dataset_path = dataset_path
+        self.num_samples = num_samples
+        with self._patch_lm_eval():
+            self.task_dict = lm_eval.tasks.get_task_dict(task_name)
+
+    @contextmanager
+    def _patch_lm_eval(self):
+        if self.dataset_path is None:
+            yield
+            return
+
+        self._task_config_post_init = lm_eval.api.task.TaskConfig.__post_init__
+
+        def _patched(task_config, *args, **kwargs):
+            task_config.dataset_path = self.dataset_path
+            self._task_config_post_init(task_config, *args, **kwargs)
+
+        lm_eval.api.task.TaskConfig.__post_init__ = _patched
+
+        try:
+            yield
+        finally:
+            lm_eval.api.task.TaskConfig.__post_init__ = self._task_config_post_init
 
     def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()
@@ -99,10 +124,12 @@ class LmEvalEvaluator(Evaluator):
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None) -> float:
-        results = lm_eval.evaluate(
-            lm=LmEvalWrapper(llm),
-            task_dict=self.task_dict,
-        )
+        if sampling_params is not None:
+            raise NotImplementedError("lm-eval handles sampling internally.")
+        results = lm_eval.evaluate(lm=LmEvalWrapper(llm),
+                                   task_dict=self.task_dict,
+                                   limit=self.num_samples,
+                                   apply_chat_template=self.apply_chat_template)
         logger.info(f"Lm eval results:\n{lm_eval.utils.make_table(results)}")
         return self.get_score(results)
 
@@ -123,14 +150,14 @@ class GSM8K(LmEvalEvaluator):
                          system_prompt=system_prompt)
 
     def get_score(self, results: dict):
-        return results["results"]["gsm8k"]["exact_match,strict-match"]
+        return results["results"]["gsm8k"]["exact_match,strict-match"] * 100
 
     @click.command("gsm8k")
     @click.option("--dataset_path", type=str, default=None)
     @click.option("--num_samples", type=int, default=None)
     @click.option("--random_seed", type=int, default=0)
     @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=15)
+    @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
