@@ -58,8 +58,7 @@ class ZeroMqQueue:
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
 
-
-        # Check HMAC key
+        # Check HMAC key condition
         if self.use_hmac_encryption and self.is_server and self.hmac_key is not None:
             raise ValueError("Server should not receive HMAC key when encryption is enabled")
         elif self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
@@ -83,30 +82,14 @@ class ZeroMqQueue:
                 self.hmac_key = os.urandom(32)
             
             self.address = (self.address_endpoint, self.hmac_key)
-        
-        self.verbose = False
-
-        if self.verbose: # for debugging
-            logger.debug(f"In ZeroMqQueue init, HMAC key: {self.hmac_key}")
-            logger.debug(f"In ZeroMqQueue init, self.name: {self.name}")
 
     def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
         """Verify the HMAC of received pickle data."""
         expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
-        if self.verbose: # for debugging
-            logger.debug("in _verify_hmac")
-            logger.debug(f"Data: {data}")
-            logger.debug(f"HMAC key: {self.hmac_key}")
-            logger.debug(f"Expected HMAC: {expected_hmac}")
-            logger.debug(f"Actual HMAC: {actual_hmac}")
         return hmac.compare_digest(expected_hmac, actual_hmac)
 
     def _sign_data(self, data_before_encoding: bytes) -> bytes:
         """Generate HMAC for data."""
-        if self.verbose: # for debugging
-            logger.debug("in _sign_data")
-            logger.debug(f"Signing data: {data_before_encoding}")
-            logger.debug(f"HMAC key: {self.hmac_key}")
         hmac_signature = hmac.new(self.hmac_key, data_before_encoding, hashlib.sha256).digest()
         return data_before_encoding + hmac_signature
 
@@ -207,7 +190,7 @@ class ZeroMqQueue:
             
             # Verify HMAC
             if not self._verify_hmac(data, actual_hmac):
-                raise ValueError("HMAC verification failed")
+                raise RuntimeError("HMAC verification failed")
                 
             obj = pickle.loads(data)
         else:
@@ -241,7 +224,7 @@ class ZeroMqQueue:
             
             # Verify HMAC
             if not self._verify_hmac(data, actual_hmac):
-                raise ValueError("HMAC verification failed")
+                raise RuntimeError("HMAC verification failed")
             
             obj = pickle.loads(data)
         else:
