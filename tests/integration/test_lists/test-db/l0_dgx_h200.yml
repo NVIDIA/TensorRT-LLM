@@ -15,4 +15,3 @@ l0_dgx_h200:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/multi_gpu
-  
