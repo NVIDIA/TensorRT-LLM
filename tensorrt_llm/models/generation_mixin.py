@@ -277,7 +277,7 @@ class GenerationMixin:
         local_attn_layers = [i for i in layers_range if i in attn_layer_idx]
         # number of attention layers local to previous pp ranks
         num_attn_layers_lower_ranks = attn_layer_idx.index(local_attn_layers[0])
-        num_attn_layers_prev_rank = num_attn_layers_lower_ranks // self.mapping.pp_rank if self.mapping.pp_rank != 0 else len(
+        num_attn_layers_prev_rank = num_attn_layers_lower_ranks // mapping.pp_rank if mapping.pp_rank != 0 else len(
             layers_range)
         past_key_value = []
         kv_cache_block_offsets = None
