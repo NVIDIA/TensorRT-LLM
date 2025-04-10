@@ -95,6 +95,7 @@ l0_l40s:
   - accuracy/test_cli_flow.py::TestQwen1_5MoeA2_7BChat::test_weight_only
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] # 10 mins
   - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1]
+  # - examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] #4 mins
   - examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
