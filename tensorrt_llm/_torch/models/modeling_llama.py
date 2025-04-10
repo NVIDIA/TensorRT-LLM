@@ -72,10 +72,6 @@ class LlamaAttention(Attention):
             pos_embd_params = None
 
         attn_scale = is_nope_layer and config.attn_temperature_tuning > 0
-        # For NOPE layers (like in Llama4), the position_ids needs to be set to None when attn_scale is disabled.
-        # so that the rotary embedding will be applied in the Llama4MoE layer.
-        if is_nope_layer and not attn_scale:
-            pass
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -207,6 +203,9 @@ class LlamaDecoderLayer(DecoderLayer):
         self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
 
         self.is_llama4 = config.model_type == "llama4_text"
+        self.is_nope_layer = False
+        if self.is_llama4:
+            self.is_nope_layer = config.no_rope_layers[layer_idx] == 0
 
         self.self_attn = LlamaAttention(
             model_config,
@@ -294,6 +293,11 @@ class LlamaDecoderLayer(DecoderLayer):
 
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
+
+        # Self Attention
+        # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
+        if self.is_nope_layer and not self.self_attn.attn_scale:
+            position_ids = None
 
         hidden_states = self.self_attn(
             position_ids=position_ids,
