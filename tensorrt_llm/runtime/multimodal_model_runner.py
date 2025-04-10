@@ -357,8 +357,13 @@ class MultimodalModelRunner:
         self.stream = torch.cuda.Stream(torch.cuda.current_device())
         torch.cuda.set_stream(self.stream)
 
-        if self.args.ptable_offloading is None:
-            self.args.ptable_offloading = self.args.enable_chunked_context
+        if self.args.mm_embedding_offloading is None:
+            self.args.mm_embedding_offloading = self.args.enable_chunked_context
+        elif self.args.mm_embedding_offloading and not self.args.enable_chunked_context:
+            logger.warning(
+                "mm_embedding_offloading requires enable_chunked_context to be True. Setting mm_embedding_offloading to None."
+            )
+            self.args.mm_embedding_offloading = None
 
         # parse model type from visual engine config
         with open(os.path.join(self.visual_engine_dir, "config.json"),
@@ -791,6 +796,7 @@ class MultimodalModelRunner:
                     kv_cache_free_gpu_memory_fraction,
                     cross_kv_cache_fraction=cross_kv_cache_fraction,
                     multi_block_mode=self.args.multi_block_mode,
+                    mm_embedding_offloading=self.args.mm_embedding_offloading,
                 )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
@@ -1394,7 +1400,7 @@ class MultimodalModelRunner:
                 lora_uids=self.args.lora_task_uids,
                 output_sequence_lengths=False,
                 return_dict=False,
-                ptable_offloading=self.args.ptable_offloading)
+                mm_embedding_offloading=self.args.mm_embedding_offloading)
         elif self.model_type == "mllama":
             # When image is passed:
             # the shape of visual_features is [bs, 1, 4, 1025, hidden_size]
@@ -1586,7 +1592,7 @@ class MultimodalModelRunner:
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
 
-        if self.args.ptable_offloading:
+        if self.args.mm_embedding_offloading:
             # Allocate pinned memory with same shape and dtype
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
@@ -2059,7 +2065,7 @@ class MultimodalModelRunner:
                 prompt_table = prompt_table.cuda().to(
                     dtype=str_dtype_to_torch(self.model_config.dtype))
             else:
-                if self.args.ptable_offloading:
+                if self.args.mm_embedding_offloading:
                     prompt_table = prompt_table.pin_memory().to(
                         dtype=self.model.dtype)
                 else:

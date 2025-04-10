@@ -361,12 +361,12 @@ private:
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
 
-    void prefetchPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
+    void prefetchNextPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
 
-    void processPromptTableChunk(
+    void remapInputTokensForPromptTable(
         std::shared_ptr<LlmRequest> const& llmReq, bool isCurrentChunk, SizeType32 bufferId, SizeType32 contextId);
 
-    void prefetchPromptTableChunkToGpu(std::shared_ptr<LlmRequest> const& llmReq,
+    void copyPromptTableToGpuInChunk(std::shared_ptr<LlmRequest> const& llmReq,
         std::vector<int32_t> const& outOfVocabTokens, bool useCurrentBuffer, SizeType32 bufferId, SizeType32 contextId);
 
 protected:
@@ -509,7 +509,7 @@ private:
     // Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
     // Whether the context is chunked
-    bool mIsChunkedContext;
+    bool mPromptTableOffloading;
 
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.

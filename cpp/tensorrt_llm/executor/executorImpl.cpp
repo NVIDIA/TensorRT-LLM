@@ -401,6 +401,7 @@ void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
     mIsSchedulerGuaranteedNoEvict = (executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy()
         == CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT);
     mIsChunkedContext = executorConfig.getEnableChunkedContext();
+    mPromptTableOffloading = executorConfig.getPromptTableOffloading();
     mMaxQueueSize = executorConfig.getMaxQueueSize();
 
     mLastReqId = 1;
