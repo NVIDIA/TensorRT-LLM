@@ -183,12 +183,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             data = queue.get()
         except:
-            logger.error(
+            logger.debug(
                 "proxy.py: Error in _iteration_result_task: queue.get()")
             return False
 
         if data is None:
-            logger.error("proxy.py: _iteration_result_task: data is None")
+            logger.debug("proxy.py: _iteration_result_task: data is None")
             return False  # shutdown the thread
 
         data = data if isinstance(data, list) else [data]
@@ -201,7 +201,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             for d in data:
                 if d is None:
-                    logger.error("proxy.py: _iteration_result_task: d is None")
+                    logger.debug("proxy.py: _iteration_result_task: d is None")
                     return False
 
                 if isinstance(queue, _SyncQueue):
@@ -219,7 +219,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # and therefore event loop can already be closed.
             logger.debug("proxy.py: EventLoopShutdownError")
         except Exception as e:
-            logger.error(f"proxy.py: Error in _iteration_result_task: {e}")
+            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
             raise e
 
         return True  # success
