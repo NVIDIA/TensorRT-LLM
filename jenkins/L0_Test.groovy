@@ -1370,9 +1370,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             }
 
             if (checkPipStage) {
-                pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
-                    stage("Prerequisites") {
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
@@ -1381,8 +1378,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade pip || true")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --upgrade 'setuptools' || true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                     }
