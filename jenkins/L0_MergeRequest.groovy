@@ -862,12 +862,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast)
 
                         echo "trigger SBSA test job, params: ${parameters}"
 
-                    def status = triggerJob(
-                        "L0_Test-SBSA",
-                        parameters,
-                        jenkinsUrl,
-                        credentials,
-                    )
+                        def status = triggerJob(
+                            "L0_Test-SBSA",
+                            parameters,
+                            jenkinsUrl,
+                            credentials,
+                        )
 
                         if (status != "SUCCESS") {
                             error "Downstream job did not succeed"
