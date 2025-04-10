@@ -19,6 +19,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import (Gemma2ConfigGroup,
+                                                Gemma3ConfigGroup,
                                                 PretrainedConfig, QuantConfig)
 
 if TYPE_CHECKING:
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 GEMMA_ARCHITECTURE = "GemmaForCausalLM"
 GEMMA2_ARCHITECTURE = "Gemma2ForCausalLM"
+GEMMA3_ARCHITECTURE = "Gemma3ForCausalLM"
 
 
 class GemmaConfig(PretrainedConfig):
@@ -48,6 +50,9 @@ class GemmaConfig(PretrainedConfig):
         final_logit_softcapping: Optional[float] = None,
         attn_logit_softcapping: Optional[float] = None,
         mapping: Optional[Union[Mapping, dict]] = None,
+        sliding_window_pattern: int = None,
+        rope_local_base_freq: int = None,
+        sliding_window: int = None,
         **kwargs,
     ):
         use_parallel_embedding = False
@@ -79,23 +84,29 @@ class GemmaConfig(PretrainedConfig):
         self.mlp_bias = mlp_bias
 
         self.inter_layernorms = False
-        if self.is_gemma_2:
+        if self.is_gemma_2 or self.is_gemma_3:
             self.inter_layernorms = True
-            assert query_pre_attn_scalar is not None, "Gemma2 models must configure `query_pre_attn_scalar`"
+            assert query_pre_attn_scalar is not None, "Gemma2 / Gemma3 models must configure `query_pre_attn_scalar`"
             self.query_pre_attn_scalar = query_pre_attn_scalar
             self.final_logit_softcapping = final_logit_softcapping
-            self.attn_logit_softcapping = attn_logit_softcapping
+            if self.is_gemma_2:
+                self.attn_logit_softcapping = attn_logit_softcapping
+            if self.is_gemma_3:
+                self.sliding_window_pattern = sliding_window_pattern
+                self.rope_local_base_freq = rope_local_base_freq
+                self.sliding_window = sliding_window
 
     GEMMA_ADDED_FIELDS = {
         "rotary_base", "rotary_scaling", "attn_bias", "mlp_bias",
         "inter_layernorms"
     }
     GEMMA2_ADDED_FIELDS = Gemma2ConfigGroup.keys()
+    GEMMA3_ADDED_FIELDS = Gemma3ConfigGroup.keys()
     VERBATIM = {
         "num_hidden_layers", "num_attention_heads", "hidden_size",
         "intermediate_size", "vocab_size", "max_position_embeddings",
         "hidden_act", "use_parallel_embedding"
-    } | GEMMA2_ADDED_FIELDS
+    } | GEMMA2_ADDED_FIELDS | GEMMA3_ADDED_FIELDS
 
     @property
     def is_gemma_2(self) -> bool:
@@ -104,6 +115,15 @@ class GemmaConfig(PretrainedConfig):
     def gemma2_config(self):
         if self.is_gemma_2:
             return self.get_config_group(Gemma2ConfigGroup)
+        return None
+
+    @property
+    def is_gemma_3(self) -> bool:
+        return self.architecture == GEMMA3_ARCHITECTURE
+
+    def gemma3_config(self):
+        if self.is_gemma_3:
+            return self.get_config_group(Gemma3ConfigGroup)
         return None
 
     def to_dict(self):
@@ -118,7 +138,11 @@ class GemmaConfig(PretrainedConfig):
             **({
                 f: getattr(self, f)
                 for f in self.GEMMA2_ADDED_FIELDS
-            } if self.is_gemma_2 else {})
+            } if self.is_gemma_2 else {}),
+            **({
+                f: getattr(self, f)
+                for f in self.GEMMA3_ADDED_FIELDS
+            } if self.is_gemma_3 else {})
         }
 
     @classmethod
@@ -148,6 +172,7 @@ class GemmaConfig(PretrainedConfig):
             norm_epsilon=hf_config.rms_norm_eps,
             num_key_value_heads=getattr(hf_config, "num_key_value_heads",
                                         hf_config.num_attention_heads),
+            rotary_base=getattr(hf_config, "rope_theta", 10000.0),
             rotary_scaling=getattr(hf_config, "rotary_scaling", None),
             quantization=quant_config,
             mapping=mapping,
