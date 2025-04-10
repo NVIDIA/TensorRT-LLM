@@ -285,7 +285,7 @@ private:
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
         ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
+    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent, SizeType32 vocabId = 0);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -302,7 +302,7 @@ private:
     /// @brief Copies the content of the cache indirection outputs to the cache indirection inputs.
     /// @param[in] scheduledRequests The requests to copy the cache indirections for.
     /// @param[in] genBufferId The id of the generation buffers for those requests.
-    void copyCacheIndirectionFromOutputsToInputs(ScheduledRequests const& scheduledRequests, SizeType32 genBufferId);
+    void copyCacheIndirectionFromOutputsToInputs(ScheduledRequests const& scheduledRequests, SizeType32 genBufferId, SizeType32 vocabId);
 
     [[nodiscard]] bool getGatherGenerationLogits() const override
     {
@@ -400,6 +400,16 @@ protected:
 
     SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const override;
 
+    [[nodiscard]] SizeType32 getNumVocabs() const
+    {
+        return mModelConfig.getNumVocabs();
+    }
+
+    [[nodiscard]] SizeType32 getVocabSize() const
+    {
+        return mModelConfig.getVocabSize();
+    }
+
 private:
     /******************** Configs ********************/
     // Parameters of the model (TRT engine)
@@ -422,8 +432,8 @@ private:
     std::shared_ptr<nvinfer1::ILogger> mLogger;
     // Runner for the TRT engine. The engine produces logits.
     std::shared_ptr<runtime::TllmRuntime> mRuntime;
-    // Decoder that generates new tokens from the logits.
-    std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
+    // Decoders that generates new tokens from the logits.
+    std::vector<std::shared_ptr<runtime::GptDecoderBatched>> mDecoders;
     // Synchronization handles for decoder
     std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 
@@ -496,14 +506,14 @@ private:
     // Decoder buffers for each micro batch.
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
     // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::shared_ptr<DecoderBuffers> mDecoderBuffers;
+    std::vector<std::shared_ptr<DecoderBuffers>> mDecoderBuffers;
     // Buffers for each slot in the decoder
     std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
     // Decoder input for each micro batch.
-    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
-    std::unique_ptr<runtime::decoder_batch::Output> mDecodingOutput;
+    std::vector<std::vector<std::unique_ptr<runtime::decoder_batch::Input>>> mDecodingInputs;
+    std::vector<std::unique_ptr<runtime::decoder_batch::Output>> mDecodingOutput;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch

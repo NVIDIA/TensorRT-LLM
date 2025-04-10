@@ -40,6 +40,7 @@ class LLaMAConfig(PretrainedConfig):
                  attention_multiplier: float = 1.0,
                  residual_multiplier: float = 1.0,
                  output_multiplier_scale: float = 1.0,
+                 num_vocabs: int = 8,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -68,6 +69,7 @@ class LLaMAConfig(PretrainedConfig):
         self.attention_multiplier = attention_multiplier
         self.residual_multiplier = residual_multiplier
         self.output_multiplier_scale = output_multiplier_scale
+        self.num_vocabs = num_vocabs
         self.has_partial_lora_mask = False
 
         super().__init__(**kwargs)
@@ -88,6 +90,7 @@ class LLaMAConfig(PretrainedConfig):
         output['use_last_layernorm'] = self.use_last_layernorm
         output['layer_idx_offset'] = self.layer_idx_offset
         output['moe'] = self.moe.to_dict()
+        output['num_vocabs'] = self.num_vocabs
         return output
 
     @classmethod

@@ -111,6 +111,8 @@ class Embedding(Module):
     def postprocess(self, tllm_key, weights, **kwargs):
         if weights is None:
             return {}
+        if isinstance(weights, Sequence):
+            weights = torch.vstack(weights)
         weights = weights.to(str_dtype_to_torch(self.dtype))
         return {tllm_key: weights}
 

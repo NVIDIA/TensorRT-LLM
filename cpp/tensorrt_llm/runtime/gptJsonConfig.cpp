@@ -193,6 +193,7 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
     auto const vocabSize = config.at("vocab_size").template get<SizeType32>();
     auto const hiddenSize = config.at("hidden_size").template get<SizeType32>() / tensorParallelism;
     auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
+    auto const numVocabs = parseJsonFieldOptional<SizeType32>(config, "num_vocabs");
 
     // Logits datatype
     auto const logitsDtypeStr = parseJsonFieldOr(config, "logits_dtype", std::string("float32"));
@@ -212,7 +213,7 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
     auto numKvHeadsPerCrossAttentionLayer = parseJsonFieldOr<std::vector<SizeType32>>(
         config, "num_kv_heads_per_cross_attn_layer", std::vector<SizeType32>());
     auto modelConfig
-        = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType};
+        = ModelConfig{vocabSize, numLayers, numAttentionLayers, numRnnLayers, numHeads, hiddenSize, dataType, numVocabs};
 
     if (!numKvHeadsPerAttentionLayer.empty())
     {

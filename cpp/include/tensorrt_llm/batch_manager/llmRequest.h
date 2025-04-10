@@ -127,9 +127,10 @@ public:
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
+	SizeType32 numVocabs = 8)
         : mRequestId(requestId)
-        , mPromptLen(inputTokens->size())
+        , mPromptLen(inputTokens->size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
@@ -180,6 +181,7 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
+	, mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -207,9 +209,9 @@ public:
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt, SizeType32 numVocabs = 8)
         : mRequestId(requestId)
-        , mPromptLen(inputTokens.size())
+        , mPromptLen(inputTokens.size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
@@ -247,6 +249,7 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
+	, mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value())
         {
@@ -258,7 +261,7 @@ public:
     // 29 items in initialization list
     GenericLlmRequest(RequestIdType requestId, executor::Request const& req)
         : mRequestId(requestId)
-        , mPromptLen(req.getInputTokenIds().size())
+        , mPromptLen(req.getInputTokenIds().size() / req.getNumVocabs())
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
         , mEndId(req.getEndId())
@@ -286,6 +289,7 @@ public:
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
+	, mNumVocabs(req.getNumVocabs())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -481,6 +485,14 @@ public:
         return *static_cast<executor::DataTransceiverState const*>(mContextPhaseParams.value().getState());
     }
 
+    /// @brief Get number of vocabs for this multi vocab sampling
+    /// @param
+    /// @return  The number of vocabs
+    [[nodiscard]] SizeType32 getNumVocabs() const
+    {
+        return mNumVocabs;
+    }
+
     [[nodiscard]] std::shared_ptr<ContextProgress> const& getContextProgress() const noexcept
     {
         return mContextProgress;
@@ -496,7 +508,7 @@ public:
     /// @return  The number of tokens
     [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
-        return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
+        return mTokens.at(beam).size() / getNumVocabs() - mNumPreDecodedTokens[beam];
     }
 
     /// @brief Get number of return sequences for this req.
@@ -793,9 +805,9 @@ public:
             for (std::size_t beam = 0; beam < mTokens.size(); ++beam)
             {
                 auto& beamTokens = mTokens.at(beam);
-                beamTokens.resize(newPromptLen);
+                beamTokens.resize(newPromptLen * mNumVocabs);
                 auto& beamUniqueTokens = mUniqueTokens.at(beam);
-                beamUniqueTokens.resize(newPromptLen);
+                beamUniqueTokens.resize(newPromptLen * mNumVocabs);
 
                 if (returnLogProbs())
                 {
@@ -1897,6 +1909,7 @@ protected:
     std::shared_ptr<std::vector<bool>> mSequenceFinalVec;
 
     std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
+    SizeType32 mNumVocabs; 
 
     // Performance metrics.
     bool mReturnPerfMetrics{false};

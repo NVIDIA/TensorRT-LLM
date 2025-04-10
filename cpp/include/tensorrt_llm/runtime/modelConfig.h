@@ -100,7 +100,7 @@ public:
     };
 
     explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
-        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype)
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype, SizeType32 numVocabs = 8)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
@@ -141,6 +141,7 @@ public:
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
         , mNumLanguages(0)
+	, mNumVocabs{numVocabs}
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -156,6 +157,11 @@ public:
     [[nodiscard]] SizeType32 constexpr getVocabSize() const noexcept
     {
         return mVocabSize;
+    }
+
+    [[nodiscard]] SizeType32 getNumVocabs() const
+    {
+	return mNumVocabs;
     }
 
     [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
@@ -931,6 +937,7 @@ private:
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
     bool mSkipCrossAttnBlocks;
+    SizeType32 mNumVocabs;
 
     // Language adapter info
     std::optional<SizeType32> mNumLanguages;

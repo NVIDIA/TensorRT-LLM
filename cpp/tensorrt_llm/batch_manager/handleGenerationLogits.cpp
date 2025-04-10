@@ -75,7 +75,7 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 
 void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector const& generationRequests,
     DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, BufferManager const& manager,
-    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers) const
+    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers, SizeType32 vocabId) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
@@ -99,6 +99,8 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
+
+        SizeType32 vocabSize = modelConfig.getVocabSize();
         auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
         auto const logitsViewShape = logitsView->getShape();
         if (reqBeamWidth > 1)
@@ -108,8 +110,15 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         }
         else
         {
-            decoderLogits
-                = ITensor::view(logitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
+            auto curVocablogitsView = logitsView;
+            if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
+            {
+                curVocablogitsView = ITensor::slice(logitsView, {0, vocabId * vocabSize}, vocabSize); // [vocabSize,]
+                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSize}));
+            }
+            logitsViewShape = curVocablogitsView->getShape();
+            decoderLogits = ITensor::view(
+                curVocablogitsView, ITensor::makeShape({logitsViewShape.d[0], 1, logitsViewShape.d[1]}));
         }
 
         if (llmReq->getReturnGenerationLogits())
@@ -137,6 +146,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
             TLLM_CHECK(genRuntimeBuffers);
+            // speculative decoding is not supported for numVocabs > 1
             auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
             setupMedusaLogits(medusaLogitsHeads, genRuntimeBuffers->medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex, draftLength);

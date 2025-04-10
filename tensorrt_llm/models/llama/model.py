@@ -21,7 +21,7 @@ from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                            allgather, concat, constant, div, non_gated_version,
-                           recv, send, unsqueeze)
+                           recv, send, unsqueeze, shape, sum, view)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
@@ -313,6 +313,7 @@ class LLaMAModel(Module):
         self.vocab_size = config.vocab_size
         self.has_partial_lora_mask = config.has_partial_lora_mask
         self.hidden_size = config.hidden_size
+        self.num_vocabs = config.num_vocabs
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
@@ -338,7 +339,7 @@ class LLaMAModel(Module):
                                     dtype=config.dtype)
 
     def forward(self,
-                input_ids,
+                input_ids,  # seqlen x num_vocabs
                 position_ids=None,
                 use_cache=False,
                 attention_mask=None,
@@ -357,9 +358,19 @@ class LLaMAModel(Module):
         ] if prompt_embedding_table is not None else []
 
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            hidden_states = self.vocab_embedding(input_ids, *ptuning_args)  # seqlen x num_vocabs x hidden_size
+            hidden_states = view(
+                hidden_states,
+                concat([shape(hidden_states, 0) / self.num_vocabs, self.num_vocabs, -1])
+            )  # shape [totalSeqLen, nVocab, embDim]
+            # TODO: for debug pick the very first sampled token, ignore rest
+            # in the future:
+            # hidden_states = sum(hidden_states, 1, keepdim=False)
+            # shape [totalSeqLen, embDim]
+            hidden_states = hidden_states[:, 0, :]
             hidden_states *= self.embedding_multiplier
         else:
+            # TODO: not supported for multi-vocab yet
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
             if default_net().plugin_config.pp_reduce_scatter:
                 hidden_states = allgather(hidden_states,

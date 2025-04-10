@@ -35,13 +35,12 @@ std::tuple<ITensor::SharedPtr, std::vector<decoder_batch::Request>, std::vector<
 GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
     BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
-    OptionalRef<RuntimeBuffers const> buffers) const
+    OptionalRef<RuntimeBuffers const> buffers, SizeType32 vocabId) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(GenerateRequestOptions);
 
     SizeType32 batchSize{0};
-    unsigned decoderInputSize{0};
     if (!contextRequests.empty())
     {
         for (auto const& llmReq : contextRequests)
@@ -49,13 +48,13 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             auto const& reqTokens = llmReq->getTokens(0);
             if (llmReq->isLastContextChunk())
             {
-                decoderInputSize += reqTokens.size();
                 ++batchSize;
             }
         }
     }
-    inputBuffers.inputsIds->resize(decoderInputSize);
 
+    // TODO: these are requests for sampling, do we need to multiply by num vocabs here?
+    SizeType32 numVocabs = modelConfig.getNumVocabs();
     TensorPtr batchSlotsView = runtime::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
     auto batchSlotsRange = BufferRange<SizeType32>(*batchSlotsView);
     std::vector<decoder_batch::Request> decoderRequests;
@@ -72,10 +71,30 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             continue;
         }
 
-        auto const promptLen = llmReq->getPromptLen();
+        // TODO: before slicing, we need to transpose, but why, if there is one decoder request per vocab?
+        auto& inputIds = inputBuffers.inputsIds;
+        TensorPtr inputIdsFlatView = ITensor::view(inputBuffers.inputsIds);
+        auto const numTokens = inputIdsFlatView->getShape().d[0] / numVocabs;
+        TLLM_CHECK(inputIdsFlatView->getShape().d[0] % numVocabs == 0);
+        if (numVocabs > 1) {
+            inputIdsFlatView = ITensor::view(inputIds, ITensor::makeShape({numTokens, numVocabs}));
+            auto inputIdsTransposed
+                = bufferManager.gpu(ITensor::makeShape({numVocabs, numTokens}), inputBuffers.inputsIds->getDataType());
+            runtime::kernels::invokeTranspose(*inputIdsTransposed, *inputIdsFlatView, bufferManager.getStream());
+            inputIdsFlatView = std::move(inputIdsTransposed);
+        } else {
+            inputIdsFlatView = ITensor::view(inputIdsFlatView, ITensor::makeShape({numVocabs, numTokens}));
+        }
+
+        // TODO: not sure about promptLen here, it 
+        auto const promptLen = llmReq->getPromptLen() * numVocabs;
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
-        TensorPtr inputView = ITensor::slice(inputBuffers.inputsIds, inputOffset, promptLen);
+        TensorPtr inputView = ITensor::slice(inputIdsFlatView, ITensor::makeShape({vocabId, inputOffset}), promptLen);
+        if (numVocabs > 1) {
+            runtime::kernels::invokeAdd<TokenIdType>(
+                *inputView, -modelConfig.getVocabSize() * vocabId, bufferManager.getStream()); // restore original input ids
+        }
         bufferManager.copy(reqTokens.data(), *inputView);
 
         auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
@@ -97,6 +116,7 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             }
             else
             {
+                // TODO: should this be changed?
                 decoderRequest.generatedTokensPerEngineStep = 1;
             }
         }
@@ -145,6 +165,7 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
                 = bufferManager.copyFrom(*llmReq->getStopWordsList().value(), MemoryType::kGPU);
             decoderRequest.stopWordsList->squeeze(0);
         }
+        // TODO: is this correct?
         batchSlotsRange[batchIdx] = llmReq->mSeqSlot.value();
         decoderRequests.push_back(decoderRequest);
         samplingConfigs.push_back(llmReq->mSamplingConfig);

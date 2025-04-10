@@ -166,7 +166,7 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     seqSlotRemappingDevice->reshape(numRequestsShape);
 
     auto const numTokens = getNumTokens();
-    inputsIds->reshape(ITensor::makeShape({numTokens}));
+    inputsIds->reshape(ITensor::makeShape({numTokens * modelConfig.getNumVocabs()}));
 
     if (modelConfig.useMrope())
     {
@@ -523,7 +523,11 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto const contextChunkSize = llmReq->getContextChunkSize();
             auto const beginCompute = llmReq->getContextCurrentPosition();
             auto const endCompute = beginCompute + contextChunkSize;
-            inputHost.insert(inputHost.end(), reqTokens.begin() + beginCompute, reqTokens.begin() + endCompute);
+            inputHost.insert(
+                inputHost.end(),
+                reqTokens.begin() + beginCompute,
+                reqTokens.begin() + beginCompute + contextChunkSize * llmReq->getNumVocabs()
+            );
 
             logitsIdsHostPtr[totalNumLogits++] = contextChunkSize;
             numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
@@ -643,7 +647,21 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             {
                 auto const lastToken = llmReq->getLastTokens(beam);
                 auto const numTokens = llmReq->getNumTokens(beam);
-                inputHost.push_back(lastToken);
+                if (llmReq->getNumVocabs() > 1)
+                {
+                    auto const& beamTokens = llmReq->getTokens(beam);
+                    // TODO: disable for now
+                    // TLLM_CHECK_WITH_INFO(
+                    //     beamTokens.size() % llmReq->getNumVocabs() == 0, "Number of tokens needs to be a multiple of
+                    //     number of vocabs!");
+                    inputHost.insert(inputHost.end(), beamTokens.cend() - llmReq->getNumVocabs(), beamTokens.cend());
+                }
+                else
+                {
+                    inputHost.push_back(lastToken);
+                }
+
+
                 // If model updates generation position ids do not append them here.
                 if (!modelConfig.getSpeculativeDecodingMode().updatesPositionIds())
                 {

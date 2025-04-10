@@ -57,7 +57,7 @@ public:
         tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
         BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers const& inputBuffers,
-        OptionalRef<RuntimeBuffers const> buffers = std::nullopt) const;
+        OptionalRef<RuntimeBuffers const> buffers = std::nullopt, SizeType32 vocabId = 0) const;
 
 private:
     [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(tr::ModelConfig const& modelConfig,
