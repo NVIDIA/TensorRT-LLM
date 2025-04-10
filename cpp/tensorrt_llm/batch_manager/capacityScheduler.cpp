@@ -431,7 +431,7 @@ bool trySchedulingRequestMaxUtilization(std::shared_ptr<LlmRequest> const& req, 
         bool reqHasLora = req->getLoraTaskId().has_value();
         bool isNewTask = reqHasLora && !seenTaskIds.count(req->getLoraTaskId().value());
         SizeType32 numRequiredPeftPages
-            = isNewTask && (peftCacheManager ? peftCacheManager->determineNumPages(req) : 0);
+            = (isNewTask && peftCacheManager) ? peftCacheManager->determineNumPages(req) : 0;
         TLLM_LOG_DEBUG(
             "MaxUtilizationScheduler: request ID %lu required peft pages: %i", req->mRequestId, numRequiredPeftPages);
         auto const scheduledBlocksIfFitsKvCache = blocksManager.prepareNewNumberOfBlocksIfWeEndUpScheduling(*req);
