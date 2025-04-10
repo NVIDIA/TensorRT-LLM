@@ -1,4 +1,5 @@
 import operator
+from collections import defaultdict
 from typing import List
 
 import torch
@@ -7,6 +8,10 @@ from torch.fx import GraphModule
 from ...utils.logger import ad_logger
 from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
+
+# Caches for fused cosine-sine tensors and position IDs.
+_rope_flash_cache = defaultdict(lambda: None)
+_rope_position_ids = None
 
 
 def match_rope_v1(gm: GraphModule) -> GraphModule:
@@ -319,9 +324,7 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
 
         half_head_dim = head_dim // 2
         # Use cache for fused cosine-sine flash tensor
-        if not hasattr(graph, "rope_flash_cache"):
-            graph.rope_flash_cache = {}
-        cache = graph.rope_flash_cache
+        cache = _rope_flash_cache
         cache_key = (cos_node, sin_node)
         if cache_key in cache:
             fused_cos_sin = cache[cache_key]
@@ -357,6 +360,9 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
     else:
         new_q, new_k = raw_q, raw_k
 
+    new_q.meta["val"] = q_match["add_node"].meta.get("val", None)
+    new_k.meta["val"] = k_match["add_node"].meta.get("val", None)
+
     q_match["add_node"].replace_all_uses_with(new_q)
     k_match["add_node"].replace_all_uses_with(new_k)
 
@@ -390,9 +396,7 @@ def _process_rope_v2(graph, q_match, k_match):
         )
 
     # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
-    if not hasattr(graph, "rope_flash_cache"):
-        graph.rope_flash_cache = {}
-    cache = graph.rope_flash_cache
+    cache = _rope_flash_cache
     if inv_freq_node in cache:
         cos_sin_flash = cache[inv_freq_node]
     else:
@@ -419,6 +423,9 @@ def _process_rope_v2(graph, q_match, k_match):
         raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
         raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
 
+    raw_q.meta["val"] = q_match["out"].meta.get("val", None)
+    raw_k.meta["val"] = k_match["out"].meta.get("val", None)
+
     q_match["out"].replace_all_uses_with(raw_q)
     k_match["out"].replace_all_uses_with(raw_k)
 
@@ -428,8 +435,9 @@ def _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1):
     Retrieves the cached position_ids from the graph if available, or computes and caches them.
     It uses the symbolic batch and sequence sizes from q_node with the provided dimension indices.
     """
-    if hasattr(graph, "rope_position_ids"):
-        return graph.rope_position_ids
+    global _rope_position_ids
+    if _rope_position_ids is not None:
+        return _rope_position_ids
 
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
