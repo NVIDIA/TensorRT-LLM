@@ -18,6 +18,43 @@ easier for users to reproduce our officially published [performance overiew](./p
 the [this section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
 in further detail.
 
+## Before Benchmarking
+
+For rigorous benchmarking where consistent and reproducible results are critical, proper GPU configuration is essential. These settings help maximize GPU utilization, eliminate performance variability, and ensure optimal conditions for accurate measurements. While not strictly required for normal operation, we recommend applying these configurations when conducting performance comparisons or publishing benchmark results.
+
+### Persistence mode
+Ensure persistence mode is enabled to maintain consistent GPU state:
+```shell
+sudo nvidia-smi -pm 1
+```
+
+### GPU Clock Management
+Allow the GPU to dynamically adjust its clock speeds based on workload and temperature. While locking clocks at maximum frequency might seem beneficial, it can sometimes lead to thermal throttling and reduced performance. Reset GPU clocks using:
+```shell
+sudo nvidia-smi -rgc
+```
+
+### Set power limits
+First query the maximum power limit:
+```shell
+nvidia-smi -q -d POWER
+```
+Then configure the GPU to operate at its maximum power limit for consistent performance:
+```shell
+sudo nvidia-smi -pl <max_power_limit>
+```
+
+### Boost settings
+Potentially a GPU may support boost levels. First query available boost levels:
+```shell
+sudo nvidia-smi boost-slider -l
+```
+If supported, enable the boost slider using one of the available levels for maximum performance:
+```shell
+sudo nvidia-smi boost-slider --vboost <max_boost_slider>
+```
+
+
 ## Throughput Benchmarking
 
 ### Limitations and Caveats
