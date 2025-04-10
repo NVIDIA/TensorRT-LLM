@@ -3,8 +3,8 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Literal, NamedTuple, Optional,
+                    TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -31,15 +31,21 @@ __all__ = [
 ]
 
 
-@dataclass
+@dataclass(slots=True)
 class Logprob:
     """Holds logprob and vocab rank for a token."""
     logprob: float
     rank: Optional[int] = None
 
 
-# List of token_id to Logprob for prompt or generated texts
-LogprobResults = list[dict[int, Logprob]]
+# List of token_id_to_Logprob dict for prompt or generation texts
+LogprobResults: TypeAlias = list[dict[int, Logprob]]
+
+
+class AdditionalOutputs(NamedTuple):
+    """Optional log probability outputs computed post runtime."""
+    prompt_logprobs: Optional[LogprobResults] = None
+    generation_logprobs: Optional[LogprobResults] = None
 
 
 @dataclass(slots=True)
@@ -49,7 +55,7 @@ class CompletionOutput:
     Args:
         index (int): The index of the output in the request.
         text (str): The generated output text. Defaults to "".
-        token_ids (List[int], optional): The token ids of the generated output text. Defaults to None.
+        token_ids (list[int], optional): The token ids of the generated output text. Defaults to None.
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
         logprobs (LogprobResults, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
         prompt_logprobs (LogprobResults, optional): The log probabilities per prompt token. Defaults to None.
@@ -60,16 +66,16 @@ class CompletionOutput:
 
     Attributes:
         length (int): The number of generated tokens.
-        token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (List[float]): Logprobs of newly generated tokens.
+        token_ids_diff (list[int]): Newly generated token ids.
+        logprobs_diff (list[float]): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
     """
     index: int
     text: str = ""
-    token_ids: Optional[List[int]] = None
+    token_ids: Optional[list[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
-    logprobs: Optional[LogprobResults] = None
-    prompt_logprobs: Optional[LogprobResults] = None
+    logprobs: Optional[LogprobResults] = field(default_factory=list)
+    prompt_logprobs: Optional[LogprobResults] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -86,14 +92,6 @@ class CompletionOutput:
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
 
-    def __post_init__(self):
-        if self.token_ids is None:
-            self.token_ids = []
-        if self.logprobs is None:
-            self.logprobs = []
-        if self.prompt_logprobs is None:
-            self.prompt_logprobs = []
-
     @property
     def length(self) -> int:
         return len(self.token_ids)
@@ -103,11 +101,11 @@ class CompletionOutput:
         return self.text[self._last_text_len:]
 
     @property
-    def token_ids_diff(self) -> List[int]:
+    def token_ids_diff(self) -> list[int]:
         return self.token_ids[self._last_token_ids_len:]
 
     @property
-    def logprobs_diff(self) -> List[dict[int, Logprob]]:
+    def logprobs_diff(self) -> list[dict[int, Logprob]]:
         return self.logprobs[self._last_logprobs_len:]
 
 
@@ -136,7 +134,7 @@ class GenerationResultBase:
         # In Sampling mode, the Executor runtime will return best_of sequences
         # in total, which the LLM API will select the n-best sequences among
         # them based on their cumulative log probabilities.
-        self._outputs: List[CompletionOutput] = [
+        self._outputs: list[CompletionOutput] = [
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
@@ -155,7 +153,7 @@ class GenerationResultBase:
         self._params_transmitted = False
 
     @property
-    def outputs(self) -> List[CompletionOutput]:
+    def outputs(self) -> list[CompletionOutput]:
         sampling_param = self.sampling_params
         if (sampling_param.use_beam_search
                 or sampling_param.n == sampling_param.best_of):
@@ -244,10 +242,11 @@ class GenerationResultBase:
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
 
     @nvtx_range("handle_response", color="red", category="GenerationResultBase")
-    def _handle_response(self,
-                         response: Union["PostprocWorker.Output", tllm.Response,
-                                         ErrorResponse],
-                         additional_outputs: Optional[Dict[str, Any]] = None):
+    def _handle_response(
+        self,
+        response: Union["PostprocWorker.Output", tllm.Response, ErrorResponse],
+        additional_outputs: Optional[AdditionalOutputs] = None,
+    ):
 
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
@@ -295,10 +294,8 @@ class GenerationResultBase:
             # TODO: handle beam
             if additional_outputs is not None:
                 out = self._outputs[response_result.sequence_index]
-                if 'prompt_logprobs' in additional_outputs:
-                    out.prompt_logprobs = additional_outputs['prompt_logprobs']
-                if 'generation_logprobs' in additional_outputs:
-                    out.logprobs = additional_outputs['generation_logprobs']
+                out.prompt_logprobs = additional_outputs.prompt_logprobs
+                out.logprobs = additional_outputs.generation_logprobs
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -336,9 +333,11 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
     @nvtx_range("handle_response",
                 color="red",
                 category="DetokenizedGenerationResultBase")
-    def _handle_response(self,
-                         response: "GenerationExecutor.Response",
-                         additional_outputs: Optional[Dict[str, Any]] = None):
+    def _handle_response(
+        self,
+        response: "GenerationExecutor.Response",
+        additional_outputs: Optional[AdditionalOutputs] = None,
+    ):
         GenerationResultBase._handle_response(self, response,
                                               additional_outputs)
 
@@ -408,7 +407,7 @@ class GenerationResult(GenerationResultBase):
         return self._generation_request.id
 
     @property
-    def prompt_token_ids(self) -> List[int]:
+    def prompt_token_ids(self) -> list[int]:
         return self._generation_request.prompt_token_ids
 
     def abort(self) -> None:
@@ -537,7 +536,7 @@ class IterationResult:
         # should be called when new prompts are submitted
         self._done = False
 
-    def get_results(self) -> List[dict]:
+    def get_results(self) -> list[dict]:
         """
         Return all runtime results in the queue.
         """
@@ -568,19 +567,19 @@ class IterationResult:
 
 
 def compute_logprobs(
+    k_prompt_logprobs: int,
+    k_logprobs: int,
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
-    k_prompt_logprobs: int = 5,
-    k_logprobs: int = 5,
-) -> Tuple[Optional[LogprobResults], Optional[LogprobResults]]:
+) -> AdditionalOutputs:
     """
-    Compute top-K logprobs and ranks for each token position in prompt and generated texts.
+    Compute top-K logprobs and ranks for each token position.
 
     Returns:
-        Tuple of:
-            - prompt_logprobs: list of dicts {token_id -> Logprob}
-            - generation_logprobs: list of dicts {token_id -> Logprob}
+        AdditionalOutputs, a NamedTuple containing:
+            - prompt_logprobs: Optional[List[Dict[token_id, Logprob]]] for prompt tokens.
+            - generation_logprobs: Optional[List[Dict[token_id, Logprob]]] for generated tokens.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,
@@ -591,7 +590,7 @@ def compute_logprobs(
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
-        results: Logprobs = []
+        results: LogprobResults = []
         # for each token position
         for t in range(logprobs.size(0)):
             token_dict = {
@@ -614,9 +613,10 @@ def compute_logprobs(
 
     prompt_logprobs = _topk_logprobs(
         context_logits, k_prompt_logprobs,
-        None) if context_logits is not None else None
+        None) if k_prompt_logprobs and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
-        generation_logits, k_logprobs,
-        output_token_ids) if generation_logits is not None else None
+        generation_logits, k_logprobs, output_token_ids
+    ) if k_logprobs and generation_logits is not None else None
 
-    return prompt_logprobs, generation_logprobs
+    return AdditionalOutputs(prompt_logprobs=prompt_logprobs,
+                             generation_logprobs=generation_logprobs)

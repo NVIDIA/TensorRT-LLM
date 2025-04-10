@@ -426,6 +426,19 @@ class ExecutorBindingsWorker(GenerationExecutor):
         request_id = self._enqueue_request(request)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
+        # Store lobprobs-related fields from request for the later logprob calculation.
+        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+            self._await_response_helper._request_id_to_logprob_params[
+                request_id] = {
+                    "logprobs":
+                    request.sampling_params.logprobs,
+                    "prompt_logprobs":
+                    request.sampling_params.prompt_logprobs,
+                    "drop_context_logits":
+                    not request.sampling_params._need_return_context_logits,
+                    "drop_generation_logits":
+                    not request.sampling_params._need_return_generation_logits
+                }
 
         self._handle_background_error()
 
@@ -690,6 +703,10 @@ class AwaitResponseHelper:
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown
         self.enable_postprocprocess_parallel = self.worker.enable_postprocess_parallel
 
+        # mapping: runtime request_id to minimal sampling_params info
+        # that are needed for logprob calculation
+        self._request_id_to_logprob_params: dict[int, dict] = {}
+
     def responses_handler(self, responses: List[tllm.Response]):
         HandlerKind = AwaitResponseHelper.HandlerKind
 
@@ -747,16 +764,24 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            # TODO: pass in k
-            prompt_logprobs, logprobs = compute_logprobs(
-                response.result.context_logits,
-                response.result.generation_logits,
-                response.result.output_token_ids[0])  #TODO: need change
+            additional_outputs = None
+            logprob_params = self._request_id_to_logprob_params.get(
+                response.request_id)
+            if logprob_params:
+                additional_outputs = compute_logprobs(
+                    logprob_params.get("prompt_logprobs"),
+                    logprob_params.get("logprobs"),
+                    response.result.context_logits,
+                    response.result.generation_logits,
+                    response.result.output_token_ids[0])  # TODO
 
-            additional_outputs = {
-                "prompt_logprobs": prompt_logprobs,
-                "generation_logprobs": logprobs,
-            }
+                if logprob_params.get("drop_context_logits"):
+                    # TODO: drop
+                    pass
+
+                if logprob_params.get("drop_generation_logits"):
+                    # TODO: drop
+                    pass
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -817,16 +842,16 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
 
-            # TODO: pass in k
-            prompt_logprobs, logprobs = compute_logprobs(
-                response.result.context_logits,
-                response.result.generation_logits,
-                response.result.output_token_ids[0])  #TODO: need change
-
-            additional_outputs = {
-                "prompt_logprobs": prompt_logprobs,
-                "generation_logprobs": logprobs,
-            }
+            additional_outputs = None
+            logprob_params = self._request_id_to_logprob_params.get(
+                response.request_id)
+            if logprob_params:
+                additional_outputs = compute_logprobs(
+                    logprob_params.get("prompt_logprobs"),
+                    logprob_params.get("logprobs"),
+                    response.result.context_logits,
+                    response.result.generation_logits,
+                    response.result.output_token_ids[0])  #TODO: need change
 
             # TODO: need change
             _send_rsp(self.worker,

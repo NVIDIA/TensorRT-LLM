@@ -233,6 +233,8 @@ class SamplingParams:
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
+    _context_logits_auto_enabled: bool = False
+    _generation_logits_auto_enabled: bool = False
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -321,6 +323,14 @@ class SamplingParams:
         return (not self.use_beam_search
                 and (self.top_k is None or self.top_k == 1)
                 and (self.top_p is None or self.top_p == 0.0))
+
+    @property
+    def _need_return_context_logits(self) -> bool:
+        return self.prompt_logprobs and not self._context_logits_auto_enabled
+
+    @property
+    def _need_return_generation_logits(self) -> bool:
+        return self.logprobs and not self._generation_logits_auto_enabled
 
     def _setup(self,
                tokenizer,

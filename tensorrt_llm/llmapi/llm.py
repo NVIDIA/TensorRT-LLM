@@ -447,12 +447,13 @@ class LLM:
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
                 sampling_params._setup(self.tokenizer)
-            if sampling_params.prompt_logprobs:
-                # Context logits are required to compute prompt_logprobs
+            # auto enabled context and/or generation logits flags, as they are required by logprob computation.
+            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
-                # TODO: need a way to know whether to drop context logits at worker later
-            if sampling_params.logprobs:
+                sampling_params._context_logits_auto_enabled = True
+            if sampling_params.logprobs and not sampling_params.return_generation_logits:
                 sampling_params.return_generation_logits = True
+                sampling_params._generation_logits_auto_enabled = True
             return sampling_params
         else:
             raise TypeError(
