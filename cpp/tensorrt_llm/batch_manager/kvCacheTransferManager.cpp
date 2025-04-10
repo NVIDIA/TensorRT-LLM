@@ -46,15 +46,11 @@ namespace tk = tensorrt_llm::kernels;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-// Helper function to move the POSIX write logic
-// into a dedicated function, as requested in PR #3209. This removes duplication
-// and replaces malloc/free with std::vector.
 static bool gpuToFilePosix(
     tr::ITensor::SharedPtr const& srcPtr,
     std::string const& filename)
 {
 #ifdef _WIN32
-    // Windows doesn't support the same POSIX calls, so I simply log an error.
     TLLM_LOG_ERROR("POSIX fallback not supported on Windows");
     return false;
 #else
@@ -66,7 +62,6 @@ static bool gpuToFilePosix(
     }
 
     ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
-    // Using std::vector here was part of the PR #3209 requests to avoid manual memory management
     std::vector<uint8_t> hostBuffer(numBytes);
 
     cudaError_t cpyErr = cudaMemcpy(hostBuffer.data(), srcPtr->data(), numBytes, cudaMemcpyDeviceToHost);
@@ -92,8 +87,6 @@ static bool gpuToFilePosix(
 #endif
 }
 
-// Similarly, I added a dedicated helper for file->GPU IO.
-// Again, this was recommended in PR #3209 to unify the logic and reduce duplication.
 static bool fileToGpuPosix(
     tr::ITensor::SharedPtr const& dstPtr,
     std::string const& filename)
@@ -110,7 +103,6 @@ static bool fileToGpuPosix(
     }
 
     ssize_t numBytes = static_cast<ssize_t>(dstPtr->getSizeInBytes());
-    // Per PR #3209, I replaced manual memory allocation with a vector.
     std::vector<uint8_t> hostBuffer(numBytes);
 
     ssize_t bytesRead = ::read(fd, hostBuffer.data(), numBytes);
@@ -162,8 +154,6 @@ void KVCacheTransferManager::copyBlock(
     int numTokensToCopy,
     KVCacheTransferMode mode = KVCacheTransferMode::DRAM)
 {
-    // Based on PR #3209 feedback, I'm replacing raw printf with TLLM_LOG_* macros
-    // and also switching from the old boolean approach to an enum (KVCacheTransferMode).
     TLLM_LOG_DEBUG(
         "copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d",
         src->getBlockId(),
@@ -171,9 +161,6 @@ void KVCacheTransferManager::copyBlock(
         (isOffload ? "true" : "false"),
         static_cast<int>(mode));
     
-    // If mode == 0 => DRAM-based copy (CPU <-> GPU).
-    // If mode == 1 => GDS attempts, fallback to POSIX.
-    // If mode == 2 => forced POSIX fallback.
 
     if (mode == KVCacheTransferMode::DRAM)
     {
@@ -204,8 +191,6 @@ void KVCacheTransferManager::copyBlock(
                 }
                 else
                 {
-                    // Otherwise, do a partial copy. This logic was part of the
-                    // original partial-copy PR, I'm only changing the logs here.
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
                     int const numLayers   = pools[poolIdx].numLayers;
                     int const numHeads    = pools[poolIdx].numKvHeads;
@@ -217,8 +202,6 @@ void KVCacheTransferManager::copyBlock(
                         "Expected KVCache block to have 4 dims, got %d",
                         shape.nbDims);
 
-                    // My partial copy kernel is in kvCachePartialCopy. 
-                    // That logic is unchanged, just the logging is updated.
                     tk::kvCacheBlockPartialCopy(
                         *dstPtr, *srcPtr,
                         numLayers, numHeads, tokensPerBlock, sizePerHead,
@@ -234,22 +217,17 @@ void KVCacheTransferManager::copyBlock(
 
 
 #ifndef _WIN32
-    // On Linux, we can attempt GPUDirect Storage or forced POSIX fallback.
-    // This was another highlight of PR #3209: unify GDS logic + fallback.
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
         auto srcPtr = computeBlockPointer(src, pools, poolIdx);
         auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
-        // I replaced the static char array with a dynamic std::string,
-        // as requested in PR #3209.
         int size = std::snprintf(nullptr, 0,
             "/mnt/weka/block_%d_pool_%zu.bin", src->getBlockId(), poolIdx);
         std::string filename(size + 1, '\0');
         std::snprintf(filename.data(), filename.size(),
             "/mnt/weka/block_%d_pool_%zu.bin", src->getBlockId(), poolIdx);
 
-        // If I'm forcing POSIX fallback, I skip GDS entirely.
         if (mode == KVCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
             TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
@@ -268,7 +246,6 @@ void KVCacheTransferManager::copyBlock(
         int fd = ::open(filename.c_str(), openFlags, 0664);
         if (fd < 0)
         {
-            // If file open fails, I log an error and fallback to POSIX (per the PR #3209 suggestions)
             TLLM_LOG_ERROR("Failed to open '%s' for %s; fallback POSIX",
                 filename.c_str(),
                 (isOffload ? "writing" : "reading"));
@@ -328,7 +305,7 @@ void KVCacheTransferManager::copyBlock(
                 status.err,
                 filename.c_str());
 
-            // Fallback if GDS fails to register the file handle
+            // Non-fatal fallback if GDS fails to register the file handle.
             if (isOffload) gpuToFilePosix(srcPtr, filename);
             else           fileToGpuPosix(dstPtr, filename);
         }
