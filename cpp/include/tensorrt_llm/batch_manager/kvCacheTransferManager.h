@@ -25,14 +25,6 @@ namespace tr = tensorrt_llm::runtime;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-//! \brief Enum describing the transfer mode for KV cache.
-enum class KVCacheTransferMode
-{
-    DRAM                 = 0, //!< Copy to/from CPU memory (original approach).
-    GDS                  = 1, //!< Attempt GPUDirect Storage (cuFile).
-    POSIX_DEBUG_FALLBACK = 2, //!< Force a POSIX read/write for debugging.
-};
-
 // The TransferManager accelerates transfers to/from the GPU by overlapping HtoD and DtoH transfers, and tracks ongoing
 // transfers in order to avoid race conditions. It is functionally equivalent to the prior approach of putting all
 // transfers into the forward pass stream. This is only ever used as a component of a KVCacheManager.
@@ -65,9 +57,10 @@ private:
      * \param pools           Pools describing memory layout for KV blocks
      * \param isOffload       true => GPU->CPU/file, false => CPU/file->GPU
      * \param numTokensToCopy if > 0, partial copy is done
-     * \param mode            See \ref KVCacheTransferMode
+     * \param mode            See \ref executor::KvCacheTransferMode
+     * \param directory       Directory to save the file if mode is GDS or POSIX_DEBUG_FALLBACK
      *
-     * The default param is set to KVCacheTransferMode::DRAM.
+     * The default param is set to executor::KvCacheTransferMode::DRAM.
      */
     void copyBlock(
         BlockPtr const& src,
@@ -75,7 +68,8 @@ private:
         std::vector<KVCacheBlockPool> const& pools,
         bool isOffload,
         int numTokensToCopy = 0,
-        KVCacheTransferMode mode = KVCacheTransferMode::DRAM);
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
 
     runtime::BufferManager mBufferManager;

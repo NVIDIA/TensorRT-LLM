@@ -96,6 +96,7 @@ target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 # Find and link cuFile library for kvCacheTransferManager (GDS).
+if (ENABLE_CUFILE)
 find_library(CUFILE_LIBRARY
 NAMES cufile
 HINTS
@@ -108,3 +109,4 @@ message(FATAL_ERROR "Could not find cufile library inside container.")
 endif()
 
 target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()

@@ -26,10 +26,13 @@ namespace tensorrt_llm::executor
 
 KvCacheRetentionConfig::KvCacheRetentionConfig(
     std::vector<KvCacheRetentionConfig::TokenRangeRetentionConfig> const& tokenRangeRetentionPriorities,
-    RetentionPriority decodeRetentionPriority, std::optional<std::chrono::milliseconds> decodeDurationMs)
+    RetentionPriority decodeRetentionPriority, std::optional<std::chrono::milliseconds> decodeDurationMs,
+    KvCacheTransferMode transferMode, std::optional<std::string> directory)
     : mTokenRangeRetentionConfigs(std::vector<TokenRangeRetentionConfig>(tokenRangeRetentionPriorities))
     , mDecodeRetentionPriority{decodeRetentionPriority}
     , mDecodeDurationMs{decodeDurationMs}
+    , mTransferMode{transferMode}
+    , mDirectory{directory}
 {
 
     // The token ranges must be non-overlapping
@@ -89,6 +92,16 @@ RetentionPriority KvCacheRetentionConfig::getDecodeRetentionPriority() const
 std::optional<std::chrono::milliseconds> KvCacheRetentionConfig::getDecodeDurationMs() const
 {
     return mDecodeDurationMs;
+}
+
+KvCacheTransferMode KvCacheRetentionConfig::getTransferMode() const
+{
+    return mTransferMode;
+}
+
+std::optional<std::string> KvCacheRetentionConfig::getDirectory() const
+{
+    return mDirectory;
 }
 
 std::vector<RetentionPriorityAndDuration> KvCacheRetentionConfig::getPerBlockRetentionPriorityDuration(
