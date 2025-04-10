@@ -1,6 +1,6 @@
 import copy
-import enum
 from dataclasses import dataclass, field
+from enum import Enum, IntEnum
 from functools import lru_cache
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
@@ -22,6 +22,14 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
 
 
 @dataclass(kw_only=True)
@@ -421,7 +429,7 @@ class PositionalEmbeddingParams:
 TMetadata = TypeVar("TMetadata", bound=AttentionMetadata)
 
 
-class PredefinedAttentionMask(str, enum.Enum):
+class PredefinedAttentionMask(str, Enum):
     """
     Predefined attention mask types
 
@@ -450,6 +458,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         """
         Initialize the backend.

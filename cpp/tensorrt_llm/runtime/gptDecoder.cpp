@@ -48,6 +48,7 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     , mDecodingMode{mode}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto const decodingDomain = tensorrt_llm::layers::DecoderDomain(
         maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, speculativeDecodingModule);
     mDynamicDecodeLayer = std::make_shared<tensorrt_llm::layers::DynamicDecodeLayer<T>>(mode, decodingDomain, mManager);
@@ -173,6 +174,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         beamSearchParams->beamSearchDiversityRate = mSamplingConfig.beamSearchDiversityRate;
         beamSearchParams->lengthPenalty = mSamplingConfig.lengthPenalty;
         beamSearchParams->earlyStopping = mSamplingConfig.earlyStopping;
+        beamSearchParams->beamWidthArray = mSamplingConfig.beamWidthArray;
 
         setupParams->decodingParams = std::move(beamSearchParams);
     }
@@ -234,7 +236,6 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
             auto const& topK = mSamplingConfig.topK.value();
             externalDraftTokensParams->runtimeTopK = std::vector<SizeType32>(std::begin(topK), std::end(topK));
         }
-
         externalDraftTokensParams->runtimeTopP = mSamplingConfig.topP;
         setupParams->decodingParams = std::move(externalDraftTokensParams);
     }
@@ -248,6 +249,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
         setupParams->decodingParams = eagleParams;
     }
+
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
     mDynamicDecodeLayer->setup(batchSize, mSamplingConfig.beamWidth, batchSlots, setupParams, mDecodingLayerWorkspace);
@@ -335,7 +337,6 @@ void prepareExternalDraftTokensInputs(DecodingInput const& inputs, std::shared_p
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto inputParams = std::dynamic_pointer_cast<tl::ExternalDraftTokensInputs>(baseInputs);
-
     auto const& externalDraftTokensInputs = inputs.externalDraftTokensInputs.value();
 
     inputParams->draftLogits = externalDraftTokensInputs.draftLogits;
@@ -423,6 +424,8 @@ template <typename T>
 std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto constexpr ite = 0;
 
     TLLM_CHECK_WITH_INFO(input.batchSlots != nullptr, "Batch slots are mandatory to call the decoder.");
@@ -548,45 +551,46 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
 void prepareBeamSearchOutputs(DecodingOutput& output, std::shared_ptr<tl::BaseDecodingOutputs>& baseOutputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto const& bhSrc = output.beamHypotheses;
+    auto bhOutputs = std::dynamic_pointer_cast<tl::BeamSearchOutputs>(baseOutputs);
+    bhOutputs->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
+    auto& bhDst = bhOutputs->beamHypotheses;
 
-    auto outputParams = std::dynamic_pointer_cast<tl::BeamSearchOutputs>(baseOutputs);
-    outputParams->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
-    if (output.beamHypotheses.outputIdsCBA)
+    if (bhSrc.outputIdsCBA)
     {
-        outputParams->beamHypotheses->outputIdsCBA = bufferCast<int>(*output.beamHypotheses.outputIdsCBA);
+        bhDst->outputIdsCBA = bufferCast<int>(*bhSrc.outputIdsCBA);
     }
-    if (output.beamHypotheses.logProbsCBA)
+    if (bhSrc.logProbsCBA)
     {
-        outputParams->beamHypotheses->logProbsCBA = bufferCast<float>(*output.beamHypotheses.logProbsCBA);
+        bhDst->logProbsCBA = bufferCast<float>(*bhSrc.logProbsCBA);
     }
-    if (output.beamHypotheses.sequenceLengthsCBA)
+    if (bhSrc.sequenceLengthsCBA)
     {
-        outputParams->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*output.beamHypotheses.sequenceLengthsCBA);
+        bhDst->sequenceLengthsCBA = bufferCast<int>(*bhSrc.sequenceLengthsCBA);
     }
-    if (output.beamHypotheses.cumLogProbsCBA)
+    if (bhSrc.cumLogProbsCBA)
     {
-        outputParams->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*output.beamHypotheses.cumLogProbsCBA);
+        bhDst->cumLogProbsCBA = bufferCast<float>(*bhSrc.cumLogProbsCBA);
     }
-    if (output.beamHypotheses.normedScoresCBA)
+    if (bhSrc.normedScoresCBA)
     {
-        outputParams->beamHypotheses->normedScoresCBA = bufferCast<float>(*output.beamHypotheses.normedScoresCBA);
+        bhDst->normedScoresCBA = bufferCast<float>(*bhSrc.normedScoresCBA);
     }
-    if (output.beamHypotheses.numBeamsCBA)
+    if (bhSrc.numBeamsCBA)
     {
-        outputParams->beamHypotheses->numBeamsCBA = bufferCast<int>(*output.beamHypotheses.numBeamsCBA);
+        bhDst->numBeamsCBA = bufferCast<int>(*bhSrc.numBeamsCBA);
     }
-    if (output.beamHypotheses.minNormedScoresCBA)
+    if (bhSrc.minNormedScoresCBA)
     {
-        outputParams->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*output.beamHypotheses.minNormedScoresCBA);
+        bhDst->minNormedScoresCBA = bufferCast<float>(*bhSrc.minNormedScoresCBA);
     }
-    if (output.beamHypotheses.batchDones)
+    if (bhSrc.batchDones)
     {
-        outputParams->beamHypotheses->batchDones = bufferCast<bool>(*output.beamHypotheses.batchDones);
+        bhDst->batchDones = bufferCast<bool>(*bhSrc.batchDones);
     }
-
     if (output.cacheIndirection)
     {
-        outputParams->tgtCacheIndirection = output.cacheIndirection;
+        bhOutputs->tgtCacheIndirection = output.cacheIndirection;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -673,6 +677,7 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
 std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, tle::DecodingMode const& decodingMode)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     std::shared_ptr<tl::BaseDecodingOutputs> outputParams;
 
     if (decodingMode.isBeamSearch())
@@ -757,9 +762,9 @@ template <typename T>
 void GptDecoder<T>::forwardAsync(DecodingOutput& output, DecodingInput const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto forwardParams = prepareInputs<T>(input, mMaxBatchSize, mDecodingMode);
     auto outputParams = prepareOutputs(output, mDecodingMode);
-
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

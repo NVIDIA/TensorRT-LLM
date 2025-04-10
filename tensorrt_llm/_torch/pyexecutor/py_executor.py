@@ -309,6 +309,7 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        del self.model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -1409,6 +1410,12 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+
+        # For gen-only benchmarking, mark new gen request as transmission complete right away
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            for req in new_gen_reqs:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:

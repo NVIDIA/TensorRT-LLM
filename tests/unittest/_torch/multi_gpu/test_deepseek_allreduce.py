@@ -47,13 +47,12 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
 
 
 def run_single_rank(tensor_parallel_size, single_rank_forward_func, input,
-                    residual, weights, hidden_size, dtype, fused_add_norm):
+                    residual, hidden_size, dtype, fused_add_norm):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
         single_rank_forward_func(input, residual, hidden_size, dtype,
-                                 tensor_parallel_size, rank, weights,
-                                 fused_add_norm)
+                                 tensor_parallel_size, rank, fused_add_norm)
     except Exception:
         traceback.print_exc()
         raise
@@ -79,25 +78,13 @@ def run_moe_single_rank(tensor_parallel_size, single_rank_forward_func,
 def row_linear_residual_norm_fusion_forward(
         x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
         dtype: torch.dtype, tensor_parallel_size: int,
-        tensor_parallel_rank: int, weights: torch.Tensor,
-        fusion_op: AllReduceFusionOp):
+        tensor_parallel_rank: int, fusion_op: AllReduceFusionOp):
 
     x = x.cuda()
     residual = residual.cuda()
     norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
     eps = 1e-5
 
-    l0 = Linear(
-        in_features=hidden_size,
-        out_features=hidden_size,
-        bias=False,
-        dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-        ),
-    ).cuda()
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
     allreduce = AllReduce(parallel_config=ParallelConfig(
@@ -162,7 +149,6 @@ def row_linear_residual_norm_fusion_forward(
 
         return output
 
-    l0.load_weights([dict(weight=weights)])
     norm.weight.data.copy_(norm_weight)
 
     output = func(x.clone(), residual.clone(), enable_fusion=False)
@@ -232,13 +218,12 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion_op):
     tensor_parallel_size = 2
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
-    l0_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
     with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
         results = executor.map(
             run_single_rank,
             *zip(*[(tensor_parallel_size,
                     row_linear_residual_norm_fusion_forward, x, residual,
-                    [l0_weight], hidden_size, dtype, fusion_op)] * 2),
+                    hidden_size, dtype, fusion_op)] * 2),
         )
         for r in results:
             assert r is True

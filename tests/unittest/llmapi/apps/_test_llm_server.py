@@ -2,12 +2,14 @@ import concurrent.futures
 import time
 
 import pytest
-from apps.fastapi_server import LLM, BuildConfig, KvCacheConfig, LlmServer
+from apps.fastapi_server import LLM, BuildConfig, LlmServer
 from fastapi.testclient import TestClient
 
 import tensorrt_llm.profiler as profiler
 
 from ..test_llm import llama_model_path
+
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 @pytest.fixture(scope="module")
@@ -16,14 +18,11 @@ def client():
     build_config.max_batch_size = 8
     build_config.max_seq_len = 512
     llm = LLM(llama_model_path, build_config=build_config)
-    KvCacheConfig()
 
     app_instance = LlmServer(llm)
     client = TestClient(app_instance.app)
     yield client
-
-    del llm
-    del app_instance.llm
+    llm.shutdown()
 
 
 def test_health(client):

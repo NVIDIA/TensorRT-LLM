@@ -56,7 +56,7 @@ private:
 
     template <typename T, typename KVCacheBuffer>
     void runImpl(XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer, int multiprocessor_count,
-        cudaStream_t const& stream);
+        cudaStream_t const& stream) const;
 
     template <typename KVCacheBuffer>
     void runDispatchKVCacheBuffer(

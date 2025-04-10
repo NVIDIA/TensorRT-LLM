@@ -1,7 +1,6 @@
 import math
 import threading
 from dataclasses import dataclass, field
-from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -11,9 +10,10 @@ from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams)
+from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
+                        AttentionMetadata, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams)
 from .vanilla import VanillaAttention
 
 
@@ -93,11 +93,11 @@ class TrtllmAttentionWrapper:
     rotary_embedding_original_max_positions: int
     use_paged_context_fmha: bool
     is_mla_enable: bool
-    q_lora_rank: int
-    kv_lora_rank: int
-    qk_rope_head_dim: int
-    qk_nope_head_dim: int
-    v_head_dim: int
+    q_lora_rank: Optional[int]
+    kv_lora_rank: Optional[int]
+    qk_rope_head_dim: Optional[int]
+    qk_nope_head_dim: Optional[int]
+    v_head_dim: Optional[int]
     kwargs: dict
 
     def __init__(
@@ -108,6 +108,7 @@ class TrtllmAttentionWrapper:
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
         mla_params: Optional[MLAParams] = None,
         **kwargs,
     ):
@@ -129,7 +130,7 @@ class TrtllmAttentionWrapper:
             rope_params = RopeParams()
 
         self.is_mla_enable = mla_params is not None
-        self.q_scaling = 1.0
+        self.q_scaling = q_scaling or 1.0
         self.mla_rope_params = None
         self.predicted_tokens_per_seq = 1
 
@@ -142,18 +143,6 @@ class TrtllmAttentionWrapper:
             self.predicted_tokens_per_seq = mla_params.predicted_tokens_per_seq
 
             self.rotary_embedding_dim = 0
-
-            def yarn_get_mscale(scale=1, mscale=1):
-                if scale <= 1:
-                    return 1.0
-                return 0.1 * mscale * math.log(scale) + 1.0
-
-            mscale_all_dim = rope_params.mscale_all_dim
-            scaling_factor = rope_params.scale
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.q_scaling = 1.0 / (mscale * mscale)
-
             self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_deepseek_rope_const_params(
                 self.qk_rope_head_dim)
             self.rotary_embedding_scale_type = RotaryScalingType.none
@@ -193,6 +182,7 @@ class TrtllmAttentionWrapper:
         *,
         tokens_per_block: Optional[int] = None,
         max_num_requests: int,
+        max_sequence_length: int,
         max_context_length: int,
         attention_window_size: Optional[int] = None,
         sink_token_length: int = 0,
@@ -225,6 +215,7 @@ class TrtllmAttentionWrapper:
         Args:
             tokens_per_block (int): Token number per KV cache block.
             max_num_requests (int): Max request number per batch.
+            max_sequence_length (int): Max sequence length.
             max_context_length (int): Max context length per context-phase sequence.
             attention_window_size (int): Max token number attended in windowed attention.
             sink_token_length (int): Sink token number in StreamingLLM.
@@ -250,7 +241,7 @@ class TrtllmAttentionWrapper:
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
         self.max_context_length = max_context_length
-        self.attention_window_size = attention_window_size or max_context_length
+        self.attention_window_size = attention_window_size or max_sequence_length
         self.sink_token_length = sink_token_length
         self.beam_width = beam_width
         self.sequence_length = sequence_length
@@ -656,9 +647,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_heads: int,
         head_dim: int,
         num_kv_heads: Optional[int] = None,
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         quant_config: Optional[QuantConfig] = None,
+        q_scaling: Optional[float] = None,
+        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         mla_params: Optional[MLAParams] = None,
+        **kwargs,
     ):
         """
         Initialize the backend.
@@ -667,13 +660,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             num_heads (int): The number of query heads.
             head_dim (int): The size of each attention head (hidden_size // num_heads).
             num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
+            quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
+            q_scaling (float): Scaling factor for QK. Defaults to 1.0 if None.
             pos_embd_params (PositionalEmbeddingParams): Optional parameters defining how positional embedding should be applied.
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
-            quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
+            mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
         """
-        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+        super().__init__(layer_idx,
+                         num_heads,
+                         head_dim,
+                         num_kv_heads,
+                         quant_config,
+                         q_scaling=q_scaling,
+                         pos_embd_params=pos_embd_params,
+                         mla_params=mla_params,
+                         **kwargs)
         self.wrapper = TrtllmAttentionWrapper(
             layer_idx,
             num_heads,
@@ -681,6 +683,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             num_kv_heads,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            q_scaling=q_scaling,
             mla_params=mla_params,
         )
 
@@ -770,7 +773,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
-            max_context_length=metadata.max_seq_len,
+            max_sequence_length=metadata.max_seq_len,
+            max_context_length=min(metadata.max_seq_len - 1,
+                                   metadata.max_num_tokens),
             attention_window_size=None,
             sink_token_length=0,
             beam_width=1,

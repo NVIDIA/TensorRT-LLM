@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
@@ -8,8 +9,7 @@ from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
-                     get_power_of_2_num_tokens_buckets, is_torch_compiling,
-                     next_positive_power_of_2, reswizzle_sf)
+                     reswizzle_sf)
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
@@ -71,6 +71,40 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
                                                dim=-1)
         return topk_indices.to(torch.int32), torch.nn.functional.softmax(
             topk_values.float(), dim=-1)
+
+
+class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        topk_values, topk_indices = torch.topk(router_logits,
+                                               k=self.top_k,
+                                               dim=-1)
+        return topk_indices.to(torch.int32), torch.sigmoid(topk_values.float())
+
+
+# TODO: re-enable this once the custom op is working.
+# class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
+
+#     def __init__(self, top_k: int, num_experts_total: int, ep_size: int,
+#                  ep_rank: int):
+#         super().__init__()
+#         self.top_k = top_k
+#         self.num_experts_total = num_experts_total
+#         self.num_experts_per_node = self.num_experts_total // ep_size
+#         self.start_expert = self.num_experts_per_node * ep_rank
+#         self.end_expert = self.start_expert + self.num_experts_per_node
+
+#     def apply(self,
+#               router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+#         unpermuted_scales, indices = torch.ops.trtllm.fused_topk_softmax(
+#             router_logits, self.top_k, self.num_experts_total,
+#             self.start_expert, self.end_expert)
+#         return indices, unpermuted_scales
 
 
 # TODO Test this for Phi models
@@ -173,6 +207,11 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
         return balanced_indices, balanced_values
 
 
+class MoEWeightLoadingMode(Enum):
+    VANILLA = 0
+    FUSED_GATE_UP_PROJ = 1
+
+
 class FusedMoE(nn.Module):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
@@ -189,16 +228,18 @@ class FusedMoE(nn.Module):
     """
 
     def __init__(
-            self,
-            *,
-            routing_method: BaseMoeRoutingMethod,
-            num_experts: int,
-            hidden_size: int,
-            intermediate_size: int,
-            dtype: Optional[torch.dtype] = None,
-            reduce_results: bool = False,
-            model_config: ModelConfig = ModelConfig(),
-            aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        self,
+        *,
+        routing_method: BaseMoeRoutingMethod,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        model_config: ModelConfig = ModelConfig(),
+        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
+        VANILLA,
     ):
         from ..distributed import AllReduce
 
@@ -207,6 +248,7 @@ class FusedMoE(nn.Module):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        self.weight_loading_mode = weight_loading_mode
 
         self.aux_stream = aux_stream
         self.event_dict = {
@@ -305,7 +347,7 @@ class FusedMoE(nn.Module):
             self.intermediate_size_per_partition,
         )
 
-        self.quant_scales = None
+        self.quant_scales = []
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
@@ -486,17 +528,6 @@ class FusedMoE(nn.Module):
             outputs.append(output)
         return outputs
 
-    def _run_profiler(self, x, output_dtype, use_fp8_block_scaling,
-                      min_latency_mode):
-        profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-            x.dtype, self.w3_w1_weight.dtype, output_dtype,
-            use_fp8_block_scaling, min_latency_mode)
-        profiler.run_profile(
-            self.w2_weight, self.routing_method.experts_per_token, self.tp_size,
-            self.tp_rank, self.ep_size, self.ep_rank,
-            get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
-        return profiler
-
     def reducescatter_or_allreduce(self, inputs):
         outputs = inputs
         if self.parallel_size > 1:
@@ -573,27 +604,7 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-        if is_torch_compiling():
-            profile_ids = None
-        else:
-            if not self.has_been_profiled:
-                self.profiler = self._run_profiler(x, output_dtype,
-                                                   use_fp8_block_scaling, False)
-                self.has_been_profiled = True
-
-            if not self.has_been_profiled_min_latency and min_latency_mode:
-                self.profiler_min_latency = self._run_profiler(
-                    x, output_dtype, use_fp8_block_scaling, False)
-                self.has_been_profiled_min_latency = True
-
-            profiler = self.profiler_min_latency if min_latency_mode else self.profiler
-
-            profile_ids = profiler.get_profile_ids(
-                next_positive_power_of_2(x.shape[0]), self.w2_weight,
-                self.routing_method.experts_per_token, self.num_experts)
-
-        fused_moe_op = torch.ops.trtllm.fused_moe_min_latency if min_latency_mode else torch.ops.trtllm.fused_moe
-        final_hidden_states = fused_moe_op(
+        final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
@@ -606,11 +617,18 @@ class FusedMoE(nn.Module):
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            profile_ids=profile_ids,
             use_fp8_block_scaling=use_fp8_block_scaling,
+            min_latency_mode=min_latency_mode,
         )
 
-        return final_hidden_states
+        if min_latency_mode:
+            assert not self.reduce_results
+            return final_hidden_states
+
+        if self.reduce_results and self.parallel_size > 1:
+            return self.all_reduce(final_hidden_states)
+        else:
+            return final_hidden_states[0]
 
     def forward(
         self,
@@ -713,15 +731,25 @@ class FusedMoE(nn.Module):
             dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight = weights[f"{expert_id}.w1.weight"]
-            w3_weight = weights[f"{expert_id}.w3.weight"]
-            w2_weight = weights[f"{expert_id}.w2.weight"]
-
             expert_idx = expert_id - self.expert_start
 
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight = weights[f"{expert_id}.w1.weight"]
+                w3_weight = weights[f"{expert_id}.w3.weight"]
+                w2_weight = weights[f"{expert_id}.w2.weight"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_w3_weight = weights["gate_up_proj"][expert_idx].transpose(
+                    0, 1)
+                w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                w2_weight = weights["down_proj"][expert_idx].transpose(0, 1)
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
+
+            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx])
             load_expert_w3_w1_weight(w1_weight, w3_weight,
                                      self.w3_w1_weight.data[expert_idx])
-            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx])
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             if self.quant_config.quant_mode.has_fp8_qdq():

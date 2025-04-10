@@ -256,6 +256,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                    atol=0,
                                    rtol=0)
 
+        kv_cache_manager.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
