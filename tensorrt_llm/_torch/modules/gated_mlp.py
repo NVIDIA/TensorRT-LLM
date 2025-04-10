@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.mapping import Mapping
+
 from ..custom_ops import IS_FLASHINFER_AVAIABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
