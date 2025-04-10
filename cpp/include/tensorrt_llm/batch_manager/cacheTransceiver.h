@@ -118,7 +118,7 @@ private:
     std::unique_ptr<DataRequester> mDataRequester;
     std::map<LlmRequest*, std::future<void>> mResponderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
-    mpi::MpiComm const *mMpiGroupComm{}, *mMpiWorldComm{};
+    mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,
         mMpiGroupTPInDPComm;
     executor::kv_cache::CommState const* mCommState;
