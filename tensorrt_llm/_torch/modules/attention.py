@@ -53,6 +53,7 @@ class Attention(nn.Module):
         config: Optional[ModelConfig] = None,
         use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attn_scale: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -150,6 +151,7 @@ class Attention(nn.Module):
 
         if not config.skip_create_weights:
             self.create_weights()
+        self.attn_scale = attn_scale
 
     def create_weights(self):
         self.attn = create_attention(
@@ -161,6 +163,17 @@ class Attention(nn.Module):
             pos_embd_params=self.pos_embd_params,
             quant_config=self.quant_config,
         )
+
+    def _get_attn_scale(self, position_ids: torch.Tensor) -> torch.Tensor:
+        # FIXME: use hf config instead of hardcoded values
+        # self.floor_scale = getattr(config, "floor_scale", 8192.0)
+        # self.attn_scale = getattr(config, "attn_scale", 0.1)
+        positions = position_ids.view(-1)
+        floor_scale = 8192.0
+        attn_scale = 0.1
+        floor = torch.floor((positions + 1.0) / floor_scale)
+        attn_scale = torch.log(floor + 1.0) * attn_scale + 1.0
+        return attn_scale.unsqueeze(-1)
 
     def forward(
         self,
@@ -197,6 +210,16 @@ class Attention(nn.Module):
                 q = self.qk_norm(q)
                 k = self.qk_norm(k)
             qkv = torch.concat([q, k, v], dim=-1)
+
+        if self.attn_scale:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+            attn_scale = self._get_attn_scale(position_ids)
+            q = (q * attn_scale).to(q.dtype)
+            qkv = torch.concat(
+                [q.contiguous(), k.contiguous(),
+                 v.contiguous()], dim=-1)
+            position_ids = None  # For NOPE layers (like in Llama4), after applying attn_scale, disable the rotary embedding.
 
         if lora_params is not None:
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
