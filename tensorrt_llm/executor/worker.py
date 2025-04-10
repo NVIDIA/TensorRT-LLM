@@ -500,7 +500,6 @@ def worker_main(
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         ready_signal: Optional[str] = None,
         is_llm_executor: Optional[bool] = True,  # whether it's the main executor instance
-        random_hmac_key: Optional[bytes] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -538,30 +537,21 @@ def worker_main(
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
 
-        # If HMAC key is not provided, initialize a new HMAC key
-        if not random_hmac_key:
-            logger.warning("HMAC key not found in worker queues, generating new one")
-            random_hmac_key = os.urandom(32)
-
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
-                                 name="worker_request_queue",
-                                 hmac_key=random_hmac_key)
+                                 name="worker_request_queue")
         request_error_queue = IpcQueue(worker_queues.request_error_queue_addr,
                                        is_server=False,
-                                       name="worker_request_error_queue",
-                                       hmac_key=random_hmac_key)
+                                       name="worker_request_error_queue")
         mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                        is_server=False,
                                        fuse_message=True,
-                                       name="worker_stats_queue",
-                                       hmac_key=random_hmac_key)
+                                       name="worker_stats_queue")
         kv_cache_events_queue = FusedIpcQueue(
             worker_queues.kv_cache_events_queue_addr,
             is_server=False,
             fuse_message=False,
-            name="worker_kv_cache_events_queue",
-            hmac_key=random_hmac_key)
+            name="worker_kv_cache_events_queue")
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -569,8 +559,7 @@ def worker_main(
             result_queues = [
                 FusedIpcQueue(is_server=True,
                               fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                              name=f"postprocess_{i}_feedin_queue",
-                              hmac_key=random_hmac_key)
+                              name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         else:
@@ -579,8 +568,7 @@ def worker_main(
             result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
                                          is_server=False,
                                          fuse_message=PERIODICAL_RESP_IN_AWAIT,
-                                         name="worker_result_queue",
-                                         hmac_key=random_hmac_key)
+                                         name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
         # Signal the dispatcher thread in the proxy to quit
@@ -598,13 +586,13 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         print_colored_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: str = worker_queues.result_queue_addr
+        proxy_result_queue: tuple[str, bytes] = worker_queues.result_queue_addr
 
         assert result_queues is not None
         assert postproc_worker_config.postprocess_tokenizer_dir is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, str)
+        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
@@ -612,7 +600,6 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                random_hmac_key,
             )
             postprocess_worker_futures.append(fut)
 
