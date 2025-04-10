@@ -23,8 +23,13 @@ def similar(a, b, threshold=0.9):
                          ids=["deepseekv3_lite"])
 @pytest.mark.parametrize("backend", ["TRTLLM"], ids=["trtllm"])
 @pytest.mark.parametrize("quant", ["bf16"])
-@pytest.mark.parametrize("tp_size", [1], ids=["tp1"])
-def test_deepseek_streaming(model_name, backend, quant, tp_size):
+@pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
+@pytest.mark.parametrize("enable_attention_dp", [False, True],
+                         ids=["adp_off", "adp_on"])
+@pytest.mark.parametrize("moe_max_num_tokens", [None, 64],
+                         ids=["moe_chunk_off", "moe_chunk_on"])
+def test_deepseek_streaming(model_name, backend, quant, tp_size,
+                            enable_attention_dp, moe_max_num_tokens):
     model_path = {
         "bf16": "bf16",
         "fp8": "fp8",
@@ -61,6 +66,7 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
         use_cuda_graph=False,
         kv_cache_dtype="auto",
         attn_backend=backend,
+        moe_max_num_tokens=moe_max_num_tokens,
     )
 
     model_dir = str(llm_models_root() / model_name / model_path[quant])
@@ -73,7 +79,7 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
               pytorch_backend_config=pytorch_config,
               moe_expert_parallel_size=-1,
               moe_tensor_parallel_size=-1,
-              enable_attention_dp=False,
+              enable_attention_dp=enable_attention_dp,
               kv_cache_config=KvCacheConfig(enable_block_reuse=False))
 
     sampling_params = SamplingParams(max_tokens=10)

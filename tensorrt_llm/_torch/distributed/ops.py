@@ -1,5 +1,5 @@
 import threading
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -35,70 +35,118 @@ def userbuffers_allreduce_finalize(
     return output
 
 
-def allgather(input: torch.Tensor,
-              mapping: Mapping,
-              gather_dim: int = -1) -> torch.Tensor:
+def allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    gather_dim: int = -1,
+    all_rank_split_size: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     '''
     Add an operation that performs a collective all-gather.
 
-    The input tensors in the different ranks must have the same shape.
-    The output tensor will be replicated among the TP group.
+    If 'all_rank_split_size' is 'None', the input tensors in the different ranks must have the same shape.
+    Otherwise, 'all_rank_split_size[i]' must be 'input.shape[gather_dim]' at rank i, and the input tensors in
+    the different ranks can only differ in shape at dimension `gather_dim`.
 
-    Given the 'section_size = input.shape[gather_dim]', each rank
-    contributes a section of its input tensor that correspond to
-    'rank*section_size:(rank+1)*section_size',
-    and 'output.shape[gather_dim] = input.shape[gather_dim] * tp_group_size'.
+    The input tensors in the same TP group are concatenated at dimension 'gather_dim' to produce the output tensor.
+    If 'all_rank_split_size' is 'None', 'output.shape[gather_dim] = input.shape[gather_dim] * tp_group_size'.
+    Otherwise, 'output.shape[gather_dim] = sum(all_rank_split_size)'.
 
-    That operation is implemented using a torch op that wraps the NCCL all-gather
-    collective operation. See
-    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather
-    for details.
+    That operation is implemented using a torch op that wraps the NCCL all-gather collective operation or
+    the NCCL group call of a series of NCCL broadcast collective operations. See the following materials for details.
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#broadcast,
+    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/group.html.
 
     Args:
-        input (Tensor): The input tensor.
+        input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         mapping (Mapping):  The parallel mapping.
         gather_dim (int): Gather along given dimension. By default -1.
+        all_rank_split_size(Optional[List[int]]): An optional list indicating 'input.shape[gather_dim]' in all ranks. By default None.
     Returns:
-        The gathered tensor.
+        The gathered tensor or tensor list.
     '''
     if mapping.tp_size == 1:
         return input
 
-    output = torch.ops.trtllm.allgather(
+    if all_rank_split_size is not None:
+        assert len(all_rank_split_size) == len(mapping.tp_group)
+        if isinstance(input, torch.Tensor):
+            assert input.shape[gather_dim] == all_rank_split_size[
+                mapping.tp_rank]
+        else:
+            assert all([
+                val.shape[gather_dim] == all_rank_split_size[mapping.tp_rank]
+                for val in input
+            ])
+        # 'all_rank_split_size' is not needed if all inputs in the same TP group have the same shape
+        for split_size in all_rank_split_size[1:]:
+            if split_size != all_rank_split_size[0]:
+                break
+        else:
+            all_rank_split_size = None
+
+    if isinstance(input, torch.Tensor):
+        torch_op = torch.ops.trtllm.allgather
+        input = input.movedim(gather_dim, 0).contiguous()
+    else:
+        torch_op = torch.ops.trtllm.allgather_list
+        input = [val.movedim(gather_dim, 0).contiguous() for val in input]
+
+    output = torch_op(
         input,
+        all_rank_split_size,
         mapping.tp_group,
     )
 
-    if gather_dim < 0:
-        gather_dim += input.ndim
-
-    output = torch.movedim(output, 0, gather_dim)
-    input_shape = input.size()
-    output = output.reshape(input_shape[:gather_dim] +
-                            (mapping.tp_size * input_shape[gather_dim], ) +
-                            input_shape[gather_dim + 1:])
+    if isinstance(input, torch.Tensor):
+        output = output.movedim(0, gather_dim).contiguous()
+    else:
+        output = [val.movedim(0, gather_dim).contiguous() for val in output]
     return output
 
 
-def reducescatter(input: torch.Tensor,
-                  mapping: Mapping,
-                  scatter_dim: int = -1) -> torch.Tensor:
+def reducescatter(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    scatter_dim: int = -1,
+    all_rank_split_size: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     if mapping.tp_size == 1:
         return input
 
-    output = torch.ops.trtllm.reducescatter(
+    if all_rank_split_size is not None:
+        assert len(all_rank_split_size) == len(mapping.tp_group)
+        sum_split_size = sum(all_rank_split_size)
+        if isinstance(input, torch.Tensor):
+            assert input.shape[scatter_dim] == sum_split_size
+        else:
+            assert all(
+                [val.shape[scatter_dim] == sum_split_size for val in input])
+        # 'all_rank_split_size' is not needed if all outputs in the same TP group have the same shape
+        for split_size in all_rank_split_size[1:]:
+            if split_size != all_rank_split_size[0]:
+                break
+        else:
+            all_rank_split_size = None
+
+    if isinstance(input, torch.Tensor):
+        torch_op = torch.ops.trtllm.reducescatter
+        input = input.movedim(scatter_dim, 0).contiguous()
+    else:
+        torch_op = torch.ops.trtllm.reducescatter_list
+        input = [val.movedim(scatter_dim, 0).contiguous() for val in input]
+
+    output = torch_op(
         input,
+        all_rank_split_size,
         mapping.tp_group,
     )
 
-    if scatter_dim < 0:
-        scatter_dim += input.ndim
-
-    output = torch.movedim(output, 0, scatter_dim)
-    input_shape = input.size()
-    output = output.reshape(input_shape[:scatter_dim] +
-                            (input_shape[scatter_dim] // mapping.tp_size, ) +
-                            input_shape[scatter_dim + 1:])
+    if isinstance(input, torch.Tensor):
+        output = output.movedim(0, scatter_dim).contiguous()
+    else:
+        output = [val.movedim(0, scatter_dim).contiguous() for val in output]
     return output
 
 
