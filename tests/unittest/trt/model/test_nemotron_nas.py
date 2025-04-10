@@ -359,7 +359,7 @@ class TestNemotronNas(unittest.TestCase):
 
     def get_loader_test_cases():
         model_root = llm_models_root(check=True)
-        test_models_base_path = Path(model_root, "nvsmall/tests")
+        test_models_base_path = Path(model_root, "nemotron_nas/tests")
         models_path = [
             os.path.join(test_models_base_path, x)
             for x in os.listdir(test_models_base_path)
@@ -822,12 +822,13 @@ class TestNemotronNas(unittest.TestCase):
     @parameterized.expand(
         itertools.product(
             os.listdir(
-                Path(llm_models_root(check=True), "nvsmall/tests").as_posix()),
-            (True, False), (1, 2), (1, 2), ("auto", "float16", "bfloat16")))
+                Path(llm_models_root(check=True),
+                     "nemotron_nas/tests").as_posix()), (True, False), (1, 2),
+            (1, 2), ("auto", "float16", "bfloat16")))
     def test_convert_model_from_hf(self, model_dir: Optional[str],
                                    preloaded: bool, tp_size: int, pp_size: int,
                                    dtype: str) -> None:
-        ckpt_path = Path(llm_models_root(check=True), "nvsmall/tests",
+        ckpt_path = Path(llm_models_root(check=True), "nemotron_nas/tests",
                          model_dir)
 
         if preloaded:
@@ -850,11 +851,11 @@ class TestNemotronNas(unittest.TestCase):
     @parameterized.expand(
         itertools.product(
             os.listdir(
-                Path(llm_models_root(check=True), "nvsmall/tests").as_posix()),
-            (1, 2, 4)))
+                Path(llm_models_root(check=True),
+                     "nemotron_nas/tests").as_posix()), (1, 2, 4)))
     def test_weights_loader(self, model_dir: str, tp_size: int) -> None:
 
-        ckpt_path = Path(llm_models_root(check=True), "nvsmall/tests",
+        ckpt_path = Path(llm_models_root(check=True), "nemotron_nas/tests",
                          model_dir)
         config = DeciConfig.from_hugging_face(ckpt_path, trust_remote_code=True)
         weights = load_weights_from_hf_safetensors(ckpt_path, config)

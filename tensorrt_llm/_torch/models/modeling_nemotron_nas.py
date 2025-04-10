@@ -21,7 +21,7 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
-class NVSmallRotaryEmbedding(RotaryEmbedding):
+class NemotronNASRotaryEmbedding(RotaryEmbedding):
 
     def __init__(self, config: PretrainedConfig, layer_idx: int):
         if config.rope_scaling is not None:
@@ -69,7 +69,7 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
     )
 
 
-class NVSmallAttention(Attention):
+class NemotronNASAttention(Attention):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int):
@@ -88,7 +88,7 @@ class NVSmallAttention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=pos_embd_params,
-            rotary_emb=NVSmallRotaryEmbedding(config, layer_idx=layer_idx),
+            rotary_emb=NemotronNASRotaryEmbedding(config, layer_idx=layer_idx),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config)
@@ -120,7 +120,7 @@ class LinearMLP(nn.Module):
         return self.linear_mlp(hidden_states)
 
 
-class NVSmallDecoderLayer(DecoderLayer):
+class NemotronNASDecoderLayer(DecoderLayer):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  block_config: Dict[str, Any], layer_idx: int):
@@ -134,8 +134,8 @@ class NVSmallDecoderLayer(DecoderLayer):
             if self.block_config.attention.replace_with_linear:
                 self.self_attn = LinearAttention(model_config, config)
             else:
-                self.self_attn = NVSmallAttention(model_config=model_config,
-                                                  layer_idx=layer_idx)
+                self.self_attn = NemotronNASAttention(model_config=model_config,
+                                                      layer_idx=layer_idx)
         if not self.block_config.ffn.no_op:
             self.post_attention_layernorm = RMSNorm(
                 hidden_size=config.hidden_size,
@@ -182,7 +182,7 @@ class NVSmallDecoderLayer(DecoderLayer):
         return hidden_states
 
 
-class NVSmallModel(DecoderModel):
+class NemotronNASModel(DecoderModel):
 
     def __init__(self, model_config):
         super().__init__(model_config)
@@ -200,7 +200,7 @@ class NVSmallModel(DecoderModel):
             dtype=config.torch_dtype,
         )
         self.layers = nn.ModuleList([
-            NVSmallDecoderLayer(model_config, block_config, layer_idx)
+            NemotronNASDecoderLayer(model_config, block_config, layer_idx)
             for layer_idx, block_config in enumerate(config.block_configs)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -209,11 +209,11 @@ class NVSmallModel(DecoderModel):
 
 
 @register_auto_model("DeciLMForCausalLM")
-class NVSmallForCausalLM(DecoderModelForCausalLM[NVSmallModel,
-                                                 PretrainedConfig]):
+class NemotronNASForCausalLM(DecoderModelForCausalLM[NemotronNASModel,
+                                                     PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        super().__init__(NVSmallModel(model_config),
+        super().__init__(NemotronNASModel(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
