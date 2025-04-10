@@ -5,7 +5,7 @@
 1. Install TensorRT-LLM (tested on Ubuntu 24.04).
 
     ```bash
-    sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm --extra-index-url https://pypi.nvidia.com
+    sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
     ```
 
 2. Sanity check the installation by running the following in Python (tested on Python 3.12):
