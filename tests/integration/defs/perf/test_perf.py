@@ -1402,7 +1402,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if self._build_script == "trtllm-build" and metric.metric_type == PerfMetricType.ENGINE_SIZE:
                 metric_values = [0.0]
             elif self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
-                print_info("skip building process for multi-gpu test"
+                print_info("WAR: skip build time metric for multi-gpu test"
                            )  #https://nvbugspro.nvidia.com/bug/5210111
                 metric_values = [0.0]
             else:
