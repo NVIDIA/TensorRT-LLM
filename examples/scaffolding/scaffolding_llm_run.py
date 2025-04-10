@@ -1,9 +1,8 @@
 import argparse
 import asyncio
 
-from tensorrt_llm.scaffolding.controller import NativeGenerationController
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.worker import TRTLLMWorker
+from tensorrt_llm.scaffolding import (NativeGenerationController,
+                                      ScaffoldingLlm, TRTLLMWorker)
 
 
 def parse_arguments():
