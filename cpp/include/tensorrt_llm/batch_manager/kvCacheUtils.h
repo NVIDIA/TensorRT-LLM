@@ -96,7 +96,6 @@ public:
     void updatePoolIdx(SizeType32 poolIdx)
     {
         TLLM_CHECK(mManager);
-        TLLM_CHECK(poolIdx > kFIRST_POOL_INDEX);
         mPool = mManager->getBlockManager().getPrimaryPool(poolIdx);
         auto const newWindowSize = mManager->getBlockManager().getPoolWindowSize(poolIdx);
         if (newWindowSize != mWindowSize)
