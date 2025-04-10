@@ -70,6 +70,7 @@ install_python_rockylinux() {
     libffi-devel \
     zlib-devel \
     xz-devel \
+    sqlite-devel \
     -y
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
   cd /tmp/Python-${PYTHON_VERSION}
