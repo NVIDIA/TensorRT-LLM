@@ -486,6 +486,7 @@ class TRTLLMDecoder(Decoder):
         self.algs.update_decoder_buffers = UpdateDecoderBuffers()
 
     def setup_decoder_step(self, requests):
+        self.store["torch_stream"].wait_stream(torch.cuda.current_stream())
         with torch.inference_mode():
             batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
                 self.model_config, self.world_config, self.decoding_config,
@@ -543,6 +544,8 @@ class TRTLLMDecoder(Decoder):
 
             self.algs.decoder.forward_async(self.decoding_output,
                                             decoding_input)
+        
+        torch.cuda.current_stream().wait_stream(self.store["torch_stream"])
 
         # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
         #       current implementation of model_engine.
