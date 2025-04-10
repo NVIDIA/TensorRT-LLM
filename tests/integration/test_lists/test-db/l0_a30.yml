@@ -40,6 +40,7 @@ l0_a30:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_unit_tests[80]
   - test_cpp.py::test_model[gpt-80]
+  - test_cpp.py::test_model[gpt_executor-80]
   - test_cpp.py::test_benchmarks[gpt-80]
 - condition:
     ranges:
