@@ -277,6 +277,7 @@ def main(args):
             num_beams=args.num_beams,
             length_penalty=args.length_penalty,
             early_stopping=args.early_stopping,
+            beam_width_array=args.beam_width_array,
             repetition_penalty=args.repetition_penalty,
             presence_penalty=args.presence_penalty,
             frequency_penalty=args.frequency_penalty,

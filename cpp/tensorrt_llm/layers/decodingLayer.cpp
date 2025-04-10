@@ -90,43 +90,16 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
 
     TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
 
-    if (mDecodingMode.isTopKorTopP())
-    { // sampling layers
-        TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
-    }
-    else if (mDecodingMode.isBeamSearch())
-    { // beam search layer
-        TLLM_CHECK_WITH_INFO(beamWidth > 1, "Decoding mode is beam search, but beamWidth <= 1 (%d <= 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
-    }
-    else if (mDecodingMode.isMedusa())
-    {
-        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Medusa, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
-    }
-    else if (mDecodingMode.isLookahead())
-    {
-        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Lookahead, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
-    }
-    else if (mDecodingMode.isExplicitDraftTokens())
+    if (mDecodingMode.isBeamSearch())
     {
         TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is ExplicitDraftTokens, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
+            beamWidth > 1, "Decoding mode is %s, but beamWidth <= 1 (%d <= 1)", mDecodingMode.getName(), beamWidth);
     }
-    else if (mDecodingMode.isExternalDraftTokens())
+    else if (mDecodingMode.isTopKorTopP() || mDecodingMode.isMedusa() || mDecodingMode.isLookahead()
+        || mDecodingMode.isExplicitDraftTokens() || mDecodingMode.isExternalDraftTokens() || mDecodingMode.isEagle())
     {
         TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is external draft tokens, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
-    }
-    else if (mDecodingMode.isEagle())
-    {
-        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Eagle, but beamWidth != 1 (%d != 1)", beamWidth);
-        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
+            beamWidth == 1, "Decoding mode is %s, but beamWidth != 1 (%d != 1)", mDecodingMode.getName(), beamWidth);
     }
     else
     {
@@ -134,6 +107,8 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
             "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
     }
+
+    mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -240,8 +215,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
             "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
-        // In sampling, we have supported batch sampling. So, we always compute all
-        // sentences once.
+        // Compute all sentences once since batch-sampling is supported
         TensorConstPtr logitsSlice = ITensor::slice(*externalDraftTokenParams->logits, 0, localBatchSize);
         TensorConstPtr endIdSlice = ITensor::slice(endIds, 0, localBatchSize);
         auto decodeInputs = std::make_shared<ExternalDraftTokensInputs>(

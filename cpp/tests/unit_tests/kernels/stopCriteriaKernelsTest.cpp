@@ -33,7 +33,7 @@ using namespace tensorrt_llm::runtime;
 namespace
 {
 
-// TODO(nkorobov): add tests for numNewTokens for EOS and seqLenLimit
+// TODO: add tests for numNewTokens for EOS and seqLenLimit
 
 class StopCriteriaKernelsTest : public testing::Test
 {

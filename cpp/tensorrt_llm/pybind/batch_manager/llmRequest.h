@@ -50,6 +50,7 @@ public:
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
+    // 45 parameters
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -72,25 +73,65 @@ public:
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
+        tb::LlmRequestType llmRequestType = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
-        : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
-            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
-                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            promptEmbeddingTable, promptVocabSize, mropeRotaryCosSin, mropePositionDeltas, loraTaskId, loraWeights,
-            loraConfig, lookaheadConfig, kvCacheRetentionConfig, returnLogProbs, returnContextLogits,
-            returnGenerationLogits,
-            draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
-                                    : std::make_shared<VecTokens>(),
-            draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,
-            encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
-                               : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
-            tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-            inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
-                               : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            numReturnSequences, std::nullopt, skipCrossAttnBlocks)
+        std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
+        std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
+        : Base(requestId,                                                                                        //
+            maxNewTokens,                                                                                        //
+            std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                  //
+            samplingConfig,                                                                                      //
+            isStreaming,                                                                                         //
+            endId,                                                                                               //
+            padId,                                                                                               //
+            embeddingBias,                                                                                       //
+            badWordsList,                                                                                        //
+            stopWordsList,                                                                                       //
+            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))  //
+                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),     //
+            promptEmbeddingTable,                                                                                //
+            promptVocabSize,                                                                                     //
+            mropeRotaryCosSin,                                                                                   //
+            mropePositionDeltas,                                                                                 //
+            loraTaskId,                                                                                          //
+            loraWeights,                                                                                         //
+            loraConfig,                                                                                          //
+            lookaheadConfig,                                                                                     //
+            kvCacheRetentionConfig,                                                                              //
+            returnLogProbs,                                                                                      //
+            returnContextLogits,                                                                                 //
+            returnGenerationLogits,                                                                              //
+            draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))                //
+                                    : std::make_shared<VecTokens>(),                                             //
+            draftLogits,                                                                                         //
+            excludeInputFromOutput,                                                                              //
+            logitsPostProcessor,                                                                                 //
+            applyLogitsPostProcessorBatched,                                                                     //
+            encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens))) //
+                               : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),                        //
+            returnEncoderOutput,                                                                                 //
+            clientId,                                                                                            //
+            priority,                                                                                            //
+            encoderInputFeatures,                                                                                //
+            encoderOutputLength,                                                                                 //
+            crossAttentionMask,                                                                                  //
+            llmRequestType,                                                                                      //
+            inputTokenExtraIds                                                                                   //
+                ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))         //
+                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),                                //
+            numReturnSequences,                                                                                  //
+            eagleConfig,                                                                                         //
+            skipCrossAttnBlocks,                                                                                 //
+            returnPerfMetrics,                                                                                   //
+            guidedDecodingParams,                                                                                //
+            languageAdapterUid,                                                                                  //
+            allottedTimeMs,                                                                                      //
+            contextPhaseParams                                                                                   //
+        )
     {
     }
 

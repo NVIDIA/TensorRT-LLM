@@ -2,7 +2,6 @@
 """Logic for parsing test lists."""
 
 import array
-import enum
 import json
 import os
 import re
@@ -290,7 +289,7 @@ def get_test_name_corrections(
     return ret
 
 
-class TestCorrectionMode(enum.IntEnum):
+class TestCorrectionMode:
     """Enum describing the different test correction modes supported by get_test_name_corrections_v2."""
 
     EXACT_MATCH = 0  # Filters specify exact matches

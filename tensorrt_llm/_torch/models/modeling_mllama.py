@@ -26,9 +26,11 @@ from tqdm import tqdm
 from ..attention_backend.interface import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
+from ..modules.gated_mlp import GatedMLP
 from ..modules.logits_procesor import LogitsProcessor
-from .modeling_llama import LlamaDecoderLayer
+from .modeling_llama import LlamaAttention
 from .modeling_utils import duplicate_kv_weight, register_auto_model
 
 
@@ -61,6 +63,79 @@ class RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+class MllamaDecoderLayer(DecoderLayer):
+
+    def __init__(
+        self,
+        config: ModelConfig[config_mllama.MllamaConfig],
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        pretrained_config = config.pretrained_config
+        # llama_config for reusing the LlamaAttention
+        llama_config = ModelConfig(
+            pretrained_config=pretrained_config.text_config,
+            mapping=config.mapping,
+            quant_config=config.quant_config,
+            quant_config_dict=config.quant_config_dict,
+            attn_backend=config.attn_backend)
+        llama_config.pretrained_config.attention_bias = False
+        llama_config.pretrained_config.mlp_bias = False
+
+        self.layer_idx = layer_idx
+
+        self.self_attn = LlamaAttention(
+            llama_config,
+            layer_idx=layer_idx,
+        )
+
+        self.mlp = GatedMLP(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            intermediate_size=llama_config.pretrained_config.intermediate_size,
+            bias=llama_config.pretrained_config.mlp_bias,
+            dtype=llama_config.pretrained_config.torch_dtype,
+            config=llama_config,
+        )
+        self.input_layernorm = RMSNorm(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            eps=llama_config.pretrained_config.rms_norm_eps,
+            dtype=llama_config.pretrained_config.torch_dtype)
+
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            eps=llama_config.pretrained_config.rms_norm_eps,
+            dtype=llama_config.pretrained_config.torch_dtype)
+
+    def forward(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+
 class MllamaTextModel(nn.Module):
 
     def __init__(
@@ -71,16 +146,6 @@ class MllamaTextModel(nn.Module):
         super().__init__()
         pretrained_config = config.pretrained_config
         text_config = pretrained_config.text_config
-        # llama_config for reusing the LlamaDecoderLayer
-        llama_config = ModelConfig(
-            pretrained_config=pretrained_config.text_config,
-            mapping=config.mapping,
-            quant_config=config.quant_config,
-            quant_config_dict=config.quant_config_dict,
-            attn_backend=config.attn_backend)
-        llama_config.pretrained_config.attention_bias = False
-        llama_config.pretrained_config.mlp_bias = False
-
         self.padding_id = text_config.pad_token_id
         self.vocab_size = text_config.vocab_size
         self.embed_tokens = Embedding(
@@ -97,8 +162,7 @@ class MllamaTextModel(nn.Module):
                 # TODO: Cross-attention decoder layer impl.
                 layers.append(None)
             else:
-                layers.append(
-                    LlamaDecoderLayer(llama_config, layer_idx=layer_id))
+                layers.append(MllamaDecoderLayer(config, layer_idx=layer_id))
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size=text_config.hidden_size,
@@ -123,7 +187,7 @@ class MllamaTextModel(nn.Module):
         for _, decoder_layer in enumerate(self.layers):
             if decoder_layer == None:
                 assert skip_cross_attention == True, 'Cross-attention is not supported yet'
-            elif isinstance(decoder_layer, LlamaDecoderLayer):
+            elif isinstance(decoder_layer, MllamaDecoderLayer):
                 hidden_states, residual = decoder_layer(
                     position_ids=positions,
                     hidden_states=hidden_states,

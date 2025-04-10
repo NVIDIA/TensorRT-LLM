@@ -19,7 +19,6 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              userbuffers_allreduce_finalize)
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -31,14 +30,17 @@ MPI.pickle.__init__(
 )
 
 
-def init_runtime(tp_size, max_ub_size, init_fp4_ub=False):
-    ub.ub_initialize(tp_size)
-    allocated_buffer_0 = ub.ub_allocate(0, max_ub_size)
-    allocated_buffer_1 = ub.ub_allocate(1, max_ub_size)
-    if init_fp4_ub:
-        allocated_buffer_2 = ub.ub_allocate(2, max_ub_size)
-        return allocated_buffer_0, allocated_buffer_1, allocated_buffer_2
-    return allocated_buffer_0, allocated_buffer_1
+def init_userbuffers_allocator(tp_size, rank, max_ub_size):
+    ub.initialize_userbuffers_manager(tp_size, 1, 1, rank,
+                                      torch.cuda.device_count(), max_ub_size)
+
+
+def create_userbuffers_tensor(shape, dtype):
+    # WAR pickle error
+    def func(shape, dtype):
+        return torch.ops.trtllm.create_userbuffers_tensor(shape, dtype)
+
+    return func(shape, dtype)
 
 
 def quant(input, scale):
@@ -75,28 +77,22 @@ def run_single_rank(tensor_parallel_size, a, b, c):
         ref = torch.matmul(a, b) + c
 
         ub_size = c.nelement() * c.element_size()
-        ub0_addr, ub1_addr = init_runtime(tensor_parallel_size, ub_size)
-        assert ub.ub_is_initialized()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
 
-        ub0 = ub.ub_get(0)
-        assert not ub0.invalid()
-        assert ub0_addr == ub0.addr
-        ub1 = ub.ub_get(1)
-        assert not ub1.invalid()
-        assert ub1_addr == ub1.addr
+        def run_ub_impl(a, b, c):
+            ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
+            ub1_tensor = create_userbuffers_tensor(c.size(), a.dtype)
+            assert ub0_tensor is not None
+            assert ub1_tensor is not None
+            internal = torch.matmul(a, b, out=ub0_tensor)
+            res = torch.add(internal, c, out=ub1_tensor)
+            return res
 
-        ub0_tensor = convert_to_torch_tensor(
-            TensorWrapper(ub0.addr, a.dtype, c.size()))
-        ub1_tensor = convert_to_torch_tensor(
-            TensorWrapper(ub1.addr, a.dtype, c.size()))
-        internal = torch.matmul(a, b, out=ub0_tensor)
-        res = torch.add(internal, c, out=ub1_tensor)
+        res = run_ub_impl(a, b, c)
+        res = run_ub_impl(a, b, c)
 
         torch.cuda.synchronize()
         torch.testing.assert_close(ref, res)
-
-        ub.ub_deallocate(ub0_addr)
-        ub.ub_deallocate(ub1_addr)
 
     except Exception:
         traceback.print_exc()
@@ -122,14 +118,9 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
         gamma = gamma.cuda()
 
         ub_size = c.nelement() * c.element_size()
-        ub0_addr, ub1_addr = init_runtime(tensor_parallel_size, ub_size)
-        assert ub.ub_is_initialized()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
 
-        ub0 = ub.ub_get(0)
-        assert not ub0.invalid()
-        assert ub0_addr == ub0.addr
-        ub0_tensor = convert_to_torch_tensor(
-            TensorWrapper(ub0.addr, a.dtype, c.size()))
+        ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
         parallel_config = ParallelConfig(
             tensor_parallel_rank=rank,
@@ -218,14 +209,9 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
         scale = scale.cuda()
 
         ub_size = c.nelement() * c.element_size()
-        ub0_addr, ub1_addr = init_runtime(tensor_parallel_size, ub_size)
-        assert ub.ub_is_initialized()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
 
-        ub0 = ub.ub_get(0)
-        assert not ub0.invalid()
-        assert ub0_addr == ub0.addr
-        ub0_tensor = convert_to_torch_tensor(
-            TensorWrapper(ub0.addr, a.dtype, c.size()))
+        ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
         parallel_config = ParallelConfig(
             tensor_parallel_rank=rank,
@@ -239,8 +225,8 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
             norm_weight=gamma,
             scale=scale,
             eps=eps)
-        q_res, residual = ar.forward(hidden, all_reduce_params=ar_params)
-        res = dequant(q_res, scale, torch.float16)
+        res, residual = ar.forward(hidden, all_reduce_params=ar_params)
+        res = dequant(res, scale, torch.float16)
         residual = userbuffers_allreduce_finalize(residual, False)
 
         torch.cuda.synchronize()
@@ -273,7 +259,7 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-def test_user_buffers():
+def test_user_buffers_basic():
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float32
@@ -462,8 +448,7 @@ def run_single_rank_ub_pass(
         dtype = input.dtype
         input = input.cuda()
         ub_size = input.nelement() * input.element_size()
-        ub0_addr, ub1_addr = init_runtime(tensor_parallel_size, ub_size)
-        assert ub.ub_is_initialized()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
         model = UBTestModel(
             tensor_parallel_size, rank, hidden_size, dtype, eps,
             quant(l0_weight, l0_weight_scale), l0_input_scale, l0_weight_scale,
@@ -477,9 +462,11 @@ def run_single_rank_ub_pass(
         with torch.inference_mode():
             output_fused = model_opt(input)
         # 3 AR_NORM fusion happens first
-        # 2 can be replaced with UB AR + UB AG
-        # 1 UB AG can be fused into UB AR
-        assert backend.match_count == [3, 2, 1, 0]
+        # 2 AR_NORM fused with Quant
+        # 1 AR_NORM replacement
+        # 3 Scaled MM Prologue
+        # 2 UB Finalize Removal
+        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -494,8 +481,7 @@ def run_single_rank_ub_pass(
                         in_s,
                         w_s,
                         bias=None,
-                        out_dtype=dtype,
-                        userbuffers_id=-1) for i in range(0, len(xs))
+                        out_dtype=dtype) for i in range(0, len(xs))
                 ]
                 y = ys[0]
                 for i in range(1, tensor_parallel_size):
@@ -510,8 +496,7 @@ def run_single_rank_ub_pass(
                                                       in_s,
                                                       w_s,
                                                       bias=None,
-                                                      out_dtype=dtype,
-                                                      userbuffers_id=-1)
+                                                      out_dtype=dtype)
                     for i in range(0, len(ws))
                 ]
                 return ys
@@ -619,15 +604,9 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
         internal_global_sf = internal_global_sf.cuda()
 
         ub_size = c.nelement() * c.element_size()
-        ub0_addr, ub1_addr, ub2_addr = init_runtime(tensor_parallel_size,
-                                                    ub_size, True)
-        assert ub.ub_is_initialized()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
 
-        ub0 = ub.ub_get(0)
-        assert not ub0.invalid()
-        assert ub0_addr == ub0.addr
-        ub0_tensor = convert_to_torch_tensor(
-            TensorWrapper(ub0.addr, a.dtype, c.size()))
+        ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
         parallel_config = ParallelConfig(
             tensor_parallel_rank=rank,
@@ -702,5 +681,134 @@ def test_user_buffers_ar_rms_norm_fp4(mnk):
             run_single_rank_ar_rms_norm_fp4,
             *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
                  tensor_parallel_size))
+        for r in results:
+            assert r is True
+
+
+class UBMMAddModel(nn.Module):
+
+    def __init__(self, tp_size, rank, hidden_size, dtype, eps, norm0_gamma,
+                 norm1_gamma, norm2_gamma):
+        super().__init__()
+        self.tp_size = tp_size
+        self.rank = rank
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.ar_0 = AllReduce(
+            ParallelConfig(tensor_parallel_size=tp_size,
+                           tensor_parallel_rank=rank,
+                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
+        self.ar_1 = AllReduce(
+            ParallelConfig(tensor_parallel_size=tp_size,
+                           tensor_parallel_rank=rank,
+                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
+        self.ar_2 = AllReduce(
+            ParallelConfig(tensor_parallel_size=tp_size,
+                           tensor_parallel_rank=rank,
+                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
+        self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+        self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+        self.norm2 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+        self.norm0.weight.data.copy_(norm0_gamma)
+        self.norm1.weight.data.copy_(norm1_gamma)
+        self.norm2.weight.data.copy_(norm2_gamma)
+
+    def forward(self, mm0_input_0, mm0_input_1, mm1_input_0, mm1_input_1,
+                residual_0, residual_1):
+        mm0_output = torch.matmul(mm0_input_0, mm0_input_1)
+        ar0_output = self.ar_0(mm0_output)
+        ar0_add = ar0_output + residual_0
+        norm0_output = self.norm0(ar0_add)
+
+        mm1_output = torch.matmul(mm1_input_0, mm1_input_1)
+        ar1_output = self.ar_1(mm1_output)
+        ar1_add = ar1_output + residual_1
+        norm1_output = self.norm1(ar1_add)
+        sum = norm0_output + norm1_output
+        ar2_output = self.ar_2(sum)
+        ar2_add = ar2_output + ar1_add
+        return self.norm2(ar2_add)
+
+
+def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
+                                   hidden_size, dtype, norm0_gamma, norm1_gamma,
+                                   norm2_gamma):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        support = ub.ub_supported()
+        if not support:
+            return True
+
+        eps = 1e-6
+
+        mm0_input_0 = torch.randn((num_tokens, hidden_size), dtype=dtype).cuda()
+        mm0_input_1 = torch.randn((hidden_size, hidden_size),
+                                  dtype=dtype).cuda()
+        mm1_input_0 = torch.randn((num_tokens, hidden_size), dtype=dtype).cuda()
+        mm1_input_1 = torch.randn((hidden_size, hidden_size),
+                                  dtype=dtype).cuda()
+        residual_0 = torch.randn((num_tokens, hidden_size), dtype=dtype).cuda()
+        residual_1 = torch.randn((num_tokens, hidden_size), dtype=dtype).cuda()
+
+        ub_size = mm0_input_0.nelement() * mm0_input_0.element_size()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+        model = UBMMAddModel(tensor_parallel_size, rank, hidden_size, dtype,
+                             eps, norm0_gamma, norm1_gamma, norm2_gamma)
+        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        model_opt = torch.compile(model, backend=backend, fullgraph=True)
+        with torch.inference_mode():
+            output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
+                                     mm1_input_1, residual_0, residual_1)
+            torch.cuda.synchronize()
+            del output_fused
+            # Run twice
+            output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
+                                     mm1_input_1, residual_0, residual_1)
+            torch.cuda.synchronize()
+            output_ref = model(mm0_input_0, mm0_input_1, mm1_input_0,
+                               mm1_input_1, residual_0, residual_1)
+        # 3 AR_NORM fusion happens first
+        # 0 AR_NORM fused with Quant
+        # 3 AR_NORM replacement
+        # 3 Prologue
+        # 1 UB Finalize Removal
+        assert backend.match_count == [3, 0, 0, 3, 0, 3, 0, 1, 0]
+        torch.cuda.synchronize()
+
+        if rank == 0:
+            torch.testing.assert_close(output_fused,
+                                       output_ref,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+    except Exception:
+        traceback.print_exc()
+
+        return False
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("hidden", [512, 32], ids=lambda x: f"_hidden{x}")
+@pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                         ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
+    torch.manual_seed(42)
+    tensor_parallel_size = 2
+
+    norm0_gamma = torch.randn((hidden, ), dtype=dtype)
+    norm1_gamma = torch.randn((hidden, ), dtype=dtype)
+    norm2_gamma = torch.randn((hidden, ), dtype=dtype)
+
+    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
+        results = executor.map(
+            run_single_rank_ub_mm_add_pass,
+            *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
+                    norm1_gamma, norm2_gamma)] * tensor_parallel_size))
         for r in results:
             assert r is True

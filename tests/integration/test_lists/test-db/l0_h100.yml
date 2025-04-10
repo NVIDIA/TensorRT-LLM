@@ -17,14 +17,57 @@ l0_h100:
   # Only key models in H100: llama/mixtral/nemotron/deepseek
   - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
   - unittest/_torch -k "modeling_llama"
-  - unittest/_torch/multi_gpu_modeling -k "llama and tp1 and pp1"
+  - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_nemotron"
-  - unittest/_torch/multi_gpu_modeling -k "deepseek and tp1 and nextn0"
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[attn_backend=TRTLLM-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[attn_backend=FLASHINFER-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv-attn_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv-attn_backend=TRTLLM-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv-attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv-attn_backend=FLASHINFER-torch_compile]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[attention_dp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[cuda_graph]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[attention_dp-cuda_graph-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=2]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=2-attention_dp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=2-cuda_graph]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=2-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-instruct-hf-fp8-True-True]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-True-True-DeepSeek-V3-Lite-fp8/fp8]
+
 - condition:
     ranges:
       system_gpu_count:
@@ -121,6 +164,30 @@ l0_h100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[attention_dp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[cuda_graph]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[attention_dp-cuda_graph-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-cuda_graph]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
@@ -140,7 +207,9 @@ l0_h100:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8] # 9 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
   - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins

@@ -58,9 +58,8 @@ std::optional<tb::LlmRequest::LogitsPostProcessor> LlmRequest::callbackAdapter(
         return std::nullopt;
     }
 
-    return [callback](RequestIdType reqId, tensorrt_llm::runtime::ITensor::SharedPtr& tensor,
-               tensorrt_llm::batch_manager::LlmRequest::BeamTokens const& tokens,
-               tensorrt_llm::runtime::BufferManager::CudaStreamPtr stream, std::optional<RequestIdType> clientId)
+    return [callback](RequestIdType reqId, tr::ITensor::SharedPtr& tensor, tb::LlmRequest::BeamTokens const& tokens,
+               tr::BufferManager::CudaStreamPtr stream, std::optional<RequestIdType> clientId)
     {
         at::Tensor atTensor = tr::Torch::tensor(tensor);
         callback.value()(reqId, atTensor, tokens, runtime::TorchUtils::stream(*stream).unwrap(), clientId);
@@ -69,26 +68,59 @@ std::optional<tb::LlmRequest::LogitsPostProcessor> LlmRequest::callbackAdapter(
 
 std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
 {
-    auto embeddingBias = from_torch(mEmbeddingBias);
-    auto badWordsList = from_torch(mBadWordsList);
-    auto stopWordsList = from_torch(mStopWordsList);
-    auto promptEmbeddingTable = from_torch(mPromptEmbeddingTable);
-    auto mropeRotaryCosSin = from_torch(mMropeRotaryCosSin);
 
-    auto loraWeights = from_torch(mLoraWeights);
-    auto loraConfig = from_torch(mLoraConfig);
-    auto draftLogits = from_torch(mDraftLogits);
-    auto encoderInputFeatures = from_torch(mEncoderInputFeatures);
-    auto crossAttentionMask = from_torch(mCrossAttentionMask);
-    auto skipCrossAttnBlocks = from_torch(mSkipCrossAttnBlocks);
-
-    return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
-        std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
-        embeddingBias, badWordsList, stopWordsList, mPositionIds, promptEmbeddingTable, mPromptVocabSize,
-        mropeRotaryCosSin, mMropePositionDeltas, mLoraTaskId, loraWeights, loraConfig, mLookaheadConfig,
-        mKvCacheRetentionConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens,
-        draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched,
-        mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority, encoderInputFeatures, mEncoderOutputLength,
-        crossAttentionMask, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, mInputTokenExtraIds,
-        mNumReturnSequences, std::nullopt, skipCrossAttnBlocks);
+    auto const draftTokens = std::make_shared<std::vector<TokenIdType>>(*mDraftTokens.get());
+    auto const optDraftTokens = std::optional<std::shared_ptr<std::vector<TokenIdType>>>(draftTokens);
+    auto const encoderInputTokens = mEncoderTokens.has_value()
+        ? std::make_shared<std::vector<TokenIdType>>(*mEncoderTokens.value().get())
+        : nullptr;
+    auto const optEncoderInputTokens = std::optional<std::shared_ptr<std::vector<TokenIdType>>>(encoderInputTokens);
+    // 45 parameters
+    return std::make_shared<tb::LlmRequest>(                       //
+        mRequestId,                                                //
+        mMaxNewTokens,                                             //
+        std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), //
+        mSamplingConfig,                                           //
+        mIsStreaming,                                              //
+        mEndId,                                                    //
+        mPadId,                                                    //
+        from_torch(mEmbeddingBias),                                //
+        from_torch(mBadWordsList),                                 //
+        from_torch(mStopWordsList),                                //
+        mPositionIds,                                              //
+        from_torch(mPromptEmbeddingTable),                         //
+        mPromptVocabSize,                                          //
+        from_torch(mMropeRotaryCosSin),                            //
+        mMropePositionDeltas,                                      //
+        mLoraTaskId,                                               //
+        from_torch(mLoraWeights),                                  //
+        from_torch(mLoraConfig),                                   //
+        mLookaheadConfig,                                          //
+        mKvCacheRetentionConfig,                                   //
+        mReturnLogProbs,                                           //
+        mReturnContextLogits,                                      //
+        mReturnGenerationLogits,                                   //
+        optDraftTokens,                                            //
+        from_torch(mDraftLogits),                                  //
+        mExcludeInputFromOutput,                                   //
+        callbackAdapter(mLogitsPostProcessor),                     //
+        mApplyLogitsPostProcessorBatched,                          //
+        optEncoderInputTokens,                                     //
+        mReturnEncoderOutput,                                      //
+        mClientId,                                                 //
+        mPriority,                                                 //
+        from_torch(mEncoderInputFeatures),                         //
+        mEncoderOutputLength,                                      //
+        from_torch(mCrossAttentionMask),                           //
+        getLlmRequestType(),                                       //
+        std::nullopt,                                              // inputTokenExtraIds
+        mNumReturnSequences,                                       //
+        mEagleConfig,                                              //
+        from_torch(mSkipCrossAttnBlocks),                          //
+        false,                                                     // returnPerfMetrics
+        mGuidedDecodingParams,                                     //
+        mLanguageAdapterUid,                                       //
+        mAllottedTimeMs,                                           //
+        mContextPhaseParams                                        //
+    );
 }

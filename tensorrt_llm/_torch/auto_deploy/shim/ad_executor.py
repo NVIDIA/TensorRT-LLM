@@ -59,7 +59,7 @@ class _CacheManagerWithFakePool(KVCacheManager):
         self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
     ) -> Tuple[int, int]:
         """Calculate the maximum number of blocks needed for the cache."""
-        # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks
+        # TODO: this is VERY hacky... Ideally, we want to compute the number of blocks
         # just like in the original implementation. However, let's wait for the layer-wise attention
         # implementation before over-optimizing the function here
         ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)

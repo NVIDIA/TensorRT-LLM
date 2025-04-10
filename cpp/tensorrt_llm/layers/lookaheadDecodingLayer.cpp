@@ -123,6 +123,7 @@ LookaheadDecodingLayer<T>::LookaheadDecodingLayer(
 
     mSetupWorkspaceSize = DecodingLayerWorkspace::calculateRequiredWorkspaceSize(
         std::make_pair(maxBatchShape1D, nvinfer1::DataType::kINT64));
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -225,7 +226,7 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     TLLM_CHECK_WITH_INFO(inputs->batchSlots, "Batch slots must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(inputs->curTokensPerStep, "curTokensPerStep must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(outputs->sequenceLength, "sequenceLength must be provided for LookaheadDecoding");
-    TLLM_CHECK_WITH_INFO(inputs->logits, "logits must be provided for lookaheadDecoding");
+    TLLM_CHECK_WITH_INFO(inputs->logits, "logits must be provided for LookaheadDecoding");
     TLLM_CHECK_WITH_INFO(inputs->localBatchSize > 0, "batchSize must be");
 
     TopKSamplingKernelParams<T> params;

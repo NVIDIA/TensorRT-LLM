@@ -1098,7 +1098,7 @@ class LlmArgs(BaseModel):
             if self.max_num_tokens:
                 self.build_config.max_num_tokens = self.max_num_tokens
 
-        # TODO(xiweny): remove the checker when manage weights support all data types
+        # TODO: remove the checker when manage weights support all data types
         if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
                                 or self.quant_config.quant_algo is None):
             self._update_plugin_config("manage_weights", True)

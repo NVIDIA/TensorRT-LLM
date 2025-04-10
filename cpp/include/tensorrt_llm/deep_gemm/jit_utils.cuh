@@ -16,12 +16,42 @@
  */
 
 #pragma once
-#include "scheduler.cuh"
 #include <climits>
 #include <cstdint>
+#include <cuda_runtime.h>
+#include <iostream>
+#include <nvrtc.h>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#include "scheduler.cuh"
+
+// Helper function to check NVRTC errors
+#define CHECK_NVRTC(call)                                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        nvrtcResult result = call;                                                                                     \
+        if (result != NVRTC_SUCCESS)                                                                                   \
+        {                                                                                                              \
+            std::cerr << "NVRTC error: " << nvrtcGetErrorString(result) << std::endl;                                  \
+            exit(1);                                                                                                   \
+        }                                                                                                              \
+    } while (0)
+
+// Helper function to check CUDA driver errors
+#define CHECK_CUDA(call)                                                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        CUresult result = call;                                                                                        \
+        if (result != CUDA_SUCCESS)                                                                                    \
+        {                                                                                                              \
+            const char* error_string;                                                                                  \
+            cuGetErrorString(result, &error_string);                                                                   \
+            std::cerr << "CUDA error: " << error_string << std::endl;                                                  \
+            exit(1);                                                                                                   \
+        }                                                                                                              \
+    } while (0)
 
 namespace deep_gemm::jit
 {

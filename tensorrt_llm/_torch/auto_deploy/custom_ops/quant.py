@@ -2,20 +2,16 @@
 
 from typing import Optional
 
-import numpy as np
 import torch
 from torch import nn
+
+from tensorrt_llm._torch.autotuner import autotune
 
 from ..distributed import common as dist
 from ..distributed import trtllm as trtllm_dist
 from .torch_libs.float8_python_api import addmm_float8_unwrapped
 
-try:
-    from tensorrt_llm.quantization.utils.fp4_utils import FP4_BUCKETS as fp4_buckets
-
-    TRTLLM_FP4_OP_AVAILABLE = True
-except ImportError:
-    TRTLLM_FP4_OP_AVAILABLE = False
+TRTLLM_FP4_OP_AVAILABLE = True
 
 TRTLLM_NVFP4_SCALING_VECTOR_SIZE = 16
 
@@ -179,12 +175,6 @@ def fp4_linear(
         The linear output with the original dtype as the input.
     """
     assert TRTLLM_FP4_OP_AVAILABLE, "TRT-LLM FP4 operators are not available."
-    if not hasattr(fp4_linear, "profiler"):
-        fp4_linear.profiler = torch.classes.trtllm.FP4GemmRunner.get_instance(input.dtype)
-        fp4_linear.profile_record = set()
-
-    profiler = fp4_linear.profiler
-    profile_record = fp4_linear.profile_record
 
     input_shape = input.shape
     weight_shape = weight_fp4.shape
@@ -197,12 +187,6 @@ def fp4_linear(
 
     input = input.reshape(-1, k)
 
-    # profile if needed and get the best config
-    if (n, k) not in profile_record:
-        profiler.run_profile(n, k, fp4_buckets)
-        profile_record.add((n, k))
-    best_config_id = profiler.get_best_config_id(np.prod(input_shape[:-1]), n, k)
-
     # FP4 compatibility
     assert input_scale is not None
     assert weight_scale is not None
@@ -211,9 +195,10 @@ def fp4_linear(
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
-    output = profiler.run_gemm(
-        x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, best_config_id
-    )
+    with autotune():
+        output = torch.ops.trtllm.nvfp4_gemm(
+            x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, False, input.dtype
+        )
 
     if bias is not None:
         output = output + bias

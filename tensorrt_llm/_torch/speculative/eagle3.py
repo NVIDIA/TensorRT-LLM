@@ -59,7 +59,7 @@ class Eagle3SpecMetadata(SpecMetadata):
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:
         if layer_id in self.layers_to_capture:
-            # TODO(miovine): write directly into a pre-allocated buffer for
+            # TODO: write directly into a pre-allocated buffer for
             # CUDA graph support.
             self.hidden_states.append(hidden_states + residual)
 

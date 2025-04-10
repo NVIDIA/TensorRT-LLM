@@ -85,7 +85,7 @@ void BanWordsLayer<T>::banRepeatNGrams(TensorPtr const& logits, std::shared_ptr<
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     if (useNoRepeatNgramSize)
     {
-        // auto const maxStep = inputs->step; // TODO (bhsueh) Should we use step? but current inputs->step is always 0.
+        // auto const maxStep = inputs->step; // TODO Should we use step? but current inputs->step is always 0.
         auto const maxStep = maxSeqLen;
         // Temporary variables to store dereferenced inputs
         auto logitsPtr = bufferCast<T>(*logits);

@@ -62,27 +62,27 @@ public:
     {
     }
 
-    // mandatory parameters
-    std::vector<TensorPtr>
-        logits; // batchSize * [1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
-
-    // control activity of decoder slots in batch
+    //! Mandatory parameters
+    //! [batchSize][1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
+    std::vector<TensorPtr> logits;
+    //! Control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
-    TensorPtr
-        batchSlots; // [maxTokensPerEngineStep, batchSize], empty buffer filled in GptDecoderBatched, sorted by slots
-    TensorPtr batchSlotsRequestOrder; // [batchSize], filled with slots in request order
+    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep, batchSize]
+    TensorPtr batchSlots;
+    //! Filled with slots in request order, [batchSize]
+    TensorPtr batchSlotsRequestOrder;
 
-    // parameters for beam search
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen] - indices into KV cache of different rays
-                                // within one beam for beam search, on gpu
-    std::vector<std::vector<TensorPtr>>
-        predictedDraftLogits;   // [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    //! For beam search
+    //! Indices into KV cache of different rays within one beam
+    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
+    std::vector<std::vector<TensorPtr>> predictedDraftLogits;
 
-    // explicit draft tokens data.
+    //! Explicit draft tokens data
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
     std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
 
-    // eagle data
+    //! Eagle data
     std::optional<EagleBuffers::EngineOutputs> eagleInputs;
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };

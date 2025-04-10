@@ -47,7 +47,8 @@ def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
     num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
     # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
-    if config.architectures[0] == "Nemotron5ForCausalLM":
+    if config.architectures and config.architectures[
+            0] == "Nemotron5ForCausalLM":
         # attention layers are derived from configuration (hybrid_override_pattern)
         num_hidden_layers = config.hybrid_override_pattern.count("*")
 

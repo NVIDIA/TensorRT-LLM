@@ -195,7 +195,7 @@ def gqa_attention_kv_stage1(
     # [seq_block, V_D_HEAD]
     v = tl.load(v_cache_ptr + v_block_offsets, mask=v_mask, other=0.0)
 
-    # Note(suyogg): check the output precision of the sum.
+    # Note: check the output precision of the sum.
     # compute q*K^T
     # [NUM_HEADS, Q_D_HEAD] * [seq_block, Q_D_HEAD], sum along axis 1
     attn = tl.dot(q, k.trans())  # [N, seq_block]
@@ -308,7 +308,7 @@ def attention_kv_stage1(
     k = tl.load(k_cache_ptr + kv_block_offsets, mask=kv_mask, other=0.0)
     v = tl.load(v_cache_ptr + kv_block_offsets, mask=kv_mask, other=0.0)
 
-    # Note(suyogg): check the output precision of the sum.
+    # Note: check the output precision of the sum.
     # compute q*K^T
     # [D_HEAD] * [seq_block, D_HEAD], sum along axis 1
     attn = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1)  # [seq_block]

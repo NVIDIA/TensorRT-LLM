@@ -252,6 +252,11 @@ def _extract_expert_weights_from_topk(
             if len(node.args) < 2:
                 continue
             arg0, arg1 = node.args[0], node.args[1]
+            if not all(
+                isinstance(arg, torch.fx.Node) and arg.op == "call_function" for arg in (arg0, arg1)
+            ):
+                node = node.next
+                continue
             if _is_routing_weight(arg0) != _is_routing_weight(arg1):
                 candidate_expert_branches.append(arg1 if _is_routing_weight(arg0) else arg0)
 

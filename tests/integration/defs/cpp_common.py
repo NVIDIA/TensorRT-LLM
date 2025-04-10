@@ -20,6 +20,7 @@ default_test_timeout = 3600
 
 include_test_map = {
     "gpt": ("Gpt[^j]", ),
+    "gpt_executor": ("GptExecutor", ),
     "gptj": ("Gptj", ),
     "llama": ("Llama", ),
     "chatglm": ("ChatGlm", ),
@@ -40,6 +41,7 @@ include_test_map = {
 
 def generate_excluded_model_tests() -> Generator[str, None, None]:
     yield "Gpt[^j]"
+    yield "GptExecutor"
     yield "Gptj"
     yield "Llama"
     yield "ChatGlm"
@@ -619,6 +621,10 @@ def prepare_model_tests(model_name: str,
             beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
+    # share the same script for gpt and gpt_executor
+    if model_name == 'gpt_executor':
+        model_name = 'gpt'
+
     build_engines = [
         python_exe,
         str(scripts_dir / f"build_{model_name}_engines.py")
@@ -709,6 +715,9 @@ def run_single_gpu_tests(build_dir: _pl.Path,
     resultFileName = "-".join(fname_list) + ".xml"
 
     excluded_tests = ["FP8"] if not run_fp8 else []
+
+    if "gpt" in test_list and "gpt_executor" not in test_list:
+        excluded_tests.append("GptExecutor")
 
     ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 

@@ -24,8 +24,8 @@ import torch
 from datasets import load_dataset
 from transformers import (AutoModel, AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM, GenerationConfig)
-from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, load_tokenizer,
-                   read_model_name, supports_inflight_batching)
+from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
+                   load_tokenizer, read_model_name, supports_inflight_batching)
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
@@ -143,6 +143,11 @@ def main(args):
         bad_words_list = tensorrt_llm.runtime.decode_words_list(
             args.bad_words, tokenizer)
 
+    if args.beam_width_array is not None:
+        logger.info("Use Variable-Beam-Width-Search")
+        args.beam_width_array, args.num_beams = get_beam_width_array(
+            args.beam_width_array)
+
     num_beams = args.num_beams
     num_return_sequences = args.num_return_sequences
     num_sequences = args.num_return_sequences or num_beams
@@ -151,6 +156,7 @@ def main(args):
     temperature = args.temperature
     length_penalty = args.length_penalty
     early_stopping = args.early_stopping
+    beam_width_array = args.beam_width_array
     repetition_penalty = args.repetition_penalty
     presence_penalty = args.presence_penalty
     frequency_penalty = args.frequency_penalty
@@ -280,6 +286,7 @@ def main(args):
                     num_return_sequences=num_return_sequences,
                     length_penalty=length_penalty,
                     early_stopping=early_stopping,
+                    beam_width_array=beam_width_array,
                     repetition_penalty=repetition_penalty,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,

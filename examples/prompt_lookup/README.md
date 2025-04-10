@@ -4,10 +4,6 @@ This document shows how to build and run a model using Prompt-Lookup speculative
 
 ## Overview
 
-The Prompt-Lookup speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning.
-
-The Prompt-Lookup profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
-
 The Prompt-Lookup has 3 additional hyperparameters that you need to specify to control the process of generation:
 - `prompt_lookup_num_tokens`: the number of tokens we extract from input prompt or previous generated output as draft tokens in one iteration, which the range is from 4 to 10 in common usage. Empirically, the larger the value is, the higher acceptance ratio but higher overhead is expected at the same time, so the right balance based on the models and application scenarios needs to be found.
 - `max_matching_ngram_size`: the number of tokens we get from the tail of the generated output as a pattern, which is used to match in input prompt or previous generated output. Empirically, the larger the value is, the more precise context can be matched from the existed sequence, indicating higher acceptance ratio, but the higher probability of miss-match and higher overhead appear, which fall back to normal generation (one token per iteration).

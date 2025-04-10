@@ -487,7 +487,7 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         // desc_val == -1 means beam_width is not static, we should look at min/max/opt.
         //
         // In prepareEnqueueGeneration, we'll prepare for all cases where beam_width doesn't exceed max.
-        // TODO(minwei): pass min AND max to prepareEnqueueGeneration instead of max only.
+        // TODO: pass min AND max to prepareEnqueueGeneration instead of max only.
         int desc_val = in[getIdx(IdxEntry::CACHE_INDIR)].desc.dims.d[1];
         int max_val = in[getIdx(IdxEntry::CACHE_INDIR)].max.d[1];
         beamWidth = desc_val == -1 ? max_val : desc_val;
@@ -868,8 +868,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         std::int32_t const* host_pool_mapping
             = static_cast<std::int32_t const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)]);
 
-        const int32_t layerToPool = host_pool_mapping[mLayerIdx * 2];
-        const int32_t layerIdxInCachePool = host_pool_mapping[mLayerIdx * 2 + 1];
+        int32_t const layerToPool = host_pool_mapping[mLayerIdx * 2];
+        int32_t const layerIdxInCachePool = host_pool_mapping[mLayerIdx * 2 + 1];
         TLLM_LOG_TRACE("Layer%d: LayerCachePoolLocator{.indexOfPool=%d, .layerIdxInCachePool=%d}", mLayerIdx,
             layerToPool, layerIdxInCachePool);
         auto const seqStride = getStride(kvCacheBlockOffsetsShape, 1);

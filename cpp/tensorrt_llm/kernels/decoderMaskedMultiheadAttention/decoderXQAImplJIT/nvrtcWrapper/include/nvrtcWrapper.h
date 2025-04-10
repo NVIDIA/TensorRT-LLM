@@ -61,6 +61,7 @@ extern "C"
         unsigned int beam_width;
         unsigned int tokens_per_block;
         bool multi_query_tokens;
+        unsigned int q_seq_len;
         bool paged_kv_cache;
 
         // Actual type: tensorrt_llm::kernels::Data_type
