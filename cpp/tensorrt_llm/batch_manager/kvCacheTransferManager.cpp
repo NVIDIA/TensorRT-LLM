@@ -198,11 +198,21 @@ void KVCacheTransferManager::copyBlock(
         auto srcPtr = computeBlockPointer(src, pools, poolIdx);
         auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
+        TLLM_CHECK_WITH_INFO(directory.has_value(),
+        "Expected a directory path for KVCache offload, but none was provided.");
+    
         int size = std::snprintf(nullptr, 0,
-            "/mnt/weka/block_%d_pool_%zu.bin", src->getBlockId(), poolIdx);
+            "%s/block_%d_pool_%zu.bin",
+            directory.value().c_str(),
+            src->getBlockId(),
+            poolIdx);
+        
         std::string filename(size + 1, '\0');
         std::snprintf(filename.data(), filename.size(),
-            "/mnt/weka/block_%d_pool_%zu.bin", src->getBlockId(), poolIdx);
+            "%s/block_%d_pool_%zu.bin",
+            directory.value().c_str(),
+            src->getBlockId(),
+            poolIdx);
 
         if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
