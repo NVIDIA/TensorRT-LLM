@@ -974,6 +974,8 @@ def build_phi_engine(args):
         }
     }
     to_json_file(config_args, args.output_dir + "/config.json")
+    to_json_file(config_args, args.output_dir + "audio/config.json")
+    to_json_file(config_args, args.output_dir + "vision/config.json")
     return
 
     processor = AutoProcessor.from_pretrained(args.model_path,
@@ -1019,6 +1021,24 @@ def build_phi_engine(args):
 
 
 def build_phi4mm_engine(args):
+    logger.warning(
+        "Skipping TRT engine build for Phi-4-multimodal encoder.  MultimodalModelRunner will use PyTorch vision & audio encoder. Flash/SDPA attention in CLIP encoder is not compatible with torch.onnx.export and eager attention is unstable in PyTorch."
+    )
+
+    # Dump config.json needed by model runner
+    config_args = {
+        "builder_config": {
+            "precision": torch_dtype_to_str(torch.float16),
+            "model_type": "phi-4-multimodal",
+        }
+    }
+    os.makedirs(os.path.join(args.output_dir, "vision"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "audio"), exist_ok=True)
+    to_json_file(config_args, args.output_dir + "vision/config.json")
+    to_json_file(config_args, args.output_dir + "audio/config.json")
+    
+    return
+
     processor = AutoProcessor.from_pretrained(args.model_path,
                                               trust_remote_code=True)
     raw_image = Image.new('RGB', [10, 10])  # dummy image
