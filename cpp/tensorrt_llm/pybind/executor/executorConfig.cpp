@@ -496,7 +496,8 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
                  std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
                  bool,                                                   // GatherGenerationLogits
-                 bool                                                    // UseVariableBeamWidthSearch
+                 bool,                                                   // UseVariableBeamWidthSearch
+                 bool                                                    // PromptTableOffloading
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -515,8 +516,13 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
+<<<<<<< HEAD
             py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
             py::arg("use_variable_beam_width_search") = false)
+=======
+            py::arg("additional_output_names") = py::none(), py::arg("gather_generation_logits") = false,
+            py::arg("use_variable_beam_width_search") = false, py::arg("mm_embedding_offloading") = false)
+>>>>>>> 102a20d7 (Update Readme for multimodal and add a new param mm_embedding_offloading)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -562,6 +568,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setGatherGenerationLogits)
         .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
+        .def_property("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
+            &tle::ExecutorConfig::setPromptTableOffloading)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 

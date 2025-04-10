@@ -38,7 +38,7 @@ public:
     runtime::PromptTuningParams mPromptTuningParams;
     SizeType32 mMaxPromptVocabSize;
 
-    bool runtimeIsChunkedContext;
+    bool mPromptTableOffloading;
 
     bool mChunkPtableInitialized{false};
     std::optional<std::array<TensorPtr, 2>> mChunkPtableBuffers;
@@ -47,6 +47,9 @@ public:
 
     PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
+
+    PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
+        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, bool promptTableOffloading);
 
     void validate(std::optional<TensorPtr> const& optReqPromptEmbeddingTable,
         std::optional<SizeType32> const& optReqPromptVocabSize);
