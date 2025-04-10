@@ -42,9 +42,6 @@
 #include "cute/tensor.hpp"
 #include "cutlass/trace.h"
 
-#include "cutlass_extensions/arch/copy_red_global.hpp"
-#include "cutlass_extensions/util/gather_tensor.hpp"
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass
