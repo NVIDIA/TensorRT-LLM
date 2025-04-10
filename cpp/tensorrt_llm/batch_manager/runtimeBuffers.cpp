@@ -55,12 +55,16 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens,
     std::optional<std::vector<std::string>> const& additionalOutputNames)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     create(maxBatchSize, maxBeamWidth, maxAttentionWindowVec, maxAttentionWindow, sinkTokenLen, runtime, modelConfig,
         worldConfig, decodingConfig, gatherGenerationLogits, additionalOutputNames);
 
     // pre-allocate
     setMaxBufferSizes(maxBatchSize, maxBeamWidth, modelConfig, maxNumTokens);
     reshape(runtime, modelConfig, worldConfig, gatherGenerationLogits);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 RuntimeBuffers::~RuntimeBuffers() = default;
@@ -209,6 +213,8 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits,
     std::optional<std::vector<std::string>> const& additionalOutputNames)
 {
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto const& manager = runtime.getBufferManager();
     auto const& engine = runtime.getEngine();
 
@@ -237,7 +243,7 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     seqSlotRemappingHost = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     seqSlotRemappingDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
-    // TODO check which tensors can be allocated as pinned for max size
+    // TODO: check which tensors can be allocated as pinned for max size
     requestTypes = manager.emptyTensor(MemoryType::kCPU, TRTDataType<runtime::RequestType>::value);
 
     contextLengthsHost = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
@@ -314,19 +320,16 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         medusaBuffers = std::make_unique<MedusaBuffers>(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
-
-    if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+    else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
     {
         lookaheadBuffers.emplace(
             maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
     }
-
-    if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
+    else if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
     {
         explicitDraftTokensBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig);
     }
-
-    if (modelConfig.getSpeculativeDecodingMode().isEagle())
+    else if (modelConfig.getSpeculativeDecodingMode().isEagle())
     {
         eagleBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
     }
@@ -342,6 +345,8 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         auto const dataType = engine.getTensorDataType(outputTensorName.c_str());
         mAdditionalOutputTensors.emplace(outputTensorName, manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
     }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void RuntimeBuffers::setMaxBufferSizes(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -349,23 +354,21 @@ void RuntimeBuffers::setMaxBufferSizes(SizeType32 maxBatchSize, SizeType32 maxBe
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    // maxNumSequences is reached when all requests are in generation
+    // `maxNumSequences` is reached when all requests are in generation
     numContextRequests = 0;
     numGenRequests = maxBatchSize;
     numGenSequences = maxBatchSize * maxBeamWidth;
 
     auto const maxDraftTokens = modelConfig.getMaxDecodingDraftTokens();
+    // Draft-Tokens and Beam-Search are mutually exclusive
+    numLogits = maxBatchSize * std::max(1 + maxDraftTokens, maxBeamWidth);
+    auto const maxNumModelTokens = modelConfig.getMaxNumTokens();
     auto const maxNumContextTokens = maxBatchSize * modelConfig.getMaxInputLen();
-    auto const maxNumGenTokens = maxBatchSize * std::max(1 + maxDraftTokens, maxBeamWidth);
-    auto maxNumModelTokens = modelConfig.getMaxNumTokens();
-    // this is only used for computeContextLogits, do not set here
-    numContextTokens = 0;
-    // set maxNumTokens for pre-allocation
+    auto const maxNumGenTokens = numLogits;
+    // For pre-allocation
+    numContextTokens = 0; // Set in `setBufferSizes` rather than here for `computeContextLogits`
     numGenTokens
         = maxNumRuntimeTokens.value_or(maxNumModelTokens.value_or(std::max(maxNumContextTokens, maxNumGenTokens)));
-
-    // Draft tokens cannot be combined with beam search
-    numLogits = maxBatchSize * std::max(1 + maxDraftTokens, maxBeamWidth);
 
     if (modelConfig.useCrossAttention())
     {
@@ -458,7 +461,8 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     auto const& manager = runtime.getBufferManager();
     auto const& stream = runtime.getStream();
 
-    { // fill requestTypes
+    // Fill requestTypes
+    {
         auto* hostRequestTypes = bufferCast<runtime::RequestType>(*requestTypes);
         std::fill_n(hostRequestTypes, numContextRequests, runtime::RequestType::kCONTEXT);
         std::fill_n(hostRequestTypes + numContextRequests, numGenSequences, runtime::RequestType::kGENERATION);
@@ -480,7 +484,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     bool const isChatGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kChatGlm;
     bool const isGlm = modelConfig.getModelVariant() == ModelConfig::ModelVariant::kGlm;
     auto const mropeRotaryCosSinSize = modelConfig.getMaxPositionEmbeddings() * modelConfig.getRotaryEmbeddingDim();
-    bool isSkipCrossAttn = true;
 
     {
         NVTX3_SCOPED_RANGE(seqSlotsLoop);
@@ -553,9 +556,9 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             }
             else
             {
-                if (isChatGlm) // ChatGLM-6B
+                if (isChatGlm)
                 {
-                    // Using 2D Position Encoding, shape of positionIds is doubled than gpt.
+                    // Specialize for ChatGLM-6B with 2D-Position-Embedding
                     positionIdsHost.resize(totalInputSize + inputLength);
                     std::iota(std::begin(positionIdsHost) + totalInputSize, std::end(positionIdsHost), 0);
                     positionIdsHost.back() = positionIdsHost.back() - 1;
@@ -565,21 +568,13 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                 }
                 else if (isGlm)
                 {
-                    // iterate over inputIds to find mask id position
+                    // Specialize for GLM-10B with 2D-Position-Embedding and special value of the mask id position
                     auto start = inputHost.begin() + totalInputSize;
                     auto end = start + inputLength;
                     auto it = std::find_if(
                         start, end, [](SizeType32 id) { return id == 50260 || id == 50263 || id == 50264; });
-                    if (it != end)
-                    {
-                        llmReq->mMaskPosition = std::distance(start, it);
-                    }
-                    else
-                    {
-                        llmReq->mMaskPosition = maxContextLength;
-                    }
+                    llmReq->mMaskPosition = (it != end) ? std::distance(start, it) : maxContextLength;
 
-                    // Using 2D Position Encoding, shape of positionIds is doubled than gpt.
                     positionIdsHost.resize(totalInputSize + inputLength);
                     std::iota(std::begin(positionIdsHost) + totalInputSize, std::end(positionIdsHost), 0);
                     positionIdsHost.back() = llmReq->mMaskPosition;
@@ -587,8 +582,9 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
                     positionIdsHostRow2.resize(totalInputSize + inputLength);
                     positionIdsHostRow2.back() = 1;
                 }
-                else // GPT / ChatGLM2-6B / ChatGLM3-6B
+                else
                 {
+                    // Other models
                     positionIdsHost.resize(totalInputSize + inputLength);
                     std::iota(std::begin(positionIdsHost) + totalInputSize,
                         std::begin(positionIdsHost) + totalInputSize + inputLength, beginCompute);
@@ -647,13 +643,11 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             auto const promptLen = llmReq->mPromptLen;
             auto const sequenceLen = promptLen + llmReq->getMaxNumGeneratedTokens();
             auto const& positionIds = llmReq->getPositionIds();
-
             for (int beam = 0; beam < reqBeamWidth; ++beam)
             {
                 auto const lastToken = llmReq->getLastTokens(beam);
                 auto const numTokens = llmReq->getNumTokens(beam);
                 inputHost.push_back(lastToken);
-
                 // If model updates generation position ids do not append them here.
                 if (!modelConfig.getSpeculativeDecodingMode().updatesPositionIds())
                 {
@@ -770,6 +764,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     // check skipCrossAttnBlocks
     if (transformerBuffers && modelConfig.skipCrossAttnBlocks())
     {
+        bool isSkipCrossAttn = true;
         for (auto const& requests : {contextRequests, genRequests})
         {
             for (auto const& llmReq : requests)
@@ -803,7 +798,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     {
         loraBuffers->fill(contextRequests, genRequests, peftTable, manager, modelConfig, worldConfig);
     }
-
     if (modelConfig.useMrope())
     {
         if (!mropePositionDeltasHost.empty())
@@ -982,7 +976,6 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     {
         encoderBuffers->insertInputTensors(inputMap);
     }
-
     if (modelConfig.usePromptTuning())
     {
         auto const& promptTuningParams = promptTuningBuffers->mPromptTuningParams;
@@ -996,13 +989,11 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
         inputMap.insert_or_assign(kMRopeRotaryCosSinTensorName, mropeRotaryCosSin);
         inputMap.insert_or_assign(kMRopePositionDeltasTensorName, mropePositionDeltas);
     }
-
     if (modelConfig.useLoraPlugin())
     {
         loraBuffers->insertInputTensors(inputMap, loraBuffers->mLoraWeightsPointersHost,
             loraBuffers->mLoraAdapterSizesHost, modelConfig, worldConfig);
     }
-
     if (modelConfig.useLanguageAdapter())
     {
         inputMap.insert_or_assign("language_adapter_routings", languageAdapterRoutings);
@@ -1012,17 +1003,14 @@ void RuntimeBuffers::fillIOMaps(ModelConfig const& modelConfig, WorldConfig cons
     {
         medusaBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-
     if (lookaheadBuffers)
     {
         lookaheadBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-
     if (explicitDraftTokensBuffers)
     {
         explicitDraftTokensBuffers->insertInputTensors(inputMap, outputMap, worldConfig);
     }
-
     if (eagleBuffers)
     {
         eagleBuffers->insertInputTensors(inputMap, outputMap, worldConfig);

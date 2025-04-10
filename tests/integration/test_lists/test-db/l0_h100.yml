@@ -47,6 +47,27 @@ l0_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-True-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-False-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-False-True-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-True-False-DeepSeek-V3-Lite-fp8/fp8]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-True-True-DeepSeek-V3-Lite-fp8/fp8]
+
 - condition:
     ranges:
       system_gpu_count:

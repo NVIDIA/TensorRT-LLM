@@ -980,7 +980,7 @@ TEST_P(ParamTest, Test)
 
     if (modelSpec.mSpecDecodingMode == SpeculativeDecodingMode::LookaheadDecoding())
     {
-        modelOptionalParams.decodingConfig.setLookaheadDecoding(texec::LookaheadDecodingConfig(5, 5, 5));
+        modelOptionalParams.decodingConfig.setLookaheadDecodingConfig(texec::LookaheadDecodingConfig(5, 5, 5));
     }
 
     if (modelType == TrtGptModelType::V1

@@ -23,7 +23,7 @@
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-
+#include "userbuffersTensor.h"
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
@@ -208,10 +208,11 @@ public:
                 || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4);
             TLLM_CHECK_WITH_INFO(
                 tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
-            auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
-            TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
-            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
-            auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
+            auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
+            auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+            TLLM_CHECK(!ub_buffer0.invalid());
+
+            auto ub_comm = ub_manager.comm();
             int hidden_size = input.size(-1);
             int m = size / hidden_size;
             int scale_size = tensorrt_llm::common::roundUp(m, 128) * tensorrt_llm::common::roundUp(hidden_size / 16, 4);
@@ -228,24 +229,19 @@ public:
                 TLLM_CHECK(mScale);
                 TLLM_CHECK(mAffine);
                 TLLM_CHECK(!mBias);
-
+                tensorrt_llm::runtime::ub::UBBuffer ub_buffer1;
+                std::tie(finalOutput, ub_buffer1)
+                    = torch_ext::create_userbuffers_tensor(input.sizes(), torch::kFloat8_e4m3fn);
                 tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
                     ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
                     mType, ub_comm, stream);
-                finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
-                    torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
             }
             else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
             {
                 TLLM_CHECK(mScale);
                 TLLM_CHECK(mAffine);
                 TLLM_CHECK(!mBias);
-                auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
-                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
-                    ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
-                    residual, output.data_ptr(), mType, ub_comm, stream);
-                scaleOutput = torch::from_blob(
-                    ub_buffer2.addr, {scale_size}, {1}, torch::dtype(torch::kByte).device(torch::kCUDA));
+
                 auto output_shape = input.sizes().vec();
                 output_shape.back() /= 2;
                 auto output_strides = input.strides().vec();
@@ -253,19 +249,26 @@ public:
                 {
                     output_strides[i] /= 2;
                 }
-                finalOutput = torch::from_blob(
-                    ub_buffer1.addr, output_shape, output_strides, torch::dtype(torch::kByte).device(torch::kCUDA));
+
+                tensorrt_llm::runtime::ub::UBBuffer ub_buffer1;
+                tensorrt_llm::runtime::ub::UBBuffer ub_buffer2;
+                std::tie(finalOutput, ub_buffer1) = torch_ext::create_userbuffers_tensor(output_shape, torch::kByte);
+                std::tie(scaleOutput, ub_buffer2) = torch_ext::create_userbuffers_tensor({scale_size}, torch::kByte);
+
+                tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
+                    ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale,
+                    residual, output.data_ptr(), mType, ub_comm, stream);
             }
             else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
                 TLLM_CHECK(mAffine);
                 TLLM_CHECK(!mBias);
                 TLLM_CHECK(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16);
+                tensorrt_llm::runtime::ub::UBBuffer ub_buffer1;
+                std::tie(finalOutput, ub_buffer1)
+                    = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
                 tensorrt_llm::kernels::ub::allreduce2_userbuff_rmsnorm_launcher(ub_buffer0.handle, 0, ub_buffer1.handle,
                     0, size, hidden_size, nullptr, gamma, mEps, residual, output.data_ptr(), mType, ub_comm, stream);
-                auto dt = input.scalar_type();
-                finalOutput = torch::from_blob(
-                    ub_buffer1.addr, input.sizes(), input.strides(), torch::dtype(dt).device(torch::kCUDA));
             }
         }
         else if (runtimeStrategy == AllReduceStrategyType::NCCL)

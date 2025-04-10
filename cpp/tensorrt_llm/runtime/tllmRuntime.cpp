@@ -749,11 +749,11 @@ void TllmRuntime::initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const&
     TLLM_LOG_INFO("[UserBuffer] MaxBatchSize %d, maxBeamWidth %d, maxSequenceLength %d, maxNumTokens %d, select %lu",
         maxBatchSize, maxBeamWidth, maxSequenceLength, maxNumTokens.has_value() ? maxNumTokens.value() : 0, tokensNum);
     tensorrt_llm::runtime::ub::ub_initialize(world_config);
-    tensorrt_llm::runtime::ub::ub_allocate(0, elemNum * sizeof(half));
-    tensorrt_llm::runtime::ub::ub_allocate(1, elemNum * sizeof(half));
+    tensorrt_llm::runtime::ub::ub_allocate(elemNum * sizeof(half));
+    tensorrt_llm::runtime::ub::ub_allocate(elemNum * sizeof(half));
     if (useNVFP4Model)
     {
-        tensorrt_llm::runtime::ub::ub_allocate(2, elemNum * sizeof(uint8_t) / 16);
+        tensorrt_llm::runtime::ub::ub_allocate(elemNum * sizeof(uint8_t) / 16);
     }
 }
 

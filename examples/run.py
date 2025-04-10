@@ -23,9 +23,9 @@ from typing import List, Optional
 import numpy as np
 import torch
 from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
-                   add_common_args, load_tokenizer, prepare_enc_dec_inputs,
-                   read_model_name, supports_inflight_batching,
-                   throttle_generator)
+                   add_common_args, get_beam_width_array, load_tokenizer,
+                   prepare_enc_dec_inputs, read_model_name,
+                   supports_inflight_batching, throttle_generator)
 
 import tensorrt_llm
 import tensorrt_llm.profiler
@@ -391,6 +391,12 @@ def main(args):
         x.size(0) for x in (encoder_input_features or encoder_input_ids)
     ] if is_enc_dec else None
 
+    if args.beam_width_array is not None:
+        logger.info("Enable Variable-Beam-Width-Search (VBWS)")
+        assert not args.use_py_session, "`--use_py_session` is not supported in VBWS."
+        args.beam_width_array, args.num_beams = get_beam_width_array(
+            args.beam_width_array)
+
     if not args.use_py_session and not supports_inflight_batching(
             os.path.join(args.engine_dir, "decoder") if is_enc_dec else args.
             engine_dir):
@@ -448,7 +454,7 @@ def main(args):
             lora_ckpt_source=args.lora_ckpt_source,
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
-        )
+            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
@@ -493,9 +499,10 @@ def main(args):
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode,
-                gather_generation_logits=args.output_generation_logits)
-        runner_kwargs.update(
-            enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
+                gather_generation_logits=args.output_generation_logits,
+                use_variable_beam_width_search=(args.beam_width_array
+                                                is not None),
+            )
         runner = runner_cls.from_dir(**runner_kwargs)
 
         with torch.no_grad():
@@ -519,6 +526,7 @@ def main(args):
                 num_return_sequences=args.num_return_sequences,
                 length_penalty=args.length_penalty,
                 early_stopping=args.early_stopping,
+                beam_width_array=args.beam_width_array,
                 repetition_penalty=args.repetition_penalty,
                 presence_penalty=args.presence_penalty,
                 frequency_penalty=args.frequency_penalty,
@@ -615,6 +623,7 @@ def main(args):
                     num_beams=args.num_beams,
                     length_penalty=args.length_penalty,
                     early_stopping=args.early_stopping,
+                    beam_width_array=args.beam_width_array,
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,
@@ -652,6 +661,7 @@ def main(args):
                     num_beams=args.num_beams,
                     length_penalty=args.length_penalty,
                     early_stopping=args.early_stopping,
+                    beam_width_array=args.beam_width_array,
                     repetition_penalty=args.repetition_penalty,
                     presence_penalty=args.presence_penalty,
                     frequency_penalty=args.frequency_penalty,

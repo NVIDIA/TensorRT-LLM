@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,15 @@
 #include <gtest/gtest.h>
 #include <nccl.h>
 
+#include <cstdarg>
 #include <cstdint>
 #include <functional>
 #include <iostream>
 #include <random>
 #include <vector>
 
-#include "tensorrt_llm/kernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -51,59 +53,42 @@ void residual_add(DType* data, DType* residual, int size, cudaStream_t stream)
 }
 
 template <typename DType>
-__global__ void cast_to_fp32_kernel(DType* in, float* out, int size)
+__global__ void quantize_to_fp8_kernel(DType* data, __nv_fp8_e4m3* data_fp8, int size, float* scale_factor)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size)
         return;
-    out[idx] = static_cast<float>(in[idx]);
+    data_fp8[idx] = static_cast<__nv_fp8_e4m3>(static_cast<float>(data[idx]) * (1.f / *scale_factor));
 }
 
 template <typename DType>
-void cast_to_fp32(DType* in, float* out, int size, cudaStream_t stream)
+void quantize_to_fp8(DType* data, __nv_fp8_e4m3* data_fp8, int size, float* scale_factor, cudaStream_t stream)
 {
-    cast_to_fp32_kernel<<<size / 128, 128, 0, stream>>>(in, out, size);
+    quantize_to_fp8_kernel<<<size / 128, 128, 0, stream>>>(data, data_fp8, size, scale_factor);
 }
 
 template <typename T>
-void print(int rank, void* _pa, int size)
+bool compare(int rank, void* p_real, void* p_ref, int size, std::string const& cmp_info = "", float atol = 1e-3)
 {
-    auto pa = reinterpret_cast<T*>(_pa);
-    if (rank == 0)
-    {
-        printf("print: [");
-        for (int n = 0; n < 20; ++n)
-        {
-            float v = static_cast<float>(pa[n]);
-            printf("%f, ", v);
-        }
-        printf("...]\n");
-    }
-}
-
-template <typename T>
-float compare(int rank, void* _pa, void* _pb, int size, float scale, std::string const& cmp_info = "")
-{
-    auto pa = reinterpret_cast<T*>(_pa);
-    auto pb = reinterpret_cast<T*>(_pb);
+    auto ptr_real = reinterpret_cast<T*>(p_real);
+    auto ptr_ref = reinterpret_cast<T*>(p_ref);
     float max_diff = 0.f, tot_diff = 0.f;
-    float max_val = 0.f;
-    int diff_cnt = 0;
-    float threshold = 1e-7;
+    int error_cnt = 0;
+    float max_error_value_real = 0.f, max_error_value_ref = 0.f;
     static char* ar_debug = std::getenv("AR_DEBUG");
     if (ar_debug && rank == 0)
     {
-        printf("TensorA: [");
+        printf("TensorReal: [");
         for (int n = 0; n < 20; ++n)
         {
-            float v = static_cast<float>(pa[n]);
+            float v = static_cast<float>(ptr_real[n]);
             printf("%f, ", v);
         }
         printf("...]\n");
-        printf("TensorB: [");
+        printf("TensorRef: [");
         for (int n = 0; n < 20; ++n)
         {
-            float v = static_cast<float>(pb[n]);
+            float v = static_cast<float>(ptr_ref[n]);
             printf("%f, ", v);
         }
         printf("...]\n");
@@ -111,29 +96,40 @@ float compare(int rank, void* _pa, void* _pb, int size, float scale, std::string
     int print_cnt = 0;
     for (int n = 0; n < size; ++n)
     {
-        float va = static_cast<float>(pa[n]);
-        float vb = static_cast<float>(pb[n]);
-        max_val = std::max(max_val, vb);
-        float diff = std::abs(va - vb);
-        if (diff > threshold)
+        float v_real = static_cast<float>(ptr_real[n]);
+        float v_ref = static_cast<float>(ptr_ref[n]);
+        float diff = std::abs(v_real - v_ref);
+
+        if (diff > max_diff)
         {
-            max_diff = std::max(max_diff, diff);
-            tot_diff += diff;
-            ++diff_cnt;
+            max_diff = diff;
+            max_error_value_real = v_real;
+            max_error_value_ref = v_ref;
         }
-        if (rank == 0 && print_cnt < 20 && ar_debug && diff / (std::abs(vb) + 1e-7) > 0.1)
+
+        bool is_error = diff > atol;
+        if (diff > atol)
+        {
+            tot_diff += diff;
+            ++error_cnt;
+        }
+        if (ar_debug && is_error && rank == 0 && print_cnt < 20)
         {
             ++print_cnt;
-            printf("idx %d, va %f, vb %f\n", n, va, vb);
+            if (rank == 0)
+                printf("idx %d, v_real %f, v_ref %f\n", n, v_real, v_ref);
         }
     }
-    float diff_thres = max_val * scale;
-    if (rank == 0)
+    bool pass = error_cnt == 0;
+    if (!pass && rank == 0)
     {
-        TLLM_LOG_INFO("[%s] rank %d, max diff %f (diff threshold %f), avg diff %f, diff cnt %d/%d", cmp_info.c_str(),
-            rank, max_diff, diff_thres, tot_diff / std::max(diff_cnt, 1), diff_cnt, size);
+        printf(
+            "[%s] rank %d, atol %8.4f, max absolute diff %8.4f(%8.4f vs %8.4f), avg absolute diff %8.4f, absolute "
+            "error count %d/%d\n",
+            cmp_info.c_str(), rank, atol, max_diff, max_error_value_real, max_error_value_ref,
+            tot_diff / std::max(error_cnt, 1), error_cnt, size);
     }
-    return max_diff <= diff_thres;
+    return pass;
 }
 
 template <typename T1, typename T2>
@@ -146,6 +142,15 @@ void random_fill(T1* data, int size, T2 minv, T2 maxv)
     {
         data[i] = static_cast<T1>(dis(gen));
     }
+}
+
+int get_random_int(int min_v, int max_v)
+{
+    static int rseed = 20250227;
+    std::mt19937 gen(rseed++);
+    std::uniform_int_distribution<> dis(min_v, max_v);
+
+    return dis(gen);
 }
 
 struct CudaBuffer
@@ -169,7 +174,7 @@ struct CudaBuffer
         TLLM_CHECK(m_d_data == nullptr && m_h_data == nullptr);
         m_size = size_in_bytes;
         TLLM_CUDA_CHECK(cudaMalloc(&m_d_data, m_size));
-        TLLM_CUDA_CHECK(cudaMemset(m_d_data, 0, m_size));
+        clear();
         m_h_data = malloc(m_size);
     }
 
@@ -193,6 +198,11 @@ struct CudaBuffer
     {
         random_fill(reinterpret_cast<DType*>(m_h_data), m_size / sizeof(DType), minv, maxv);
         h2d();
+    }
+
+    void clear()
+    {
+        TLLM_CUDA_CHECK(cudaMemset(m_d_data, 0, m_size));
     }
 
     void h2d()
@@ -219,12 +229,37 @@ struct CudaBuffer
 };
 
 template <typename DType>
+struct DTypeTraits;
+
+template <>
+struct DTypeTraits<half>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclFloat16;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kHALF;
+};
+
+template <>
+struct DTypeTraits<__nv_bfloat16>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclBfloat16;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kBF16;
+};
+
+template <>
+struct DTypeTraits<float>
+{
+    static constexpr ncclDataType_t kNCCLDataType = ncclFloat32;
+    static constexpr nvinfer1::DataType kTRTDataType = nvinfer1::DataType::kFLOAT;
+};
+
+template <typename DType, ar_fusion::AllReduceFusionPattern Pattern>
 class TestRunner
 {
-    static_assert(std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>);
-    static constexpr ncclDataType_t kNCCLDataType = std::is_same_v<DType, half> ? ncclFloat16 : ncclBfloat16;
-    static constexpr nvinfer1::DataType kTRTDataType
-        = std::is_same_v<DType, half> ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kBF16;
+    static constexpr ncclDataType_t kNCCLDataType = DTypeTraits<DType>::kNCCLDataType;
+    static constexpr nvinfer1::DataType kTRTDataType = DTypeTraits<DType>::kTRTDataType;
+    static constexpr bool kFP4QuantOutSupport = !std::is_same_v<DType, float>;
+    static_assert(kFP4QuantOutSupport || Pattern != ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant,
+        "kARResidualRMSNormFP4Quant is not supported for float dtype");
 
 public:
     TestRunner(int max_token_num, int hidden_dim)
@@ -244,10 +279,13 @@ public:
 
         m_allreduce_in.allocate(m_message_size * sizeof(DType));
         m_residual_in.allocate(m_message_size * sizeof(DType));
+        m_allreduce_out.allocate(m_message_size * sizeof(DType));
         m_residual_out.allocate(m_message_size * sizeof(DType));
         m_norm_out.allocate(m_message_size * sizeof(DType));
         m_quant_out.allocate(m_message_size * sizeof(DType));
-        m_scale_out.allocate(m_message_size * sizeof(DType));
+        // SF layout was packed to [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+        size_t scale_out_size = ((max_token_num + 127) / 128 * 128) * ((hidden_dim + 63) / 64 * 4);
+        m_scale_out.allocate(scale_out_size);
         m_rms_gamma.allocate(hidden_dim * sizeof(DType));
         m_scale_factor.allocate(sizeof(float));
         m_stream = std::make_shared<tr::CudaStream>();
@@ -259,6 +297,7 @@ public:
         m_params.workspace = m_workspace->get_workspace();
         m_params.allreduce_in = m_allreduce_in.device_data();
         m_params.residual_in = m_residual_in.device_data();
+        m_params.allreduce_out = m_allreduce_out.device_data();
         m_params.residual_out = m_residual_out.device_data();
         m_params.norm_out = m_norm_out.device_data();
         m_params.quant_out = m_quant_out.device_data();
@@ -267,14 +306,21 @@ public:
         m_params.scale_factor = m_scale_factor.device_data<float>();
         m_params.rms_eps = 1e-3;
         m_params.stream = m_stream->get();
+        m_params.pattern = Pattern;
     }
 
-    void random_input()
+    void reset_io()
     {
         m_allreduce_in.random<DType>(-100.f, 100.f);
         m_residual_in.random<DType>(-100.f, 100.f);
         m_rms_gamma.random<DType>(-1.f, 1.f);
-        m_scale_factor.random<float>(5.f, 5.f);
+        m_scale_factor.random<float>(1.f, 1.f);
+        // Because scale_out internally performs layout interleaving, not all elements will be covered, so it should be
+        // reset before calling the kernel to ensure correct comparison results
+        if (kFP4QuantOutSupport)
+        {
+            m_scale_out.clear();
+        }
     }
 
     template <typename Func>
@@ -285,7 +331,6 @@ public:
         cudaEvent_t begin, end;
         cudaEventCreate(&begin);
         cudaEventCreate(&end);
-        random_input();
         m_mpi_comm.barrier();
         for (int i = 0; i < warmup; ++i)
         {
@@ -307,6 +352,12 @@ public:
         return time * 1000;
     }
 
+    template <typename Func>
+    void run_once(Func func, int token_num, int hidden_dim)
+    {
+        benchmark(func, 0, 1, token_num, hidden_dim);
+    }
+
     int get_sm_count()
     {
         static int sm_count = 0;
@@ -324,19 +375,68 @@ public:
     void verify(int token_num, int hidden_dim)
     {
         int message_size = token_num * hidden_dim;
-        CudaBuffer ref_output(message_size * sizeof(DType)), ref_scale(message_size * sizeof(DType));
+        CudaBuffer ref_output(message_size * sizeof(DType));
+
+        // We directly compare the results of AR+AddResidual here, as the accumulation order in NCCL's AR might be
+        // inconsistent across different kernels. Therefore, we set atol to 1 (setting it to 0 locally also passes the
+        // test).
         TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
             kNCCLDataType, ncclSum, m_nccl_comm, 0));
-        residual_add(ref_output.device_data<DType>(), m_residual_in.device_data<DType>(), message_size, 0);
-        invokeGeneralRmsNorm<DType, int8_t>(ref_output.device_data<DType>(), ref_output.device_data<DType>(),
-            m_rms_gamma.device_data<DType>(), nullptr, m_params.rms_eps, token_num, hidden_dim,
-            tensorrt_llm::common::QuantMode(), 0);
-        compare<DType>(m_rank, m_norm_out.host_data(), ref_output.host_data(), message_size, 1e-3, "norm out");
-        invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
-            m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(), ref_scale.device_data<int32_t>(),
-            false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, 0);
-        compare<int8_t>(m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, 1e-3, "quant out");
-        compare<int8_t>(m_rank, m_scale_out.host_data(), ref_scale.host_data(), message_size / 16, 1e-3, "scale out");
+        if constexpr (ar_fusion::HasAllReduceOut<Pattern>)
+        {
+            TLLM_CHECK(compare<DType>(
+                m_rank, m_allreduce_out.host_data(), ref_output.host_data(), message_size, "allreduce out", 1));
+        }
+        if constexpr (ar_fusion::HasResidual<Pattern>)
+        {
+            residual_add(ref_output.device_data<DType>(), m_residual_in.device_data<DType>(), message_size, 0);
+            if constexpr (ar_fusion::HasResidualOut<Pattern>)
+            {
+                TLLM_CHECK(compare<DType>(
+                    m_rank, m_residual_out.host_data(), ref_output.host_data(), message_size, "residual out", 1));
+            }
+        }
+        if constexpr (ar_fusion::HasRMSNorm<Pattern>)
+        {
+            // This excludes the accumulation order errors introduced by AR and only compares the accuracy of the
+            // RMSNorm. The atol is set to 1e-2 to exclude errors caused by accumulation order changes due to
+            // differences in cluster/block size.
+            invokeGeneralRmsNorm<DType, int8_t>(ref_output.device_data<DType>(), m_residual_out.device_data<DType>(),
+                m_rms_gamma.device_data<DType>(), nullptr, m_params.rms_eps, token_num, hidden_dim,
+                tensorrt_llm::common::QuantMode(), 0);
+            if constexpr (ar_fusion::HasNormOut<Pattern>)
+            {
+                TLLM_CHECK(compare<DType>(
+                    m_rank, m_norm_out.host_data(), ref_output.host_data(), message_size, "norm out", 1e-2));
+            }
+        }
+        if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP4)
+        {
+            // We need norm out to verify the accuracy of quantization.
+            static_assert(Pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+            // SF layout was packed to [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+            size_t scale_out_size = ((token_num + 127) / 128 * 128) * ((hidden_dim + 63) / 64 * 4);
+            CudaBuffer ref_scale(scale_out_size);
+            // Here, we also only compare the accuracy of quantization. Since there are no differences in
+            // computation order, atol is set to 0.
+            invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
+                m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(),
+                ref_scale.device_data<int32_t>(), false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, 0);
+            TLLM_CHECK(compare<int8_t>(
+                m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, "fp4 quant out", 0));
+            TLLM_CHECK(compare<int8_t>(
+                m_rank, m_scale_out.host_data(), ref_scale.host_data(), scale_out_size, "fp4 scale out", 0));
+        }
+        else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
+        {
+            // We need norm out to verify the accuracy of quantization.
+            static_assert(Pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+            CudaBuffer ref_fp8_output(message_size * sizeof(__nv_fp8_e4m3));
+            quantize_to_fp8(m_norm_out.device_data<DType>(), ref_fp8_output.device_data<__nv_fp8_e4m3>(), message_size,
+                m_scale_factor.device_data<float>(), m_stream->get());
+            TLLM_CHECK(compare<__nv_fp8_e4m3>(
+                m_rank, m_quant_out.host_data(), ref_fp8_output.host_data(), message_size, "fp8 quant out", 0));
+        }
     }
 
     void run_nccl_allreduce(int token_num, int hidden_dim)
@@ -353,7 +453,7 @@ public:
 
     void run_rms_norm(int token_num, int hidden_dim)
     {
-        invokeGeneralRmsNorm<DType, int8_t>(m_residual_out.device_data<DType>(), m_norm_out.device_data<DType>(),
+        invokeGeneralRmsNorm<DType, int8_t>(m_norm_out.device_data<DType>(), m_residual_out.device_data<DType>(),
             m_rms_gamma.device_data<DType>(), nullptr, m_params.rms_eps, token_num, hidden_dim,
             tensorrt_llm::common::QuantMode(), m_stream->get());
     }
@@ -383,6 +483,7 @@ private:
     ncclComm_t m_nccl_comm;
     CudaBuffer m_allreduce_in;
     CudaBuffer m_residual_in;
+    CudaBuffer m_allreduce_out;
     CudaBuffer m_residual_out;
     CudaBuffer m_norm_out;
     CudaBuffer m_quant_out;
@@ -394,8 +495,9 @@ private:
     std::shared_ptr<tr::CudaStream> m_stream;
 };
 
-TEST(Kernel, allReduceFusion)
+TEST(Kernel_AllReduceFusion, AllReduceAccuracyRandomTokenNum)
 {
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -404,453 +506,34 @@ TEST(Kernel, allReduceFusion)
         TLLM_LOG_WARNING("world size is not a multiple of 2, return");
         return;
     }
-    int warmup = 100, iter = 100;
-    int hidden_dim = 7168;
-    std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+    int iter = 100;
+    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    int min_token_num = 1;
     int max_token_num = 2048;
-    TestRunner<half> runner(max_token_num, hidden_dim);
-    for (auto token_num : candidate_token_num)
+    for (auto hidden_dim : candidate_hidden_dim)
     {
-        auto latency = runner.benchmark(&TestRunner<half>::run_kernel, warmup, iter, token_num, hidden_dim);
-        runner.verify(token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("token_num %d, hidden_dim %d, latency %fus", token_num, hidden_dim, latency);
-        }
-        auto nccl_latency
-            = runner.benchmark(&TestRunner<half>::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("nccl allreduce latency %fus", nccl_latency);
-        }
-        auto residual_latency
-            = runner.benchmark(&TestRunner<half>::run_residual_add, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("residual add latency %fus", residual_latency);
-        }
-        auto rms_latency = runner.benchmark(&TestRunner<half>::run_rms_norm, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("rms norm latency %fus", rms_latency);
-        }
-        auto quant_latency = runner.benchmark(&TestRunner<half>::run_fp4_quant, warmup, iter, token_num, hidden_dim);
-        if (rank == 0)
-        {
-            TLLM_LOG_INFO("fp4 quant latency %fus", quant_latency);
-            auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
-            TLLM_LOG_INFO("fusion kernel latency %fus, nccl + ops latency %fus, total speedup %fx", latency,
-                tot_latency, tot_latency / latency);
-        }
-    }
-}
-
-/////////////////////////////////////////////////////////////////
-//                  * MoE Reduction Fusion *                   //
-/////////////////////////////////////////////////////////////////
-
-template <typename IOType>
-union ACCESS_TYPE
-{
-    static constexpr int ELEM_PER_ACCESS = 16 / sizeof(IOType);
-
-    // For LDG.128 STG.128 access
-    int4 packed;
-    IOType unpacked[ELEM_PER_ACCESS];
-};
-
-template <typename IOType, typename ScaleType>
-__global__ void moe_reduction_kernel(IOType const* ggemm2_actexp_m_hidden_in, IOType const* fc2_m_hidden_in,
-    ScaleType const* scale_actexp_m_in, int const* actexpi_to_global_expid, IOType* reduce_m_hidden_ou, int num_act_exp,
-    int num_token, int hidden_size)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-
-    static_assert(sizeof(ScaleType) >= sizeof(IOType), "This kernel assume scale type is more precious than io type");
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-    cg::grid_group grid = cg::this_grid();
-
-    using ACC_TYPE = ACCESS_TYPE<IOType>;
-
-    // Each cluster handle one token
-    // Each thread handle ACC_TYPE::ELEM_PER_ACCESS element per token per expert
-
-    int threadid_in_cluster = cluster.thread_rank();
-    // Start Offset within one token's hidden_size of element
-    // Current thread handle token[thread_offset_within_token : thread_offset_within_token + ACC_TYPE::ELEM_PER_ACCESS]
-    int thread_offset_within_token = threadid_in_cluster * ACC_TYPE::ELEM_PER_ACCESS;
-
-    if (thread_offset_within_token >= hidden_size)
-    {
-        return;
-    }
-
-    cudaGridDependencySynchronize();
-
-    // Same as AR + Fusion kernel, use persistent kernel design
-    for (int token_id = grid.cluster_rank(); token_id < num_token; token_id += grid.num_clusters())
-    {
-
-        // Offset within (num_token, hidden_size) in unit of element
-        int thread_offset_across_token = token_id * hidden_size + thread_offset_within_token;
-
-        ACC_TYPE accumulator;
-#pragma unroll
-        for (int i = 0; i < ACC_TYPE::ELEM_PER_ACCESS; ++i)
-        {
-            accumulator.unpacked[i] = static_cast<IOType>(0);
-        }
-
-        // * Iterate through all active expert
-        for (int actexp_i = 0; actexp_i < num_act_exp; ++actexp_i)
-        {
-
-            // * Load active expert i's token j's partial data
-            // Offset within (num_act_exp, num_token, hidden_size) in unit of element
-            int thread_offset_across_actexp_token = actexp_i * (hidden_size * num_token) + thread_offset_across_token;
-            ACC_TYPE actexp_i_data;
-            actexp_i_data.packed = reinterpret_cast<int4 const*>(
-                ggemm2_actexp_m_hidden_in)[thread_offset_across_actexp_token / ACC_TYPE::ELEM_PER_ACCESS];
-
-            // * Load active expert i's token j's scale
-            int gloabl_exp_id = actexpi_to_global_expid[actexp_i];
-            int thread_offset_scale = gloabl_exp_id * num_token + token_id;
-            ScaleType actexp_i_token_j_scale
-                = reinterpret_cast<ScaleType const*>(scale_actexp_m_in)[thread_offset_scale];
-
-// * acc += scale(data)
-#pragma unroll
-            for (int i = 0; i < ACC_TYPE::ELEM_PER_ACCESS; ++i)
-            {
-                // assume computation is done in ScaleType
-                accumulator.unpacked[i] += static_cast<IOType>(
-                    (static_cast<ScaleType>(actexp_i_data.unpacked[i]) * actexp_i_token_j_scale));
-            }
-        }
-
-        // * FC2 + reduced(gGEMM2)
-        ACC_TYPE fc2_data;
-        fc2_data.packed
-            = reinterpret_cast<int4 const*>(fc2_m_hidden_in)[thread_offset_across_token / ACC_TYPE::ELEM_PER_ACCESS];
-#pragma unroll
-        for (int i = 0; i < ACC_TYPE::ELEM_PER_ACCESS; ++i)
-        {
-            accumulator.unpacked[i] += fc2_data.unpacked[i];
-        }
-
-        // * Store
-        // Only store valid section of ACC_TYPE::ELEM_PER_ACCESS
-        reinterpret_cast<int4*>(reduce_m_hidden_ou)[thread_offset_across_token / ACC_TYPE::ELEM_PER_ACCESS]
-            = accumulator.packed;
-    }
-
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
-template <typename IOType, typename ScaleType>
-void moe_reduction_kernel_launcher(IOType const* ggemm2_actexp_m_hidden_in, IOType const* fc2_m_hidden_in,
-    ScaleType const* scale_actexp_m_in, int const* actexpi_to_global_expid, IOType* reduce_m_hidden_ou, int num_act_exp,
-    int num_token, int hidden_size)
-{
-    // * Device Property & SM
-    int device_id;
-    TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, 0);
-    int sm_count = device_prop.multiProcessorCount;
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-
-    using ACC_TYPE = ACCESS_TYPE<IOType>;
-
-    // * Check for launch assumption
-    if (hidden_size % ACC_TYPE::ELEM_PER_ACCESS != 0)
-    {
-        printf("FAILED. Unable to launch as hidden_size must be multiplier of ACC_TYPE::ELEM_PER_ACCESS\n");
-        return;
-    }
-
-    // * Heuristic for launch config
-    // targeting low latency inference to fully utilize as much SM as possible
-    int num_thread_per_token = hidden_size / ACC_TYPE::ELEM_PER_ACCESS;
-    int num_warp_per_token = (num_thread_per_token + 32 - 1) / 32;
-    int cluster_dim = 8;
-    while (num_warp_per_token % cluster_dim != 0)
-    {
-        cluster_dim /= 2;
-    }
-    int block_dim = num_warp_per_token / cluster_dim * 32;
-    int grid_dim = min(sm_count, num_token * cluster_dim) / cluster_dim * cluster_dim;
-
-    printf(
-        "* num_act_exp %d, num_token %d, hidden_size %d, num_warp_per_token %d, heuristic pick grid %d cluster %d "
-        "block %d\n",
-        num_act_exp, num_token, hidden_size, num_warp_per_token, grid_dim, cluster_dim, block_dim);
-
-    // * Launch Config
-    cudaLaunchConfig_t config = {0};
-    cudaLaunchAttribute attribute[2];
-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = 1;
-    attribute[1].id = cudaLaunchAttributeClusterDimension;
-    attribute[1].val.clusterDim.x = cluster_dim;
-    attribute[1].val.clusterDim.y = 1;
-    attribute[1].val.clusterDim.z = 1;
-    config.gridDim = grid_dim;
-    config.blockDim = block_dim;
-    config.stream = stream;
-    config.numAttrs = 2;
-    config.attrs = attribute;
-    config.dynamicSmemBytes = 0;
-
-    TLLM_CUDA_CHECK(
-        cudaLaunchKernelEx(&config, moe_reduction_kernel<IOType, ScaleType>, ggemm2_actexp_m_hidden_in, fc2_m_hidden_in,
-            scale_actexp_m_in, actexpi_to_global_expid, reduce_m_hidden_ou, num_act_exp, num_token, hidden_size));
-    TLLM_CUDA_CHECK(cudaPeekAtLastError());
-    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-template <typename DType>
-class MoEARFuseTestRunner
-{
-    static_assert(std::is_same_v<DType, half> || std::is_same_v<DType, __nv_bfloat16>);
-    static constexpr ncclDataType_t kNCCLDataType = std::is_same_v<DType, half> ? ncclFloat16 : ncclBfloat16;
-    static constexpr nvinfer1::DataType kTRTDataType
-        = std::is_same_v<DType, half> ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kBF16;
-
-public:
-    MoEARFuseTestRunner(int max_token_num, int hidden_dim, int max_expert_num)
-        : m_mpi_comm(mpi::MpiComm::world())
-    {
-        m_message_size = max_token_num * hidden_dim;
-        m_world_size = m_mpi_comm.getSize();
-        m_rank = m_mpi_comm.getRank();
-        TLLM_CUDA_CHECK(cudaSetDevice(m_rank));
-        ncclUniqueId id;
-        if (m_rank == 0)
-        {
-            TLLM_NCCL_CHECK(ncclGetUniqueId(&id));
-        }
-        m_mpi_comm.bcast(&id, sizeof(id), mpi::MpiType::kBYTE, 0);
-        TLLM_NCCL_CHECK(ncclCommInitRank(&m_nccl_comm, m_world_size, id, m_rank));
-
-        m_allreduce_in.allocate(m_message_size * sizeof(DType));
-        m_residual_in.allocate(m_message_size * sizeof(DType));
-        m_residual_out.allocate(m_message_size * sizeof(DType));
-        m_norm_out.allocate(m_message_size * sizeof(DType));
-        m_quant_out.allocate(m_message_size * sizeof(DType));
-        m_scale_out.allocate(m_message_size * sizeof(DType));
-        m_rms_gamma.allocate(hidden_dim * sizeof(DType));
-        m_scale_factor.allocate(sizeof(float));
-        m_stream = std::make_shared<tr::CudaStream>();
-        m_workspace = std::make_shared<ar_fusion::Workspace>(m_rank, m_world_size, max_token_num, hidden_dim, m_stream);
-
-        m_params.nranks = m_world_size;
-        m_params.rank = m_rank;
-        m_params.dtype = kTRTDataType;
-        m_params.workspace = m_workspace->get_workspace();
-        m_params.allreduce_in = m_allreduce_in.device_data();
-        m_params.residual_in = m_residual_in.device_data();
-        m_params.residual_out = m_residual_out.device_data();
-        m_params.norm_out = m_norm_out.device_data();
-        m_params.quant_out = m_quant_out.device_data();
-        m_params.scale_out = m_scale_out.device_data();
-        m_params.rms_gamma = m_rms_gamma.device_data();
-        m_params.scale_factor = m_scale_factor.device_data<float>();
-        m_params.rms_eps = 1e-3;
-        m_params.stream = m_stream->get();
-
-        // * moe reduction related param
-        m_max_expert_num = max_expert_num;
-
-        // [device_num_expert, m]
-        m_moe_reduction_scale_input.allocate(m_max_expert_num * max_token_num * sizeof(float));
-        // [device_num_expert, m, 7168]
-        m_moe_reduction_active_experts_token_input.allocate(m_max_expert_num * m_message_size * sizeof(DType));
-        // [m, 7168]
-        m_moe_reduction_token_input.allocate(m_message_size * sizeof(DType));
-        // [1]
-        m_moe_reduction_device_num_experts.allocate(sizeof(int));
-
-        m_params.moe_reduction_scale_input = reinterpret_cast<float*>(m_moe_reduction_scale_input.device_data());
-        m_params.moe_reduction_active_experts_token_input = m_moe_reduction_active_experts_token_input.device_data();
-        m_params.moe_reduction_token_input = m_moe_reduction_token_input.device_data();
-        m_params.moe_reduction_device_num_experts
-            = reinterpret_cast<int*>(m_moe_reduction_device_num_experts.device_data());
-    }
-
-    void random_input()
-    {
-        m_allreduce_in.random<DType>(-100.f, 100.f);
-        m_residual_in.random<DType>(-100.f, 100.f);
-        m_rms_gamma.random<DType>(-1.f, 1.f);
-        m_scale_factor.random<float>(5.f, 5.f);
-
-        // * moe reduction
-        m_moe_reduction_scale_input.random<float>(-100.f, 100.f);
-        m_moe_reduction_active_experts_token_input.random<DType>(-100.f, 100.f);
-        m_moe_reduction_token_input.random<DType>(-100.f, 100.f);
-    }
-
-    template <typename Func>
-    float benchmark(Func func, int warmup, int iter, int token_num, int hidden_dim, int num_active_expert = 0)
-    {
-        m_params.size = token_num * hidden_dim;
-        m_params.hidden_dim = hidden_dim;
-        cudaMemcpy(m_params.moe_reduction_device_num_experts, &num_active_expert, sizeof(int), cudaMemcpyHostToDevice);
-        cudaEvent_t begin, end;
-        cudaEventCreate(&begin);
-        cudaEventCreate(&end);
-        random_input();
-        m_mpi_comm.barrier();
-        for (int i = 0; i < warmup; ++i)
-        {
-            (this->*func)(token_num, hidden_dim, num_active_expert);
-        }
-        cudaEventRecord(begin, m_stream->get());
+        Runner runner(max_token_num, hidden_dim);
         for (int i = 0; i < iter; ++i)
         {
-            (this->*func)(token_num, hidden_dim, num_active_expert);
+            int token_num = get_random_int(min_token_num, max_token_num);
+            if (rank == 0)
+            {
+                printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+            }
+            runner.reset_io();
+            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+            runner.verify(token_num, hidden_dim);
+            if (rank == 0)
+            {
+                printf("\033[32mPass!\033[0m\n");
+            }
         }
-        cudaEventRecord(end, m_stream->get());
-        cudaEventSynchronize(end);
-        float time;
-        cudaEventElapsedTime(&time, begin, end);
-        time /= iter;
-        m_mpi_comm.barrier();
-        cudaEventDestroy(begin);
-        cudaEventDestroy(end);
-        return time * 1000;
     }
+}
 
-    int get_sm_count() const
-    {
-        static int sm_count = 0;
-        if (sm_count == 0)
-        {
-            int device_id;
-            TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-            cudaDeviceProp device_prop;
-            cudaGetDeviceProperties(&device_prop, device_id);
-            sm_count = device_prop.multiProcessorCount;
-        }
-        return sm_count;
-    }
-
-    void verify(int token_num, int hidden_dim, int num_active_expert)
-    {
-        int message_size = token_num * hidden_dim;
-        CudaBuffer ref_output(message_size * sizeof(DType)), ref_scale(message_size * sizeof(DType));
-
-        // * MoE Reduction
-        moe_reduction_kernel_launcher<DType, float>(m_moe_reduction_active_experts_token_input.device_data<DType>(),
-            m_moe_reduction_token_input.device_data<DType>(), m_moe_reduction_scale_input.device_data<float>(),
-            ref_output.device_data<DType>(), num_active_expert, token_num, hidden_dim);
-
-        compare<DType>(
-            m_rank, m_allreduce_in.host_data(), ref_output.host_data(), message_size, 1e-3, "moe reduction out");
-
-        // * AR
-        TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
-            kNCCLDataType, ncclSum, m_nccl_comm, 0));
-
-        // * Add
-        residual_add(ref_output.device_data<DType>(), m_residual_in.device_data<DType>(), message_size, 0);
-
-        // * Norm
-        invokeGeneralRmsNorm<DType, int8_t>(ref_output.device_data<DType>(), ref_output.device_data<DType>(),
-            m_rms_gamma.device_data<DType>(), nullptr, m_params.rms_eps, token_num, hidden_dim,
-            tensorrt_llm::common::QuantMode(), 0);
-
-        compare<DType>(m_rank, m_norm_out.host_data(), ref_output.host_data(), message_size, 1e-3, "norm out");
-
-        // * Quant
-        invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
-            m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(), ref_scale.device_data<int32_t>(),
-            false, 128, 0);
-        compare<int8_t>(m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, 1e-3, "quant out");
-        compare<int8_t>(m_rank, m_scale_out.host_data(), ref_scale.host_data(), message_size / 16, 1e-3, "scale out");
-    }
-
-    void run_nccl_allreduce(int token_num, int hidden_dim, int)
-    {
-        TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), m_residual_out.device_data(),
-            token_num * hidden_dim, kNCCLDataType, ncclSum, m_nccl_comm, m_stream->get()));
-    }
-
-    void run_moe_reduction(int token_num, int hidden_dim, int num_active_expert)
-    {
-        moe_reduction_kernel_launcher<DType, float>(m_moe_reduction_active_experts_token_input.device_data<DType>(),
-            m_moe_reduction_token_input.device_data<DType>(), m_moe_reduction_scale_input.device_data<float>(),
-            m_allreduce_in.device_data<DType>(), num_active_expert, token_num, hidden_dim);
-    }
-
-    void run_residual_add(int token_num, int hidden_dim, int)
-    {
-        residual_add(m_residual_out.device_data<DType>(), // output and input
-            m_residual_in.device_data<DType>(),           // input
-            token_num * hidden_dim, m_stream->get());
-    }
-
-    void run_rms_norm(int token_num, int hidden_dim, int)
-    {
-        invokeGeneralRmsNorm<DType, int8_t>(m_residual_out.device_data<DType>(), m_norm_out.device_data<DType>(),
-            m_rms_gamma.device_data<DType>(), nullptr, m_params.rms_eps, token_num, hidden_dim,
-            tensorrt_llm::common::QuantMode(), m_stream->get());
-    }
-
-    void run_fp4_quant(int token_num, int hidden_dim, int)
-    {
-        invokeFP4Quantization(token_num,         // m
-            hidden_dim,                          // n
-            m_norm_out.device_data<DType>(),     // input
-            m_scale_factor.device_data<float>(), // input sf
-            m_quant_out.device_data<int64_t>(),  // output
-            m_scale_out.device_data<int32_t>(),  // output sf
-            false, 128, m_stream->get());
-    }
-
-    void run_kernel(int token_num, int hidden_dim)
-    {
-        ar_fusion::moereduction_allreduce_fusion_op(m_params);
-    }
-
-    ~MoEARFuseTestRunner()
-    {
-        TLLM_NCCL_CHECK(ncclCommDestroy(m_nccl_comm));
-    }
-
-private:
-    int m_rank;
-    int m_world_size;
-    int m_message_size;
-    mpi::MpiComm const& m_mpi_comm;
-    ncclComm_t m_nccl_comm;
-    CudaBuffer m_allreduce_in;
-    CudaBuffer m_residual_in;
-    CudaBuffer m_residual_out;
-    CudaBuffer m_norm_out;
-    CudaBuffer m_quant_out;
-    CudaBuffer m_scale_out;
-    CudaBuffer m_rms_gamma;
-    CudaBuffer m_scale_factor;
-    std::shared_ptr<ar_fusion::Workspace> m_workspace;
-    ar_fusion::MoeReductionAllReduceFusionParams m_params;
-    std::shared_ptr<tr::CudaStream> m_stream;
-
-    // * moe reduction related params
-    int m_max_expert_num;
-    CudaBuffer m_moe_reduction_scale_input;
-    CudaBuffer m_moe_reduction_active_experts_token_input;
-    CudaBuffer m_moe_reduction_token_input;
-    CudaBuffer m_moe_reduction_device_num_experts;
-};
-
-TEST(Kernel, MoEReduceAddARFuse)
+TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
 {
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kAllReduce>;
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
@@ -859,58 +542,130 @@ TEST(Kernel, MoEReduceAddARFuse)
         TLLM_LOG_WARNING("world size is not a multiple of 2, return");
         return;
     }
-    int warmup = 100, iter = 100;
+    int iter = 10;
+    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    int min_token_num = 1;
+    int max_token_num = 2048;
+    for (auto hidden_dim : candidate_hidden_dim)
+    {
+        Runner runner(max_token_num, hidden_dim);
+        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
+        {
+            if (rank == 0)
+            {
+                printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+            }
+            for (int i = 0; i < iter; ++i)
+            {
+                runner.reset_io();
+                runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+                runner.verify(token_num, hidden_dim);
+            }
+            if (rank == 0)
+            {
+                printf("\033[32mPass!\033[0m\n");
+            }
+        }
+    }
+}
+
+TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
+{
+#define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
+    {                                                                                                                  \
+        using Runner = TestRunner<DType, FusionPattern>;                                                               \
+        Runner runner(max_token_num, hidden_dim);                                                                      \
+        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)                                \
+        {                                                                                                              \
+            if (rank == 0)                                                                                             \
+            {                                                                                                          \
+                printf("[Verify] pattern %-20s, dtype %-10s, token_num %-4d, hidden_dim %-4d ...", #FusionPattern,     \
+                    #DType, token_num, hidden_dim);                                                                    \
+            }                                                                                                          \
+            runner.reset_io();                                                                                         \
+            runner.run_once(&Runner::run_kernel, token_num, hidden_dim);                                               \
+            runner.verify(token_num, hidden_dim);                                                                      \
+            if (rank == 0)                                                                                             \
+            {                                                                                                          \
+                printf("\033[32mPass!\033[0m\n");                                                                      \
+            }                                                                                                          \
+        }                                                                                                              \
+    }
+
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+    std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    int min_token_num = 1;
+    int max_token_num = 2048;
+    for (auto hidden_dim : candidate_hidden_dim)
+    {
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kAllReduce);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kAllReduce);
+        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kAllReduce);
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+        TEST_AR_FUSION(float, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+        TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
+    }
+#undef TEST_AR_FUSION
+}
+
+TEST(Kernel_AllReduceFusion, Perf)
+{
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+    int warmup = 100, iter = 300;
     int hidden_dim = 7168;
     std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
-    std::vector<int> candidate_active_expert_num{8, 12, 16};
     int max_token_num = 2048;
-    int max_expert_num = 16;
-    MoEARFuseTestRunner<half> runner(max_token_num, hidden_dim, max_expert_num);
+    Runner runner(max_token_num, hidden_dim);
     for (auto token_num : candidate_token_num)
     {
-        for (auto act_exp_num : candidate_active_expert_num)
+        auto latency = runner.benchmark(&Runner::run_kernel, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
         {
-            auto latency = runner.benchmark(
-                &MoEARFuseTestRunner<half>::run_kernel, warmup, iter, token_num, hidden_dim, act_exp_num);
-            runner.verify(token_num, hidden_dim, act_exp_num);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("token_num %d, hidden_dim %d, act_exp_num %d, latency %fus", token_num, hidden_dim,
-                    act_exp_num, latency);
-            }
-            auto moe_reduce_latency = runner.benchmark(
-                &MoEARFuseTestRunner<half>::run_moe_reduction, warmup, iter, token_num, hidden_dim, act_exp_num);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("moe reduce latency %fus", moe_reduce_latency);
-            }
-            auto nccl_latency
-                = runner.benchmark(&MoEARFuseTestRunner<half>::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("nccl allreduce latency %fus", nccl_latency);
-            }
-            auto residual_latency
-                = runner.benchmark(&MoEARFuseTestRunner<half>::run_residual_add, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("residual add latency %fus", residual_latency);
-            }
-            auto rms_latency
-                = runner.benchmark(&MoEARFuseTestRunner<half>::run_rms_norm, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("rms norm latency %fus", rms_latency);
-            }
-            auto quant_latency
-                = runner.benchmark(&MoEARFuseTestRunner<half>::run_fp4_quant, warmup, iter, token_num, hidden_dim);
-            if (rank == 0)
-            {
-                TLLM_LOG_INFO("fp4 quant latency %fus", quant_latency);
-                auto tot_latency = moe_reduce_latency + nccl_latency + residual_latency + rms_latency + quant_latency;
-                TLLM_LOG_INFO("fusion kernel latency %fus, moe reduce + nccl + ops latency %fus, total speedup %fx",
-                    latency, tot_latency, tot_latency / latency);
-            }
+            TLLM_LOG_INFO(
+                "token_num %-4d, hidden_dim %-4d, fusion kernel latency %4.4fus", token_num, hidden_dim, latency);
+        }
+        auto nccl_latency = runner.benchmark(&Runner::run_nccl_allreduce, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("nccl allreduce latency %4.4fus", nccl_latency);
+        }
+        auto residual_latency = runner.benchmark(&Runner::run_residual_add, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("residual add latency %4.4fus", residual_latency);
+        }
+        auto rms_latency = runner.benchmark(&Runner::run_rms_norm, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("rms norm latency %4.4fus", rms_latency);
+        }
+        auto quant_latency = runner.benchmark(&Runner::run_fp4_quant, warmup, iter, token_num, hidden_dim);
+        if (rank == 0)
+        {
+            TLLM_LOG_INFO("fp4 quant latency %4.4fus", quant_latency);
+            auto tot_latency = nccl_latency + residual_latency + rms_latency + quant_latency;
+            TLLM_LOG_INFO("fusion kernel latency %4.4fus, nccl + ops latency %4.4fus, total speedup %2.4fx", latency,
+                tot_latency, tot_latency / latency);
         }
     }
 }

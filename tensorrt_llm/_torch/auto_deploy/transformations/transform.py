@@ -14,6 +14,7 @@ from ..utils.logger import ad_logger
 from ._graph import move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    check_in_out_nodes,
     column_row_shard,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
@@ -22,6 +23,7 @@ from .library import (
     fuse_moe,
     identify_and_fuse_mha,
     insert_mha_with_kv_cache,
+    insert_mla_with_kv_cache,
     match_moe_pattern,
     quantize,
     resize_kv_cache,
@@ -38,7 +40,8 @@ class InferenceOptimizer:
     ):
         self.factory = factory
         self.attn_backend = ad_config.attn_backend
-        # TODO: let's split up the compile backend to separately handle cuda graph
+        self.mla_backend = ad_config.mla_backend
+        # TODO (lliebenwein): let's split up the compile backend to separately handle cuda graph
         # and torch compile so we can follow the PyTorchConfig here and enable it separately.
         self.ad_config = ad_config
         if ad_config.use_cuda_graph or ad_config.torch_compile_enabled:
@@ -50,6 +53,7 @@ class InferenceOptimizer:
 
         # look up attention op
         self.attention_op = AttentionRegistry.get(self.attn_backend)
+        self.mla_op = AttentionRegistry.get(self.mla_backend)
 
     def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
         """Transform a model into an optimized inference model.
@@ -97,8 +101,17 @@ class InferenceOptimizer:
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
 
+        input_node = check_in_out_nodes(egm)
+
         # insert MHA with KV cache
-        egm = insert_mha_with_kv_cache(egm, cm, self.attention_op, self.factory.get_cache_config())
+        egm = insert_mha_with_kv_cache(
+            egm, cm, self.attention_op, self.factory.get_cache_config(), input_node
+        )
+
+        # insert MLA with KV cache
+        egm = insert_mla_with_kv_cache(
+            egm, cm, self.mla_op, self.factory.get_cache_config(), input_node
+        )
 
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)

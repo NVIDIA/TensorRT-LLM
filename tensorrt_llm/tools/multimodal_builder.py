@@ -1174,7 +1174,7 @@ def build_qwen2_vl_engine(args):
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
     from transformers.models.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock,
-        VisionAttention, VisionRotaryEmbedding, apply_rotary_pos_emb_vision)
+        VisionAttention, VisionRotaryEmbedding)
 
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_path,
@@ -1247,6 +1247,25 @@ def build_qwen2_vl_engine(args):
                                                       self.num_heads,
                                                       -1).permute(1, 0, 2,
                                                                   3).unbind(0)
+
+            # Copied from transformers.models.llama.modeling_qwen2_vl in v4.48
+            def rotate_half(x):
+                x1 = x[..., :x.shape[-1] // 2]
+                x2 = x[..., x.shape[-1] // 2:]
+                return torch.cat((-x2, x1), dim=-1)
+
+            def apply_rotary_pos_emb_vision(
+                    tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+                orig_dtype = tensor.dtype
+                tensor = tensor.float()
+                cos = freqs.cos()
+                sin = freqs.sin()
+                cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+                output = (tensor * cos) + (rotate_half(tensor) * sin)
+                output = output.to(orig_dtype)
+                return output
+
             q = apply_rotary_pos_emb_vision(q.unsqueeze(0),
                                             rotary_pos_emb).squeeze(0)
             k = apply_rotary_pos_emb_vision(k.unsqueeze(0),

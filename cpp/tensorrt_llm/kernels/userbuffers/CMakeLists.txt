@@ -15,7 +15,7 @@
 # the License.
 #
 if(ENABLE_MULTI_DEVICE EQUAL 0)
-  add_library(userbuffers_src OBJECT ub_interface.cpp)
+  add_library(userbuffers_src OBJECT ub_interface.cpp userbuffersManager.cpp)
 else()
   file(GLOB_RECURSE SRC_CPP *.cpp)
   file(GLOB_RECURSE SRC_CU *.cu)

@@ -329,7 +329,7 @@ public:
         // Compiler flags
         std::vector<std::string> flags
             = {"-std=c++17", "--gpu-architecture=sm_90a", "--ptxas-options=-allow-expensive-optimizations=true",
-                "-lineinfo", "--ptxas-options=--register-usage-level=10", "--diag-suppress=161,174,177,940",
+                "--ptxas-options=--register-usage-level=10", "--diag-suppress=161,174,177,940",
                 "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
 
         if (kJitUseNvcc)

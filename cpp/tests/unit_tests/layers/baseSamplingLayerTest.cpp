@@ -100,8 +100,57 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     tk::invokeCurandInitialize(reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice)), nullptr,
         maxBatchSize(), seed, mStream->get());
 
-    if (mBeamWidth > 1)
+    auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+    for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
+        batchSlotsPtr[bi] = kDoubleBatchIdx * bi;
+    }
+    for (SizeType32 bi = 0; bi < mBatchSizeBadPad; ++bi)
+    {
+        batchSlotsPtr[mBatchSize + bi] = 0xbaadf00d;
+    }
+
+    auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
+    auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
+    for (SizeType32 bi = 0; bi < maxBatchSize(); bi++)
+    {
+        idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
+    }
+
+    std::shared_ptr<DecodingSetupParams> setupParams;
+    if (params.isExternalDraftTokensLayerTest)
+    {
+        auto externalDraftTokensSetupParams = std::make_shared<ExternalDraftTokensSetupParams>();
+        externalDraftTokensSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+        externalDraftTokensSetupParams->runtimeTopK
+            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+        externalDraftTokensSetupParams->runtimeTopP
+            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+
+        setupParams = externalDraftTokensSetupParams;
+    }
+    else if (mBeamWidth == 1)
+    {
+        auto samplingSetupParams = std::make_shared<SamplingSetupParams>();
+        samplingSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+        samplingSetupParams->runtimeTopK
+            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+        samplingSetupParams->runtimeTopP
+            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+        samplingSetupParams->topPDecay
+            = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
+        samplingSetupParams->topPMin
+            = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
+        samplingSetupParams->topPResetIds
+            = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
+
+        setupParams = samplingSetupParams;
+    }
+    else // Beam Search
+    {
+        auto samplingSetupParams = std::make_shared<BeamSearchSetupParams>();
+        setupParams = samplingSetupParams;
+
         mSrcCacheIndirection = mBufferManager->gpu(
             ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mTgtCacheIndirection = mBufferManager->gpu(
@@ -137,26 +186,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
         trk::invokeFill(*mNumBeamsCBA, int32_t{0}, *mStream);
         trk::invokeFill(*mMinNormedScoresCBA, float{0}, *mStream);
         trk::invokeFill(*mBatchDones, bool{0}, *mStream);
-    }
 
-    auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-    for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
-    {
-        batchSlotsPtr[bi] = kDoubleBatchIdx * bi;
-    }
-    for (SizeType32 bi = 0; bi < mBatchSizeBadPad; ++bi)
-    {
-        batchSlotsPtr[mBatchSize + bi] = 0xbaadf00d;
-    }
-
-    auto idsPtrHostPtr = BufferRange<void*>(*mIdsPtrHost);
-    auto outputIdsDevicePtr = bufferCast<int32_t>(*mOutputIdsDevice);
-    for (SizeType32 bi = 0; bi < maxBatchSize(); bi++)
-    {
-        idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
-    }
-    if (mBeamWidth > 1)
-    {
         auto outputIdsPtr = bufferCast<int*>(*mOutputIdsPtr);
         auto parentIdsPtr = bufferCast<int*>(*mParentIdsPtr);
         for (SizeType32 bi = 0; bi < maxBatchSize(); bi++)
@@ -164,42 +194,6 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
             outputIdsPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
             parentIdsPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
         }
-    }
-
-    std::shared_ptr<DecodingSetupParams> setupParams;
-    if (mBeamWidth > 1)
-    {
-        auto samplingSetupParams = std::make_shared<BeamSearchSetupParams>();
-
-        setupParams = samplingSetupParams;
-    }
-    else if (!params.isExternalDraftTokensLayerTest)
-    {
-        auto samplingSetupParams = std::make_shared<SamplingSetupParams>();
-        samplingSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-        samplingSetupParams->runtimeTopK
-            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
-        samplingSetupParams->runtimeTopP
-            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-        samplingSetupParams->topPDecay
-            = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
-        samplingSetupParams->topPMin
-            = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
-        samplingSetupParams->topPResetIds
-            = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
-
-        setupParams = samplingSetupParams;
-    }
-    else
-    {
-        auto externalDraftTokensSetupParams = std::make_shared<ExternalDraftTokensSetupParams>();
-        externalDraftTokensSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-        externalDraftTokensSetupParams->runtimeTopK
-            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
-        externalDraftTokensSetupParams->runtimeTopP
-            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-
-        setupParams = externalDraftTokensSetupParams;
     }
 
     mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
@@ -212,25 +206,26 @@ template <typename T>
 std::shared_ptr<DecodingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
+
+    auto decodeInputTensors = (mBeamWidth > 1)
+        ? std::make_shared<DecodingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize)
+        : std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
+    decodeInputTensors->logits = mDecodingWorkspace->getDeviceRuntimeLogits();
+    decodeInputTensors->inputLengths = mContextLengthDevice;
+    decodeInputTensors->finished = mFinishedDevice;
+
     if (mBeamWidth > 1)
     {
-        auto decodeInputTensors = std::make_shared<DecodingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
-        decodeInputTensors->logits = mDecodingWorkspace->getDeviceRuntimeLogits();
-        decodeInputTensors->inputLengths = mContextLengthDevice;
-        decodeInputTensors->finished = mFinishedDevice;
         decodeInputTensors->srcCacheIndirection = mSrcCacheIndirection;
-        return decodeInputTensors;
     }
     else
     {
-        auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
-        decodeInputTensors->logits = mDecodingWorkspace->getDeviceRuntimeLogits();
-        decodeInputTensors->inputLengths = mContextLengthDevice;
-        decodeInputTensors->finished = mFinishedDevice;
-        decodeInputTensors->probsComputed = mComputeProbs;
-        decodeInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-        return decodeInputTensors;
+        auto samplingInputTensors = std::dynamic_pointer_cast<SamplingInputs>(decodeInputTensors);
+        samplingInputTensors->probsComputed = mComputeProbs;
+        samplingInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
     }
+
+    return decodeInputTensors;
 }
 
 template <typename T>
@@ -238,42 +233,33 @@ std::shared_ptr<BaseDecodingOutputs> BaseSamplingLayerTest<T>::createOutputTenso
 {
     // TODO: check log probs and cum_log_probs
 
+    auto decodeOutputs = (mBeamWidth > 1) ? std::make_shared<BeamSearchOutputs>(mOutputIdsDevice)
+                                          : std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
+    decodeOutputs->outputIdsPtr = mIdsPtrHost;
+    decodeOutputs->outputIdsPtrHost = mIdsPtrHost;
+    decodeOutputs->sequenceLength = mSeqLengthsDevice;
+    decodeOutputs->finished = mFinishedDevice;
+    decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
+    decodeOutputs->cumLogProbs = mCumLogProbsDevice;
+
     if (mBeamWidth > 1)
     {
-        auto decodeOutputs = std::make_shared<BeamSearchOutputs>(mOutputIdsDevice);
-        decodeOutputs->outputIdsPtr = mOutputIdsPtr;
-        decodeOutputs->outputIdsPtrHost = mIdsPtrHost;
-        decodeOutputs->sequenceLength = mSeqLengthsDevice;
-        decodeOutputs->finished = mFinishedDevice;
-        decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
-        decodeOutputs->cumLogProbs = mCumLogProbsDevice;
-        decodeOutputs->tgtCacheIndirection = mTgtCacheIndirection;
-        decodeOutputs->parentIds = mParentIds;
-        decodeOutputs->parentIdsPtr = mIdsPtrHost;
-
-        decodeOutputs->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
-        decodeOutputs->beamHypotheses->outputIdsCBA = bufferCast<int>(*mOutputIdsCBA);
-        decodeOutputs->beamHypotheses->logProbsCBA = bufferCast<float>(*mLogProbsCBA);
-        decodeOutputs->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*mSequenceLengthsCBA);
-        decodeOutputs->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*mCumLogProbsCBA);
-        decodeOutputs->beamHypotheses->normedScoresCBA = bufferCast<float>(*mNormedScoresCBA);
-        decodeOutputs->beamHypotheses->numBeamsCBA = bufferCast<int>(*mNumBeamsCBA);
-        decodeOutputs->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*mMinNormedScoresCBA);
-        decodeOutputs->beamHypotheses->batchDones = bufferCast<bool>(*mBatchDones);
-
-        return decodeOutputs;
+        auto beamSearchOutputs = std::dynamic_pointer_cast<BeamSearchOutputs>(decodeOutputs);
+        beamSearchOutputs->tgtCacheIndirection = mTgtCacheIndirection;
+        beamSearchOutputs->parentIds = mParentIds;
+        beamSearchOutputs->parentIdsPtr = mParentIdsPtr;
+        beamSearchOutputs->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
+        beamSearchOutputs->beamHypotheses->outputIdsCBA = bufferCast<int>(*mOutputIdsCBA);
+        beamSearchOutputs->beamHypotheses->logProbsCBA = bufferCast<float>(*mLogProbsCBA);
+        beamSearchOutputs->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*mSequenceLengthsCBA);
+        beamSearchOutputs->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*mCumLogProbsCBA);
+        beamSearchOutputs->beamHypotheses->normedScoresCBA = bufferCast<float>(*mNormedScoresCBA);
+        beamSearchOutputs->beamHypotheses->numBeamsCBA = bufferCast<int>(*mNumBeamsCBA);
+        beamSearchOutputs->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*mMinNormedScoresCBA);
+        beamSearchOutputs->beamHypotheses->batchDones = bufferCast<bool>(*mBatchDones);
     }
-    else
-    {
-        auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
-        decodeOutputs->outputIdsPtr = mIdsPtrHost;
-        decodeOutputs->outputIdsPtrHost = mIdsPtrHost;
-        decodeOutputs->sequenceLength = mSeqLengthsDevice;
-        decodeOutputs->finished = mFinishedDevice;
-        decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
-        decodeOutputs->cumLogProbs = mCumLogProbsDevice;
-        return decodeOutputs;
-    }
+
+    return decodeOutputs;
 }
 
 template <typename T>

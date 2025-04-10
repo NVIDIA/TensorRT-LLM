@@ -27,3 +27,4 @@ def test_interactive_console(interactive_console):
     assert console.history[0]['role'] == 'user'
     assert console.history[1]['role'] == 'assistant'
     assert console.history[1]['content']  # reply not empty
+    console.llm.shutdown()

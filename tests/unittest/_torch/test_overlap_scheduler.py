@@ -64,7 +64,7 @@ def test_overlap_scheduler_consistency(model_path, test_case):
     texts_with_overlap = [[
         completion.text for completion in request_output.outputs
     ] for request_output in outputs_with_overlap]
-    del llm
+    llm.shutdown()
 
     # Test with overlap scheduler disabled
     llm = create_llm(model_path, enable_overlap_scheduler=False)
@@ -74,7 +74,7 @@ def test_overlap_scheduler_consistency(model_path, test_case):
     texts_without_overlap = [[
         completion.text for completion in request_output.outputs
     ] for request_output in outputs_without_overlap]
-    del llm
+    llm.shutdown()
 
     # Verify outputs are consistent
     for with_overlap, without_overlap in zip(texts_with_overlap,

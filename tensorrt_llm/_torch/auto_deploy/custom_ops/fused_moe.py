@@ -59,7 +59,9 @@ def torch_moe(
         expert_out = F.linear(prod, w2_weight[expert_idx])
 
         current_hidden_states = expert_out * routing_weights[top_x, idx, None]
-        final_hidden_states.index_add_(0, top_x, current_hidden_states)
+        final_hidden_states.index_add_(
+            0, top_x, current_hidden_states.to(final_hidden_states.dtype)
+        )
 
     return final_hidden_states.view_as(x)
 

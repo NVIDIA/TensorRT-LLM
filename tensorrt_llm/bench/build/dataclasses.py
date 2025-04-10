@@ -1,6 +1,6 @@
 from transformers import AutoConfig
 from typing import Optional, Literal
-from pydantic import BaseModel, Field, AliasChoices, model_validator
+from pydantic import AliasPath, BaseModel, Field, AliasChoices, model_validator
 import huggingface_hub
 from huggingface_hub.constants import (
     SAFETENSORS_INDEX_FILE,
@@ -117,23 +117,42 @@ class ModelConfig(BaseModel):
     """
     name: str
     param_count: int
-    num_hidden_layers: int = Field(
-        validation_alias=AliasChoices("num_hidden_layers", "n_layer"))
-    num_attention_heads: int = Field(
-        validation_alias=AliasChoices("num_attention_heads", "n_head"))
+    num_hidden_layers: int = Field(validation_alias=AliasChoices(
+        "num_hidden_layers",
+        "n_layer",
+        AliasPath("text_config", "num_hidden_layers"),
+    ))
+    num_attention_heads: int = Field(validation_alias=AliasChoices(
+        "num_attention_heads",
+        "n_head",
+        AliasPath("text_config", "num_attention_heads"),
+    ))
     num_key_value_heads: Optional[int] = Field(
         default=None,
-        validation_alias=AliasChoices("num_key_value_heads", "num_kv_heads"),
+        validation_alias=AliasChoices(
+            "num_key_value_heads",
+            "num_kv_heads",
+            AliasPath("text_config", "num_key_value_heads"),
+        ),
     )
-    hidden_size: int = Field(
-        validation_alias=AliasChoices("hidden_size", "n_embd"))
+    hidden_size: int = Field(validation_alias=AliasChoices(
+        "hidden_size",
+        "n_embd",
+        AliasPath("text_config", "hidden_size"),
+    ))
     head_size: Optional[int] = Field(default=None,
                                      validation_alias=AliasChoices(
-                                         "head_size", "head_dim"))
+                                         "head_size",
+                                         "head_dim",
+                                         AliasPath("text_config", "head_dim"),
+                                     ))
     max_position_embeddings: Optional[int] = Field(
         default=None,
-        validation_alias=AliasChoices("max_position_embeddings", "n_positions"),
-    )
+        validation_alias=AliasChoices(
+            "max_position_embeddings",
+            "n_positions",
+            AliasPath("text_config", "max_position_embeddings"),
+        ))
     dtype: Literal["float16", "bfloat16",
                    None] = Field(default="float16",
                                  validation_alias=AliasChoices(

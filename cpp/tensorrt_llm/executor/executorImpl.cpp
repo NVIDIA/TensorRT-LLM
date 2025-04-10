@@ -385,6 +385,7 @@ Executor::Impl::~Impl()
 void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mShutdown = false;
     mShutdownCalled = false;
     mIterStatsMaxIterations = executorConfig.getIterStatsMaxIterations();
@@ -1427,6 +1428,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(fetchNewRequests);
+
     // If grab requests from queue, do exchange between ranks
     auto reqWithIds = getNewReqWithIds(numActiveRequests, lowestPriorityActive);
     RequestList newRequests;

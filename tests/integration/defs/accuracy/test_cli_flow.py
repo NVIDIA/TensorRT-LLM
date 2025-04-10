@@ -520,6 +520,8 @@ class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=["--gemm_plugin=disable"])
 
+    @pytest.mark.skip(
+        reason="Broken by modelopt. Will be fixed in next release")
     @skip_pre_blackwell
     @pytest.mark.parametrize("fuse_fp4_quant", [False, True],
                              ids=["disable_fused_quant", "enable_fused_quant"])

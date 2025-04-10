@@ -52,6 +52,7 @@ add_library(
   fp4BatchedQuantize.cpp
   fp8BlockScalingGemm.cpp
   fp8Quantize.cpp
+  fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
@@ -65,6 +66,7 @@ add_library(
   relativeAttentionBiasOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
+  userbuffersTensor.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)

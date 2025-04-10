@@ -126,10 +126,10 @@ def process_image(image: Union[Image.Image, torch.Tensor],
                   dtype=None):
 
     image_aspect_ratio = model_config.image_aspect_ratio
-    if hasattr(image_processor, "crop_size"):
-        crop_size = image_processor.crop_size  # CLIP vision tower
-    elif hasattr(image_processor, "size"):
+    if hasattr(image_processor, "size"):
         crop_size = image_processor.size  # SIGLIP vision tower
+    elif hasattr(image_processor, "crop_size"):
+        crop_size = image_processor.crop_size  # CLIP vision tower
 
     if image_aspect_ratio == "dynamic" and enable_dynamic_res:
         # VILA 2.0

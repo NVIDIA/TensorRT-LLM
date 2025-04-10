@@ -28,7 +28,7 @@
 namespace tensorrt_llm::batch_manager
 {
 class LookaheadDecodingBuffers;
-}
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::runtime
 {

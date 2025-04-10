@@ -304,9 +304,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+                         quant_config, **kwargs)
 
     def forward(self,
                 q: torch.Tensor,

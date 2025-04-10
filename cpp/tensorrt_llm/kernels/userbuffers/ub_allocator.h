@@ -51,15 +51,16 @@ public:
 
     void initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
     bool is_initialized();
-    UBBuffer register_ub_buffer(size_t bytes);
-    void* allocate(int idx, size_t bytes);
+    UBBuffer allocate(size_t bytes);
     void deallocate(void* addr);
     UBBuffer get(int idx);
     communicator* comm();
 
 private:
+    UBBuffer register_ub_buffer(size_t bytes);
+
     communicator* ub_comm_;
-    std::array<UBBuffer, 3> buffers_;
+    std::vector<UBBuffer> buffers_;
     bool is_initialized_;
     tensorrt_llm::runtime::WorldConfig world_config_;
 };
