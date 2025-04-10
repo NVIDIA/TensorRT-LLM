@@ -2048,7 +2048,7 @@ class DeepseekV2Attention(Attention):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
+        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
             self.max_position_embeddings, self.qk_rope_head_dim,
             self.rotary_embedding_base, self.rotary_scaling["factor"],
             rotary_embedding_origin_max_position, rotary_embedding_beta_fast,
