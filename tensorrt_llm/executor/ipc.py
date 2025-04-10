@@ -1,9 +1,9 @@
-import time
-import traceback
+import hashlib
 import hmac
 import os
-import pickle
-import hashlib
+import pickle  # nosec B403
+import time
+import traceback
 from queue import Queue
 from typing import Any, Optional
 
@@ -42,7 +42,8 @@ class ZeroMqQueue:
         '''
 
         self.socket_type = socket_type
-        self.address_endpoint = address[0] if address is not None else "tcp://127.0.0.1:*"
+        self.address_endpoint = address[
+            0] if address is not None else "tcp://127.0.0.1:*"
         self.is_server = is_server
         self.context = zmq.Context() if not is_async else zmq.asyncio.Context()
         self.poller = None
@@ -57,38 +58,33 @@ class ZeroMqQueue:
 
         # Check HMAC key condition
         if self.use_hmac_encryption and self.is_server and self.hmac_key is not None:
-            raise ValueError("Server should not receive HMAC key when encryption is enabled")
+            raise ValueError(
+                "Server should not receive HMAC key when encryption is enabled")
         elif self.use_hmac_encryption and not self.is_server and self.hmac_key is None:
-            raise ValueError("Client must receive HMAC key when encryption is enabled") 
+            raise ValueError(
+                "Client must receive HMAC key when encryption is enabled")
         elif not self.use_hmac_encryption and self.hmac_key is not None:
-            raise ValueError("Server and client should not receive HMAC key when encryption is disabled")
+            raise ValueError(
+                "Server and client should not receive HMAC key when encryption is disabled"
+            )
 
         if (socket_type == zmq.PAIR
                 and self.is_server) or socket_type == zmq.PULL:
             self.socket.bind(
                 self.address_endpoint
             )  # Binds to the address and occupy a port immediately
-            self.address_endpoint = self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+            self.address_endpoint = self.socket.getsockopt(
+                zmq.LAST_ENDPOINT).decode()
             print_colored_debug(
                 f"Server [{name}] bound to {self.address_endpoint} in {self.socket_type_str[socket_type]}\n",
                 "green")
-            
+
             if self.use_hmac_encryption:
                 # Initialize HMAC key for pickle encryption
                 logger.info(f"Generating a new HMAC key for server {self.name}")
                 self.hmac_key = os.urandom(32)
-            
+
             self.address = (self.address_endpoint, self.hmac_key)
-
-    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
-        """Verify the HMAC of received pickle data."""
-        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
-        return hmac.compare_digest(expected_hmac, actual_hmac)
-
-    def _sign_data(self, data_before_encoding: bytes) -> bytes:
-        """Generate HMAC for data."""
-        hmac_signature = hmac.new(self.hmac_key, data_before_encoding, hashlib.sha256).digest()
-        return data_before_encoding + hmac_signature
 
     def setup_lazily(self):
         if self._setup_done:
@@ -122,7 +118,7 @@ class ZeroMqQueue:
         with nvtx_range_debug("send", color="blue", category="IPC"):
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                data = pickle.dumps(obj)
+                data = pickle.dumps(obj)  # nosec B301
                 signed_data = self._sign_data(data)
                 self.socket.send(signed_data)
             else:
@@ -134,7 +130,7 @@ class ZeroMqQueue:
         try:
             if self.use_hmac_encryption:
                 # Send pickled data with HMAC appended
-                data = pickle.dumps(obj)
+                data = pickle.dumps(obj)  # nosec B301
                 signed_data = self._sign_data(data)
                 await self.socket.send(signed_data)
             else:
@@ -152,7 +148,7 @@ class ZeroMqQueue:
 
     def get(self) -> Any:
         self.setup_lazily()
-        
+
         if self.use_hmac_encryption:
             # Receive signed data with HMAC
             signed_data = self.socket.recv()
@@ -160,12 +156,12 @@ class ZeroMqQueue:
             # Split data and HMAC
             data = signed_data[:-32]
             actual_hmac = signed_data[-32:]
-            
+
             # Verify HMAC
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
-                
-            obj = pickle.loads(data)
+
+            obj = pickle.loads(data)  # nosec B301
         else:
             # Receive data without HMAC
             obj = self.socket.recv_pyobj()
@@ -181,12 +177,12 @@ class ZeroMqQueue:
             # Split data and HMAC
             data = signed_data[:-32]
             actual_hmac = signed_data[-32:]
-            
+
             # Verify HMAC
             if not self._verify_hmac(data, actual_hmac):
                 raise RuntimeError("HMAC verification failed")
-            
-            obj = pickle.loads(data)
+
+            obj = pickle.loads(data)  # nosec B301
         else:
             # Receive data without HMAC
             obj = await self.socket.recv_pyobj()
@@ -200,6 +196,17 @@ class ZeroMqQueue:
             self.context.term()
             self.context = None
 
+    def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
+        """Verify the HMAC of received pickle data."""
+        expected_hmac = hmac.new(self.hmac_key, data, hashlib.sha256).digest()
+        return hmac.compare_digest(expected_hmac, actual_hmac)
+
+    def _sign_data(self, data_before_encoding: bytes) -> bytes:
+        """Generate HMAC for data."""
+        hmac_signature = hmac.new(self.hmac_key, data_before_encoding,
+                                  hashlib.sha256).digest()
+        return data_before_encoding + hmac_signature
+
     def __del__(self):
         self.close()
 
@@ -211,7 +218,7 @@ class FusedIpcQueue:
     ''' A Queue-like container for IPC with optional message batched. '''
 
     def __init__(self,
-                 address: Optional[str] = None,
+                 address: Optional[tuple[str, Optional[bytes]]] = None,
                  *,
                  is_server: bool,
                  fuse_message=False,
@@ -264,7 +271,7 @@ class FusedIpcQueue:
         return self.queue.get()
 
     @property
-    def address(self) -> str:
+    def address(self) -> tuple[str, Optional[bytes]]:
         return self.queue.address
 
     def __del__(self):

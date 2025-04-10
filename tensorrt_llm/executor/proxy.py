@@ -108,6 +108,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             atexit.register(self.pre_shutdown)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
+
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.request_error_queue = IpcQueue(is_server=True,

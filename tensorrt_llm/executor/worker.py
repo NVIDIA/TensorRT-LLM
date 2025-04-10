@@ -499,7 +499,8 @@ def worker_main(
         _torch_model_class_mapping: Optional[dict] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[bool] = True,  # whether it's the main executor instance
+        is_llm_executor: Optional[
+            bool] = True,  # whether it's the main executor instance
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -586,7 +587,8 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         print_colored_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: tuple[str, bytes] = worker_queues.result_queue_addr
+        proxy_result_queue: tuple[
+            str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
         assert postproc_worker_config.postprocess_tokenizer_dir is not None
