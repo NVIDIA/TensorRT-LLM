@@ -56,3 +56,67 @@ class RMSNorm(nn.Module):
             return hidden_states
         else:
             return hidden_states, residual
+
+
+class GroupRMSNorm(nn.Module):
+
+    def __init__(self,
+                 *,
+                 eps: float = 1e-5,
+                 weight_bias: float = 0.0,
+                 enable_weights: bool = False,
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None):
+        """
+        Group RMS Normalization for multiple tensors.
+
+        Args:
+            hidden_sizes: List of hidden dimensions for each input tensor
+            eps: Epsilon for numerical stability
+            enable_weights: Whether to use learnable weights
+            dtype: Data type for weights
+            device: Device for weights
+        """
+        super().__init__()
+        self.variance_epsilon = eps
+        self.weight_bias = weight_bias
+        self.enable_weights = enable_weights
+
+    def forward(
+            self,
+            inputs: list[torch.Tensor],
+            weights: Optional[list[torch.Tensor]] = None,
+            outputs: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
+        """
+        Apply RMS normalization to a group of inputs.
+
+        Args:
+            inputs: List of tensors to normalize [batch_size, hidden_dim]
+
+        Returns:
+            List of normalized tensors with same shape as inputs
+        """
+
+        if len(inputs) == 0:
+            return []
+        if outputs is None:
+            outputs = [torch.empty_like(input) for input in inputs]
+        for input, output in zip(inputs, outputs):
+            assert input.device == output.device, "inputs and outputs must have the same device"
+            assert input.shape == output.shape, "inputs and outputs must have the same shape"
+            assert input.dtype == output.dtype, "inputs and outputs must have the same dtype"
+
+        if self.enable_weights:
+            assert weights is not None, "weights must be provided if enable_weights is True"
+
+        w = weights if weights is not None else [
+            nn.Parameter(
+                torch.empty(
+                    input.shape[-1], dtype=input.dtype, device=input.device))
+            for input in inputs
+        ]
+
+        torch.ops.trtllm.group_rms_norm(inputs, outputs, w,
+                                        self.variance_epsilon, self.weight_bias,
+                                        self.enable_weights)
+        return outputs
