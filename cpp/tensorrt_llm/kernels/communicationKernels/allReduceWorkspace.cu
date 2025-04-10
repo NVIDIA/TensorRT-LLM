@@ -13,23 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/kernels/communicationKernels/allReduceUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 
 namespace tensorrt_llm::kernels::ar_fusion
 {
-
-__global__ void lamport_initialize_kernel(float* ptr, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size)
-        return;
-    ptr[idx] = -0.f;
-}
-
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream)
-{
-    lamport_initialize_kernel<<<bytes / 128, 128, 0, stream>>>(reinterpret_cast<float*>(ptr), bytes / sizeof(float));
-}
 
 Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> stream_ptr)
@@ -74,7 +62,7 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     TLLM_CUDA_CHECK(cudaMalloc(&m_workspace, workspace.size() * sizeof(void*)));
     TLLM_CUDA_CHECK(
         cudaMemcpy(m_workspace, workspace.data(), workspace.size() * sizeof(void*), cudaMemcpyHostToDevice));
-    lamport_initialize(m_ipc_mem_handles[2].getCommPtrs()[rank], lamport_buffer_size, 0);
+    lamport_initialize(m_ipc_mem_handles[3].getCommPtrs()[rank], lamport_buffer_size, 0);
 }
 
 Workspace::~Workspace()

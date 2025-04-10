@@ -39,6 +39,4 @@ private:
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> m_cuda_stream;
     void* m_flag_d_ptr;
 };
-
-void lamport_initialize(void* ptr, int bytes, cudaStream_t stream);
 } // namespace tensorrt_llm::kernels::ar_fusion
