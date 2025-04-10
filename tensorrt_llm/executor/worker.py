@@ -14,15 +14,16 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .._utils import KVCacheEventSerializer, global_mpi_rank, mpi_comm, mpi_rank
+from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
+                      mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, nvtx_range,
-                            print_colored_debug, print_traceback_on_error)
+                            clear_sched_affinity, print_colored_debug,
+                            print_traceback_on_error)
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -732,9 +733,9 @@ class AwaitResponseHelper:
                 lambda _: _,
                 [self.worker._engine_response_callback(r) for r in responses]))
 
-        with nvtx_range(f"await_response-{len(responses)}",
-                        color="red",
-                        category="Worker"):
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
             self.responses_handler(responses)
         return True
 
@@ -770,9 +771,9 @@ class AwaitResponseHelper:
         in a FusedIpcQueue, and a background thread will batch them and invoke
         IPC periodically. '''
 
-        with nvtx_range(f"handle_for_ipc_periodically-{len(responses)}",
-                        color="red",
-                        category="Worker"):
+        with nvtx_range_debug(f"handle_for_ipc_periodically-{len(responses)}",
+                              color="red",
+                              category="Worker"):
 
             for response in responses:
 

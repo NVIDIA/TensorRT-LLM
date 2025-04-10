@@ -17,10 +17,10 @@ import gc
 import inspect
 import json
 import math
+import os
 import struct
 import trace
 import weakref
-from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial, wraps
@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
+import nvtx
 from cuda import cuda
 from mpi4py import MPI
 from packaging import version
@@ -733,13 +734,18 @@ class QuantModeWrapper:
         return self.objs[index]
 
 
-@contextmanager
-def nvtx_range(msg):
-    torch.cuda.nvtx.range_push(msg)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+def nvtx_range(msg, color="grey", domain="TensorRT-LLM", category=None):
+    return nvtx.annotate(msg, color=color, domain=domain, category=category)
+
+
+def nvtx_range_debug(msg, color="grey", domain="TensorRT-LLM", category=None):
+    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
+            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+        return nvtx_range(msg, color=color, domain=domain, category=category)
+
+
+def nvtx_mark(msg, color="grey", domain="TensorRT-LLM", category=None):
+    nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def volume(d: Sequence[int]):
