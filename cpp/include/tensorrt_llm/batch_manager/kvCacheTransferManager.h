@@ -17,6 +17,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
+#include "tensorrt_llm/executor/types.h"
 
 namespace tr = tensorrt_llm::runtime;
 
@@ -34,12 +35,22 @@ public:
     explicit KVCacheTransferManager(tr::BufferManager const& bufferManager);
 
     //! \brief Onboard a block to gpu memory.
-    void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
-        int numTokensToCopy = 0);
+    void onboard(
+        BlockPtr const& offloadBlock,
+        BlockPtr const& block,
+        std::vector<KVCacheBlockPool> const& pools,
+        int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     //! \brief Offload a block to cpu memory.
-    void offload(BlockPtr const& block, BlockPtr const& offloadBlock, std::vector<KVCacheBlockPool> const& pools,
-        int numTokensToCopy = 0);
+    void offload(
+        BlockPtr const& block,
+        BlockPtr const& offloadBlock,
+        std::vector<KVCacheBlockPool> const& pools,
+        int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::optional<std::string> directory = std::nullopt);
 
     //! \brief Synchronize the offload/onboard streams with the bufferManager stream.
     void syncTransfers();
