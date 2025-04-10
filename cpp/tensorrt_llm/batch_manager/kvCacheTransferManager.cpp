@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/executor/executor.h"
 
 #ifndef _WIN32
 #  ifdef ENABLE_CUFILE
@@ -291,22 +292,32 @@ void KVCacheTransferManager::copyBlock(
 }
 
 
-
-void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr const& block,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy)
+void KVCacheTransferManager::onboard(
+    BlockPtr const& offloadBlock,
+    BlockPtr const& block,
+    std::vector<KVCacheBlockPool> const& pools,
+    int numTokensToCopy,
+    executor::KvCacheTransferMode mode,
+    std::optional<std::string> directory)
 {
     if (mPendingOffloads.find(offloadBlock->getBlockId()) != mPendingOffloads.end())
     {
         mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
     }
-    copyBlock(offloadBlock, block, pools, false, numTokensToCopy);
+    copyBlock(offloadBlock, block, pools, false, numTokensToCopy, mode, directory);
 }
 
-void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy)
+
+void KVCacheTransferManager::offload(
+    BlockPtr const& block,
+    BlockPtr const& offloadBlock,
+    std::vector<KVCacheBlockPool> const& pools,
+    int numTokensToCopy,
+    executor::KvCacheTransferMode mode,
+    std::optional<std::string> directory)
 {
     mPendingOffloads[block->getBlockId()] = tr::CudaEvent();
-    copyBlock(block, offloadBlock, pools, true, numTokensToCopy);
+    copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
     mOffloadManager.getStream().record(mPendingOffloads[block->getBlockId()]);
 }
 
