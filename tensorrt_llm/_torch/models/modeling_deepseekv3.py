@@ -321,28 +321,38 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
+        all_rank_split_size = all_rank_num_tokens
         if self.use_dp and self.parallel_config.tensor_parallel_size > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
             if disable_fp4_allgather():
-                hidden_states = allgather(hidden_states,
-                                          self.parallel_config,
-                                          gather_dim=0)
+                hidden_states = allgather(
+                    hidden_states,
+                    self.parallel_config,
+                    gather_dim=0,
+                    all_rank_split_size=all_rank_split_size)
+            elif not self.experts.has_fp8_qdq and self.experts.has_nv_fp4:
+                # Use padding only when x_sf in self.experts is not None
+                all_rank_split_size = None
+                max_num_token = max(all_rank_num_tokens)
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
 
         if hidden_states_fp4 is not None:
-            routed_output = self.experts(hidden_states_fp4,
-                                         router_logits,
-                                         min_latency_mode,
-                                         output_dtype=hidden_states.dtype)
+            routed_output = self.experts(
+                hidden_states_fp4,
+                router_logits,
+                min_latency_mode,
+                output_dtype=hidden_states.dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                all_rank_split_size=all_rank_split_size)
         else:
             routed_output = self.experts(
                 hidden_states,
                 router_logits,
                 min_latency_mode,
-                all_rank_num_tokens=all_rank_num_tokens)
+                all_rank_num_tokens=all_rank_num_tokens,
+                all_rank_split_size=all_rank_split_size)
 
         return routed_output
 

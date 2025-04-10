@@ -8,7 +8,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import ParallelConfig
+from ..distributed import ParallelConfig, allgather
 from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
@@ -17,6 +17,7 @@ from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
+from ..utils import disable_fp4_allgather
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -61,14 +62,27 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_split_size = all_rank_num_tokens
         if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
+            if disable_fp4_allgather():
+                hidden_states = allgather(
+                    hidden_states,
+                    self.parallel_config,
+                    gather_dim=0,
+                    all_rank_split_size=all_rank_split_size)
+            elif not self.experts.has_fp8_qdq and self.experts.has_nv_fp4:
+                # Use padding only when x_sf in self.experts is not None
+                all_rank_split_size = None
+                max_num_token = max(all_rank_num_tokens)
+                hidden_states = torch.nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_split_size=all_rank_split_size)
         return final_hidden_states
 
 
