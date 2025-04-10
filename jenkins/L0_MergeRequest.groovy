@@ -609,6 +609,7 @@ def collectTestResults(pipeline, testFilter)
             testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
 
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
             sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
             sh "cat result_file_names.txt"
@@ -619,6 +620,11 @@ def collectTestResults(pipeline, testFilter)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            if (testFilter[(IS_POST_MERGE)]) {
+                sh "python3 llm/jenkins/scripts/generate_duration.py --duration-file=new_test_duration.json"
+                trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
+            }
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
@@ -635,13 +641,11 @@ def collectTestResults(pipeline, testFilter)
                     echo "Test coverage is skipped because there is no test data file."
                     return
                 }
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
                 sh "coverage --version"
 
-                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                 sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
                 def coverageConfigFile = "cov/.coveragerc"
                 sh """
