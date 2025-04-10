@@ -20,7 +20,7 @@ import signal
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -32,14 +32,23 @@ from packaging.version import parse
 from tqdm import tqdm
 
 import tensorrt_llm
-from tensorrt_llm._torch import LLM as TORCH_LLM
+from tensorrt_llm._torch.auto_deploy.shim.interface import AutoDeployConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import DecodingConfig
+from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 from tensorrt_llm.llmapi import RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm import LLM as TRT_LLM
 
 logger = logging.getLogger(__name__)
+
+
+# utility class to keep track of json encoded chats
+class JsonChatStr(NamedTuple):
+    prompt: str
+
+    def encode(self, encoding):
+        return self.prompt.encode(encoding)
 
 
 @register_model("trt-llm")
@@ -59,7 +68,10 @@ class TRTLLMEvalBase(TemplateLM):
         backend: str = 'trt',
         max_context_length: Optional[int] = None,
         moe_expert_parallel_size: Optional[int] = None,
-        moe_backend: Optional[str] = "TRTLLM",
+        attn_backend: str = "TRTLLM",
+        moe_backend: str = "TRTLLM",
+        tokenized_requests: bool = True,
+        temperature: Optional[float] = None,
         **kwargs,
     ):
         # initialize TemplateLM, copied from TemplateAPI
@@ -73,6 +85,8 @@ class TRTLLMEvalBase(TemplateLM):
         self.max_context_length = max_context_length
         self.moe_expert_parallel_size = moe_expert_parallel_size
         self.moe_backend = moe_backend
+        self.tokenized_requests = tokenized_requests
+        self.temperature = temperature
         trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
         trt_kv_cache_config.free_gpu_memory_fraction = free_gpu_memory_fraction
         if max_tokens_kv_cache is not None:
@@ -88,7 +102,7 @@ class TRTLLMEvalBase(TemplateLM):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        if self.backend == 'torch':
+        if self.backend in ['pytorch', 'autodeploy']:
             kwargs.pop('batch_size')
             if tp < 1:
                 tp = torch.cuda.device_count()
@@ -97,15 +111,28 @@ class TRTLLMEvalBase(TemplateLM):
                 "use_cuda_graph": use_cuda_graph,
                 "print_iter_log": False,
             }
-            if hasattr(PyTorchConfig, "moe_backend"):
-                pytorch_config_params["moe_backend"] = self.moe_backend
-                print(f"Info: moe_backend is set to {self.moe_backend}")
-            pytorch_config = PyTorchConfig(**pytorch_config_params)
+            if self.backend == 'pytorch':
+                if hasattr(PyTorchConfig, "moe_backend"):
+                    pytorch_config_params["moe_backend"] = self.moe_backend
+                    print(f"Info: moe_backend is set to {self.moe_backend}")
+                pytorch_config_params["attn_backend"] = attn_backend.upper()
+                print(f"Info: attn_backend is set to {attn_backend}")
+                pytorch_config = PyTorchConfig(**pytorch_config_params)
+            elif self.backend == 'autodeploy':
+                assert self.max_context_length is not None, "max_context_length must be specified for autodeploy backend"
+                # Only FlashInfer is supported for autodeploy backend.
+                pytorch_config_params["attn_backend"] = "FlashInfer"
+                pytorch_config = AutoDeployConfig(**pytorch_config_params)
+                kwargs["build_config"] = BuildConfig(
+                    max_seq_len=self.max_context_length + self.max_gen_toks)
+            else:
+                raise ValueError(f"Invalid backend: {self.backend}")
 
             # stop words not currently supported by torch backend
             self.use_stop_words = False
 
-            self.llm = TORCH_LLM(
+            self.llm = TRT_LLM(
+                backend=self.backend,
                 model=model,
                 tensor_parallel_size=tp,
                 trust_remote_code=trust_remote_code,
@@ -141,8 +168,31 @@ class TRTLLMEvalBase(TemplateLM):
                                tokenizer=self.tokenizer,
                                kv_cache_config=trt_kv_cache_config,
                                **kwargs)
-            self.max_length = build_config['max_seq_len'] - 1
             logger.info("Loaded TRT-LLM engine")
+
+    @property
+    def tokenizer_name(self) -> str:
+        """Must be defined for LM subclasses which implement Chat Templating.
+        Should return the name of the tokenizer or chat template used.
+        Used only to properly fingerprint caches when requests are being cached with `--cache_requests`, otherwise not used.
+        """
+        return ""
+
+    def apply_chat_template(
+            self,
+            chat_history: List[Dict[str, str]],
+            add_generation_prompt: bool = True) -> Union[str, JsonChatStr]:
+        """Applies a chat template to a list of chat history between user and model."""
+        if self.tokenized_requests:
+            return self.tokenizer.apply_chat_template(
+                chat_history,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=not add_generation_prompt,
+            )
+        else:
+            # bit of a hack. We'll load back before sending to the API
+            return JsonChatStr(json.dumps(chat_history, ensure_ascii=False))
 
     @property
     def eot_token_id(self) -> int:
@@ -264,6 +314,8 @@ class TRTLLMEvalBase(TemplateLM):
             }
             if "max_tokens" not in kwargs_mapped:
                 kwargs_mapped["max_tokens"] = self.max_gen_toks
+            if self.temperature is not None:
+                kwargs_mapped["temperature"] = self.temperature
             return SamplingParams(**kwargs_mapped)
 
         # process requests
