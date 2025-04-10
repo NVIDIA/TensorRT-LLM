@@ -2,6 +2,7 @@ import bisect
 import contextlib
 import glob
 import math
+import os
 import traceback
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -11,7 +12,7 @@ import safetensors
 import torch
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._utils import nvtx_range, release_gc
+from tensorrt_llm._utils import nvtx_range, release_gc, trace_func
 from tensorrt_llm.bindings.executor import GuidedDecodingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -753,6 +754,9 @@ class PyTorchModelEngine(ModelEngine):
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
+        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+        if num_layers > 0:
+            config.pretrained_config.num_hidden_layers = num_layers
 
         with timing("Model init total"):
             try:
@@ -1675,17 +1679,24 @@ class PyTorchModelEngine(ModelEngine):
 
             return outputs
 
+    def model_forward(self, **kwargs):
+        if self.mapping.rank == 0 and int(
+                os.environ.get("TLLM_TRACE_MODEL_FORWARD", "0")) == 1:
+            return trace_func(self.model.forward)(**kwargs)
+        else:
+            return self.model.forward(**kwargs)
+
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor]) -> torch.Tensor:
         inputs = self._preprocess_inputs(inputs)
         if self.without_logits:
-            outputs = self.model.forward(**inputs)
+            outputs = self.model_forward(**inputs)
             return outputs
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        logits = self.model.forward(**inputs,
+        logits = self.model_forward(**inputs,
                                     return_context_logits=gather_ids
                                     is not None)
         if gather_ids is not None:
@@ -1695,7 +1706,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @nvtx_range("_forward_step_intermediate")
     def _forward_step_intermediate(self, inputs: Dict[str, Any]):
-        pipeline_interface = self.model.forward(**inputs)
+        pipeline_interface = self.model_forward(**inputs)
         return pipeline_interface
 
     @nvtx_range("_post_forward_intermediate")
