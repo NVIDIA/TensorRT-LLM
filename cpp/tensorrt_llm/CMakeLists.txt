@@ -210,7 +210,6 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 add_library(${SHARED_TARGET} SHARED)
 
-# (Added for selective cuFile)
 if(ENABLE_CUFILE)
   find_library(CUFILE_LIBRARY cufile
       HINTS
@@ -219,8 +218,7 @@ if(ENABLE_CUFILE)
           /usr/local/lib
   )
   if(NOT CUFILE_LIBRARY)
-    # We could either make this a warning or a fatal error. 
-    # Here we FATAL_ERROR if user explicitly requests GDS but it's missing.
+    # FATAL_ERROR if user explicitly requests with GDS if CUDA's libcufile.so is not found.
     message(FATAL_ERROR
       "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required.")
   else()
