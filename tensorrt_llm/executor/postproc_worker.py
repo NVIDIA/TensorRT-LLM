@@ -71,17 +71,16 @@ class PostprocWorker:
 
     def __init__(
         self,
-        pull_pipe_addr: str,
-        push_pipe_addr: str,
+        pull_pipe_addr: tuple[str, bytes],
+        push_pipe_addr: tuple[str, bytes],
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
-        hmac_key: Optional[bytes] = None,
     ):
         '''
         Args:
-            pull_pipe_addr (str): The address of the input IPC.
-            push_pipe_addr (str): The address of the output IPC.
+            pull_pipe_addr (tuple[str, bytes]): The address and HMAC key of the input IPC.
+            push_pipe_addr (tuple[str, bytes]): The address and HMAC key of the output IPC.
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
@@ -92,14 +91,12 @@ class PostprocWorker:
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
                                       is_server=False,
-                                      name="postprocess_pull_pipe",
-                                      hmac_key=hmac_key)
+                                      name="postprocess_pull_pipe")
         self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
                                       is_async=True,
                                       is_server=False,
                                       socket_type=zmq.PUSH,
-                                      name="postprocess_push_pipe",
-                                      hmac_key=hmac_key)
+                                      name="postprocess_push_pipe")
         self._to_stop = asyncio.Event()
 
         self._q = deque()
@@ -213,7 +210,7 @@ class PostprocWorker:
 
 
 @print_traceback_on_error
-def postproc_worker_main(feedin_ipc_addr: str, feedout_ipc_addr: str,
+def postproc_worker_main(feedin_ipc_addr: tuple[str, bytes], feedout_ipc_addr: tuple[str, bytes],
                          tokenizer_dir: str, record_creator: Callable):
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,

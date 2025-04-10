@@ -80,10 +80,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
             print_colored(
                 f"rank {mpi_rank()} using MpiPoolSession to spawn MPI processes\n",
                 "yellow")
-            
-        # Initialize HMAC key for pickle encryption
-        logger.info(f"Generating a new HMAC key")
-        self.random_hmac_key = os.urandom(32)
 
         self._results: Dict[int, GenerationResult] = {}
 
@@ -113,11 +109,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
         self.request_queue = IpcQueue(is_server=True,
-                                      name="proxy_request_queue",
-                                      hmac_key=self.random_hmac_key)
+                                      name="proxy_request_queue")
         self.request_error_queue = IpcQueue(is_server=True,
-                                            name="proxy_request_error_queue",
-                                            hmac_key=self.random_hmac_key)
+                                            name="proxy_request_error_queue")
         # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
         # Use PULL mode when enable_postprocess_parallel as there are
         # multiple senders from multiple processes.
@@ -126,17 +120,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
             fuse_message=False,
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
-            name="proxy_result_queue",
-            hmac_key=self.random_hmac_key)
+            name="proxy_result_queue")
         self.mp_stats_queue = FusedIpcQueue(is_server=True,
                                             fuse_message=False,
-                                            name="proxy_stats_queue",
-                                            hmac_key=self.random_hmac_key)
+                                            name="proxy_stats_queue")
         self.kv_cache_events_queue = FusedIpcQueue(
             is_server=True,
             fuse_message=False,
-            name="proxy_kv_cache_events_queue",
-            hmac_key=self.random_hmac_key)
+            name="proxy_kv_cache_events_queue")
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             request_error_queue_addr=self.request_error_queue.address,
@@ -304,7 +295,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=ExecutorBindingsProxy.READY_SIGNAL,
-            random_hmac_key=self.random_hmac_key,
         )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
