@@ -15,7 +15,14 @@
 # the License.
 #
 
-add_subdirectory(blockscaleGemm)
-add_subdirectory(fmha)
-add_subdirectory(fp8BlockScaleMoe)
-add_subdirectory(gemm)
+file(GLOB_RECURSE SRC_CPP *.cpp)
+file(GLOB_RECURSE SRC_CU *.cu)
+
+filter_cuda_archs("100" SRC_CPP)
+
+add_library(trtllm_gen_gemm OBJECT ${SRC_CPP} ${SRC_CU})
+
+target_compile_definitions(trtllm_gen_gemm PUBLIC TLLM_GEN_EXPORT_INTERFACE)
+
+set_property(TARGET trtllm_gen_gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET trtllm_gen_gemm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
