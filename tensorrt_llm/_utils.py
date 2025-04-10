@@ -21,6 +21,7 @@ import os
 import struct
 import trace
 import weakref
+from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial, wraps
@@ -734,6 +735,11 @@ class QuantModeWrapper:
         return self.objs[index]
 
 
+@contextmanager
+def _null_context_manager():
+    yield
+
+
 def nvtx_range(msg, color="grey", domain="TensorRT-LLM", category=None):
     return nvtx.annotate(msg, color=color, domain=domain, category=category)
 
@@ -742,6 +748,8 @@ def nvtx_range_debug(msg, color="grey", domain="TensorRT-LLM", category=None):
     if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
             os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
         return nvtx_range(msg, color=color, domain=domain, category=category)
+    else:
+        return _null_context_manager()
 
 
 def nvtx_mark(msg, color="grey", domain="TensorRT-LLM", category=None):
