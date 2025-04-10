@@ -707,8 +707,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install -y rsync")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -1370,6 +1368,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             }
 
             if (checkPipStage) {
+                stage("Run LLMAPI tests") {
+                    pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
+                    trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
+                        echo "###### Prerequisites Start ######"
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
@@ -1380,9 +1382,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
-                    }
-                    if ((values[5] != DLFW_IMAGE) && (cpu_arch == AARCH64_TRIPLE)) {
-                        stage("Extra prerequisites on aarch64") {
+                        if ((values[5] != DLFW_IMAGE) && (cpu_arch == AARCH64_TRIPLE)) {
+                            echo "###### Extra prerequisites on aarch64 Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
                         }
                         def libEnv = []
