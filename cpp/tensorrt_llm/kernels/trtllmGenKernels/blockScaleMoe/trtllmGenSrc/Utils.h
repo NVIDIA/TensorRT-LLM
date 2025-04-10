@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,36 @@ template <typename T>
 inline __device__ T clamp(T x, T lb, T ub)
 {
     return (x < lb) ? lb : (x > ub ? ub : x);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+inline __device__ void cp(
+    T* dst, T const* src, int32_t dstOffset = 0, int64_t srcOffset = 0, int const cpSize = sizeof(T))
+{
+    if (cpSize == 4)
+    {
+        uint32_t* dstUInt32 = reinterpret_cast<uint32_t*>(dst + dstOffset);
+        uint32_t const* srcUInt32 = reinterpret_cast<uint32_t const*>(src + srcOffset);
+        *dstUInt32 = *srcUInt32;
+    }
+    else if (cpSize == 8)
+    {
+        uint64_t* dstUInt64 = reinterpret_cast<uint64_t*>(dst + dstOffset);
+        uint64_t const* srcUInt64 = reinterpret_cast<uint64_t const*>(src + srcOffset);
+        *dstUInt64 = *srcUInt64;
+    }
+    else if (cpSize == 16)
+    {
+        uint4* dstUInt128 = reinterpret_cast<uint4*>(dst + dstOffset);
+        uint4 const* srcUInt128 = reinterpret_cast<uint4 const*>(src + srcOffset);
+        *dstUInt128 = *srcUInt128;
+    }
+    else
+    {
+        assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

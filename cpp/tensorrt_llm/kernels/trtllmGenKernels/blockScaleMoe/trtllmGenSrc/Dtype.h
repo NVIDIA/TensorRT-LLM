@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -267,7 +267,7 @@ inline Dtype dtypeFromString(std::string const& str)
     }
     else
     {
-        TLLM_LOG_ERROR("Unknown Dtype");
+        TLLM_LOG_ERROR("Unknown Dtype ", str.c_str());
     }
     return Dtype::Void;
 }
@@ -327,7 +327,7 @@ inline Dtype dtypeBlockSfType(Dtype dtype)
     case Dtype::E0m3:
     case Dtype::E2m1: return Dtype::E4m3;
     case Dtype::MxE2m1: return Dtype::UE8m0;
-    default: TLLM_LOG_ERROR("Unknown scaling factor type"); return Dtype::Void;
+    default: TLLM_LOG_ERROR("Unknown scaling factor type for ", dtypeToString(dtype).c_str()); return Dtype::Void;
     }
 }
 
