@@ -237,8 +237,8 @@ class HFFactory(ModelFactory):
         except HFValidationError:
             is_hf_repo = False
         if is_hf_repo:
-            # we don't expect to use bin files in this context and they are quite large.
-            ignore_patterns = ["**pytorch_model*.bin*", "**.pt"]
+            # we don't expect to use bin files or pt/pth checkpoint files (they are quite large)
+            ignore_patterns = ["**pytorch_model*.bin*", "**.pt", "**.pth"]
             # we will also ignore the .safetensors files if we skip loading weights
             if self.skip_loading_weights:
                 ignore_patterns.append("**safetensors")

@@ -12,14 +12,8 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
+from ...utils.node_utils import is_op
 from .._graph import canonicalize_graph
-
-
-def _is_transpose_op(node: Node) -> bool:
-    """Check if a node is a transpose operation."""
-    return node.op == "call_function" and (
-        node.target == torch.transpose or node.target == torch.ops.aten.transpose.int
-    )
 
 
 def _are_transpose_args_same(node1: Node, node2: Node) -> bool:
@@ -54,7 +48,7 @@ def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
             node_to_users[user].append(node)
 
     # Find transpose nodes
-    transpose_nodes = [n for n in gm.graph.nodes if _is_transpose_op(n)]
+    transpose_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.aten.transpose)]
 
     # Find pairs of redundant transpose operations
     nodes_to_eliminate: Set[Tuple[Node, Node]] = set()
@@ -65,7 +59,7 @@ def eliminate_redundant_transposes(gm: GraphModule) -> GraphModule:
 
         for parent in node_to_users[node]:
             # Check if parent is also a transpose with the same dimensions
-            if _is_transpose_op(parent) and _are_transpose_args_same(node, parent):
+            if is_op(parent, torch.ops.aten.transpose) and _are_transpose_args_same(node, parent):
                 # If the parent node has only one user (the current node),
                 # and the current node is only used for the transpose operation,
                 # then both nodes can be eliminated

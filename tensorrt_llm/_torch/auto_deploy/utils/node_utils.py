@@ -178,6 +178,9 @@ def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverl
 
 def is_op(node: Node, ops: Union[OpOverloadPacket, Iterable[OpOverloadPacket]]) -> bool:
     """Check if the node is a call to one of the ops."""
+    if not isinstance(node, Node):
+        return False
+
     if node.op != "call_function":
         return False
 
@@ -284,7 +287,8 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     # TODO: seems to come from post_attention_layer_norm that is *only* applied to the input to the
     # MLP layer but not to the residual. Hence, the "add" has multiple users.
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
-    ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
+    if res_nodes_more_users:
+        ad_logger.warning(f"Unexpected # of users for residuals: {res_nodes_more_users}")
 
     # add output node to boundary nodes
     boundary_nodes.append(output_node)

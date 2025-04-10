@@ -79,9 +79,9 @@ def _insert_transposes(egm: GraphModule, attention_nodes: List[Node]) -> GraphMo
 
         # Create transpose nodes before the attention node
         with graph.inserting_before(attn_node):
-            q_transposed = graph.call_function(torch.transpose, args=(q, 1, 2))
-            k_transposed = graph.call_function(torch.transpose, args=(k, 1, 2))
-            v_transposed = graph.call_function(torch.transpose, args=(v, 1, 2))
+            q_transposed = graph.call_function(torch.ops.aten.transpose.int, args=(q, 1, 2))
+            k_transposed = graph.call_function(torch.ops.aten.transpose.int, args=(k, 1, 2))
+            v_transposed = graph.call_function(torch.ops.aten.transpose.int, args=(v, 1, 2))
 
         # Replace the q, k, v inputs with their transposed versions
         new_args = (q_transposed, k_transposed, v_transposed) + attn_node.args[3:]
