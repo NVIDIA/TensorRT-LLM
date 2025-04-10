@@ -29,6 +29,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cufile.h>
+#include <dlfcn.h>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -211,10 +213,188 @@ void assessLikelihoodOfRuntimeAllocation(
             numWarnings);
     }
 }
+
+class GDSStreamReader final : public nvinfer1::IStreamReaderV2
+{
+public:
+    explicit GDSStreamReader(std::filesystem::path const& filePath)
+    {
+        auto const start_time = std::chrono::high_resolution_clock::now();
+        initializeDriver();
+        auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - start_time);
+        TLLM_LOG_INFO("GDS driver initialization time %lld ms", elapsed_ms);
+
+        open(filePath);
+    }
+
+    bool open(std::string const& filepath)
+    {
+        if (!initializeDriver())
+        {
+            TLLM_LOG_INFO("Failed to initialize cuFile driver");
+            return false;
+        }
+
+        int32_t const ret = ::open(filepath.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0664);
+
+        if (ret < 0)
+        {
+            TLLM_LOG_INFO("Failed to open engine file");
+            return false;
+        }
+
+        mFd = ret;
+        mFileSize = lseek(mFd, 0, SEEK_END);
+        lseek(mFd, 0, SEEK_SET);
+
+        CUfileDescr_t fileDescr;
+        memset((void*) &fileDescr, 0, sizeof(fileDescr));
+        fileDescr.handle.fd = mFd;
+        fileDescr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+
+        CUfileError_t gdsStatus = cuFileHandleRegister(&mFileHandle, &fileDescr);
+
+        if (gdsStatus.err != CU_FILE_SUCCESS)
+        {
+            TLLM_LOG_INFO("Failed to cuFileHandleRegister");
+            ::close(mFd);
+            return false;
+        }
+        return true;
+    }
+
+    void close()
+    {
+        if (mFd >= 0)
+        {
+            ::close(mFd);
+            mFd = -1;
+        }
+    }
+
+    ~GDSStreamReader()
+    {
+        if (mFileHandle)
+        {
+            cuFileHandleDeregister(mFileHandle);
+            mFileHandle = nullptr;
+        }
+
+        if (mDriverInitialized)
+        {
+            cuFileDriverClose();
+        }
+    }
+
+    bool seek(int64_t offset, nvinfer1::SeekPosition where) noexcept final
+    {
+        switch (where)
+        {
+        case nvinfer1::SeekPosition::kSET: mCursor = offset; return true;
+        case nvinfer1::SeekPosition::kCUR: mCursor += offset; return true;
+        case nvinfer1::SeekPosition::kEND: mCursor = -offset; return true;
+        default: return false;
+        }
+        return true;
+    }
+
+    int64_t read(void* dest, int64_t bytes, cudaStream_t stream) noexcept final
+    {
+        cudaPointerAttributes attributes{};
+        if (cudaPointerGetAttributes(&attributes, dest) != cudaSuccess)
+        {
+            TLLM_LOG_INFO("cudaPointerGetAttributes failed");
+        }
+
+        off_t destOffset = 0;
+        void* destBase = dest;
+
+        if (attributes.type == cudaMemoryTypeDevice)
+        {
+            CUdeviceptr cuDest = reinterpret_cast<CUdeviceptr>(dest);
+            CUdeviceptr cuBufBase = 0;
+            size_t cuBufSize = 0;
+
+            cuMemGetAddressRange(&cuBufBase, &cuBufSize, cuDest);
+            destOffset += cuDest - cuBufBase;
+            destBase = reinterpret_cast<void*>(cuBufBase);
+        }
+        cuFileRead(this->mFileHandle, destBase, bytes, mCursor, destOffset);
+
+        mCursor += bytes;
+        return bytes;
+    }
+
+    void reset()
+    {
+        lseek(mFd, 0, SEEK_SET);
+        mCursor = 0;
+    }
+
+    [[nodiscard]] bool isOpen() const
+    {
+        bool open = mFd >= 0;
+        return open;
+    }
+
+private:
+    bool initializeDriver()
+    {
+        if (mDriverInitialized)
+        {
+            return true;
+        }
+
+        mCuFileLibHandle = dlopen("libcufile.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (!mCuFileLibHandle)
+        {
+            TLLM_LOG_INFO("Failed to dlopen libcufile.so");
+            return false;
+        }
+
+        // Load the required functions
+        *reinterpret_cast<void**>(&cuFileDriverOpen) = dlsym(mCuFileLibHandle, "cuFileDriverOpen");
+        *reinterpret_cast<void**>(&cuFileHandleRegister) = dlsym(mCuFileLibHandle, "cuFileHandleRegister");
+        *reinterpret_cast<void**>(&cuFileHandleDeregister) = dlsym(mCuFileLibHandle, "cuFileHandleDeregister");
+        *reinterpret_cast<void**>(&cuFileDriverClose) = dlsym(mCuFileLibHandle, "cuFileDriverClose");
+        *reinterpret_cast<void**>(&cuFileRead) = dlsym(mCuFileLibHandle, "cuFileRead");
+
+        if (!cuFileDriverOpen || !cuFileHandleRegister || !cuFileHandleDeregister || !cuFileDriverClose || !cuFileRead)
+        {
+            TLLM_LOG_INFO("Failed to dlsym libcufile.so");
+            return false;
+        }
+
+        CUfileError_t gdsStatus = cuFileDriverOpen();
+        if (gdsStatus.err != CU_FILE_SUCCESS)
+        {
+            TLLM_LOG_INFO("cuFileDriverOpen failed");
+            return false;
+        }
+
+        mDriverInitialized = true;
+        return true;
+    }
+
+    void* mCuFileLibHandle{};
+    CUfileHandle_t mFileHandle{nullptr};
+    bool mDriverInitialized{false};
+    int32_t mFd{-1};
+    int64_t mCursor{0};
+    int64_t mFileSize{0};
+
+    CUfileError_t (*cuFileDriverOpen)(){};
+    CUfileError_t (*cuFileHandleRegister)(CUfileHandle_t*, CUfileDescr_t*){};
+    CUfileError_t (*cuFileHandleDeregister)(CUfileHandle_t){};
+    CUfileError_t (*cuFileDriverClose)(){};
+    ssize_t (*cuFileRead)(CUfileHandle_t, void*, size_t, int64_t, int64_t){};
+};
+
 } // namespace
 
-TllmRuntime::TllmRuntime(
-    RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent, bool useShapeInference)
+TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage,
+    float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
@@ -225,8 +405,26 @@ TllmRuntime::TllmRuntime(
     {
     case RawEngine::Type::FilePath:
     {
-        auto reader = StreamReader(rawEngine.getPath());
-        mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        if (useGpuDirectStorage)
+        {
+            TLLM_LOG_INFO("GDS is used to load the engine!");
+
+            auto const start_time = std::chrono::high_resolution_clock::now();
+            auto reader = GDSStreamReader(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+            auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - start_time);
+            TLLM_LOG_INFO("Engine load time %lld ms", elapsed_ms);
+        }
+        else
+        {
+            auto const start_time = std::chrono::high_resolution_clock::now();
+            auto reader = StreamReader(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+            auto const elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - start_time);
+            TLLM_LOG_INFO("Engine load time %lld ms", elapsed_ms);
+        }
         break;
     }
     case RawEngine::Type::AddressWithSize:
