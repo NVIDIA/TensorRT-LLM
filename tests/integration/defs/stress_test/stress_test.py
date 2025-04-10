@@ -225,8 +225,10 @@ def launch_process(cmd, start_new_session=True, filter_pattern=None):
                     cleanup_process_tree(process, has_session=True)
                     print_info("Process killed forcefully")
 
-            # For stdout_reader and stderr_reader:
-            # they are daemon threads and will exit when Python process exits
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
 
 
 def get_model_path(model_dir: str) -> str:
