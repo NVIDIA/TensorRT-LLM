@@ -144,23 +144,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     fraction = get_fraction_from_executor_config(executor_config)
     kv_cache_max_tokens_in = executor_config.kv_cache_config.max_tokens
 
-<<<<<<< HEAD
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-=======
-        req = create_dummy_context_request(max_num_tokens, max_seq_len,
-                                           vocab_size)
-        resource_manager.prepare_resources(req)
-        model_engine.forward(req, resource_manager, is_dummy_forward=True)
-        # Assume TRTLLMDecoder, which statically allocates the most memory
-        decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping,
-                                DecodingMode.TopKTopP())
-        torch.cuda.synchronize()
-        # Get the torch-managed peak memory
-        torch_peak_memory = torch.cuda.memory_stats(
-        )["allocated_bytes.all.peak"]
->>>>>>> 6c92c6b3b1 (Add TRTLLMDecoder allocation to estimate max kv cache tokens.)
 
     py_executor.set_gather_responses(True)
     origin_iter_stats = py_executor.enable_iter_perf_stats

@@ -454,8 +454,8 @@ class TRTLLMDecoder(Decoder):
             self.executor_config.max_batch_size,
             self.executor_config.max_beam_width,
         ),
-                                               dtype=torch.int,
-                                               device='cuda')
+                                                             dtype=torch.int,
+                                                             device='cuda')
 
     def _instantiate_algorithms(self):
         self.algs = Algorithms()
@@ -544,14 +544,15 @@ class TRTLLMDecoder(Decoder):
 
             self.algs.decoder.forward_async(self.decoding_output,
                                             decoding_input)
-        
+
         torch.cuda.current_stream().wait_stream(self.store["torch_stream"])
 
         # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
         #       current implementation of model_engine.
         # TODO: When we support speculative decoding:
         # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-        new_tokens_device_tensor = self.store["new_tokens_device_tensor"][:self.batch_size, :self.beam_width]
+        new_tokens_device_tensor = self.store[
+            "new_tokens_device_tensor"][:self.batch_size, :self.beam_width]
         seq_slots = [
             request.seq_slot for request in itertools.chain(
                 scheduled_requests.context_requests,
@@ -562,7 +563,6 @@ class TRTLLMDecoder(Decoder):
             non_blocking=True)
         new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
 
-        # NOTE: This does dynamic memory allocations.
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
         finished_sum = self.algs.decoder.decoder_state.finished_sum.to(
