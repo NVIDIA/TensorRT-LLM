@@ -34,8 +34,32 @@ PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::Buffe
     // vocabSize and mMaxPromptVocabSize
     mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
-
     // optionalParams.enableChunkedContext || modelConfig.getContextFMHA()
+
+    auto promptVocabSizeHost
+        = runtime::BufferManager::pinned(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto promptVocabSizeHostData = runtime::bufferCast<SizeType32>(*promptVocabSizeHost);
+    promptVocabSizeHostData[0] = mMaxPromptVocabSize;
+    manager.copy(*promptVocabSizeHost, *mPromptTuningParams.vocabSize);
+
+    // embeddingTable
+    mPromptTuningParams.embeddingTable = manager.gpu(
+        runtime::ITensor::makeShape({maxPromptEmbeddingTableSize, hiddenSize}), modelConfig.getDataType());
+
+    // tasks
+    mPromptTuningParams.tasks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+}
+
+PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
+    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, bool promptTableOffloading)
+{
+    auto maxPromptEmbeddingTableSize = modelConfig.getMaxPromptEmbeddingTableSize();
+    auto const hiddenSize = modelConfig.getHiddenSize() * worldConfig.getTensorParallelism();
+
+    // vocabSize and mMaxPromptVocabSize
+    mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
+    mPromptTableOffloading = promptTableOffloading;
 
     auto promptVocabSizeHost
         = runtime::BufferManager::pinned(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
@@ -123,7 +147,7 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
             // request This if statement is to check if the context chunk mode is enabled
             if (batchIdx < numContextRequests)
             {
-                if (runtimeIsChunkedContext)
+                if (mPromptTableOffloading)
                 {
                     optReqPromptEmbeddingTable = getChunkPtableBuffer(getChunkPtableCurrentIndex());
                     optReqPromptVocabSize = getChunkPtableBufferSliceSize(getChunkPtableCurrentIndex(), batchIdx);

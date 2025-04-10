@@ -52,7 +52,7 @@ public:
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false, std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
-        bool gatherGenerationLogits = false)
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -73,6 +73,7 @@ public:
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalOutputNames{std::move(additionalOutputNames)}
         , gatherGenerationLogits{gatherGenerationLogits}
+        , promptTableOffloading{promptTableOffloading}
     {
         if (guidedDecodingConfig)
         {
@@ -91,7 +92,7 @@ public:
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
             executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
             executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalOutputNames(),
-            executorConfig.getGatherGenerationLogits())
+            executorConfig.getGatherGenerationLogits(), executorConfig.getPromptTableOffloading())
     {
     }
 
@@ -116,6 +117,7 @@ public:
             && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
             && additionalOutputNames == other.additionalOutputNames                 //
             && gatherGenerationLogits == other.gatherGenerationLogits               //
+            && promptTableOffloading == other.promptTableOffloading                 //
             ;
     }
 
@@ -145,6 +147,8 @@ public:
     bool isLeaderInOrchMode;
     std::optional<std::vector<std::string>> additionalOutputNames;
     bool gatherGenerationLogits;
+    // Whether to offload the prompt table to the GPU
+    bool promptTableOffloading;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -135,7 +135,7 @@ private:
 
 public:
     TensorPtr sequenceLengthsDevice;
-    bool runtimeIsChunkedContext;
+    bool promptTableOffloading;
 
     //! Prompt-Tuning
     std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
@@ -261,7 +261,8 @@ public:
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, executor::DecodingConfig const& decodingConfig,
         bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens = std::nullopt,
-        std::optional<std::vector<std::string>> const& additionalOutputNames = std::nullopt);
+        std::optional<std::vector<std::string>> const& additionalOutputNames = std::nullopt,
+        bool promptTableOffloading = false);
 
     RuntimeBuffers(RuntimeBuffers const& other) = delete;
     RuntimeBuffers& operator=(RuntimeBuffers const& other) = delete;

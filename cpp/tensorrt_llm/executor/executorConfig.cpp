@@ -33,7 +33,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<std::string>> additionalOutputNames, bool gatherGenerationLogits,
-    bool useVariableBeamWidthSearch)
+    bool useVariableBeamWidthSearch, bool promptTableOffloading)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -59,6 +59,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mAdditionalOutputNames(std::move(additionalOutputNames))
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
+    , mPromptTableOffloading(promptTableOffloading)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
@@ -201,6 +202,11 @@ bool ExecutorConfig::getUseVariableBeamWidthSearch() const
     return mUseVariableBeamWidthSearch;
 }
 
+bool ExecutorConfig::getPromptTableOffloading() const
+{
+    return mPromptTableOffloading;
+}
+
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
 {
     mMaxBeamWidth = maxBeamWidth;
@@ -331,6 +337,11 @@ void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
 void ExecutorConfig::setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch)
 {
     mUseVariableBeamWidthSearch = useVariableBeamWidthSearch;
+}
+
+void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
+{
+    mPromptTableOffloading = promptTableOffloading;
 }
 
 } // namespace tensorrt_llm::executor
