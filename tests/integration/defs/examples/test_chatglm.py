@@ -59,10 +59,10 @@ def test_llm_glm_4_9b_single_gpu_summary(glm_4_9b_example_root,
 
     # fix HF error in glm-4-9b, hope to remove this in the future
     # nvbug 5025895
-    model_temp_dir = glm_4_9b_example_root + "/glm-4-9b/model_temp_dir"
+    model_temp_dir = glm_4_9b_example_root + "/model_temp_dir"
     if not exists(model_temp_dir):
         shutil.copytree(llm_glm_4_9b_model_root, model_temp_dir)
-        shutil.copy(glm_4_9b_example_root + "/glm-4-9b/tokenization_chatglm.py",
+        shutil.copy(glm_4_9b_example_root + "/tokenization_chatglm.py",
                     model_temp_dir)
 
     summary_cmd = [
