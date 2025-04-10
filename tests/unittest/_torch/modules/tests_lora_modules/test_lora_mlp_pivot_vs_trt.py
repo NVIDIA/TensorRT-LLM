@@ -79,11 +79,7 @@ class TestLoraMLPPivotVsTRT(unittest.TestCase):
                 self.torch_dtype) * 0.1 for lora_rank in lora_ranks_list
         ]
 
-        # Transpose and make contiguous
-        lora_weight_ins_up = [
-            # tmp.transpose(1, 0).contiguous() for tmp in lora_weight_ins_up
-            tmp.contiguous() for tmp in lora_weight_ins_up
-        ]
+        lora_weight_ins_up = [tmp.contiguous() for tmp in lora_weight_ins_up]
         lora_weight_outs_up = [
             tmp.transpose(1, 0).contiguous() for tmp in lora_weight_outs_up
         ]

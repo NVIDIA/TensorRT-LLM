@@ -16,7 +16,8 @@ from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.layers import Attention
+from tensorrt_llm.layers import (Attention, AttentionMaskType, AttentionParams,
+                                 KeyValueCacheParams)
 from tensorrt_llm.layers.lora import Lora, LoraParams
 from tensorrt_llm.mapping import Mapping
 
@@ -26,7 +27,7 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.batch_size = 1
-        cls.seq_len = 16
+        cls.seq_len = 8
         cls.hidden_size = 64
         cls.head_num = 1
         cls.num_hidden_layers = 1
@@ -176,16 +177,12 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
     def _setup_trt_network(self, hidden_states, lora_params, attention_module):
         builder = tensorrt_llm.Builder()
         net = builder.create_network()
-        net.plugin_config.to_legacy_setting()
+        net.plugin_config.gpt_attention_plugin = self.dtype
         net.plugin_config.lora_plugin = self.dtype
+        net.plugin_config.remove_input_padding = True
+        net.plugin_config.paged_kv_cache = True
 
         with tensorrt_llm.net_guard(net):
-            # Create input tensor
-            trt_hidden_states = Tensor(name='hidden_states',
-                                       shape=hidden_states.shape,
-                                       dtype=tensorrt_llm.str_dtype_to_trt(
-                                           self.dtype))
-
             # Create LoRA tensors
             host_request_types_tensor = Tensor(
                 name='host_request_types',
@@ -204,8 +201,70 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
                 shape=lora_params['lora_weights_pointers'].shape,
                 dtype=tensorrt_llm.str_dtype_to_trt('int64'))
 
-            # Create LoRA parameters
-            lora_params = LoraParams(
+            # Create tensors for GPT Attention Plugin
+            sequence_length_tensor = Tensor(
+                name='sequence_length',
+                shape=[self.batch_size],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            context_lengths_tensor = Tensor(
+                name='context_lengths',
+                shape=[self.batch_size],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_past_key_value_lengths_tensor = Tensor(
+                name='host_past_key_value_lengths',
+                shape=[self.batch_size],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_max_attention_window_sizes_tensor = Tensor(
+                name='host_max_attention_window_sizes',
+                shape=[self.num_hidden_layers],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_sink_token_length_tensor = Tensor(
+                name='host_sink_token_length',
+                shape=[self.num_hidden_layers],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            cache_indirection_tensor = Tensor(
+                name='cache_indirection',
+                shape=[self.batch_size, 1, 1],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            # Use dummy block offsets as we are in context phase and don't actually need KV cache values yet
+            # Shape: [num_layers, batch_size, 2, max_blocks_per_seq]
+            max_blocks_per_seq = (self.seq_len + self.tokens_per_block -
+                                  1) // self.tokens_per_block
+            kv_cache_block_offsets_tensor = Tensor(
+                name='kv_cache_block_offsets',
+                shape=[
+                    self.num_hidden_layers, self.batch_size, 2,
+                    max_blocks_per_seq
+                ],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            host_kv_cache_block_offsets_tensor = Tensor(
+                name='host_kv_cache_block_offsets',
+                shape=[
+                    self.num_hidden_layers, self.batch_size, 2,
+                    max_blocks_per_seq
+                ],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            # Add tensors for perf knobs and context progress
+            host_runtime_perf_knobs_tensor = Tensor(
+                name='host_runtime_perf_knobs',
+                shape=[1],  # Typically a single int64 value
+                dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+            host_context_progress_tensor = Tensor(
+                name='host_context_progress',
+                shape=[self.batch_size],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+            # Add tensors for paged kv cache pool management
+            host_kv_cache_pool_pointers_tensor = Tensor(
+                name='host_kv_cache_pool_pointers',
+                shape=[2],  # Pointers to K and V pools
+                dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+            host_kv_cache_pool_mapping_tensor = Tensor(
+                name='host_kv_cache_pool_mapping',
+                shape=[self.batch_size],
+                dtype=tensorrt_llm.str_dtype_to_trt('int32'))
+
+            # Create LoRA parameters object
+            lora_layer_params = LoraParams(
                 lora_ranks=[{
                     "attn_q_lora_ranks": lora_ranks_tensor,
                     "attn_k_lora_ranks": lora_ranks_tensor,
@@ -223,15 +282,44 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
                     lora_weights_pointers_tensor,
                 }],
                 host_context_lengths=host_context_lengths_tensor,
-                host_request_types=host_request_types_tensor)
+                host_request_types=host_request_types_tensor,
+            )
+
+            # Create AttentionParams and KeyValueCacheParams
+            attention_params = AttentionParams(
+                sequence_length=sequence_length_tensor,
+                context_lengths=context_lengths_tensor,
+                host_context_lengths=
+                host_context_lengths_tensor,  # Use the same tensor on host
+                max_context_length=self.
+                seq_len,  # Use current seq_len as max for context phase
+                host_request_types=
+                host_request_types_tensor,  # Use the same tensor on host
+                host_runtime_perf_knobs=host_runtime_perf_knobs_tensor,
+                host_context_progress=host_context_progress_tensor)
+
+            kv_cache_params = KeyValueCacheParams(
+                host_past_key_value_lengths=host_past_key_value_lengths_tensor,
+                host_max_attention_window_sizes=
+                host_max_attention_window_sizes_tensor,
+                host_sink_token_length=host_sink_token_length_tensor,
+                kv_cache_block_offsets=kv_cache_block_offsets_tensor,
+                host_kv_cache_block_offsets=host_kv_cache_block_offsets_tensor,
+                cache_indirection=cache_indirection_tensor,
+                # past_key_value needs to be None for context phase
+                past_key_value=None,
+                # Add pool pointers and mapping
+                host_kv_cache_pool_pointers=host_kv_cache_pool_pointers_tensor,
+                host_kv_cache_pool_mapping=host_kv_cache_pool_mapping_tensor)
 
             attn_layer = Attention(
                 local_layer_idx=0,
                 hidden_size=hidden_states.shape[-1],
                 num_attention_heads=1,
-                max_position_embeddings=hidden_states.shape[1],
-                attention_mask_type=tensorrt_llm.layers.AttentionMaskType.
-                causal,
+                num_kv_heads=1,  # Added num_kv_heads
+                max_position_embeddings=self.llama_config.
+                max_position_embeddings,  # Use config value
+                attention_mask_type=AttentionMaskType.causal,
                 bias=False)
 
             attn_layer.qkv_lora = Lora(
@@ -257,8 +345,20 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
             attn_layer.qkv.weight.value = attention_module.qkv_proj.weight.data
             attn_layer.dense.weight.value = attention_module.o_proj.weight.data
 
-            output = attn_layer(hidden_states=trt_hidden_states,
-                                lora_layer_params=lora_params)
+            # Create input tensor - already flattened to [numToken, dim]
+            trt_hidden_states = Tensor(
+                name='hidden_states',
+                shape=hidden_states.reshape(-1, hidden_states.shape[-1]).shape,
+                dtype=tensorrt_llm.str_dtype_to_trt(self.dtype))
+
+            # Update forward call for GPT Attention Plugin
+            output, _ = attn_layer(  # GPT Attention Plugin returns a tuple (context, past_key_value)
+                hidden_states=trt_hidden_states,
+                lora_layer_params=lora_layer_params,  # Use the renamed object
+                attention_params=attention_params,
+                kv_cache_params=kv_cache_params,
+                use_cache=True  # Must be True for GPT Attention Plugin
+            )
             output.mark_output('output',
                                tensorrt_llm.str_dtype_to_trt(self.dtype))
 
@@ -272,26 +372,86 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
             engine_buffer)
 
         stream = torch.cuda.current_stream().cuda_stream
+
+        # Prepare inputs for GPT Attention Plugin
+        sequence_length_tensor = torch.tensor([self.seq_len] * self.batch_size,
+                                              dtype=torch.int32,
+                                              device='cuda')
+        context_lengths_tensor = torch.tensor([self.seq_len] * self.batch_size,
+                                              dtype=torch.int32,
+                                              device='cuda')
+        host_past_key_value_lengths_tensor = torch.tensor(
+            [0] * self.batch_size,
+            dtype=torch.int32)  # Start from 0 for context phase
+        max_seq_len = self.num_blocks * self.tokens_per_block
+        host_max_attention_window_sizes_tensor = torch.tensor(
+            [max_seq_len] * self.num_hidden_layers, dtype=torch.int32)
+        host_sink_token_length_tensor = torch.tensor([0] *
+                                                     self.num_hidden_layers,
+                                                     dtype=torch.int32)
+        cache_indirection_tensor = torch.arange(self.batch_size,
+                                                dtype=torch.int32,
+                                                device='cuda').reshape(
+                                                    self.batch_size, 1, 1)
+        # Create dummy block offsets for context phase
+        max_blocks_per_seq = (self.seq_len + self.tokens_per_block -
+                              1) // self.tokens_per_block
+        shape = (self.num_hidden_layers, self.batch_size, 2, max_blocks_per_seq)
+        kv_cache_block_offsets_tensor = torch.zeros(shape,
+                                                    dtype=torch.int32,
+                                                    device='cuda')
+        host_kv_cache_block_offsets_tensor = torch.zeros(
+            shape, dtype=torch.int32)  # Host copy
+        # Add tensors for paged kv cache pool management (dummy values for context phase)
+        # Get the actual pointers from the cache manager if needed for generation phase
+        dummy_pool_pointers = torch.tensor([0, 0],
+                                           dtype=torch.int64)  # Dummy pointers
+        host_kv_cache_pool_pointers_tensor = dummy_pool_pointers
+        host_kv_cache_pool_mapping_tensor = torch.zeros(
+            [self.batch_size], dtype=torch.int32)  # Map all to pool 0
+        host_runtime_perf_knobs_tensor = torch.tensor(
+            [0], dtype=torch.int64)  # Default value
+        host_context_progress_tensor = torch.zeros(
+            [self.batch_size],
+            dtype=torch.int32)  # Default value for context phase
+
         inputs = {
-            'hidden_states': hidden_states,
+            'hidden_states': hidden_states.reshape(-1, hidden_states.shape[-1]),
             'host_request_types': lora_params['host_request_types'],
             'host_context_lengths': lora_params['host_context_lengths'],
             'lora_ranks': lora_params['lora_ranks'],
             'lora_weights_pointers': lora_params['lora_weights_pointers'],
+            # Inputs for GPT Attention Plugin
+            'sequence_length': sequence_length_tensor,
+            'context_lengths': context_lengths_tensor,
+            'host_past_key_value_lengths': host_past_key_value_lengths_tensor,
+            'host_max_attention_window_sizes':
+            host_max_attention_window_sizes_tensor,
+            'host_sink_token_length': host_sink_token_length_tensor,
+            'cache_indirection': cache_indirection_tensor,
+            'kv_cache_block_offsets': kv_cache_block_offsets_tensor,
+            'host_kv_cache_block_offsets': host_kv_cache_block_offsets_tensor,
+            'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor,
+            'host_context_progress': host_context_progress_tensor,
+            # Add pool pointers and mapping to inputs
+            'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers_tensor,
+            'host_kv_cache_pool_mapping': host_kv_cache_pool_mapping_tensor,
         }
 
         outputs = {
             'output':
-            torch.empty(hidden_states.shape,
-                        dtype=tensorrt_llm._utils.str_dtype_to_torch(
-                            self.dtype),
-                        device='cuda'),
+            # Output shape is [num_tokens, hidden_size] when remove_input_padding is True
+            torch.empty(
+                hidden_states.reshape(-1, hidden_states.shape[-1]).shape,
+                dtype=tensorrt_llm._utils.str_dtype_to_torch(self.dtype),
+                device='cuda'),
         }
 
         session.run(inputs=inputs, outputs=outputs, stream=stream)
         torch.cuda.synchronize()
 
-        return outputs['output'].squeeze(0)
+        # Reshape output back to [batch_size, seq_len, hidden_size] for comparison
+        return outputs['output'].reshape(hidden_states.shape)
 
     def test_attention_with_lora(self):
         hidden_states, qkv_weight, out_weight = self._create_attention_inputs()
@@ -348,10 +508,12 @@ class TestLoraAttentionPivotVsTRT(unittest.TestCase):
 
         with torch.inference_mode():
             attn_metadata.prepare()
-            hidden_states_pivot = hidden_states
+            hidden_states_reshaped = hidden_states.reshape(
+                -1, hidden_states.shape[-1])
+
             pivot_output = attention_module(
                 position_ids=None,
-                hidden_states=hidden_states_pivot,
+                hidden_states=hidden_states_reshaped,
                 attn_metadata=attn_metadata,
                 attention_mask=PredefinedAttentionMask.CAUSAL,
                 lora_params=lora_params_pivot)

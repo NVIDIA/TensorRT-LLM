@@ -19,17 +19,19 @@ class TestLoraPluginVsLayer(unittest.TestCase):
         self.dtype = 'float16'
         self.torch_dtype = torch.float16
         self.device = 'cuda'
+        self.batch_size = 4
+        self.seq_len = 8
+        self.hidden_size = 1024
+        self.lora_rank = 8
 
     def _create_input_tensors(self, batch_size, seq_len, hidden_size,
                               lora_ranks_list):
-        # Create input tensor with batch size dimension
         input_tensor = torch.randn(batch_size,
                                    seq_len,
                                    hidden_size,
                                    dtype=self.torch_dtype,
                                    device=self.device) * 0.1
 
-        # Create LoRA weights
         lora_weight_ins = [
             torch.randn(hidden_size, lora_rank, device=self.device).to(
                 self.torch_dtype) * 0.1 for lora_rank in lora_ranks_list
@@ -147,46 +149,14 @@ class TestLoraPluginVsLayer(unittest.TestCase):
             prompt_lens_cpu, output_hidden_sizes, transA, transB, max_rank,
             weight_index, is_remove_input_padding)
 
-        # if isinstance(lora_outputs, torch.Tensor):
-        #             return lora_outputs
-        # else:
-        #     # For multiple LoRA modules, some might not be executed in grouped gemm.
-        #     # For those modules not executed, we create zero tensors with matching dimensions.
-        #     # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
-        #     lora_output = []
-        #     for module_idx in self.lora_module_types:
-        #         if int(module_idx) in active_lora_module_ids:
-        #             lora_output.append(lora_outputs.pop(0))
-        #         else:
-        #             lora_output.append(
-        #                 torch.zeros(list(x.shape[:-1]) + [
-        #                     self.output_hidden_sizes[
-        #                         self.lora_module_types.index(
-        #                             module_idx)]
-        #                 ],
-        #                             dtype=x.dtype,
-        #                             device=x.device))
-
-        #     lora_output = torch.cat(lora_output, dim=-1)
-        #     return lora_output
-
         return lora_outputs[0]
 
-    def test_lora_plugin_vs_layer(self, lora_rank=8):
-        """Test comparing LoRA plugin (TensorRT) with lora_grouped_gemm operation"""
-        print(f"[INFO] Testing with lora_rank: {lora_rank}")
+    def test_lora_plugin_vs_lora_op(self):
+        lora_ranks_list = [self.lora_rank] * self.batch_size
 
-        # Set up test parameters
-        batch_size = 4
-        seq_len = 8
-        hidden_size = 1024
-        lora_ranks_list = [lora_rank] * batch_size
+        tensors = self._create_input_tensors(self.batch_size, self.seq_len,
+                                             self.hidden_size, lora_ranks_list)
 
-        # Create input tensors and weights
-        tensors = self._create_input_tensors(batch_size, seq_len, hidden_size,
-                                             lora_ranks_list)
-
-        # Run TensorRT implementation
         session = self._create_lora_plugin_session(tensors)
         inputs = {
             'input_tensor': tensors['input_tensor'],
@@ -204,56 +174,6 @@ class TestLoraPluginVsLayer(unittest.TestCase):
                                    lora_outputs,
                                    atol=5e-3,
                                    rtol=0.3)
-
-    # def test_lora_plugin_vs_layer_different_ranks(self):
-    #     """Test comparing LoRA plugin with lora_grouped_gemm using different ranks for each batch item"""
-    #     print("[INFO] Testing with different ranks for each batch item")
-
-    #     # Set up test parameters
-    #     batch_size = 4
-    #     input_length = 32
-    #     hidden_size = 1024
-    #     lora_ranks_list = [1, 2, 4, 8]  # Different ranks for each batch item
-
-    #     # Create input tensors and weights
-    #     tensors = self._create_input_tensors(batch_size, input_length, hidden_size, lora_ranks_list)
-
-    #     # Run TensorRT implementation
-    #     session = self._create_lora_plugin_session(tensors)
-    #     inputs = {
-    #         'input_tensor': tensors['concat_input_data'],
-    #         'host_request_types': tensors['host_request_types'],
-    #         'host_context_lengths': tensors['host_context_lengths'],
-    #         'lora_ranks': tensors['lora_ranks'],
-    #         'lora_weights_pointers': tensors['lora_weights_pointers'],
-    #     }
-    #     outputs = run_session(session, inputs)
-    #     torch.cuda.synchronize()
-
-    #     # Run lora_grouped_gemm directly
-    #     lora_outputs = self._run_lora_grouped_gemm(tensors)
-
-    #     # Compare results with appropriate tolerance
-    #     atol = 5e-3
-    #     rtol = 0.3
-
-    #     # Print some statistics about the differences
-    #     diff = (outputs['output'] - lora_outputs).abs()
-    #     max_diff = diff.max().item()
-    #     mean_diff = diff.mean().item()
-    #     std_diff = diff.std().item()
-
-    #     print(f"[INFO] Max difference: {max_diff}")
-    #     print(f"[INFO] Mean difference: {mean_diff}")
-    #     print(f"[INFO] Std difference: {std_diff}")
-
-    #     # Assert that the results are close
-    #     torch.testing.assert_close(
-    #         outputs['output'],
-    #         lora_outputs,
-    #         atol=atol,
-    #         rtol=rtol
-    #     )
 
 
 if __name__ == "__main__":

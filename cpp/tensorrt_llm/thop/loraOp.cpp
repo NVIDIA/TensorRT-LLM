@@ -77,7 +77,13 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     std::vector<th::Tensor> output_torch;
     for (int i = 0; i < numLoraModules; i++)
     {
-        std::vector<int64_t> output_shape = {out_shape[0], out_shape[1], output_hidden_sizes[i]};
+        std::vector<int64_t> output_shape = {out_shape[0], out_shape[1]};
+
+        if (!isRemoveInputPadding)
+        {
+            output_shape = {out_shape[0], out_shape[1], output_hidden_sizes[i]};
+        }
+
         output_torch.push_back(torch::empty(output_shape, input.options()));
     }
     std::vector<void*> output;
