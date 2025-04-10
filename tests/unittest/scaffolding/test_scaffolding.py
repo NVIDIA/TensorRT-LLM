@@ -3,9 +3,9 @@
 
 from scaffolding.test_worker import create_trtllm_worker
 
-from tensorrt_llm.scaffolding.controller import (MajorityVoteController,
-                                                 NativeGenerationController)
-from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
+from tensorrt_llm.scaffolding import (MajorityVoteController,
+                                      NativeGenerationController,
+                                      ScaffoldingLlm)
 
 
 def create_scaffolding_llm_with_native_generation_controller(
