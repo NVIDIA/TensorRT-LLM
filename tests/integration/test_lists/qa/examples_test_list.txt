@@ -35,6 +35,7 @@ examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8
 examples/test_exaone.py::test_llm_exaone_1gpu[enable_weight_only-exaone_deep_2.4b-float16-nb:1]
 examples/test_exaone.py::test_llm_exaone_2gpu[exaone_3.0_7.8b_instruct-float16-nb:1]
 examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-2-27b-it-other-bfloat16-8]
+examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-3-1b-it-other-bfloat16-8]
 examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-2-27b-it-fp8-bfloat16-8]
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it]
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-27b-it]
