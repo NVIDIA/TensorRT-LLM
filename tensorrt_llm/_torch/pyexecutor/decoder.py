@@ -450,6 +450,12 @@ class TRTLLMDecoder(Decoder):
         self.store["decoder_input_buffers"] = DecoderInputBuffers(
             self.executor_config.max_batch_size, self.max_decoding_tokens,
             self.store["buffer_manager"])
+        self.store["new_tokens_device_tensor"] = torch.empty((
+            self.executor_config.max_batch_size,
+            self.executor_config.max_beam_width,
+        ),
+                                               dtype=torch.int,
+                                               device='cuda')
 
     def _instantiate_algorithms(self):
         self.algs = Algorithms()
@@ -542,13 +548,7 @@ class TRTLLMDecoder(Decoder):
         #       current implementation of model_engine.
         # TODO: When we support speculative decoding:
         # new_tokens_device_tensor should be, for speculative decoding cases: [batch, 1 + draft_len], others: [batch]
-        new_tokens_device_tensor = torch.empty((
-            self.batch_size,
-            self.beam_width,
-        ),
-                                               dtype=torch.int,
-                                               device='cuda')
-
+        new_tokens_device_tensor = self.store["new_tokens_device_tensor"][:self.batch_size, :self.beam_width]
         seq_slots = [
             request.seq_slot for request in itertools.chain(
                 scheduled_requests.context_requests,
