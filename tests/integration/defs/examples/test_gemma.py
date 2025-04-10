@@ -150,7 +150,7 @@ def test_llm_hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
 @pytest.mark.parametrize("gemma_model_root", [
     "gemma-2b", "gemma-7b", "gemma-2b-torch", "gemma-7b-torch",
     "gemma-2b-keras", "gemma-7b-keras", "gemma-2b-it-flax", "gemma-7b-it-flax",
-    "gemma-2-9b-it", "gemma-2-27b-it"
+    "gemma-2-9b-it", "gemma-2-27b-it", "gemma-3-1b-it"
 ],
                          indirect=True)
 def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
@@ -231,6 +231,13 @@ def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
         ])
     else:
         summary_cmd.append(f"--vocab_file={vocab_file}")
+
+    os.path.basename(gemma_model_root)
+    if 'gemma-3-1b-it' in gemma_model_root:
+        max_attention_window_size = [512, 512, 512, 512, 512, 3100]
+        summary_cmd.append(f"--max_attention_window_size")
+        for window_size in max_attention_window_size:
+            summary_cmd.append(str(window_size))
 
     venv_check_call(llm_venv, summary_cmd)
 
