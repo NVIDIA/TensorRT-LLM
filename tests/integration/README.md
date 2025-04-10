@@ -11,7 +11,7 @@ The following subfolder contains test definitions for Tensorrt LLM.
     ├── defs            #     Test definitions
     ├── perf_configs    #     Configs for perf tests
     └── test_lists      #     Test lists
-        ├── test-db     #         Test-DB (New test list convention adopted by pytest)
+        ├── test-db     #         Test-DB that is the test list convention adopted by CI
         ├── dev         #         Other test lists used by TRT LLM developers
         ├── qa          #         Test lists used by QA
         └── waives.txt  #         Test waive list
