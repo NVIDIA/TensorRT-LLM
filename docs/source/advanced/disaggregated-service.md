@@ -60,8 +60,6 @@ In the code example above, the `contextRequestId` assigned by the contextExecuto
 
 An `orchestrator` is required in `disaggregated-service` to manage multiple executor instances and route requests to different executors, TRT-LLM provides class `DisaggExecutorOrchestrator` in `cpp/include/tensorrt_llm/executor/disaggServerUtil.h` to launch multiple executor instances, however, `DisaggExecutorOrchestrator` only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their usage scenario.
 
-TRT-LLM currently implements KV cache transfer using `CUDA-aware MPI` or `UCX`, and all executor processes involved need to hold the same MPI world communicator. Therefore, TRT-LLM only supports launching multiple executors using `MPI`, and the `CommunicationMode` of the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for `disaggregated-service`, TRT-LLM will relax this restriction in future version to manage executors with greater ease.
-
 
 ## Example
 
