@@ -25,14 +25,13 @@ from .logger import logger
 from .mapping import Mapping
 
 
-def _raise_if_error(error: cudaError_t):
-    if error != cudaError_t.cudaSuccess:
-        raise RuntimeError(error)
-
-
-def _raise_if_error(error: cuda.CUresult):
-    if error != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(error)
+def _raise_if_error(error: cudaError_t | cuda.CUresult):
+    if isinstance(error, cudaError_t):
+        if error != cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
+    if isinstance(error, cuda.CUresult):
+        if error != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"CUDA Driver API error: {repr(error)}")
 
 
 def can_access_peer(mapping: Mapping) -> bool:

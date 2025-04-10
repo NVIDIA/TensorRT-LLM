@@ -3,6 +3,7 @@ import itertools
 import os
 import socket
 import sys
+import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
 
 from .._utils import global_mpi_rank
 from .utils import print_colored_debug
@@ -89,8 +91,37 @@ class MpiSession(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def shutdown(self):
+    def shutdown(self, wait=True):
         raise NotImplementedError()
+
+    @abc.abstractmethod
+    def abort(self):
+        raise NotImplementedError()
+
+    def _abort_on_timeout(self, fut: Future, timeout: float, reason=None):
+        try:
+            fut.result(timeout=timeout)
+        except TimeoutError:
+            logger.critical("MpiSession shutdown timeout, aborting...")
+            if reason is not None:
+                logger.info(f"Reason to shutdown: {repr(reason)}")
+            self.abort()
+
+    def shutdown_abort(self, grace: float = 60, reason=None):
+        if sys.is_finalizing():
+            # cannot start thread at interpreter shutdown
+            # simply don't wait to avoid hang
+            return self.shutdown(wait=False)
+
+        fut = Future()
+        killer = threading.Thread(group=None,
+                                  target=self._abort_on_timeout,
+                                  name="MpiSessionTimeoutKiller",
+                                  args=(fut, grace, reason))
+        killer.start()
+        self.shutdown()
+        fut.set_result(None)
+        killer.join()
 
 
 class MpiPoolSession(MpiSession):
@@ -119,10 +150,13 @@ class MpiPoolSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=True)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -131,7 +165,7 @@ class MpiPoolSession(MpiSession):
                                         path=sys.path)
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
@@ -193,13 +227,16 @@ class MpiCommSession(MpiSession):
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=True)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
         if self.thread_pool is not None:
-            self.thread_pool.shutdown(wait=True)
+            self.thread_pool.shutdown(wait=wait)
             self.thread_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -209,7 +246,7 @@ class MpiCommSession(MpiSession):
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
@@ -249,7 +286,7 @@ class RemoteMpiCommSessionClient():
     def submit_sync(self, task, *args, **kwargs):
         return self.submit(task, *args, **kwargs)
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self._is_shutdown:
             return
 

@@ -302,12 +302,19 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.workers_started = True
 
-        while not self.request_error_queue.poll(1):
+        while True:
+            if self.request_error_queue.poll(1):
+                ready_signal = self.request_error_queue.get()
+                break
+            if any(fut.done() for fut in self.mpi_futures):
+                logger.error("Executor worker died during initialization.")
+                ready_signal = RuntimeError(
+                    "Executor worker died during initialization")
+                break
             self._handle_background_error()
 
-        ready_signal = self.request_error_queue.get()
         if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
-            self.mpi_session.shutdown()
+            self.mpi_session.shutdown_abort(reason=ready_signal)
             raise ready_signal
 
     def _abort_all_requests(self):
