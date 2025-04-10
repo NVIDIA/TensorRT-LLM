@@ -339,6 +339,7 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
             fused_cos_sin = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+            fused_cos_sin = graph.call_method("to", (fused_cos_sin, torch.float32))
             cache[cache_key] = fused_cos_sin
 
         position_ids = _get_position_ids(graph, q_for_op_contig, batch_dim=0, seq_dim=1)
@@ -410,6 +411,8 @@ def _process_rope_v2(graph, q_match, k_match):
             )
         with graph.inserting_after(cos_sin_flash_3d):
             cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
+        with graph.inserting_after(cos_sin_flash):
+            cos_sin_flash = graph.call_method("to", (cos_sin_flash, torch.float32))
         cache[inv_freq_node] = cos_sin_flash
 
     with graph.inserting_before(q_match["out"]):
