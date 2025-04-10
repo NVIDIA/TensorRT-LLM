@@ -126,7 +126,8 @@ void KVCacheTransferManager::copyBlock(
     std::vector<KVCacheBlockPool> const& pools,
     bool isOffload,
     int numTokensToCopy,
-    KVCacheTransferMode mode = KVCacheTransferMode::DRAM)
+    executor::KvCacheTransferMode mode,
+    std::optional<std::string> directory)
 {
     TLLM_LOG_DEBUG(
         "copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d",
@@ -136,7 +137,7 @@ void KVCacheTransferManager::copyBlock(
         static_cast<int>(mode));
     
 
-    if (mode == KVCacheTransferMode::DRAM)
+    if (mode == executor::KvCacheTransferMode::DRAM)
     {
         TLLM_LOG_INFO("Using DRAM-based copy (GPU <-> CPU) for this block.");
 
@@ -202,7 +203,7 @@ void KVCacheTransferManager::copyBlock(
         std::snprintf(filename.data(), filename.size(),
             "/mnt/weka/block_%d_pool_%zu.bin", src->getBlockId(), poolIdx);
 
-        if (mode == KVCacheTransferMode::POSIX_DEBUG_FALLBACK)
+        if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
             TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
             if (isOffload)
