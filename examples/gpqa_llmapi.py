@@ -61,9 +61,8 @@ from transformers import AutoTokenizer
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import MTPDecodingConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
