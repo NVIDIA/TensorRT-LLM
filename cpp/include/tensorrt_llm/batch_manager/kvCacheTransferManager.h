@@ -65,11 +65,9 @@ private:
      * \param pools           Pools describing memory layout for KV blocks
      * \param isOffload       true => GPU->CPU/file, false => CPU/file->GPU
      * \param numTokensToCopy if > 0, partial copy is done
-     * \param mode            If 0 => DRAM, 1 => GDS, 2 => POSIX fallback
+     * \param mode            See \ref KVCacheTransferMode
      *
-     * The default param is set to (KVCacheTransferMode)0 so it picks DRAM by default.
-     * If we want to switch to GDS or POSIX, we can update the default param
-     * in the function signature
+     * The default param is set to KVCacheTransferMode::DRAM.
      */
     void copyBlock(
         BlockPtr const& src,
@@ -77,7 +75,7 @@ private:
         std::vector<KVCacheBlockPool> const& pools,
         bool isOffload,
         int numTokensToCopy = 0,
-        KVCacheTransferMode mode = (KVCacheTransferMode)0);
+        KVCacheTransferMode mode = KVCacheTransferMode::DRAM);
 
 
     runtime::BufferManager mBufferManager;
