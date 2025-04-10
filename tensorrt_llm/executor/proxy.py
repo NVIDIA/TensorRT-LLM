@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 import time
 import weakref
 from typing import Dict, Optional, Union
@@ -94,7 +95,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self._start_executor_workers(worker_kwargs)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
-
         self.request_queue = IpcQueue(is_server=True,
                                       name="proxy_request_queue")
         self.request_error_queue = IpcQueue(is_server=True,

@@ -499,8 +499,7 @@ def worker_main(
         _torch_model_class_mapping: Optional[dict] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+        is_llm_executor: Optional[bool] = True,  # whether it's the main executor instance
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -537,6 +536,7 @@ def worker_main(
         # Only set the log level for the leader process, the other processes will
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
+
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
                                  name="worker_request_queue")
@@ -586,13 +586,13 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         print_colored_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: str = worker_queues.result_queue_addr
+        proxy_result_queue: tuple[str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
         assert postproc_worker_config.postprocess_tokenizer_dir is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, str)
+        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
