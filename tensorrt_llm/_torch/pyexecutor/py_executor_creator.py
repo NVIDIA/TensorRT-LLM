@@ -6,6 +6,7 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
@@ -21,7 +22,7 @@ from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import KVCacheManager, ResourceManager
+from .resource_manager import KVCacheManager, PeftCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 
@@ -91,7 +92,8 @@ def _create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
-                       engine_dir: str = None):
+                       engine_dir: str = None,
+                       lora_config: LoraConfig = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -306,6 +308,40 @@ def create_py_executor(executor_config: ExecutorConfig,
             decoder = TorchDecoder(
                 max_seq_len=model_engine.max_seq_len,
                 mixed_decoder=pytorch_backend_config.mixed_decoder)
+
+    if lora_config is not None:
+        from tensorrt_llm.bindings import LoraModule
+        load_torch_hf_lora(lora_config)
+        model_binding_config = model_engine.model.model_config.get_bindings_model_config(
+        )
+        lora_modules = LoraModule.create_lora_modules(
+            lora_config.lora_target_modules, model_binding_config.hidden_size,
+            model_binding_config.mlp_hidden_size,
+            model_binding_config.num_heads, model_binding_config.num_heads,
+            model_binding_config.head_size)
+        model_binding_config.use_lora_plugin = True
+        model_binding_config.lora_modules = lora_modules
+        model_binding_config.max_lora_rank = lora_config.max_lora_rank
+
+        max_lora_rank = lora_config.max_lora_rank
+        num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
+            len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+
+        # TODO smor- need to figure out how to set these values
+        max_loras = 4
+        max_cpu_loras = 4
+        executor_config.peft_cache_config = tllm.executor.PeftCacheConfig(
+            num_device_module_layer=max_lora_rank * num_lora_modules *
+            max_loras,
+            num_host_module_layer=max_lora_rank * num_lora_modules *
+            max_cpu_loras,
+        )
+
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=executor_config.peft_cache_config,
+            model_config=model_binding_config)
+        resources["peft_cache_manager"] = peft_cache_manager
+
     py_executor = PyExecutor(resource_manager,
                              scheduler,
                              model_engine=model_engine,
