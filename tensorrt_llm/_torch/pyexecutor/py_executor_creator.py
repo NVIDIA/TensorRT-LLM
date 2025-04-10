@@ -1,16 +1,26 @@
 import copy
 
 import tensorrt_llm
+<<<<<<< HEAD
+=======
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+>>>>>>> a1ed7c149d (Make memory calculation of decoder adapt to the chosen decoder. Recognize decoder option passed in executorconfig. Make overlap scheduler test run on TinyLlama.)
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+<<<<<<< HEAD
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
+=======
+from ..speculative import (Eagle3Config, get_num_spec_layers, get_spec_decoder,
+                           get_spec_resource_manager)
+from ._util import estimate_max_kv_cache_tokens, instantiate_decoder, is_mla
+>>>>>>> a1ed7c149d (Make memory calculation of decoder adapt to the chosen decoder. Recognize decoder option passed in executorconfig. Make overlap scheduler test run on TinyLlama.)
 from .config import PyTorchConfig
 from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine

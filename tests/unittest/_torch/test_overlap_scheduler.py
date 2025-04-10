@@ -19,7 +19,7 @@ def test_case():
 
 @pytest.fixture(scope="module")
 def model_path():
-    return llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct"
+    return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
 def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):

@@ -343,17 +343,17 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
     elif spec_decoder is not None:
         decoder = spec_decoder
     elif pytorch_backend_config.enable_trtllm_decoder:
+        decoding_mode = executor_config.decoding_config.decoding_mode if executor_config.decoding_config and executor_config.decoding_config.decoding_mode else DecodingMode.TopK(
+        )
         decoder = TRTLLMDecoder(executor_config, model_engine.model,
-                                model_engine.dtype, mapping,
-                                tllm.executor.DecodingMode.TopKTopP())
-    else:
+                                model_engine.dtype, mapping, decoding_mode)
+    elif not model_engine.model.model_config.is_generation:
         # NOTE: choose decoder based on model type
-        if not model_engine.model.model_config.is_generation:
-            decoder = EarlyStopDecoder()
-        else:
-            decoder = TorchDecoder(
-                max_seq_len=model_engine.max_seq_len,
-                mixed_decoder=pytorch_backend_config.mixed_decoder)
+        decoder = EarlyStopDecoder()
+    else:
+        decoder = TorchDecoder(
+            max_seq_len=model_engine.max_seq_len,
+            mixed_decoder=pytorch_backend_config.mixed_decoder)
 
     return PyExecutor(resource_manager,
                       scheduler,
