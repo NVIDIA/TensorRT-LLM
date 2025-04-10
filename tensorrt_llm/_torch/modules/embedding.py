@@ -54,6 +54,7 @@ class LMHead(Linear):
                 local_in_features -= self.padding_size
         self.in_features = local_in_features
         self.out_features = local_out_features
+        self.num_embeddings = num_embeddings
 
         weight_shape = (self.out_features, self.in_features)
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
