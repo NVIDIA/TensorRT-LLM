@@ -83,7 +83,7 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_rope_v2(graph, q_match, k_match, start_boundary)
+        _process_rope_v2(graph, q_match, k_match)
 
     gm = canonicalize_graph(gm)
     return gm
@@ -260,6 +260,8 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
     """
     Process a region that matched the legacy RoPE pattern (v1).
     Inserts the custom op (flashinfer) and replaces the original add nodes.
+    Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
+    and reuses those nodes when possible.
     """
     q_node = q_match["raw_input"]
     k_node = k_match["raw_input"]
@@ -313,9 +315,34 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
         else:
             q_for_op_contig, k_for_op_contig = q_node, k_node
 
+        head_dim = cos_node.meta["val"].shape[-1]
+
+        half_head_dim = head_dim // 2
+        # Use cache for fused cosine-sine flash tensor
+        if not hasattr(graph, "rope_flash_cache"):
+            graph.rope_flash_cache = {}
+        cache = graph.rope_flash_cache
+        cache_key = (cos_node, sin_node)
+        if cache_key in cache:
+            fused_cos_sin = cache[cache_key]
+        else:
+            cos_prefix = graph.call_function(
+                torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
+            )
+            sin_prefix = graph.call_function(
+                torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
+            )
+            fused_cos_sin = graph.call_function(
+                torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
+            )
+            fused_cos_sin = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+            cache[cache_key] = fused_cos_sin
+
+        position_ids = _get_position_ids(graph, q_for_op_contig, batch_dim=0, seq_dim=1)
+
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, cos_node, sin_node, True),
+            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin, True),
         )
 
     with graph.inserting_after(flash_node):
@@ -334,11 +361,13 @@ def _process_rope_v1(graph, q_match, k_match, start_boundary):
     k_match["add_node"].replace_all_uses_with(new_k)
 
 
-def _process_rope_v2(graph, q_match, k_match, start_boundary):
+def _process_rope_v2(graph, q_match, k_match):
     """
     Process a region that matched the complex-multiplication RoPE pattern (v2).
-    Inserts the custom op (flashinfer) after extracting frequency info and replaces
-    the original type_as nodes.
+    Inserts the custom op (flashinfer) after extracting frequency information,
+    and replaces the original type_as nodes.
+    Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
+    and reuses those nodes when possible.
     """
     q_node = q_match["input"]
     k_node = k_match["input"]
@@ -360,19 +389,30 @@ def _process_rope_v2(graph, q_match, k_match, start_boundary):
             f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
         )
 
+    # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
+    if not hasattr(graph, "rope_flash_cache"):
+        graph.rope_flash_cache = {}
+    cache = graph.rope_flash_cache
+    if inv_freq_node in cache:
+        cos_sin_flash = cache[inv_freq_node]
+    else:
+        # Compute the fused cosine/sine cache.
+        with graph.inserting_after(inv_freq_node):
+            real_part = graph.call_function(torch.ops.aten.real, args=(inv_freq_node,))
+            imag_part = graph.call_function(torch.ops.aten.imag, args=(inv_freq_node,))
+        with graph.inserting_after(real_part):
+            cos_sin_flash_3d = graph.call_function(
+                torch.ops.aten.cat, args=((real_part, imag_part), -1)
+            )
+        with graph.inserting_after(cos_sin_flash_3d):
+            cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
+        cache[inv_freq_node] = cos_sin_flash
+
     with graph.inserting_before(q_match["out"]):
-        q_for_op_contig, k_for_op_contig = q_node, k_node
-        cos_from_freqs = graph.call_function(torch.ops.aten.real, args=(inv_freq_node,))
-        sin_from_freqs = graph.call_function(torch.ops.aten.imag, args=(inv_freq_node,))
-        cos_flash = graph.call_function(
-            torch.ops.aten.cat, args=((cos_from_freqs, cos_from_freqs), -1)
-        )
-        sin_flash = graph.call_function(
-            torch.ops.aten.cat, args=((sin_from_freqs, sin_from_freqs), -1)
-        )
+        position_ids = _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1)
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, cos_flash, sin_flash, False),
+            args=(q_node, k_node, position_ids, cos_sin_flash, False),
         )
 
     with graph.inserting_after(flash_node):
@@ -381,3 +421,34 @@ def _process_rope_v2(graph, q_match, k_match, start_boundary):
 
     q_match["out"].replace_all_uses_with(raw_q)
     k_match["out"].replace_all_uses_with(raw_k)
+
+
+def _get_position_ids(graph, q_node, batch_dim=0, seq_dim=1):
+    """
+    Retrieves the cached position_ids from the graph if available, or computes and caches them.
+    It uses the symbolic batch and sequence sizes from q_node with the provided dimension indices.
+    """
+    if hasattr(graph, "rope_position_ids"):
+        return graph.rope_position_ids
+
+    sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
+    sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
+
+    # Retrieve device information, ensuring it is a torch.device.
+    device = q_node.meta.get("device", "cpu")
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Build positions: arange(sym_seq) -> view -> expand -> flatten.
+    positions_node = graph.call_function(
+        torch.ops.aten.arange,
+        args=(sym_seq,),
+        kwargs={"dtype": torch.float32, "device": device, "pin_memory": False},
+    )
+    positions_node = graph.call_function(torch.ops.aten.view, args=(positions_node, (1, -1)))
+    positions_node = graph.call_function(
+        torch.ops.aten.expand, args=(positions_node, (sym_batch, -1))
+    )
+    position_ids = graph.call_function(torch.ops.aten.flatten, args=(positions_node,))
+    graph.rope_position_ids = position_ids
+    return position_ids

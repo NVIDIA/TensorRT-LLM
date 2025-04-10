@@ -83,7 +83,7 @@ def test_flashinfer_and_custom_rope_ops(dtype, atol, rtol, head_dim):
     k_hf = k_hf.transpose(1, 2).to(dtype)
 
     # Custom op call
-    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_new, sin_new, True)
+    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, positions, cos_sin_cache, True)
 
     torch.testing.assert_close(q_hf, q_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
@@ -135,11 +135,11 @@ def test_flashinfer_complex_rotary(dtype, atol, rtol, head_dim):
 
     cos_from_freqs = torch.real(freqs_cis)  # (B, seq, head_dim//2)
     sin_from_freqs = torch.imag(freqs_cis)  # (B, seq, head_dim//2)
-    cos_flash = torch.cat((cos_from_freqs, cos_from_freqs), dim=-1)  # (B, seq, head_dim)
-    sin_flash = torch.cat((sin_from_freqs, sin_from_freqs), dim=-1)  # (B, seq, head_dim)
+    cos_sin_cache = torch.cat([cos_from_freqs, sin_from_freqs], dim=-1)[0]  # (seq, head_dim))
 
     # q/k of llama4 rope is interleaved
-    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, cos_flash, sin_flash, False)
+    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch)])
+    custom_q, custom_k = torch.ops.rope.flashinfer(query, key, positions, cos_sin_cache, False)
 
     torch.testing.assert_close(out_q_v2, custom_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(out_k_v2, custom_k, rtol=rtol, atol=atol)

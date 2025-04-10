@@ -69,84 +69,103 @@ def _precompute_freqs_cis_v2(seq_len: int, head_dim: int, rope_theta: float):
 
 
 class RotaryModel(torch.nn.Module):
-    def __init__(self, hidden_size: int, max_seq_len: int, layout: str = "BNSD"):
+    def __init__(
+        self,
+        hidden_size: int,
+        max_seq_len: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layout: str = "BNSD",
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_seq_len = max_seq_len
         self.layout = layout
-        self.linear = torch.nn.Linear(hidden_size, hidden_size)
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+        self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self.linear(x)
-        k = self.linear(x)
-        # Simulate a single-head scenario by unsqueezing the head dimension.
-        q = q.unsqueeze(1)
-        k = k.unsqueeze(1)  # [B, 1, S, D]
-        batch, _, seq, hidden = q.shape
-        if self.layout == "BSND":
-            # Transpose to [B, S, N, D]
-            q = q.transpose(1, 2).contiguous()
-            k = k.transpose(1, 2).contiguous()
-            unsqueeze_dim = 2
-        else:
-            # For BNSD, layout remains [B, N, S, D]
-            unsqueeze_dim = 1
+        q = self.linear_q(x)
+        k = self.linear_k(x)
 
-        # Precompute cosine-sine cache. shape: [max_seq_len, hidden].
-        cos, sin = _precompute_freqs_cis(seq, hidden, rope_theta=10000)
-        cos = cos.to(q.device)
-        sin = sin.to(q.device)
-        cos = cos.unsqueeze(0).expand(batch, -1, -1)  # [B, max_seq_len, hidden]
-        sin = sin.unsqueeze(0).expand(batch, -1, -1)
+        batch, seq, _ = q.shape
+        q = q.view(batch, seq, self.num_heads, self.head_dim)
+        k = k.view(batch, seq, self.num_kv_heads, self.head_dim)
+
+        if self.layout == "BNSD":
+            q = q.permute(0, 2, 1, 3).contiguous()  # [B, N, S, D]
+            k = k.permute(0, 2, 1, 3).contiguous()
+            unsqueeze_dim = 1
+        else:  # BSND
+            unsqueeze_dim = 2
+
+        cos, sin = _precompute_freqs_cis(seq, self.head_dim, rope_theta=10000)
+        cos = cos.to(q.device).unsqueeze(0).expand(batch, -1, -1)
+        sin = sin.to(q.device).unsqueeze(0).expand(batch, -1, -1)
 
         q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-        return (q_embed + k_embed).to(torch.float16)
+        if self.layout == "BNSD":
+            # [B, N, S, D] -> [B, S, N*D]
+            q_embed = q_embed.permute(0, 2, 1, 3).reshape(batch, seq, -1)
+            k_embed = k_embed.permute(0, 2, 1, 3).reshape(batch, seq, -1)
+        else:  # BSND
+            q_embed = q_embed.reshape(batch, seq, -1)
+            k_embed = k_embed.reshape(batch, seq, -1)
+
+        output = torch.cat([q_embed, k_embed], dim=-1)
+        return output.to(torch.float16)
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
 
 class RotaryModelV2(torch.nn.Module):
-    def __init__(self, hidden_size: int, max_seq_len: int):
+    def __init__(self, hidden_size: int, max_seq_len: int, num_heads: int, num_kv_heads: int):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_seq_len = max_seq_len
-        self.linear = torch.nn.Linear(hidden_size, hidden_size)
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self.linear(x)
-        k = self.linear(x)
-        q = q.unsqueeze(2)
-        k = k.unsqueeze(2)  # [B, S, 1, D]
-        batch, seq, n_head, hidden = q.shape
+        batch, seq, _ = x.shape
 
-        # Precompute the complex frequency tensor.
-        freqs_cis = _precompute_freqs_cis_v2(seq, hidden, rope_theta=10000)
-        freqs_cis = freqs_cis.to(q.device)  # [seq, hidden//2]
-        # Expand to batch dimension; expected shape: [B, seq, hidden//2]
-        freqs_cis = freqs_cis.unsqueeze(0).expand(batch, -1, -1)
+        q = self.linear_q(x).view(batch, seq, self.num_heads, self.head_dim)
+        k = self.linear_k(x).view(batch, seq, self.num_kv_heads, self.head_dim)
+
+        freqs_cis = _precompute_freqs_cis_v2(seq, self.head_dim, rope_theta=10000)
+        freqs_cis = freqs_cis.to(x.device).unsqueeze(0).expand(batch, -1, -1)
 
         q_embed, k_embed = apply_rotary_emb(q, k, freqs_cis)
-        out = (q_embed + k_embed).to(torch.float16)
-        return out
+
+        q_embed = q_embed.reshape(batch, seq, -1)
+        k_embed = k_embed.reshape(batch, seq, -1)
+
+        output = torch.cat([q_embed, k_embed], dim=-1)
+        return output.to(torch.float16)
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
 
-@pytest.mark.parametrize(
-    "layout",
-    ["BNSD", "BSND"],
-)
+@pytest.mark.parametrize("layout", ["BNSD", "BSND"])
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4)])
 @torch.inference_mode()
-def test_match_rope(layout):
+def test_match_rope(layout, num_heads, num_kv_heads):
     batch_size, seq_len = 8, 16
-    hidden_size = 64
+    hidden_size = 512
     max_position_embeddings = seq_len
 
-    model = RotaryModel(hidden_size, max_position_embeddings, layout=layout).to(
-        "cuda", dtype=torch.float16
-    )
+    model = RotaryModel(
+        hidden_size, max_position_embeddings, num_heads, num_kv_heads, layout=layout
+    ).to("cuda", dtype=torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
@@ -164,13 +183,17 @@ def test_match_rope(layout):
     )
 
 
+@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4)])
 @torch.inference_mode()
-def test_match_rope_v2():
+def test_match_rope_v2(num_heads, num_kv_heads):
     batch_size, seq_len = 8, 16
-    hidden_size = 64
+    hidden_size = 512
     max_position_embeddings = seq_len
 
-    model = RotaryModelV2(hidden_size, max_position_embeddings).to("cuda", dtype=torch.float16)
+    model = RotaryModelV2(hidden_size, max_position_embeddings, num_heads, num_kv_heads).to(
+        "cuda", dtype=torch.float16
+    )
+
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
