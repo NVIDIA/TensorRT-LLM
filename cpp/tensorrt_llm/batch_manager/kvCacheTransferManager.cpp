@@ -27,13 +27,14 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-// For GPUDirect Storage (cuFile)
 #ifndef _WIN32
-#include <cufile.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#  ifdef ENABLE_CUFILE
+#    include <cufile.h>
+#  endif
+#  include <fcntl.h>
+#  include <sys/stat.h>
+#  include <sys/types.h>
+#  include <unistd.h>
 #endif
 
 #include <cstring>
@@ -55,35 +56,21 @@ static bool gpuToFilePosix(
     return false;
 #else
     int fd = ::open(filename.c_str(), O_CREAT | O_WRONLY, 0664);
-    if (fd < 0)
-    {
-        TLLM_LOG_ERROR("Failed to open '%s' for writing (POSIX fallback)", filename.c_str());
-        return false;
-    }
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for writing (POSIX fallback)", filename.c_str());
 
     ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
     std::vector<uint8_t> hostBuffer(numBytes);
 
     cudaError_t cpyErr = cudaMemcpy(hostBuffer.data(), srcPtr->data(), numBytes, cudaMemcpyDeviceToHost);
-    if (cpyErr != cudaSuccess)
-    {
-        TLLM_LOG_ERROR("cudaMemcpy to host failed, error=%d", cpyErr);
-        ::close(fd);
-        return false;
-    }
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
 
     ssize_t written = ::write(fd, hostBuffer.data(), numBytes);
-    if (written < 0)
-    {
-        TLLM_LOG_ERROR("POSIX write error=%zd", written);
-    }
-    else
-    {
-        TLLM_LOG_DEBUG("Wrote %zd bytes to %s (POSIX fallback)", written, filename.c_str());
-    }
+    TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+
+    TLLM_LOG_DEBUG("Wrote %zd bytes to %s (POSIX fallback)", written, filename.c_str());
 
     ::close(fd);
-    return (written >= 0);
+    return true;
 #endif
 }
 
@@ -96,31 +83,18 @@ static bool fileToGpuPosix(
     return false;
 #else
     int fd = ::open(filename.c_str(), O_RDONLY);
-    if (fd < 0)
-    {
-        TLLM_LOG_ERROR("Failed to open '%s' for reading (POSIX fallback)", filename.c_str());
-        return false;
-    }
+    TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' for reading (POSIX fallback)", filename.c_str());
 
     ssize_t numBytes = static_cast<ssize_t>(dstPtr->getSizeInBytes());
     std::vector<uint8_t> hostBuffer(numBytes);
 
     ssize_t bytesRead = ::read(fd, hostBuffer.data(), numBytes);
-    if (bytesRead < 0)
-    {
-        TLLM_LOG_ERROR("POSIX read error=%zd", bytesRead);
-        ::close(fd);
-        return false;
-    }
+    TLLM_CHECK_WITH_INFO(bytesRead >= 0, "POSIX read error=%zd", bytesRead);
+
     TLLM_LOG_DEBUG("Read %zd bytes from %s (POSIX fallback)", bytesRead, filename.c_str());
 
     cudaError_t cpyErr = cudaMemcpy(dstPtr->data(), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-    if (cpyErr != cudaSuccess)
-    {
-        TLLM_LOG_ERROR("cudaMemcpy to device failed, error=%d", cpyErr);
-        ::close(fd);
-        return false;
-    }
+    TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
 
     ::close(fd);
     return true;
@@ -255,69 +229,63 @@ void KVCacheTransferManager::copyBlock(
             continue;
         }
 
+#  ifdef ENABLE_CUFILE
         CUfileDescr_t cufileDesc = {};
         cufileDesc.type          = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         cufileDesc.handle.fd     = fd;
 
         CUfileHandle_t cufileHandle;
         CUfileError_t status = cuFileHandleRegister(&cufileHandle, &cufileDesc);
-
-        if (status.err == CU_FILE_SUCCESS)
+        if (status.err != CU_FILE_SUCCESS)
         {
-            TLLM_LOG_DEBUG("GDS: Using cuFile for %s", filename.c_str());
-            ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
+            // Fallback to POSIX
+            TLLM_LOG_WARN("cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'",
+                          status.err, filename.c_str());
+            ::close(fd);
+            if (isOffload) gpuToFilePosix(srcPtr, filename);
+            else           fileToGpuPosix(dstPtr, filename);
+            continue;
+        }
 
-            if (isOffload)
+        ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
+        if (isOffload)
+        {
+            ssize_t written = cuFileWrite(cufileHandle, srcPtr->data(), numBytes, 0, 0);
+            if (written < 0)
             {
-                // GPU->file
-                ssize_t written = cuFileWrite(cufileHandle, srcPtr->data(), numBytes, 0, 0);
-                if (written < 0)
-                {
-                    TLLM_LOG_ERROR("cuFileWrite error=%zd. Fallback to POSIX", written);
-                    gpuToFilePosix(srcPtr, filename);
-                }
-                else
-                {
-                    TLLM_LOG_DEBUG("cuFileWrite: Wrote %zd bytes to %s", written, filename.c_str());
-                }
+                TLLM_LOG_ERROR("cuFileWrite error=%zd. Fallback to POSIX", written);
+                cuFileHandleDeregister(cufileHandle);
+                ::close(fd);
+                gpuToFilePosix(srcPtr, filename);
+                continue;
             }
-            else
-            {
-                // file->GPU
-                ssize_t readCount = cuFileRead(cufileHandle, dstPtr->data(), numBytes, 0, 0);
-                if (readCount < 0)
-                {
-                    TLLM_LOG_ERROR("cuFileRead error=%zd. Fallback to POSIX", readCount);
-                    fileToGpuPosix(dstPtr, filename);
-                }
-                else
-                {
-                    TLLM_LOG_DEBUG("cuFileRead: Read %zd bytes from %s", readCount, filename.c_str());
-                }
-            }
-
-            cuFileHandleDeregister(cufileHandle);
         }
         else
         {
-            TLLM_LOG_WARN(
-                "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'",
-                status.err,
-                filename.c_str());
-
-            // Non-fatal fallback if GDS fails to register the file handle.
-            if (isOffload) gpuToFilePosix(srcPtr, filename);
-            else           fileToGpuPosix(dstPtr, filename);
+            ssize_t readCount = cuFileRead(cufileHandle, dstPtr->data(), numBytes, 0, 0);
+            if (readCount < 0)
+            {
+                TLLM_LOG_ERROR("cuFileRead error=%zd. Fallback to POSIX", readCount);
+                cuFileHandleDeregister(cufileHandle);
+                ::close(fd);
+                fileToGpuPosix(dstPtr, filename);
+                continue;
+            }
         }
 
+        cuFileHandleDeregister(cufileHandle);
         ::close(fd);
+#  else
+        // If GDS isn't enabled, fallback to POSIX automatically
+        TLLM_LOG_DEBUG("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
+        ::close(fd); // close the file opened for GDS
+        if (isOffload) gpuToFilePosix(srcPtr, filename);
+        else           fileToGpuPosix(dstPtr, filename);
+#  endif
     }
-
-    TLLM_LOG_DEBUG("copyBlock: GDS/POSIX path complete. Returning...");
 #else
-    // I added this block because PR #3209 reminded me that GDS is not supported on Windows.
-    TLLM_LOG_WARN(
-        "KVCacheTransferManager::copyBlock called with GDS or POSIX mode on Windows. Not supported.");
+    // On Windows, we cannot do GDS or POSIX fallback
+    TLLM_LOG_WARN("No GDS or POSIX fallback on Windows in this build.");
 #endif
 }
 
