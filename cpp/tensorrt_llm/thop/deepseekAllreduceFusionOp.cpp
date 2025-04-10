@@ -42,8 +42,6 @@
 namespace torch_ext
 {
 
-#if ENABLE_MULTI_DEVICE
-
 using tensorrt_llm::kernels::AllReduceFusionOp;
 
 namespace
@@ -232,13 +230,10 @@ public:
 
 } // namespace
 
-#endif // ENABLE_MULTI_DEVICE
-
 std::vector<torch::Tensor> deepseekAllreduceFusion(torch::Tensor input, torch::optional<torch::Tensor> workspace,
     torch::TensorList reduce_fusion_inputs, int64_t const rank, int64_t const nranks, double const eps,
     int64_t const fusion_op)
 {
-#if ENABLE_MULTI_DEVICE
     DeepseekAllreduceOp op;
     auto fusion_op_type = static_cast<AllReduceFusionOp>(int8_t(fusion_op));
     if (fusion_op_type == AllReduceFusionOp::MOE_ALLREDUCE_RESIDUAL_RMS_NORM)
@@ -249,9 +244,6 @@ std::vector<torch::Tensor> deepseekAllreduceFusion(torch::Tensor input, torch::o
     {
         return op.run(input, workspace, reduce_fusion_inputs, rank, nranks, eps, fusion_op);
     }
-#else
-    return std::vector<torch::Tensor>();
-#endif // ENABLE_MULTI_DEVICE
 }
 
 } // namespace torch_ext

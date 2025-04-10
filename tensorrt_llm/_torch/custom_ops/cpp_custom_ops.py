@@ -211,3 +211,13 @@ def _register_fake():
 
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
+
+    @torch.library.register_fake("trtllm::group_rms_norm")
+    def _(
+        inputs: List[torch.Tensor],
+        weights: List[torch.Tensor],
+        eps: float,
+        enable_weights: bool = False,
+    ):
+        # Return empty tensors with the same shape as inputs
+        return [torch.empty_like(input) for input in inputs]
