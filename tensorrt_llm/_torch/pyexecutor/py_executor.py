@@ -914,7 +914,12 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     generation_requests = scheduled_batch.generation_requests
-                    # Reorder generation requests
+
+                    # The generation requests that are do not have batch_idx,
+                    # needs to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
                     new_generation_requests = []
                     for req in generation_requests:
                         if req.py_batch_idx is None:
