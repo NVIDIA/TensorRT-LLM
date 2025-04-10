@@ -19,10 +19,6 @@ class Llama4Factory(HFFactory):
             "max_position_embeddings"
         ]
 
-        # TODO (lliebenwein): bug in Llama4TextAttention when attn_temperature_tuning==True
-        # disable for now...
-        self.model_kwargs["text_config"]["attn_temperature_tuning"] = False
-
     def _from_config(self, *args, **kwargs):
         kwargs.pop("trust_remote_code", None)
         return Llama4ForConditionalGeneration._from_config(*args, **kwargs)
