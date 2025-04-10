@@ -27,7 +27,7 @@ cd TensorRT-LLM
 git submodule update --init --recursive
 git lfs pull
 ```
-**Note**: Replace `<*_PATH>` to your actual path. 
+**Note**: Replace `<*_PATH>` to your actual path.
 
 #### 2. Download the DeepSeek R1 models
 
@@ -76,7 +76,7 @@ export PYTHONPATH=`pwd`
 sudo nvidia-smi -pm 0; sudo nvidia-smi -pm 1; sudo nvidia-smi boost-slider --vboost 4
 ```
 The boost-slider option will tune the GPU clock and can get you slight perf increase, for B200 min-latency scenarios it's about 8 TPS/USER.
-This is not a required step, it's provided here to make sure the perf numbers in this doc can be reproduced more closely to our internal run. 
+This is not a required step, it's provided here to make sure the perf numbers in this doc can be reproduced more closely to our internal run.
 
 #### 6. Dataset preparation
 
@@ -143,14 +143,14 @@ Explanation:
 #### Expected Results
 The perf can be different when using different datasets and different machines.
 
-``` 
-===========================================================                                                                                                     
-= PERFORMANCE OVERVIEW  
+```
 ===========================================================
-Request Throughput (req/sec):                     0.1244   
+= PERFORMANCE OVERVIEW
+===========================================================
+Request Throughput (req/sec):                     0.1244
 Total Output Throughput (tokens/sec):             254.5535
 Per User Output Throughput (tokens/sec/user):     254.7634
-Per GPU Output Throughput (tokens/sec/gpu):       31.8192  
+Per GPU Output Throughput (tokens/sec/gpu):       31.8192
 Total Latency (ms):                               80368.1616
 Average request latency (ms):                     8036.7546
 ```
@@ -162,7 +162,7 @@ Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_reque
 To do the benchmark, run the following command:
 
 ```bash
-# generate synthetic dataset 
+# generate synthetic dataset
 python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
         --stdout \
         --tokenizer nvidia/DeepSeek-R1-FP4 \
@@ -210,7 +210,7 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
 
 #### Expected Result Format
 The perf might be different from different datasets and machines
-``` 
+```
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
@@ -253,24 +253,24 @@ trtllm-bench --model deepseek-ai/DeepSeek-R1 \
 #### Expected Result Format
 
 The perf might be different from different datasets and machines
-``` 
-===========================================================                     
-= PERFORMANCE OVERVIEW                                                               
-===========================================================                                                                                                               
-Request Throughput (req/sec):                     0.0772                       
-Total Output Throughput (tokens/sec):             158.0669                     
-Per User Output Throughput (tokens/sec/user):     158.1196                
-Per GPU Output Throughput (tokens/sec/gpu):       19.7584                
-Total Latency (ms):                               129498.2168                       
+```
+===========================================================
+= PERFORMANCE OVERVIEW
+===========================================================
+Request Throughput (req/sec):                     0.0772
+Total Output Throughput (tokens/sec):             158.0669
+Per User Output Throughput (tokens/sec/user):     158.1196
+Per GPU Output Throughput (tokens/sec/gpu):       19.7584
+Total Latency (ms):                               129498.2168
 Average request latency (ms):                     12945.9379
 ```
 
-### H200 max-throughput 
+### H200 max-throughput
 Our benchmark results are based on **Batch = 1024, ISL = 1K, OSL = 2K, num_requests = 5120 from real dataset**
 To do the benchmark, run the following command:
 
 ```bash
-# generate synthetic dataset 
+# generate synthetic dataset
 python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
         --stdout \
         --tokenizer deepseek-ai/DeepSeek-R1 \
@@ -290,7 +290,7 @@ enable_attention_dp: true
 EOF
 
 # Use NVCC for DeepGEMM JIT compilation
-export TRTLLM_DG_JIT_USE_NVCC=1 
+export TRTLLM_DG_JIT_USE_NVCC=1
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     throughput \
@@ -310,7 +310,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
 #### Expected Result Format
 The perf might be different from different datasets and machines
 
-``` 
+```
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
@@ -322,4 +322,3 @@ Total Token Throughput (tokens/sec):              15707.0888
 Total Latency (ms):                               993548.8470
 Average request latency (ms):                     197768.0434
 ```
-

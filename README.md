@@ -18,7 +18,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [04/10] TensorRT-LLM DeepSeek R1 performance benchmarking best practices now published. 
+* [04/10] TensorRT-LLM DeepSeek R1 performance benchmarking best practices now published.
 ✨ [➡️ link](./docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md)
 
 * [04/05] TensorRT-LLM can run Llama 4 at over 40,000 tokens per second on B200 GPUs!
