@@ -447,9 +447,16 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(40000)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_summarization(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=8) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        pytorch_config = PyTorchConfig(enable_overlap_scheduler=True)
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 kv_cache_config=kv_cache_config,
+                 pytorch_backend_config=pytorch_config) as llm:
+
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
