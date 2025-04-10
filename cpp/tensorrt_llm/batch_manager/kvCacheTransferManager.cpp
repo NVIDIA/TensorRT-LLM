@@ -134,7 +134,7 @@ void KVCacheTransferManager::copyBlock(
         "copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d",
         src->getBlockId(),
         dst->getBlockId(),
-        (isOffload ? "true" : "false"),
+        (int)isOffload,
         static_cast<int>(mode));
     
 
