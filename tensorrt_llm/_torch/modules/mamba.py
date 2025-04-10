@@ -168,7 +168,6 @@ class Mamba2(nn.Module):
         self.mapping = config.mapping
         tp_rank = config.mapping.tp_rank
         tp_size = config.mapping.tp_size
-        config.mapping.gpus_per_node
 
         d_inner = d_model * expand
         nheads = d_inner // head_dim

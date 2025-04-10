@@ -29,8 +29,8 @@ class LMHead(Linear):
         embedding_dim: int,
         dtype: torch.dtype = None,
         mapping: Optional[Mapping] = None,
-        gather_output: bool = False,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -50,8 +50,8 @@ class LMHead(Linear):
             bias=False,
             dtype=dtype,
             mapping=mapping,
-            gather_output=gather_output,
             tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -127,8 +127,8 @@ class Embedding(LMHead):
         embedding_dim: int,
         dtype: Optional[torch.dtype] = None,
         mapping: Optional[Mapping] = None,
-        gather_output: bool = False,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -136,6 +136,7 @@ class Embedding(LMHead):
             dtype=dtype,
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
         )
         if self.tp_size > 1:
             slice_width = math.ceil(num_embeddings / self.tp_size)

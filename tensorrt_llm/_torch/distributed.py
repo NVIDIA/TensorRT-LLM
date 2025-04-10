@@ -196,13 +196,9 @@ class AllReduce(nn.Module):
         super().__init__()
 
         self.mapping = mapping
-        self.tp_size = self.mapping.tp_size
-        self.rank = self.mapping.rank
-        self.gpus_per_node = self.mapping.gpus_per_node
-
         self.workspace = None
         self.strategy = strategy
-        if self.tp_size > 1:
+        if self.mapping.tp_size > 1:
             if self.strategy != AllReduceStrategy.UB:
                 self.workspace = get_allreduce_workspace(mapping)
 
@@ -225,12 +221,8 @@ class DeepseekAllReduce(nn.Module):
     def __init__(self, mapping: Mapping):
         super().__init__()
         self.mapping = mapping
-        self.tp_size = self.mapping.tp_size
-        self.tp_rank = self.mapping.tp_rank
-        self.gpus_per_node = self.mapping.gpus_per_node
-        self.rank = self.mapping.rank
         self.workspace = None
-        if self.tp_size > 1:
+        if self.mapping.tp_size > 1:
             self.workspace = get_deepseek_allreduce_workspace(mapping)
 
     def forward(

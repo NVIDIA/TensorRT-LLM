@@ -283,12 +283,12 @@ def moe_residual_norm_fusion_forward(
         out_features=hidden_size,
         bias=False,
         dtype=dtype,
-        tensor_parallel_mode=TensorParallelMode.ROW,
         mapping=Mapping(
             world_size=tensor_parallel_size,
             tp_size=tensor_parallel_size,
             rank=tensor_parallel_rank,
         ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
     ).cuda()
     l0.load_weights([dict(weight=l0_weight)])
     token_input_chunked = torch.chunk(token_input.clone(),
