@@ -1912,10 +1912,10 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& fusedRuntimeBuffers = mBuffers.at(fusedBufferId);
 
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
-    std::tie(decodingInput, mDecodingOutput)
-        = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests, scheduledRequests.generationRequests,
-            *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId), mModelConfig, getMaxNumSequences(),
-            mOperatingBeamWidth, mRuntime->getBufferManager(), mRuntime->getStream(), *fusedRuntimeBuffers);
+    std::tie(decodingInput, mDecodingOutput) = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
+        scheduledRequests.generationRequests, *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId),
+        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), mOperatingBeamWidth,
+        mRuntime->getBufferManager(), mRuntime->getStream(), *fusedRuntimeBuffers);
 
     runtime::CudaEvent decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
 
