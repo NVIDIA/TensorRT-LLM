@@ -690,6 +690,9 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.empty_cache()
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+        enable_paged_context_mla = hasattr(
+            self.model.model_config.pretrained_config,
+            "kv_lora_rank") and self.attn_runtime_features.cache_reuse
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -697,7 +700,8 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla)
+                enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -711,7 +715,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla,
+            enable_paged_context_mla=enable_paged_context_mla)
         return self.attn_metadata
 
     def _set_up_spec_metadata(
