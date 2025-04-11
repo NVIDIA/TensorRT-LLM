@@ -1509,7 +1509,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                 newReq->validate(mModel->getMaxInputLen(), mModel->getMaxSequenceLen(), mModel->getMaxDraftLen(),
                     mModel->getVocabSizePadded(),
                     mEncoderModel ? std::optional<SizeType32>(mEncoderModel->getMaxInputLen()) : std::nullopt,
-                    mEnableBlockReuse, mModel->getModelConfig().computeContextLogits());
+                    mEnableBlockReuse);
 
                 TLLM_CHECK_WITH_INFO(!mEncoderModel || !mIsSchedulerMaxUtilization,
                     "Encoder or Encoder-Decoder model don't support max utilization scheduler yet. Only max requests "

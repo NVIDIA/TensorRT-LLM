@@ -139,7 +139,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDecodingConfig{optionalParams.decodingConfig}
     , mExtendedRuntimePerfKnobConfig{optionalParams.extendedRuntimePerfKnobConfig}
     , mDebugConfig{optionalParams.debugConfig}
-    , mAdditionalOutputNames{optionalParams.additionalOutputNames}
+    , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
     , mRuntime{std::make_shared<TllmRuntime>(
           rawEngine, mLogger.get(), optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
@@ -230,7 +230,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     auto& memCounter = MemoryCounters::getInstance();
     auto const gpuUsage1 = memCounter.getGpu();
-    createBuffers(mDecodingConfig, mAdditionalOutputNames);
+    createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     auto const gpuUsage2 = memCounter.getGpu();
     TLLM_LOG_INFO("[MemUsageChange] Allocated %s GPU memory for runtime buffers.",
         memCounter.bytesToString(gpuUsage2 - gpuUsage1).c_str());
@@ -536,7 +536,7 @@ void TrtGptModelInflightBatching::adjustMaxAttentionWindow(SizeType32 numPrimary
         // maxAttentionWindow; maxAttentionWindowVec; maxSequenceLen;
         // TODO(nhaber): This is problematic, as createBuffers edits the state of trtGptModelInflightBatching, but what
         // if there are different window values for cross+self etc. in encoder+decoder scenario...
-        createBuffers(mDecodingConfig, mAdditionalOutputNames);
+        createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     }
 }
 
@@ -1359,7 +1359,7 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
 }
 
 void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& decodingConfig,
-    std::optional<std::vector<std::string>> const& additionalOutputNames)
+    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -1368,7 +1368,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     {
         mBuffers.emplace_back(std::make_shared<RuntimeBuffers>(getMaxBatchSize(), mOperatingBeamWidth,
             getMaxAttentionWindowVec(), getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig,
-            mWorldConfig, decodingConfig, getGatherGenerationLogits(), getMaxNumTokens(), additionalOutputNames));
+            mWorldConfig, decodingConfig, getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs));
     }
 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
@@ -1647,9 +1647,10 @@ void TrtGptModelInflightBatching::executeStep(
         debugIOTensors(contextRequests, generationRequests, inputMap, outputMap);
     }
 
-    if (mAdditionalOutputNames.has_value() && !mAdditionalOutputNames.value().empty())
+    if (mAdditionalModelOutputs.has_value() && !mAdditionalModelOutputs.value().empty())
     {
-        utils::copyAdditionalOutputs(contextRequests, generationRequests, outputMap, getBufferManager());
+        utils::copyAdditionalOutputs(
+            mAdditionalModelOutputs.value(), contextRequests, generationRequests, outputMap, getBufferManager());
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -2385,7 +2386,7 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_DEBUG("Changing operating beam width from %d to %d", mOperatingBeamWidth, beamWidth);
     mOperatingBeamWidth = beamWidth;
 
-    createBuffers(mDecodingConfig, mAdditionalOutputNames);
+    createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     createDecoder(mDecodingConfig.getDecodingMode());
 
     if (static_cast<bool>(mKvCacheManager))

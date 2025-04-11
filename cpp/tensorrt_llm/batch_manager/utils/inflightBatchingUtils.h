@@ -44,7 +44,8 @@ void copyGenerationLogits(RuntimeBuffers::GenerationLogitsCache& generationLogit
     runtime::BufferManager const& bufferManager, LlmRequest& llmReq, bool beforeDecoder,
     std::vector<SizeType32> const& numDroppedTokens = {});
 
-void copyAdditionalOutputs(RequestVector const& contextRequests, RequestVector const& generationRequests,
+void copyAdditionalOutputs(std::vector<executor::AdditionalModelOutput> const& additionalModelOutputs,
+    RequestVector const& contextRequests, RequestVector const& generationRequests,
     RuntimeBuffers::TensorMap const& outputMap, runtime::BufferManager const& manager);
 
 void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmRequest, SizeType32 maxInputLen,

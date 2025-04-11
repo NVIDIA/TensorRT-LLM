@@ -33,7 +33,6 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
@@ -41,7 +40,6 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
-#include <valarray>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -53,12 +51,12 @@ RuntimeBuffers::RuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
     TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens,
-    std::optional<std::vector<std::string>> const& additionalOutputNames)
+    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     create(maxBatchSize, maxBeamWidth, maxAttentionWindowVec, maxAttentionWindow, sinkTokenLen, runtime, modelConfig,
-        worldConfig, decodingConfig, gatherGenerationLogits, additionalOutputNames);
+        worldConfig, decodingConfig, gatherGenerationLogits, additionalModelOutputs);
 
     // pre-allocate
     setMaxBufferSizes(maxBatchSize, maxBeamWidth, modelConfig, maxNumTokens);
@@ -211,7 +209,7 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen,
     TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits,
-    std::optional<std::vector<std::string>> const& additionalOutputNames)
+    std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -339,11 +337,11 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         languageAdapterRoutings = manager.emptyTensor(MemoryType::kGPU, TRTDataType<SizeType32>::value);
     }
 
-    for (auto const& outputTensorName : additionalOutputNames.value_or(std::vector<std::string>{}))
+    for (auto const& output : additionalModelOutputs.value_or(std::vector<executor::AdditionalModelOutput>{}))
     {
         auto const& engine = runtime.getEngine();
-        auto const dataType = engine.getTensorDataType(outputTensorName.c_str());
-        mAdditionalOutputTensors.emplace(outputTensorName, manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
+        auto const dataType = engine.getTensorDataType(output.name.c_str());
+        mAdditionalOutputTensors.emplace(output.name, manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

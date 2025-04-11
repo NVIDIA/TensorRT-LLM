@@ -556,8 +556,7 @@ RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std:
                     = trtGptModel->getModelConfig().getSpeculativeDecodingModulePtr()->getMaxDecodingDraftTokens();
             }
             r->validate(trtGptModel->getMaxInputLen(), trtGptModel->getMaxSequenceLen(), maxDraftTokens,
-                trtGptModel->getVocabSizePadded(), std::nullopt, enableBlockReuse,
-                trtGptModel->getModelConfig().computeContextLogits());
+                trtGptModel->getVocabSizePadded(), std::nullopt, enableBlockReuse);
 
             if (enableStreamingMode)
             {

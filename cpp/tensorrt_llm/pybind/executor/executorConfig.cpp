@@ -414,7 +414,7 @@ void initConfigBindings(pybind11::module_& m)
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
             c.getGpuWeightsPercent(), c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(),
             c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalOutputNames(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch());
+            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -455,9 +455,9 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[19].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
             cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
             cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
-            cpp_states[22].cast<std::optional<std::vector<std::string>>>(),       // AdditionalOutputNames
-            cpp_states[23].cast<bool>(),                                          // GatherGenerationLogits
-            cpp_states[24].cast<bool>()                                           // UseVariableBeamWidthSearch
+            cpp_states[22].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
+            cpp_states[23].cast<bool>(),                                                   // GatherGenerationLogits
+            cpp_states[24].cast<bool>()                                                    // UseVariableBeamWidthSearch
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -466,32 +466,32 @@ void initConfigBindings(pybind11::module_& m)
     };
 
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig", pybind11::dynamic_attr())
-        .def(py::init<                                          //
-                 SizeType32,                                    // MaxBeamWidth
-                 tle::SchedulerConfig const&,                   // SchedulerConfig
-                 tle::KvCacheConfig const&,                     // KvCacheConfig
-                 bool,                                          // EnableChunkedContext
-                 bool,                                          // NormalizeLogProbs
-                 SizeType32,                                    // IterStatsMaxIterations
-                 SizeType32,                                    // RequestStatsMaxIterations
-                 tle::BatchingType,                             // BatchingType
-                 std::optional<SizeType32>,                     // MaxBatchSize
-                 std::optional<SizeType32>,                     // MaxNumTokens
-                 std::optional<tle::ParallelConfig>,            // ParallelConfig
-                 tle::PeftCacheConfig const&,                   // PeftCacheConfig
-                 std::optional<tle::LogitsPostProcessorConfig>, // LogitsPostProcessorConfig
-                 std::optional<tle::DecodingConfig>,            // DecodingConfig
-                 float,                                         // GpuWeightsPercent
-                 std::optional<SizeType32>,                     // MaxQueueSize
-                 tle::ExtendedRuntimePerfKnobConfig const&,     // ExtendedRuntimePerfKnobConfig
-                 std::optional<tle::DebugConfig>,               // DebugConfig
-                 SizeType32,                                    // RecvPollPeriodMs
-                 uint64_t,                                      // MaxSeqIdleMicroseconds
-                 std::optional<tle::SpeculativeDecodingConfig>, // SpecDecConfig
-                 std::optional<tle::GuidedDecodingConfig>,      // GuidedDecodingConfig
-                 std::optional<std::vector<std::string>>,       // AdditionalOutputNames
-                 bool,                                          // GatherGenerationLogits
-                 bool                                           // UseVariableBeamWidthSearch
+        .def(py::init<                                                   //
+                 SizeType32,                                             // MaxBeamWidth
+                 tle::SchedulerConfig const&,                            // SchedulerConfig
+                 tle::KvCacheConfig const&,                              // KvCacheConfig
+                 bool,                                                   // EnableChunkedContext
+                 bool,                                                   // NormalizeLogProbs
+                 SizeType32,                                             // IterStatsMaxIterations
+                 SizeType32,                                             // RequestStatsMaxIterations
+                 tle::BatchingType,                                      // BatchingType
+                 std::optional<SizeType32>,                              // MaxBatchSize
+                 std::optional<SizeType32>,                              // MaxNumTokens
+                 std::optional<tle::ParallelConfig>,                     // ParallelConfig
+                 tle::PeftCacheConfig const&,                            // PeftCacheConfig
+                 std::optional<tle::LogitsPostProcessorConfig>,          // LogitsPostProcessorConfig
+                 std::optional<tle::DecodingConfig>,                     // DecodingConfig
+                 float,                                                  // GpuWeightsPercent
+                 std::optional<SizeType32>,                              // MaxQueueSize
+                 tle::ExtendedRuntimePerfKnobConfig const&,              // ExtendedRuntimePerfKnobConfig
+                 std::optional<tle::DebugConfig>,                        // DebugConfig
+                 SizeType32,                                             // RecvPollPeriodMs
+                 uint64_t,                                               // MaxSeqIdleMicroseconds
+                 std::optional<tle::SpeculativeDecodingConfig>,          // SpecDecConfig
+                 std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
+                 std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
+                 bool,                                                   // GatherGenerationLogits
+                 bool                                                    // UseVariableBeamWidthSearch
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -509,7 +509,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
-            py::arg("additional_output_names") = py::none(), py::arg("gather_generation_logits") = false,
+            py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
             py::arg("use_variable_beam_width_search") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
@@ -548,11 +548,11 @@ void initConfigBindings(pybind11::module_& m)
         .def_property("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
         .def_property("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
             &tle::ExecutorConfig::setGuidedDecodingConfig)
-        .def_property("additional_output_names", &tle::ExecutorConfig::getAdditionalOutputNames,
-            &tle::ExecutorConfig::setAdditionalOutputNames)
+        .def_property("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,
+            &tle::ExecutorConfig::setAdditionalModelOutputs)
         .def_property("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
             &tle::ExecutorConfig::setGatherGenerationLogits)
-        .def_property("gather_generation_logits", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
+        .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
