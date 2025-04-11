@@ -122,6 +122,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         use_runtime_defaults: bool = True,
         gather_generation_logits: bool = False,
         use_variable_beam_width_search: bool = False,
+        mm_embedding_offloading: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -391,7 +392,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
-
+        trtllm_config.mm_embedding_offloading = mm_embedding_offloading
         if is_orchestrator_mode:
             communication_mode = trtllm.CommunicationMode.ORCHESTRATOR
             path = str(Path(__file__).parent.parent / 'bin' / 'executorWorker')
@@ -549,6 +550,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             input_token_extra_ids: List[List[int]] = None,
             return_all_generated_tokens: bool = False,
             language_adapter_uids: Optional[List[int]] = None,
+            mm_embedding_offloading: bool = False,
             **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -687,8 +689,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         )
 
         prompt_tuning_configs = self._prepare_ptuning_executor(
-            batch_input_ids_list, prompt_table, prompt_tasks,
-            input_token_extra_ids)
+            batch_input_ids_list,
+            prompt_table,
+            prompt_tasks,
+            input_token_extra_ids,
+            mm_embedding_offloading=mm_embedding_offloading)
         mrope_configs = self._prepare_mrope_executor(batch_input_ids_list,
                                                      mrope_params)
 
@@ -821,14 +826,19 @@ class ModelRunnerCpp(ModelRunnerMixin):
         return names_list
 
     def _prepare_ptuning_executor(self, batch_input_ids_list, prompt_table,
-                                  prompt_tasks, input_token_extra_ids):
+                                  prompt_tasks, input_token_extra_ids,
+                                  mm_embedding_offloading):
         if input_token_extra_ids:
             assert len(batch_input_ids_list) == len(input_token_extra_ids), \
                 f"Batch size of input_token_extra_ids ({len(input_token_extra_ids)}) must be the same as input batch size ({len(batch_input_ids_list)})"
         prompt_tuning_configs = len(batch_input_ids_list) * [None]
         if prompt_table is not None:
-            prompt_table_data = self._prepare_embedding_table(
-                prompt_table).cuda()
+            if mm_embedding_offloading:
+                prompt_table_data = self._prepare_embedding_table(
+                    prompt_table).pin_memory()
+            else:
+                prompt_table_data = self._prepare_embedding_table(
+                    prompt_table).cuda()
             if prompt_tasks is not None:
                 task_indices = [int(t) for t in prompt_tasks.split(',')]
                 assert len(task_indices) == len(batch_input_ids_list), \

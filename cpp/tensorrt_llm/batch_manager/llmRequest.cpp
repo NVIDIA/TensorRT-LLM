@@ -302,7 +302,6 @@ void LlmRequest::movePromptEmbeddingTableToGpu(runtime::BufferManager const& man
     {
         return;
     }
-
     TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
     mPromptEmbeddingTable = gpuPromptEmbeddingTable;
 }
