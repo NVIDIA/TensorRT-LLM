@@ -94,8 +94,8 @@ struct BlockKey
         SizeType32 numMatched{0};
         if (loraTaskId == other.loraTaskId)
         {
-            auto [matchEnd, otherMatchEnd]
-                = std::mismatch(uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin());
+            auto [matchEnd, otherMatchEnd] = std::mismatch(
+                uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
             numMatched = std::distance(uniqueTokens.begin(), matchEnd);
         }
         return numMatched;
