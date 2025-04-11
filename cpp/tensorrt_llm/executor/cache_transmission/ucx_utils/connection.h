@@ -50,6 +50,8 @@ public:
     friend class UcxConnectionManager;
 
 private:
+    constexpr static uint64_t ResponserTag = 0xF1;
+    constexpr static uint64_t RequesterTag = 0xF2;
     uint64_t mSendTagPrefix{0};
     uint64_t mRecvTagPrefix{0};
 
