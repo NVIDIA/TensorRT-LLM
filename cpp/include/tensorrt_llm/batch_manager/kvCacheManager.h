@@ -51,6 +51,10 @@ static constexpr SizeType32 kPrimaryLevel = 0;
 
 static constexpr SizeType32 kSecondaryLevel = 1;
 
+// Extra buffer block for sequences exceeding attention window, allowing to detach previous blocks only
+// when we'll be left with enough tokens to fill the attention window
+static constexpr SizeType32 kExtraBlockBuffer = 1;
+
 class KVCacheBlock;
 class KVCacheManager;
 class KVCacheTransferManager;
@@ -300,7 +304,7 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
     explicit GenerationRequest(LlmRequest::RequestIdType requestId, SizeType32 numTokens, SizeType32 beamWidth,
-        SizeType32 maxBlocks, SizeType32 cyclicThreshold, SizeType32 numPools = 1,
+        SizeType32 maxBlocks, SizeType32 numPools = 1,
         executor::KvCacheRetentionConfig kvCacheRetentionConfig = executor::KvCacheRetentionConfig())
         : mRequestId(requestId)
         , mNumTokens(numTokens)
@@ -310,7 +314,6 @@ public:
               runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
               runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mCyclicThreshold(cyclicThreshold)
     {
         auto cacheBlockIdsRange = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices);
         std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
@@ -365,11 +368,6 @@ public:
         mCacheBlockIds.at(beamIdx).push_back(blockId);
     }
 
-    void changeCacheBlock(SizeType32 beamIdx, SizeType32 pagedBlockIdx, KVCacheBlock::IdType blockId)
-    {
-        mCacheBlockIds.at(beamIdx).at(pagedBlockIdx) = blockId;
-    }
-
     void clearCacheBlocks()
     {
         for (auto& beamBlockIds : mCacheBlockIds)
@@ -386,6 +384,14 @@ public:
         }
     }
 
+    void removeBlock(SizeType32 const blockIdx)
+    {
+        for (auto& beamBlockIds : mCacheBlockIds)
+        {
+            beamBlockIds.erase(beamBlockIds.begin() + blockIdx);
+        }
+    }
+
     [[nodiscard]] executor::RetentionPriority getDecodeRetentionPriority() const
     {
         return mKvCacheRetentionConfig.getDecodeRetentionPriority();
@@ -396,12 +402,14 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
-    // @brief Check whether the sequence uses cyclic KV cache.
-    // @return `true` if we have begun overwriting the beginning of the sequence's KV cache.
-    // @details If `true`, we cannot store the sequence's KV cache for reuse.
-    [[nodiscard]] bool isCyclic() const
+    [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
     {
-        return mNumTokens >= mCyclicThreshold;
+        return mContextRequiresSlidingWindowKvCache;
+    }
+
+    void setContextRequiresSlidingWindowKvCache(bool contextRequiresSlindigWindowKvCache)
+    {
+        mContextRequiresSlidingWindowKvCache = contextRequiresSlindigWindowKvCache;
     }
 
 private:
@@ -418,8 +426,8 @@ private:
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
 
-    // Number of tokens at which the KV Cache begins sliding
-    SizeType32 mCyclicThreshold;
+    // A value indicating whether or not the context is long enough to warrant the use of sliding window kv-cache.
+    bool mContextRequiresSlidingWindowKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -509,8 +517,6 @@ public:
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams = false);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
 
@@ -523,7 +529,7 @@ public:
     //! \brief Release last block in the sequence
     void releaseLastBlock(GenerationRequest& sequence);
 
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumFreeBlocks(SizeType32 cacheLevel = kPrimaryLevel) const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -1255,7 +1261,6 @@ private:
 
     void cacheBlockOffsets(GenerationRequest& seq);
     void cacheNewBlockOffsets(GenerationRequest& seq);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 blockIdx);
     void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
@@ -1281,6 +1286,8 @@ private:
     SizeType32 mMaxTokenNum;
     // Number of tokens in the sink blocks
     SizeType32 mSinkBlockTokenLength;
+    // Number of non-sink tokens in the attention window
+    SizeType32 mNumNonSinkTokensInWindow;
     // Block manager
     BlockManager mBlockManager;
     // Map of all sequences
