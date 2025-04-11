@@ -472,7 +472,6 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     }
     def specialFileToTagMap = [
         "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
-        "jenkins/": ["-DeepSeek-"],
     ]
     for (file in changedFileList) {
         for (String key : specialFileToTagMap.keySet()) {
