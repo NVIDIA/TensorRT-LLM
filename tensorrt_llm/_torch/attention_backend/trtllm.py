@@ -1,5 +1,6 @@
 import threading
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Optional
 
 import torch
