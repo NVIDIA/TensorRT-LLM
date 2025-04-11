@@ -1,17 +1,29 @@
 import os
-import subprocess  # nosec B404
 import time
+from typing import Literal
+
+import click
 
 from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient
 from tensorrt_llm.llmapi.utils import print_colored
 
 
-def main():
+@click.command()
+@click.option("--task_type",
+              type=click.Choice(["submit", "submit_sync"]),
+              default="submit")
+def main(task_type: Literal["submit", "submit_sync"]):
     tasks = [0]
+    assert os.environ[
+        'TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] is not None, "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set"
     client = RemoteMpiCommSessionClient(
         os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'])
     for task in tasks:
-        client.submit(print_colored, f"{task}\n", "green")
+        if task_type == "submit":
+            client.submit(print_colored, f"{task}\n", "green")
+        elif task_type == "submit_sync":
+            client.submit_sync(print_colored, f"{task}\n", "green")
+
     time.sleep(10)
     client.shutdown()
 
