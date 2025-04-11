@@ -789,7 +789,8 @@ def multimodal_model_root(request, llm_venv):
     elif 'Llama-3.2' in tllm_model_name:
         models_root = os.path.join(llm_models_root(), 'llama-3.2-models')
 
-    multimodal_model_root = os.path.join(models_root, tllm_model_name)
+    multimodal_model_root = "/home/scratch.fmu_gpu/checkpoints/Phi-4-multimodal-instruct-dev/"
+    tllm_model_name = "Phi-4-multimodal-instruct"
 
     if 'llava-onevision' in tllm_model_name and 'video' in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-6]
