@@ -7,7 +7,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (mpi_allgather, mpi_broadcast,
                                  str_dtype_to_binding, torch_dtype_to_str)
-from tensorrt_llm.bindings.executor import ExecutorConfig, DecodingMode
+from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -127,13 +127,11 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
-                                 model_engine: PyTorchModelEngine,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping, origin_seq_len: int,
-                                 ctx_chunk_config,
-                                 draft_model_engine: PyTorchModelEngine,
-                                 pytorch_backend_config):
+def estimate_max_kv_cache_tokens(
+        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
+        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
+        ctx_chunk_config, draft_model_engine: PyTorchModelEngine,
+        pytorch_backend_config):
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
         return executor_config.max_num_tokens
@@ -148,9 +146,11 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
 
     spec_decoder = None
     if executor_config.speculative_config is not None:
-        spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
-                                        spec_config=executor_config.speculative_config)
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder, pytorch_backend_config, mapping)
+        spec_decoder = get_spec_decoder(
+            max_seq_len=model_engine.max_seq_len,
+            spec_config=executor_config.speculative_config)
+    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
+                                  pytorch_backend_config, mapping)
 
     py_executor.set_gather_responses(True)
     origin_iter_stats = py_executor.enable_iter_perf_stats
@@ -341,7 +341,8 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
                                                        kv_cache_manager,
                                                        attention_type)
 
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder, pytorch_backend_config, mapping)
+    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
+                                  pytorch_backend_config, mapping)
 
     return PyExecutor(resource_manager,
                       scheduler,
@@ -357,7 +358,9 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
                       draft_model_engine=draft_model_engine,
                       start_worker=start_worker)
 
-def instantiate_decoder(model_engine, executor_config, spec_decoder, pytorch_backend_config, mapping):
+
+def instantiate_decoder(model_engine, executor_config, spec_decoder,
+                        pytorch_backend_config, mapping):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(

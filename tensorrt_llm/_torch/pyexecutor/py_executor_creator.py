@@ -1,19 +1,16 @@
 import copy
 
 import tensorrt_llm
-
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
-
 from .config import PyTorchConfig
 from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
@@ -162,7 +159,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     if executor_config.pytorch_backend_config.use_kv_cache:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
-            origin_seq_len, ctx_chunk_config, draft_model_engine, pytorch_backend_config)
+            origin_seq_len, ctx_chunk_config, draft_model_engine,
+            pytorch_backend_config)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
