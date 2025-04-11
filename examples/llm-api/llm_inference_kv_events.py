@@ -1,8 +1,8 @@
 ### Get KV Cache Events
 
-import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 
 
 def main():
@@ -12,8 +12,8 @@ def main():
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               tensor_parallel_size=2,
               pytorch_backend_config=pytorch_config,
-              kv_cache_config=trtllm.KvCacheConfig(enable_block_reuse=True,
-                                                   event_buffer_max_size=1024),
+              kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                            event_buffer_max_size=1024),
               backend="pytorch")
 
     # Sample prompts having a common prefix.
