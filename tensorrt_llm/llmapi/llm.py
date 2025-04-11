@@ -40,7 +40,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     Attributes:
         request_id (int): The unique ID of the request.
         prompt (str, optional): The prompt string of the request.
-        prompt_token_ids (List[int]): The token ids of the prompt.
+        prompt_len (int, optional): The length of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
         finished (bool): Whether the whole request is finished.
@@ -57,12 +57,14 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
             cls,
             generation_result: GenerationResult,
             prompt: Optional[str] = None,
+            prompt_len: int = None,
             tokenizer: Optional[TokenizerBase] = None) -> 'RequestOutput':
         inst = cls.__new__(cls)
         inst.__dict__.update(generation_result.__dict__)
         inst.tokenizer = tokenizer
         inst._streaming = generation_result._streaming
         inst._prompt = prompt
+        inst._prompt_len = prompt_len
         return inst
 
     @property
@@ -70,9 +72,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         return self._prompt
 
     def _repr_fields(self):
-        return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
-        ]
+        return ["request_id", "prompt", "prompt_len", "outputs", "finished"]
 
 
 LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
@@ -358,6 +358,7 @@ class LLM:
         )
 
         return RequestOutput._from_generation_result(result, prompt,
+                                                     len(prompt_token_ids),
                                                      self.tokenizer)
 
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:

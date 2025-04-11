@@ -71,6 +71,8 @@ class RuntimeConfig(BaseModel):
             self.settings_config.max_batch_size,
             "max_num_tokens":
             self.settings_config.max_num_tokens,
+            "modality":
+            self.settings_config.modality,
         }
 
         backend_config_map = {
@@ -203,6 +205,7 @@ class ExecutorSettingsConfig(BaseModel):
         default=CapacitySchedulerPolicy.MAX_UTILIZATION)
     max_batch_size: int
     max_num_tokens: int
+    modality: Optional[str] = None
     kv_cache_percent: PositiveFloat = Field(default=.90, le=1.0)
     kv_cache_reuse: bool = False
     dynamic_max_batch_size: bool = True

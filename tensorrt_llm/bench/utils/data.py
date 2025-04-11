@@ -36,6 +36,10 @@ def create_dataset_from_stream(
     max_input_length: int = 0,
     max_output_length: int = 0,
     num_requests: int = 0,
+    model_dir: str = None,
+    model_type: str = None,
+    modality: str = None,
+    max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.
 
@@ -83,13 +87,30 @@ def create_dataset_from_stream(
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
-        logits = data.get("input_ids", data.get("logits", None))
-        prompt = data.get("prompt", None)
+        if modality is not None:
+            # Multimodal data
+            assert modality in [
+                "image", "video"
+            ], f"Modality must be one of ['image', 'video'] but got {modality}."
+            from tensorrt_llm.inputs.utils import prepare_media
+
+            prompt = data.get("prompt")  # cannot be None
+            media_paths = data.get("media_paths", None)
+            inputs = prepare_media(model_dir,
+                                   model_type,
+                                   modality,
+                                   prompts=[prompt],
+                                   media=media_paths)  # list of dicts
+            logits = None  # cannot tokenize multi-modal data, handled by preprocessor
+            prompt = inputs[0]
+        else:
+            logits = data.get("input_ids", data.get("logits", None))
+            prompt = data.get("prompt", None)
+            # If the request comes in with logits, just use the provided.
+            # Otherwise we need to tokenize it.
+            logits = tokenize(prompt)["input_ids"] if logits is None else logits
         task_id = data["task_id"]
         osl = data["output_tokens"]
-        # If the request comes in with logits, just use the provided.
-        # Otherwise we need to tokenize it.
-        logits = tokenize(prompt)["input_ids"] if logits is None else logits
 
         request = InferenceRequest(
             task_id=task_id,
@@ -97,9 +118,14 @@ def create_dataset_from_stream(
             output_tokens=output_limiter(osl),
             input_ids=logits,
         )
-        all_isl.append(len(logits))
         all_osl.append(osl)
-        all_seq_len.append(len(logits) + osl)
+        if modality is not None:
+            cur_isl = max_input_seq_len_for_multimodal  # NOTE: actual sequence length is unknown until the model is run
+            all_isl.append(cur_isl)
+            all_seq_len.append(cur_isl + osl)
+        else:
+            all_isl.append(len(logits))
+            all_seq_len.append(len(logits) + osl)
         dataset.append(request)
 
     isl_stats = PercentileStats.from_iterable(all_isl)
@@ -115,3 +141,31 @@ def create_dataset_from_stream(
     )
 
     return metadata, dataset
+
+
+def update_metadata_for_multimodal(metadata, statistics) -> DatasetMetadata:
+    """Update the metadata from benchmark statistics. Only used for multimodal models.
+
+    Args:
+        metadata (DatasetMetadata): The metadata to update.
+        statistics (StatsKeeper): The statistics to update the metadata with.
+
+    Returns:
+        DatasetMetadata: The updated metadata.
+    """
+    all_isl = []
+    all_osl = []
+    all_seq_len = []
+    for request in statistics.requests.values():
+        all_isl.append(request.num_input_tokens)
+        all_osl.append(request.num_total_output_tokens)
+        all_seq_len.append(request.num_input_tokens +
+                           request.num_total_output_tokens)
+    isl_stats = PercentileStats.from_iterable(all_isl)
+    osl_stats = PercentileStats.from_iterable(all_osl)
+    seq_len_stats = PercentileStats.from_iterable(all_seq_len)
+    metadata.isl_stats = isl_stats
+    metadata.osl_stats = osl_stats
+    metadata.seq_len_stats = seq_len_stats
+
+    return metadata

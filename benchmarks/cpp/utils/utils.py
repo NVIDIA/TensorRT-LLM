@@ -2,7 +2,7 @@ import json
 import math
 import os
 import random
-from typing import List
+from typing import List, Union
 
 import numpy as np
 from pydantic import BaseModel
@@ -15,9 +15,16 @@ class Sample(BaseModel):
     task_id: int
 
 
+class MultimodalSample(BaseModel):
+    task_id: int
+    prompt: str
+    media_paths: List[str]
+    output_len: int
+
+
 class Workload(BaseModel):
     metadata: dict
-    samples: List[Sample] = []
+    samples: List[Union[Sample, MultimodalSample]] = []
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -48,11 +55,39 @@ def dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
         json.dump(workload.model_dump(), f)
 
 
+def multimodal_dataset_dump(multimodal_texts, multimodal_image_paths,
+                            output_lens, task_ids, metadata, output_file):
+    samples = []
+    for i in range(len(multimodal_texts)):
+        samples.append(
+            MultimodalSample(task_id=task_ids[i],
+                             prompt=multimodal_texts[i],
+                             media_paths=multimodal_image_paths[i],
+                             output_len=output_lens[i]))
+    workload = Workload(metadata=metadata, samples=samples)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
+        json.dump(workload.model_dump(), f)
+
+
 def print_dataset(input_ids, output_lens):
     for i, input_tokens in enumerate(input_ids):
         d = {
             "task_id": i,
             "input_ids": input_tokens,
+            "output_tokens": output_lens[i]
+        }
+        print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))
+
+
+def print_multimodal_dataset(multimodal_texts, multimodal_image_paths,
+                             output_lens):
+    for i, (text, image_paths) in enumerate(
+            zip(multimodal_texts, multimodal_image_paths)):
+        d = {
+            "task_id": i,
+            "prompt": text,
+            "media_paths": image_paths,
             "output_tokens": output_lens[i]
         }
         print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))

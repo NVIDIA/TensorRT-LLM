@@ -50,7 +50,8 @@ class LlmManager:
             time_on_first_token = None
             # Schedule the request in the LLM API (asynchronously)
             output: RequestOutput = self.llm.generate_async(
-                request.input_ids,
+                request.input_ids
+                if self.llm.args.modality is None else request.prompt,
                 sampling_params=sampling_params,
                 streaming=self.streaming)
             if self.streaming:
@@ -70,7 +71,7 @@ class LlmManager:
             start_timestamp=request_start_timestamp,
             end_timestamp=response_end_timestamp,
             request_id=response.request_id,
-            num_input_tokens=len(request.input_ids),
+            num_input_tokens=output._prompt_len,
             response_is_final=response.finished,
             error=False,
             tokens=tokens,
