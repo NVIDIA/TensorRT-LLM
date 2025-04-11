@@ -24,7 +24,8 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -135,6 +136,8 @@ class Llama4MoE(nn.Module):
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size,
+            pipeline_parallel_size=model_config.mapping.pp_size,
+            parallel_rank=model_config.mapping.rank,
             gpus_per_node=model_config.mapping.gpus_per_node)
         self.all_reduce = AllReduce(self.parallel_config)
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
@@ -271,6 +274,8 @@ class LlamaDecoderLayer(DecoderLayer):
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size,
+            pipeline_parallel_size=model_config.mapping.pp_size,
+            parallel_rank=model_config.mapping.rank,
             gpus_per_node=model_config.mapping.gpus_per_node)
         self.all_reduce = AllReduce(self.parallel_config)
         self.next_layer_layernorm: RMSNorm = None
@@ -556,7 +561,8 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+                # layers[idx + 1] is MissingLayer for last layer in pp rank
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 

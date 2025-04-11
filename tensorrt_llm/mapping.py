@@ -249,12 +249,19 @@ class Mapping(object):
                 and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
-        return (hash(self.world_size) ^ hash(self.rank)
-                ^ hash(self.gpus_per_node) ^ hash(self.cp_size)
-                ^ hash(self.tp_size) ^ hash(self.pp_size)
-                ^ hash(self.moe_tp_size) ^ hash(self.moe_ep_size)
-                ^ hash(self.attn_tp_size) ^ hash(self.attn_cp_size)
-                ^ hash(self.auto_parallel))
+        return hash((
+            self.world_size,
+            self.rank,
+            self.gpus_per_node,
+            self.cp_size,
+            self.tp_size,
+            self.pp_size,
+            self.moe_tp_size,
+            self.moe_ep_size,
+            self.attn_tp_size,
+            self.attn_cp_size,
+            self.auto_parallel,
+        ))
 
     @property
     def rank(self):
