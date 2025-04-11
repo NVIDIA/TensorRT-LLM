@@ -24,11 +24,11 @@ import modelopt.torch.quantization as mtq
 import modelopt.torch.sparsity as mts
 import numpy as np
 import torch
-from modelopt.torch.export import export_hf_checkpoint
+from modelopt.torch.export import export_hf_checkpoint, get_model_type
 from modelopt.torch.utils.dataset_utils import (create_forward_loop,
                                                 get_dataset_dataloader,
                                                 get_max_batch_size)
-from modelopt.torch.utils.image_processor import MllamaImageProcessor
+from modelopt.torch.utils.memory_monitor import launch_memory_monitor
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizer, PreTrainedTokenizerFast)
 
@@ -42,41 +42,15 @@ QUANT_CFG_CHOICES = {
     "w4a8_awq": "W4A8_AWQ_BETA_CFG",
     "nvfp4": "NVFP4_DEFAULT_CFG",
     "nvfp4_awq": "NVFP4_AWQ_LITE_CFG",
+    "fp8_pb_wo": "FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG",
+}
+
+KV_QUANT_CFG_CHOICES = {
+    "fp8": "FP8_KV_CFG",
+    "nvfp4": "NVFP4_KV_CFG",
 }
 
 mto.enable_huggingface_checkpointing()
-
-
-def get_tokenizer(ckpt_path, trust_remote_code=False, **kwargs):
-    print(f"Initializing tokenizer from {ckpt_path}")
-
-    if "vila" in ckpt_path.lower():
-        ckpt_path += "/llm"
-
-    if ckpt_path.endswith(".yaml"):
-        # Model Optimizer modification
-        # For Nemo models, tokenizer is instantiated based on its config
-        from modelopt.deploy.llm.nemo_utils import get_nemo_tokenizer
-
-        tokenizer = get_nemo_tokenizer(ckpt_path)
-
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            ckpt_path, trust_remote_code=trust_remote_code, **kwargs)
-
-        if "qwen" in type(tokenizer).__name__.lower():
-            # qwen use token id 151643 as pad and eos tokens
-            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-            tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
-
-        # can't set attribute 'pad_token' for "<unk>"
-        # We skip this step for Nemo models
-        if tokenizer.pad_token != "<unk>" or tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-    assert tokenizer.pad_token is not None, f"Pad token for {ckpt_path} cannot be set!"
-
-    return tokenizer
 
 
 def is_model_on_gpu(model) -> bool:
@@ -110,8 +84,7 @@ def get_model(ckpt_path,
         model = AutoModelForCausalLM.from_config(
             hf_config,
             torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-        )
+            trust_remote_code=trust_remote_code)
 
     max_memory = get_max_memory()
     inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
@@ -153,18 +126,13 @@ def auto_quantize(model,
                   calibrate_loop,
                   batch_size=1):
     qformat_list = qformat.split(",")
+    assert qformat_list, "No quantization formats provided"
     # Check if all provided quantization formats are supported
-    if args.export_fmt == "hf":
-        assert all(
-            qformat in ["fp8", "int4_awq", "nvfp4", "nvfp4_awq", "w4a8_awq"]
-            for qformat in qformat_list
-        ), "One or more quantization formats provided are not supported for unified checkpoint export"
-    else:
-        assert all(
-            qformat in
-            ["fp8", "int8_sq", "int4_awq", "w4a8_awq", "nvfp4", "nvfp4_awq"]
-            for qformat in qformat_list
-        ), "One or more quantization formats provided are not supported for tensorrt llm export"
+    assert all(
+        qformat in
+        ["fp8", "int4_awq", "nvfp4", "nvfp4_awq", "w4a8_awq", "fp8_pb_wo"]
+        for qformat in qformat_list
+    ), "One or more quantization formats provided are not supported for unified checkpoint export"
 
     model, _ = mtq.auto_quantize(
         model,
@@ -184,30 +152,24 @@ def auto_quantize(model,
     )
 
     # We need to explicitly calibrate for kv cache quantization
-    enable_kv_cache_quantization = ("int8" not in args.qformat
-                                    and not args.disable_kv_cache_quant)
+    enable_quant_kv_cache = args.kv_cache_qformat != "none"
     print(
-        f"{'Enable' if enable_kv_cache_quantization else 'Disable'} KV cache quantization"
+        f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization"
     )
-    if enable_kv_cache_quantization:
+    if enable_quant_kv_cache:
+        kv_cache_quant_cfg = getattr(
+            mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])["quant_cfg"]
+
         mtq.set_quantizer_by_cfg(
             model,
-            quant_cfg={
-                "*output_quantizer": {
-                    "num_bits": (4, 3),
-                    "axis": None,
-                    "enable": True
-                }
-            },
+            quant_cfg=kv_cache_quant_cfg,
         )
-        # Lets calibrate only the output quantizer this time. Let's disable all other quantizers.
+        # Lets calibrate only the quantizers for kv cache quantization this time. Let's disable all others.
         with mtq.set_quantizer_by_cfg_context(model, {
                 "*": {
                     "enable": False
                 },
-                "*output_quantizer": {
-                    "enable": True
-                }
+                **kv_cache_quant_cfg
         }):
             mtq.calibrate(model, algorithm="max", forward_loop=calibrate_loop)
     return model
@@ -257,6 +219,30 @@ def quantize_model(model, quant_cfg, args, calib_dataloader=None):
     return model
 
 
+def get_tokenizer(ckpt_path, trust_remote_code=False, **kwargs):
+    print(f"Initializing tokenizer from {ckpt_path}")
+
+    if ckpt_path.endswith(".yaml"):
+        # Model Optimizer modification
+        # For Nemo models, tokenizer is instantiated based on its config
+        from modelopt.deploy.llm.nemo_utils import get_nemo_tokenizer
+
+        tokenizer = get_nemo_tokenizer(ckpt_path)
+
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            ckpt_path, trust_remote_code=trust_remote_code, **kwargs)
+
+        # can't set attribute 'pad_token' for "<unk>"
+        # We skip this step for Nemo models
+        if tokenizer.pad_token != "<unk>" or tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+    assert tokenizer.pad_token is not None, f"Pad token for {ckpt_path} cannot be set!"
+
+    return tokenizer
+
+
 def main(args):
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
@@ -264,37 +250,44 @@ def main(args):
     random.seed(RAND_SEED)
     np.random.seed(RAND_SEED)
 
+    # launch a memory monitor to read the currently used GPU memory.
+    launch_memory_monitor()
+
     # Check that only one quantization format is provided for non auto_quant case
     if not args.auto_quantize_bits:
         assert (len(args.qformat.split(",")) == 1
                 ), "Quantization supports only one quantization format."
 
     # Check arguments for unified_hf export format and set to default if unsupported arguments are provided
-    if args.export_fmt == "hf":
-        assert (
-            args.sparsity_fmt == "dense"
-        ), f"Sparsity format {args.sparsity_fmt} not supported by unified export api."
+    assert (
+        args.sparsity_fmt == "dense"
+    ), f"Sparsity format {args.sparsity_fmt} not supported by unified export api."
 
-        if not args.auto_quantize_bits:
-            assert args.qformat in [
-                "int4_awq",
-                "fp8",
-                "nvfp4",
-                "nvfp4_awq",
-                "w4a8_awq",
-            ], f"Quantization format {args.qformat} not supported for HF export path"
+    if not args.auto_quantize_bits:
+        assert args.qformat in [
+            "int4_awq",
+            "fp8",
+            "nvfp4",
+            "nvfp4_awq",
+            "w4a8_awq",
+            "fp8_pb_wo",
+        ] or args.kv_cache_qformat in [
+            "fp8",
+            "nvfp4",
+            "none",
+            "",
+        ], f"Quantization format {args.qformat} not supported for HF export path"
 
     model = get_model(args.pyt_ckpt_path,
                       args.device,
                       trust_remote_code=args.trust_remote_code)
+    model_type = get_model_type(model)
+
     device = model.device
     if hasattr(model, "model"):
         device = model.model.device
-    processor = None
     tokenizer = None
-    if args.dataset is None:
-        args.dataset = "cnn_dailymail"
-        warnings.warn("No dataset specified. Defaulting to cnn_dailymail.")
+    args.dataset = "cnn_dailymail"
     tokenizer = get_tokenizer(args.pyt_ckpt_path,
                               trust_remote_code=args.trust_remote_code)
     default_padding_side = tokenizer.padding_side
@@ -333,15 +326,7 @@ def main(args):
         )
         mts.export(model)
 
-    if (not args.auto_quantize_bits and args.qformat in [
-            "fp8", "int8_sq", "int4_awq", "w4a8_awq", "nvfp4", "nvfp4_awq"
-    ]) or args.auto_quantize_bits:
-        # If any qformat provided is not fp8, assert model is on GPU
-        if args.qformat not in ["fp8", "nvfp4"]:
-            assert is_model_on_gpu(model), (
-                f"Model must be fully loaded onto GPUs for {args.qformat} calibration. "
-                "Please make sure the system has enough GPU memory to load the model."
-            )
+    if args.auto_quantize_bits or args.qformat in QUANT_CFG_CHOICES:
 
         if "awq" in args.qformat:
             print(
@@ -359,14 +344,30 @@ def main(args):
             # to 2 to avoid OOM for AWQ/SmoothQuant fake quantization as it will take more memory than inference.
             sample_memory_usage_ratio = (2 if "awq" in args.qformat
                                          or "sq" in args.qformat else 1.1)
+            # Whisper model expects mel-spectrogram input features of length 3000
+            # Whisper model needs input of shape (batch_size, num_mel_bins, 3000)
+            # As the encoder of Whisper doesn't have embedding layer, input dtype has to be float
+            # For non-Whisper models (language models), sample_input will be set up inside get_max_batch_size()
+            if model_type == "whisper":
+                max_sample_length = 3000
+                num_mel_bins = model.config.num_mel_bins
+                sample_input_single_batch = (
+                    torch.ones([1, num_mel_bins, max_sample_length],
+                               dtype=torch.float32).to(model.device) * 100)
+            else:
+                sample_input_single_batch = None
             args.batch_size = get_max_batch_size(
-                model, sample_memory_usage_ratio=sample_memory_usage_ratio)
+                model,
+                sample_memory_usage_ratio=sample_memory_usage_ratio,
+                sample_input_single_batch=sample_input_single_batch,
+            )
             if args.batch_size > args.calib_size:
                 args.batch_size = args.calib_size
 
         print(f"Use calib batch_size {args.batch_size}")
 
         calib_dataloader = None
+
         assert tokenizer is not None and isinstance(
             tokenizer,
             (PreTrainedTokenizer,
@@ -380,13 +381,13 @@ def main(args):
             include_labels=args.auto_quantize_bits is not None,
         )
 
-        quant_cfg = None
+        quant_cfg = {}
         if not args.auto_quantize_bits:
-            if args.qformat in QUANT_CFG_CHOICES:
-                quant_cfg = getattr(mtq, QUANT_CFG_CHOICES[args.qformat])
-            else:
-                raise ValueError(
-                    f"Unsupported quantization format: {args.qformat}")
+            assert (
+                args.qformat in QUANT_CFG_CHOICES
+            ), f"Unsupported quantization format: {args.qformat} with {args.kv_cache_qformat} KV cache"
+
+            quant_cfg = getattr(mtq, QUANT_CFG_CHOICES[args.qformat])
 
             if "awq" in args.qformat:
                 quant_cfg = copy.deepcopy(
@@ -398,57 +399,107 @@ def main(args):
                 if args.awq_block_size:
                     weight_quantizer["block_sizes"][-1] = args.awq_block_size
 
-            # Always turn on FP8 kv cache to save memory footprint.
-            # For int8_sq, we do not quantize kv cache to preserve accuracy.
-            # We turn off FP8 kv cache for unified_hf checkpoint
-            enable_quant_kv_cache = ("int8_sq" not in args.qformat
-                                     and not args.disable_kv_cache_quant)
+                # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
+                if "w4a8_awq" == args.qformat and model_type in [
+                        "gemma", "mpt"
+                ]:
+                    quant_cfg["algorithm"] = {
+                        "method": "awq_lite",
+                        "alpha_step": 1
+                    }
 
+            enable_quant_kv_cache = args.kv_cache_qformat != "none"
             print(
                 f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization"
             )
-            quant_cfg["quant_cfg"]["*output_quantizer"] = {
-                "num_bits": 8 if args.qformat == "int8_sq" else (4, 3),
-                "axis": None,
-                "enable": enable_quant_kv_cache,
-            }
+
+            # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.
+            if enable_quant_kv_cache:
+                # Update KV cache related bmm quantizers
+                # If quant_cfg["quant_cfg"] is None, it corresponds to only kv cache quantization case
+                quant_cfg["quant_cfg"] = quant_cfg.get(
+                    "quant_cfg", {"default": {
+                        "enable": False
+                    }})
+                quant_cfg["quant_cfg"].update(
+                    getattr(mtq, KV_QUANT_CFG_CHOICES[args.kv_cache_qformat])
+                    ["quant_cfg"])
+
+                # Set default algorithm for kv cache quantization if not provided.
+                if not quant_cfg.get("algorithm", None):
+                    quant_cfg["algorithm"] = "max"
+
+            # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
+            if model_type == "gemma" and "int8_sq" in args.qformat:
+                quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
         # Only run single sample for preview
-        input_ids = next(iter(calib_dataloader))["input_ids"][0:1]
+        input_ids = next(
+            iter(calib_dataloader))["input_features" if model_type ==
+                                    "whisper" else "input_ids"][0:1]
         generated_ids_before_ptq = model.generate(input_ids, max_new_tokens=100)
 
         model = quantize_model(model, quant_cfg, args, calib_dataloader)
-        # Lets print the quantization summary
-        mtq.print_quant_summary(model)
+        if args.compress:
+            mtq.compress(model)
+            # Lets print the quantization summary
+        if args.verbose:
+            mtq.print_quant_summary(model)
 
         # Run some samples
-        generated_ids_after_ptq = model.generate(input_ids, max_new_tokens=100)
+        torch.cuda.empty_cache()
+        generated_ids_after_ptq = None
+        if model_type != "llama4":
+            generated_ids_after_ptq = model.generate(input_ids,
+                                                     max_new_tokens=100)
+        else:
+            warnings.warn(
+                "Llama4 Maverick generation after quantization has a bug. Skipping generation sample."
+            )
 
         def input_decode(input_ids):
-            if processor is not None and isinstance(processor,
-                                                    MllamaImageProcessor):
-                return processor.tokenizer.batch_decode(input_ids)
-            elif tokenizer is not None:
-                return tokenizer.batch_decode(input_ids)
-            else:
-                raise ValueError("The processor or tokenizer must be set")
+            return tokenizer.batch_decode(input_ids)
 
         def output_decode(generated_ids, input_shape):
             return tokenizer.batch_decode(generated_ids[:, input_shape:])
 
-        print("--------")
-        print(f"example test input: {input_decode(input_ids)}")
-        print("--------")
+        if generated_ids_after_ptq is not None:
+            print("--------")
+            print(f"example test input: {input_decode(input_ids)}")
+            print("--------")
+            print(
+                f"example outputs before ptq: {output_decode(generated_ids_before_ptq, input_ids.shape[1])}"
+            )
+            print("--------")
+            print(
+                f"example outputs after ptq: {output_decode(generated_ids_after_ptq, input_ids.shape[1])}"
+            )
+
+    else:
+        assert (model_type != "dbrx"
+                ), f"Does not support export {model_type} without quantizaton"
         print(
-            f"example outputs before ptq: {output_decode(generated_ids_before_ptq, input_ids.shape[1])}"
-        )
-        print("--------")
-        print(
-            f"example outputs after ptq: {output_decode(generated_ids_after_ptq, input_ids.shape[1])}"
+            f"qformat: {args.qformat}. No quantization applied, export {device} model"
         )
 
     with torch.inference_mode():
+        if model_type is None:
+            print(
+                f"Unknown model type {type(model).__name__}. Continue exporting..."
+            )
+            model_type = f"unknown:{type(model).__name__}"
+
         export_path = args.export_path
+
+        if model_type == "mllama":
+            full_model_config = model.config
+            model = model.language_model
+            # TRT-LLM expects both the vision_config and text_config to be set for export.
+            setattr(model.config, "vision_config",
+                    full_model_config.vision_config)
+            setattr(model.config, "text_config", full_model_config.text_config)
+            setattr(model.config, "architectures",
+                    full_model_config.architectures)
 
         start_time = time.time()
         export_hf_checkpoint(
@@ -517,10 +568,12 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--disable_kv_cache_quant",
-        type=lambda x: x.lower() == "true",
-        choices=[True, False],
-        help="Disable KV cache quantization (True/False)",
+        "--kv_cache_qformat",
+        required=False,
+        default="fp8",
+        choices=["fp8", "nvfp4", "none"],
+        help=
+        "Specify KV cache quantization format, default to fp8 if not provided",
     )
     parser.add_argument(
         "--vlm",
@@ -540,6 +593,19 @@ if __name__ == "__main__":
         help="Set trust_remote_code for Huggingface models and tokenizers",
         default=False,
         action="store_true",
+    )
+    parser.add_argument(
+        "--compress",
+        help="Compress the model weights after quantization",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--verbose",
+        help=
+        "Print verbose output (e.g. quantization summary). Disable by --no_verbose.",
+        default=True,
+        action=argparse.BooleanOptionalAction,
     )
     args = parser.parse_args()
 
