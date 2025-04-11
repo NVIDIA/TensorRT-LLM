@@ -181,7 +181,8 @@ class RotaryEmbedding(nn.Module):
 
         if use_gptj_style_rope:
             raise ValueError(
-                "Must have flashinfer installed to use gptj style RoPE")
+                "gptj style RoPE has to go through flashinfer route for correct results."
+            )
         # it is assumed all targets are of the same rank
         q_or_k = targets[0]
         remove_input_padding = (len(q_or_k.size()) == 2)

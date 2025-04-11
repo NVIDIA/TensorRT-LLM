@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import copy
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -23,6 +24,7 @@ import transformers.models.mllama.configuration_mllama as config_mllama
 from torch import nn
 from tqdm import tqdm
 
+from ...logger import logger
 from ..attention_backend.interface import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
@@ -209,6 +211,7 @@ class MllamaForCausalLM(nn.Module):
         cache_config=None,
     ):
         super().__init__()
+        self.config = config
         pretrain_config = config.pretrained_config
         text_config = pretrain_config.text_config
 
@@ -259,6 +262,32 @@ class MllamaForCausalLM(nn.Module):
         )
         return hidden_states
 
+    def infer_max_seq_len(self) -> int:
+        # NOTE: Copied from DecoderModelForCausalLM.infer_max_seq_len
+        # Modified from tensorrt_llm/builder.py _init_max_seq_len
+        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        rope_factor = 1
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                rope_factor = rope_scaling.get('factor', 1.0)
+
+        # Step 1: Find the upper bound of max_seq_len
+        inferred_max_seq_len = 2048
+        if getattr(self.config, 'max_position_embeddings', None) is not None:
+            inferred_max_seq_len = self.config.max_position_embeddings
+
+        # Step 2: Scale max_seq_len with rotary scaling
+        if rope_factor != 1:
+            inferred_max_seq_len = int(
+                math.ceil(inferred_max_seq_len * rope_factor))
+            logger.warning(
+                f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+            )
+
+        # Step 3: Return the new max_seq_len
+        return inferred_max_seq_len
+
 
 @register_auto_model("MllamaForConditionalGeneration")
 class MllamaForConditionalGeneration(nn.Module):
@@ -297,6 +326,9 @@ class MllamaForConditionalGeneration(nn.Module):
             bias=True,
             dtype=config.pretrained_config.vision_config.torch_dtype)
         self.logits_processor = LogitsProcessor()
+
+    def infer_max_seq_len(self) -> int:
+        return self.language_model.infer_max_seq_len()
 
     @torch.inference_mode()
     def forward(

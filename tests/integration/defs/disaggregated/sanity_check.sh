@@ -76,6 +76,12 @@ trtllm-serve disaggregated --server_start_timeout 900 -c ${CONFIG_FILE} &> outpu
 for i in $(seq 1 ${NUM_ITERS}); do
     python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950
     python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950 --streaming -o output_streaming.json
+
+    # Run the chat completion endpoint test only for TinyLlama
+    if [[ "${TEST_DESC}" == "overlap" ]]; then
+      python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json -e chat --server-start-timeout 950 -o output_chat.json
+      python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json -e chat --server-start-timeout 950 --streaming -o output_streaming_chat.json
+    fi
 done
 
 echo "------------------"
@@ -118,5 +124,10 @@ if [[ "${TEST_DESC}" != "gen_only" ]]; then
   for expected_string in "${expected_strings[@]}"; do
       grep "${expected_string}" output.json
       grep "${expected_string}" output_streaming.json
+
+      if [[ "${TEST_DESC}" == "overlap" ]]; then
+        grep "${expected_string}" output_chat.json
+        grep "${expected_string}" output_streaming_chat.json
+      fi
   done
 fi

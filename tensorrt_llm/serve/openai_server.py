@@ -27,7 +27,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo)
+                                                ModelList, UsageInfo,
+                                                to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
@@ -194,6 +195,7 @@ class OpenAIServer:
                 **(request.chat_template_kwargs or {}),
             )
             sampling_params = request.to_sampling_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             postproc_args = ChatPostprocArgs.from_request(request)
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
@@ -209,6 +211,7 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -306,7 +309,7 @@ class OpenAIServer:
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             sampling_params = request.to_sampling_params()
-            disaggregated_params = request.to_llm_disaggregated_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx

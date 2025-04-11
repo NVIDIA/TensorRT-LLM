@@ -560,7 +560,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
+    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 }

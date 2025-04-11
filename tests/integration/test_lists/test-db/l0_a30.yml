@@ -18,9 +18,10 @@ l0_a30:
   - unittest/_torch -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_nvsmall"
+  - unittest/_torch/modeling -k "modeling_nemotron_nas"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_qwen"
+  - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/auto_deploy/unit/singlegpu
@@ -40,6 +41,7 @@ l0_a30:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_unit_tests[80]
   - test_cpp.py::test_model[gpt-80]
+  - test_cpp.py::test_model[gpt_executor-80]
   - test_cpp.py::test_benchmarks[gpt-80]
 - condition:
     ranges:

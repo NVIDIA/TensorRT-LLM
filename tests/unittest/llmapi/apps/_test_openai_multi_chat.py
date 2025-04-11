@@ -59,6 +59,8 @@ def engine_from_fp8_quantization(model_name):
 
     yield engine_dir.name
 
+    llm.shutdown()
+
 
 @pytest.fixture(scope="module")
 def server(model_name: str, engine_from_fp8_quantization: str):

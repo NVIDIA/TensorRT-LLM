@@ -119,6 +119,12 @@ class PostprocWorker:
 
     async def _handle_input(self, input: "PostprocWorker.Input") -> Any:
         ''' Handle a single response from await_response worker. '''
+        if input.rsp.result.context_logits is not None or \
+              input.rsp.result.generation_logits is not None:
+            raise ValueError(
+                "Context logits or generation logits are not supposed to be "
+                "sent to postprocessing workers.")
+
         with nvtx_range("handle_input", color="yellow", category="Postproc"):
             req_id = input.rsp.client_id
             if req_id not in self._records:

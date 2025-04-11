@@ -202,7 +202,7 @@
    "examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]": 355.9665117710829,
    "examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha]": 334.18761303275824,
    "examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct]": 373.8418433815241,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modeling -k \"modeling_nvsmall\"]": 587.2612264081836,
+   "test_unittests.py::test_unittests_v2[unittest/_torch/modeling -k \"modeling_nemotron_nas\"]": 587.2612264081836,
    "test_unittests.py::test_unittests_v2[unittest/trt/model/test_gpt.py -k \"partition2\"]": 1086.5458996072412,
    "examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_tokens-draft_len_4-float16-bs1]": 216.4487509690225,
    "examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]": 213.7413339074701,

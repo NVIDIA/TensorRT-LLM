@@ -8,10 +8,11 @@ from .modeling_llava_next import LlavaNextModel
 from .modeling_mamba_hybrid import MambaHybridForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
-from .modeling_nvsmall import NVSmallForCausalLM
+from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
-from .modeling_qwen2vl import Qwen2VLForConditionalGeneration
+from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
+from .modeling_qwen_moe import Qwen2MoeForCausalLM
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
@@ -25,13 +26,15 @@ __all__ = [
     "MambaHybridForCausalLM",
     "MixtralForCausalLM",
     "NemotronForCausalLM",
-    "NVSmallForCausalLM",
+    "NemotronNASForCausalLM",
     "Qwen2ForCausalLM",
     "Qwen2ForProcessRewardModel",
     "Qwen2ForRewardModel",
+    "Qwen2MoeForCausalLM",
     "get_model_architecture",
     "VilaModel",
-    "Qwen2VLForConditionalGeneration",
+    "Qwen2VLModel",
+    "Qwen2_5_VLModel",
 ]
 
 if transformers.__version__ >= "4.45.1":

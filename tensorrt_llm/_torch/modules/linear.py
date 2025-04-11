@@ -56,7 +56,7 @@ def load_weight_shard(
         tensor_shape = weight.get_shape()
 
         def maybe_convert_to_torch_tensor(
-            tensor, indices: Union[slice | tuple[slice]] = slice(None)):
+            tensor, indices: Union[slice, tuple[slice]] = slice(None)):
             return tensor[indices].to(device)
     else:
         raise ValueError(f'unsupported weight type: {type(weight)}')
@@ -129,17 +129,19 @@ def load_weight_scales_nvfp4(weights: List[Dict],
 
 class Linear(nn.Module):
 
-    def __init__(self,
-                 in_features: int,
-                 out_features: int,
-                 bias: bool = True,
-                 dtype: torch.dtype = None,
-                 parallel_config: Optional[ParallelConfig] = None,
-                 quant_config: Optional[QuantConfig] = None,
-                 weights_loading_config: Optional[WeightsLoadingConfig] = None,
-                 is_expert: bool = False,
-                 skip_create_weights: bool = False,
-                 use_custom_cublas_mm: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        dtype: torch.dtype = None,
+        parallel_config: Optional[ParallelConfig] = None,
+        quant_config: Optional[QuantConfig] = None,
+        weights_loading_config: Optional[WeightsLoadingConfig] = None,
+        is_expert: bool = False,
+        skip_create_weights: bool = False,
+        use_custom_cublas_mm: bool = False,
+    ):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -354,10 +356,10 @@ class Linear(nn.Module):
         return output
 
     def forward(
-            self,
-            input: Union[torch.Tensor, Fp4QuantizedTensor],
-            *,
-            all_reduce_params: Optional[AllReduceParams] = None
+        self,
+        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        *,
+        all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
         from ..distributed import allgather
 
