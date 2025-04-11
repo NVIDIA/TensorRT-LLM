@@ -20,7 +20,6 @@ def apply_rotary_pos_emb(
 ):
     """
     Apply rotary positional embeddings to query and key tensors.
-
     Args:
         q: Query tensor of shape [batch, n_heads, seq_len, head_dim]
         k: Key tensor of shape [batch, n_kv_heads, seq_len, head_dim]
@@ -28,7 +27,6 @@ def apply_rotary_pos_emb(
         head_dim: Dimension of each head
         rope_theta: Base value for RoPE (default 10000.0)
         rope_scale: Scaling factor for positions (default 1.0)
-
     Returns:
         Tuple of transformed query and key tensors
     """
@@ -108,7 +106,6 @@ def fused_mha(
     rope_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Fused MHA+Rope that takes raw input from q, k, v GEMMs.
-
     Rope is performed according to the specified rope configuration. No support for caching.
     """
     # b, s info
