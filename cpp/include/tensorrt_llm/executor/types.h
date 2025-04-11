@@ -555,6 +555,11 @@ public:
         return DecodingMode{kEagle | kUseStandardStopCriteria | kUseExplicitEosStop};
     }
 
+    static auto constexpr PromptLookup()
+    {
+        return DecodingMode{kPromptLookup | kUsePenalties | kUseBanTokens | kUseStandardStopCriteria};
+    }
+
     auto constexpr useTemperature(bool useTemp)
     {
         mState = setBitTo(kUseTemperature, useTemp);
@@ -694,6 +699,11 @@ public:
         return anyBitSet(kEagle);
     }
 
+    [[nodiscard]] bool constexpr isPromptLookup() const
+    {
+        return anyBitSet(kPromptLookup);
+    }
+
     [[nodiscard]] bool constexpr isUseTemperature() const
     {
         return anyBitSet(kUseTemperature);
@@ -821,6 +831,10 @@ public:
         {
             return "Eagle";
         }
+        if (isPromptLookup())
+        {
+            return "PromptLookup";
+        }
         return "Unknown";
     }
 
@@ -856,6 +870,7 @@ private:
     static UnderlyingType constexpr kExplicitDraftTokens{1u << (kNumFlags + 6)};
     static UnderlyingType constexpr kExternalDraftTokens{1u << (kNumFlags + 7)};
     static UnderlyingType constexpr kEagle{1u << (kNumFlags + 8)};
+    static UnderlyingType constexpr kPromptLookup{1u << (kNumFlags + 9)};
 
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
@@ -888,6 +903,7 @@ static_assert(!DecodingMode::Auto().isLookahead());
 static_assert(!DecodingMode::Auto().isExplicitDraftTokens());
 static_assert(!DecodingMode::Auto().isExternalDraftTokens());
 static_assert(!DecodingMode::Auto().isEagle());
+static_assert(!DecodingMode::Auto().isPromptLookup());
 
 static_assert(DecodingMode::TopK().isUseBanWords());
 static_assert(DecodingMode::TopK().isUseOccurrencePenalty());
@@ -910,6 +926,7 @@ static_assert(!DecodingMode::TopK().isLookahead());
 static_assert(!DecodingMode::TopK().isExplicitDraftTokens());
 static_assert(!DecodingMode::TopK().isExternalDraftTokens());
 static_assert(!DecodingMode::TopK().isEagle());
+static_assert(!DecodingMode::TopK().isPromptLookup());
 
 static_assert(DecodingMode::TopP().isUseBanWords());
 static_assert(DecodingMode::TopP().isUseOccurrencePenalty());
@@ -925,6 +942,7 @@ static_assert(!DecodingMode::TopP().isLookahead());
 static_assert(!DecodingMode::TopP().isExplicitDraftTokens());
 static_assert(!DecodingMode::TopP().isExternalDraftTokens());
 static_assert(!DecodingMode::TopP().isEagle());
+static_assert(!DecodingMode::TopP().isPromptLookup());
 
 static_assert(DecodingMode::TopKTopP().isUseBanWords());
 static_assert(DecodingMode::TopKTopP().isUseOccurrencePenalty());
@@ -940,6 +958,7 @@ static_assert(!DecodingMode::TopKTopP().isLookahead());
 static_assert(!DecodingMode::TopKTopP().isExplicitDraftTokens());
 static_assert(!DecodingMode::TopKTopP().isExternalDraftTokens());
 static_assert(!DecodingMode::TopKTopP().isEagle());
+static_assert(!DecodingMode::TopKTopP().isPromptLookup());
 
 static_assert(DecodingMode::BeamSearch().isUseStopCriteria());
 static_assert(!DecodingMode::BeamSearch().isAuto());
@@ -950,6 +969,7 @@ static_assert(!DecodingMode::BeamSearch().isLookahead());
 static_assert(!DecodingMode::BeamSearch().isExplicitDraftTokens());
 static_assert(!DecodingMode::BeamSearch().isExternalDraftTokens());
 static_assert(!DecodingMode::BeamSearch().isEagle());
+static_assert(!DecodingMode::BeamSearch().isPromptLookup());
 
 static_assert(!DecodingMode::Medusa().isUseBanWords());
 static_assert(!DecodingMode::Medusa().isUseOccurrencePenalty());
@@ -965,6 +985,7 @@ static_assert(!DecodingMode::Medusa().isLookahead());
 static_assert(!DecodingMode::Medusa().isExplicitDraftTokens());
 static_assert(!DecodingMode::Medusa().isExternalDraftTokens());
 static_assert(!DecodingMode::Medusa().isEagle());
+static_assert(!DecodingMode::Medusa().isPromptLookup());
 
 static_assert(DecodingMode::Lookahead().isUseStopCriteria());
 static_assert(DecodingMode::Lookahead().isUseStopWords());
@@ -977,6 +998,7 @@ static_assert(DecodingMode::Lookahead().isLookahead());
 static_assert(!DecodingMode::Lookahead().isExplicitDraftTokens());
 static_assert(!DecodingMode::Lookahead().isExternalDraftTokens());
 static_assert(!DecodingMode::Lookahead().isEagle());
+static_assert(!DecodingMode::Lookahead().isPromptLookup());
 
 static_assert(!DecodingMode::ExplicitDraftTokens().isUsePenalty());
 static_assert(DecodingMode::ExplicitDraftTokens().isUseStopCriteria());
@@ -989,6 +1011,7 @@ static_assert(!DecodingMode::ExplicitDraftTokens().isLookahead());
 static_assert(DecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
 static_assert(!DecodingMode::ExplicitDraftTokens().isExternalDraftTokens());
 static_assert(!DecodingMode::ExplicitDraftTokens().isEagle());
+static_assert(!DecodingMode::ExplicitDraftTokens().isPromptLookup());
 
 static_assert(DecodingMode::ExternalDraftTokens().isUseBanWords());
 static_assert(DecodingMode::ExternalDraftTokens().isUseOccurrencePenalty());
@@ -1001,6 +1024,7 @@ static_assert(!DecodingMode::ExternalDraftTokens().isLookahead());
 static_assert(!DecodingMode::ExternalDraftTokens().isExplicitDraftTokens());
 static_assert(DecodingMode::ExternalDraftTokens().isExternalDraftTokens());
 static_assert(!DecodingMode::ExternalDraftTokens().isEagle());
+static_assert(!DecodingMode::ExternalDraftTokens().isPromptLookup());
 
 static_assert(!DecodingMode::Eagle().isUseBanWords());
 static_assert(!DecodingMode::Eagle().isUseOccurrencePenalty());
@@ -1013,4 +1037,19 @@ static_assert(!DecodingMode::Eagle().isLookahead());
 static_assert(!DecodingMode::Eagle().isExplicitDraftTokens());
 static_assert(!DecodingMode::Eagle().isExternalDraftTokens());
 static_assert(DecodingMode::Eagle().isEagle());
+static_assert(!DecodingMode::Eagle().isPromptLookup());
+
+static_assert(DecodingMode::PromptLookup().isUseBanWords());
+static_assert(DecodingMode::PromptLookup().isUseOccurrencePenalty());
+static_assert(DecodingMode::PromptLookup().isUseStopCriteria());
+static_assert(!DecodingMode::PromptLookup().isAuto());
+static_assert(!DecodingMode::PromptLookup().isTopKorTopP());
+static_assert(!DecodingMode::PromptLookup().isBeamSearch());
+static_assert(!DecodingMode::PromptLookup().isMedusa());
+static_assert(!DecodingMode::PromptLookup().isLookahead());
+static_assert(!DecodingMode::PromptLookup().isExplicitDraftTokens());
+static_assert(!DecodingMode::PromptLookup().isExternalDraftTokens());
+static_assert(!DecodingMode::PromptLookup().isEagle());
+static_assert(DecodingMode::PromptLookup().isPromptLookup());
+
 } // namespace tensorrt_llm::executor

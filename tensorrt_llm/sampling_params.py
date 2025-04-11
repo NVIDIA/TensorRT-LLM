@@ -157,6 +157,7 @@ class SamplingParams:
         additional_model_outputs (List[tensorrt_llm.sampling_params.AdditionalModelOutput], optional): The additional outputs to gather from the model. Defaults to None.
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
+        prompt_lookup_config (tensorrt_llm.bindings.executor.PromptLookupConfig , optional): Prompt-Lookup decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
@@ -234,6 +235,9 @@ class SamplingParams:
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
+
+    # Prompt-Lookup decoding config
+    prompt_lookup_config: Optional[tllme.PromptLookupConfig] = None
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None

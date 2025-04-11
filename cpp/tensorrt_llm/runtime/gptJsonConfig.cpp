@@ -604,7 +604,8 @@ GptJsonConfig parseJson(InputType&& input)
                 auto lookaheadDecodingModule = std::make_shared<LookaheadModule>(maxDraftLen, maxDraftLen);
                 modelConfig.setSpeculativeDecodingModule(lookaheadDecodingModule);
             }
-            else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
+            else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal()
+                || modelConfig.getSpeculativeDecodingMode().isPromptLookup())
             {
                 TLLM_CHECK_WITH_INFO(
                     maxDraftLen > 0, "max_draft_len has to be larger than 0 for decoding with external draft tokens");

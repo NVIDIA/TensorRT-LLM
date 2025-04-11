@@ -30,8 +30,12 @@ void tensorrt_llm::batch_manager::AssignReqSeqSlots::operator()(SequenceSlotMana
     {
         for (auto const& llmReq : requests)
         {
-            auto const isReqNew = (llmReq->isContextInitState() && !llmReq->mSeqSlot)
-                || (llmReq->isDisaggGenerationTransmissionComplete());
+            bool const isFirstContext = (llmReq->isContextInitState() && llmReq->isFirstContextChunk())
+                || llmReq->isDisaggGenerationTransmissionComplete();
+            bool const isPLD = llmReq->getPromptLookupConfig().has_value();
+            bool const isFirstPLD = llmReq->getOrigPromptLen() == (int) llmReq->getTokens(0).size();
+            auto const isReqNew = (!isPLD && isFirstContext) || (isPLD && isFirstPLD);
+
             if (isReqNew && llmReq->getReturnPerfMetrics())
             {
                 llmReq->setFirstScheduledTime(std::chrono::steady_clock::now());

@@ -122,6 +122,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         use_runtime_defaults: bool = True,
         gather_generation_logits: bool = False,
         use_variable_beam_width_search: bool = False,
+        prompt_lookup_config: list[int] | None = None,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -342,9 +343,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 multi_block_mode = False  # Eagle doesn't support multi-block mode.
 
         if lookahead_config is not None:
-            [w, n, g] = lookahead_config
             decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
-                w, n, g)
+                *lookahead_config)
+
+        if prompt_lookup_config is not None:
+            decoding_config.prompt_lookup_config = trtllm.PromptLookupConfig(
+                *prompt_lookup_config)
 
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
@@ -531,6 +535,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             sampling_config: Optional[SamplingConfig] = None,
             lora_uids: Optional[list] = None,
             lookahead_config: list[int] | None = None,
+            prompt_lookup_config: list[int] | None = None,
             streaming: bool = False,
             stopping_criteria: Optional[StoppingCriteria] = None,
             logits_processor_names: list[str] | None = None,
@@ -701,34 +706,48 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         lora_configs = self._prepare_lora_configs(lora_uids,
                                                   len(batch_input_ids_list))
+
         request_lookahead_config = None
         if lookahead_config is not None:
-            [w, n, g] = lookahead_config
-            request_lookahead_config = trtllm.LookaheadDecodingConfig(w, n, g)
+            request_lookahead_config = trtllm.LookaheadDecodingConfig(
+                *lookahead_config)
+
+        request_prompt_lookup_config = None
+        if prompt_lookup_config is not None:
+            request_prompt_lookup_config = trtllm.PromptLookupConfig(
+                *prompt_lookup_config)
+
         skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
 
         # Draft-Target-Model speculative decoding
-        if "draft_tokens_list" in kwargs.keys() and kwargs[
-                "draft_tokens_list"] is not None and "draft_logits_list" in kwargs.keys(
-                ) and kwargs["draft_logits_list"] is not None:
+        if "draft_tokens_list" in kwargs.keys() and \
+            kwargs["draft_tokens_list"] is not None and \
+            "draft_logits_list" in kwargs.keys() and \
+            kwargs["draft_logits_list"] is not None:
             # Use logits to accept
-            external_draft_tokens_configs = [
-                ExternalDraftTokensConfig(draft_tokens, draft_logits)
-                for draft_tokens, draft_logits in zip(
-                    kwargs["draft_tokens_list"], kwargs["draft_logits_list"])
-            ]
             is_draft_target_model = True
-        elif "draft_tokens_list" in kwargs.keys(
-        ) and kwargs["draft_tokens_list"] is not None:
+            external_draft_tokens_configs = []
+            for draft_tokens, draft_logits in zip(kwargs["draft_tokens_list"],
+                                                  kwargs["draft_logits_list"]):
+                if len(draft_tokens) > 0:
+                    external_draft_tokens_configs.append(
+                        ExternalDraftTokensConfig(draft_tokens, draft_logits))
+                else:
+                    external_draft_tokens_configs.append(None, None)
+        elif "draft_tokens_list" in kwargs.keys() and \
+            kwargs["draft_tokens_list"] is not None:
             # Use tokens to accept
-            external_draft_tokens_configs = [
-                ExternalDraftTokensConfig(draft_tokens)
-                for draft_tokens in kwargs["draft_tokens_list"]
-            ]
             is_draft_target_model = True
+            external_draft_tokens_configs = []
+            for draft_tokens in kwargs["draft_tokens_list"]:
+                if len(draft_tokens) > 0:
+                    external_draft_tokens_configs.append(
+                        ExternalDraftTokensConfig(draft_tokens))
+                else:
+                    external_draft_tokens_configs.append(None)
         else:
-            external_draft_tokens_configs = [None] * len(batch_input_ids_list)
             is_draft_target_model = False
+            external_draft_tokens_configs = [None] * len(batch_input_ids_list)
 
         if language_adapter_uids is None:
             language_adapter_uids = [None] * len(batch_input_ids_list)
@@ -756,6 +775,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                  if use_sampling_config_for_each_request else
                                  sampling_config),
                 lookahead_config=request_lookahead_config,
+                prompt_lookup_config=request_prompt_lookup_config,
                 streaming=streaming,
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
