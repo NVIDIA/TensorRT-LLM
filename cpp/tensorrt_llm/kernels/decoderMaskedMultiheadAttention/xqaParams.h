@@ -106,70 +106,71 @@ struct XQAParams
     {
         std::stringstream ss;
 
-        ss << "XQAParams ====================" << std::endl
-           << "data_type: " << static_cast<int>(data_type) << std::endl
-           << "kv_cache_data_type: " << static_cast<int>(kv_cache_data_type) << std::endl
-           << "output: " << output << std::endl
-           << "qkv: " << qkv << std::endl
-           << "cache_indir: " << cache_indir << std::endl
-           << "kv_scale_orig_quant: " << kv_scale_orig_quant << std::endl
-           << "kv_scale_quant_orig: " << kv_scale_quant_orig << std::endl
-           << "host_past_key_value_lengths: " << host_past_key_value_lengths << std::endl
-           << "host_context_lengths: " << host_context_lengths << std::endl
-           << "semaphores: " << semaphores << std::endl
-           << "workspaces: " << workspaces << std::endl
-           << "batch_size: " << batch_size << std::endl
-           << "beam_width: " << beam_width << std::endl
-           << "max_attention_window_size: " << max_attention_window_size << std::endl
-           << "cyclic_attention_window_size: " << cyclic_attention_window_size << std::endl
-           << "sink_token_length: " << sink_token_length << std::endl
-           << "max_past_kv_length: " << max_past_kv_length << std::endl
-           << "qkv_bias: " << qkv_bias << std::endl
-           << "sequence_lengths: " << sequence_lengths << std::endl
-           << "context_lengths: " << context_lengths << std::endl
-           << "alibi_slopes: " << alibi_slopes << std::endl
-           << "rotary_embedding_inv_freq_cache: " << rotary_embedding_inv_freq_cache << std::endl
-           << "spec_decoding_packed_mask: " << spec_decoding_packed_mask << std::endl
-           << "spec_decoding_position_offsets: " << spec_decoding_position_offsets << std::endl
-           << "spec_decoding_generation_lengths: " << spec_decoding_generation_lengths << std::endl
-           << "spec_decoding_is_generation_length_variable: "
-           << (spec_decoding_is_generation_length_variable ? "true" : "false") << std::endl
-           << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
-           << "mrope_position_deltas: " << mrope_position_deltas << std::endl
-           << "generation_input_length: " << generation_input_length << std::endl
-           << "num_q_heads: " << num_q_heads << std::endl
-           << "num_kv_heads: " << num_kv_heads << std::endl
-           << "head_size: " << head_size << std::endl
-           << "unidirectional: " << unidirectional << std::endl
-           << "q_scaling: " << q_scaling << std::endl
-           << "rotary_embedding_dim: " << rotary_embedding_dim << std::endl
-           << "rotary_embedding_base: " << rotary_embedding_base << std::endl
-           << "rotary_embedding_scale_type: " << static_cast<int>(rotary_embedding_scale_type) << " (enum value)"
-           << std::endl
-           << "rotary_embedding_scale: " << rotary_embedding_scale << std::endl
-           << "rotary_embedding_max_positions: " << rotary_embedding_max_positions << std::endl
-           << "rotary_vision_start: " << rotary_vision_start << std::endl
-           << "rotary_vision_length: " << rotary_vision_length << std::endl
-           << "rotary_cos_sin: " << rotary_cos_sin << std::endl
-           << "position_embedding_type: " << static_cast<int>(position_embedding_type) << " (enum value)" << std::endl
-           << "position_shift_enabled: " << (position_shift_enabled ? "true" : "false") << std::endl
-           << "remove_padding: " << (remove_padding ? "true" : "false") << std::endl
-           << "mask_type: " << static_cast<int>(mask_type) << " (enum value)" << std::endl
-           << "paged_kv_cache: " << (paged_kv_cache ? "true" : "false") << std::endl
-           << "tokens_per_block: " << tokens_per_block << std::endl
-           << "max_blocks_per_sequence: " << max_blocks_per_sequence << std::endl
-           << "tp_size: " << tp_size << std::endl
-           << "tp_rank: " << tp_rank << std::endl
-           << "qkv_bias_enabled: " << (qkv_bias_enabled ? "true" : "false") << std::endl
-           << "cross_attention: " << (cross_attention ? "true" : "false") << std::endl
-           << "max_distance: " << max_distance << std::endl
-           << "multi_block_mode: " << (multi_block_mode ? "true" : "false") << std::endl
-           << "multi_query_tokens: " << (multi_query_tokens ? "true" : "false") << std::endl
-           << "logn_scaling_ptr :" << logn_scaling_ptr << std ::endl
-           << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
-           << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
-           << "fp8_out_scale :" << fp8_out_scale << std ::endl
-           << "stream :" << stream;
+        // ss << "XQAParams ====================" << std::endl
+        //    << "data_type: " << static_cast<int>(data_type) << std::endl
+        //    << "kv_cache_data_type: " << static_cast<int>(kv_cache_data_type) << std::endl
+        //    << "output: " << output << std::endl
+        //    << "qkv: " << qkv << std::endl
+        //    << "cache_indir: " << cache_indir << std::endl
+        //    << "kv_scale_orig_quant: " << kv_scale_orig_quant << std::endl
+        //    << "kv_scale_quant_orig: " << kv_scale_quant_orig << std::endl
+        //    << "host_past_key_value_lengths: " << host_past_key_value_lengths << std::endl
+        //    << "host_context_lengths: " << host_context_lengths << std::endl
+        //    << "semaphores: " << semaphores << std::endl
+        //    << "workspaces: " << workspaces << std::endl
+        //    << "batch_size: " << batch_size << std::endl
+        //    << "beam_width: " << beam_width << std::endl
+        //    << "max_attention_window_size: " << max_attention_window_size << std::endl
+        //    << "cyclic_attention_window_size: " << cyclic_attention_window_size << std::endl
+        //    << "sink_token_length: " << sink_token_length << std::endl
+        //    << "max_past_kv_length: " << max_past_kv_length << std::endl
+        //    << "qkv_bias: " << qkv_bias << std::endl
+        //    << "sequence_lengths: " << sequence_lengths << std::endl
+        //    << "context_lengths: " << context_lengths << std::endl
+        //    << "alibi_slopes: " << alibi_slopes << std::endl
+        //    << "rotary_embedding_inv_freq_cache: " << rotary_embedding_inv_freq_cache << std::endl
+        //    << "spec_decoding_packed_mask: " << spec_decoding_packed_mask << std::endl
+        //    << "spec_decoding_position_offsets: " << spec_decoding_position_offsets << std::endl
+        //    << "spec_decoding_generation_lengths: " << spec_decoding_generation_lengths << std::endl
+        //    << "spec_decoding_is_generation_length_variable: "
+        //    << (spec_decoding_is_generation_length_variable ? "true" : "false") << std::endl
+        //    << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
+        //    << "mrope_position_deltas: " << mrope_position_deltas << std::endl
+        //    << "generation_input_length: " << generation_input_length << std::endl
+        //    << "num_q_heads: " << num_q_heads << std::endl
+        //    << "num_kv_heads: " << num_kv_heads << std::endl
+        //    << "head_size: " << head_size << std::endl
+        //    << "unidirectional: " << unidirectional << std::endl
+        //    << "q_scaling: " << q_scaling << std::endl
+        //    << "rotary_embedding_dim: " << rotary_embedding_dim << std::endl
+        //    << "rotary_embedding_base: " << rotary_embedding_base << std::endl
+        //    << "rotary_embedding_scale_type: " << static_cast<int>(rotary_embedding_scale_type) << " (enum value)"
+        //    << std::endl
+        //    << "rotary_embedding_scale: " << rotary_embedding_scale << std::endl
+        //    << "rotary_embedding_max_positions: " << rotary_embedding_max_positions << std::endl
+        //    << "rotary_vision_start: " << rotary_vision_start << std::endl
+        //    << "rotary_vision_length: " << rotary_vision_length << std::endl
+        //    << "rotary_cos_sin: " << rotary_cos_sin << std::endl
+        //    << "position_embedding_type: " << static_cast<int>(position_embedding_type) << " (enum value)" <<
+        //    std::endl
+        //    << "position_shift_enabled: " << (position_shift_enabled ? "true" : "false") << std::endl
+        //    << "remove_padding: " << (remove_padding ? "true" : "false") << std::endl
+        //    << "mask_type: " << static_cast<int>(mask_type) << " (enum value)" << std::endl
+        //    << "paged_kv_cache: " << (paged_kv_cache ? "true" : "false") << std::endl
+        //    << "tokens_per_block: " << tokens_per_block << std::endl
+        //    << "max_blocks_per_sequence: " << max_blocks_per_sequence << std::endl
+        //    << "tp_size: " << tp_size << std::endl
+        //    << "tp_rank: " << tp_rank << std::endl
+        //    << "qkv_bias_enabled: " << (qkv_bias_enabled ? "true" : "false") << std::endl
+        //    << "cross_attention: " << (cross_attention ? "true" : "false") << std::endl
+        //    << "max_distance: " << max_distance << std::endl
+        //    << "multi_block_mode: " << (multi_block_mode ? "true" : "false") << std::endl
+        //    << "multi_query_tokens: " << (multi_query_tokens ? "true" : "false") << std::endl
+        //    << "logn_scaling_ptr :" << logn_scaling_ptr << std ::endl
+        //    << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
+        //    << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
+        //    << "fp8_out_scale :" << fp8_out_scale << std ::endl
+        //    << "stream :" << stream;
 
         return ss.str();
     }
