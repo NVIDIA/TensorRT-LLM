@@ -235,7 +235,7 @@ class RemoteMpiCommSessionClient():
         self.queue = ZeroMqQueue(addr, is_server=False)
         self._is_shutdown = False
 
-    def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
+    def submit(self, task: Callable[..., T], *args, **kwargs) -> None:
         ''' Submit a task to the remote MPI pool. '''
         if self._is_shutdown:
             print_colored_debug(
@@ -247,7 +247,7 @@ class RemoteMpiCommSessionClient():
         self.queue.put(RemoteTask(task, args, kwargs))
         return []
 
-    def submit_sync(self, task, *args, **kwargs):
+    def submit_sync(self, task, *args, **kwargs) -> List[T]:
         ''' Submit a task to the remote MPI pool and wait for task completion. '''
         self.submit(task, *args, **kwargs)
 
@@ -259,6 +259,7 @@ class RemoteMpiCommSessionClient():
         if not res:
             raise RuntimeError(
                 "RemoteMpiCommSessionClient received unexpected response")
+        return res
 
     def poll(self) -> bool:
         ''' Poll the queue for a response.
@@ -303,7 +304,7 @@ class RemoteMpiCommSessionServer():
         self.addr = addr
         self.queue = ZeroMqQueue(addr, is_server=True)
         self.comm = comm
-        self.num_results: int = 0
+        self.results = []  # the results may arrive in any order
 
         if self.comm is not None:
             self.session = MpiCommSession(n_workers=self.comm.Get_size(),
@@ -335,9 +336,9 @@ class RemoteMpiCommSessionServer():
                     future.add_done_callback(self.mpi_future_callback)
 
     def mpi_future_callback(self, *args):
-        self.num_results -= 1
-        if self.num_results == 0:
-            self.queue.put(True)  # notify the client that all tasks are done
+        self.results.append(args[0].result())
+        if len(self.results) == self.num_results:
+            self.queue.put(self.results)
 
 
 def find_free_port() -> int:

@@ -22,7 +22,8 @@ def main(task_type: Literal["submit", "submit_sync"]):
         if task_type == "submit":
             client.submit(print_colored, f"{task}\n", "green")
         elif task_type == "submit_sync":
-            client.submit_sync(print_colored, f"{task}\n", "green")
+            res = client.submit_sync(print_colored, f"{task}\n", "green")
+            print(res)
 
     time.sleep(10)
     client.shutdown()
