@@ -2614,6 +2614,36 @@ SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 input
     return mKvCacheManager->getMaxCapacityBatchSize(inputLength, outputLength);
 }
 
+/*
+ * Manages prefetching of prompt table chunks using a double-buffer strategy
+ *
+ * Function Flow:
+ * 1. First Chunk Processing (isBeforePrepareBuffers == true):
+ *    - Uses blocking prefetch on main runtime stream
+ *    - Ensures initial data is ready before computation starts
+ *
+ * 2. Subsequent Chunks (isBeforePrepareBuffers == false):
+ *    - Uses non-blocking prefetch on separate copy stream
+ *    - Overlaps data transfer with computation
+ *
+ * Synchronization:
+ * - First prefetch: No wait needed (fresh start)
+ * - Later prefetches: Wait for previous copy to complete
+ * - Uses mPtableCopyDoneEvent to track completion
+ *
+ * Key Functions:
+ * 1. prefetchNextPromptTableChunk:
+ *    - Calls the correct function based on position in code (before or after prepareBuffers())
+ *    - Waits for previous copy to complete if not the first chunk
+ *
+ * 2. remapInputTokensForPromptTable:
+ *    - Identifies tokens that need prompt table embeddings (tokens that are greater than vocabSize)
+ *    - Remaps IDs to match chunked prompt table layout
+ *
+ * 3. copyPromptTableToGpuInChunk:
+ *    - Handles actual transfer from CPU pinned memory to GPU
+ *    - Uses appropriate buffer manager based on isBeforePrepareBuffers
+ */
 void TrtGptModelInflightBatching::prefetchNextPromptTableChunk(
     RequestVector const& contextRequests, bool isBeforePrepareBuffers, SizeType32 bufferId)
 {
@@ -2662,7 +2692,6 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
     auto& inputTokensMutable = llmReq->getTokensMutable(0);
     auto vocabSize = mModelConfig.getVocabSize();
 
-    // For first chunk's initialization
     if (isBeforePrepareBuffers)
     {
         promptTuningBuffers->initializeChunkPtableBuffers(
@@ -2697,15 +2726,10 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
         beginPos = llmReq->getContextCurrentPosition();
     }
 
-    // Bounds check
-    if (beginPos + processChunkSize > inputTokensMutable.size())
-    {
-        TLLM_THROW("Invalid chunk access: beginPos(%zu) + processChunkSize(%zu) > totalSize(%zu)", beginPos,
-            processChunkSize, inputTokensMutable.size());
-        return;
-    }
+    TLLM_CHECK_WITH_INFO(beginPos + processChunkSize <= inputTokensMutable.size(),
+        "Invalid chunk access: beginPos(%zu) + processChunkSize(%zu) > totalSize(%zu)", beginPos, processChunkSize,
+        inputTokensMutable.size());
 
-    // Process tokens
     auto inputTokensChunk = inputTokensMutable.begin() + beginPos;
     std::vector<SizeType32> outOfVocabTokens;
     SizeType32 ptableTokenId = vocabSize;
@@ -2723,7 +2747,7 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
 
 void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<LlmRequest> const& llmReq,
     std::vector<int32_t> const& outOfVocabTokens, bool isBeforePrepareBuffers, SizeType32 bufferId,
-    SizeType32 contextId) // Add parameter to choose which buffer to use
+    SizeType32 contextId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "copyPromptTableToGpuInChunk");
@@ -2755,14 +2779,11 @@ void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<Ll
     auto table1D = runtime::ITensor::view(
         promptTable.value(), runtime::ITensor::makeShape({static_cast<int64_t>(totalElements)}));
 
-    // Add bounds checking
-    if (srcOffset + sliceSize > totalElements)
-    {
-        printf("ERROR: Would access beyond buffer bounds!\n");
-        printf("Total elements: %zu, Trying to access up to: %zu\n", totalElements, srcOffset + (sliceSize));
-    }
+    TLLM_CHECK_WITH_INFO(srcOffset + sliceSize <= totalElements,
+        "Buffer bounds violation: Trying to access up to %zu elements but buffer only has %zu elements (offset: %zu, "
+        "slice size: %zu)",
+        srcOffset + sliceSize, totalElements, srcOffset, sliceSize);
 
-    // Convert UniquePtr to SharedPtr
     auto table1DShared = runtime::ITensor::SharedPtr(table1D.release());
     auto pTableView = runtime::ITensor::slice(table1DShared, srcOffset, sliceSize);
 
@@ -2770,10 +2791,8 @@ void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<Ll
 
     currentBufferManager.copy(*pTableView, *gpuBufferSlice);
 
-    // Update buffer sizes
     promptTuningBuffers->updateBufferStartPosition(currentIndex, outOfVocabTokens.size());
 
-    // Update position for next chunk
     llmReq->mPtableCurrentPosition += outOfVocabTokens.size();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

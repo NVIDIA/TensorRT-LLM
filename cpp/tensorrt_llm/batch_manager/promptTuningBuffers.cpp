@@ -34,7 +34,6 @@ PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::Buffe
     // vocabSize and mMaxPromptVocabSize
     mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
-    // optionalParams.enableChunkedContext || modelConfig.getContextFMHA()
 
     auto promptVocabSizeHost
         = runtime::BufferManager::pinned(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
@@ -143,23 +142,18 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
 
             std::optional<TensorPtr> optReqPromptEmbeddingTable = std::nullopt;
             std::optional<SizeType32> optReqPromptVocabSize = std::nullopt;
-            // If context chunk mode, the context chunk size would be less than the total number of tokens in the
-            // request This if statement is to check if the context chunk mode is enabled
-            if (batchIdx < numContextRequests)
+
+            if (mPromptTableOffloading)
             {
-                if (mPromptTableOffloading)
-                {
-                    optReqPromptEmbeddingTable = getChunkPtableBuffer(getChunkPtableCurrentIndex());
-                    optReqPromptVocabSize = getChunkPtableBufferSliceSize(getChunkPtableCurrentIndex(), batchIdx);
-                }
-                else
-                {
-                    optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
-                    optReqPromptVocabSize = llmReq->getPromptVocabSize();
-                }
+                optReqPromptEmbeddingTable = getChunkPtableBuffer(getChunkPtableCurrentIndex());
+                optReqPromptVocabSize = getChunkPtableBufferSliceSize(getChunkPtableCurrentIndex(), batchIdx);
             }
-            // auto optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
-            // auto const optReqPromptVocabSize = llmReq->getPromptVocabSize();
+            else
+            {
+                optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
+                optReqPromptVocabSize = llmReq->getPromptVocabSize();
+            }
+
             mPromptTuningParams.promptTuningEnabled.push_back(optReqPromptEmbeddingTable.has_value());
 
             // If context request & has embedding table, validate it
@@ -174,9 +168,8 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
                         // The size depends on optReqPromptVocabSize which stores how many fake prompts are in the chunk
                         auto slicedPtable = runtime::ITensor::slice(
                             optReqPromptEmbeddingTable.value(), 0, optReqPromptVocabSize.value());
-                        // Add leading dimension 1 for batch
-                        slicedPtable->unsqueeze(0);                           // Call unsqueeze() as member function
-                        optReqPromptEmbeddingTable = std::move(slicedPtable); // Move ownership of the unique_ptr
+                        slicedPtable->unsqueeze(0);
+                        optReqPromptEmbeddingTable = std::move(slicedPtable);
                     }
                     else
                     {
