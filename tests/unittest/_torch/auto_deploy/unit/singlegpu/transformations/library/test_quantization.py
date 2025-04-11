@@ -85,12 +85,12 @@ def test_linear_quantization(quant_config, atol, rtol, num_p_og):
     ],
 )
 def test_bmm_quantization(quant_config, atol, rtol, num_p_og):
-    batch_size, seq_len, hidden_dim, num_experts = 2, 4, 16, 1
+    batch_size, seq_len, hidden_dim, num_experts = 2, 2, 16, 1
     model = BMMModel(hidden_dim, batch_size, num_experts).to(torch.float16).to("cuda")
     x = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.float16).to("cuda")
 
     # register fp8 scales
-    if quant_config == "FP8":
+    if quant_config["quant_algo"] == "FP8":
         model.experts[0].register_buffer("weight1_input_scale", fp8_scale(x))
         model.experts[0].register_buffer(
             "weight1_weight_scale", fp8_scale(model.experts[0].weight1)

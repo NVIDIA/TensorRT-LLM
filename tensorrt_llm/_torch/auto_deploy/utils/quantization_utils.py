@@ -432,61 +432,10 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                 state_dict[weight_name + "_scale"] = weight_scale
 
 
+# TODO: complete this once FP4 HF ckpt format is finalized
 class FP4BMMQuantizationImpl(QuantizationImpl):
     """Implementation of FP4 quantization for BMM operations."""
 
     @staticmethod
     def target_op():
         return torch.ops.quant.fp4_bmm
-
-    @staticmethod
-    def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
-        # FP4 quantization uses uint8 for storage
-        return torch.empty(
-            original_weight.numel() // 2, dtype=torch.uint8, device=original_weight.device
-        )
-
-    @staticmethod
-    def scale_names() -> List[str]:
-        return ["input_scale", "weight_scale", "alpha"]
-
-    @staticmethod
-    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
-        return {
-            "input_scale": torch.tensor(1.0),
-            "weight_scale": torch.tensor(1.0),
-            "alpha": torch.tensor(1.0),
-        }
-
-    @staticmethod
-    def load_hook(state_dict, prefix, *args, weight_name):
-        """Load hook for state_dict quantization pre-processing."""
-        if weight_name in state_dict:
-            # Get related scale names
-            input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
-            weight_scale_name = weight_name.rsplit(".", 1)[0] + ".weight_scale"
-            alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
-
-            weight = state_dict[weight_name]
-            # If weight is not already quantized (not uint8)
-            if weight.dtype != torch.uint8:
-                # FP4 quantization details
-                weight_scale_2 = fp4_global_scale(weight)
-                # Quantize using TRTLLM FP4 quantization
-                weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
-                    weight.to("cuda"),
-                    weight_scale_2.to("cuda"),
-                    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
-                    False,
-                )
-
-                # Update state dict with quantized values and scales
-                state_dict[weight_name] = weight_fp4
-                state_dict[weight_scale_name] = weight_scale
-
-                # Make sure input scale exists
-                if input_scale_name not in state_dict:
-                    state_dict[input_scale_name] = torch.tensor(1.0)
-
-                # Compute alpha parameter
-                state_dict[alpha_name] = 1 / (weight_scale_2 * state_dict[input_scale_name])
