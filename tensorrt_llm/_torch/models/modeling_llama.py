@@ -43,7 +43,12 @@ class Llama4Attention(Attention):
         # Note the convention no_rope_layers[layer_idx] == 0 means nope_layer
         is_nope_layer = config.no_rope_layers[layer_idx] == 0
 
-        if not is_nope_layer:
+        use_rope = not is_nope_layer
+        attn_temperature_tuning = is_nope_layer and config.attn_temperature_tuning > 0
+        use_qk_norm = use_qk_norm and not is_nope_layer
+
+        if use_rope and not use_qk_norm:
+            # We can fuse pos embed only when: is_rope=True, is_qk_norm=False
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
@@ -62,9 +67,9 @@ class Llama4Attention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            use_qk_norm=use_qk_norm and not is_nope_layer,
+            use_qk_norm=use_qk_norm,
             aux_stream=aux_stream,
-        )
+            attn_temperature_tuning=attn_temperature_tuning)
 
 
 class LlamaAttention(Attention):
@@ -284,7 +289,7 @@ class Llama4DecoderLayer(DecoderLayer):
 
         # Self Attention
         # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
-        if self.is_nope_layer:
+        if self.is_nope_layer and not self.self_attn.attn_temperature_tuning:
             position_ids = None
 
         hidden_states = self.self_attn(
@@ -468,10 +473,15 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
         )
