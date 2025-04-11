@@ -131,7 +131,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             logger.info(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
             )
-        executor_config.kv_cache_config.enable_block_reuse = False
         executor_config.enable_chunked_context = False
 
     kv_cache_manager = None

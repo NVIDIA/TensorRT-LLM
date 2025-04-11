@@ -565,6 +565,9 @@ class PyTorchModelEngine(ModelEngine):
         # is_dummy_forward is used to indicate whether the forward is
         # a dummy forward for memory estimation OR
         # a real forward w.o. kv cache
+        enable_paged_context_mla = hasattr(
+            self.model.model_config.pretrained_config,
+            "kv_lora_rank") and self.attn_runtime_features.cache_reuse
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -573,6 +576,7 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
+                enable_paged_context_mla=enable_paged_context_mla,
                 is_dummy_attention=is_dummy_forward)
 
         if self.attn_metadata is not None:
@@ -587,7 +591,8 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager=kv_cache_manager,
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla)
+            enable_flash_mla=self.model.model_config.enable_flash_mla,
+            enable_paged_context_mla=enable_paged_context_mla)
         return self.attn_metadata
 
     def _set_up_spec_metadata(

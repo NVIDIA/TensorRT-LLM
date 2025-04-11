@@ -368,7 +368,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
 
     for (auto const [numKvHeads, numLayers] : numLayersPerPool)
     {
-        mPools.emplace_back(numLayers, numKvHeads, sizePerHead, tokensPerBlock, 1);
+        mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead, tokensPerBlock, 1);
     }
 
     // assign each layer to its pool
@@ -449,8 +449,8 @@ void BlockManager::createBlockScalePools(SizeType32 quantBlockSize)
         TLLM_CHECK_WITH_INFO(kv_pool.blockSize % quantBlockSize == 0,
             "Cannot use FP4 quantization since kv_pool.blockSize is not divisible by FP4 quantBlockSize.");
 
-        mPools.emplace_back(kv_pool.numLayers, kv_pool.numKvHeads, kv_pool.sizePerHead, kv_pool.tokensPerBlock,
-            quantBlockSize,
+        mPools.emplace_back(kv_pool.numLayers, kv_pool.kvFactor, kv_pool.numKvHeads, kv_pool.sizePerHead,
+            kv_pool.tokensPerBlock, quantBlockSize,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/true);

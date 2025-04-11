@@ -49,6 +49,7 @@ class AttentionMetadata:
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
+    enable_paged_context_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 

@@ -1,6 +1,7 @@
 import math
 import os
 import warnings
+from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -65,13 +66,16 @@ class DeepseekV3RotaryEmbedding(RotaryEmbedding):
     def __init__(self,
                  config: PretrainedConfig,
                  device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
+        config_for_rope = deepcopy(config)
+        # make compute_deepseek_parameters works correctly
+        config_for_rope.hidden_size = config.qk_rope_head_dim * config.num_attention_heads
+        super().__init__(config_for_rope,
+                         head_dim=config.qk_rope_head_dim,
                          num_attention_heads=config.num_attention_heads,
                          max_position_embeddings=config.max_position_embeddings,
                          device=device,
-                         rope_type="default")
+                         rope_type="deepseek",
+                         permute_before_rope=True)
 
 
 class DeepseekV3Attention(MLA):

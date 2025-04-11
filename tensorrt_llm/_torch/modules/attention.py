@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 from torch import nn
@@ -7,7 +7,7 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 TrtllmAttention)
+                                 TrtllmAttention, TrtllmAttentionMetadata)
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
@@ -544,7 +544,8 @@ class MLA(nn.Module):
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
-                                                       k_pe_ctx, attn_metadata)
+                                                       k_pe_ctx, attn_metadata,
+                                                       position_ids)
         else:
             attn_output_context = None
 
@@ -585,12 +586,13 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         return attn_output
 
-    def forward_context(
+    def forward_context_default(
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
@@ -628,6 +630,144 @@ class MLA(nn.Module):
         )
 
         return attn_output
+
+    def forward_paged_context_fmha_for_mla(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        # copy past_compressed_kv and past_k_pe from paged kv cache
+        past_latent_cache = trtllm_attention.load_paged_kv_cache_for_mla(
+            attn_metadata, q.dtype)
+        assert past_latent_cache.shape[0] == attn_metadata.num_ctx_cached_tokens
+        assert past_latent_cache.shape[
+            1] == self.kv_lora_rank + self.qk_rope_head_dim
+        past_compressed_kv, past_k_pe = past_latent_cache.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        # compute past_k_nope and past_v from past_compressed_kv
+        # TODO: remove this contiguous by return two tensors from load_paged_kv_cache_for_mla
+        past_compressed_kv = past_compressed_kv.contiguous()
+        past_kv = self.kv_b_proj(past_compressed_kv)
+        past_k_nope, past_v = past_kv.split(
+            [
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim
+            ],
+            -1,
+        )
+        past_k_nope = past_k_nope.view(-1, self.num_heads,
+                                       self.qk_nope_head_dim)
+        past_v = past_v.view(-1, self.num_heads, self.v_head_dim)
+
+        # compute current k_nope and v from compressed_kv
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split([
+            self.num_heads * self.qk_nope_head_dim,
+            self.num_heads * self.v_head_dim
+        ],
+                             dim=-1)
+
+        # split current q into q_nope and q_pe
+        q_nope, q_pe = q.view([
+            -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
+        ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # apply rope to current q_pe and k_pe
+        assert position_ids is not None
+        assert self.rotary_emb is not None
+        assert self.rotary_emb.head_dim == self.qk_rope_head_dim
+        assert q_pe.shape[0] == k_pe.shape[0]
+        q_pe = q_pe.contiguous().view(-1,
+                                      self.num_heads * self.qk_rope_head_dim)
+        q_pe, k_pe = self.rotary_emb(
+            position_ids[:, :attn_metadata.num_ctx_tokens], [q_pe, k_pe],
+            attn_metadata)
+
+        # build q for attention op
+        q_view = q.view(-1, self.num_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim)
+        q_view[:, :,
+               self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
+                                                   self.qk_rope_head_dim)
+        q = q_view.view(
+            -1,
+            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
+        assert q.is_contiguous()
+
+        # set compressed paged kv cache for mla
+        # we may finish it inside the attention op by passing latent_cache
+        trtllm_attention.set_compressed_paged_kv_cache_for_mla(
+            compressed_kv,
+            k_pe,
+            attn_metadata,
+        )
+
+        # build full_k and full_v
+        k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
+        v = v.view(-1, self.num_heads, self.v_head_dim)
+
+        tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
+        # paged kv cache should be initialized to 0 to avoid NaN
+        full_kv = torch.zeros([
+            attn_metadata.num_contexts, 2,
+            (attn_metadata.max_ctx_full_seq_len + tokens_per_block - 1) //
+            tokens_per_block, self.num_heads, tokens_per_block,
+            max(self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim)
+        ],
+                              dtype=q.dtype,
+                              device=q.device)
+
+        mla_context_kv_cache_block_offsets = trtllm_attention.set_paged_kv_cache_v2_for_mla(
+            full_kv,
+            past_k_nope.contiguous(),
+            past_v.contiguous(),
+            past_k_pe.contiguous(),
+            k_nope.contiguous(),
+            v.contiguous(),
+            k_pe.contiguous(),
+            attn_metadata,
+        )
+
+        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        attn_output = self.mha.forward(
+            q,
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=out_scale,
+            mla_context_paged_kv=full_kv,
+            mla_context_kv_cache_block_offsets=
+            mla_context_kv_cache_block_offsets,
+        )
+        return attn_output
+
+    def forward_context(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(self.mha, TrtllmAttention):
+            assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+            trtllm_attention = cast(TrtllmAttention, self.mha)
+            if trtllm_attention.use_paged_context_fmha_for_mla(attn_metadata):
+                return self.forward_paged_context_fmha_for_mla(
+                    q, compressed_kv, k_pe, attn_metadata, position_ids)
+            else:
+                return self.forward_context_default(q, compressed_kv, k_pe,
+                                                    attn_metadata, position_ids)
+        else:
+            return self.forward_context_default(q, compressed_kv, k_pe,
+                                                attn_metadata, position_ids)
 
     def forward_generation(
         self,
