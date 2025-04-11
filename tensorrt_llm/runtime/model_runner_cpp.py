@@ -836,6 +836,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
         prompt_tuning_configs = len(batch_input_ids_list) * [None]
         if prompt_table is not None:
             if mm_embedding_offloading:
+                # CUDA Stream Overlapping Requirements:
+                # 1. Both memory copy stream and kernel execution stream must be non-default streams
+                # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).pin_memory()
             else:

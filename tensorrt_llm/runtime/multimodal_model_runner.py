@@ -1569,11 +1569,12 @@ class MultimodalModelRunner:
         image_embeds = visual_outputs[self.vision_output_names[0]]
 
         if self.args.mm_embedding_offloading:
-            # Allocate pinned memory with same shape and dtype
+            # CUDA Stream Overlapping Requirements:
+            # 1. Both memory copy stream and kernel execution stream must be non-default streams
+            # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
             pinned_embeds = torch.empty_like(image_embeds,
                                              device='cpu',
                                              pin_memory=True)
-            # Copy directly from GPU to pinned memory
             pinned_embeds.copy_(image_embeds, non_blocking=True)
             image_embeds = pinned_embeds
 
@@ -2042,6 +2043,9 @@ class MultimodalModelRunner:
                     dtype=str_dtype_to_torch(self.model_config.dtype))
             else:
                 if self.args.mm_embedding_offloading:
+                    # CUDA Stream Overlapping Requirements:
+                    # 1. Both memory copy stream and kernel execution stream must be non-default streams
+                    # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
                     prompt_table = prompt_table.pin_memory().to(
                         dtype=self.model.dtype)
                 else:
