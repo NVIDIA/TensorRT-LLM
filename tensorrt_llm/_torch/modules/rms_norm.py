@@ -47,3 +47,52 @@ class RMSNorm(nn.Module):
             if residual is not None:
                 return hidden_states, residual
             return hidden_states
+
+
+class GroupRMSNorm(nn.Module):
+
+    def __init__(self,
+                 *,
+                 eps: float = 1e-6,
+                 enable_weights: bool = False,
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None):
+        """
+        Group RMS Normalization for multiple tensors.
+
+        Args:
+            hidden_sizes: List of hidden dimensions for each input tensor
+            eps: Epsilon for numerical stability
+            enable_weights: Whether to use learnable weights
+            dtype: Data type for weights
+            device: Device for weights
+        """
+        super().__init__()
+        self.variance_epsilon = eps
+        self.enable_weights = enable_weights
+        assert not enable_weights, "enable_weights is not supported yet"
+
+    def forward(
+            self,
+            inputs: list[torch.Tensor],
+            weights: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
+        """
+        Apply RMS normalization to a group of inputs.
+
+        Args:
+            inputs: List of tensors to normalize [batch_size, hidden_dim]
+
+        Returns:
+            List of normalized tensors with same shape as inputs
+        """
+
+        if len(inputs) == 0:
+            return []
+
+        weights = [torch.ones_like(input) for input in inputs]
+
+        # Use CUDA kernel if available
+        outputs = torch.ops.trtllm.group_rms_norm(inputs, weights,
+                                                  self.variance_epsilon,
+                                                  self.enable_weights)
+        return outputs
