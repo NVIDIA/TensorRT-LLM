@@ -4,7 +4,6 @@ from collections.abc import Iterable
 import torch
 
 import tensorrt_llm
-import tensorrt_llm.bindings as tllm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (mpi_allgather, mpi_broadcast,
                                  str_dtype_to_binding, torch_dtype_to_str)
@@ -16,7 +15,6 @@ from ..speculative import (get_num_spec_layers, get_spec_decoder,
                            get_spec_resource_manager)
 from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
                       TRTLLMDecoder)
-from .guided_decoder import GuidedDecoderResourceManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
@@ -292,10 +290,10 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
         if spec_config is not None:
             raise ValueError(
                 "Guided decoding is not supported with speculative decoding.")
-    
+
     resources["seq_slot_manager"] = SeqSlotManager(
-            executor_config.max_batch_size +
-            pytorch_backend_config.enable_overlap_scheduler)
+        executor_config.max_batch_size +
+        pytorch_backend_config.enable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
