@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import random
 from subprocess import CalledProcessError
 
+import pytest
 from defs.conftest import tests_path
 
 
@@ -62,6 +64,12 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
+    random_number = random.choice([0, 1])
+    if random_number == 0:
+        pytest.fail("test failed")
+    elif random_number == 1:
+        return
+
     import pandas as pd
     import pynvml
     pynvml.nvmlInit()
