@@ -1686,13 +1686,6 @@ class PyExecutor:
 
             extra_model_inputs = {'hidden_states': hidden_states}
 
-            if spec_metadata.spec_dec_mode.is_eagle3():
-                # Another eagle3 hack. Eagle3 checkpoints don't have embed_tokens,
-                # so we need to provide them some other way. We can get rid of this
-                # hack if we provide our own preprocessed eagle3 checkpoints.
-                extra_model_inputs[
-                    'embed_tokens'] = self.model_engine.model.model.embed_tokens
-
             outputs = self.draft_model_engine.forward(
                 draft_batch,
                 self.resource_manager,
@@ -1731,10 +1724,6 @@ class PyExecutor:
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
-                if spec_metadata.spec_dec_mode.is_eagle3():
-                    # See note above.
-                    extra_model_inputs[
-                        'embed_tokens'] = self.model_engine.model.model.embed_tokens
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,

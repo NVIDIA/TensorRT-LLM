@@ -477,14 +477,22 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 self._run_cuda_graphs = _run_cuda_graphs
 
+        def _create_extra_inputs(bs, num_tokens):
+            if self.spec_config is None:
+                extra_model_inputs = None
+            else:
+                expected_shape_creator = getattr(
+                    self.model, "spec_decode_extra_input_info", None)
+                if callable(expected_shape_creator):
+                    extra_model_inputs = expected_shape_creator(bs, num_tokens)
+                else:
+                    extra_model_inputs = None
+
+            return extra_model_inputs
+
         # TODO: current warmup_request is not suitable for star attention
         cp_type = self.mapping.cp_config.get('cp_type', None)
         if cp_type == 'star_attention':
-            return
-
-        # TODO: CUDA graph support with eagle.
-        if self.spec_config is not None and self.spec_config.spec_dec_mode.is_eagle3(
-        ):
             return
 
         if self._torch_compile_enabled:
@@ -508,9 +516,12 @@ class PyTorchModelEngine(ModelEngine):
                             logger.info(
                                 f"Run warmup for batch size={bs}, pure {'context' if num_tokens is not None else 'generation'} phase"
                             )
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
+                            self.forward(
+                                batch,
+                                new_tensors_device=None,
+                                resource_manager=resource_manager,
+                                extra_model_inputs=_create_extra_inputs(
+                                    bs, num_tokens))
                             torch.cuda.synchronize()
 
         if self.pytorch_backend_config.autotuner_enabled:
@@ -527,7 +538,9 @@ class PyTorchModelEngine(ModelEngine):
                         logger.info(f"Run autotuning warmup for batch size={1}")
                         self.forward(batch,
                                      new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                                     resource_manager=resource_manager,
+                                     extra_model_inputs=_create_extra_inputs(
+                                         1, num_tokens))
                         torch.cuda.synchronize()
 
                 logger.info(f"Autotuner Cache size after warmup " +
@@ -553,7 +566,8 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info(f"Run warmup for batch size={bs}")
                 self.forward(batch,
                              new_tensors_device=None,
-                             resource_manager=resource_manager)
+                             resource_manager=resource_manager,
+                             extra_model_inputs=_create_extra_inputs(bs, 1))
                 torch.cuda.synchronize()
 
     def _set_up_attn_metadata(self,
@@ -1113,13 +1127,12 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
 
-        if not attn_metadata.is_cuda_graph:
-            # No need to overwrite seq lens when using CUDA graphs -
-            # CUDA graphs are only used for pure decoding batches
-            # and have static batch size, so the seqlens never change.
-            # Note that it's important to not free the seq_lens_cuda
-            # buffer once the graph has been captured also - this will invalidate
-            # the graph and force an expensive recapture.
+        if not attn_metadata.is_cuda_graph or is_spec_decode:
+            # Usually, we don't need to update seq_lens when using CUDA graphs.
+            # This is because CUDA graphs are only used for pure decoding batches.
+            # If we're doing spec decode, however, we can have variable seqlens (up
+            # to max_num_draft_tokens per request). The buffers inside the CUDA graph
+            # runner are padded to handle this.
             attn_metadata.seq_lens = torch.tensor(
                 sequence_lengths,
                 dtype=torch.int,
@@ -1656,13 +1669,14 @@ class PyTorchModelEngine(ModelEngine):
                             inputs)
                     else:
                         capture_fn = lambda inputs: self._forward_step(
-                            inputs, gather_ids=None)
+                            inputs, gather_ids=gather_ids)
 
                     pool = maybe_graph.capture(capture_fn,
-                                               self._cuda_graph_mem_pool)
+                                               self._cuda_graph_mem_pool,
+                                               extra_model_inputs)
                     self._cuda_graph_mem_pool = pool
 
-                outputs = maybe_graph.run(inputs)
+                outputs = maybe_graph.run(inputs, extra_model_inputs)
                 if not self.mapping.is_last_pp_rank():
                     pp_interface = PipelineInterface(*outputs)
                     pp_interface.send()
@@ -1759,3 +1773,14 @@ class PyTorchModelEngine(ModelEngine):
                                           self.mapping.gpus_per_node,
                                           hidden_size * self.max_num_tokens * 2)
         return True
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        """
+        When doing spec decode, sometimes draft models need to share certain weights
+        with their target models. Here, we set up such weights by invoking
+        self.model.load_weights_from_target_model if such a method exists.
+        """
+        loader = getattr(self.model, "load_weights_from_target_model", None)
+        if callable(loader):
+            loader(target_model)

@@ -1,5 +1,5 @@
 import copy
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -636,6 +636,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         config = model_config.pretrained_config
         self.dtype = config.torch_dtype
+        self.hidden_size = config.hidden_size
 
         self.fc = Linear(config.hidden_size * 3,
                          config.hidden_size,
@@ -652,23 +653,27 @@ class Eagle3LlamaDraftModel(DecoderModel):
                                             dtype=torch.int64),
                                 requires_grad=False)
 
+        # Shared with target model.
+        self.embed_tokens = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        embed_tokens: torch.nn.Module,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.embed_tokens is not None
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
         if inputs_embeds is None:
-            inputs_embeds = embed_tokens(input_ids).to(self.dtype)
+            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
         assert hidden_states is not None and len(hidden_states) > 0
 
@@ -715,17 +720,8 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if "embed_tokens" not in kwargs:
-            raise ValueError(
-                "EAGLE3 checkpoints do not include embed_tokens. "
-                "The embed_tokens module from the target model therefore needs to "
-                "be passed explicitly via extra_model_inputs. NOTE: we can "
-                "get rid of this hack by providing our own custom checkpoint "
-                "format that includes embed_tokens.")
-
         output = self.model(
             input_ids=input_ids,
-            embed_tokens=kwargs['embed_tokens'],
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
@@ -747,3 +743,28 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
             new_weights[new_k] = v
 
         super().load_weights(new_weights)
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        self.model.embed_tokens = target_model.model.embed_tokens
+
+    def spec_decode_extra_input_info(self, batch_size: int,
+                                     num_tokens: int) -> Dict[str, Any]:
+
+        is_gen = num_tokens == 1
+        if is_gen:
+            hidden_states = [
+                torch.empty(batch_size,
+                            self.model.hidden_size,
+                            dtype=self.model.dtype,
+                            device='cuda')
+            ]
+        else:
+            hidden_states = [
+                torch.empty(batch_size * num_tokens,
+                            self.model.hidden_size,
+                            dtype=self.model.dtype,
+                            device='cuda') for _ in range(3)
+            ]
+
+        return {'hidden_states': hidden_states}
