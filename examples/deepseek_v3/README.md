@@ -334,14 +334,15 @@ You can enable FP8 MLA through either of these methods:
 
 **Option 1: Checkpoint config**
 
-TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer). To enable FP8 MLA, modify the configuration as follows:
+TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+
+To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 quantization recipe:
 
 ```json
 {
   "quantization": {
-    "quant_algo": "FP8_BLOCK_SCALES",  // Or "NVFP4"
-    "kv_cache_quant_algo": "FP8",
-    // ...
+    "quant_algo": "FP8_BLOCK_SCALES",
+    "kv_cache_quant_algo": "FP8"
   }
 }
 ```
@@ -354,7 +355,6 @@ Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch bac
 pytorch_backend_config:
   kv_cache_dtype: fp8
   # ...
-```
 ```
 
 ## Notes and Troubleshooting
