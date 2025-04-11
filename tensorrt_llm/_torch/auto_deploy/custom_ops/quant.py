@@ -349,9 +349,14 @@ def fp4_bmm_fake(
     return torch.bmm(input, expanded_weight)
 
 
-QUANT_OPS = [
+QUANT_LINEAR_OPS = [
     torch.ops.quant.fp8_linear,
     torch.ops.quant.fp4_linear,
+]
+
+QUANT_BMM_OPS = [
     torch.ops.quant.fp8_bmm,
     torch.ops.quant.fp4_bmm,
 ]
+
+QUANT_OPS = QUANT_LINEAR_OPS + QUANT_BMM_OPS
