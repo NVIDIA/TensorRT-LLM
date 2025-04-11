@@ -426,6 +426,8 @@ private:
 
 std::vector<int> getWorldRanks(MpiComm const& comm);
 
+int getNumNodes();
+
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
 
 class MpiWaitThread
