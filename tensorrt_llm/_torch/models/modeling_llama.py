@@ -1,10 +1,13 @@
 import copy
-from typing import Dict, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List
 
 import torch
 from torch import nn
-from transformers import Llama4Config, LlamaConfig
-
+from transformers import Llama4Config, LlamaConfig, AutoModel, AutoProcessor, Llama4VisionModel
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.modeling_utils import load_sharded_checkpoint
+from safetensors import safe_open
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce,
                                              ParallelConfig, TensorParallelMode)
@@ -25,6 +28,17 @@ from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model, support_pp)
+from .modeling_multimodal_utils import fuse_input_embeds
+
+from ...inputs import (
+    ExtraProcessedInputs,
+    InputProcessor,
+    TextPrompt,
+    register_input_processor,
+)
+from ...sampling_params import SamplingParams
+
+from PIL.Image import Image
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -561,15 +575,12 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                     idx + 1].input_layernorm
 
 
-@register_auto_model("Llama4ForConditionalGeneration")
-class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
-                                                             Llama4Config]):
-
+@register_auto_model("Llama4ForCausalLM")
+class Llama4ForCausalLM(DecoderModelForCausalLM[LlamaModel, Llama4Config]):
     def __init__(
         self,
         model_config: ModelConfig[Llama4Config],
     ):
-        # TODO: figure out a better way to handle multimodality.
         model_config = copy.copy(model_config)
         model_config.pretrained_config = model_config.pretrained_config.text_config
         super().__init__(LlamaModel(model_config),
@@ -595,6 +606,68 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+
+class Llama4InputProcessor(InputProcessor):
+    def __init__(self, model_path, model_config, tokenizer):
+        self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+        self.model_config = model_config
+        self.tokenizer = tokenizer
+        self.vocab_size = model_config.text_config.vocab_size
+        self.image_token_index = model_config.image_token_index
+
+        self.encoder = nn.ModuleDict({
+            "vision_model": Llama4VisionModel(model_config.vision_config),
+            "multi_modal_projector": Llama4MultiModalProjector(model_config)
+        }).cuda()
+        load_sharded_checkpoint(self.encoder, model_path, strict=False)
+
+    @torch.inference_mode()
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data")
+        if not mm_data or not mm_data.get("image"):
+            # text only
+            return token_ids, {}
+        
+        # preprocess images and insert image tokens
+        img_type = type(mm_data["image"][0])
+        assert all(isinstance(img, img_type) for img in mm_data["image"])
+
+        processed = self.processor(
+            text=text_prompt, images=mm_data["image"],
+            return_tensors="pt", device="cuda",
+            do_rescale=(img_type == Image)
+        )
+        token_ids, pixel_values = processed["input_ids"].squeeze(), processed["pixel_values"]
+        mm_embeds = self.encoder.vision_model(pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
+        mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
+        # for fuse_input_embeds
+        token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+        return token_ids.tolist(), {"prompt_tuning_config": [mm_embeds, None, None]}
+
+
+
+@register_auto_model("Llama4ForConditionalGeneration")
+@register_input_processor(Llama4InputProcessor)
+class Llama4ForConditionalGeneration(Llama4ForCausalLM):
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: Optional[bool] = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        mm_embed = kwargs.get("multi_modal_data", [])
+        input_ids, inputs_embeds = fuse_input_embeds(self.model.embed_tokens, input_ids, mm_embed)
+        logits = super().forward(
+            attn_metadata, input_ids, position_ids, inputs_embeds, return_context_logits
+        )
+        return logits
 
 
 @register_auto_model("MistralForCausalLM")
