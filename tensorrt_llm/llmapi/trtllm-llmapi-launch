@@ -5,14 +5,13 @@ task_with_command="${@:1}"
 native_mpi_rank=$OMPI_COMM_WORLD_RANK
 mpi_rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
 
-log_stderr() { echo "$@" >&2; }
+log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
 log_stderr "mpi_rank: $mpi_rank"
 
 pid=$(ps -o pid= -p $$ | tr -d ' ')
 
 # Tell TRTLLM to spawn a additional process for the Proxy
 export TLLM_SPAWN_PROXY_PROCESS=1
-export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="ipc:///tmp/trtllm-ipc-${pid}"
 
 function mpi_size {
     if [ -n "$SLURM_JOB_NUM_NODES" ]; then
@@ -24,8 +23,17 @@ function mpi_size {
     fi
 }
 
+function export_free_tcp_addr {
+    # find free port with python -c, the port should start from 10000
+    local free_port=$(python -c 'import socket; s=socket.socket(); s.bind(("", 10000)); print(s.getsockname()[1]); s.close()')
+    export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:${free_port}"
+    log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
+}
+
 export tllm_mpi_size=$(mpi_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
+
+export_free_tcp_addr
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     log_stderr "rank${mpi_rank} run ${task_with_command} in background"
