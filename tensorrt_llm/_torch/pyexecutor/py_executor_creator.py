@@ -159,7 +159,8 @@ def create_py_executor(executor_config: ExecutorConfig,
     if executor_config.pytorch_backend_config.use_kv_cache:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
-            origin_seq_len, ctx_chunk_config, draft_model_engine)
+            origin_seq_len, ctx_chunk_config, draft_model_engine,
+            pytorch_backend_config)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
