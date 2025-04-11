@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -12,7 +11,7 @@ except ImportError:
     AttentionMaskConverter = None
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        PredefinedAttentionMask, dummy_forward)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -223,38 +222,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
 
-    @torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
-    @staticmethod
-    def dummy_forward(q: torch.Tensor, k: torch.Tensor,
-                      v: torch.Tensor) -> torch.Tensor:
-        """
-        Dummy attention forward function to estimate memory usage.
-        Args:
-            q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
-            k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-            v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-        Returns:
-            torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
-        """
-        head_dim = q.shape[2]
-        assert q.dim() == 3
-        assert k.dim() == 3 and k.size(2) == head_dim
-        assert v.dim() == 3 and v.size(2) == head_dim
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        o = _flash_attention_forward(q.unsqueeze(0),
-                                     k.unsqueeze(0),
-                                     v.unsqueeze(0),
-                                     attention_mask=None,
-                                     query_length=q.size(0),
-                                     is_causal=True)
-        return o.reshape(o.size(1), -1)
-
-    @dummy_forward.register_fake
-    def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        num_q_tokens = q.size(0)
-        return torch.empty_like(q).reshape(num_q_tokens, -1)
-
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
@@ -267,9 +234,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata.is_dummy_attention:
-            return VanillaAttention.dummy_forward(q.unsqueeze(0),
-                                                  k.unsqueeze(0),
-                                                  v.unsqueeze(0))
+            return dummy_forward(q, k, v)
         elif metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.
@@ -287,7 +252,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q, k, v)
+            return dummy_forward(q, k, v)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
