@@ -972,21 +972,16 @@ class MultimodalModelRunner:
                     model_runner_input = torch.vsplit(
                         model_runner_input, model_runner_input.shape[0])
                 else:
-                    assert False
                     visual_features, visual_atts = self.get_visual_features(
                         model_runner_input, other_vision_inputs)
                     model_runner_input = None
-
-        if audio is not None:
-            tmp_features, _ = self.audio_model.encoder(audio.to(str_dtype_to_torch(self.audio_precision)), other_audio_inputs['attention_mask'])
-            speech_out = self.audio_model.audio_projection['speech'](tmp_features)
-            vision_out = self.audio_model.audio_projection['vision'](tmp_features)
-            audio_features = torch.cat((speech_out, vision_out), dim=-1)
-            # audio_features = self.get_audio_features(audio, other_audio_inputs)
-        else:
-            audio_features = None
-
         profiler.stop("Vision encoder")
+
+        profiler.start("Audio encoder")
+        audio_features = None
+        if audio is not None:
+            audio_features = self.get_audio_features(audio, other_audio_inputs)
+        profiler.stop("Audio encoder")
 
         if self.model_type == 'fuyu':
             input_ids = image['input_ids'].to(torch.int32)
@@ -1599,73 +1594,16 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
-        # ##################################################################
-        # model = AutoModelForCausalLM.from_pretrained(
-        #         self.args.hf_model_dir,
-        #         torch_dtype=torch.float16,
-        #         trust_remote_code=True,
-        #         device_map='cpu')
-        # vision_model = model.model.embed_tokens_extend.image_embed
-        # vision_model = vision_model.to(self.device, torch.float16).eval()
-        # tmp_features = vision_model.get_img_features(visual_features['input'], visual_features['attention_mask'])
-        # alt_features = vision_model.img_projection(tmp_features)
-        # image_embeds = alt_features
-        # ##################################################################
-
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
         return image_embeds, image_atts
 
     def get_audio_features(self, audio, other_audio_inputs):
-        audio_features = {
-            self.audio_input_names[0]:
-            audio.to(str_dtype_to_torch(self.audio_precision)),
-        }
-        for key, tensor in other_audio_inputs.items():
-            audio_features.update({key: tensor})
-
-        tensor_info = [
-            TensorInfo(self.audio_input_names[0],
-                       str_dtype_to_trt(self.audio_precision), audio.shape),
-        ]
-        for key, tensor in other_audio_inputs.items():
-            tensor_info.append(
-                TensorInfo(key, torch_dtype_to_trt(tensor.dtype), tensor.shape))
-
-        audio_output_info = self.audio_encoder_session.infer_shapes(tensor_info)
-        self.audio_encoder_session.set_shapes(audio_features)
-        audio_outputs = {
-            t.name:
-            torch.empty(tuple(t.shape),
-                        dtype=trt_dtype_to_torch(t.dtype),
-                        device=audio.device)
-            for t in audio_output_info
-        }
-
-        ok = self.audio_encoder_session.run(audio_features, audio_outputs,
-                                            self.stream.cuda_stream)
-        assert ok, "Runtime execution failed for audio encoder session"
-        self.stream.synchronize()
-
-        audio_embeds = audio_outputs[self.audio_output_names[0]]
-
-        ############################################################
-        # model = AutoModelForCausalLM.from_pretrained(
-        #         self.args.hf_model_dir,
-        #         torch_dtype=torch.float16,
-        #         trust_remote_code=True,
-        #         device_map='cpu')
-        # audio_model = model.model.embed_tokens_extend.audio_embed
-        # audio_model = audio_model.to(self.device, torch.float16).eval()
-        # tmp_features, _ = audio_model.encoder(audio_features['input'], audio_features['attention_mask'])
-        # speech_out = audio_model.audio_projection['speech'](tmp_features)
-        # vision_out = audio_model.audio_projection['vision'](tmp_features)
-        # alt_features = torch.cat((speech_out, vision_out), dim=-1)
-        # audio_embeds = alt_features
-        ############################################################
-
-        return audio_embeds
+        tmp_features, _ = self.audio_model.encoder(audio.to(str_dtype_to_torch(self.audio_precision)), other_audio_inputs['attention_mask'])
+        speech_out = self.audio_model.audio_projection['speech'](tmp_features)
+        vision_out = self.audio_model.audio_projection['vision'](tmp_features)
+        return torch.cat((speech_out, vision_out), dim=-1)
 
     def setup_fake_prompts_vila(self, batch_size, visual_features,
                                 split_input_ids, input_lengths):
