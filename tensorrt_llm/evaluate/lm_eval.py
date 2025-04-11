@@ -17,8 +17,12 @@ from contextlib import contextmanager
 from typing import Iterable, List, Optional, Tuple, Union
 
 import click
-import lm_eval
 from tqdm import tqdm
+
+try:
+    from lm_eval.api.model import TemplateLM
+except ImportError:
+    TemplateLM = object
 
 from .._torch import LLM as PyTorchLLM
 from ..llmapi import LLM, RequestOutput
@@ -27,7 +31,7 @@ from ..sampling_params import SamplingParams
 from .interface import Evaluator
 
 
-class LmEvalWrapper(lm_eval.api.model.TemplateLM):
+class LmEvalWrapper(TemplateLM):
 
     def __init__(self, llm: Union[LLM, PyTorchLLM]):
         super().__init__()
@@ -82,6 +86,13 @@ class LmEvalEvaluator(Evaluator):
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
+        try:
+            import lm_eval
+        except ImportError as e:
+            raise ImportError(
+                f"Evaluation task {self.__class__.__name__} requires `lm_eval`. "
+                "Please install the package first, e.g., `pip install lm_eval`."
+            ) from e
         if system_prompt is not None:
             raise NotImplementedError("lm-eval does not support system_prompt.")
         super().__init__(random_seed=random_seed,
@@ -97,6 +108,7 @@ class LmEvalEvaluator(Evaluator):
             yield
             return
 
+        import lm_eval
         self._task_config_post_init = lm_eval.api.task.TaskConfig.__post_init__
 
         def _patched(task_config, *args, **kwargs):
@@ -126,6 +138,8 @@ class LmEvalEvaluator(Evaluator):
                  sampling_params: Optional[SamplingParams] = None) -> float:
         if sampling_params is not None:
             raise NotImplementedError("lm-eval handles sampling internally.")
+
+        import lm_eval
         results = lm_eval.evaluate(lm=LmEvalWrapper(llm),
                                    task_dict=self.task_dict,
                                    limit=self.num_samples,
