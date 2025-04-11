@@ -234,7 +234,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata.is_dummy_attention:
-            return dummy_forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+            return dummy_forward(q, k, v)
         elif metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.
