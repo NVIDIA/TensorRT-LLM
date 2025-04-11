@@ -15,6 +15,7 @@
 import json
 import math
 import os
+import tempfile
 from typing import Dict, List, Optional, Union
 
 import pytest
@@ -33,7 +34,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
-from ..trt_test_alternative import check_call, exists, makedirs
+from ..trt_test_alternative import check_call, exists
 
 
 def compute_threshold(num_samples: int,
@@ -303,23 +304,18 @@ class CliFlowAccuracyTestHarness:
         cls.llm_venv = request.getfixturevalue("llm_venv")
         cls.llm_root = request.getfixturevalue("llm_root")
 
+    @pytest.fixture(autouse=True, scope="function")
+    def setup_method(self):
+        with tempfile.TemporaryDirectory(
+                prefix=self.MODEL_NAME.replace("/", "-"),
+                dir=self.llm_venv.get_working_directory()) as workspace:
+            self.ckpt_dir = f"{workspace}/cmodels"
+            self.engine_dir = f"{workspace}/engines"
+            yield
+
     @property
     def example_dir(self):
         return f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}"
-
-    @property
-    def ckpt_dir(self):
-        ckpt_dir = f"{self.llm_venv.get_working_directory()}/cmodels/{self.MODEL_NAME}"
-        if not exists(ckpt_dir):
-            makedirs(ckpt_dir)
-        return ckpt_dir
-
-    @property
-    def engine_dir(self):
-        engine_dir = f"{self.llm_venv.get_working_directory()}/engines/{self.MODEL_NAME}"
-        if not exists(engine_dir):
-            makedirs(engine_dir)
-        return engine_dir
 
     def install_requirements(self):
         requirements = f"{self.example_dir}/requirements.txt"
