@@ -812,9 +812,18 @@ class FusedMoE(nn.Module):
                                            dtype=torch.float32)
         tmp_fc2_input_scale = torch.empty(self.num_experts, dtype=torch.float32)
         for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights[f"gate_up_proj_input_scale"]
+                w3_input_scale = weights[f"gate_up_proj_input_scale"]
+                w2_input_scale = weights[f"down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             load_expert_fc31_input_scale_fp8_qdq(
                 w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
@@ -878,9 +887,18 @@ class FusedMoE(nn.Module):
             dst_w2_weight_scale.copy_(w2_weight_scale[...].reshape([]))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-            w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-            w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w3_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w2_weight_scale = weights[f"down_proj_weight_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             expert_idx = expert_id - self.expert_start
 
