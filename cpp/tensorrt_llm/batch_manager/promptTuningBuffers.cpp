@@ -168,7 +168,7 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
                 // If a context request, validate prompt tensors and move to GPU
                 if (batchIdx < numContextRequests)
                 {
-                    if (static_cast<size_t>(llmReq->getContextChunkSize()) < llmReq->getTokens(0).size())
+                    if (mPromptTableOffloading)
                     {
                         // Need to slice the ptable since we don't need the entire buffer
                         // The size depends on optReqPromptVocabSize which stores how many fake prompts are in the chunk
