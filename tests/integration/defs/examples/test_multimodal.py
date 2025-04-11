@@ -230,7 +230,7 @@ def _test_llm_multimodal_general(llm_venv,
             multimodal_len = 196
         elif phi3_model:
             multimodal_len = 5120
-        elif phi4_model:        # @B: Confirm this.
+        elif phi4_model:  # @B: Confirm this.
             multimodal_len = 5120
         elif "fuyu" in model_name:
             multimodal_len = 2640
@@ -452,20 +452,18 @@ def _test_llm_multimodal_general(llm_venv,
     video_path = os.path.join(
         os.path.dirname(model_ckpt_path), "test_video",
         "video_test.mp4") if "video-neva" in model_name else ""
-    visual_engine="visual_encoder.engine"
-    audio_engine="audio_encoder.engine"
-    image_path='https://www.ilankelman.org/stopsigns/australia.jpg'
-    audio_path="/home/scratch.fmu_gpu/checkpoints/Phi-4-multimodal-instruct-dev/examples/what_is_the_traffic_sign_in_the_image.wav"
+    visual_engine = "visual_encoder.engine"
+    audio_engine = "audio_encoder.engine"
+    image_path = 'https://www.ilankelman.org/stopsigns/australia.jpg'
+    audio_path = "/home/scratch.fmu_gpu/checkpoints/Phi-4-multimodal-instruct-dev/examples/what_is_the_traffic_sign_in_the_image.wav"
     run_cmd = [
         f"{multimodal_example_root}/run.py",
         f"--engine_dir={llm_engine_dir}/{llm_engine_subdir}",
         f"--hf_model_dir={hf_model_dir}", "--max_new_tokens=30",
         f"--batch_size={1}", "--check_accuracy",
         f"--visual_engine_name={visual_engine}",
-        f"--audio_engine_name={audio_engine}",
-        f"--image_path={image_path}",
-        f"--audio_path={audio_path}",
-        "--enable_context_fmha_fp32_acc"
+        f"--audio_engine_name={audio_engine}", f"--image_path={image_path}",
+        f"--audio_path={audio_path}", "--enable_context_fmha_fp32_acc"
     ]
     if vision_model_type in ['llava', 'vila'] and batch_size > 1:
         # batch inference test

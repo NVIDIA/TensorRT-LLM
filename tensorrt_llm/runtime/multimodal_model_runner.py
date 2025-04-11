@@ -666,14 +666,7 @@ class MultimodalModelRunner:
 
     def init_image_encoder(self):
 
-        if self.model_type == "phi-4-multimodal":
-            model = AutoModelForCausalLM.from_pretrained(
-                    self.args.hf_model_dir,
-                    torch_dtype=torch.float16,
-                    trust_remote_code=True,
-                    device_map='cpu')
-            self.vision_model = model.model.embed_tokens_extend.image_embed.to(self.device).eval()
-
+        def create_image_newlines():
             self.image_newlines = {}
             image_newlines_path = os.path.join(self.visual_engine_dir,
                                                'image_newlines.safetensors')
@@ -683,6 +676,16 @@ class MultimodalModelRunner:
                 for k in f.keys():
                     self.image_newlines[k] = f.get_tensor(k)
 
+        # Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.
+        if self.model_type == "phi-4-multimodal":
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map='cpu')
+            self.vision_model = model.model.embed_tokens_extend.image_embed.to(
+                self.device).eval()
+            create_image_newlines()
             return
 
         if self.model_type == "phi-3-vision":
@@ -731,35 +734,17 @@ class MultimodalModelRunner:
             logger.info(f'Creating session from engine {vision_encoder_path}')
             self.visual_encoder_session = Session.from_serialized_engine(
                 engine_buffer)
-        if self.model_type in [
-                "llava_next", "llava_onevision", "phi-4-multimodal"
-        ]:
-            self.image_newlines = {}
-            image_newlines_path = os.path.join(self.visual_engine_dir,
-                                               'image_newlines.safetensors')
-            with safe_open(image_newlines_path,
-                           framework="pt",
-                           device=self.device) as f:
-                for k in f.keys():
-                    self.image_newlines[k] = f.get_tensor(k)
+        if self.model_type in ["llava_next", "llava_onevision"]:
+            create_image_newlines()
 
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
-        model = AutoModelForCausalLM.from_pretrained(
-            self.args.hf_model_dir,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            device_map='cpu')
-        self.audio_model = model.model.embed_tokens_extend.audio_embed.to(self.device).eval()
-
-        # audio_encoder_path = os.path.join(self.audio_engine_dir,
-        #                                   self.args.audio_engine_name)
-        # logger.info(f'Loading engine from {audio_encoder_path}')
-        # with open(audio_encoder_path, 'rb') as f:
-        #     engine_buffer = f.read()
-        # logger.info(f'Creating session from engine {audio_encoder_path}')
-        # self.audio_encoder_session = Session.from_serialized_engine(
-        #     engine_buffer)
+        model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                     torch_dtype=torch.float16,
+                                                     trust_remote_code=True,
+                                                     device_map='cpu')
+        self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
+            self.device).eval()
 
     def init_llm(self):
         if self.decoder_llm:
@@ -943,9 +928,15 @@ class MultimodalModelRunner:
                                    self.vision_model.image_dim_out)
                 visual_atts = None
             elif self.model_type == "phi-4-multimodal":
-                visual_features = self.vision_model.get_img_features(model_runner_input.to(str_dtype_to_torch(self.vision_precision)), other_vision_inputs['attention_mask'])
-                visual_features = self.vision_model.img_projection(visual_features)
-                visual_atts = torch.ones(visual_features.size()[:-1], dtype=torch.long).to(model_runner_input.device)
+                visual_features = self.vision_model.get_img_features(
+                    model_runner_input.to(
+                        str_dtype_to_torch(self.vision_precision)),
+                    other_vision_inputs['attention_mask'])
+                visual_features = self.vision_model.img_projection(
+                    visual_features)
+                visual_atts = torch.ones(visual_features.size()[:-1],
+                                         dtype=torch.long).to(
+                                             model_runner_input.device)
             else:
                 if self.cpp_e2e:
                     # If using E2E C++ runtime, visual_features will not be computed here in Python runtime.
@@ -1524,40 +1515,6 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
-    def get_embeddings(self, key_input, other_inputs, input_names, output_names, precision, encoder_session, stream, mode="vision"):
-        features = {
-            input_names[0]:
-            key_input.to(str_dtype_to_torch(precision)),
-        }
-        for key, tensor in other_inputs.items():
-            features.update({key: tensor})
-
-        tensor_info = [
-            TensorInfo(input_names[0],
-                       str_dtype_to_trt(precision), key_input.shape),
-        ]
-        for key, tensor in other_inputs.items():
-            tensor_info.append(
-                TensorInfo(key, torch_dtype_to_trt(tensor.dtype), tensor.shape))
-
-        output_info = encoder_session.infer_shapes(tensor_info)
-        encoder_session.set_shapes(features)
-        outputs = {
-            t.name:
-            torch.empty(tuple(t.shape),
-                        dtype=trt_dtype_to_torch(t.dtype),
-                        device=key_input.device)
-            for t in output_info
-        }
-
-        ok = encoder_session.run(features, outputs,
-                                            stream.cuda_stream)
-        assert ok, f"Runtime execution failed for {mode} encoder session"
-        stream.synchronize()
-
-        embeds = outputs[output_names[0]]
-        return embeds
-
     def get_visual_features(self, image, other_vision_inputs):
         visual_features = {
             self.vision_input_names[0]:
@@ -1600,7 +1557,9 @@ class MultimodalModelRunner:
         return image_embeds, image_atts
 
     def get_audio_features(self, audio, other_audio_inputs):
-        tmp_features, _ = self.audio_model.encoder(audio.to(str_dtype_to_torch(self.audio_precision)), other_audio_inputs['attention_mask'])
+        tmp_features, _ = self.audio_model.encoder(
+            audio.to(str_dtype_to_torch(self.audio_precision)),
+            other_audio_inputs['attention_mask'])
         speech_out = self.audio_model.audio_projection['speech'](tmp_features)
         vision_out = self.audio_model.audio_projection['vision'](tmp_features)
         return torch.cat((speech_out, vision_out), dim=-1)
