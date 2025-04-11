@@ -136,11 +136,10 @@ public:
 
         if (op.isRoPE())
         {
-            rotary_inv_freq_ptr = rotary_inv_freq.value().data_ptr<float>();
-        }
-
-        if (op.isRoPE() || op.isMLAEnabled())
-        {
+            if (rotary_inv_freq.has_value())
+            {
+                rotary_inv_freq_ptr = rotary_inv_freq.value().data_ptr<float>();
+            }
             rotary_cos_sin_ptr = static_cast<float2 const*>(rotary_cos_sin.value().data_ptr());
         }
 
