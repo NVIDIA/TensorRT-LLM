@@ -746,7 +746,7 @@ class CustomAllReduceHelper:
                 lamport_buffers_0.local_ptr,
                 lamport_buffers_1.local_ptr,
                 lamport_buffers_2.local_ptr,
-                size * mapping.tp_size,
+                lamport_buffers_size,
             )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
@@ -767,12 +767,13 @@ class CustomAllReduceHelper:
             mapping: Mapping,
             size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
+        force_deterministic = force_all_reduce_deterministic()
         is_p2p_supported = can_access_peer(mapping)
-        ipc_buffers_size = size * mapping.tp_size
+        ipc_buffers_size = size if force_deterministic else size * mapping.tp_size
         ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
         ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size,
                                  is_p2p_supported)
-        lamport_buffers_size = size * mapping.tp_size
+        lamport_buffers_size = 1 if force_deterministic else size * mapping.tp_size
         lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
                                     is_p2p_supported)
         rank = mapping.rank
