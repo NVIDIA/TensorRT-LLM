@@ -636,10 +636,16 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
+
+        if config.model_type == "llama4_text":
+           inter_size = config.intermediate_size_mlp
+        else:
+           inter_size = config.intermediate_size
+
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            bias=config.mlp_bias,
+            intermediate_size=inter_size,
+            bias=getattr(config, "mlp_bias", False),
             dtype=config.torch_dtype,
             config=model_config,
         )
@@ -1048,7 +1054,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
-                         bias=False,
+                         bias=getattr(config, "bias", False),
                          dtype=config.torch_dtype)
 
         self.midlayer = Eagle3LlamaDecoderLayer(model_config, 0)
@@ -1057,9 +1063,10 @@ class Eagle3LlamaDraftModel(DecoderModel):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-        self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
-                                            dtype=torch.int64),
-                                requires_grad=False)
+        if config.vocab_size != config.draft_vocab_size:
+            self.d2t = nn.Parameter(torch.empty((config.draft_vocab_size, ),
+                                                dtype=torch.int64),
+                                    requires_grad=False)
 
         if self.hidden_size_in != config.hidden_size:
             self.embed_tokens = Embedding(
