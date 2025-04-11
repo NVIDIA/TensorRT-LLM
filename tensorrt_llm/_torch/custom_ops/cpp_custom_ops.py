@@ -10,34 +10,55 @@ def _register_fake():
     @torch.library.register_fake("trtllm::allreduce")
     def _(
         input,
+        residual,
+        norm_weight,
+        scale,
+        bias,
         workspace,
-        reduce_fusion_inputs,
         group,
         strategy,
-        config,
         op,
         eps,
-        affine,
-        bias,
-        scale,
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
-        if op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
-            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
-            final_output = input.new_empty(fp4_shape, dtype=torch.uint8)
-            inter_output = torch.empty_like(input)
-            scale_output = input.new_empty(scale_shape, dtype=torch.uint8)
-            return [final_output, scale_output, inter_output]
-        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
-            final_output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
-            inter_output = torch.empty_like(input)
-            return [final_output, inter_output]
+        if op == int(AllReduceFusionOp.NONE):
+            return [torch.empty_like(input)]
         elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
-            final_output = torch.empty_like(input)
-            inter_output = torch.empty_like(input)
-            return [final_output, inter_output]
+            norm_out = torch.empty_like(input)
+            residual_out = torch.empty_like(input)
+            return [norm_out, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8):
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            residual_out = torch.empty_like(input)
+            return [quant_out, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8):
+            norm_out = torch.empty_like(input)
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            residual_out = torch.empty_like(input)
+            return [norm_out, quant_out, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4):
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            residual_out = torch.empty_like(input)
+            return [quant_fp4, scale_fp4, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
+            fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+            quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
+            scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
+            norm_out = torch.empty_like(input)
+            residual_out = torch.empty_like(input)
+            return [norm_out, quant_fp4, scale_fp4, residual_out]
         else:
             return [torch.empty_like(input)]
+
+    @torch.library.register_fake("trtllm::moe_allreduce")
+    def _(residual, norm_weight, moe_reduction_device_num_experts,
+          moe_reduction_scale_input, moe_reduction_active_experts_token_input,
+          moe_reduction_token_input, workspace, rank, nranks, eps):
+        norm_out = torch.empty_like(moe_reduction_token_input)
+        residual_out = torch.empty_like(residual)
+        return [norm_out, residual_out]
 
     @torch.library.register_fake("trtllm::allgather")
     def _(input, group):
@@ -183,7 +204,7 @@ def _register_fake():
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         residual = reduce_fusion_inputs[0]
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
             sf_vec_size = 16
             quant_shape, scale_shape = fp4_utils.get_fp4_shape(
                 input.shape, sf_vec_size)

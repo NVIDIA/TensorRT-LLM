@@ -778,7 +778,6 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
         DISPATCH_DTYPE(NRanks);                                                                                        \
     }
 
-    TLLM_CHECK(params.allreduce_in && params.residual_in && params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     bool fp32_acc = use_fp32_acc();
     DISPATCH_RANKS(2);

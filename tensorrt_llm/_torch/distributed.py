@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
-                                     AllReduceParams, AllReduceStrategy)
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -53,106 +53,12 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
         _thread_local.allreduce_workspaces = {}
     allreduce_workspaces = _thread_local.allreduce_workspaces
     if mapping not in allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_workspace(
+        ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
             CustomAllReduceHelper.max_workspace_size_auto(mapping.tp_size),
         )
         allreduce_workspaces[mapping] = (ipc_buffers, workspace)
     return allreduce_workspaces[mapping][1]
-
-
-def get_deepseek_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
-    if not hasattr(_thread_local, 'deepseek_allreduce_workspaces'):
-        _thread_local.deepseek_allreduce_workspaces = {}
-    deepseek_allreduce_workspaces = _thread_local.deepseek_allreduce_workspaces
-    if mapping not in deepseek_allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
-            mapping,
-            CustomAllReduceHelper.max_workspace_size_auto(mapping.tp_size),
-        )
-        deepseek_allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-    return deepseek_allreduce_workspaces[mapping][1]
-
-
-def allreduce(
-    input: torch.Tensor,
-    workspace: Optional[torch.LongTensor],
-    parallel_config: ParallelConfig,
-    strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-    config: AllReduceConfig = AllReduceConfig(0),
-    all_reduce_params: Optional[AllReduceParams] = None
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor]]:
-    '''
-    Add an operation that performs a collective all-reduce.
-
-    The input tensors in the different ranks must have the same shape.
-    The output tensor will have that same shape with the input tensor.
-    The output tensor will be replicated among the TP group.
-    Noting that it is not an in-place operation like torch.distributed.all_reduce.
-
-    That operation is implemented using a torch op that wraps the NCCL all-reduce
-    collective operation and custom one-shot/two-shot allreduce kernels. See
-    https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce
-    for details.
-
-    Args:
-        input (Tensor): The input tensor.
-        parallel_config (ParallelConfig):  The parallel config.
-        strategy (AllReduceStrategy): NCCL delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
-            AUTO chooses amongst the three based on a message-size heuristic.
-        config (AllReduceConfig): The config for custom allreduce kernels.
-        all_reduce_params (AllReduceParams): The parameters for the fused ops into the allreduce op.
-    Returns:
-        The reduced tensor and an optional intermediate tensor if fused.
-    '''
-    if parallel_config.tensor_parallel_size == 1 or (
-            all_reduce_params is not None
-            and all_reduce_params.enable_allreduce == False):
-        return input
-
-    mapping = Mapping(
-        world_size=parallel_config.parallel_size,
-        tp_size=parallel_config.tensor_parallel_size,
-        pp_size=parallel_config.pipeline_parallel_size,
-        rank=parallel_config.parallel_rank,
-        gpus_per_node=parallel_config.gpus_per_node,
-    )
-
-    if all_reduce_params is None:
-        all_reduce_params = AllReduceParams()
-    is_fused = all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM or \
-        all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8 or \
-        all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
-    reduce_fusion_inputs = []
-    if is_fused:
-        if all_reduce_params.has_bias() == 1:
-            reduce_fusion_inputs.append(all_reduce_params.bias)
-        reduce_fusion_inputs.append(all_reduce_params.residual)
-        if all_reduce_params.has_affine() == 1:
-            reduce_fusion_inputs.append(all_reduce_params.norm_weight)
-        if all_reduce_params.has_scale() == 1:
-            reduce_fusion_inputs.append(all_reduce_params.scale)
-
-    out = torch.ops.trtllm.allreduce(
-        input,
-        workspace,
-        reduce_fusion_inputs,
-        mapping.tp_group,
-        int(strategy),
-        int(config),
-        int(all_reduce_params.fusion_op),
-        float(all_reduce_params.eps),
-        all_reduce_params.has_affine(),
-        all_reduce_params.has_bias(),
-        all_reduce_params.has_scale(),
-    )
-    if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
-        return out[0], out[1], out[2]
-    elif is_fused:
-        return out[0], out[1]
-    else:
-        return out[0]
 
 
 def userbuffers_allreduce_finalize(
@@ -254,6 +160,18 @@ class AllReduce(nn.Module):
                  parallel_config: ParallelConfig,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
         super().__init__()
+        """
+        AllReduce is a module that performs an all-reduce operation on a tensor.
+
+        Args:
+            parallel_config (ParallelConfig):  The parallel config.
+            strategy (AllReduceStrategy):
+                Three types of all-reduce strategies are supported:
+                UB: AllReduce uses user-buffer based all-reduce kernel.
+                NCCL: AllReduce delegates all-reduce to NCCL MIN_LATENCY mode kernel.
+                MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
+                AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+        """
 
         self.parallel_config = parallel_config
         self.tp_size = self.parallel_config.tensor_parallel_size
@@ -263,28 +181,61 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         if self.tp_size > 1:
-            mapping = Mapping(
+            self.mapping = Mapping(
                 world_size=self.parallel_config.parallel_size,
                 tp_size=self.tp_size,
                 pp_size=self.parallel_config.pipeline_parallel_size,
                 rank=self.rank,
                 gpus_per_node=self.gpus_per_node,
             )
-            if self.strategy != AllReduceStrategy.UB:
-                self.workspace = get_allreduce_workspace(mapping)
+            if self.strategy != AllReduceStrategy.UB and self.strategy != AllReduceStrategy.NCCL:
+                self.workspace = get_allreduce_workspace(self.mapping)
 
     def forward(
         self,
         input: torch.Tensor,
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
-    ) -> torch.Tensor:
-        output = allreduce(input,
-                           self.workspace,
-                           self.parallel_config,
-                           all_reduce_params=all_reduce_params,
-                           strategy=self.strategy)
-        return output
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        '''
+        The input tensors in the different ranks must have the same shape.
+        The output tensor will have that same shape with the input tensor.
+        The output tensor will be replicated among the TP group.
+        Note that it is not an in-place operation like torch.distributed.all_reduce.
+
+        That operation is implemented using a torch op that wraps the NCCL all-reduce
+        collective operation and custom one-shot/two-shot allreduce kernels. See
+        https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce
+        for details.
+
+        Args:
+            input (Tensor): The input tensor.
+            all_reduce_params (AllReduceParams): The parameters for the fused ops into the allreduce op.
+        Returns:
+            The reduced tensor and an optional intermediate tensor if fused.
+        '''
+        if self.tp_size == 1 or (all_reduce_params is not None and
+                                 all_reduce_params.enable_allreduce == False):
+            return input
+
+        # Assume using no fusion allreduce here
+        if all_reduce_params is None:
+            all_reduce_params = AllReduceParams()
+
+        output = torch.ops.trtllm.allreduce(
+            input=input,
+            residual=all_reduce_params.residual,
+            norm_weight=all_reduce_params.norm_weight,
+            scale=all_reduce_params.scale,
+            bias=all_reduce_params.bias,
+            workspace=self.workspace,
+            group=self.mapping.tp_group,
+            strategy=self.strategy,
+            op=all_reduce_params.fusion_op,
+            eps=all_reduce_params.eps,
+        )
+
+        return output if len(output) > 1 else output[0]
 
 
 class DeepseekAllReduce(nn.Module):
@@ -305,7 +256,7 @@ class DeepseekAllReduce(nn.Module):
                 rank=self.rank,
                 gpus_per_node=self.gpus_per_node,
             )
-            self.workspace = get_deepseek_allreduce_workspace(mapping)
+            self.workspace = get_allreduce_workspace(mapping)
 
     def forward(
         self,
@@ -313,7 +264,7 @@ class DeepseekAllReduce(nn.Module):
         reduce_fusion_inputs: List[torch.Tensor],
         eps: float,
         fusion_op: AllReduceFusionOp,
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         """
         hidden_states: hidden_states of the model
         reduce_fusion_inputs: [residual, norm_weight, scale (if using FP4 quantization)]
@@ -321,7 +272,6 @@ class DeepseekAllReduce(nn.Module):
         fusion_op: AllReduceFusionOp Type, currently supports RMSNorm:
           * RESIDUAL_RMS_NORM: allreduce + residual + Norm
           * RESIDUAL_RMS_NORM_QUANT_NVFP4: allreduce + residual + Norm + fp4 quantization
-
         output:
           * [hidden_states, residual] if using RESIDUAL_RMS_NORM fusion_op
           * [act_fp4, act_sf, residual] if using RESIDUAL_RMS_NORM_QUANT_NVFP4 fusion_op
