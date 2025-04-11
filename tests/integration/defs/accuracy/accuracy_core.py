@@ -34,7 +34,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
-from ..trt_test_alternative import check_call, exists, makedirs
+from ..trt_test_alternative import check_call, exists
 
 
 def compute_threshold(num_samples: int,
@@ -306,14 +306,11 @@ class CliFlowAccuracyTestHarness:
 
     @pytest.fixture(autouse=True, scope="function")
     def setup_method(self):
-        model_workspace = f"{self.llm_venv.get_working_directory()}/{self.MODEL_NAME}"
-        if not exists(model_workspace):
-            makedirs(model_workspace)
-        with tempfile.TemporaryDirectory(dir=model_workspace) as workspace:
+        with tempfile.TemporaryDirectory(
+                prefix=self.MODEL_NAME.replace("/", "-"),
+                dir=self.llm_venv.get_working_directory()) as workspace:
             self.ckpt_dir = f"{workspace}/cmodels"
-            makedirs(self.ckpt_dir)
             self.engine_dir = f"{workspace}/engines"
-            makedirs(self.engine_dir)
             yield
 
     @property
