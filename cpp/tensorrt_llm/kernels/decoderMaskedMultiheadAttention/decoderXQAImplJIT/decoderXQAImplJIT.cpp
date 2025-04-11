@@ -251,7 +251,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the xqaParams.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
         float const* rotary_inv_freq_buf = xqaParams.rotary_embedding_inv_freq_cache;
-        if (decoder_params.isBuildDecoderInfoKernelNeeded())
+        if (decoder_params.isBuildDecoderInfoKernelNeeded() || xqaParams.multi_query_tokens)
         {
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             invokeBuildDecoderInfo(decoder_params, stream);
