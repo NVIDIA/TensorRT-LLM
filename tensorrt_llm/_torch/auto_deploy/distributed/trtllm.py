@@ -7,10 +7,10 @@ try:
     from ...distributed import AllReduce, allgather
     from ...modules.linear import AllReduceFusionOp, AllReduceParams, ParallelConfig
 
-    def trtllm_allgather(tensor, dim):
+    def trtllm_allgather(tensor, dim, all_rank_split_size=None):
         rank, world_size = get_rank_world_size()
         p_config = ParallelConfig(tensor_parallel_size=world_size, tensor_parallel_rank=rank)
-        return allgather(tensor, p_config, gather_dim=dim)
+        return allgather(tensor, p_config, gather_dim=dim, all_rank_split_size=all_rank_split_size)
 
     def trtllm_allreduce(tensor, op, all_reduce_params=None):
         rank, world_size = get_rank_world_size()
@@ -44,7 +44,7 @@ try:
     TRTLLM_OP_AVAILABLE = True
 except ImportError:
 
-    def trtllm_allgather(tensor, dim):
+    def trtllm_allgather(tensor, dim, all_rank_split_size=None):
         raise ImportError("TRT-LLM is not available.")
 
     def trtllm_allreduce(tensor, op):

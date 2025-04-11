@@ -487,54 +487,18 @@ class FusedMoE(nn.Module):
         self.register_parameter("w2_weight", w2_weight)
         self._weights_created = True
 
-    def all_gather(self, input_tensors):
-        flatten_inputs = []
-        shapes = []
-        dtypes = []
-        lengths = []
-        start_indices = []
-        start_idx = 0
-        for input_tensor in input_tensors:
-            if input_tensor is None:
-                continue
-            shapes.append(input_tensor.shape)
-            dtypes.append(input_tensor.dtype)
-            lengths.append(input_tensor.nbytes)
-            start_indices.append(start_idx)
-            start_idx += input_tensor.nbytes
-            flatten_input = input_tensor.view(-1).view(torch.uint8)
-            flatten_inputs.append(flatten_input)
-
-        if len(flatten_inputs) == 0:
-            return input_tensors
-
-        flatten_outputs = allgather(
-            torch.cat(flatten_inputs),
-            self.parallel_config,
-            gather_dim=0,
-        ).view(self.parallel_size, -1)
-
-        outputs = []
-        for input_tensor in input_tensors:
-            if input_tensor is None:
-                output = None
-            else:
-                dtype = dtypes.pop(0)
-                nbytes = lengths.pop(0)
-                start_idx = start_indices.pop(0)
-                shape = [self.parallel_size, *shapes.pop(0)]
-                output = flatten_outputs[:, start_idx:start_idx +
-                                         nbytes].view(dtype).view(*shape)
-            outputs.append(output)
-        return outputs
-
-    def reducescatter_or_allreduce(self, inputs):
+    def reducescatter_or_allreduce(
+        self,
+        inputs,
+        all_rank_split_size: Optional[List[int]] = None,
+    ):
         outputs = inputs
         if self.parallel_size > 1:
             if self.use_dp:
                 outputs = reducescatter(inputs,
                                         self.parallel_config,
-                                        scatter_dim=0)
+                                        scatter_dim=0,
+                                        all_rank_split_size=all_rank_split_size)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
@@ -545,6 +509,7 @@ class FusedMoE(nn.Module):
         router_logits: torch.Tensor,
         min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
+        all_rank_split_size: Optional[List[int]] = None,
     ) -> torch.Tensor:
 
         if isinstance(x, Fp4QuantizedTensor):
@@ -593,14 +558,18 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ):
-            x_sf, token_selected_experts, token_final_scales = self.all_gather(
-                [x_sf, token_selected_experts, token_final_scales])
-            x = allgather(x, self.parallel_config, gather_dim=0)
-            token_selected_experts = token_selected_experts.flatten(
-                0, 1).contiguous()
-            token_final_scales = token_final_scales.flatten(0, 1).contiguous()
-
-            if x_sf is not None:
+            if x_sf is None:
+                x, token_selected_experts, token_final_scales = allgather(
+                    [x, token_selected_experts, token_final_scales],
+                    self.parallel_config,
+                    gather_dim=0,
+                    all_rank_split_size=all_rank_split_size)
+            else:
+                x, x_sf, token_selected_experts, token_final_scales = allgather(
+                    [x, x_sf, token_selected_experts, token_final_scales],
+                    self.parallel_config,
+                    gather_dim=0,
+                    all_rank_split_size=all_rank_split_size)
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
@@ -625,10 +594,8 @@ class FusedMoE(nn.Module):
             assert not self.reduce_results
             return final_hidden_states
 
-        if self.reduce_results and self.parallel_size > 1:
-            return self.all_reduce(final_hidden_states)
-        else:
-            return final_hidden_states[0]
+        return final_hidden_states if isinstance(
+            final_hidden_states, torch.Tensor) else final_hidden_states[0]
 
     def forward(
         self,
@@ -637,6 +604,7 @@ class FusedMoE(nn.Module):
         min_latency_mode: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_split_size: Optional[List[int]] = None,
     ) -> torch.Tensor:
         max_chunk_size = self.moe_max_num_tokens
         if self.use_dp:
@@ -655,9 +623,14 @@ class FusedMoE(nn.Module):
             ), "min_latency_mode must be used with a single chunk and reduce_results must be False"
 
         if num_chunks == 1:
-            outputs = self.forward_chunk(x, router_logits, min_latency_mode,
-                                         output_dtype)
-            outputs = self.reducescatter_or_allreduce(outputs)
+            outputs = self.forward_chunk(
+                x,
+                router_logits,
+                min_latency_mode,
+                output_dtype,
+                all_rank_split_size=all_rank_split_size)
+            outputs = self.reducescatter_or_allreduce(
+                outputs, all_rank_split_size=all_rank_split_size)
         else:
             val_div = x.shape[0] // num_chunks
             val_mod = x.shape[0] % num_chunks
@@ -674,23 +647,32 @@ class FusedMoE(nn.Module):
                     zip(x_list, router_logits_list)):
                 if idx_chunk % 2 == 0:
                     with torch.cuda.stream(self.aux_stream):
-                        outputs = self.forward_chunk(x, router_logits)
+                        outputs = self.forward_chunk(
+                            x,
+                            router_logits,
+                            all_rank_split_size=all_rank_split_size)
                     if idx_chunk > 0:
                         outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1])
+                            outputs_list[-1],
+                            all_rank_split_size=all_rank_split_size)
                 else:
-                    outputs = self.forward_chunk(x, router_logits)
+                    outputs = self.forward_chunk(
+                        x,
+                        router_logits,
+                        all_rank_split_size=all_rank_split_size)
                     with torch.cuda.stream(self.aux_stream):
                         outputs_list[-1] = self.reducescatter_or_allreduce(
-                            outputs_list[-1])
+                            outputs_list[-1],
+                            all_rank_split_size=all_rank_split_size)
                 outputs_list.append(outputs)
             if num_chunks % 2 == 0:
                 outputs_list[-1] = self.reducescatter_or_allreduce(
-                    outputs_list[-1])
+                    outputs_list[-1], all_rank_split_size=all_rank_split_size)
             else:
                 with torch.cuda.stream(self.aux_stream):
                     outputs_list[-1] = self.reducescatter_or_allreduce(
-                        outputs_list[-1])
+                        outputs_list[-1],
+                        all_rank_split_size=all_rank_split_size)
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.MoeChunkingOverlap].record()
             self.event_dict[EventType.MoeChunkingOverlap].wait()
