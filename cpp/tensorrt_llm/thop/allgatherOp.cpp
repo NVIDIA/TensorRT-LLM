@@ -63,12 +63,8 @@ public:
         std::vector<int64_t> outputShape = input.sizes().vec();
         if (all_rank_split_size.has_value())
         {
-            int64_t total_size = 0;
-            for (auto const& split_size : all_rank_split_size.value())
-            {
-                total_size += split_size;
-            }
-            outputShape[0] = total_size;
+            outputShape[0] = std::accumulate(
+                all_rank_split_size.value().begin(), all_rank_split_size.value().end(), 0, std::plus<>{});
         }
         else
         {
@@ -77,11 +73,7 @@ public:
         auto output = torch::empty(outputShape, input.options());
         if (all_rank_split_size.has_value())
         {
-            size_t numel_base = 1;
-            for (auto it = outputShape.cbegin() + 1; it != outputShape.cend(); ++it)
-            {
-                numel_base *= *it;
-            }
+            size_t numel_base = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
             int64_t split_offset = 0;
             ncclGroupStart();
             for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)

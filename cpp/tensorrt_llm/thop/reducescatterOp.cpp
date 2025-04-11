@@ -81,11 +81,7 @@ public:
         auto output = torch::empty(outputShape, input.options());
         if (all_rank_split_size.has_value())
         {
-            size_t numel_base = 1;
-            for (auto it = outputShape.cbegin() + 1; it != outputShape.cend(); ++it)
-            {
-                numel_base *= *it;
-            }
+            size_t numel_base = std::accumulate(outputShape.cbegin() + 1, outputShape.cend(), 1, std::multiplies<>{});
             int64_t split_offset = 0;
             ncclGroupStart();
             for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
