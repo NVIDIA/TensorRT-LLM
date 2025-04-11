@@ -677,18 +677,19 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
     if (!fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         error "There is not results.xml file, skip the rerun step"
     }
-    failSignaturesList = trtllm_utils.getFailSignaturesList()
 
     // Generate rerun test lists
+    failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
         python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
         generate_rerun_tests_list \
-        ${WORKSPACE}/${stageName}/ \
-        ${WORKSPACE}/${stageName}/results.xml
+        --output-dir=${WORKSPACE}/${stageName}/ \
+        --input-file=${WORKSPACE}/${stageName}/results.xml \
+        --fail-signatures=${failSignaturesList}
     """
 
-    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure pattern),
-    // fail the build immediately without attempting any reruns
+    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
+    // fail the stage immediately without attempting any reruns
     rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
@@ -732,23 +733,22 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
     }
 
     // generate rerun report
+    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
         python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
         generate_rerun_report \
-        ${WORKSPACE}/${stageName}/rerun_results.xml \
-        ${WORKSPACE}/${stageName}/results.xml \
-        ${WORKSPACE}/${stageName}/rerun_results_1.xml \
-        ${WORKSPACE}/${stageName}/rerun_results_2.xml
+        --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
+        --input-files=${inputFiles.join(",")}
     """
 
     // Update original results xml file with rerun results xml files for junit
     sh """
         python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
         merge_junit_xmls \
-        ${WORKSPACE}/${stageName}/results.xml \
-        ${WORKSPACE}/${stageName}/results.xml \
-        ${WORKSPACE}/${stageName}/rerun_results_1.xml \
-        ${WORKSPACE}/${stageName}/rerun_results_2.xml \
+        --output-file=${WORKSPACE}/${stageName}/results.xml \
+        --input-files=${inputFiles.join(",")} \
         --deduplicate
     """
 

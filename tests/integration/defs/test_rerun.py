@@ -1,6 +1,7 @@
 import os
 import sys
 import xml.etree.ElementTree as ET
+import argparse
 
 
 def parse_name(name, filename):
@@ -11,7 +12,7 @@ def parse_name(name, filename):
         return filename + "::" + name
 
 
-def generate_rerun_tests_list(outdir, xml_filename):
+def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
     # Generate rerun test lists:
     # 1. Parse the test results xml file
     # 2. For failed tests:
@@ -19,9 +20,6 @@ def generate_rerun_tests_list(outdir, xml_filename):
     #    - If test duration > 5 min and <= 10 min: add to rerun_1.txt (will rerun 1 time)
     #    - If test duration > 10 min but contains fail signatures in error message: add to rerun_1.txt
     #    - If test duration > 10 min and no known failure signatures: add to rerun_0.txt (will not rerun)
-
-    # todo: change
-    failSignaturesList = ["bad luck"]
 
     rerun_0_filename = os.path.join(outdir, 'rerun_0.txt')
     rerun_1_filename = os.path.join(outdir, 'rerun_1.txt')
@@ -383,11 +381,36 @@ def generate_rerun_report(output_filename, input_filenames):
 
 if __name__ == '__main__':
     if (sys.argv[1] == "generate_rerun_tests_list"):
-        generate_rerun_tests_list(sys.argv[2], sys.argv[3])
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--output-dir', required=True, help='Output directory for rerun test lists')
+        parser.add_argument('--input-file', required=True, help='Input XML file containing test results')
+        parser.add_argument('--fail-signatures', required=True, help='List of failure signatures to match')
+        args = parser.parse_args(sys.argv[2:])
+        failSignaturesList = args.fail_signatures.split(',')
+        generate_rerun_tests_list(args.output_dir, args.input_file, failSignaturesList)
+
     elif (sys.argv[1] == "merge_junit_xmls"):
-        deduplicate = "--deduplicate" in sys.argv
-        merge_junit_xmls(sys.argv[2], sys.argv[3:], deduplicate=deduplicate)
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--output-file', required=True, help='Output XML file')
+        parser.add_argument('--input-files', required=True, help='Input XML files to merge')
+        parser.add_argument('--deduplicate', action='store_true', help='Deduplicate test cases')
+        args = parser.parse_args(sys.argv[2:])
+        input_files = args.input_files.split(',')
+        deduplicate = args.deduplicate
+        merge_junit_xmls(args.output_file, input_files, deduplicate)
+
     elif (sys.argv[1] == "xml_to_html"):
-        xml_to_html(sys.argv[2], sys.argv[3])
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--input-file', required=True, help='Input XML file')
+        parser.add_argument('--output-file', required=True, help='Output HTML file')
+        parser.add_argument('--sort-by-name', action='store_true', help='Sort test cases by name')
+        args = parser.parse_args(sys.argv[2:])
+        xml_to_html(args.input_file, args.output_file, args.sort_by_name)
+
     elif (sys.argv[1] == "generate_rerun_report"):
-        generate_rerun_report(sys.argv[2], sys.argv[3:])
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--output-file', required=True, help='Output XML file')
+        parser.add_argument('--input-files', required=True, help='Input XML files to merge')
+        args = parser.parse_args(sys.argv[2:])
+        input_files = args.input_files.split(',')
+        generate_rerun_report(args.output_file, input_files)
