@@ -6,6 +6,7 @@ from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_mamba_hybrid import MambaHybridForCausalLM
+from .modeling_mistral import MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_nas import NemotronNASForCausalLM
@@ -22,6 +23,7 @@ __all__ = [
     "BertForSequenceClassification",
     "DeepseekV3ForCausalLM",
     "LlamaForCausalLM",
+    "MistralForCausalLM",
     "LlavaNextModel",
     "MambaHybridForCausalLM",
     "MixtralForCausalLM",
@@ -39,6 +41,7 @@ __all__ = [
 
 if transformers.__version__ >= "4.45.1":
     from .modeling_mllama import MllamaForConditionalGeneration  # noqa
+
     __all__.append("MllamaForConditionalGeneration")
 else:
     print(
