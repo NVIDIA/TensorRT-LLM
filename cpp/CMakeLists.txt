@@ -51,36 +51,6 @@ else()
 endif()
 
 if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/batch_manager/CMakeLists.txt")
-  set(BUILD_BATCH_MANAGER_DEFAULT ON)
-else()
-  set(BUILD_BATCH_MANAGER_DEFAULT OFF)
-endif()
-
-option(BUILD_BATCH_MANAGER "Build batch manager from source"
-       ${BUILD_BATCH_MANAGER_DEFAULT})
-
-if(BUILD_BATCH_MANAGER)
-  message(STATUS "Building batch manager")
-else()
-  message(STATUS "Importing batch manager")
-endif()
-
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/executor/CMakeLists.txt")
-  set(BUILD_EXECUTOR_DEFAULT ON)
-else()
-  set(BUILD_EXECUTOR_DEFAULT OFF)
-endif()
-
-option(BUILD_EXECUTOR "Build executor from source" ${BUILD_EXECUTOR_DEFAULT})
-
-if(BUILD_EXECUTOR)
-  message(STATUS "Building executor")
-else()
-  message(STATUS "Importing executor")
-endif()
-
-if(EXISTS
    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
 )
   set(BUILD_NVRTC_WRAPPER_DEFAULT ON)

@@ -1667,7 +1667,8 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useEagle()
                 .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(std::nullopt), // freeGpuMemoryFraction
