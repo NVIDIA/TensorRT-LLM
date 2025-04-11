@@ -57,6 +57,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_bfloat16(self, attn_backend, torch_compile):
+        if torch_compile:
+            pytest.skip("https://nvbugs/5216737")
         pytorch_config = PyTorchConfig(
             torch_compile_enabled=torch_compile,
             cuda_graph_padding_enabled=torch_compile,
@@ -82,6 +84,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "Pipeline parallel with torch.compile is not supported yet.\n"
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
                 "discarded at graph breaks.")
+        if torch_compile:
+            pytest.skip("https://nvbugs/5216737")
         pytorch_config = PyTorchConfig(
             torch_compile_enabled=torch_compile,
             cuda_graph_padding_enabled=torch_compile,
@@ -103,6 +107,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     @parametrize_with_ids("fp8kv", [False, True])
     def test_fp8(self, fp8kv, attn_backend, torch_compile):
+        if torch_compile:
+            pytest.skip("https://nvbugs/5216737")
         quant_config = QuantConfig(QuantAlgo.FP8)
         pytorch_config = PyTorchConfig(
             torch_compile_enabled=torch_compile,
@@ -134,6 +140,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                              ids=["tp4", "tp2pp2"])
     def test_fp8_4gpus(self, tp_size, pp_size, fp8kv, attn_backend,
                        torch_compile):
+        if torch_compile:
+            pytest.skip("https://nvbugs/5216737")
         if pp_size > 1:
             # https://nvbugspro.nvidia.com/bug/5214235
             pytest.skip(
