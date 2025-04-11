@@ -99,6 +99,7 @@ def llm_test_harness(model_dir: str,
 
     tp_size = llm_kwargs.get('tensor_parallel_size', 1)
     pp_size = llm_kwargs.get('pipeline_parallel_size', 1)
+    backend = llm_kwargs.get('backend', None)
     world_size = tp_size * pp_size
     if world_size > torch.cuda.device_count():
         pytest.skip(
@@ -109,7 +110,11 @@ def llm_test_harness(model_dir: str,
     if tokenizer is None:
         tokenizer = model_dir
 
-    llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
+    if backend == "pytorch":
+        from tensorrt_llm._torch import LLM as LLM_torch
+        llm = LLM_torch(model_dir, tokenizer=tokenizer, **llm_kwargs)
+    else:
+        llm = LLM(model_dir, tokenizer=tokenizer, **llm_kwargs)
     outputs = llm.generate(inputs, sampling_params=sampling_params)
     print(outputs)
     check_output(outputs, references, similar_threshold=similar_threshold)
@@ -983,12 +988,18 @@ class MyLogitsProcessor(LogitsProcessor):
 
     def __call__(self, req_id: int, logits: torch.Tensor, ids: List[List[int]],
                  stream_ptr: int, client_id: Optional[int]):
+        if stream_ptr is None:
+            # for pytorch backend
+            logits[:] = float("-inf")
+            logits[..., self.biased_word_id] = 0
+            return logits
+
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
             logits[:] = float("-inf")
             logits[..., self.biased_word_id] = 0
 
 
-def tinyllama_logits_processor_test_harness(**llm_kwargs):
+def tinyllama_logits_processor_test_harness(backend: str, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     sampling_params = SamplingParams(
@@ -999,13 +1010,14 @@ def tinyllama_logits_processor_test_harness(**llm_kwargs):
         prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        backend=backend,
         **llm_kwargs)
 
 
-@force_ampere
 @pytest.mark.part0
-def test_tinyllama_logits_processor():
-    tinyllama_logits_processor_test_harness()
+@pytest.mark.parametrize("backend", [None, 'pytorch'])
+def test_tinyllama_logits_processor(backend: str):
+    tinyllama_logits_processor_test_harness(backend)
 
 
 class MyBatchedLogitsProcessor(BatchedLogitsProcessor):

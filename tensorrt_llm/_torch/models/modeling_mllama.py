@@ -31,7 +31,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
-from ..modules.logits_procesor import LogitsProcessor
+from ..modules.logits_processor import LogitsProcessor
 from .modeling_llama import LlamaAttention
 from .modeling_utils import duplicate_kv_weight, register_auto_model
 

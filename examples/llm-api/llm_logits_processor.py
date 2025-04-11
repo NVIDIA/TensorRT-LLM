@@ -66,7 +66,8 @@ class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
 def main():
 
-    # Batched logits processor should be specified when initializing LLM.
+    # Batched logits processor (only supported in TensorRT backend)
+    # should be specified when initializing LLM ().
     llm = LLM(
         model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))
