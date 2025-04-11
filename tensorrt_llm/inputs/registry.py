@@ -95,7 +95,7 @@ def create_input_processor(model_path_or_dir: str, tokenizer):
         config = ModelConfig.from_pretrained(model_path_or_dir,
                                              trust_remote_code=True)
         model_config = config.pretrained_config
-    except ValueError:
+    except (ValueError, EnvironmentError):
         config = None
 
     if model_config is not None:

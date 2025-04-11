@@ -14,18 +14,15 @@ pid=$(ps -o pid= -p $$ | tr -d ' ')
 export TLLM_SPAWN_PROXY_PROCESS=1
 export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="ipc:///tmp/trtllm-ipc-${pid}"
 
-function mpi_size {
-    if [ -n "$SLURM_JOB_NUM_NODES" ]; then
-        echo "$SLURM_JOB_NUM_NODES"
+function mpi_world_size {
+    if [ -n "$SLURM_NTASKS" ]; then
+        echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
     else
         echo "1"
     fi
 }
-
-export tllm_mpi_size=$(mpi_size)
-log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     log_stderr "rank${mpi_rank} run ${task_with_command} in background"
@@ -55,9 +52,10 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         $task_with_command
     ) &
 
-    log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_size) ..."
+    log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
+    log_stderr "rank0 host: $HOSTNAME"
     python3 -m tensorrt_llm.llmapi.mgmn_leader_node
 else
-    log_stderr "rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_size) ..."
+    log_stderr "rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     python3 -m tensorrt_llm.llmapi.mgmn_worker_node
 fi

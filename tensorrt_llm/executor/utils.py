@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple
 
+from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
@@ -32,6 +33,8 @@ if PERIODICAL_RESP_IN_AWAIT:
 
 def create_mpi_comm_session(
         n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
+    assert mpi_rank(
+    ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
