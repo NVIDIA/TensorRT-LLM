@@ -10,8 +10,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams)
-from .vanilla import VanillaAttention
+                        RopeParams, dummy_forward)
 
 
 @dataclass(kw_only=True, init=False)
@@ -661,7 +660,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                 self.head_dim,
                                 dtype=q.dtype,
                                 device=q.device)
-            output = VanillaAttention.dummy_forward(q, k, v)
+            output = dummy_forward(q, k, v)
             if self.head_dim != self.v_head_dim:
                 output = output[..., :self.num_kv_heads *
                                 self.v_head_dim].contiguous()

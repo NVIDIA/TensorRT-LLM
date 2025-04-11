@@ -12,8 +12,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
-from .vanilla import VanillaAttention
+                        PredefinedAttentionMask, dummy_forward)
 
 try:
     check_cuda_arch()
@@ -472,7 +471,7 @@ def forward_pattern(
         q = q.view(1, -1, num_heads, head_dim)
         k = k.view(1, -1, num_kv_heads, head_dim)
         v = v.view(1, -1, num_kv_heads, head_dim)
-        return VanillaAttention.dummy_forward(q, k, v)
+        return dummy_forward(q, k, v)
 
     assert isinstance(
         metadata,
@@ -548,7 +547,6 @@ def forward_pattern(
 
 
 @forward_pattern.register_fake
-@staticmethod
 def _(
     q: torch.Tensor,
     k: torch.Tensor,
