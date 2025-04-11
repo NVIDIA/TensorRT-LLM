@@ -624,11 +624,16 @@ class FusedMoE(nn.Module):
         if min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
+        else:
+            # Custom op requires all inputs are in the same type.
+            # Only in min_latency_mode, the output is a list of tensors.
+            # Otherwise, the output should be unpacked as a single tensor.
+            final_hidden_states = final_hidden_states[0]
 
         if self.reduce_results and self.parallel_size > 1:
             return self.all_reduce(final_hidden_states)
         else:
-            return final_hidden_states[0]
+            return final_hidden_states
 
     def forward(
         self,
