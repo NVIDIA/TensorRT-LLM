@@ -204,7 +204,7 @@ def _register_fake():
     ):
         from tensorrt_llm.functional import AllReduceFusionOp
         residual = reduce_fusion_inputs[0]
-        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4 or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
             sf_vec_size = 16
             quant_shape, scale_shape = fp4_utils.get_fp4_shape(
                 input.shape, sf_vec_size)

@@ -165,8 +165,12 @@ class AllReduce(nn.Module):
 
         Args:
             parallel_config (ParallelConfig):  The parallel config.
-            strategy (AllReduceStrategy): AllReduce delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
-                AUTO chooses amongst the three based on a message-size heuristic.
+            strategy (AllReduceStrategy):
+                Three types of all-reduce strategies are supported:
+                UB: AllReduce uses user-buffer based all-reduce kernel.
+                NCCL: AllReduce delegates all-reduce to NCCL MIN_LATENCY mode kernel.
+                MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
+                AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
         """
 
         self.parallel_config = parallel_config

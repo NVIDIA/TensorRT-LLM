@@ -108,16 +108,15 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             trtllm_allreduce_default = CallFunction(
                 torch.ops.trtllm.allreduce.default,
                 input_node,
-                Ignored(), [KeywordArg('residual_in'),
-                            KeywordArg('gamma')],
+                KeywordArg('residual_in'),
+                KeywordArg('gamma'),
+                None,
+                Ignored(),
+                Ignored(),
                 mapping.tp_group,
                 strategy,
-                Ignored(),
                 fusion,
                 KeywordArg('eps'),
-                True,
-                False,
-                False,
                 _users=2)
             allreduce_output = CallFunction(getitem, trtllm_allreduce_default,
                                             0)
@@ -153,10 +152,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             ):
                 input = torch.ops.trtllm.copy_to_userbuffers(input)
                 all_reduce_output = torch.ops.trtllm.allreduce(
-                    input, None, [residual_in, gamma, scale], mapping.tp_group,
-                    int(AllReduceStrategy.UB), 0,
-                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4), eps,
-                    True, False, True)
+                    input, residual_in, gamma, scale, None, None,
+                    mapping.tp_group, int(AllReduceStrategy.UB),
+                    int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4), eps)
                 finalize_output = torch.ops.trtllm.userbuffers_allreduce_finalize(
                     all_reduce_output[-1], False)
                 return all_reduce_output[0], all_reduce_output[
@@ -452,8 +450,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass]):
             ):
                 all_reduce_output = torch.ops.trtllm.allreduce(
                     input, sharded_residual, gamma, scale, None, None,
-                    mapping.tp_group, int(AllReduceStrategy.UB),
-                    fusion_op, eps)
+                    mapping.tp_group, int(AllReduceStrategy.UB), fusion_op, eps)
                 return all_reduce_output
 
             register_replacement(
