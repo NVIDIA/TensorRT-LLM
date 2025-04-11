@@ -657,9 +657,13 @@ def collectTestResults(pipeline, testFilter)
                     echo "Test coverage is skipped because there is no test data file."
                     return
                 }
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
                 sh "coverage --version"
 
+                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                 sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
                 def coverageConfigFile = "cov/.coveragerc"
                 sh """
