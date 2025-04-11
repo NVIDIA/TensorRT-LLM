@@ -1563,6 +1563,19 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
+        ##################################################################
+        model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map='cpu')
+        vision_model = model.model.embed_tokens_extend.image_embed
+        vision_model = vision_model.to(self.device, torch.float16).eval()
+        tmp_features = vision_model.get_img_features(visual_features['input'], visual_features['attention_mask'])
+        alt_features = vision_model.img_projection(tmp_features)
+        image_embeds = alt_features
+        ##################################################################
+
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -1600,6 +1613,22 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         audio_embeds = audio_outputs[self.audio_output_names[0]]
+
+        ############################################################
+        model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map='cpu')
+        audio_model = model.model.embed_tokens_extend.audio_embed
+        audio_model = audio_model.to(self.device, torch.float16).eval()
+        tmp_features, _ = audio_model.encoder(audio_features['input'], audio_features['attention_mask'])
+        speech_out = audio_model.audio_projection['speech'](tmp_features)
+        vision_out = audio_model.audio_projection['vision'](tmp_features)
+        alt_features = torch.cat((speech_out, vision_out), dim=-1)
+        audio_embeds = alt_features
+        ############################################################
+
         return audio_embeds
 
     def setup_fake_prompts_vila(self, batch_size, visual_features,
