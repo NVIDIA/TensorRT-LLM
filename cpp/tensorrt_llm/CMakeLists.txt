@@ -375,6 +375,7 @@ set(TRTLLM_LINK_LIBS
     trtllm_gen_fmha
     trtllm_gen_blockscale_gemm
     trtllm_gen_fp8_block_scale_moe
+    trtllm_gen_gemm
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src
