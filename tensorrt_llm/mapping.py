@@ -191,9 +191,9 @@ class Mapping(object):
         self.attn_cp_size = attn_cp_size
         self.auto_parallel = auto_parallel
         self.world_size = world_size
+        self.enable_attention_dp = enable_attention_dp
         self.rank = rank
         self.gpus_per_node = gpus_per_node
-        self.enable_attention_dp = enable_attention_dp
         self.pp_groups = []
         self.cp_groups = []
         self.tp_groups = []
@@ -262,10 +262,13 @@ class Mapping(object):
 
     @rank.setter
     def rank(self, rank: int):
-        if not isinstance(rank, int) or rank < 0 or rank >= self.world_size:
-            raise ValueError(
-                f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
-            )
+        # TODO(qijun): skip check for enable_attention_dp temporarily, will support attention_dp_size
+        if not self.enable_attention_dp:
+            if not isinstance(rank,
+                              int) or rank < 0 and rank >= self.world_size:
+                raise ValueError(
+                    f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
+                )
         self._rank = rank
 
     @property

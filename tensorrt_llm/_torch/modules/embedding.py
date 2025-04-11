@@ -6,9 +6,10 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams
+from tensorrt_llm.mapping import Mapping
 
-from ..distributed import ParallelConfig, TensorParallelMode, allgather
-from .linear import Linear
+from ..distributed import allgather
+from .linear import Linear, TensorParallelMode
 
 
 class LMHead(Linear):
@@ -18,7 +19,7 @@ class LMHead(Linear):
         num_embeddings (int): vocabulary size.
         embedding_dim (int): size of hidden state.
         dtype (Optional[torch.dtype]): type of the parameters.
-        parallel_config (Optional[ParallelConfig]): parallelism configuration.
+        mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
     """
 
@@ -27,17 +28,19 @@ class LMHead(Linear):
         num_embeddings: int,
         embedding_dim: int,
         dtype: torch.dtype = None,
-        parallel_config: Optional[ParallelConfig] = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
-        parallel_config = parallel_config or ParallelConfig()
-        tp_size = parallel_config.tensor_parallel_size
+        mapping = mapping or Mapping()
+        tp_size = mapping.tp_size
 
-        if parallel_config.tensor_parallel_mode == TensorParallelMode.ROW:
+        if tensor_parallel_mode == TensorParallelMode.ROW:
             local_in_features = math.ceil(embedding_dim / tp_size)
             self.padding_size = tp_size * local_in_features - embedding_dim
-        elif parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+        elif tensor_parallel_mode == TensorParallelMode.COLUMN:
             local_out_features = math.ceil(num_embeddings / tp_size)
             self.padding_size = tp_size * local_out_features - num_embeddings
 
@@ -46,10 +49,12 @@ class LMHead(Linear):
             local_out_features * tp_size,
             bias=False,
             dtype=dtype,
-            parallel_config=parallel_config,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
         )
 
-        if parallel_config.tensor_parallel_mode == TensorParallelMode.ROW:
+        if tensor_parallel_mode == TensorParallelMode.ROW:
             if self.tp_rank == self.tp_size - 1:
                 local_in_features -= self.padding_size
         self.in_features = local_in_features
@@ -61,7 +66,7 @@ class LMHead(Linear):
 
     @property
     def vocab_size_padded(self) -> int:
-        if self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+        if self.tp_mode == TensorParallelMode.COLUMN:
             return self.out_features * self.tp_size
         else:
             return self.out_features
@@ -73,8 +78,7 @@ class LMHead(Linear):
             all_reduce_params: Optional[AllReduceParams] = None
     ) -> torch.Tensor:
         output = super().forward(input, all_reduce_params=all_reduce_params)
-        if (self.tp_mode == TensorParallelMode.COLUMN
-                and self.parallel_config.gather_output
+        if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
                 and self.padding_size > 0):
             output = output[..., :-self.padding_size]
 
@@ -82,7 +86,7 @@ class LMHead(Linear):
 
     def load_weights(self, weights: List[Dict]):
         original_weight = None
-        if self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+        if self.tp_mode == TensorParallelMode.COLUMN:
             if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:
                 original_weight = self.weight.data.zero_()
                 self.weight.data = self.weight[:-self.padding_size, :]
@@ -113,7 +117,7 @@ class Embedding(LMHead):
         num_embeddings (int): vocabulary size.
         embedding_dim (int): size of hidden state.
         dtype (Optional[torch.dtype]): type of the parameters.
-        parallel_config (Optional[ParallelConfig]): parallelism configuration.
+        mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
     """
 
@@ -122,13 +126,17 @@ class Embedding(LMHead):
         num_embeddings: int,
         embedding_dim: int,
         dtype: Optional[torch.dtype] = None,
-        parallel_config: Optional[ParallelConfig] = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
             num_embeddings=num_embeddings,
             dtype=dtype,
-            parallel_config=parallel_config,
+            mapping=mapping,
+            tensor_parallel_mode=tensor_parallel_mode,
+            gather_output=gather_output,
         )
         if self.tp_size > 1:
             slice_width = math.ceil(num_embeddings / self.tp_size)
@@ -138,7 +146,7 @@ class Embedding(LMHead):
 
     def forward(self, input):
         if self.tp_size > 1:
-            if self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+            if self.tp_mode == TensorParallelMode.COLUMN:
                 # Build the mask.
                 input, input_mask = get_masked_input_and_mask(
                     input,
@@ -149,15 +157,15 @@ class Embedding(LMHead):
         output = F.embedding(input, self.weight)
         # Mask the output embedding.
         if self.tp_size > 1:
-            if self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+            if self.tp_mode == TensorParallelMode.COLUMN:
                 output.masked_fill_(input_mask, 0)
                 # Reduce across all the model parallel GPUs.
                 output = self.all_reduce(output)
-            elif self.parallel_config.tensor_parallel_mode == TensorParallelMode.ROW:
-                if self.parallel_config.gather_output:
+            elif self.tp_mode == TensorParallelMode.ROW:
+                if self.gather_output:
                     if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:
                         output = F.pad(output, (0, self.padding_size))
-                    output = allgather(output, self.parallel_config)
+                    output = allgather(output, self.mapping)
                     if self.padding_size > 0:
                         output = output[..., :-self.padding_size]
 

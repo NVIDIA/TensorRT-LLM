@@ -26,11 +26,11 @@ from tqdm import tqdm
 
 from ...logger import logger
 from ..attention_backend.interface import AttentionMetadata
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import TensorParallelMode
 from ..modules.logits_procesor import LogitsProcessor
 from .modeling_llama import LlamaAttention
 from .modeling_utils import duplicate_kv_weight, register_auto_model
@@ -224,13 +224,9 @@ class MllamaForCausalLM(nn.Module):
             text_config.vocab_size,
             text_config.hidden_size,
             dtype=text_config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=config.mapping.tp_rank,
-                tensor_parallel_size=config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-                gpus_per_node=config.mapping.gpus_per_node,
-            ),
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         # use embedding weights in lm_head if tie word embedding is enabled
         if text_config.tie_word_embeddings:

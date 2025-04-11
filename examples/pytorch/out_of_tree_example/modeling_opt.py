@@ -7,7 +7,6 @@ from transformers import OPTConfig
 from transformers.activations import ACT2FN
 
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        DecoderModelForCausalLM,
@@ -16,7 +15,7 @@ from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 
 
 class LayerNorm(nn.LayerNorm):
@@ -70,10 +69,8 @@ class OPTDecoderLayer(DecoderLayer):
             config.ffn_dim,
             bias=config.enable_bias,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=model_config.get_quant_config(),
         )
         self.fc2 = Linear(
@@ -81,10 +78,8 @@ class OPTDecoderLayer(DecoderLayer):
             config.hidden_size,
             bias=config.enable_bias,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.ROW),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=model_config.get_quant_config(),
         )
         self.final_layer_norm = LayerNorm(
@@ -150,10 +145,8 @@ class OPTModel(DecoderModel):
             config.vocab_size,
             config.word_embed_proj_dim,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN))
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN)
         self.embed_positions = nn.Embedding(config.max_position_embeddings + 2,
                                             config.hidden_size,
                                             dtype=config.torch_dtype)

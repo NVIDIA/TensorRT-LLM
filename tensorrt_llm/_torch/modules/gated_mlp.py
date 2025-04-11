@@ -5,13 +5,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
+from tensorrt_llm.mapping import Mapping
 
 from ..custom_ops import IS_FLASHINFER_AVAIABLE
-from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
-from .linear import Linear, WeightMode, WeightsLoadingConfig
+from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
 def swiglu(x):
@@ -44,30 +45,31 @@ class GatedMLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
+        self.mapping = config.mapping
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
-            tp_rank = config.mapping.tp_rank % overridden_tp_size
             tp_size = overridden_tp_size
             # "Misuse" pp_size here to perform all-reduce within smaller groups
             pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
         else:
-            tp_rank = config.mapping.tp_rank
             tp_size = config.mapping.tp_size
             pp_size = config.mapping.pp_size
-        gpus_per_node = config.mapping.gpus_per_node
+
+        mapping = Mapping(
+            world_size=tp_size * pp_size,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node,
+            tp_size=tp_size,
+            pp_size=pp_size,
+        )
 
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
             bias=bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=pp_size,
-                parallel_rank=config.mapping.rank),
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
@@ -79,13 +81,8 @@ class GatedMLP(nn.Module):
             self.hidden_size,
             bias=bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=pp_size,
-                parallel_rank=config.mapping.rank),
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,

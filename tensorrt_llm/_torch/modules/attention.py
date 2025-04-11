@@ -4,15 +4,17 @@ from typing import Optional
 import torch
 from torch import nn
 
+from tensorrt_llm.mapping import Mapping
+
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  TrtllmAttention)
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
-from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from .linear import Linear, WeightMode, WeightsLoadingConfig
+from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
@@ -80,12 +82,18 @@ class Attention(nn.Module):
         # tensor parallel
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
-        tp_rank = config.mapping.tp_rank
-        gpus_per_node = config.mapping.gpus_per_node
+        pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
-            tp_rank = 0
 
+        mapping = Mapping(
+            world_size=tp_size * pp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            rank=config.mapping.rank,
+            gpus_per_node=config.mapping.gpus_per_node,
+            enable_attention_dp=config.mapping.enable_attention_dp,
+        )
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
@@ -103,13 +111,8 @@ class Attention(nn.Module):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tp_size,
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=config.mapping.pp_size,
-                parallel_rank=config.mapping.rank),
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
@@ -120,13 +123,8 @@ class Attention(nn.Module):
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tp_size,
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=config.mapping.pp_size,
-                parallel_rank=config.mapping.rank),
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )
@@ -310,27 +308,17 @@ class MLA(nn.Module):
         # tensor parallel
         config = config or ModelConfig()
         tp_size = config.mapping.tp_size
-        tp_rank = config.mapping.tp_rank
-        gpus_per_node = config.mapping.gpus_per_node
+        pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
             tp_size = 1
-            tp_rank = 0
 
-        row_parallel_config = ParallelConfig(
-            tensor_parallel_rank=tp_rank,
-            tensor_parallel_size=tp_size,
-            tensor_parallel_mode=TensorParallelMode.ROW,
-            gpus_per_node=gpus_per_node,
-            pipeline_parallel_size=config.mapping.pp_size,
-            parallel_rank=config.mapping.rank,
-        )
-        col_parallel_config = ParallelConfig(
-            tensor_parallel_rank=tp_rank,
-            tensor_parallel_size=tp_size,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gpus_per_node=gpus_per_node,
-            pipeline_parallel_size=config.mapping.pp_size,
-            parallel_rank=config.mapping.rank,
+        mapping = Mapping(
+            world_size=tp_size * pp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            rank=config.mapping.rank,
+            gpus_per_node=config.mapping.gpus_per_node,
+            enable_attention_dp=config.mapping.enable_attention_dp,
         )
 
         assert self.num_heads % tp_size == 0
@@ -362,7 +350,8 @@ class MLA(nn.Module):
                 (self.qk_nope_head_dim + self.qk_rope_head_dim),
                 bias=bias,
                 dtype=dtype,
-                parallel_config=col_parallel_config,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights=config.skip_create_weights)
         else:
@@ -381,7 +370,8 @@ class MLA(nn.Module):
                 (self.qk_nope_head_dim + self.qk_rope_head_dim),
                 bias=bias,
                 dtype=dtype,
-                parallel_config=col_parallel_config,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
                 skip_create_weights=config.skip_create_weights)
             self.q_b_proj = self.q_proj
@@ -400,7 +390,8 @@ class MLA(nn.Module):
                                 (self.qk_nope_head_dim + self.v_head_dim),
                                 bias=bias,
                                 dtype=dtype,
-                                parallel_config=col_parallel_config,
+                                mapping=mapping,
+                                tensor_parallel_mode=TensorParallelMode.COLUMN,
                                 quant_config=quant_config,
                                 skip_create_weights=config.skip_create_weights)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
@@ -455,7 +446,8 @@ class MLA(nn.Module):
             self.hidden_size,
             bias=self.dense_bias,
             dtype=dtype,
-            parallel_config=row_parallel_config,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
             skip_create_weights=config.skip_create_weights,
         )
