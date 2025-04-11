@@ -740,11 +740,48 @@ def _null_context_manager():
     yield
 
 
-def nvtx_range(msg, color="grey", domain="TensorRT-LLM", category=None):
+def nvtx_range(msg: str,
+               color: str = "grey",
+               domain: str = "TensorRT-LLM",
+               category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for profiling.
+
+    This function returns a context manager that marks the beginning and end of a
+    range in NVIDIA Tools Extension (NVTX) profiling tools like Nsight Systems.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that marks the NVTX range.
+    """
     return nvtx.annotate(msg, color=color, domain=domain, category=category)
 
 
-def nvtx_range_debug(msg, color="grey", domain="TensorRT-LLM", category=None):
+def nvtx_range_debug(msg: str,
+                     color: str = "grey",
+                     domain: str = "TensorRT-LLM",
+                     category: Optional[str] = None):
+    """
+    Creates an NVTX range annotation for debugging purposes.
+
+    Similar to nvtx_range, but only creates the range if specific environment
+    variables are set, making it suitable for debug profiling.
+
+    Args:
+        msg (str): The message/name for the NVTX range.
+        color (str, optional): The color to use for the range in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the range. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the range. Defaults to None.
+
+    Returns:
+        contextmanager: A context manager that either marks the NVTX range if enabled,
+                        or a null context manager that does nothing if disabled.
+    """
     if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
             os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
         return nvtx_range(msg, color=color, domain=domain, category=category)
@@ -752,7 +789,22 @@ def nvtx_range_debug(msg, color="grey", domain="TensorRT-LLM", category=None):
         return _null_context_manager()
 
 
-def nvtx_mark(msg, color="grey", domain="TensorRT-LLM", category=None):
+def nvtx_mark(msg: str,
+              color: str = "grey",
+              domain: str = "TensorRT-LLM",
+              category: Optional[str] = None):
+    """
+    Creates an NVTX marker for profiling.
+
+    This function places a single marker point in NVIDIA Tools Extension (NVTX)
+    profiling tools like Nsight Systems, useful for marking specific events.
+
+    Args:
+        msg (str): The message/name for the NVTX marker.
+        color (str, optional): The color to use for the marker in the profiler. Defaults to "grey".
+        domain (str, optional): The domain name for the marker. Defaults to "TensorRT-LLM".
+        category (str, optional): The category for the marker. Defaults to None.
+    """
     nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
