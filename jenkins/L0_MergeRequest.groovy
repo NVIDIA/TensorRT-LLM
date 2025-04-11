@@ -95,6 +95,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
 def DEBUG_MODE = "debug"
 
 def testFilter = [
@@ -110,6 +112,7 @@ def testFilter = [
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
+    (AUTO_TRIGGER_TAG_LIST): [],
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -312,6 +315,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     })
 }
 
@@ -458,6 +462,30 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
+}
+
+def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
+    def autoTriggerTagList = []
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return autoTriggerTagList
+    }
+    def specialFileToTagMap = [
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "jenkins/": ["-DeepSeek-"],
+    ]
+    for (file in changedFileList) {
+        for (String key : specialFileToTagMap.keySet()) {
+            if (file.startsWith(key)) {
+                autoTriggerTagList += specialFileToTagMap[key]
+            }
+        }
+    }
+    autoTriggerTagList = autoTriggerTagList.unique()
+    if (!autoTriggerTagList.isEmpty()) {
+        pipeline.echo("Auto trigger tags detected: ${autoTriggerTagList.join(', ')}")
+    }
+    return autoTriggerTagList
 }
 
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
