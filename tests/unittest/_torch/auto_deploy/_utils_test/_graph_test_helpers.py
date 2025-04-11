@@ -78,6 +78,7 @@ def run_test(
         y_random = gm_transformed(x)
         assert not all_close(y_model, y_random)
 
+        # print(model.state_dict())
         gm_transformed.load_state_dict(model.state_dict(), strict=True if strict_loading else False)
         y_loaded_from_original = gm_transformed(x)
         assert all_close(y_model, y_loaded_from_original, atol=atol, rtol=rtol)

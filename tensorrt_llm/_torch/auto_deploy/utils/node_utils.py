@@ -7,7 +7,7 @@ import torch
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import Graph, GraphModule, Node
 
-from ..custom_ops.quant import QUANT_OPS
+from ..custom_ops.quant import QUANT_BMM_OPS, QUANT_LINEAR_OPS
 
 try:
     # import modelopt to get quantize_op
@@ -203,12 +203,22 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
     }
 
     if include_quantization:
-        lin_ops.update(QUANT_OPS)
+        lin_ops.update(QUANT_LINEAR_OPS)
     return is_op(node, lin_ops)
 
 
-def is_dist_op(node: Node) -> bool:
+def is_bmm_op(node: Node, include_quantization: bool = False) -> bool:
     """Check if the node is a distributed op."""
+    dist_ops = {torch.ops.aten.bmm}
+
+    if include_quantization:
+        dist_ops.update(QUANT_BMM_OPS)
+
+    return is_op(node, dist_ops)
+
+
+def is_dist_op(node: "Node") -> bool:
+    """Check if the node is a torch.bmm operation."""
     dist_ops = {
         torch.ops.dist.all_gather,
         torch.ops.dist.all_reduce,

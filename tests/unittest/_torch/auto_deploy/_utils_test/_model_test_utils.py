@@ -204,6 +204,34 @@ class MoEOpModel(nn.Module):
         return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
 
 
+class BMM(nn.Module):
+    """Expert model with BMM operations for testing."""
+
+    # using hidden_size for both weight dimensions to simplify the test
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create parameter weights for BMM
+        self.weight1 = nn.Parameter(torch.randn(batch_size, hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.bmm(x, self.weight1)
+
+
+class BMMModel(nn.Module):
+    """Simple model with BMM operations for testing."""
+
+    def __init__(self, hidden_dim, batch_size, num_experts):
+        super().__init__()
+        self.experts = nn.ModuleList([BMM(hidden_dim, batch_size) for _ in range(num_experts)])
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.cat([expert(x) for expert in self.experts], dim=1)
+
+
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
     dynamic_shapes = (
         {
