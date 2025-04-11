@@ -15,6 +15,7 @@
 import json
 import math
 import os
+import tempfile
 from typing import Dict, List, Optional, Union
 
 import pytest
@@ -303,23 +304,21 @@ class CliFlowAccuracyTestHarness:
         cls.llm_venv = request.getfixturevalue("llm_venv")
         cls.llm_root = request.getfixturevalue("llm_root")
 
+    @pytest.fixture(autouse=True, scope="function")
+    def setup_method(self):
+        model_workspace = f"{self.llm_venv.get_working_directory()}/{self.MODEL_NAME}"
+        if not exists(model_workspace):
+            makedirs(model_workspace)
+        with tempfile.TemporaryDirectory(dir=model_workspace) as workspace:
+            self.ckpt_dir = f"{workspace}/cmodels"
+            makedirs(self.ckpt_dir)
+            self.engine_dir = f"{workspace}/engines"
+            makedirs(self.engine_dir)
+            yield
+
     @property
     def example_dir(self):
         return f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}"
-
-    @property
-    def ckpt_dir(self):
-        ckpt_dir = f"{self.llm_venv.get_working_directory()}/cmodels/{self.MODEL_NAME}"
-        if not exists(ckpt_dir):
-            makedirs(ckpt_dir)
-        return ckpt_dir
-
-    @property
-    def engine_dir(self):
-        engine_dir = f"{self.llm_venv.get_working_directory()}/engines/{self.MODEL_NAME}"
-        if not exists(engine_dir):
-            makedirs(engine_dir)
-        return engine_dir
 
     def install_requirements(self):
         requirements = f"{self.example_dir}/requirements.txt"
