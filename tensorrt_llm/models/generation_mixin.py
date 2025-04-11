@@ -277,14 +277,17 @@ class GenerationMixin:
         local_attn_layers = [i for i in layers_range if i in attn_layer_idx]
         # number of attention layers local to previous pp ranks
         num_attn_layers_lower_ranks = attn_layer_idx.index(local_attn_layers[0])
+        num_attn_layers_prev_rank = num_attn_layers_lower_ranks // mapping.pp_rank if mapping.pp_rank != 0 else len(
+            local_attn_layers)
+        num_layers_prev_rank = layers_range[
+            0] // mapping.pp_rank if mapping.pp_rank != 0 else len(layers_range)
         past_key_value = []
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         host_kv_cache_pool_pointers = None
         host_kv_cache_pool_mapping = None
         if kv_cache_type == KVCacheType.DISABLED:
-            for i in layers_range:
-                past_key_value.append(None)
+            past_key_value = [None] * num_layers_prev_rank
         else:
             if kv_cache_type != KVCacheType.PAGED:
                 for layer_idx in layers_range:
@@ -375,18 +378,17 @@ class GenerationMixin:
                 host_kv_cache_pool_mapping = Tensor(
                     name=f'host_kv_cache_pool_mapping',
                     dtype=trt.int32,
-                    shape=[len(local_attn_layers),
+                    shape=[num_attn_layers_prev_rank,
                            2],  # 2: (Index of pool, Index of layer within pool)
                     dim_range=OrderedDict([
                         ('pools_mapping',
-                         [len(local_attn_layers)] * num_profiles),
+                         [num_attn_layers_prev_rank] * num_profiles),
                         ('layer_cache_pool_locator', [2] * num_profiles)
                     ]))
 
-                for i in layers_range:
-                    past_key_value.append(None)
+                past_key_value = [None] * num_layers_prev_rank
 
-        assert len(past_key_value) == len(layers_range)
+        assert len(past_key_value) == num_layers_prev_rank
         sequence_length = None
         context_lengths = None
         host_context_lengths = None
@@ -467,9 +469,9 @@ class GenerationMixin:
             host_max_attention_window_sizes = Tensor(
                 name=f'host_max_attention_window_sizes',
                 dtype=trt.int32,
-                shape=[len(local_attn_layers)],
+                shape=[num_attn_layers_prev_rank],
                 dim_range=OrderedDict([
-                    ('num_layers', [len(local_attn_layers)] * num_profiles)
+                    ('num_layers', [num_attn_layers_prev_rank] * num_profiles)
                 ]))
 
             host_sink_token_length = Tensor(name='host_sink_token_length',
