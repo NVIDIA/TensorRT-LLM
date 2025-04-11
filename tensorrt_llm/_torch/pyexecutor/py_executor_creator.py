@@ -2,11 +2,6 @@ import copy
 
 import tensorrt_llm
 
-<<<<<<< HEAD
-=======
-from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-
->>>>>>> a1ed7c149d (Make memory calculation of decoder adapt to the chosen decoder. Recognize decoder option passed in executorconfig. Make overlap scheduler test run on TinyLlama.)
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
@@ -14,18 +9,11 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
 
-<<<<<<< HEAD
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
 
-=======
-from ..speculative import (Eagle3Config, get_num_spec_layers, get_spec_decoder,
-                           get_spec_resource_manager)
-from ._util import estimate_max_kv_cache_tokens, instantiate_decoder, is_mla
-
->>>>>>> a1ed7c149d (Make memory calculation of decoder adapt to the chosen decoder. Recognize decoder option passed in executorconfig. Make overlap scheduler test run on TinyLlama.)
 from .config import PyTorchConfig
 from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
@@ -174,7 +162,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     if executor_config.pytorch_backend_config.use_kv_cache:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
-            origin_seq_len, ctx_chunk_config, draft_model_engine)
+            origin_seq_len, ctx_chunk_config, draft_model_engine, pytorch_backend_config)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
