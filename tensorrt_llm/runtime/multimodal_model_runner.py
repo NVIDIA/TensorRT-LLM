@@ -1345,36 +1345,12 @@ class MultimodalModelRunner:
             prompt_tasks = None
             prompt_table = None
             if not self.cpp_e2e:
-                # Duplicate input_ids if it's a single sample
-                if len(input_ids) == 1:
-                    input_ids = input_ids.expand(2, -1)
-
-                # Ensure input_lengths matches batch size
-                if len(input_lengths) == 1:
-                    input_lengths = input_lengths.expand(2)
-
-                # Duplicate prompt table for batching
                 batch_size = len(input_ids)
                 prompt_tasks = ",".join(
                     np.arange(batch_size, dtype=np.int32).astype(str))
-
-                # Duplicate visual features/prompt table
-                if isinstance(ptuning_args[0], torch.Tensor):
-                    if ptuning_args[0].dim(
-                    ) == 2:  # [num_visual_tokens, hidden_size]
-                        prompt_table = ptuning_args[0].unsqueeze(0).expand(
-                            batch_size, -1, -1)
-                    elif ptuning_args[0].dim(
-                    ) == 3:  # [1, num_visual_tokens, hidden_size]
-                        prompt_table = ptuning_args[0].expand(
-                            batch_size, -1, -1)
-
-                # batch_size = len(input_ids)
-                # prompt_tasks = ",".join(
-                #     np.arange(batch_size, dtype=np.int32).astype(str))
-                # prompt_table = torch.stack([ptuning_args[0]])
-                # prompt_table = prompt_table.view(batch_size, -1,
-                #                                  prompt_table.shape[-1])
+                prompt_table = torch.stack([ptuning_args[0]])
+                prompt_table = prompt_table.view(batch_size, -1,
+                                                 prompt_table.shape[-1])
 
             output_ids = self.model.generate(
                 input_ids,
