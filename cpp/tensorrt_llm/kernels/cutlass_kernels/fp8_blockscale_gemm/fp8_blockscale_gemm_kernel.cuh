@@ -991,10 +991,6 @@ __global__ void scale_1x128_kernel(
         // Each thread reads 2 elements from input_line
         int lane_id = threadIdx.x % 32 * 2;
 
-        // if constexpr (std::is_same<InputType, half>::value)
-        // {
-        //     using Input2Type = __half2;
-        // }
         Input2Type input_frag2[2] = {Input2Type(0, 0), Input2Type(0, 0)};
 
         for (int i = 0; i < 2; i++)
@@ -1287,7 +1283,6 @@ __global__ void scale_1x128_reshape_kernel(
             }
             else
             {
-                // input_frag2[i] = make_bfloat162(input_line[lane_id], input_line[lane_id+1]);
                 input_frag2[i] = *((Input2Type*) (input_line) + lane_id / 2);
             }
             input_line += 64;
