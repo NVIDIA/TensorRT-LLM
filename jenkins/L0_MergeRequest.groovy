@@ -618,6 +618,31 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        stage("Rerun report") {
+            // todo: get results.xml and rerun_results.xml in all stages
+            // merge the xml files:
+            //      filter the failure tests from results.xml files and merge them with rerun_results.xml
+            //      and then sort by name
+            // transform xml to html and upload to artifactory
+            // report the html
+            sh "rm -rf rerun && mkdir -p rerun"
+            sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+            sh "find rerun -type f"
+            def inputfiles = sh(returnStdout: true, script: "find rerun -type f -name '*.xml' | sort | tr '\n' ' '").trim()
+            echo "inputfiles: ${inputfiles}"
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            sh """
+                python3 llm/tests/integration/defs/test_rerun.py \
+                generate_rerun_report \
+                rerun/rerun_results_report.xml \
+                ${inputfiles}
+            """
+            trtllm_utils.uploadArtifacts("rerun/rerun_results_report.html", "${UPLOAD_PATH}/test-results/rerun_report.html")
+                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+        }
         try {
             stage("Test coverage") {
                 sh "ls"
@@ -631,13 +656,10 @@ def collectTestResults(pipeline, testFilter)
                     echo "Test coverage is skipped because there is no test data file."
                     return
                 }
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
                 sh "coverage --version"
 
-                trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                // trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                 sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
                 def coverageConfigFile = "cov/.coveragerc"
                 sh """
