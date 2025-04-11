@@ -8,9 +8,10 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
-from ..llmapi.utils import nvtx_range, print_traceback_on_error
+from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
 
@@ -125,7 +126,9 @@ class PostprocWorker:
                 "Context logits or generation logits are not supposed to be "
                 "sent to postprocessing workers.")
 
-        with nvtx_range("handle_input", color="yellow", category="Postproc"):
+        with nvtx_range_debug("handle_input",
+                              color="yellow",
+                              category="Postproc"):
             req_id = input.rsp.client_id
             if req_id not in self._records:
                 # TODO: support variant creation later
