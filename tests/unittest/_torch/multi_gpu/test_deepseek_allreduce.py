@@ -26,10 +26,10 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, TensorParallelMode)
-from tensorrt_llm._torch.modules.linear import Linear
+                                             AllReduceParams, DeepseekAllReduce)
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -87,16 +87,16 @@ def row_linear_residual_norm_fusion_forward(
 
     norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype).cuda()
 
-    allreduce = AllReduce(parallel_config=ParallelConfig(
-        tensor_parallel_size=tensor_parallel_size,
-        tensor_parallel_rank=tensor_parallel_rank,
-        tensor_parallel_mode=TensorParallelMode.ROW,
+    allreduce = AllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
     ), ).cuda()
 
-    deepseek_allreduce = DeepseekAllReduce(parallel_config=ParallelConfig(
-        tensor_parallel_size=tensor_parallel_size,
-        tensor_parallel_rank=tensor_parallel_rank,
-        tensor_parallel_mode=TensorParallelMode.ROW,
+    deepseek_allreduce = DeepseekAllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
     ), ).cuda()
 
     scale = torch.tensor(1.0, dtype=torch.float32).cuda()
@@ -268,10 +268,10 @@ def moe_residual_norm_fusion_forward(
     norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
 
     # Initialize DeepseekAllReduce and AllReduce
-    deepseek_allreduce = DeepseekAllReduce(parallel_config=ParallelConfig(
-        tensor_parallel_size=tensor_parallel_size,
-        tensor_parallel_rank=tensor_parallel_rank,
-        tensor_parallel_mode=TensorParallelMode.ROW,
+    deepseek_allreduce = DeepseekAllReduce(mapping=Mapping(
+        world_size=tensor_parallel_size,
+        tp_size=tensor_parallel_size,
+        rank=tensor_parallel_rank,
     )).cuda()
 
     # Initialize RMSNorm
@@ -283,11 +283,12 @@ def moe_residual_norm_fusion_forward(
         out_features=hidden_size,
         bias=False,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.ROW,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
         ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
     ).cuda()
     l0.load_weights([dict(weight=l0_weight)])
     token_input_chunked = torch.chunk(token_input.clone(),

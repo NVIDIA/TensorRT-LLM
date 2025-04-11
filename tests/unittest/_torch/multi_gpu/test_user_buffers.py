@@ -16,10 +16,10 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
-                                             ParallelConfig, TensorParallelMode,
                                              userbuffers_allreduce_finalize)
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -123,11 +123,12 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        parallel_config = ParallelConfig(
-            tensor_parallel_rank=rank,
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_mode=TensorParallelMode.COLUMN)
-        ar = AllReduce(parallel_config, strategy=AllReduceStrategy.UB)
+        mapping = Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=rank,
+        )
+        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -214,11 +215,12 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        parallel_config = ParallelConfig(
-            tensor_parallel_rank=rank,
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_mode=TensorParallelMode.COLUMN)
-        ar = AllReduce(parallel_config, strategy=AllReduceStrategy.UB)
+        mapping = Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=rank,
+        )
+        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -318,55 +320,45 @@ class UBTestModel(nn.Module):
         quant_config.layer_quant_mode
         self.rank = rank
         self.tp_size = tp_size
+        mapping = Mapping(
+            world_size=tp_size,
+            tp_size=tp_size,
+            rank=rank,
+        )
         self.l0 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         parallel_config=ParallelConfig(
-                             tensor_parallel_size=tp_size,
-                             tensor_parallel_rank=rank,
-                             tensor_parallel_mode=TensorParallelMode.ROW,
-                         ),
+                         mapping=mapping,
+                         tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         parallel_config=ParallelConfig(
-                             tensor_parallel_size=tp_size,
-                             tensor_parallel_rank=rank,
-                             tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         ),
+                         mapping=mapping,
+                         tensor_parallel_mode=TensorParallelMode.COLUMN,
                          quant_config=quant_config).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         parallel_config=ParallelConfig(
-                             tensor_parallel_size=tp_size,
-                             tensor_parallel_rank=rank,
-                             tensor_parallel_mode=TensorParallelMode.ROW,
-                         ),
+                         mapping=mapping,
+                         tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         parallel_config=ParallelConfig(
-                             tensor_parallel_size=tp_size,
-                             tensor_parallel_rank=rank,
-                             tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         ),
+                         mapping=mapping,
+                         tensor_parallel_mode=TensorParallelMode.COLUMN,
                          quant_config=quant_config).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         parallel_config=ParallelConfig(
-                             tensor_parallel_size=tp_size,
-                             tensor_parallel_rank=rank,
-                             tensor_parallel_mode=TensorParallelMode.ROW,
-                         ),
+                         mapping=mapping,
+                         tensor_parallel_mode=TensorParallelMode.ROW,
                          quant_config=quant_config).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
@@ -608,11 +600,12 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        parallel_config = ParallelConfig(
-            tensor_parallel_rank=rank,
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_mode=TensorParallelMode.COLUMN)
-        ar = AllReduce(parallel_config, strategy=AllReduceStrategy.UB)
+        mapping = Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=rank,
+        )
+        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -694,18 +687,14 @@ class UBMMAddModel(nn.Module):
         self.rank = rank
         self.hidden_size = hidden_size
         self.dtype = dtype
-        self.ar_0 = AllReduce(
-            ParallelConfig(tensor_parallel_size=tp_size,
-                           tensor_parallel_rank=rank,
-                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
-        self.ar_1 = AllReduce(
-            ParallelConfig(tensor_parallel_size=tp_size,
-                           tensor_parallel_rank=rank,
-                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
-        self.ar_2 = AllReduce(
-            ParallelConfig(tensor_parallel_size=tp_size,
-                           tensor_parallel_rank=rank,
-                           tensor_parallel_mode=TensorParallelMode.ROW)).cuda()
+        mapping = Mapping(
+            world_size=tp_size,
+            tp_size=tp_size,
+            rank=rank,
+        )
+        self.ar_0 = AllReduce(mapping).cuda()
+        self.ar_1 = AllReduce(mapping).cuda()
+        self.ar_2 = AllReduce(mapping).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,

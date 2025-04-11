@@ -9,7 +9,6 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
-from ..modules.linear import ParallelConfig
 from .flashinfer import FlashInferAttentionMetadata, PlanParams
 from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
 from .vanilla import VanillaAttention
@@ -440,12 +439,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
             out_tmp = output
             lse = lse.unsqueeze(-1) / np.log2(np.e)  # [b * s, nheads, 1]
             if metadata.mapping.cp_size != 1:
-                parallel_cfg = ParallelConfig(
-                    tensor_parallel_size=metadata.mapping.cp_size,
-                    tensor_parallel_rank=metadata.mapping.cp_rank,
-                    pipeline_parallel_size=metadata.mapping.pp_size)
-                output_tensor = allgather(output, parallel_cfg, gather_dim=0)
-                lse_tensor = allgather(lse, parallel_cfg, gather_dim=0)
+                output_tensor = allgather(output,
+                                          metadata.mapping,
+                                          gather_dim=0)
+                lse_tensor = allgather(lse, metadata.mapping, gather_dim=0)
                 output_tensor = output_tensor.to(torch.float32)
             else:
                 lse_tensor = lse
