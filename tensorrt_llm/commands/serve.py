@@ -15,6 +15,7 @@ from tensorrt_llm.llmapi import (LLM, BuildConfig, CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               parse_disagg_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
@@ -33,6 +34,7 @@ def get_llm_args(model: str,
                  free_gpu_memory_fraction: Optional[float] = None,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
+                 reasoning_parser: Optional[str] = None,
                  **llm_args_dict: Any):
 
     if gpus_per_node is None:
@@ -59,6 +61,10 @@ def get_llm_args(model: str,
         dynamic_batch_config=dynamic_batch_config,
     )
 
+    if reasoning_parser is not None and \
+            reasoning_parser not in ReasoningParserFactory.parsers:
+        raise ValueError(f"Invalid reasoning_parser: {reasoning_parser}")
+
     llm_args = {
         "model": model,
         "scheduler_config": scheduler_config,
@@ -74,6 +80,7 @@ def get_llm_args(model: str,
         "pytorch_backend_config": pytorch_backend_config,
         "_num_postprocess_workers": num_postprocess_workers,
         "_postprocess_tokenizer_dir": tokenizer or model,
+        "_reasoning_parser": reasoning_parser,
     }
 
     llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict)
@@ -173,6 +180,13 @@ def launch_server(host: str, port: int, llm_args: dict):
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
 )
+@click.option(
+    "--reasoning_parser",
+    type=str,
+    default=None,
+    help=
+    "Specify the parser for reasoning models, supported parsers are: [deepseek-r1].",
+)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
@@ -180,7 +194,8 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str]):
+          extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -207,6 +222,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
+        reasoning_parser=reasoning_parser,
         **llm_args_dict)
 
     launch_server(host, port, llm_args)
