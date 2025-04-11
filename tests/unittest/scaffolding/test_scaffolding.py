@@ -1,7 +1,7 @@
-# isort: off
-# isort: on
+# autoflake: skip_file
 
-from scaffolding.test_worker import create_trtllm_worker
+from scaffolding.test_worker import (create_trtllm_worker,
+                                     deepseek_distill_7b_path, default_prompt)
 
 from tensorrt_llm.scaffolding import (MajorityVoteController,
                                       NativeGenerationController,
