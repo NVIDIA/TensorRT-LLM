@@ -33,7 +33,8 @@ def example_root():
                          [("python3", "openai_chat_client.py"),
                           ("python3", "openai_completion_client.py"),
                           ("bash", "curl_chat_client.sh"),
-                          ("bash", "curl_completion_client.sh")])
+                          ("bash", "curl_completion_client.sh"),
+                          ("bash", "genai_perf_client.sh")])
 def test_trtllm_serve_examples(exe: str, script: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)

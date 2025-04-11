@@ -1212,8 +1212,13 @@ def test_llmapi_server_example(llm_root, llm_venv):
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_llm_server.py")])
 
 
-def test_trtllm_serve_example(llm_venv):
+def test_trtllm_serve_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_trtllm_serve_example.py")])

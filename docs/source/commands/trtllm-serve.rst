@@ -34,7 +34,7 @@ For the full syntax and argument descriptions, refer to :ref:`syntax`.
 Inference Endpoints
 -------------------
 
-After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs.
+After you start the server, you can send inference requests through completions API and Chat API, which are compatible with corresponding OpenAI APIs. We use `TinyLlama-1.1B-Chat-v1.0 <https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0>`_ for examples in the following sections.
 
 Chat API
 ~~~~~~~~
@@ -65,6 +65,47 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../examples/serve/curl_completion_client.sh
     :language: bash
     :linenos:
+
+Benchmark
+---------
+
+You can use any benchmark clients compatible with OpenAI API to test serving performance of ``trtllm_serve``, we recommend ``genai-perf`` and here is a benchmarking recipe.
+
+First, install ``genai-perf`` with ``pip``:
+
+.. code-block:: bash
+
+   pip install genai-perf
+
+Then, :ref:`start a server<Starting a Server>` with ``trtllm-serve`` and ``TinyLlama-1.1B-Chat-v1.0``.
+
+Finally, test performance with the following command:
+
+.. literalinclude:: ../../../examples/serve/genai_perf_client.sh
+    :language: bash
+    :linenos:
+
+Refer to `README <https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md>`_ of ``genai-perf`` for more guidance.
+
+Multi-node Serving with Slurm
+-----------------------------
+
+You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ model across two nodes with Slurm and ``trtllm-serve``
+
+.. code-block:: bash
+
+    echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > extra-llm-api-config.yml
+
+    srun -N 2 -w [NODES] \
+        --output=benchmark_2node.log \
+        --ntasks 16 --ntasks-per-node=8 \
+        --mpi=pmix --gres=gpu:8 \
+        --container-image=<CONTAINER_IMG> \
+        --container-mounts=/workspace:/workspace \
+        --container-workdir /workspace \
+        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+
+See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
 
 Metrics Endpoint
 ----------------
@@ -127,3 +168,4 @@ Syntax
 
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve
+   :nested: full
