@@ -278,14 +278,16 @@ class GenerationMixin:
         # number of attention layers local to previous pp ranks
         num_attn_layers_lower_ranks = attn_layer_idx.index(local_attn_layers[0])
         num_attn_layers_prev_rank = num_attn_layers_lower_ranks // mapping.pp_rank if mapping.pp_rank != 0 else len(
-            layers_range)
+            local_attn_layers)
+        num_layers_prev_rank = layers_range[
+            0] // mapping.pp_rank if mapping.pp_rank != 0 else len(layers_range)
         past_key_value = []
         kv_cache_block_offsets = None
         host_kv_cache_block_offsets = None
         host_kv_cache_pool_pointers = None
         host_kv_cache_pool_mapping = None
         if kv_cache_type == KVCacheType.DISABLED:
-            past_key_value = [None] * num_attn_layers_prev_rank
+            past_key_value = [None] * num_layers_prev_rank
         else:
             if kv_cache_type != KVCacheType.PAGED:
                 for layer_idx in layers_range:
@@ -384,9 +386,9 @@ class GenerationMixin:
                         ('layer_cache_pool_locator', [2] * num_profiles)
                     ]))
 
-                past_key_value = [None] * num_attn_layers_prev_rank
+                past_key_value = [None] * num_layers_prev_rank
 
-        assert len(past_key_value) == num_attn_layers_prev_rank
+        assert len(past_key_value) == num_layers_prev_rank
         sequence_length = None
         context_lengths = None
         host_context_lengths = None
