@@ -33,7 +33,6 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
@@ -41,7 +40,6 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
-#include <valarray>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
