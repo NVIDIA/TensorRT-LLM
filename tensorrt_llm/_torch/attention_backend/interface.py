@@ -358,7 +358,7 @@ class RopeParams:
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
-        if config.model_type == "deepseek_v3":
+        elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
 
         return rope_params
@@ -380,7 +380,6 @@ class RopeParams:
                     rope_const_params.cos_sin(),
                 )
 
-        assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
         if self.scale_type == RotaryScalingType.yarn:
             rope_inv_freq = None
             rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
@@ -394,6 +393,8 @@ class RopeParams:
                 self.mscale,
                 self.mscale_all_dim,
             )
+        elif self.scale_type == RotaryScalingType.longrope:
+            raise NotImplementedError("Long RoPE is not supported.")
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                 self.max_positions,
