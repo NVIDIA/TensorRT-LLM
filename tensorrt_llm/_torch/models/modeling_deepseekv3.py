@@ -15,7 +15,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           DeepseekAllReduce, ParallelConfig, allgather)
+                           DeepseekAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -306,13 +306,8 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             is_expert=True)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -321,14 +316,14 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
-        if self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+        if self.use_dp and self.mapping.tp_size > 1:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
             if disable_fp4_allgather():
                 hidden_states = allgather(hidden_states,
-                                          self.parallel_config,
+                                          self.mapping,
                                           gather_dim=0)
         router_logits = self.gate(hidden_states)
 
@@ -383,7 +378,7 @@ class Deepseekv3MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if not self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -470,14 +465,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
+        self.mapping = model_config.mapping
         self.layer_idx = layer_idx
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
         self.deepseek_allreduce_disabled = os.environ.get(
@@ -486,7 +476,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.deepseek_allreduce_disabled = True
 
         if not self.deepseek_allreduce_disabled:
-            self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
+            self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
 
     def forward(
         self,
@@ -511,9 +501,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.fusion_config.
-                PRE_MLP_FUSION or self.parallel_config.tensor_parallel_size == 1
-                or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION
+                or self.fusion_config.PRE_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -586,9 +576,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                    POST_MLP_FUSION or self.parallel_config.tensor_parallel_size
-                    == 1 or self.enable_attention_dp)),
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
                 min_latency_mode=min_latency_mode,
             )
         else:
@@ -596,9 +586,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                    POST_MLP_FUSION or self.parallel_config.tensor_parallel_size
-                    == 1 or self.enable_attention_dp)),
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
                 min_latency_mode=min_latency_mode,
             )
 
@@ -729,8 +719,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -762,8 +752,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states,
             all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
         )
 
         if self.fusion_config.POST_MOE_FUSION:

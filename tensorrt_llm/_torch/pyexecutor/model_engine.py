@@ -287,8 +287,7 @@ class PyTorchModelEngine(ModelEngine):
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size,
-                    self.model.model_config.get_quant_config(), self.dtype)
+                    self.model.config.hidden_size)
                 self.model = torch.compile(
                     self.model,
                     backend=Backend(
@@ -1746,19 +1745,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return {'hidden_states': hidden_states}
 
-    def _init_userbuffers(self, hidden_size, quant_config, dtype):
-        # No quant, do not allow UB
+    def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:
-            return False
-
-        if quant_config is None:
-            return False
-
-        # UB currently only support FP8 quant
-        if not quant_config.layer_quant_mode.has_fp8_qdq():
-            return False
-
-        if dtype != torch.float16 and dtype != torch.bfloat16:
             return False
 
         # Disable UB for unsupported platforms
