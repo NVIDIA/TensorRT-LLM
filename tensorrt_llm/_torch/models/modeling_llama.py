@@ -604,6 +604,14 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
         self,
         model_config: ModelConfig[LlamaConfig],
     ):
+        # to support MistralConfig
+        if not hasattr(model_config.pretrained_config, 'attention_bias'):
+            model_config.pretrained_config.attention_bias = False
+        if not hasattr(model_config.pretrained_config, 'rope_scaling'):
+            model_config.pretrained_config.rope_scaling = None
+        if not hasattr(model_config.pretrained_config, 'mlp_bias'):
+            model_config.pretrained_config.mlp_bias = False
+
         super().__init__(LlamaModel(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,

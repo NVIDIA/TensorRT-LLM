@@ -12,6 +12,7 @@ from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
@@ -592,7 +593,6 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
         ref_internal = rms_norm(ref_residual.to(torch.float32), gamma,
                                 eps).to(a.dtype)
         internal_global_sf = (448 * 6) / ref_internal.abs().max().float()
-        inv_internal_global_sf = (1 / internal_global_sf).cuda()
 
         a_partial = torch.chunk(a, tensor_parallel_size, 1)
         b_partial = torch.chunk(b, tensor_parallel_size, 0)
@@ -618,7 +618,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
             residual=c,
             norm_weight=gamma,
-            scale=inv_internal_global_sf,
+            scale=internal_global_sf,
             eps=eps)
         q_internal, scale_ub, residual = ar.forward(hidden,
                                                     all_reduce_params=ar_params)
@@ -810,5 +810,284 @@ def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
             run_single_rank_ub_mm_add_pass,
             *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
                     norm1_gamma, norm2_gamma)] * tensor_parallel_size))
+        for r in results:
+            assert r is True
+
+
+class UBFp4TestModel(nn.Module):
+
+    def __init__(self, tp_size, rank, hidden_size, dtype, eps, l0_weight,
+                 l0_input_scale, l0_weight_scale1, l0_weight_scale2, l1_weight,
+                 l1_input_scale, l1_weight_scale1, l1_weight_scale2, l2_weight,
+                 l2_input_scale, l2_weight_scale1, l2_weight_scale2, l3_weight,
+                 l3_input_scale, l3_weight_scale1, l3_weight_scale2, l4_weight,
+                 l4_input_scale, l4_weight_scale1, l4_weight_scale2,
+                 norm0_gamma, norm1_gamma, norm2_gamma):
+        super().__init__()
+        quant_config = QuantConfig()
+        quant_config.quant_algo = QuantAlgo.NVFP4
+        quant_config.layer_quant_mode
+        self.rank = rank
+        self.tp_size = tp_size
+        self.l0 = Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype,
+                         parallel_config=ParallelConfig(
+                             tensor_parallel_size=tp_size,
+                             tensor_parallel_rank=rank,
+                             tensor_parallel_mode=TensorParallelMode.ROW,
+                         ),
+                         quant_config=quant_config).cuda()
+        self.l1 = Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype,
+                         parallel_config=ParallelConfig(
+                             tensor_parallel_size=tp_size,
+                             tensor_parallel_rank=rank,
+                             tensor_parallel_mode=TensorParallelMode.COLUMN,
+                         ),
+                         quant_config=quant_config).cuda()
+        self.l2 = Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype,
+                         parallel_config=ParallelConfig(
+                             tensor_parallel_size=tp_size,
+                             tensor_parallel_rank=rank,
+                             tensor_parallel_mode=TensorParallelMode.ROW,
+                         ),
+                         quant_config=quant_config).cuda()
+        self.l3 = Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype,
+                         parallel_config=ParallelConfig(
+                             tensor_parallel_size=tp_size,
+                             tensor_parallel_rank=rank,
+                             tensor_parallel_mode=TensorParallelMode.COLUMN,
+                         ),
+                         quant_config=quant_config).cuda()
+        self.l4 = Linear(in_features=hidden_size,
+                         out_features=hidden_size,
+                         bias=False,
+                         dtype=dtype,
+                         parallel_config=ParallelConfig(
+                             tensor_parallel_size=tp_size,
+                             tensor_parallel_rank=rank,
+                             tensor_parallel_mode=TensorParallelMode.ROW,
+                         ),
+                         quant_config=quant_config).cuda()
+        self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+        self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+        self.norm2 = RMSNorm(hidden_size=hidden_size, eps=eps,
+                             dtype=dtype).cuda()
+
+        self.l0.load_weights([
+            dict(weight=l0_weight,
+                 input_scale=1.0 / l0_input_scale,
+                 weight_scale=l0_weight_scale1,
+                 weight_scale_2=1.0 / l0_weight_scale2)
+        ])
+        self.l1.load_weights([
+            dict(weight=l1_weight,
+                 input_scale=1.0 / l1_input_scale,
+                 weight_scale=l1_weight_scale1,
+                 weight_scale_2=1.0 / l1_weight_scale2)
+        ])
+        self.l2.load_weights([
+            dict(weight=l2_weight,
+                 input_scale=1.0 / l2_input_scale,
+                 weight_scale=l2_weight_scale1,
+                 weight_scale_2=1.0 / l2_weight_scale2)
+        ])
+        self.l3.load_weights([
+            dict(weight=l3_weight,
+                 input_scale=1.0 / l3_input_scale,
+                 weight_scale=l3_weight_scale1,
+                 weight_scale_2=1.0 / l3_weight_scale2)
+        ])
+        self.l4.load_weights([
+            dict(weight=l4_weight,
+                 input_scale=1.0 / l4_input_scale,
+                 weight_scale=l4_weight_scale1,
+                 weight_scale_2=1.0 / l4_weight_scale2)
+        ])
+        self.norm0.weight.data.copy_(norm0_gamma)
+        self.norm1.weight.data.copy_(norm1_gamma)
+        self.norm2.weight.data.copy_(norm2_gamma)
+        torch.cuda.current_stream().synchronize()
+
+    def forward(self, input):
+        local = torch.chunk(input, self.tp_size,
+                            1)[self.rank].contiguous()  # [token, hidden/tp]
+        hidden0 = self.l0(
+            local
+        )  # [token, hidden/tp] * [hidden/tp, hidden] -> [token, hidden], row parallel
+        hidden1 = hidden0 + input  # [token, hidden]
+        norm0 = self.norm0(hidden1)  # [token, hidden]
+        hidden2 = self.l1(
+            norm0
+        )  # [token, hidden] * [hidden, hidden/tp] -> [token, hidden/tp], col parallel, no gather
+        hidden3 = self.l2(
+            hidden2
+        )  # # [token, hidden/tp] * [hidden/tp, hidden] -> [token, hidden], row parallel
+        hidden4 = hidden3 + hidden1
+        norm1 = self.norm1(hidden4)
+        hidden5 = self.l3(
+            norm1
+        )  # [token, hidden] * [hidden, hidden/tp] -> [token, hidden/tp], col parallel, no gather
+        hidden6 = self.l4(
+            hidden5
+        )  # # [token, hidden/tp] * [hidden/tp, hidden] -> [token, hidden], row parallel
+        hidden7 = hidden6 + hidden4
+        res = self.norm2(hidden7)
+        return res
+
+
+def run_single_rank_ub_pass_fp4(
+        tensor_parallel_size, input, l0_weight, l0_input_scale, l0_weight_scale,
+        l1_weight, l1_input_scale, l1_weight_scale, l2_weight, l2_input_scale,
+        l2_weight_scale, l3_weight, l3_input_scale, l3_weight_scale, l4_weight,
+        l4_input_scale, l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        support = ub.ub_supported()
+        if not support:
+            return True
+
+        eps = 1e-5
+        hidden_size = input.size(-1)
+        dtype = input.dtype
+        input = input.cuda()
+        ub_size = input.nelement() * input.element_size()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+
+        def quant_fp4(x, sf):
+            return torch.ops.trtllm.fp4_quantize(x, sf, 16, False)
+
+        l0_weight, l0_weight_scale1 = quant_fp4(l0_weight.cuda(),
+                                                l0_weight_scale.cuda())
+        l1_weight, l1_weight_scale1 = quant_fp4(l1_weight.cuda(),
+                                                l1_weight_scale.cuda())
+        l2_weight, l2_weight_scale1 = quant_fp4(l2_weight.cuda(),
+                                                l2_weight_scale.cuda())
+        l3_weight, l3_weight_scale1 = quant_fp4(l3_weight.cuda(),
+                                                l3_weight_scale.cuda())
+        l4_weight, l4_weight_scale1 = quant_fp4(l4_weight.cuda(),
+                                                l4_weight_scale.cuda())
+
+        def block_scale_unswizzled(scale):
+            sz = fp4_utils.pad_up(hidden_size, 128)
+            return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+                scale.cpu().view(sz, -1))[0:hidden_size]
+
+        l0_weight_scale_block_unswizzled = block_scale_unswizzled(
+            l0_weight_scale1)
+        l1_weight_scale_block_unswizzled = block_scale_unswizzled(
+            l1_weight_scale1)
+        l2_weight_scale_block_unswizzled = block_scale_unswizzled(
+            l2_weight_scale1)
+        l3_weight_scale_block_unswizzled = block_scale_unswizzled(
+            l3_weight_scale1)
+        l4_weight_scale_block_unswizzled = block_scale_unswizzled(
+            l4_weight_scale1)
+
+        model = UBFp4TestModel(
+            tensor_parallel_size, rank, hidden_size, dtype, eps, l0_weight,
+            l0_input_scale,
+            l0_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
+            l0_weight_scale, l1_weight, l1_input_scale,
+            l1_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
+            l1_weight_scale, l2_weight, l2_input_scale,
+            l2_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
+            l2_weight_scale, l3_weight, l3_input_scale,
+            l3_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
+            l3_weight_scale, l4_weight, l4_input_scale,
+            l4_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
+            l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)
+
+        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        model_opt = torch.compile(model, backend=backend, fullgraph=True)
+        with torch.inference_mode():
+            output_ref = model(input)
+            output_fused = model_opt(input)
+
+        # 3 AR_NORM fusion happens first
+        # 2 AR_NORM fused with Quant
+        # 1 AR_NORM replacement
+        # 3 Scaled MM Prologue
+        # 2 UB Finalize Removal
+        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output_fused,
+                                   output_ref,
+                                   atol=1.6,
+                                   rtol=1e-2)
+    except Exception:
+        traceback.print_exc()
+
+        return False
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("hidden", [512, 128], ids=lambda x: f"_hidden{x}")
+@pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                         ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+@skip_pre_blackwell_unittest
+def test_user_buffers_fp4_pass(hidden, tokens, dtype):
+    torch.manual_seed(43)
+    tensor_parallel_size = 2
+
+    eps = 1e-5
+
+    input = torch.randn((tokens, hidden), dtype=dtype) * 0.05
+    l0_weight = torch.randn((hidden, hidden), dtype=dtype) * 0.05
+    l1_weight = torch.randn((hidden, hidden), dtype=dtype) * 0.05
+    l2_weight = torch.randn((hidden, hidden), dtype=dtype) * 0.05
+    l3_weight = torch.randn((hidden, hidden), dtype=dtype) * 0.05
+    l4_weight = torch.randn((hidden, hidden), dtype=dtype) * 0.05
+    norm0_gamma = torch.randn((hidden, ), dtype=dtype)
+    norm1_gamma = torch.randn((hidden, ), dtype=dtype)
+    norm2_gamma = torch.randn((hidden, ), dtype=dtype)
+
+    def fp4_scale(x):
+        return (448 * 6) / x.abs().max().float()
+
+    input_scale = fp4_scale(input)
+    l0_weight_scale = fp4_scale(l0_weight)
+    l1_weight_scale = fp4_scale(l1_weight)
+    l2_weight_scale = fp4_scale(l2_weight)
+    l3_weight_scale = fp4_scale(l3_weight)
+    l4_weight_scale = fp4_scale(l4_weight)
+
+    l1_residual = input @ l0_weight.t() + input
+    l0_res = rms_norm(l1_residual, norm0_gamma, eps).to(dtype)
+    l0_res_scale = fp4_scale(l0_res)
+
+    l1_res = l0_res @ l1_weight.t()
+    l1_res_scale = fp4_scale(l1_res)
+    l2_residual = l1_res @ l2_weight.t() + l1_residual
+    l2_res = rms_norm(l2_residual, norm1_gamma, eps).to(dtype)
+    l2_res_scale = fp4_scale(l2_res)
+    l3_res = l2_res @ l3_weight.t()
+    l3_res_scale = fp4_scale(l3_res)
+
+    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
+        results = executor.map(
+            run_single_rank_ub_pass_fp4,
+            *zip(*[(tensor_parallel_size, input, l0_weight, input_scale,
+                    l0_weight_scale, l1_weight, l0_res_scale, l1_weight_scale,
+                    l2_weight, l1_res_scale, l2_weight_scale, l3_weight,
+                    l2_res_scale, l3_weight_scale, l4_weight, l3_res_scale,
+                    l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
+                 tensor_parallel_size))
         for r in results:
             assert r is True

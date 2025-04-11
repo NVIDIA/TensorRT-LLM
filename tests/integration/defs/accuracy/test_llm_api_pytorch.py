@@ -201,6 +201,16 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMistral7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-7B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
@@ -418,3 +428,49 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
+
+    @skip_pre_ada
+    def test_fp8_prequantized(self):
+        with LLM(self.MODEL_PATH) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestNemotronNas(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype_tp8(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        pytorch_config = PyTorchConfig(enable_overlap_scheduler=True)
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=8,
+                 kv_cache_config=kv_cache_config,
+                 pytorch_backend_config=pytorch_config) as llm:
+
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-7B-Instruct"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=
+        "You are a helpful assistant, please summarize the article entered by the user with one or two sentences."
+    )
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)

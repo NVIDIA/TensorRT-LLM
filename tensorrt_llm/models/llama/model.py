@@ -187,16 +187,16 @@ class LLaMADecoderLayer(Module):
                         copy())
                 elif self.config.quant_mode.has_nvfp4():
                     reduce_fusion_scale = constant(
-                        self.mlp.fused_fc.activation_global_scaling_factor.
-                        raw_value.copy())
+                        [1.0] / self.mlp.fused_fc.
+                        activation_global_scaling_factor.raw_value)
             else:
                 if self.config.quant_mode.has_fp8_qdq():
                     reduce_fusion_scale = constant(
                         self.mlp.fc.activation_scaling_factor.raw_value.copy())
                 elif self.config.quant_mode.has_nvfp4():
                     reduce_fusion_scale = constant(
-                        self.mlp.fc.activation_global_scaling_factor.raw_value.
-                        copy())
+                        [1.0] /
+                        self.mlp.fc.activation_global_scaling_factor.raw_value)
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
