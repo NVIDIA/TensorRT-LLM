@@ -37,7 +37,7 @@ class DecoderXQARunner;
 class DecoderXQAImpl
 {
 public:
-    // TODO(minwei): shouldUse()/prepare() should be templated with KVCacheBuffer.
+    // TODO: shouldUse()/prepare() should be templated with KVCacheBuffer.
     // Whether it is beneficial to use this XQA codepath.
     //
     // forConfigurePlugin: whether this method is called in configure plugin phase.

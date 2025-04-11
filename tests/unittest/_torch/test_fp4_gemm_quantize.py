@@ -85,6 +85,45 @@ class TestFunctional(unittest.TestCase):
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
         self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
 
+    @parameterized.expand(
+        list([
+            [1024, 1024, 1024],
+            [256, 128, 512],
+        ]),
+        name_func=unittest_name_func,
+    )
+    @skip_pre_blackwell_unittest
+    def test_fp4_quantize_gemm_trtllmgen(self, m, n, k):
+        a = torch.randn([m, k], dtype=torch.float32)
+        b = torch.randn([n, k], dtype=torch.float32)
+        a_global_sf = (448 * 6) / a.abs().max().float()
+        b_global_sf = (448 * 6) / b.abs().max().float()
+        ab_global_sf = 1 / (a_global_sf * b_global_sf)
+        ab_global_sf = ab_global_sf.cuda()
+
+        sf_vec_size = 16
+        a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a.half().cuda(),
+                                                    a_global_sf.cuda(),
+                                                    sf_vec_size, False)
+        b_fp4, b_sf = torch.ops.trtllm.fp4_quantize(b.half().cuda(),
+                                                    b_global_sf.cuda(),
+                                                    sf_vec_size, False)
+
+        a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
+                                                      1 / a_global_sf,
+                                                      sf_vec_size)
+        b_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(b_fp4.cpu(), b_sf.cpu(),
+                                                      1 / b_global_sf,
+                                                      sf_vec_size)
+
+        c = (torch.ops.trtllm.fp4_gemm_trtllmgen(a_fp4, b_fp4, a_sf, b_sf,
+                                                 ab_global_sf,
+                                                 False).float().cpu())
+
+        torch.cuda.synchronize()
+        c_pt = torch.nn.functional.linear(a_pt, b_pt)
+        self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
+
     @parameterized.expand(list([[1024, 1024, torch.half, False],
                                 [2, 512, torch.bfloat16, False],
                                 [13, 16, torch.half, True]]),

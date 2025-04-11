@@ -19,7 +19,8 @@ import torch
 
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
 from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
-                                            IterationStats, KvCacheStats)
+                                            IterationStats, KvCacheStats,
+                                            RequestType)
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
@@ -141,7 +142,8 @@ class PyExecutor:
                  max_batch_size: int = 8,
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
-                 draft_model_engine: Optional[ModelEngine] = None):
+                 draft_model_engine: Optional[ModelEngine] = None,
+                 start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -222,20 +224,34 @@ class PyExecutor:
         self.stats = []
         self.start_times = {}
         self.new_active_requests_queue_latency_ms = 0
+        self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
-            event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
+            self.event_loop = self._executor_loop_pp_overlap if enable_overlap_scheduler else self._executor_loop_pp
         else:
-            event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+            self.event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
 
-        if self.draft_model_engine is not None and event_loop.__name__ != self._executor_loop.__name__:
+        if self.draft_model_engine is not None and self.event_loop.__name__ != self._executor_loop.__name__:
             raise NotImplementedError(
                 "Drafting is not supported for selected executor loop. "
                 "Please disable disagg/pipeline parallelism/overlap scheduler.")
 
-        self.worker_thread = threading.Thread(target=event_loop, daemon=True)
-        self.worker_thread.start()
+        self.worker_started = False
+        self.worker_lock = threading.Lock()
+        if start_worker:
+            self.start_worker()
+
+    def start_worker(self):
+        self.worker_lock.acquire()
+        try:
+            if self.worker_started == False:
+                self.worker_thread = threading.Thread(target=self.event_loop,
+                                                      daemon=True)
+                self.worker_thread.start()
+                self.worker_started = True
+        finally:
+            self.worker_lock.release()
 
     def __enter__(self):
         return self
@@ -305,9 +321,11 @@ class PyExecutor:
             self.enqueue_lock.release()
         self.shutdown_event.wait()
         self.worker_thread.join()
+        self.worker_started = False
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        del self.model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -369,6 +387,9 @@ class PyExecutor:
         finally:
             self.enqueue_lock.release()
         return req_id
+
+    def set_gather_responses(self, gather_all_responses):
+        self.gather_all_responses = gather_all_responses
 
     @contextmanager
     def _profiler(self):
@@ -472,6 +493,9 @@ class PyExecutor:
                             iter_start_time, iter_stats):
         iter_end_time = time.time()
         iter_latency_ms = iter_end_time - iter_start_time
+        if iter_stats is None:
+            return
+
         self._append_iter_stats(
             self._update_iter_stats(iter_stats, iter_latency_ms,
                                     len(finished_requests), scheduled_batch))
@@ -723,7 +747,6 @@ class PyExecutor:
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
-
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
@@ -1095,6 +1118,7 @@ class PyExecutor:
              self.dist.tp_size - 1) // self.dist.tp_size,
             max(self.all_ranks_num_active_requests),
         )
+
         self.has_context_request = False
         new_requests_cur_rank = []
         if new_requests != [] and new_requests[
@@ -1136,7 +1160,16 @@ class PyExecutor:
                     heapq.heappush(all_ranks_new_requests_heap, val)
                 elif val.rank == self.dist.tp_rank:
                     break
-            self.has_context_request = len(new_requests_cur_rank) > 0
+
+            # In disaggregated serving, we might get either context request or
+            # generation request. In IFB, we only get context request from request queue
+            if self.kv_cache_transceiver:
+                for req in new_requests_cur_rank:
+                    if req[1].request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY:
+                        self.has_context_request = True
+                        break
+            else:
+                self.has_context_request = len(new_requests_cur_rank) > 0
             self._update_new_active_requests_queue_latency(
                 new_requests_cur_rank)
 
@@ -1399,6 +1432,12 @@ class PyExecutor:
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
+
+        # For gen-only benchmarking, mark new gen request as transmission complete right away
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            for req in new_gen_reqs:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            return
 
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
             for req in new_gen_reqs:
@@ -1734,16 +1773,18 @@ class PyExecutor:
 
     @nvtx_range("_handle_cancelled_requests")
     def _handle_cancelled_requests(self):
-        if not self.canceled_req_ids:
-            return
-
         #TODO: properly handle canceled ids in pp case
-        if self.dist.has_tp and self.canceled_req_ids:
+        if self.dist.has_tp:
             self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
                                                         root=0)
 
+        if len(self.canceled_req_ids) == 0:
+            return
+
         cancelled_responses = {}
         left_requests = []
+        # Tracks canceled requests for proper handling in overlap mode during `decoder.update_requests`.
+        self.canceled_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
@@ -1752,6 +1793,8 @@ class PyExecutor:
                 request.decoding_iter = request.py_decoding_iter
                 cancelled_responses[req_id] = request.create_response(
                     False, self.dist.rank)
+                self.canceled_requests.append(request)
+                self.canceled_req_ids.erase(req_id)
             else:
                 left_requests.append(request)
         self.active_requests = left_requests
@@ -1762,21 +1805,26 @@ class PyExecutor:
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
-        if 0 not in self.dist.mapping.tp_group:
+        if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
         logger.debug(
             f'before gather, rank = {self.dist.rank}, responses = {responses}')
         if self.enable_attention_dp:
-            responses_list = self.dist.tp_gather(responses)
-            if self.dist.rank == 0:
+            if not self.gather_all_responses:
+                responses_list = self.dist.tp_gather(responses)
+            else:
+                responses_list = self.dist.allgather(responses)
+            if self.dist.rank == 0 or self.gather_all_responses:
                 gather_responses = {}
-                for resp in responses_list:
-                    gather_responses.update(resp)
-                responses = gather_responses
+                if responses_list is not None:
+                    for resp in responses_list:
+                        gather_responses.update(resp)
+                    responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
-        if self.dist.rank == 0:
+
+        if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
                 for req_id, resp in responses.items():
                     if req_id in self.responses.keys():
@@ -1796,6 +1844,7 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id
             #no responses for dummy request, and finish it
+
             if request.is_dummy == True:
                 requests_to_terminate.append(request)
                 continue
@@ -1804,7 +1853,6 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response(False, self.dist.rank)
             request_done = False
-
             if response:
                 request_done = response.result.is_final
                 new_responses.update({req_id: response})
@@ -1819,7 +1867,6 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")

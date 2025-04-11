@@ -156,7 +156,7 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
         invokeScatterDecodingParams(
             topKSetupPtr, runtimeTopK.front(), runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
 
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         auto const curMaxTopK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
         return curMaxTopK;
     };
@@ -469,7 +469,7 @@ void MedusaDecodingLayer<T>::packAcceptedPaths(SpeculativeDecodingOutputs const&
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for MedusaDecoding");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIdsDevicePtr, paths, batchSlots,
-        batchSize, batchSize, mDecoderDomain.getMaxDecodingTokens(),
+        nullptr, batchSize, batchSize, mDecoderDomain.getMaxDecodingTokens(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), false, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

@@ -386,9 +386,13 @@ void initRequestBindings(pybind11::module_& m)
 
     auto ContextPhaseParamsGetState = [](tle::ContextPhaseParams const& self)
     {
-        auto serializedState = self.getSerializedState();
-        return py::make_tuple(self.getFirstGenTokens(), self.getReqId(),
-            py::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
+        if (self.getState() != nullptr)
+        {
+            auto serializedState = self.getSerializedState();
+            return py::make_tuple(self.getFirstGenTokens(), self.getReqId(),
+                py::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
+        }
+        return py::make_tuple(self.getFirstGenTokens(), self.getReqId(), py::none(), self.getDraftTokens());
     };
 
     auto ContextPhaseParamsSetState = [](py::tuple const& state)
@@ -397,22 +401,31 @@ void initRequestBindings(pybind11::module_& m)
         {
             throw std::runtime_error("Invalid ContextPhaseParams state!");
         }
-        auto opaque_state = state[2].cast<py::bytes>();
-        auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
+        if (!state[2].is_none())
+        {
+            auto opaque_state = state[2].cast<py::bytes>();
+            auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
+            return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
+                state[1].cast<tle::ContextPhaseParams::RequestIdType>(),
+                std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
+                state[3].cast<std::optional<VecTokens>>());
+        }
         return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
-            state[1].cast<tle::ContextPhaseParams::RequestIdType>(),
-            std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
-            state[3].cast<std::optional<VecTokens>>());
+            state[1].cast<tle::ContextPhaseParams::RequestIdType>(), state[3].cast<std::optional<VecTokens>>());
     };
 
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
         .def(py::init(
             [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
-                py::bytes const& opaque_state, std::optional<VecTokens> const& draft_tokens)
+                std::optional<py::bytes> const& opaque_state, std::optional<VecTokens> const& draft_tokens)
             {
-                auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
-                return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
-                    std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
+                if (opaque_state)
+                {
+                    auto opaque_state_str_view = std::string_view(opaque_state.value().cast<std::string_view>());
+                    return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
+                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
+                }
+                return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id, draft_tokens);
             }))
         .def_property_readonly("first_gen_tokens", &tle::ContextPhaseParams::getFirstGenTokens)
         .def_property_readonly("draft_tokens", &tle::ContextPhaseParams::getDraftTokens)
@@ -420,8 +433,13 @@ void initRequestBindings(pybind11::module_& m)
         .def_property_readonly("opaque_state",
             [](tle::ContextPhaseParams const& self)
             {
-                auto serializedState = self.getSerializedState();
-                return py::bytes(serializedState.data(), serializedState.size());
+                std::optional<py::bytes> opaque_state{std::nullopt};
+                if (self.getState() != nullptr)
+                {
+                    auto serializedState = self.getSerializedState();
+                    opaque_state = py::bytes(serializedState.data(), serializedState.size());
+                }
+                return opaque_state;
             })
         .def(py::pickle(ContextPhaseParamsGetState, ContextPhaseParamsSetState));
 

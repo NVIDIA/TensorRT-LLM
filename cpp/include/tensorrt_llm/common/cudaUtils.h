@@ -125,8 +125,8 @@ void check(T ptr, char const* const func, char const* const file, int const line
 {
     if (ptr)
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -136,8 +136,8 @@ void checkEx(
 {
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -1197,8 +1197,8 @@ __forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint
 }
 
 template <bool barSetTxCnt = true>
-__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, const uint32_t wrdat0,
-    const uint32_t wrdat1, const uint32_t wrdat2, const uint32_t wrdat3)
+__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, uint32_t const wrdat0,
+    uint32_t const wrdat1, uint32_t const wrdat2, uint32_t const wrdat3)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
     if (barSetTxCnt)

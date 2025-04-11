@@ -54,10 +54,12 @@ def engine_from_fp8_quantization(model_name):
               build_config=build_config)
 
     engine_dir = TemporaryDirectory(suffix="-engine_dir")
-    llm.save(engine_dir.name)
-    del llm
+    with llm:
+        llm.save(engine_dir.name)
 
     yield engine_dir.name
+
+    llm.shutdown()
 
 
 @pytest.fixture(scope="module")

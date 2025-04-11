@@ -35,7 +35,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import (BATCH_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
+from .utils import (PERIODICAL_RESP_IN_AWAIT, ErrorResponse, IntraProcessQueue,
                     RequestError, WorkerCommIpcAddrs, has_event_loop)
 
 __all__ = [
@@ -558,7 +558,7 @@ def worker_main(
             # processes, each one is a PAIR zmq socket
             result_queues = [
                 FusedIpcQueue(is_server=True,
-                              fuse_message=not BATCH_RESP_IN_AWAIT,
+                              fuse_message=PERIODICAL_RESP_IN_AWAIT,
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
@@ -567,7 +567,7 @@ def worker_main(
             # Proxy process to handle the postprocess
             result_queue = FusedIpcQueue(worker_queues.result_queue_addr,
                                          is_server=False,
-                                         fuse_message=not BATCH_RESP_IN_AWAIT,
+                                         fuse_message=PERIODICAL_RESP_IN_AWAIT,
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
@@ -706,10 +706,10 @@ class AwaitResponseHelper:
                 # The ExecutorBindingProxy is used
                 print_colored_debug(f"creating await_response helper for IPC\n",
                                     color="yellow")
-                if BATCH_RESP_IN_AWAIT:
-                    self.handler_kind = HandlerKind.ipc_batched
-                else:
+                if PERIODICAL_RESP_IN_AWAIT:
                     self.handler_kind = HandlerKind.ipc_periodically
+                else:
+                    self.handler_kind = HandlerKind.ipc_batched
             else:
                 raise NotImplementedError
 

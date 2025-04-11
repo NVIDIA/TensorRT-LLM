@@ -41,7 +41,8 @@ def llama_7b_path(engine_path: Path) -> Path:
     if not path.exists():
         model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
         llm = LLM(model_dir)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -56,7 +57,8 @@ def llama_7b_bs2_path(engine_path: Path) -> Path:
         build_config.max_beam_width = 2
         # TODO[chunweiy]: switch to executor backend
         llm = LLM(model_dir, build_config=build_config)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -68,7 +70,8 @@ def llama_7b_tp2_path(engine_path: Path) -> Path:
     if not path.exists():
         model_dir = str(llm_models_root() / "llama-models/llama-7b-hf")
         llm = LLM(model_dir, tensor_parallel_size=2)
-        llm.save(str(path))
+        with llm:
+            llm.save(str(path))
 
     return path
 
@@ -347,6 +350,8 @@ def test_ZeroMqQueue_sync_async():
         push_pipe.put(i)
 
     assert res.result() == 45
+    pool.shutdown()
+    push_pipe.close()
 
 
 Input = PostprocWorker.Input
@@ -413,6 +418,10 @@ def test_ResponsePostprocessWorker():
 
     input_pipe.put(None)  # tell worker to shutdown
     fut.result()
+
+    pool.shutdown()
+    input_pipe.close()
+    out_pipe.close()
 
 
 if __name__ == '__main__':

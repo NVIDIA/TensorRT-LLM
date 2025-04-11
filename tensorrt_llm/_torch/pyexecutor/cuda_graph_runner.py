@@ -64,6 +64,9 @@ class DecodingCUDAGraphRunner:
         self._output = None
         self._graph = None
 
+    def __del__(self):
+        self._graph.reset()
+
     def capture(
         self,
         forward_fn: Callable[[Dict[str, Any]], torch.Tensor],

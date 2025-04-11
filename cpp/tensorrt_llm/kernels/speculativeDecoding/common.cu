@@ -40,8 +40,8 @@ namespace tensorrt_llm::kernels::speculative_decoding
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
-    SizeType32 maxPathLen, bool isPathsLinearBatchIdx)
+    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
+    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsSeqSlotIdx)
 {
     // Specialize BlockScan for a 1D block of 128 threads of type int
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
@@ -81,10 +81,26 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
         }
         __syncthreads();
 
+        int32_t pathBatchIdx{batchSlot};
+        if (isPathsSeqSlotIdx)
+        {
+            // If paths tensor is the tensor arranged according to seq slot,
+            // we must find the position of the batchSlots index in the seq slot array.
+            // TODO optimize it.
+            for (int bi = 0; bi < batchSize; ++bi)
+            {
+                auto const seqSlot = seqSlots[bi];
+                if (batchSlot == seqSlot)
+                {
+                    pathBatchIdx = bi;
+                    break;
+                }
+            }
+        }
+
         if (valid)
         {
             acceptedLengthsCumSum[validIndex] = cumSum;
-            auto const pathBatchIdx = isPathsLinearBatchIdx ? bi : batchSlot;
             auto const bestPathIdx = bestPathIds[pathBatchIdx];
             auto const pathIdx = flat_index3(pathBatchIdx, bestPathIdx, 0, numPaths, maxPathLen);
             for (SizeType32 ti = 0; ti < acceptedLen; ++ti)
@@ -101,12 +117,13 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
 void invokePackAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
-    SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream)
+    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
+    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream)
 {
     constexpr SizeType32 BLOCK_SIZE = 1024;
     packAcceptedPaths<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(acceptedLengthsCumSum, pathsOffsets, acceptedLengths,
-        bestPathIds, paths, batchSlots, batchSize, engineBatchSize, numPaths, maxPathLen, isPathsLinearBatchIdx);
+        bestPathIds, paths, batchSlots, seqSlots, batchSize, engineBatchSize, numPaths, maxPathLen,
+        isPathsLinearBatchIdx);
 }
 
 namespace

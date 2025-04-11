@@ -597,7 +597,7 @@ RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std:
                     TLLM_CHECK_WITH_INFO(beamWidth == 1, "Logits substitution is not supported for beam search");
 
                     auto const genLogitsOffset = tokens[0].size() - expectedContextLogits->getShape().d[0];
-                    // TODO(xiweny): Avoid static cast in TRT 10.0
+                    // TODO: Avoid static cast in TRT 10.0
                     auto const numLogits = static_cast<SizeType32>(logits->getShape().d[0]);
                     auto const numVerifyLogits = std::min(numLogits, acceptedDraftTokensLengths + 1);
 
@@ -980,7 +980,7 @@ TEST_P(ParamTest, Test)
 
     if (modelSpec.mSpecDecodingMode == SpeculativeDecodingMode::LookaheadDecoding())
     {
-        modelOptionalParams.decodingConfig.setLookaheadDecoding(texec::LookaheadDecodingConfig(5, 5, 5));
+        modelOptionalParams.decodingConfig.setLookaheadDecodingConfig(texec::LookaheadDecodingConfig(5, 5, 5));
     }
 
     if (modelType == TrtGptModelType::V1
@@ -1667,7 +1667,8 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useEagle()
                 .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(std::nullopt), // freeGpuMemoryFraction

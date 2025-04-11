@@ -11,6 +11,8 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from ..test_llm import llama_model_path
 
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.fixture(scope="module")
 def client():
@@ -32,9 +34,6 @@ def client():
                                 hf_tokenizer=hf_tokenizer)
     client = TestClient(app_instance.app)
     yield client
-
-    del llm
-    del app_instance.llm
 
 
 def test_health(client):

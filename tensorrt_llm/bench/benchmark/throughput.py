@@ -18,12 +18,11 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
-from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
-from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -260,7 +259,7 @@ def throughput_command(
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
-        "scheduler_policy"] = IFBSchedulingPolicy.NO_EVICT
+        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     # Dynamic runtime features.
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True

@@ -94,6 +94,8 @@ def EXTRA_STAGE_LIST = "extra_stage"
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+@Field
+def DEBUG_MODE = "debug"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -107,6 +109,7 @@ def testFilter = [
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
+    (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -323,13 +326,7 @@ def launchReleaseCheck(pipeline)
         // Step 1: cloning tekit source code
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep pre-commit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep bandit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit install")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run -a --show-diff-on-failure || (git restore . && false)")
-        sh "cd ${LLM_ROOT} && bandit --configfile scripts/bandit.yaml -r tensorrt_llm | tee /tmp/bandit.log"
-        sh "cat /tmp/bandit.log | grep -q 'Total lines skipped (#nosec): 0' && exit 0 || exit 1"
-        sh "cat /tmp/bandit.log | grep -q 'Issue:' && exit 1 || exit 0"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
         // Step 2: build tools
         withEnv(['GONOSUMDB=*.nvidia.com']) {
@@ -520,6 +517,9 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py",
+        "tensorrt_llm/_torch/models/modeling_llama.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
@@ -561,7 +561,13 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
         return false
     }
-    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+    def pytorchOnlyList = [
+        "tensorrt_llm/_torch/",
+        "tests/unittest/_torch/",
+        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+        "tests/integration/defs/disaggregated/",
+        "examples/pytorch/",
+    ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
 
@@ -569,12 +575,20 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
 
-    def result = changedFileList.every { file ->
-        def isPytorchFile = file =~ pytorchOnlyPattern
+    def result = true
+    for (file in changedFileList) {
+        def isPytorchFile = false
+        for (prefix in pytorchOnlyList) {
+            if (file.startsWith(prefix)) {
+                isPytorchFile = true
+                break
+            }
+        }
         if (!isPytorchFile) {
             pipeline.echo("Found non-PyTorch file: ${file}")
+            result = false
+            break
         }
-        return isPytorchFile
     }
 
     pipeline.echo("Only PyTorch files changed: ${result}")
