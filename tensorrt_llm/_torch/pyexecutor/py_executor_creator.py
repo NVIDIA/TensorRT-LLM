@@ -147,7 +147,13 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     # KVCacheManager modifies these fields, update them to executor_config
     if kv_cache_manager is not None:
-        executor_config.max_seq_len = kv_cache_manager.max_seq_len
+        if executor_config.max_seq_len is not None:
+            executor_config.max_seq_len = max(
+                executor_config.max_seq_len,
+                kv_cache_manager.max_seq_len,
+            )
+        else:
+            executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
     py_executor = create_py_executor_instance(dist, kv_cache_manager,
                                               draft_kv_cache_manager, mapping,
@@ -162,7 +168,13 @@ def create_py_executor(executor_config: ExecutorConfig,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
-            executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
+            if executor_config.kv_cache_config.max_tokens is not None:
+                executor_config.kv_cache_config.max_tokens = max(
+                    executor_config.kv_cache_config.max_tokens,
+                    kv_cache_max_tokens,
+                )
+            else:
+                executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
 
             kv_cache_manager = create_kv_cache_manager(model_engine, mapping,
                                                        executor_config)
