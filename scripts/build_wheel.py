@@ -267,11 +267,36 @@ def main(*,
             cache_dir = Path(os.getenv("TEMP"), "/tmp") / "tensorrt_llm"
     if cache_dir.exists():
         clear_folder(cache_dir)
+
+    install_file = copy
+    install_tree = copytree
+    if skip_building_wheel and linking_install_binary:
+
+        def symlink_remove_dst(src, dst):
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+            if os.path.isdir(dst):
+                dst = os.path.join(dst, os.path.basename(src))
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.symlink(src, dst)
+
+        install_file = symlink_remove_dst
+
+        def symlink_remove_dst_tree(src, dst, dirs_exist_ok=True):
+            src = os.path.abspath(src)
+            dst = os.path.abspath(dst)
+            if dirs_exist_ok and os.path.exists(dst):
+                os.remove(dst)
+            os.symlink(src, dst)
+
+        install_tree = symlink_remove_dst_tree
+
     lib_dir.mkdir(parents=True, exist_ok=True)
     include_dir.mkdir(parents=True, exist_ok=True)
-    copytree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
-             include_dir / "deep_gemm",
-             dirs_exist_ok=True)
+    install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
+                 include_dir / "deep_gemm",
+                 dirs_exist_ok=True)
     required_cuda_headers = [
         "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
         "cuda_fp8.h", "cuda_fp8.hpp"
@@ -293,44 +318,30 @@ def main(*,
         cuda_include_target_dir = include_dir / "cuda" / "include"
         cuda_include_target_dir.mkdir(parents=True, exist_ok=True)
         for header in required_cuda_headers:
-            copy(cuda_include_dir / header, include_dir / header)
-
-    link_binary = copy
-    if skip_building_wheel and linking_install_binary:
-
-        def symlink_remove_dst(src, dst):
-            src = os.path.abspath(src)
-            dst = os.path.abspath(dst)
-            if os.path.isdir(dst):
-                dst = os.path.join(dst, os.path.basename(src))
-            if os.path.exists(dst):
-                os.remove(dst)
-            os.symlink(src, dst)
-
-        link_binary = symlink_remove_dst
+            install_file(cuda_include_dir / header, include_dir / header)
 
     if on_windows:
-        link_binary(build_dir / "tensorrt_llm/tensorrt_llm.dll",
-                    lib_dir / "tensorrt_llm.dll")
-        link_binary(build_dir / f"tensorrt_llm/thop/th_common.dll",
-                    lib_dir / "th_common.dll")
-        link_binary(
+        install_file(build_dir / "tensorrt_llm/tensorrt_llm.dll",
+                     lib_dir / "tensorrt_llm.dll")
+        install_file(build_dir / f"tensorrt_llm/thop/th_common.dll",
+                     lib_dir / "th_common.dll")
+        install_file(
             build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
             lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
-        link_binary(
+        install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/tensorrt_llm_nvrtc_wrapper.dll",
             lib_dir / "tensorrt_llm_nvrtc_wrapper.dll")
     else:
-        link_binary(build_dir / "tensorrt_llm/libtensorrt_llm.so",
-                    lib_dir / "libtensorrt_llm.so")
-        link_binary(build_dir / "tensorrt_llm/thop/libth_common.so",
-                    lib_dir / "libth_common.so")
-        link_binary(
+        install_file(build_dir / "tensorrt_llm/libtensorrt_llm.so",
+                     lib_dir / "libtensorrt_llm.so")
+        install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
+                     lib_dir / "libth_common.so")
+        install_file(
             build_dir /
             "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
             lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
-        link_binary(
+        install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
@@ -338,15 +349,15 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
         ):
-            link_binary(
+            install_file(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
-        link_binary(
+        install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
             lib_dir / "libdecoder_attention_0.so")
-        link_binary(
+        install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
@@ -357,8 +368,8 @@ def main(*,
     bin_dir.mkdir(parents=True, exist_ok=True)
 
     if not on_windows:
-        link_binary(build_dir / "tensorrt_llm/executor_worker/executorWorker",
-                    bin_dir / "executorWorker")
+        install_file(build_dir / "tensorrt_llm/executor_worker/executorWorker",
+                     bin_dir / "executorWorker")
 
     if not cpp_only:
 
@@ -374,7 +385,7 @@ def main(*,
             ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
             return pybind_lib[0]
 
-        link_binary(get_pybind_lib(), pkg_dir)
+        install_file(get_pybind_lib(), pkg_dir)
         if not skip_stubs:
             with working_directory(project_dir):
                 build_run(
