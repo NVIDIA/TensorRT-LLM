@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@user/yiqingy/add_dgx_h200_gpu', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
