@@ -1,7 +1,7 @@
+import argparse
 import os
 import sys
 import xml.etree.ElementTree as ET
-import argparse
 
 
 def parse_name(name, filename):
@@ -383,18 +383,31 @@ def generate_rerun_report(output_filename, input_filenames):
 if __name__ == '__main__':
     if (sys.argv[1] == "generate_rerun_tests_list"):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--output-dir', required=True, help='Output directory for rerun test lists')
-        parser.add_argument('--input-file', required=True, help='Input XML file containing test results')
-        parser.add_argument('--fail-signatures', required=True, help='List of failure signatures to match')
+        parser.add_argument('--output-dir',
+                            required=True,
+                            help='Output directory for rerun test lists')
+        parser.add_argument('--input-file',
+                            required=True,
+                            help='Input XML file containing test results')
+        parser.add_argument('--fail-signatures',
+                            required=True,
+                            help='List of failure signatures to match')
         args = parser.parse_args(sys.argv[2:])
         failSignaturesList = args.fail_signatures.split(',')
-        generate_rerun_tests_list(args.output_dir, args.input_file, failSignaturesList)
+        generate_rerun_tests_list(args.output_dir, args.input_file,
+                                  failSignaturesList)
 
     elif (sys.argv[1] == "merge_junit_xmls"):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--output-file', required=True, help='Output XML file')
-        parser.add_argument('--input-files', required=True, help='Input XML files to merge')
-        parser.add_argument('--deduplicate', action='store_true', help='Deduplicate test cases')
+        parser.add_argument('--output-file',
+                            required=True,
+                            help='Output XML file')
+        parser.add_argument('--input-files',
+                            required=True,
+                            help='Input XML files to merge')
+        parser.add_argument('--deduplicate',
+                            action='store_true',
+                            help='Deduplicate test cases')
         args = parser.parse_args(sys.argv[2:])
         input_files = args.input_files.split(',')
         deduplicate = args.deduplicate
@@ -402,16 +415,26 @@ if __name__ == '__main__':
 
     elif (sys.argv[1] == "xml_to_html"):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--input-file', required=True, help='Input XML file')
-        parser.add_argument('--output-file', required=True, help='Output HTML file')
-        parser.add_argument('--sort-by-name', action='store_true', help='Sort test cases by name')
+        parser.add_argument('--input-file',
+                            required=True,
+                            help='Input XML file')
+        parser.add_argument('--output-file',
+                            required=True,
+                            help='Output HTML file')
+        parser.add_argument('--sort-by-name',
+                            action='store_true',
+                            help='Sort test cases by name')
         args = parser.parse_args(sys.argv[2:])
         xml_to_html(args.input_file, args.output_file, args.sort_by_name)
 
     elif (sys.argv[1] == "generate_rerun_report"):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--output-file', required=True, help='Output XML file')
-        parser.add_argument('--input-files', required=True, help='Input XML files to merge')
+        parser.add_argument('--output-file',
+                            required=True,
+                            help='Output XML file')
+        parser.add_argument('--input-files',
+                            required=True,
+                            help='Input XML files to merge')
         args = parser.parse_args(sys.argv[2:])
         input_files = args.input_files.split(',')
         generate_rerun_report(args.output_file, input_files)
