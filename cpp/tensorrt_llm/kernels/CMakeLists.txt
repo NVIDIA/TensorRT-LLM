@@ -59,7 +59,7 @@ function(filter_cuda_archs ARCH SOURCES_VAR)
   endif()
 endfunction()
 
-if(ENABLE_MULTI_DEVICE EQUAL 0)
+if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
 

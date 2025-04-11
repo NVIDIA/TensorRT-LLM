@@ -39,6 +39,10 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
+option(ENABLE_MULTI_DEVICE
+       "Enable building with multi device support (requires NCCL, MPI,...)" ON)
+option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
+       ON)
 
 # Always use static NVRTC for IP protection reasons.
 set(USE_SHARED_NVRTC OFF)
@@ -347,7 +351,6 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_library(RT_LIB rt)
 
-set_ifndef(ENABLE_MULTI_DEVICE 1)
 if(ENABLE_MULTI_DEVICE)
   # NCCL dependencies
   set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
@@ -438,9 +441,15 @@ endif()
 
 # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
-set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss -DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}"
-)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
+
+# note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
+# evaluation so hard to debug at cmake time
+if(ENABLE_MULTI_DEVICE)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=1")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=0")
+endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
 # be found in
@@ -653,7 +662,6 @@ endif()
 
 # Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
 # need to be built to have aligned symbols
-set_ifndef(ENABLE_UCX 1)
 if(ENABLE_UCX)
   # Only enable UCX related features if the system has UCX library
   find_package(ucx)
@@ -680,7 +688,11 @@ if(ENABLE_UCX)
                  NO_DEFAULT_PATH)
   endif()
 endif()
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
+if(ENABLE_UCX)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=0")
+endif()
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")
