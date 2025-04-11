@@ -92,12 +92,12 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         }
 
         // TODO: not sure about promptLen here, it 
-        auto const promptLen = llmReq->getPromptLen() * numVocabs;
+        auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
-        TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
+        TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen * numVocabs));
         TensorPtr inputView = ITensor::slice(inputIdsFlatView, ITensor::makeShape({vocabId, inputOffset}), promptLen);
         if (numVocabs > 1) {
-            SizeType32 vocabShift = -modelConfig.getVocabSize() * vocabId;
+            SizeType32 vocabShift = -modelConfig.getVocabSizes()[vocabId] * vocabId;
             runtime::kernels::invokeAdd<TokenIdType>(
                 *inputView, vocabShift, bufferManager.getStream()); // restore original input ids
         }

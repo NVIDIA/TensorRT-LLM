@@ -100,7 +100,8 @@ public:
     };
 
     explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
-        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype, SizeType32 numVocabs = 8)
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype,
+        std::optional<std::vector<SizeType32>> vocabSizes = std::nullopt)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
@@ -141,7 +142,7 @@ public:
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
         , mNumLanguages(0)
-	    , mNumVocabs{numVocabs}
+	    , mVocabSizes{vocabSizes}
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -161,7 +162,12 @@ public:
 
     [[nodiscard]] SizeType32 getNumVocabs() const
     {
-	return mNumVocabs;
+        return mVocabSizes ? mVocabSizes.value().size() : 1;
+    }
+
+    [[nodiscard]] std::vector<SizeType32> getVocabSizes() const
+    {
+        return mVocabSizes ? *mVocabSizes : std::vector<SizeType32>{mVocabSize};
     }
 
     [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
@@ -941,8 +947,8 @@ private:
     // Language adapter info
     std::optional<SizeType32> mNumLanguages;
 
-    // Number of vocabs
-    SizeType32 mNumVocabs;
+    // Size of each vocab if there are multiple vocabs
+    std::optional<std::vector<SizeType32>> mVocabSizes;
 };
 
 } // namespace tensorrt_llm::runtime

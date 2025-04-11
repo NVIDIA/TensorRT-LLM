@@ -313,9 +313,9 @@ class LLaMAModel(Module):
         self.vocab_size = config.vocab_size
         self.has_partial_lora_mask = config.has_partial_lora_mask
         self.hidden_size = config.hidden_size
-        self.num_vocabs = config.num_vocabs
+        self.num_vocabs = len(config.vocab_sizes) if config.vocab_sizes else 1
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(config.vocab_size * config.num_vocabs,
+            self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
             self.embedding_multiplier = config.embedding_multiplier
@@ -422,7 +422,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded * config.num_vocabs,
+                                   vocab_size_padded,
                                    bias=False,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,

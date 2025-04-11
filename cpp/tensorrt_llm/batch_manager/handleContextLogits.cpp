@@ -138,7 +138,6 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
             "Found invalid number (NaN or Inf) in logits");
 
         auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
-        auto const vocabSize = modelConfig.getVocabSize();
 
         if (reqBeamWidth > 1)
         {
@@ -155,8 +154,13 @@ SizeType32 HandleContextLogits::operator()(RequestVector const& contextRequests,
             const auto logitsViewShape = logitsView->getShape();
             if (logitsViewShape.d[0] == 1) // if current nTok is 1, could have multiple vocabs
             {
-                curVocablogitsView = ITensor::slice(logitsView, {0, vocabId * vocabSize}, vocabSize); // [vocabSize,]
-                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSize}));
+                SizeType32 offset = 0;
+                auto vocabSizes = modelConfig.getVocabSizes();
+                for (SizeType32 i = 0; i < vocabId; ++i) {
+                    offset += vocabSizes[i];
+                }
+                curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
+                curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSizes[vocabId]}));
             }
             const auto updateLogitsViewShape = curVocablogitsView->getShape();
             decoderLogits

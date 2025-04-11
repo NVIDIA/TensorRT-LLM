@@ -405,6 +405,11 @@ protected:
         return mModelConfig.getNumVocabs();
     }
 
+    [[nodiscard]] std::vector<SizeType32> getVocabSizes() const
+    {
+        return mModelConfig.getVocabSizes();
+    }
+
     [[nodiscard]] SizeType32 getVocabSize() const
     {
         return mModelConfig.getVocabSize();

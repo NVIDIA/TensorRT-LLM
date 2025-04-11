@@ -128,7 +128,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-	    SizeType32 numVocabs = 8)
+	    SizeType32 numVocabs = 1)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
@@ -209,7 +209,7 @@ public:
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
-        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt, SizeType32 numVocabs = 8)
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt, SizeType32 numVocabs = 1)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size() / numVocabs)
         , mMaxNewTokens(maxNewTokens)
@@ -249,7 +249,7 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
-	    , mNumVocabs{numVocabs}
+        , mNumVocabs{numVocabs}
     {
         if (mEncoderTokens.has_value())
         {
@@ -289,7 +289,7 @@ public:
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
-	    , mNumVocabs(req.getNumVocabs())
+        , mNumVocabs(req.getNumVocabs())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {

@@ -165,6 +165,7 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     seqSlotRemappingHost->reshape(numRequestsShape);
     seqSlotRemappingDevice->reshape(numRequestsShape);
 
+    // for buffers do we need to bump the size by numVocabs?
     auto const numTokens = getNumTokens();
     inputsIds->reshape(ITensor::makeShape({numTokens * modelConfig.getNumVocabs()}));
 

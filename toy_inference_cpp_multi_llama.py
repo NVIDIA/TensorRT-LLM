@@ -6,13 +6,13 @@ from transformers import AutoTokenizer
 def main():
 
     runner = ModelRunnerCpp.from_dir(
-        engine_dir='models/single_vocab/llama1b_engine/',
+        engine_dir='models/multi_vocab/llama1b_engine/',
         max_input_len=512,
         rank=0,
     )
 
     # Load tokenizer for encoding the input text
-    tokenizer = AutoTokenizer.from_pretrained('models/single_vocab/llama1b')
+    tokenizer = AutoTokenizer.from_pretrained('models/multi_vocab/llama1b')
     
     # Create a complex question that will require a lengthy answer
     random_text = """hi, how are things?"""
@@ -22,6 +22,12 @@ def main():
 
     input_ids = torch.tensor(tokens, dtype=torch.int32)
     print(f"Input tokens [{input_ids.shape}]: {str(input_ids)}")
+
+    # introduce multiple vocabs
+    input_ids = input_ids.unsqueeze(-1)  # [nTok, 1]
+    input_ids = input_ids.repeat(1, 2)  # [nTok, 2]
+    input_ids[:, 1] += 128256
+    input_ids = input_ids.flatten()  # [nTok * 2]
 
     with torch.no_grad():
         outputs = runner.generate(
