@@ -1621,13 +1621,6 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         v = load(
             param_name_map["vocab_embedding"], config.embedding_sharding_dim
             if config.use_parallel_embedding else -1)  # vocab_embedding
-
-        # TODO: this is a hack to test multiple vocabs with single vocab model
-        if v.shape[0] < vocab_size:
-            diff = vocab_size - v.shape[0]
-            v = torch.nn.functional.pad(
-                v, (0, 0, 0, diff), 'constant', 0)
-
         weights['transformer.vocab_embedding.weight'] = v
 
     if mapping.is_last_pp_rank():
@@ -1636,15 +1629,6 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         if v is None:
             v = load(param_name_map["vocab_embedding"],
                      -1 if pad_vocab else 0).clone().detach()
-
-        # TODO: this is a hack to test multiple vocabs with single vocab model
-        if v.shape[0] < vocab_size:
-            diff = vocab_size - v.shape[0]
-            padding_shape = (diff, v.shape[1])
-            padding = torch.ones(padding_shape, dtype=v.dtype, device=v.device) * -1.0
-            # ensure same token is output for one of the vocabs for debug
-            padding[500, :] = 1000.0
-            v = torch.cat([v, padding], dim=0)
 
         if pad_vocab:
             v = torch.nn.functional.pad(

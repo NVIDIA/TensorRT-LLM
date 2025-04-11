@@ -26,8 +26,9 @@ def main():
     # introduce multiple vocabs
     input_ids = input_ids.unsqueeze(-1)  # [nTok, 1]
     input_ids = input_ids.repeat(1, 2)  # [nTok, 2]
-    input_ids[:, 1] += 128256
+    input_ids[:, 1] = input_ids[:, 1] + 128256
     input_ids = input_ids.flatten()  # [nTok * 2]
+    print(f"Input tokens interleaved [{input_ids.shape}]: {str(input_ids)}")
 
     with torch.no_grad():
         outputs = runner.generate(
@@ -39,10 +40,14 @@ def main():
         )
         torch.cuda.synchronize()
 
-    output_ids = outputs.cpu().numpy().tolist()
+    output_ids = outputs.cpu().numpy()[0][0][:40]
     print(f"Output tokens: {str(output_ids)}")
-    decoded_output = tokenizer.decode(output_ids[0][0], skip_special_tokens=True)
-    print(f"Decoded output: {decoded_output}")
+    output_ids = output_ids.reshape(-1, 2)
+    print(f"Output tokens (vocab 0): {str(output_ids[:, 0])}")
+    print(f"Output tokens (vocab 1): {str(output_ids[:, 1])}")
+    print(f"Output tokens (vocab 1): {str(output_ids[:, 1] - 128256)}")
+    decoded_output = tokenizer.decode(output_ids[:, 0].tolist(), skip_special_tokens=True)
+    print(f"Decoded output (vocab 0): {decoded_output}")
 
 
 if __name__ == "__main__":

@@ -97,7 +97,12 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen * numVocabs));
         TensorPtr inputView = ITensor::slice(inputIdsFlatView, ITensor::makeShape({vocabId, inputOffset}), promptLen);
         if (numVocabs > 1) {
-            SizeType32 vocabShift = -modelConfig.getVocabSizes()[vocabId] * vocabId;
+            TokenIdType vocabShift = 0;
+            for (SizeType32 i = 0; i < vocabId; i++) {
+                vocabShift -= modelConfig.getVocabSizes()[i];
+            }
+            TLLM_LOG_WARNING(">>>>>>>>slicing offset [%d, %d]; slicng size %d, input shape [%d %d], adding the vocab offset [%d]",
+                (int)vocabId, (int)inputOffset, (int)promptLen, (int)inputIdsFlatView->getShape().d[0], (int)inputIdsFlatView->getShape().d[1], (int)vocabShift);
             runtime::kernels::invokeAdd<TokenIdType>(
                 *inputView, vocabShift, bufferManager.getStream()); // restore original input ids
         }

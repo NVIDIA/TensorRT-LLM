@@ -117,6 +117,8 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
                 for (SizeType32 i = 0; i < vocabId; ++i) {
                     offset += vocabSizes[i];
                 }
+                TLLM_LOG_WARNING(">>>>>>>>slicing generation logits. shape [0, %d]; slickng size %d, input shape [%d %d], view shape [1, 1, %d]",
+                    (int)offset, (int)vocabSizes[vocabId], (int)logitsViewShape.d[0], (int)logitsViewShape.d[1], (int)vocabSizes[vocabId]);
                 curVocablogitsView = ITensor::slice(logitsView, {0, offset}, vocabSizes[vocabId]); // [vocabSize,]
                 curVocablogitsView = ITensor::view(curVocablogitsView, ITensor::makeShape({1, 1, vocabSizes[vocabId]}));
             }
