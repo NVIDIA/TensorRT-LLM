@@ -515,6 +515,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
                                    cmodel_dir, engine_dir, phi_example_root,
                                    llm_datasets_root, llm_rouge_root, qformat):
     "Run phi quantization tests"
+    # Workaround for Modelopt can't convert Phi-3 on multi GPUs.
     gpu_constraint = {"CUDA_VISIBLE_DEVICES": "0"}
 
     print("Convert checkpoint by modelopt...")
