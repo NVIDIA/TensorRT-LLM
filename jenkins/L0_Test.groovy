@@ -284,7 +284,18 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
-        } else {
+        } else if (perfMode && !hasMultipleGPUs) {
+        // Not using the "perf" node currently due to hardware resource constraint.
+        // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
+        // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
+            selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu_type: ${gpuType}
+                    nvidia.com/driver_version: '${driverVersion}'"""
+        }
+        else
+        {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -1403,7 +1414,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }, {}, true)
     }]}
 
-    multiGpuJobs = parallelJobs.findAll{it.key.contains("4_GPUs") && !it.key.contains("Post-Merge")}
+    multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
 
     parallelJobs += docBuildJobs
@@ -1565,9 +1576,9 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSign = "DGX"
-                        singleGpuJobs = parallelJobs.findAll{!it.key.contains(dgxSign)}
-                        dgxJobs = parallelJobs.findAll{it.key.contains(dgxSign)}
+                        def dgxSigns = ["DGX_H100", "DGX_H200"]
+                        singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
+                        dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
                     if (singleGpuJobs.size() > 0) {
