@@ -24,10 +24,13 @@ namespace tensorrt_llm::runtime
 {
 struct IpcNvlsHandle
 {
+    // Begin internal kernel visible fields
+    // Changes to these fields must sync with ipcNvlsMemory.h in internal kernel repo
     size_t size = 0;
     // Device pointers used by kernels
     uintptr_t uc_ptr = 0;
     uintptr_t mc_ptr = 0;
+    // End internal kernel visible fields
     std::vector<uintptr_t> ipc_uc_ptrs;
     // Device pointers
     CUdeviceptr uc_va;
@@ -43,9 +46,9 @@ void MPI_group_barrier(std::set<int> ranks);
 
 bool ipcNvlsSupported();
 
-IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> ranks);
+IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> ranks);
 
-void ipcNvlsFree(IpcNvlsHandle handle);
+void ipcNvlsFree(IpcNvlsHandle* handle);
 
 template <typename T>
 class DeviceAllocationNvls
@@ -68,19 +71,19 @@ public:
     // Return device pointer to multicast memory
     [[nodiscard]] T* getMulticastPointer() const
     {
-        return reinterpret_cast<T*>(_handle.mc_ptr);
+        return reinterpret_cast<T*>(_handle->mc_ptr);
     }
 
     // Return device pointer for current rank
     [[nodiscard]] T* getUnicastPointer() const
     {
-        return reinterpret_cast<T*>(_handle.uc_ptr);
+        return reinterpret_cast<T*>(_handle->uc_ptr);
     }
 
     // Return host list of device pointers to memory on each rank
     [[nodiscard]] T** getIpcUnicastPointers()
     {
-        return reinterpret_cast<T**>(_handle.ipc_uc_ptrs.data());
+        return reinterpret_cast<T**>(_handle->ipc_uc_ptrs.data());
     }
 
     [[nodiscard]] size_t getCapacity() const
@@ -99,6 +102,6 @@ public:
 
 private:
     size_t _capacity = 0;
-    IpcNvlsHandle _handle;
+    IpcNvlsHandle* _handle;
 };
 } // namespace tensorrt_llm::runtime
