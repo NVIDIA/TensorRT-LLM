@@ -32,8 +32,16 @@ from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
 from .model_engine import ModelEngine
 from .scheduler import ScheduledRequests
 
+# Environment variable to specify iteration ranges for profiling start/stop.
+# Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
+
+# Environment variable to enable garbage collection profiling.
+# Set to "1" to enable recording of garbage collection events during profiling.
 PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
+
+# Environment variable to enable PyTorch profiler tracing.
+# Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
 
@@ -424,6 +432,8 @@ class PyExecutor:
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
+                    logger.info(f"Profiling stopped at iteration {it}, "
+                                f"trace saved to {torch_trace_path}")
                 enabled = False
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
@@ -432,8 +442,13 @@ class PyExecutor:
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 print(
-                    f'iter = {self.model_engine.iter_counter}, global_rank = {self.global_rank}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {end_time - start_time}s, timestamp = {formatted_timestamp}, states = {self.model_engine.iter_states}'
-                )
+                    f"iter = {self.model_engine.iter_counter}, "
+                    f"global_rank = {self.global_rank}, "
+                    f"rank = {self.dist.rank}, "
+                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
+                    f"elapsed_time = {end_time - start_time}s, "
+                    f"timestamp = {formatted_timestamp}, "
+                    f"states = {self.model_engine.iter_states}")
 
             it += 1
 
@@ -454,6 +469,8 @@ class PyExecutor:
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
+                    logger.info(f"Profiling stopped at iteration {it}, "
+                                f"trace saved to {torch_trace_path}")
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
