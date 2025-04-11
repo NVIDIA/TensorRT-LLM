@@ -428,12 +428,12 @@ class PyExecutor:
             nonlocal it, enabled, start_time
             if it in self.profile_stop_iters:
                 assert enabled, "Inconsistent CUDA profiling state"
-                torch.cuda.cudart().cudaProfilerStop()
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
+                torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
@@ -441,7 +441,7 @@ class PyExecutor:
 
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
-                print(
+                logger.info(
                     f"iter = {self.model_engine.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
@@ -457,6 +457,7 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
                     torch_profiler.start()
+                logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
             start_time = time.time()
 
@@ -465,12 +466,12 @@ class PyExecutor:
         finally:
             if enabled:
                 # Stop on early exit / exception
-                torch.cuda.cudart().cudaProfilerStop()
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
+                torch.cuda.cudart().cudaProfilerStop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
