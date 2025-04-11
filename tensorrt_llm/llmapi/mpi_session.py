@@ -232,6 +232,7 @@ class RemoteMpiCommSessionClient():
     '''
 
     def __init__(self, addr: str):
+        # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
         print_colored_debug(
@@ -277,6 +278,7 @@ class RemoteMpiCommSessionServer():
                  addr: str = f'tcp://127.0.0.1:*',
                  comm=None,
                  is_comm: bool = False):
+        # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
         self.queue = ZeroMqQueue(addr, is_server=True)
