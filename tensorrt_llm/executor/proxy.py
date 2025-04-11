@@ -8,6 +8,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
+from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -70,11 +71,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
             print_colored(
-                "Using MpiCommSession to bind to external MPI processes\n",
+                f"rank {mpi_rank()} using MpiCommSession to bind to external MPI processes\n",
                 "yellow")
         else:
-            print_colored("Using MpiPoolSession to spawn MPI processes\n",
-                          "yellow")
+            print_colored(
+                f"rank {mpi_rank()} using MpiPoolSession to spawn MPI processes\n",
+                "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
 
