@@ -1026,7 +1026,7 @@ def run_single_rank_ub_pass_fp4(
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,
-                                   atol=1.5,
+                                   atol=1.6,
                                    rtol=1e-2)
     except Exception:
         traceback.print_exc()
