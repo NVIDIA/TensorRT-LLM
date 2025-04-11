@@ -146,6 +146,7 @@ def quantize(model_path,
                          ids=["anchor1024", "anchor4096"])
 def test_model(backend, model_name, quant, sp_size, sa_block_size,
                sa_anchor_size):
+    pytest.skip("Skip due to https://nvbugs/5216799")
     quant_configs = {
         "bf16":
         QuantConfig(),

@@ -423,4 +423,3 @@ disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-L
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214245)
 unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugspro.nvidia.com/bug/5215499)
-unittest/_torch/multi_gpu SKIP (https://nvbugspro.nvidia.com/bug/5216799)
