@@ -665,6 +665,26 @@ class MultimodalModelRunner:
             self.processor = MllamaProcessorWrapper(self.processor, logger)
 
     def init_image_encoder(self):
+
+        if self.model_type == "phi-4-multimodal":
+            model = AutoModelForCausalLM.from_pretrained(
+                    self.args.hf_model_dir,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    device_map='cpu')
+            self.vision_model = model.model.embed_tokens_extend.image_embed.to(self.device).eval()
+
+            self.image_newlines = {}
+            image_newlines_path = os.path.join(self.visual_engine_dir,
+                                               'image_newlines.safetensors')
+            with safe_open(image_newlines_path,
+                           framework="pt",
+                           device=self.device) as f:
+                for k in f.keys():
+                    self.image_newlines[k] = f.get_tensor(k)
+
+            return
+
         if self.model_type == "phi-3-vision":
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.hf_model_dir,
@@ -725,14 +745,21 @@ class MultimodalModelRunner:
 
     def init_audio_encoder(self):
         assert self.model_type == "phi-4-multimodal"
-        audio_encoder_path = os.path.join(self.audio_engine_dir,
-                                          self.args.audio_engine_name)
-        logger.info(f'Loading engine from {audio_encoder_path}')
-        with open(audio_encoder_path, 'rb') as f:
-            engine_buffer = f.read()
-        logger.info(f'Creating session from engine {audio_encoder_path}')
-        self.audio_encoder_session = Session.from_serialized_engine(
-            engine_buffer)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.args.hf_model_dir,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            device_map='cpu')
+        self.audio_model = model.model.embed_tokens_extend.audio_embed.to(self.device).eval()
+
+        # audio_encoder_path = os.path.join(self.audio_engine_dir,
+        #                                   self.args.audio_engine_name)
+        # logger.info(f'Loading engine from {audio_encoder_path}')
+        # with open(audio_encoder_path, 'rb') as f:
+        #     engine_buffer = f.read()
+        # logger.info(f'Creating session from engine {audio_encoder_path}')
+        # self.audio_encoder_session = Session.from_serialized_engine(
+        #     engine_buffer)
 
     def init_llm(self):
         if self.decoder_llm:
@@ -915,6 +942,10 @@ class MultimodalModelRunner:
                     image).reshape(1, image.shape[0], -1,
                                    self.vision_model.image_dim_out)
                 visual_atts = None
+            elif self.model_type == "phi-4-multimodal":
+                visual_features = self.vision_model.get_img_features(model_runner_input.to(str_dtype_to_torch(self.vision_precision)), other_vision_inputs['attention_mask'])
+                visual_features = self.vision_model.img_projection(visual_features)
+                visual_atts = torch.ones(visual_features.size()[:-1], dtype=torch.long).to(model_runner_input.device)
             else:
                 if self.cpp_e2e:
                     # If using E2E C++ runtime, visual_features will not be computed here in Python runtime.
@@ -941,12 +972,17 @@ class MultimodalModelRunner:
                     model_runner_input = torch.vsplit(
                         model_runner_input, model_runner_input.shape[0])
                 else:
+                    assert False
                     visual_features, visual_atts = self.get_visual_features(
                         model_runner_input, other_vision_inputs)
                     model_runner_input = None
 
         if audio is not None:
-            audio_features = self.get_audio_features(audio, other_audio_inputs)
+            tmp_features, _ = self.audio_model.encoder(audio.to(str_dtype_to_torch(self.audio_precision)), other_audio_inputs['attention_mask'])
+            speech_out = self.audio_model.audio_projection['speech'](tmp_features)
+            vision_out = self.audio_model.audio_projection['vision'](tmp_features)
+            audio_features = torch.cat((speech_out, vision_out), dim=-1)
+            # audio_features = self.get_audio_features(audio, other_audio_inputs)
         else:
             audio_features = None
 
@@ -1563,18 +1599,18 @@ class MultimodalModelRunner:
         self.stream.synchronize()
 
         image_embeds = visual_outputs[self.vision_output_names[0]]
-        ##################################################################
-        model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
-        vision_model = model.model.embed_tokens_extend.image_embed
-        vision_model = vision_model.to(self.device, torch.float16).eval()
-        tmp_features = vision_model.get_img_features(visual_features['input'], visual_features['attention_mask'])
-        alt_features = vision_model.img_projection(tmp_features)
-        image_embeds = alt_features
-        ##################################################################
+        # ##################################################################
+        # model = AutoModelForCausalLM.from_pretrained(
+        #         self.args.hf_model_dir,
+        #         torch_dtype=torch.float16,
+        #         trust_remote_code=True,
+        #         device_map='cpu')
+        # vision_model = model.model.embed_tokens_extend.image_embed
+        # vision_model = vision_model.to(self.device, torch.float16).eval()
+        # tmp_features = vision_model.get_img_features(visual_features['input'], visual_features['attention_mask'])
+        # alt_features = vision_model.img_projection(tmp_features)
+        # image_embeds = alt_features
+        # ##################################################################
 
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
@@ -1615,18 +1651,18 @@ class MultimodalModelRunner:
         audio_embeds = audio_outputs[self.audio_output_names[0]]
 
         ############################################################
-        model = AutoModelForCausalLM.from_pretrained(
-                self.args.hf_model_dir,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                device_map='cpu')
-        audio_model = model.model.embed_tokens_extend.audio_embed
-        audio_model = audio_model.to(self.device, torch.float16).eval()
-        tmp_features, _ = audio_model.encoder(audio_features['input'], audio_features['attention_mask'])
-        speech_out = audio_model.audio_projection['speech'](tmp_features)
-        vision_out = audio_model.audio_projection['vision'](tmp_features)
-        alt_features = torch.cat((speech_out, vision_out), dim=-1)
-        audio_embeds = alt_features
+        # model = AutoModelForCausalLM.from_pretrained(
+        #         self.args.hf_model_dir,
+        #         torch_dtype=torch.float16,
+        #         trust_remote_code=True,
+        #         device_map='cpu')
+        # audio_model = model.model.embed_tokens_extend.audio_embed
+        # audio_model = audio_model.to(self.device, torch.float16).eval()
+        # tmp_features, _ = audio_model.encoder(audio_features['input'], audio_features['attention_mask'])
+        # speech_out = audio_model.audio_projection['speech'](tmp_features)
+        # vision_out = audio_model.audio_projection['vision'](tmp_features)
+        # alt_features = torch.cat((speech_out, vision_out), dim=-1)
+        # audio_embeds = alt_features
         ############################################################
 
         return audio_embeds
