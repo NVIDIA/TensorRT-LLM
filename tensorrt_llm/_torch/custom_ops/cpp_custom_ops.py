@@ -142,10 +142,33 @@ def _register_fake():
         v_head_dim,
         mrope_rotary_cos_sin,
         mrope_position_deltas,
+        use_flash_mla,
+        flash_mla_tile_scheduler_metadata,
+        flash_mla_num_splits,
     ):
         output_shape = (q.shape[0], num_heads *
                         v_head_dim if is_mla_enable else num_heads * head_size)
         return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
+
+    @torch.library.register_fake("trtllm::get_mla_metadata")
+    def _(seqlens_k, num_heads_per_head_k, num_heads_k):
+
+        def ceil_div(a, b):
+            return (a + b - 1) // b
+
+        assert seqlens_k.dtype == torch.int32
+        batch_size = seqlens_k.shape[0]
+        block_size_m = 64
+        tile_scheduler_metadata_size = 8
+        sm_count = torch.cuda.get_device_properties(
+            seqlens_k.device).multi_processor_count
+        num_sm_parts = sm_count // num_heads_k // ceil_div(
+            num_heads_per_head_k, block_size_m)
+
+        tile_scheduler_metadata = seqlens_k.new_empty(
+            (num_sm_parts, tile_scheduler_metadata_size), dtype=torch.int32)
+        num_splits = seqlens_k.new_empty((batch_size + 1), dtype=torch.int32)
+        return tile_scheduler_metadata, num_splits
 
     @torch.library.register_fake("trtllm::noaux_tc_op")
     def _(scores, scores_with_bias, n_group, topk_group, topk,

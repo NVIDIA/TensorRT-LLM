@@ -1,4 +1,6 @@
+import threading
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -13,6 +15,41 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams)
 from .vanilla import VanillaAttention
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
+
+
+_thread_local = threading.local()
+
+
+# Flash MLA metadata
+def get_flash_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k):
+    """
+    Get the Flash MLA metadata. If not cached or cache is None, compute and cache it.
+    """
+    if not hasattr(
+            _thread_local,
+            'flash_mla_metadata') or _thread_local.flash_mla_metadata is None:
+        _thread_local.flash_mla_metadata = torch.ops.trtllm.get_mla_metadata(
+            cache_seqlens,
+            num_heads_per_head_k,
+            num_heads_k,
+        )
+    return _thread_local.flash_mla_metadata
+
+
+def clear_flash_mla_metadata():
+    """
+    Clear the cached metadata.
+    """
+    if hasattr(_thread_local, 'flash_mla_metadata'):
+        _thread_local.flash_mla_metadata = None
 
 
 @dataclass(kw_only=True, init=False)
@@ -170,6 +207,7 @@ class TrtllmAttentionWrapper:
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        use_flash_mla: bool = True,
         **kwargs,
     ):
         """
@@ -198,6 +236,7 @@ class TrtllmAttentionWrapper:
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
+            use_flash_mla (bool): Whether to use FlashMLA for MLA generation on Hopper (sm90)
         """
         self.tokens_per_block = tokens_per_block
         self.max_num_requests = max_num_requests
@@ -229,7 +268,9 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
-
+        self.use_flash_mla = use_flash_mla
+        self.flash_mla_tile_scheduler_metadata = None
+        self.flash_mla_num_splits = None
         if self.is_mla_enable:
             # max_context_length will increment 1 when overlap scheduler enabled
             if self.max_context_length > (self.rotary_cos_sin.shape[1] /
@@ -248,6 +289,19 @@ class TrtllmAttentionWrapper:
                 self.rotary_cos_sin = torch.tensor(rope_cos_sin,
                                                    dtype=torch.float32,
                                                    device="cuda")
+
+            if self.use_flash_mla:
+                # Clear cache at the start of a new step (layer_idx == 0)
+                if self.layer_idx == 0:
+                    clear_flash_mla_metadata()
+                # get_flash_mla_metadata is a cached function,
+                # the actual computation is only performed once per iter rather than per layer.
+                self.flash_mla_tile_scheduler_metadata, self.flash_mla_num_splits = get_flash_mla_metadata(
+                    self.sequence_length,
+                    self.predicted_tokens_per_seq * self.num_heads //
+                    self.num_kv_heads,
+                    self.num_kv_heads,
+                )
 
     def run(
         self,
@@ -396,6 +450,9 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            self.use_flash_mla,
+            self.flash_mla_tile_scheduler_metadata,
+            self.flash_mla_num_splits,
         )
         return output
 
@@ -742,6 +799,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             latent_cache=latent_cache,
             q_pe=q_pe,
             mrope_config=mrope_config,
+            use_flash_mla=metadata.enable_flash_mla
+            and attention_input_type == AttentionInputType.generation_only,
         )
         out_dtype = None
         if out_scale is not None:
