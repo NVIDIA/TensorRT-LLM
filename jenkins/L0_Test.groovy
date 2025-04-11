@@ -264,7 +264,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 due to the hardware stability.
+        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
         if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
@@ -1565,7 +1565,7 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSign = "DGX_H100"
+                        def dgxSign = "DGX"
                         singleGpuJobs = parallelJobs.findAll{!it.key.contains(dgxSign)}
                         dgxJobs = parallelJobs.findAll{it.key.contains(dgxSign)}
                     }
