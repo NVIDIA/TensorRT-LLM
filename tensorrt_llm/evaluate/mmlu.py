@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import random
 from typing import Iterable, List, Optional, Union
 
 import click
@@ -110,12 +109,13 @@ class MMLU(Evaluator):
 
     def __init__(self,
                  dataset_path: str,
-                 num_samples: int = None,
+                 num_samples: Optional[int] = None,
                  num_train: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
-        super().__init__(apply_chat_template=apply_chat_template,
+        super().__init__(random_seed=random_seed,
+                         apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
         self.dataset_path = dataset_path
         if num_samples is None:
@@ -124,8 +124,6 @@ class MMLU(Evaluator):
             self.num_samples_per_subject = math.ceil(
                 num_samples / len(self.SUBJECT_TO_SUBCATEGORIES))
         self.num_train = num_train
-        random.seed(random_seed)
-        np.random.seed(random_seed)
 
     def format_subject(self, subject):
         line = subject.split("_")
