@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.rms_norm import GroupRMSNorm, RMSNorm
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 
 @torch.inference_mode()
@@ -43,8 +43,8 @@ def test_group_rms_norm(batch_size, hidden_dims, eps, dtype):
         ref_outputs.append(norm(inputs[i].clone()))
 
     # Test group_rms_norm
-    group_rms_norm = GroupRMSNorm(eps=eps, dtype=dtype, device=device)
-    group_outputs = group_rms_norm(inputs)
+    # Apply GroupRMSNorm to all inputs
+    group_outputs = torch.ops.trtllm.group_rms_norm(inputs, None, eps, False)
 
     # Verify same number of outputs
     assert len(group_outputs) == len(ref_outputs), \

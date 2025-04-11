@@ -15,27 +15,28 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/groupRmsNormKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/thop/thUtils.h" // For TORCH_CHECK
+#include "tensorrt_llm/thop/thUtils.h"
 
-#include <ATen/cuda/CUDAContext.h>     // For at::cuda::getCurrentCUDAStream()
-#include <cuda_runtime.h>
-#include <torch/extension.h>
-
+#include <ATen/cuda/CUDAContext.h>
 #include <cstdint>
-#include <stdexcept> // For std::runtime_error
+#include <cuda_runtime.h>
+#include <stdexcept>
+#include <torch/extension.h>
 #include <vector>
 
 namespace torch_ext
 {
 
 template <typename DType>
-void groupRMSNormImpl(torch::TensorList const& inputs, torch::TensorList const& weights, torch::TensorList& outputs,
-    std::vector<uint32_t> input_dims, std::vector<uint32_t> input_strides, std::vector<uint32_t> output_strides,
-    uint32_t batch_size, uint32_t num_inputs, double eps, bool enable_weights, cudaStream_t stream)
+void groupRMSNormImpl(torch::TensorList const& inputs, torch::TensorList const& weights,
+    std::vector<torch::Tensor>& outputs, std::vector<uint32_t> input_dims, std::vector<uint32_t> input_strides,
+    std::vector<uint32_t> output_strides, uint32_t batch_size, uint32_t num_inputs, double eps, bool enable_weights,
+    cudaStream_t stream)
 {
-
     // Prepare pointer arrays on host
     std::vector<DType*> inputs_ptr(num_inputs);
     std::vector<DType*> weights_ptr(num_inputs, nullptr); // Initialize with nullptr
@@ -51,9 +52,10 @@ void groupRMSNormImpl(torch::TensorList const& inputs, torch::TensorList const& 
         outputs_ptr[i] = reinterpret_cast<DType*>(outputs[i].mutable_data_ptr());
     }
 
-    // Call the kernel
-    tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel<DType>(inputs_ptr, weights_ptr, outputs_ptr, input_dims,
-        input_strides, output_strides, batch_size, num_inputs, static_cast<float>(eps), enable_weights, stream);
+    // Pass raw pointers to vectors
+    tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel<DType>(inputs_ptr.data(), weights_ptr.data(),
+        outputs_ptr.data(), input_dims.data(), input_strides.data(), output_strides.data(), batch_size, num_inputs,
+        static_cast<float>(eps), enable_weights, stream);
 }
 
 torch::TensorList groupRMSNorm(
@@ -62,10 +64,9 @@ torch::TensorList groupRMSNorm(
     TORCH_CHECK(inputs.size() > 0, "Input tensor list cannot be empty.");
     auto const num_inputs = inputs.size();
     auto const first_input = inputs[0];
-    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(first_input.scalar_type());
+    auto const dtype = first_input.scalar_type();
     auto const device = first_input.device();
-    auto const batch_size = first_input.size()[0];
-    auto const hidden_dim = first_input.size()[1];
+    auto const batch_size = first_input.sizes()[0];
 
     TORCH_CHECK(first_input.dim() == 2, "Inputs must be 2D tensors [batch_size, hidden_dim].");
     TORCH_CHECK(first_input.is_cuda(), "Inputs must be CUDA tensors.");
@@ -85,20 +86,20 @@ torch::TensorList groupRMSNorm(
     {
         auto const& current_input = inputs[i];
         TORCH_CHECK(current_input.dim() == 2, "All inputs must be 2D tensors.");
-        TORCH_CHECK(current_input.size()[0] == batch_size, "All inputs must have the same batch size.");
+        TORCH_CHECK(current_input.sizes()[0] == batch_size, "All inputs must have the same batch size.");
         TORCH_CHECK(current_input.scalar_type() == dtype, "All inputs must have the same data type.");
         TORCH_CHECK(current_input.device() == device, "All inputs must be on the same CUDA device.");
 
-        input_dims[i] = current_input.size()[1];
-        input_strides[i] = current_input.stride()[0];
-        output_strides[i] = current_input.stride()[0];
+        input_dims[i] = current_input.sizes()[1];
+        input_strides[i] = current_input.strides()[0];
+        output_strides[i] = current_input.strides()[0];
 
         if (enable_weights)
         {
             auto const& current_weight = weights[i];
             TORCH_CHECK(current_weight.dim() == 1, "Weights must be 1D tensors.");
             TORCH_CHECK(
-                current_weight.size()[0] == current_input.size()[1], "Weight dimension must match input dimension.");
+                current_weight.sizes()[0] == current_input.sizes()[1], "Weight dimension must match input dimension.");
             TORCH_CHECK(current_weight.scalar_type() == dtype, "Weights must have the same data type as inputs.");
             TORCH_CHECK(current_weight.device() == device, "Weights must be on the same CUDA device as inputs.");
         }
@@ -107,9 +108,22 @@ torch::TensorList groupRMSNorm(
     }
 
     auto stream = at::cuda::getCurrentCUDAStream(inputs[0].get_device());
-
-    groupRMSNormImpl<dtype>(inputs, weights, outputs, input_dims, input_strides, output_strides, batch_size, num_inputs,
-        eps, enable_weights, stream);
+    switch (dtype)
+    {
+    case torch::ScalarType::Half:
+        groupRMSNormImpl<half>(inputs, weights, outputs, input_dims, input_strides, output_strides,
+            static_cast<uint32_t>(batch_size), num_inputs, eps, enable_weights, stream);
+        break;
+    case torch::ScalarType::BFloat16:
+        groupRMSNormImpl<__nv_bfloat16>(inputs, weights, outputs, input_dims, input_strides, output_strides,
+            static_cast<uint32_t>(batch_size), num_inputs, eps, enable_weights, stream);
+        break;
+    case torch::ScalarType::Float:
+        groupRMSNormImpl<float>(inputs, weights, outputs, input_dims, input_strides, output_strides,
+            static_cast<uint32_t>(batch_size), num_inputs, eps, enable_weights, stream);
+        break;
+    default: TORCH_CHECK(false, "Unsupported data type for GroupRMSNorm");
+    }
     return outputs;
 }
 
@@ -117,11 +131,6 @@ torch::TensorList groupRMSNorm(
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    // Corresponds to::
-    // def group_rms_norm(inputs: List[Tensor],
-    //                   weights: List[Tensor],
-    //                   eps: float,
-    //                   enable_weights: bool) -> List[Tensor]:
     m.def("group_rms_norm(Tensor[] inputs, Tensor[] weights, float eps, bool enable_weights) -> Tensor[]");
 }
 

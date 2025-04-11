@@ -89,8 +89,10 @@ class GroupRMSNorm(nn.Module):
         if len(inputs) == 0:
             return []
 
+        weights = [torch.ones_like(input) for input in inputs]
+
         # Use CUDA kernel if available
-        outputs = torch.ops.trtllm.group_rms_norm(inputs, None,
+        outputs = torch.ops.trtllm.group_rms_norm(inputs, weights,
                                                   self.variance_epsilon,
                                                   self.enable_weights)
         return outputs

@@ -13,10 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <algorithm> // For std::gcd, std::max, std::min
-#include <cmath>     // For round
-#include <cstdint>   // For uint32_t
-#include <numeric>   // For std::gcd
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <numeric>
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -26,37 +26,8 @@ using tensorrt_llm::common::deviceMalloc;
 using tensorrt_llm::common::cudaAutoCpy;
 using tensorrt_llm::common::deviceFree;
 
-// DSV3:
-// kv_lora_rank (int, optional, defaults to 512) — Rank of the LoRA matrices for key and value projections.
-// q_lora_rank (int, optional, defaults to 1536) — Rank of the LoRA matrices for query projections.
-
-// The hidden size seems too small to take advantage of the cluster group based reduction.
-// Below code is inspired by flashinfer's implementation.
-
-// LLamaV4 uses L2Norm which calls RMS norm underneath.
-// Hidden size for q = 5120
-// Hidden size for kv = 8 (config.num_key_value_heads) * 128 (config.head_dim) = 1024
-
-// Base on the hidden_size in interest, a cluster_group based implementation might be more performant.
-
-// Target usage:
-// q, kv, k_pe = self.fused_a(
-//                 hidden_states).split([
-//                     self.dim_q + self.dim_kv, self.qk_rope_head_dim
-//                 ], -1)
-// q, kv = groupNmsrNorm([q, kv])
-
-// TODOs:
-// - Check if it works for 1 input case
-// - Check if it works for 2 input case
-
 namespace tensorrt_llm::kernels::group_rms_norm
 {
-
-uint32_t ceil_div(uint32_t a, uint32_t b)
-{
-    return (a + b - 1) / b;
-}
 
 // binary search over warp_prefix_sum to find which array this warp belongs to
 __device__ __forceinline__ uint32_t find_input_idx_for_warp(
@@ -67,30 +38,27 @@ __device__ __forceinline__ uint32_t find_input_idx_for_warp(
     {
         uint32_t mid = (lo + hi) / 2;
         if (warp_prefix_sum[mid + 1] <= warp_idx)
+        {
             lo = mid + 1;
+        }
         else
+        {
             hi = mid;
+        }
     }
     return lo;
 }
 
-// This kernel only supports 2 inputs for now
-// Will add support for more inputs in the future
-
-// sizeof(PackedType) = 128b
 template <typename DType, typename PackedType>
 __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ inputs, PackedType** __restrict__ outputs,
     uint32_t const* __restrict__ input_dims, uint32_t const* __restrict__ input_strides,
     uint32_t const* __restrict__ output_strides,
     // Starting warp idx for each input
-    uint32_t const* __restrict__ warp_prefix_sum,
-    // Base on the LLama and DSV3 implementation, 1 round is enough for Half[8192].
-    // Maybe we should have a kernel without round loop to further reduce runtime.
-    const uint32_t __restrict__ rounds, const uint32_t __restrict__ num_inputs, float const eps)
+    uint32_t const* __restrict__ warp_prefix_sum, const uint32_t __restrict__ rounds,
+    const uint32_t __restrict__ num_inputs, float const eps)
 {
     const uint32_t bx = blockIdx.x; // Maps to batch size
     constexpr uint32_t warp_size = 32;
-    const uint32_t num_warps = blockDim.y;
     const uint32_t warp_idx = threadIdx.y;
     const uint32_t lane_idx = threadIdx.x;
     const uint32_t thread_idx = warp_idx * warp_size + lane_idx;
@@ -98,8 +66,6 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
     static constexpr int kPackedSize = sizeof(PackedType) / sizeof(DType);
 
     // Each thread calculates its own partial sum
-    float sum_sq_q = 0.f;
-    float sum_sq_kv = 0.f;
 
     __shared__ float smem_rsqrts[32];
     float sum_sqs[32];
@@ -126,7 +92,6 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
     uint32_t warp_offset = input_dims[0] / warp_prefix_sum[1];
     uint32_t round_offset = 32 * kPackedSize;
 
-    // TODO: assert input_dims are multiple of 32 to avoid boundary check
     // Calculate sum of squares for each thread
     for (uint32_t i = 0; i < rounds; i++)
     {
@@ -158,12 +123,10 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
     // Second synchronization point to ensure normalization factors are available
     __syncthreads();
 
-    // Apply normalization for both Q and KV in parallel
+    // Apply normalization for inputs in parallel
     for (uint32_t i = 0; i < rounds; i++)
     {
         uint32_t idx = block_offset + local_warp_idx * warp_offset + i * round_offset + lane_idx;
-// Load input in unit of 128b and convert to an array of Dtype
-// Should have cache hit.
 #pragma unroll
         for (uint32_t j = 0; j < kPackedSize; j++)
         {
@@ -189,20 +152,18 @@ void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32
     constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
     TLLM_CHECK_WITH_INFO(!enable_weights, "Weights are not supported yet. Will add in the future.");
     TLLM_CHECK_WITH_INFO(weights[0] == nullptr, "Weights are not supported yet. Will add in the future.");
-    TLLM_CHECK_WITH_INFO(
-        num_inputs <= 32, "Only up to 32 inputs are supported for now. Will add support for more in the future.");
+    TLLM_CHECK_WITH_INFO(num_inputs <= 32, "Only up to 32 inputs are supported.");
     for (uint32_t i = 0; i < num_inputs; i++)
     {
-        TLLM_CHECK_WITH_INFO(input_dims[i] % 32 == 0,
-            "Input dimension must be divisible by 32. Padding support will be added in the future.");
+        TLLM_CHECK_WITH_INFO(input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
     }
 
     // Calculate total warps to launch and rounds needed
     uint32_t total_input_length = std::accumulate(input_dims, input_dims + num_inputs, 0);
     uint32_t input_chunk_per_warp = 32 * kPackedSize;
-    uint32_t total_warps_needed = ceil_div(total_input_length, input_chunk_per_warp);
+    uint32_t total_warps_needed = (total_input_length + input_chunk_per_warp - 1) / input_chunk_per_warp; // ceil_div
     uint32_t num_warps_to_launch = std::min<uint32_t>(32, total_warps_needed);
-    uint32_t rounds = ceil_div(total_warps_needed, num_warps_to_launch);
+    uint32_t rounds = (total_warps_needed + num_warps_to_launch - 1) / num_warps_to_launch;               // ceil_div
 
     // Calculate warp_prefix_sum
     float warps_per_token = float(num_warps_to_launch) / total_input_length;
@@ -228,12 +189,12 @@ void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32
     uint32_t* d_warp_prefix_sum;
 
     // Device memory allocation
-    deviceMalloc(&d_inputs, num_inputs * sizeof(float4*));
-    deviceMalloc(&d_outputs, num_inputs * sizeof(float4*));
-    deviceMalloc(&d_input_dims, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_input_strides, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_output_strides, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_warp_prefix_sum, (num_inputs + 1) * sizeof(uint32_t));
+    deviceMalloc((float**) &d_inputs, sizeof(float*) * num_inputs);
+    TLLM_CUDA_CHECK(cudaMalloc((void**) &d_outputs, sizeof(float4*) * num_inputs));
+    TLLM_CUDA_CHECK(cudaMalloc((void**) &d_input_dims, sizeof(uint32_t) * num_inputs));
+    TLLM_CUDA_CHECK(cudaMalloc((void**) &d_input_strides, sizeof(uint32_t) * num_inputs));
+    TLLM_CUDA_CHECK(cudaMalloc((void**) &d_output_strides, sizeof(uint32_t) * num_inputs));
+    TLLM_CUDA_CHECK(cudaMalloc((void**) &d_warp_prefix_sum, sizeof(uint32_t) * (num_inputs + 1)));
 
     // Prepare host arrays
     float4* h_inputs[num_inputs];
@@ -245,13 +206,17 @@ void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32
     }
 
     // Copy data to device
-    cudaAutoCpy(d_inputs, h_inputs, num_inputs * sizeof(float4*), stream);
-    cudaAutoCpy(d_outputs, h_outputs, num_inputs * sizeof(float4*), stream);
-    cudaAutoCpy(d_input_dims, input_dims, num_inputs * sizeof(uint32_t), stream);
-    cudaAutoCpy(d_input_strides, input_strides, num_inputs * sizeof(uint32_t), stream);
-    cudaAutoCpy(d_output_strides, output_strides, num_inputs * sizeof(uint32_t), stream);
-    cudaAutoCpy(d_warp_prefix_sum, warp_prefix_sum.data(), (num_inputs + 1) * sizeof(uint32_t), stream);
-
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(d_inputs, h_inputs, num_inputs * sizeof(float4*), cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemcpyAsync(d_outputs, h_outputs, num_inputs * sizeof(float4*), cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemcpyAsync(d_input_dims, input_dims, num_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemcpyAsync(d_input_strides, input_strides, num_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(
+        d_output_strides, output_strides, num_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+    TLLM_CUDA_CHECK(cudaMemcpyAsync(d_warp_prefix_sum, warp_prefix_sum.data(), (num_inputs + 1) * sizeof(uint32_t),
+        cudaMemcpyHostToDevice, stream));
     // Shared memory size: used for the rsqrt values if each input, max 32 inputs.
     const uint32_t smem_size = 32 * sizeof(float);
     cudaLaunchConfig_t cfg;
@@ -269,11 +234,24 @@ void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32
         d_input_dims, d_input_strides, d_output_strides, d_warp_prefix_sum, rounds, num_inputs, eps));
 
     // Free device memory
-    deviceFree(d_inputs);
-    deviceFree(d_outputs);
-    deviceFree(d_input_dims);
-    deviceFree(d_input_strides);
-    deviceFree(d_output_strides);
-    deviceFree(d_warp_prefix_sum);
+    TLLM_CUDA_CHECK(cudaFree(d_inputs));
+    TLLM_CUDA_CHECK(cudaFree(d_outputs));
+    TLLM_CUDA_CHECK(cudaFree(d_input_dims));
+    TLLM_CUDA_CHECK(cudaFree(d_input_strides));
+    TLLM_CUDA_CHECK(cudaFree(d_output_strides));
+    TLLM_CUDA_CHECK(cudaFree(d_warp_prefix_sum));
 }
+
+// Explicit template instantiations
+template void GroupRMSNormKernel<half>(half** inputs, half** weights, half** outputs, uint32_t const* input_dims,
+    uint32_t const* input_strides, uint32_t const* output_strides, const uint32_t batch_size, const uint32_t num_inputs,
+    float const eps, bool enable_weights, cudaStream_t stream);
+
+template void GroupRMSNormKernel<float>(float** inputs, float** weights, float** outputs, uint32_t const* input_dims,
+    uint32_t const* input_strides, uint32_t const* output_strides, const uint32_t batch_size, const uint32_t num_inputs,
+    float const eps, bool enable_weights, cudaStream_t stream);
+
+template void GroupRMSNormKernel<__nv_bfloat16>(__nv_bfloat16** inputs, __nv_bfloat16** weights,
+    __nv_bfloat16** outputs, uint32_t const* input_dims, uint32_t const* input_strides, uint32_t const* output_strides,
+    const uint32_t batch_size, const uint32_t num_inputs, float const eps, bool enable_weights, cudaStream_t stream);
 } // namespace tensorrt_llm::kernels::group_rms_norm
