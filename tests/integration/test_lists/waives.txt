@@ -294,7 +294,6 @@ examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7
 examples/test_qwen.py::test_llm_qwen_7b_int8_kv_1node_1gpus[qwen2_vl_7b_instruct-enable_gemm_plugin-enable_weight_only] SKIP (https://nvbugs/5094621)
 examples/test_qwen.py::test_llm_qwen_int4_single_gpu_summary[qwen2.5_14b_instruct_int4-nb:4] SKIP (https://nvbugs/5094690)
 test_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5061624)
-test_e2e.py::test_openai_consistent_chat SKIP (https://nvbugs/5112075)
 full:B200/examples/test_gemma.py::test_llm_hf_gemma_quantization_1gpu[gemma-2-9b-it-fp8-bfloat16-8] SKIP (not supported on B200)
 full:B200/examples/test_gpt.py::test_llm_gpt2_starcoder_1gpus SKIP (not supported on B200)
 examples/test_medusa.py::test_mistral_medusa_1gpu[mistral-7b-v0.1] SKIP (https://nvbugs/5137575)

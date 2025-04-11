@@ -517,8 +517,12 @@ class LLM:
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
-        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+        if os.getenv("FORCE_DETERMINISTIC",
+                     "0") == "1" and self.args.backend == "pytorch":
             # Disable KV cache reuse for deterministic mode
+            logger.info(
+                "FORCE_DETERMINISTIC is incompatible with KV cache reuse in PyTorch backend. KV cache reuse is disabled."
+            )
             executor_config.kv_cache_config.enable_block_reuse = False
             executor_config.kv_cache_config.enable_partial_reuse = False
         if self.args.peft_cache_config is not None:
