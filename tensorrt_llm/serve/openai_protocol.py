@@ -632,3 +632,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError(
                 "special_tokens related settings are not supported")
         return data
+
+
+class AddRemoveServerRequest(OpenAIBaseModel):
+    ip_address: str
+    port: int
+    server_type: Literal["context", "generation"]
