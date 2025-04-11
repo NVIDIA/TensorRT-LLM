@@ -468,9 +468,9 @@ def forward_pattern(
     # This is only for memory estimation for now.
     # NOTE: this method is not accurate while it works for most scenario.
     if metadata is None or metadata.kv_cache_manager is None:
-        q = q.view(1, -1, num_heads, head_dim)
-        k = k.view(1, -1, num_kv_heads, head_dim)
-        v = v.view(1, -1, num_kv_heads, head_dim)
+        q = q.view(-1, num_heads, head_dim)
+        k = k.view(-1, num_kv_heads, head_dim)
+        v = v.view(-1, num_kv_heads, head_dim)
         return dummy_forward(q, k, v)
 
     assert isinstance(
