@@ -1,7 +1,8 @@
 import copy
+import weakref
+from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from functools import lru_cache
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
@@ -15,6 +16,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..utils import get_model_extra_attrs
 
 
 @dataclass
@@ -334,6 +336,7 @@ class RopeParams:
         # rotary embedding dim.
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
+                           or getattr(config, 'qk_rope_head_dim', None)
                            or int(head_dim * rope_percentage))
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
@@ -354,57 +357,75 @@ class RopeParams:
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        elif config.model_type == "deepseek_v3":
+            rope_params.scale_type = RotaryScalingType.yarn
 
         return rope_params
 
-    @lru_cache(maxsize=1)
     def create_rope_const_params(self):
         if self.dim == 0:
             return None, None
-        assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
-        rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            self.max_positions,
-            self.dim,
-            self.theta,
-            self.scale,
-            self.scale_type,
-            rope_scaling_config={
-                "factor": self.scale,
-                "low_freq_factor": self.low_freq_factor,
-                "high_freq_factor": self.high_freq_factor,
-                "original_max_position_embeddings": self.original_max_positions,
-            })
-        rope_inv_freq = torch.torch.tensor(
-            rope_inv_freq,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        rope_cos_sin = torch.torch.tensor(
-            rope_cos_sin,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        return rope_inv_freq, rope_cos_sin
 
-    @lru_cache(maxsize=1)
-    def create_deepseek_rope_const_params(self, qk_rope_head_dim: int):
-        rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-            self.max_positions,
-            qk_rope_head_dim,
-            self.theta,
-            self.scale,
-            self.original_max_positions,
-            self.beta_fast,
-            self.beta_slow,
-            self.mscale,
-            self.mscale_all_dim,
-        )
+        RopeConstParams = namedtuple("RopeConstParams", ["inv_freq", "cos_sin"])
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            cache = extra_attrs.setdefault("rope_const_params", {})
+            rope_const_params = cache.get(self, None)
+            if rope_const_params is not None and rope_const_params.cos_sin(
+            ) is not None:
+                return (
+                    rope_const_params.inv_freq()
+                    if rope_const_params.inv_freq is not None else None,
+                    rope_const_params.cos_sin(),
+                )
+
+        if self.scale_type == RotaryScalingType.yarn:
+            rope_inv_freq = None
+            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.original_max_positions,
+                self.beta_fast,
+                self.beta_slow,
+                self.mscale,
+                self.mscale_all_dim,
+            )
+        elif self.scale_type == RotaryScalingType.longrope:
+            raise NotImplementedError("Long RoPE is not supported.")
+        else:
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.scale_type,
+                rope_scaling_config={
+                    "factor": self.scale,
+                    "low_freq_factor": self.low_freq_factor,
+                    "high_freq_factor": self.high_freq_factor,
+                    "original_max_position_embeddings":
+                    self.original_max_positions,
+                })
+        if rope_inv_freq is not None:
+            rope_inv_freq = torch.torch.tensor(
+                rope_inv_freq,
+                dtype=torch.float32,
+                device='cuda',
+            )
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
-        rope_inv_freq = None
+        if extra_attrs is not None:
+            cache[self] = RopeConstParams(
+                weakref.ref(rope_inv_freq)
+                if rope_inv_freq is not None else None,
+                weakref.ref(rope_cos_sin),
+            )
         return rope_inv_freq, rope_cos_sin
 
 

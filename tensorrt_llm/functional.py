@@ -4783,7 +4783,7 @@ class RopeEmbeddingUtils:
         return np.random.rand(dim).astype(dtype)
 
     @staticmethod
-    def create_sinusoidal_positions_for_deepseek_attention_plugin(
+    def create_sinusoidal_positions_yarn(
             num_pos: int,
             dim: int,
             base: int = 10000,
