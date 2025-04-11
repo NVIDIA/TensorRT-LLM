@@ -55,12 +55,11 @@ class LlamaAttention(Attention):
     ):
         config = model_config.pretrained_config
 
-        # TODO: do we need to use NoPE in any versions of LLaMA4?
-        nope_layer_interval = None
-        if nope_layer_interval:
-            is_nope_layer = (layer_idx + 1) % nope_layer_interval == 0
-        else:
-            is_nope_layer = False
+        # Note the convention no_rope_layers[layer_idx] == 0 means nope_layer
+        self.is_llama4 = config.model_type == "llama4_text"
+        is_nope_layer = False
+        if self.is_llama4:
+            is_nope_layer = config.no_rope_layers[layer_idx] == 0
 
         use_rope = not is_nope_layer
         if use_rope and model_config.fuse_pos_embd:
@@ -206,6 +205,10 @@ class LlamaDecoderLayer(DecoderLayer):
         self.fusion_config.POST_MLP_FUSION = False
 
         self.is_llama4 = config.model_type == "llama4_text"
+        self.is_nope_layer = False
+        if self.is_llama4:
+            self.is_nope_layer = config.no_rope_layers[layer_idx] == 0
+
         self.self_attn = LlamaAttention(
             model_config,
             layer_idx=layer_idx,
@@ -286,13 +289,20 @@ class LlamaDecoderLayer(DecoderLayer):
 
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
-        major, minor = torch.cuda.get_device_capability()
-        is_blackwell = (major * 10 + minor) >= 100
-        min_latency_mode = hidden_states.size(
-            0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
+        # major, minor = torch.cuda.get_device_capability()
+        # is_blackwell = (major * 10 + minor) >= 100
+        # min_latency_mode = hidden_states.size(
+        #     0
+        # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
+
+        # Temporarily disable min-latency mode for Llama4
+        min_latency_mode = False
 
         # Self Attention
+        # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
+        if self.is_nope_layer:
+            position_ids = None
+
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -573,6 +583,8 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
             if key.startswith("language_model."):
                 new_key = key[len("language_model."):]
                 new_weights[new_key] = tensor
+            else:
+                new_weights[key] = tensor
 
         super().load_weights(new_weights)
 
