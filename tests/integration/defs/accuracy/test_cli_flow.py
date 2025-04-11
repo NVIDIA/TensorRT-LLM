@@ -78,10 +78,17 @@ class TestGpt2(CliFlowAccuracyTestHarness):
                  extra_summarize_args=["--num_beams=4", "--length_penalty=2.0"])
 
     def test_beam_search_large(self, mocker):
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
-        self.run(extra_acc_spec="beam_width=256",
-                 extra_build_args=["--max_beam_width=256"],
-                 extra_summarize_args=["--num_beams=256"])
+        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 4)
+        self.run(extra_acc_spec="beam_width=1024",
+                 extra_build_args=["--max_beam_width=1024"],
+                 extra_summarize_args=["--num_beams=1024"])
+
+    def test_variable_beam_width_search(self, mocker):
+        mocker.patch.object(self.__class__, "MAX_BATCH_SIZE", 4)
+        self.run(
+            extra_acc_spec="beam_width=8",
+            extra_build_args=["--max_beam_width=8"],
+            extra_eval_args=["--num_beams=8", "--beam_width_array=[2,3,4,5]"])
 
     def test_weight_streaming_ootb(self):
         self.run(extra_build_args=[

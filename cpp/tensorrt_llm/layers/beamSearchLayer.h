@@ -66,8 +66,8 @@ private:
     TensorPtr mEarlyStoppingDevice;           // [batchSize] gpu
     TensorPtr mBeamWidthArrayHost;            // [batchSize, kMaxBeamWidthArrayLength] cpu
     TensorPtr mBeamWidthArrayDevice;          // [batchSize, kMaxBeamWidthArrayLength] gpu
-    TensorPtr mBeamWidthIn;                   // [batchSize] cpu, the input beamWidth of this step
-    TensorPtr mBeamWidthOut;                  // [batchSize] cpu, the output beamWidth of this step
+    TensorPtr mBeamWidthIn;                   // [batchSize] cpu, the beamWidth of last forward computation
+    TensorPtr mBeamWidthOut;                  // [batchSize] cpu, the beamWidth of next forward computation
 };
 
 } // namespace tensorrt_llm::layers

@@ -417,10 +417,9 @@ public:
         auto const& beamWidthArray = this->beamWidthArray;
         if (beamWidthArray.has_value())
         {
-            TLLM_CHECK_WITH_INFO(decodingIter > 0, "getBeamWidthByIter should only be called in generation phase.");
             // Clamped `decodingIter` into [0,kMaxBeamWidthArrayLength-1] as index
-            int const index
-                = std::min(decodingIter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1;
+            int const index = std::max(
+                std::min(decodingIter, static_cast<int>(tensorrt_llm::kernels::kMaxBeamWidthArrayLength)) - 1, 0);
             reqBeamWidth = beamWidthArray.value()[indexSC][index];
         }
         return reqBeamWidth;

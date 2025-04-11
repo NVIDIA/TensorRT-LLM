@@ -63,18 +63,25 @@ public:
     }
 
     //! Mandatory parameters
+    //! Logits
     //! [batchSize][1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
     std::vector<TensorPtr> logits;
     //! Control activity of decoder slots in batch
     std::vector<bool> active; // [batchSize]
-    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep, batchSize]
-    TensorPtr batchSlots;
-    //! Filled with slots in request order, [batchSize]
-    TensorPtr batchSlotsRequestOrder;
+
+    //! Empty buffer filled in GptDecoderBatched, sorted by slots
+    TensorPtr batchSlots; // [maxTokensPerEngineStep, batchSize]
+    //! Filled with slots in request order
+    TensorPtr batchSlotsRequestOrder; // [batchSize]
 
     //! For beam search
     //! Indices into KV cache of different rays within one beam
     TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    //! The generation step of each request (for Variable-Beam-Width-Search)
+    std::vector<tensorrt_llm::runtime::SizeType32> steps; // [batchSize]
+
+    //! For speculative decoding
+    //! Logits of draft
     //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
     std::vector<std::vector<TensorPtr>> predictedDraftLogits;
 

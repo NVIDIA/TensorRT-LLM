@@ -309,6 +309,11 @@ private:
         return getModelConfig().computeGenerationLogits() || mGatherGenerationLogits;
     }
 
+    [[nodiscard]] bool getUseVariableBeamWidthSearch() const
+    {
+        return mUseVariableBeamWidthSearch;
+    }
+
     [[nodiscard]] runtime::ModelConfig const& getModelConfig() const override
     {
         return mModelConfig;
@@ -489,6 +494,8 @@ private:
     std::optional<SizeType32> mMaxNumTokensRuntime;
     // Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
+    // Controls if Variable-Beam-Width-Search is enabled
+    bool mUseVariableBeamWidthSearch{false};
 
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.

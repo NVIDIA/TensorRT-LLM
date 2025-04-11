@@ -385,7 +385,6 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
 
     auto const& cudaStream = manager.getStream();
 
-    SizeType32 constexpr contextBeamWidth{1};
     SizeType32 numSequences{0};
     SizeType32 maxBlockCount{0};
     SizeType32 maxCrossBlockCount{0};
@@ -395,7 +394,8 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
         {
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
-            auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->mSamplingConfig.beamWidth;
+            auto const beamWidth
+                = isContextRequest ? 1 : llmReq->mSamplingConfig.getBeamWidthByIter(llmReq->getDecodingIter());
             auto const maxBeamBlockCount
                 = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences, requestId);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
@@ -448,9 +448,11 @@ void TransformerBuffers::copyCacheIndirection(
     auto batchedCopySizes = BufferRange<SizeType64>(*cacheIndirBatchedCopySizes);
 
     auto cacheIndirShape = decoderCacheIndirectionOutput->getShape();
+    auto reqBeamWidth = genRequests[0]->mSamplingConfig.getBeamWidthByIter(genRequests[0]->getDecodingIter());
 
     // Get size of copying from shape of `CacheIndirectionOutput`
     cacheIndirShape.d[0] = 1;
+    cacheIndirShape.d[1] = reqBeamWidth; // Use step-beam-width rather than max-beam-width as dst offset
     auto const copySize = static_cast<SizeType64>(ITensor::volume(cacheIndirShape));
 
     std::transform(genRequests.begin(), genRequests.end(), batchedCopySrcOffsets.begin(),

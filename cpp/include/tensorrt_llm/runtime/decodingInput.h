@@ -97,6 +97,8 @@ public:
     //! Parameters for beam search
     //! KV cache index for beam search, [batchSize, beamWidth, maxSeqLen] on gpu
     TensorPtr cacheIndirection;
+    //! Step of each request, for Variable-Beam-Width-Search
+    std::optional<std::vector<SizeType32>> steps; // [batchSize]
 
     // Medusa
     class MedusaInputs
