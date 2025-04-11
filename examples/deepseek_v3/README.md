@@ -324,6 +324,39 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --report_json "${OUTPUT_FILENAME}.json"
 ```
 
+### FP8 KV Cache and MLA
+
+FP8 KV Cache and MLA quantization is supported, which delivers two key performance advantages:
+- Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
+- MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
+
+You can enable FP8 MLA through either of these methods:
+
+**Option 1: Checkpoint config**
+
+TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer). To enable FP8 MLA, modify the configuration as follows:
+
+```json
+{
+  "quantization": {
+    "quant_algo": "FP8_BLOCK_SCALES",  // Or "NVFP4"
+    "kv_cache_quant_algo": "FP8",
+    // ...
+  }
+}
+```
+
+**Option 2: PyTorch backend config**
+
+Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
+```yaml
+# ...
+pytorch_backend_config:
+  kv_cache_dtype: fp8
+  # ...
+```
+```
+
 ## Notes and Troubleshooting
 
 - **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
