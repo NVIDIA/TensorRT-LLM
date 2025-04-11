@@ -248,6 +248,9 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+# This class has extensively parameterized test methods, which yield totally 200 test cases.
+# This is because this model requires high test coverage over the feature combinations.
+# Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
@@ -291,8 +294,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn",
                           [None, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
-                                                         (2, 2, 1)],
-                             ids=["tp4", "ep4", "tp2pp2"])
+                                                         (2, 2, 1), (1, 4, 1)],
+                             ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                             attention_dp, cuda_graph, overlap_scheduler):
         # OOM on H100 with default free_gpu_memory_fraction=0.9
@@ -355,8 +358,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [None, 2])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
-                                                         (2, 2, 1)],
-                             ids=["tp4", "ep4", "tp2pp2"])
+                                                         (2, 2, 1), (1, 4, 1)],
+                             ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_fp8_block_scales_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     attention_dp, cuda_graph,
                                     overlap_scheduler):
@@ -409,8 +412,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, False), (False, False, True),
                            (True, True, True)])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
-                                                         (2, 2, 1)],
-                             ids=["tp4", "ep4", "tp2pp2"])
+                                                         (2, 2, 1), (1, 4, 1)],
+                             ids=["tp4", "ep4", "tp2pp2", "pp4"])
     def test_nvfp4_4gpus(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler):
         pytorch_config = PyTorchConfig(
