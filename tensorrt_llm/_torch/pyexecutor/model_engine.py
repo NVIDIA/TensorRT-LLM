@@ -506,7 +506,7 @@ class PyTorchModelEngine(ModelEngine):
                                 # No KV cache space!
                                 continue
                             logger.info(
-                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens is not None else 'generation'} phase"
+                                f"Run warmup for batch size={bs}, pure {'context' if num_tokens > 1 else 'generation'} phase"
                             )
                             self.forward(batch,
                                          new_tensors_device=None,
