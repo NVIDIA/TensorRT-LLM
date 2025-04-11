@@ -421,8 +421,6 @@ examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Ne
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5166600)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)
-unittest/_torch/multi_gpu_modeling -k "deepseek and tp2_pp2_ep1_nextn0_enable_dp" SKIP (https://nvbugspro.nvidia.com/bug/5206873)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214245)
 unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugspro.nvidia.com/bug/5215499)
-accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile] SKIP (https://nvbugspro.nvidia.com/bug/5216737)
 unittest/_torch/multi_gpu SKIP (https://nvbugspro.nvidia.com/bug/5216799)
