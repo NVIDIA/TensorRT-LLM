@@ -87,7 +87,16 @@ public:
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
-using Output = decoder::Output;
+class Output
+{
+public:
+    using TensorPtr = std::shared_ptr<ITensor>;
+
+    Output() = default;
+
+    // parameters for beam search
+    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], mandatory in beam search, on gpu
+};
 
 } // namespace decoder_batch
 

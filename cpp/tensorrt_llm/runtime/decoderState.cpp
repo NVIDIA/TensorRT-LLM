@@ -72,6 +72,8 @@ DecoderState::DecoderState(nvinfer1::DataType dtype, BufferManager const& buffer
     dOutput->newTokensSteps = bufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
     dOutput->parentIds = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
+    dOutput->lengths = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
+
     // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
@@ -225,6 +227,9 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     bufferManager.setZero(*dOutput.finishReasons);
 
     dOutput.parentIds->reshape(maxTotalTokensShape);
+
+    dOutput.lengths->reshape(maxBatchSizeXmaxBeamWidthShape);
+    bufferManager.setZero(*dOutput.lengths);
 
     dOutput.finishedSum->reshape(maxBatchSizeShape);
     bufferManager.setZero(*dOutput.finishedSum);
@@ -483,6 +488,11 @@ TensorPtr DecoderState::getLogProbs(SizeType32 batchIdx) const
     auto tensor = ITensor::slice(mJointDecodingOutput->logProbs, batchIdx, 1);
     tensor->squeeze(0);
     return tensor;
+}
+
+TensorPtr DecoderState::getSequenceLengths() const
+{
+    return mJointDecodingOutput->lengths;
 }
 
 TensorPtr DecoderState::getAllNewTokens() const
