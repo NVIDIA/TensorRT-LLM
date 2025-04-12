@@ -5,17 +5,18 @@ Tests for basic graph sharding.
 import pytest
 import torch
 from _graph_test_helpers import run_test
-from _model_test_utils import MLP
+from _model_test_utils import MLP, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import quantize
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
 
 
 def check_quantized(gm):
-    op_expected = {torch.ops.quant.fp8_linear, torch.ops.quant.fp4_linear}
-    return any(is_op(n, op_expected) for n in gm.graph.nodes)
+    return any(is_op(n, QUANT_OPS) for n in gm.graph.nodes)
 
 
 @pytest.mark.parametrize(
@@ -61,6 +62,52 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
         rtol,
         True,  # test_load_hook
         False,  # strict_loading
+        None,  # dynamic_shapes
+        quant_config,
+    )
+
+    # check there's quantization error during transformation
+    assert not torch.allclose(model(x), gm_transformed(x))
+    # check if we can still export the model as expected
+    torch_export(gm_transformed, args=(x,))
+    torch_export_to_gm(gm_transformed, args=(x,))
+
+
+@pytest.mark.parametrize(
+    "quant_config,atol,rtol,num_p_og",
+    [
+        pytest.param(
+            {"quant_algo": "FP8"},
+            5e-1,
+            5e-1,
+            lambda num_p_og: num_p_og,
+            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+        ),
+    ],
+)
+def test_bmm_quantization(quant_config, atol, rtol, num_p_og):
+    batch_size, seq_len, hidden_dim, num_experts = 2, 2, 16, 1
+    model = BMMModel(hidden_dim, batch_size, num_experts).to(torch.float16).to("cuda")
+    x = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.float16).to("cuda")
+
+    # register fp8 scales
+    if quant_config["quant_algo"] == "FP8":
+        model.experts[0].register_buffer("weight1_input_scale", fp8_scale(x))
+        model.experts[0].register_buffer(
+            "weight1_weight_scale", fp8_scale(model.experts[0].weight1)
+        )
+
+    gm_transformed = run_test(
+        model,
+        x,
+        quantize,
+        check_quantized,
+        num_p_og,
+        atol,
+        rtol,
+        True,  # test_load_hook
+        False,  # strict_loading
+        None,  # dynamic_shapes
         quant_config,
     )
 
