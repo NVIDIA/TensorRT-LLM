@@ -115,6 +115,13 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
+def unpack_hidden_states(hidden_states):
+    if isinstance(hidden_states, (tuple, list)):
+        return hidden_states
+    else:
+        return hidden_states, None
+
+
 def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
                                       dtype: torch.dtype):
 
@@ -293,6 +300,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 raise ValueError(
                     "pipeline_interface is required for non-first pp rank.")
             hidden_states, residual = pipeline_interface  # unpack pp_interface
+            hidden_states, residual = local_decoder_layers[0].input_layernorm(
+                hidden_states, residual)
         else:
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
@@ -302,10 +311,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
             hidden_states = inputs_embeds
-            residual = hidden_states
-
-            hidden_states = local_decoder_layers[0].input_layernorm(
-                hidden_states)
+            residual = None
 
         for decoder_layer in local_decoder_layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
@@ -318,8 +324,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             return PipelineInterface(hidden_states,
                                      residual)  # pack pp_interface
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        else:
+            return hidden_states
 
 
 class PostInitCaller(type):
