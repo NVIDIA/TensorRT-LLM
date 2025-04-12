@@ -282,6 +282,11 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # local forward pass
+        local_decoder_layers = ([
+            self.layers[layer_id] for layer_id in self.pp_layer_list
+        ] if self.pp_size > 1 else self.layers)
+
         # unpack pp_interface or embedding lookup for the input
         if self.pp_rank != 0:
             if pipeline_interface is None:
@@ -297,12 +302,10 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
             hidden_states = inputs_embeds
-            residual = None
+            residual = hidden_states
 
-        # local forward pass
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
+            hidden_states = local_decoder_layers[0].input_layernorm(
+                hidden_states)
 
         for decoder_layer in local_decoder_layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,

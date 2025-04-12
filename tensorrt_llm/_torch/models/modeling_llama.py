@@ -24,7 +24,8 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -536,7 +537,8 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+                # layers[idx + 1] is MissingLayer for last layer in pp rank
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
