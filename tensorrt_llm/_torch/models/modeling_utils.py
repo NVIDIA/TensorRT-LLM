@@ -286,8 +286,11 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 self.model_config, layer_idx)
         self.layers = build_pipeline_layers(self.pp_layer_list,
                                             num_hidden_layers, layer_fn)
-        self._local_layers = nn.ModuleList(
-            [layer for layer in self.layers if not layer.is_missing()])
+        self._local_layers = [
+            layer for layer in self.layers[:config.num_hidden_layers]
+            if not layer.is_missing()
+        ]
+        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
@@ -295,8 +298,9 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             pp_interface_keys, config.hidden_size, config.torch_dtype)
 
     def local_layers(self) -> List[DecoderLayer]:
-        return self._local_layers if hasattr(self,
-                                             "_local_layers") else self.layers
+        return (
+            self._local_layers if hasattr(self, "_local_layers") else
+            self.layers[:self.model_config.pretrained_config.num_hidden_layers])
 
 
 class PostInitCaller(type):
