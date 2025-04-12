@@ -404,7 +404,7 @@ void initBindings(pybind11::module_& m)
             py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
-            py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
+            py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
@@ -468,17 +468,13 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_property_readonly(
-            "sequence_lengths", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengths); })
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
         .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
         .def_property_readonly(
             "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
         .def_property_readonly("new_output_tokens_host",
             [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);

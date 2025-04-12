@@ -5,9 +5,8 @@ import torch
 from torch import nn
 
 from ..attention_backend import AttentionMetadata
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
-from .linear import Linear
+from .linear import Linear, TensorParallelMode
 
 
 @dataclass
@@ -166,9 +165,9 @@ class Mamba2(nn.Module):
         super().__init__()
 
         config = config or ModelConfig()
+        self.mapping = config.mapping
         tp_rank = config.mapping.tp_rank
         tp_size = config.mapping.tp_size
-        gpus_per_node = config.mapping.gpus_per_node
 
         d_inner = d_model * expand
         nheads = d_inner // head_dim
@@ -205,11 +204,8 @@ class Mamba2(nn.Module):
             d_in_proj,
             bias=bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
         )
 
@@ -219,11 +215,8 @@ class Mamba2(nn.Module):
             conv_dim,
             bias=conv_bias,
             dtype=dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+            mapping=self.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )
@@ -258,11 +251,8 @@ class Mamba2(nn.Module):
                                d_model,
                                bias=bias,
                                dtype=dtype,
-                               parallel_config=ParallelConfig(
-                                   tensor_parallel_rank=tp_rank,
-                                   tensor_parallel_size=tp_size,
-                                   tensor_parallel_mode=TensorParallelMode.ROW,
-                                   gpus_per_node=gpus_per_node),
+                               mapping=self.mapping,
+                               tensor_parallel_mode=TensorParallelMode.ROW,
                                quant_config=config.get_quant_config())
 
     def forward(

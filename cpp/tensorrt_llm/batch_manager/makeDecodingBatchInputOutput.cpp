@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
@@ -94,9 +95,10 @@ void copySequenceLengths(RequestVector const& contextRequests, RequestVector con
 
 std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>>
 MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers, runtime::ModelConfig const& modelConfig,
-    SizeType32 maxNumSequences, SizeType32 beamWidth, runtime::BufferManager const& manager,
-    runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
+    DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
+    runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+    SizeType32 beamWidth, runtime::BufferManager const& manager, runtime::CudaStream const& stream,
+    OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -128,12 +130,11 @@ MakeDecodingBatchInputOutput::operator()(RequestVector const& contextRequests, R
         decodingInput->eagleLastInputs = fusedRuntimeBuffers->eagleBuffers->engineInputs;
     }
 
-    copySequenceLengths(
-        contextRequests, generationRequests, inputBuffers, decoderBuffers.sequenceLengths, beamWidth, manager, stream);
+    copySequenceLengths(contextRequests, generationRequests, inputBuffers,
+        decoderState.getJointDecodingOutput().lengths, beamWidth, manager, stream);
 
     auto decodingOutput = std::make_unique<tr::decoder_batch::Output>();
     decodingOutput->cacheIndirection = decoderBuffers.cacheIndirectionOutput;
-    decodingOutput->sequenceLengths = decoderBuffers.sequenceLengths;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(decodingInput), std::move(decodingOutput)};

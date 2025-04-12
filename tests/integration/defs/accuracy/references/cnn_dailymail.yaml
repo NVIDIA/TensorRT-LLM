@@ -147,6 +147,8 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 34.383
   - quant_algo: FP8
     accuracy: 34.927
+mistralai/Mistral-7B-v0.1:
+  - accuracy: 25.741
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
   - quant_algo: NVFP4
@@ -228,8 +230,12 @@ Qwen/Qwen2.5-7B-Instruct:
     accuracy: 33.248
 nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
+    accuracy: 25.247
+  - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 25.72
+nemotron-nas/Llama-3_1-Nemotron-51B-Instruct:
+  - accuracy: 35.672
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 26.465
   - quant_algo: NVFP4

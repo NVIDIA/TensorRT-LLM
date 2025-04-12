@@ -1,8 +1,6 @@
 import atexit
-import enum
 import os
 import threading
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -15,37 +13,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 _thread_local = threading.local()
-
-
-class TensorParallelMode(str, enum.Enum):
-    COLUMN = 'column'
-    ROW = 'row'
-
-    @classmethod
-    def split_dim(cls, mode):
-        return 1 if mode == cls.ROW else 0
-
-
-@dataclass(kw_only=True)
-class ParallelConfig:
-    tensor_parallel_size: int = 1
-    tensor_parallel_rank: int = 0
-    gpus_per_node: int = 8
-    tensor_parallel_mode: Optional[TensorParallelMode] = None
-    gather_output: bool = False
-    # pipeline parallel parameter in case we have multiple parallel groups
-    # default to TP-only mode if not specified for backward compatibility
-    # TODO Remove redundant fields. Keep only parallel_rank, tp_size, pp_size in constructor
-    # and infer tp_rank, pp_rank, etc. automatically.
-    pipeline_parallel_size: int = 1
-    parallel_rank: Optional[int] = None
-
-    def __post_init__(self):
-        self.parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
-        if self.pipeline_parallel_size > 1:
-            assert self.parallel_rank is not None, "parallel_rank must be specified for PP mode"
-        else:
-            self.parallel_rank = self.tensor_parallel_rank
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -77,7 +44,7 @@ def get_deepseek_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
 def allreduce(
     input: torch.Tensor,
     workspace: Optional[torch.LongTensor],
-    parallel_config: ParallelConfig,
+    mapping: Mapping,
     strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     config: AllReduceConfig = AllReduceConfig(0),
     all_reduce_params: Optional[AllReduceParams] = None
@@ -98,7 +65,7 @@ def allreduce(
 
     Args:
         input (Tensor): The input tensor.
-        parallel_config (ParallelConfig):  The parallel config.
+        mapping (Mapping):  The parallel mapping.
         strategy (AllReduceStrategy): NCCL delegates all-reduce to NCCL while ONESHOT and TWOSHOT are custom latency-optimal algorithms.
             AUTO chooses amongst the three based on a message-size heuristic.
         config (AllReduceConfig): The config for custom allreduce kernels.
@@ -106,18 +73,9 @@ def allreduce(
     Returns:
         The reduced tensor and an optional intermediate tensor if fused.
     '''
-    if parallel_config.tensor_parallel_size == 1 or (
-            all_reduce_params is not None
-            and all_reduce_params.enable_allreduce == False):
+    if mapping.tp_size == 1 or (all_reduce_params is not None and
+                                all_reduce_params.enable_allreduce == False):
         return input
-
-    mapping = Mapping(
-        world_size=parallel_config.parallel_size,
-        tp_size=parallel_config.tensor_parallel_size,
-        pp_size=parallel_config.pipeline_parallel_size,
-        rank=parallel_config.parallel_rank,
-        gpus_per_node=parallel_config.gpus_per_node,
-    )
 
     if all_reduce_params is None:
         all_reduce_params = AllReduceParams()
@@ -164,7 +122,7 @@ def userbuffers_allreduce_finalize(
 
 
 def allgather(input: torch.Tensor,
-              parallel_config: ParallelConfig,
+              mapping: Mapping,
               gather_dim: int = -1) -> torch.Tensor:
     '''
     Add an operation that performs a collective all-gather.
@@ -184,21 +142,13 @@ def allgather(input: torch.Tensor,
 
     Args:
         input (Tensor): The input tensor.
-        parallel_config (ParallelConfig):  The parallel config.
+        mapping (Mapping):  The parallel mapping.
         gather_dim (int): Gather along given dimension. By default -1.
     Returns:
         The gathered tensor.
     '''
-    if parallel_config.tensor_parallel_size == 1:
+    if mapping.tp_size == 1:
         return input
-
-    mapping = Mapping(
-        world_size=parallel_config.parallel_size,
-        tp_size=parallel_config.tensor_parallel_size,
-        pp_size=parallel_config.pipeline_parallel_size,
-        rank=parallel_config.parallel_rank,
-        gpus_per_node=parallel_config.gpus_per_node,
-    )
 
     output = torch.ops.trtllm.allgather(
         input,
@@ -211,25 +161,16 @@ def allgather(input: torch.Tensor,
     output = torch.movedim(output, 0, gather_dim)
     input_shape = input.size()
     output = output.reshape(input_shape[:gather_dim] +
-                            (parallel_config.tensor_parallel_size *
-                             input_shape[gather_dim], ) +
+                            (mapping.tp_size * input_shape[gather_dim], ) +
                             input_shape[gather_dim + 1:])
     return output
 
 
 def reducescatter(input: torch.Tensor,
-                  parallel_config: ParallelConfig,
+                  mapping: Mapping,
                   scatter_dim: int = -1) -> torch.Tensor:
-    if parallel_config.tensor_parallel_size == 1:
+    if mapping.tp_size == 1:
         return input
-
-    mapping = Mapping(
-        world_size=parallel_config.parallel_size,
-        tp_size=parallel_config.tensor_parallel_size,
-        pp_size=parallel_config.pipeline_parallel_size,
-        rank=parallel_config.parallel_rank,
-        gpus_per_node=parallel_config.gpus_per_node,
-    )
 
     output = torch.ops.trtllm.reducescatter(
         input,
@@ -242,8 +183,7 @@ def reducescatter(input: torch.Tensor,
     output = torch.movedim(output, 0, scatter_dim)
     input_shape = input.size()
     output = output.reshape(input_shape[:scatter_dim] +
-                            (input_shape[scatter_dim] //
-                             parallel_config.tensor_parallel_size, ) +
+                            (input_shape[scatter_dim] // mapping.tp_size, ) +
                             input_shape[scatter_dim + 1:])
     return output
 
@@ -251,25 +191,14 @@ def reducescatter(input: torch.Tensor,
 class AllReduce(nn.Module):
 
     def __init__(self,
-                 parallel_config: ParallelConfig,
+                 mapping: Mapping,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO):
         super().__init__()
 
-        self.parallel_config = parallel_config
-        self.tp_size = self.parallel_config.tensor_parallel_size
-        self.rank = self.parallel_config.parallel_rank
-        self.gpus_per_node = self.parallel_config.gpus_per_node
-
+        self.mapping = mapping
         self.workspace = None
         self.strategy = strategy
-        if self.tp_size > 1:
-            mapping = Mapping(
-                world_size=self.parallel_config.parallel_size,
-                tp_size=self.tp_size,
-                pp_size=self.parallel_config.pipeline_parallel_size,
-                rank=self.rank,
-                gpus_per_node=self.gpus_per_node,
-            )
+        if self.mapping.tp_size > 1:
             if self.strategy != AllReduceStrategy.UB:
                 self.workspace = get_allreduce_workspace(mapping)
 
@@ -281,7 +210,7 @@ class AllReduce(nn.Module):
     ) -> torch.Tensor:
         output = allreduce(input,
                            self.workspace,
-                           self.parallel_config,
+                           self.mapping,
                            all_reduce_params=all_reduce_params,
                            strategy=self.strategy)
         return output
@@ -289,22 +218,11 @@ class AllReduce(nn.Module):
 
 class DeepseekAllReduce(nn.Module):
 
-    def __init__(self, parallel_config: ParallelConfig):
+    def __init__(self, mapping: Mapping):
         super().__init__()
-        self.parallel_config = parallel_config
-        self.tp_size = self.parallel_config.tensor_parallel_size
-        self.tp_rank = self.parallel_config.tensor_parallel_rank
-        self.gpus_per_node = self.parallel_config.gpus_per_node
-        self.rank = self.parallel_config.parallel_rank
+        self.mapping = mapping
         self.workspace = None
-        if self.tp_size > 1:
-            mapping = Mapping(
-                world_size=self.parallel_config.parallel_size,
-                tp_size=self.tp_size,
-                pp_size=self.parallel_config.pipeline_parallel_size,
-                rank=self.rank,
-                gpus_per_node=self.gpus_per_node,
-            )
+        if self.mapping.tp_size > 1:
             self.workspace = get_deepseek_allreduce_workspace(mapping)
 
     def forward(
@@ -331,8 +249,8 @@ class DeepseekAllReduce(nn.Module):
             input=hidden_states,
             workspace=self.workspace,
             reduce_fusion_inputs=reduce_fusion_inputs,
-            rank=self.parallel_config.tensor_parallel_rank,
-            nranks=self.parallel_config.tensor_parallel_size,
+            rank=self.mapping.tp_rank,
+            nranks=self.mapping.tp_size,
             eps=eps,
             fusion_op=fusion_op,
         )

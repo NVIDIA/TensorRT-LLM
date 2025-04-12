@@ -556,8 +556,7 @@ RequestList runGptModelInference(std::shared_ptr<TrtGptModel>& trtGptModel, std:
                     = trtGptModel->getModelConfig().getSpeculativeDecodingModulePtr()->getMaxDecodingDraftTokens();
             }
             r->validate(trtGptModel->getMaxInputLen(), trtGptModel->getMaxSequenceLen(), maxDraftTokens,
-                trtGptModel->getVocabSizePadded(), std::nullopt, enableBlockReuse,
-                trtGptModel->getModelConfig().computeContextLogits());
+                trtGptModel->getVocabSizePadded(), std::nullopt, enableBlockReuse);
 
             if (enableStreamingMode)
             {
@@ -1667,7 +1666,8 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useEagle()
                 .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(std::nullopt), // freeGpuMemoryFraction
