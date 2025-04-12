@@ -115,6 +115,9 @@ public:
     //! @returns [maxBeamWidth, maxSequenceLength], log probabilities (per beam), on gpu
     [[nodiscard]] TensorPtr getLogProbs(SizeType32 batchIdx) const;
 
+    //! @returns [batchSize, maxBeamWidth], sequence lengths, on gpu
+    [[nodiscard]] TensorPtr getSequenceLengths() const;
+
     //! @brief Get maxTokensPerStep tokens generated in the last forward pass
     //! @returns [maxTokensPerStep, batchSize, maxBeamWidth], tokens generated in last forward pass, on gpu
     [[nodiscard]] TensorPtr getAllNewTokens() const;
