@@ -21,7 +21,7 @@ class PlanParams:
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
 
-    pos_embd_mode: Literal["NONE", "ROPE_LLAMA", "ALIBI"] = "NONE"
+    pos_embd_mode: Optional[Literal["NONE", "ROPE_LLAMA", "ALIBI"]] = None
     rope_theta: Optional[float] = None
     rope_scale: Optional[float] = None
     causal: bool = True
@@ -323,8 +323,120 @@ def flashinfer_mha_with_cache_fake(
     return torch.empty_like(q.contiguous())
 
 
+@torch.library.custom_op("attention::unfused_flashinfer_mha_with_cache", mutates_args=())
+def unfused_flashinfer_mha_with_cache(
+    # Q, K, V
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    # METADATA
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    offsets: torch.Tensor,
+    # CACHES
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    # BUFFERS
+    workspace_buffer: torch.Tensor,
+    # CONSTANTS
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    # reshape to standard [b*s, n_heads, head_dim] layout
+    head_dim = k_cache.shape[-1]
+    q_shape_og = q.shape
+    b, s = q_shape_og[:2]
+
+    q = q.view(b * s, -1, head_dim)
+    k = k.view(b * s, -1, head_dim)
+    v = v.view(b * s, -1, head_dim)
+
+    n_heads = q.shape[2]
+    n_kv_heads = k.shape[2]
+
+    pp = PlanParams(
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        num_seq=len(qo_indptr) - 1,
+        is_generate=(s == 1),
+        page_size=k_cache.shape[1],
+        q_dtype=q.dtype,
+        kv_dtype=k_cache.dtype,
+    )
+
+    # Assuming k_scale = v_scale = 1.0, we just have to cast k and v to fp8 before appending to kv cache
+    k_scale, v_scale = 1.0, 1.0
+    if k_cache.dtype == torch.float8_e4m3fn:
+        k = (k / k_scale).to(torch.float8_e4m3fn)
+        v = (v / v_scale).to(torch.float8_e4m3fn)
+
+    # Append to kv cache
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(paged_kv_indptr, paged_kv_last_page_len, pp.page_size),
+        q.shape[0],
+    )
+
+    if batch_indices.shape[0] != q.shape[0]:
+        print("Some issue")
+
+    flashinfer.page.append_paged_kv_cache(
+        k,
+        v,
+        batch_indices,
+        positions,
+        (k_cache, v_cache),
+        paged_kv_indices,
+        paged_kv_indptr,
+        paged_kv_last_page_len,
+    )
+
+    # run the flashinfer planner and obtain the correct wrapper
+    wrapper = _GlobalFlashInferPlanner.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        pp,
+    )
+    y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
+
+    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+
+
+@unfused_flashinfer_mha_with_cache.register_fake
+def unfused_flashinfer_mha_with_cache_fake(
+    # Q, K, V
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    # METADATA
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    offsets: torch.Tensor,
+    # CACHES
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    # BUFFERS
+    workspace_buffer: torch.Tensor,
+    # CONSTANTS
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    return torch.empty_like(q.contiguous())
+
+
 @AttentionRegistry.register("FlashInfer")
 class FlashInferAttention(AttentionDescriptor):
+    @classmethod
+    def _get_planner(cls) -> _FlashInferPlanner:
+        return _GlobalFlashInferPlanner
+
     @classmethod
     def is_paged(cls):
         """Return if the attention op is paged or not."""
@@ -357,7 +469,7 @@ class FlashInferAttention(AttentionDescriptor):
     def get_global_buffer_initializers(cls, get_info):
         def _init_workspace(si: SequenceInfo) -> torch.Tensor:
             buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=si.device)
-            _GlobalFlashInferPlanner.init_workspace(buffer)
+            cls._get_planner().init_workspace(buffer)
             return buffer
 
         return {"workspace_buffer": _init_workspace}
@@ -370,6 +482,24 @@ class FlashInferAttention(AttentionDescriptor):
             pos_embd_config.mode,  # pos_embd_mode
             pos_embd_config.rope_theta,  # rope_theta
             pos_embd_config.rope_scale,  # rope_scale
+            1.0,  # k_scale
+            1.0,  # v_scale
+        ]
+
+
+@AttentionRegistry.register("UnfusedFlashInfer")
+class UnfusedFlashInferAttention(FlashInferAttention):
+    @classmethod
+    def _get_planner(cls) -> _FlashInferPlanner:
+        return _GlobalFlashInferPlanner
+
+    @classmethod
+    def get_attention_op(cls):
+        return torch.ops.attention.unfused_flashinfer_mha_with_cache, 3
+
+    @classmethod
+    def get_constants(cls, attention_info):
+        return [
             1.0,  # k_scale
             1.0,  # v_scale
         ]
