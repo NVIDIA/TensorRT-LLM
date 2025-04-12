@@ -178,20 +178,20 @@ void initRequestBindings(pybind11::module_& m)
             "beam_width_array", &tle::SamplingConfig::getBeamWidthArray, &tle::SamplingConfig::setBeamWidthArray)
         .def(py::pickle(samplingConfigGetstate, samplingConfigSetstate));
 
-    auto additionalModelOutputGetstate = [](tle::OutputConfig::AdditionalModelOutput const& self)
-    { return py::make_tuple(self.name, self.gatherContext); };
+    auto additionalModelOutputGetstate
+        = [](tle::AdditionalModelOutput const& self) { return py::make_tuple(self.name, self.gatherContext); };
     auto additionalModelOutputSetstate = [](py::tuple const& state)
     {
         if (state.size() != 2)
         {
             throw std::runtime_error("Invalid AdditionalModelOutput state!");
         }
-        return tle::OutputConfig::AdditionalModelOutput(state[0].cast<std::string>(), state[1].cast<bool>());
+        return tle::AdditionalModelOutput(state[0].cast<std::string>(), state[1].cast<bool>());
     };
-    py::class_<tle::OutputConfig::AdditionalModelOutput>(m, "AdditionalModelOutput")
+    py::class_<tle::AdditionalModelOutput>(m, "AdditionalModelOutput")
         .def(py::init<std::string, bool>(), py::arg("name"), py::arg("gather_context") = false)
-        .def_readwrite("name", &tle::OutputConfig::AdditionalModelOutput::name)
-        .def_readwrite("gather_context", &tle::OutputConfig::AdditionalModelOutput::gatherContext)
+        .def_readwrite("name", &tle::AdditionalModelOutput::name)
+        .def_readwrite("gather_context", &tle::AdditionalModelOutput::gatherContext)
         .def(py::pickle(additionalModelOutputGetstate, additionalModelOutputSetstate));
 
     auto outputConfigGetstate = [](tle::OutputConfig const& self)
@@ -207,11 +207,10 @@ void initRequestBindings(pybind11::module_& m)
         }
         return tle::OutputConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(),
             state[3].cast<bool>(), state[4].cast<bool>(), state[5].cast<bool>(),
-            state[6].cast<std::optional<std::vector<tle::OutputConfig::AdditionalModelOutput>>>());
+            state[6].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>());
     };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
-        .def(py::init<bool, bool, bool, bool, bool, bool,
-                 std::optional<std::vector<tle::OutputConfig::AdditionalModelOutput>>>(),
+        .def(py::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>>(),
             py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
             py::arg("return_generation_logits") = false, py::arg("exclude_input_from_output") = false,
             py::arg("return_encoder_output") = false, py::arg("return_perf_metrics") = false,
