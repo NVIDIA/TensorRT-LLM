@@ -493,6 +493,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             0
         ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
 
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -825,9 +829,7 @@ class DeepseekV3Model(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        residual = hidden_states
-
-        hidden_states = self.layers[0].input_layernorm(hidden_states)
+        residual = None
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
@@ -835,53 +837,6 @@ class DeepseekV3Model(DecoderModel):
                                                     residual=residual)
 
         return hidden_states
-
-    def _pp_forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-    ) -> torch.Tensor:
-        if self.pp_rank != 0:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
-        else:
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
-
-            hidden_states = inputs_embeds
-            residual = hidden_states
-
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
-
-        if self.pp_rank == 0:
-            hidden_states = local_decoder_layers[0].input_layernorm(
-                hidden_states)
-        else:
-            hidden_states, residual = local_decoder_layers[0].input_layernorm(
-                hidden_states, residual)
-
-        for decoder_layer in local_decoder_layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
-
-        if not self.pp_rank == self.pp_size - 1:
-            return PipelineInterface(hidden_states, residual)
-        else:
-            return hidden_states
 
 
 @register_auto_model("DeepseekV3ForCausalLM")
