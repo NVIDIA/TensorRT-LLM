@@ -156,7 +156,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               model_engine, draft_model_engine,
                                               False)
 
-    if executor_config.pytorch_backend_config.use_kv_cache:
+    if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
             origin_seq_len, ctx_chunk_config, draft_model_engine)

@@ -23,10 +23,10 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
-from ..pyexecutor.cuda_graph_runner import is_graph_capturing
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -351,27 +351,25 @@ class Deepseekv3MoE(nn.Module):
     ) -> torch.Tensor:
         if min_latency_mode:
             assert not self.use_dp
-        # Only enable multi-stream for cuda graph since switch stream has extra host overhead
-        # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        do_multi_stream = is_graph_capturing()
-        if do_multi_stream:
-            self.event_dict[EventType.Main].record()
-        shared_output = self.shared_experts(hidden_states)
-        if self.shared_output_scale is not None:
-            shared_output *= self.shared_output_scale
-        if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.Main].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, hidden_states_fp4, all_rank_num_tokens,
-                    min_latency_mode)
-                self.event_dict[EventType.MoeShared].record()
-            self.event_dict[EventType.MoeShared].wait()
-        else:
+
+        def _compute_shared_output():
+            shared_output = self.shared_experts(hidden_states)
+            if self.shared_output_scale is not None:
+                shared_output *= self.shared_output_scale
+            return shared_output
+
+        def _compute_routed_output():
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
                                                        min_latency_mode)
+            return routed_output
+
+        shared_output, routed_output = maybe_execute_in_parallel(
+            _compute_shared_output, _compute_routed_output,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared], self.aux_stream)
+
         if min_latency_mode:
             return [shared_output, *routed_output]
 
