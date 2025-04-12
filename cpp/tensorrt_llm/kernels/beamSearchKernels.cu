@@ -140,20 +140,21 @@ __global__ void addCumLogProbs(T* __restrict pStage1LogProbs, float const* __res
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
 {
     int const bid = blockIdx.x; // Index of request in batch
-    float const diversityRate{diversityRates[batchSlots[bid]]};
+    runtime::SizeType32 const slot = batchSlots[bid];
+    float const diversityRate{diversityRates[slot]};
     T* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
 
     for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
     {
         int const iBMIn = i / (nBMOut * 2);
-        if (finished[bid * nBMIn + iBMIn].isFinished())
+        if (finished[slot * nBMIn + iBMIn].isFinished())
         {
-            pLocalLogProbs[i] += (i == endIds[bid]) ? 1.0f : 0.0f;
+            pLocalLogProbs[i] += (i == endIds[slot]) ? 1.0f : 0.0f;
         }
         else
         {
             // nBM is used in VBWS since `cumLogProbs` is initialized with kMaxBeamWidth earlier than BeamSearchLayer
-            pLocalLogProbs[i] += cumLogProbs[bid * nBM + iBMIn] + diversityRate * iBMIn;
+            pLocalLogProbs[i] += cumLogProbs[slot * nBM + iBMIn] + diversityRate * iBMIn;
         }
     }
     return;

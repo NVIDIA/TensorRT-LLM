@@ -88,22 +88,6 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
 
-    @staticmethod
-    def to_disaggregated_params(
-            tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
-        if tllm_disagg_params is None:
-            return None
-        else:
-            encoded_opaque_state = base64.b64encode(
-                tllm_disagg_params.opaque_state).decode(
-                    "utf-8") if tllm_disagg_params is not None else None
-            return DisaggregatedParams(
-                request_type=tllm_disagg_params.request_type,
-                first_gen_tokens=tllm_disagg_params.first_gen_tokens,
-                ctx_request_id=tllm_disagg_params.ctx_request_id,
-                encoded_opaque_state=encoded_opaque_state,
-                draft_tokens=tllm_disagg_params.draft_tokens)
-
 
 class CompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"cmpl-{str(uuid.uuid4().hex)}")
@@ -234,21 +218,6 @@ class CompletionRequest(OpenAIBaseModel):
         )
         return sampling_params
 
-    def to_llm_disaggregated_params(self) -> LlmDisaggregatedParams:
-        if self.disaggregated_params is None:
-            return None
-        else:
-            opaque_state = base64.b64decode(
-                self.disaggregated_params.encoded_opaque_state
-            ) if self.disaggregated_params.encoded_opaque_state is not None else None
-
-            return LlmDisaggregatedParams(
-                request_type=self.disaggregated_params.request_type,
-                first_gen_tokens=self.disaggregated_params.first_gen_tokens,
-                ctx_request_id=self.disaggregated_params.ctx_request_id,
-                opaque_state=opaque_state,
-                draft_tokens=self.disaggregated_params.draft_tokens)
-
     def model_post_init(self, __context: Any) -> None:
         if self.best_of is None:
             self.best_of = self.n
@@ -378,6 +347,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
+
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -520,6 +491,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "Will be accessible by the chat template."),
     )
 
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self) -> SamplingParams:
@@ -632,3 +608,41 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise ValueError(
                 "special_tokens related settings are not supported")
         return data
+
+
+def encode_opaque_state(opaque_state: Optional[bytes]) -> Optional[str]:
+    if opaque_state is None:
+        return None
+    return base64.b64encode(opaque_state).decode("utf-8")
+
+
+def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
+    if encoded_opaque_state is None:
+        return None
+    return base64.b64decode(encoded_opaque_state)
+
+
+def to_disaggregated_params(
+        tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+    if tllm_disagg_params is None:
+        return None
+    return DisaggregatedParams(
+        request_type=tllm_disagg_params.request_type,
+        first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+        ctx_request_id=tllm_disagg_params.ctx_request_id,
+        encoded_opaque_state=encode_opaque_state(
+            tllm_disagg_params.opaque_state),
+        draft_tokens=tllm_disagg_params.draft_tokens)
+
+
+def to_llm_disaggregated_params(
+        disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
+    if disaggregated_params is None:
+        return None
+    return LlmDisaggregatedParams(
+        request_type=disaggregated_params.request_type,
+        first_gen_tokens=disaggregated_params.first_gen_tokens,
+        ctx_request_id=disaggregated_params.ctx_request_id,
+        opaque_state=decode_opaque_state(
+            disaggregated_params.encoded_opaque_state),
+        draft_tokens=disaggregated_params.draft_tokens)

@@ -10,9 +10,9 @@ from mpi4py.futures import MPIPoolExecutor
 from torch import nn
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -52,23 +52,27 @@ def mlp_forward(x, hidden_size, dtype, tensor_parallel_size,
         out_features=4 * hidden_size,
         bias=False,
         dtype=dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_size=tensor_parallel_size,
-            tensor_parallel_rank=tensor_parallel_rank,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
         ),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
     )
     l0.load_weights([dict(weight=weights[0])])
     l0.cuda()
-    l1 = Linear(in_features=4 * hidden_size,
-                out_features=hidden_size,
-                bias=False,
-                dtype=dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_size=tensor_parallel_size,
-                    tensor_parallel_rank=tensor_parallel_rank,
-                    tensor_parallel_mode=TensorParallelMode.ROW,
-                ))
+    l1 = Linear(
+        in_features=4 * hidden_size,
+        out_features=hidden_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+    )
     l1.load_weights([dict(weight=weights[1])])
     l1.cuda()
 
@@ -102,15 +106,19 @@ def column_linear_forward(x, hidden_size, dtype, tensor_parallel_size,
                           tensor_parallel_rank, weights):
 
     x = x.cuda()
-    l0 = Linear(in_features=hidden_size,
-                out_features=hidden_size,
-                bias=False,
-                dtype=dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_size=tensor_parallel_size,
-                    tensor_parallel_rank=tensor_parallel_rank,
-                    tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    gather_output=True))
+    l0 = Linear(
+        in_features=hidden_size,
+        out_features=hidden_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
+    )
     l0.load_weights([dict(weight=weights[0])])
     l0.cuda()
 
@@ -137,15 +145,18 @@ def row_linear_forward(x, hidden_size, dtype, tensor_parallel_size,
                        tensor_parallel_rank, weights):
 
     x = x.cuda()
-    l0 = Linear(in_features=hidden_size,
-                out_features=hidden_size,
-                bias=False,
-                dtype=dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_size=tensor_parallel_size,
-                    tensor_parallel_rank=tensor_parallel_rank,
-                    tensor_parallel_mode=TensorParallelMode.ROW,
-                ))
+    l0 = Linear(
+        in_features=hidden_size,
+        out_features=hidden_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+    )
     l0.load_weights([dict(weight=weights[0])])
     l0.cuda()
 
@@ -183,15 +194,18 @@ def row_linear_norm_fusion_forward(x, hidden_size, dtype, tensor_parallel_size,
         eps=eps,
     )
 
-    l0 = Linear(in_features=hidden_size,
-                out_features=hidden_size,
-                bias=False,
-                dtype=dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_size=tensor_parallel_size,
-                    tensor_parallel_rank=tensor_parallel_rank,
-                    tensor_parallel_mode=TensorParallelMode.ROW,
-                ))
+    l0 = Linear(
+        in_features=hidden_size,
+        out_features=hidden_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+    )
     l0.load_weights([dict(weight=weights[0])])
     l0.cuda()
 

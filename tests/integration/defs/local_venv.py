@@ -9,7 +9,7 @@ import tempfile
 import textwrap as tw
 
 from defs.runner_interface import PythonRunnerInterface
-from defs.trt_test_alternative import check_call, check_output
+from defs.trt_test_alternative import check_call, check_output, exists, makedirs
 
 
 class PythonVenvRunnerImpl(PythonRunnerInterface):
@@ -32,6 +32,8 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
         self.venv_exe_name = os.path.basename(venv_bin)
         self.venv_exe_dir = os.path.dirname(venv_bin)
         self.workspace = workspace
+        if not exists(self.workspace):
+            makedirs(self.workspace)
         self._new_env = os.environ.copy()
 
     def get_working_directory(self, translate_wsl_path=True):
