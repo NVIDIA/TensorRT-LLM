@@ -244,10 +244,9 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
         Attention: Fp8RowwiseAttention,
     }
 
-    if quant_config.exclude_modules is None:
-        exclude_modules = ['*ln_f', '*ln_embed']
-    else:
-        exclude_modules = quant_config.exclude_modules
+    exclude_modules = list(
+        set((quant_config.exclude_modules or []) +
+            ['*ln_f', '*ln_embed', '*lm_head']))
 
     def extract_layer_idx(name):
         ss = name.split('.')
