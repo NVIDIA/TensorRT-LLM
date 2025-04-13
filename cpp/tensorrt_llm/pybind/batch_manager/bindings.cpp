@@ -464,8 +464,6 @@ void initBindings(pybind11::module_& m)
             py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
-        .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
-        .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
