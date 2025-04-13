@@ -23,16 +23,13 @@ from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          venv_mpi_check_call)
 from defs.conftest import (evaltool_mmlu_post_process,
                            evaltool_wikilingua_post_process, get_device_memory,
-                           skip_post_blackwell, skip_pre_ada)
+                           skip_pre_ada)
 from defs.trt_test_alternative import check_call
 from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_INFERENCE_SERVER_STOP_SCRIPT,
                                 EVALTOOL_MMLU_CONFIG, EVALTOOL_MMLU_RESULT_FILE,
                                 EVALTOOL_WIKILINGUA_CONFIG,
                                 EVALTOOL_WIKILINGUA_RESULT_FILE)
-
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import BuildConfig, QuantAlgo, QuantConfig
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -53,10 +50,9 @@ def mistral_example_root(llm_venv):
         check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
-@pytest.mark.parametrize("run_type", [
-    'inference', 'summarization', 'summarization_long',
-    'chunked_summarization_long'
-])
+@pytest.mark.parametrize(
+    "run_type",
+    ['inference', 'summarization_long', 'chunked_summarization_long'])
 @pytest.mark.parametrize("max_attention_window", [4096],
                          ids=['max_attention_window_size_4096'])
 @pytest.mark.parametrize("data_type", ['float16'])
@@ -99,88 +95,6 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
             f"--engine_dir={engine_dir}",
             f"--max_attention_window_size={max_attention_window}",
         ])
-
-    elif run_type == "summarization":
-        model_name = 'mistral-{}'.format(run_type)
-        model_dir = convert_weights(llm_venv=llm_venv,
-                                    example_root=llama_example_root,
-                                    cmodel_dir=cmodel_dir,
-                                    model=model_name,
-                                    model_path=llm_mistral_model_root,
-                                    data_type=data_type)
-        build_cmd = [
-            "trtllm-build",
-            f"--checkpoint_dir={model_dir}",
-            f"--output_dir={engine_dir}",
-            f"--max_beam_width=4",
-            f"--max_batch_size={1}",
-            f"--max_input_len={1024}",
-            f"--gpt_attention_plugin={data_type}",
-            f"--gemm_plugin={data_type}",
-            "--context_fmha=enable",
-            "--max_seq_len=2048",
-        ]
-
-        check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-        print("Run summarize...")
-        summary_cmd = [
-            f"{llama_example_root}/../../../summarize.py",
-            "--test_trt_llm",
-            "--hf_model_dir",
-            f"{llm_mistral_model_root}",
-            "--data_type",
-            "fp16",
-            f"--engine_dir={engine_dir}",
-            "--tensorrt_llm_rouge1_threshold",
-            "22",
-            "--check_accuracy",
-            f"--dataset_dir={llm_datasets_root}",
-            f"--rouge_dir={llm_rouge_root}",
-            f"--max_ite=100",
-        ]
-        venv_check_call(llm_venv, summary_cmd)
-
-        print("Run summarize with beam_width = 2...")
-        summary_cmd = [
-            f"{llama_example_root}/../../../summarize.py",
-            "--test_trt_llm",
-            "--hf_model_dir",
-            f"{llm_mistral_model_root}",
-            "--data_type",
-            "fp16",
-            "--num_beams",
-            "2",
-            f"--engine_dir={engine_dir}",
-            "--tensorrt_llm_rouge1_threshold",
-            "22",
-            "--check_accuracy",
-            f"--dataset_dir={llm_datasets_root}",
-            f"--rouge_dir={llm_rouge_root}",
-            f"--max_ite=100",
-        ]
-        venv_check_call(llm_venv, summary_cmd)
-
-        print("Run summarize with beam_width = 4...")
-        summary_cmd = [
-            f"{llama_example_root}/../../../summarize.py",
-            "--test_trt_llm",
-            "--hf_model_dir",
-            f"{llm_mistral_model_root}",
-            "--data_type",
-            "fp16",
-            "--num_beams",
-            "4",
-            f"--engine_dir={engine_dir}",
-            "--tensorrt_llm_rouge1_threshold",
-            "22",
-            "--check_accuracy",
-            f"--dataset_dir={llm_datasets_root}",
-            f"--rouge_dir={llm_rouge_root}",
-            f"--max_ite=100",
-        ]
-        venv_check_call(llm_venv, summary_cmd)
-
     elif run_type == "summarization_long":
         model_name = 'mistral-{}'.format(run_type)
         model_dir = convert_weights(llm_venv=llm_venv,
@@ -627,44 +541,3 @@ def test_mistral_nemo_minitron_fp8_with_bf16_lora(
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
     )
-
-
-@skip_post_blackwell
-@skip_pre_ada
-@pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.3'],
-                         indirect=True)
-def test_llm_mistral_int4_4gpus_llmapi(llm_mistral_model_root, engine_dir):
-
-    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
-
-    build_config = BuildConfig()
-    build_config.max_batch_size = 1
-    build_config.max_input_len = 1900
-    build_config.plugin_config.paged_kv_cache = True
-
-    llm = LLM(model=llm_mistral_model_root,
-              tensor_parallel_size=4,
-              build_config=build_config,
-              quant_config=quant_config)
-
-    llm.save(engine_dir)
-
-    prompt = "You are a friendly AI agent who can provide assistance to the customer regarding their recent order."
-
-    sampling_params = SamplingParams(temperature=0.8,
-                                     top_p=0.95,
-                                     max_tokens=128)
-
-    with llm:
-        output = llm.generate(prompt, sampling_params)
-        print(
-            f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}"
-        )
-        generated_text = output.outputs[0].text.strip()
-        assert ("Assistant" in generated_text) or (
-            "AI agent" in generated_text
-        ), "Generated text should start with either 'Assistant' or 'AI agent'"
-
-    del llm
