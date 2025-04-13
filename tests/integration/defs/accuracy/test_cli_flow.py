@@ -802,7 +802,12 @@ class TestMistral_7B(CliFlowAccuracyTestHarness):
         self.run(extra_acc_spec="beam_width=4",
                  extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
                  extra_summarize_args=["--num_beams=4"])
+        import gc
+
+        import torch
         for num_beams in [1, 2]:
+            gc.collect()
+            torch.cuda.empty_cache()
             self.extra_summarize_args = [f"--num_beams={num_beams}"]
             self.evaluate()
 
@@ -837,6 +842,46 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     def test_tp2(self):
         self.run(dtype='auto', tp_size=2)
 
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(45000)
+    @pytest.mark.parametrize(
+        "moe_tp_size", [1, 4, 8],
+        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
+    def test_ootb_except_mha_tp8(self, moe_tp_size):
+        self.run(tp_size=8,
+                 extra_acc_spec="ootb_except_mha;beam_width=4",
+                 extra_convert_args=[
+                     f"--moe_tp_size={moe_tp_size}",
+                     f"--moe_ep_size={8 // moe_tp_size}",
+                     f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=disable",
+                     "--moe_plugin=disable", f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=["--num_beams=4"])
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(45000)
+    @pytest.mark.parametrize(
+        "moe_tp_size", [1, 4, 8],
+        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
+    @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
+                             ids=['no_renormalize', 'renormalize'])
+    def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+        self.run(tp_size=8,
+                 extra_acc_spec="plugin;beam_width=4",
+                 extra_convert_args=[
+                     f"--moe_tp_size={moe_tp_size}",
+                     f"--moe_ep_size={8 // moe_tp_size}",
+                     f"--moe_renorm_mode={moe_renorm_mode}"
+                 ],
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=auto",
+                     "--moe_plugin=auto", f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=["--num_beams=4"])
+
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
@@ -844,6 +889,20 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(40000)
+    @pytest.mark.parametrize("manage_weights", [True, False],
+                             ids=["manage_weights", ""])
+    def test_fp8_tp2pp2(self, manage_weights):
+        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 tp_size=2,
+                 pp_size=2,
+                 extra_build_args=["--fast_build"] if manage_weights else [])
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
@@ -867,77 +926,12 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,
                  pp_size=2,
+                 extra_acc_spec="pp_reduce_scatter;beam_width=4",
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--pp_reduce_scatter=enable"
                  ],
-                 extra_summarize_args=["--num_beams=4"],
-                 extra_acc_spec="pp_reduce_scatter")
-
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(45000)
-    @pytest.mark.parametrize(
-        "moe_tp_size", [1, 4, 8],
-        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
-    def test_ootb_except_mha_tp8(self, moe_tp_size):
-        self.run(quant_algo=QuantAlgo.W8A16,
-                 tp_size=8,
-                 extra_convert_args=[
-                     f"--moe_tp_size={moe_tp_size}",
-                     f"--moe_ep_size={8 // moe_tp_size}",
-                     f"--moe_renorm_mode={0}"
-                 ],
-                 extra_build_args=[
-                     "--max_beam_width=4", "--gemm_plugin=disable",
-                     "--moe_plugin=disable", f"--max_seq_len={8192}"
-                 ],
-                 extra_summarize_args=["--num_beams=4"],
-                 extra_acc_spec="ootb_except_mha")
-
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(45000)
-    @pytest.mark.parametrize(
-        "moe_tp_size", [1, 4, 8],
-        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
-    @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
-                             ids=['no_renormalize', 'renormalize'])
-    def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
-        self.run(quant_algo=QuantAlgo.W8A16,
-                 tp_size=8,
-                 extra_convert_args=[
-                     f"--moe_tp_size={moe_tp_size}",
-                     f"--moe_ep_size={8 // moe_tp_size}",
-                     f"--moe_renorm_mode={moe_renorm_mode}"
-                 ],
-                 extra_build_args=[
-                     "--max_beam_width=4", "--gemm_plugin=auto",
-                     "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ],
-                 extra_summarize_args=["--num_beams=4"],
-                 extra_acc_spec="plugin")
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(40000)
-    def test_fp8_tp2pp2(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(40000)
-    def test_fp8_tp2pp2_manage_weights(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2,
-                 extra_build_args=["--fast_build"])
+                 extra_summarize_args=["--num_beams=4"])
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self, mocker):
@@ -968,12 +962,12 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
             self.run(tasks=[MMLU(self.MODEL_NAME)],
                      quant_algo=QuantAlgo.NVFP4,
                      kv_cache_quant_algo=QuantAlgo.FP8,
-                     extra_build_args=build_args,
-                     extra_acc_spec="fp4")
+                     extra_acc_spec="fp4",
+                     extra_build_args=build_args)
         else:
             self.run(tasks=[MMLU(self.MODEL_NAME)],
-                     extra_build_args=build_args,
-                     extra_acc_spec="fp4")
+                     extra_acc_spec="fp4",
+                     extra_build_args=build_args)
 
 
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):

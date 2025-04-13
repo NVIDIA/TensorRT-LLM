@@ -148,9 +148,15 @@ meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     accuracy: 34.927
 mistralai/Mistral-7B-v0.1:
-  - accuracy: 22.0
+  - extra_acc_spec: beam_width=4
+    accuracy: 28.368
+  - extra_acc_spec: beam_width=2
+    accuracy: 27.663
+  - extra_acc_spec: beam_width=1
+    accuracy: 25.604
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 23.0
+    extra_acc_spec: beam_width=4
+    accuracy: 27.745
   - quant_algo: FP8
     extra_acc_spec: beam_width=4
     accuracy: 28.321
@@ -170,6 +176,10 @@ NeMo/Mistral_NeMo_Minitron_8B_Instruct:
     accuracy: 32.553
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
+  - extra_acc_spec: plugin;beam_width=4
+    accuracy: 21.0
+  - extra_acc_spec: ootb_except_mha;beam_width=4
+    accuracy: 29.981
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 29.733
@@ -177,20 +187,15 @@ mistralai/Mixtral-8x7B-v0.1:
     kv_cache_quant_algo: FP8
     accuracy: 27.109
   - quant_algo: W4A16
-    accuracy: 18.0
+    accuracy: 23.229
   - quant_algo: W8A16
     extra_acc_spec: beam_width=4
     accuracy: 29.955
+  - quant_algo: W8A16
+    extra_acc_spec: pp_reduce_scatter;beam_width=4
+    accuracy: 30.042
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
     accuracy: 27.979
-  - extra_acc_spec: ootb_except_mha
-    accuracy: 21.0
-  - quant_algo: W8A16
-    extra_acc_spec: plugin
-    accuracy: 21.0
-  - quant_algo: W8A16
-    extra_acc_spec: pp_reduce_scatter
-    accuracy: 23.0
 mistralai/Mixtral-8x7B-v0.1-AWQ:
   - accuracy: 19.5
 mistralai/Mixtral-8x7B-Instruct-v0.1:
