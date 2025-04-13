@@ -18,7 +18,8 @@ from tensorrt_llm.llmapi import LLM, BuildConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, skip_post_blackwell, skip_pre_ada
+from ..conftest import (llm_models_root, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell)
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -114,6 +115,47 @@ class TestMixtral8x7B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    def test_smooth_quant_tp2pp2(self):
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_awq(self, mocker):
+        mocker.patch.object(self.__class__, "MODEL_NAME",
+                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
+        mocker.patch.object(self.__class__, "MODEL_PATH",
+                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMixtral8x7B_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
+
+    def test_awq(self):
+        with LLM(self.MODEL_PATH) as llm:
+            quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm, quant_config=quant_config)
+
+    @skip_pre_blackwell
+    def test_fp4(self, mocker):
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH",
+            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
+        with LLM(self.MODEL_PATH) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 

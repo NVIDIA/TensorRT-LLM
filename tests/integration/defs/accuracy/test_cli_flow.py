@@ -817,6 +817,78 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2)
 
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_weight_only_int4_tp2(self):
+        self.run(quant_algo=QuantAlgo.W4A16,
+                 tp_size=2,
+                 xtra_build_args=["--gemm_plugin=auto"])
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_weight_only_int8_tp2(self):
+        self.run(quant_algo=QuantAlgo.W8A16,
+                 tp_size=2,
+                 extra_acc_spec="beam_width=4",
+                 extra_build_args=["--max_beam_width=4", "--gemm_plugin=auto"],
+                 extra_summarize_args=["--num_beams=4"])
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(45000)
+    def test_pp_reduce_scatter_tp2pp2(self):
+        self.run(quant_algo=QuantAlgo.W8A16,
+                 tp_size=2,
+                 pp_size=2,
+                 extra_acc_spec="beam_width=4",
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=auto",
+                     "--pp_reduce_scatter=enable"
+                 ],
+                 extra_summarize_args=["--num_beams=4"],
+                 extra_acc_spec="pp_reduce_scatter")
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(45000)
+    @pytest.mark.parametrize(
+        "moe_tp_size", [1, 4, 8],
+        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
+    def test_ootb_except_mha_tp8(self, moe_tp_size):
+        self.run(quant_algo=QuantAlgo.W8A16,
+                 tp_size=8,
+                 extra_convert_args=[
+                     f"--moe_tp_size={moe_tp_size}",
+                     f"--moe_ep_size={8 // moe_tp_size}",
+                     f"--moe_renorm_mode={0}"
+                 ],
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=disable",
+                     "--moe_plugin=disable", f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=["--num_beams=4"],
+                 extra_acc_spec="ootb_except_mha")
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(45000)
+    @pytest.mark.parametrize(
+        "moe_tp_size", [1, 4, 8],
+        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
+    @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
+                             ids=['no_renormalize', 'renormalize'])
+    def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+        self.run(quant_algo=QuantAlgo.W8A16,
+                 tp_size=8,
+                 extra_convert_args=[
+                     f"--moe_tp_size={moe_tp_size}",
+                     f"--moe_ep_size={8 // moe_tp_size}",
+                     f"--moe_renorm_mode={moe_renorm_mode}"
+                 ],
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=auto",
+                     "--moe_plugin=auto", f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=["--num_beams=4"],
+                 extra_acc_spec="plugin")
+
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(40000)
@@ -849,6 +921,33 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("fp4_type", ["plugin", "ootb", "disable"],
+                             ids=["fp4_plugin", "fp4_ootb", "disable_fp4"])
+    def test_fp4(self, fp4_type):
+        build_args = ["--max_input_len=2048"]
+        if fp4_type != "disable":
+            build_args.extend([
+                "--gemm_plugin=disable"
+                if fp4_type == "ootb" else "--gemm_plugin=nvfp4"
+            ])
+        if fp4_type == "plugin":
+            build_args.extend([
+                "--use_paged_context_fmha=enable",
+                "--use_fp8_context_fmha=enable"
+            ])
+        if fp4_type != "disable":
+            self.run(tasks=[MMLU(self.MODEL_NAME)],
+                     quant_algo=QuantAlgo.NVFP4,
+                     kv_cache_quant_algo=QuantAlgo.FP8,
+                     extra_build_args=build_args,
+                     extra_acc_spec="fp4")
+        else:
+            self.run(tasks=[MMLU(self.MODEL_NAME)],
+                     extra_build_args=build_args,
+                     extra_acc_spec="fp4")
+
 
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x22B-v0.1"
@@ -866,6 +965,28 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  pp_size=2,
                  extra_convert_args=["--calib_size=32"],
                  extra_build_args=["--gemm_plugin=auto"])
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(45000)
+    @pytest.mark.parametrize(
+        "moe_tp_size", [1, 4, 8],
+        ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
+    @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
+                             ids=['no_renormalize', 'renormalize'])
+    def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+        self.run(quant_algo=QuantAlgo.W8A16,
+                 tp_size=8,
+                 extra_convert_args=[
+                     f"--moe_tp_size={moe_tp_size}",
+                     f"--moe_ep_size={8 // moe_tp_size}",
+                     f"--moe_renorm_mode={moe_renorm_mode}"
+                 ],
+                 extra_build_args=[
+                     "--max_beam_width=4", "--gemm_plugin=auto",
+                     "--moe_plugin=auto", f"--max_seq_len={8192}"
+                 ],
+                 extra_summarize_args=["--num_beams=4"],
+                 extra_acc_spec="plugin")
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

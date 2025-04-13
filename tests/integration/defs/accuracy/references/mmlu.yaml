@@ -45,6 +45,12 @@ mistralai/Mixtral-8x7B-v0.1:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 69.64
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: fp4
+    accuracy: 68.0
+mistralai/Mixtral-8x7B-Instruct-v0.1:
+  - accuracy: 68.0
 mistralai/Mixtral-8x22B-v0.1:
   - quant_algo: FP8
     accuracy: 70.0
