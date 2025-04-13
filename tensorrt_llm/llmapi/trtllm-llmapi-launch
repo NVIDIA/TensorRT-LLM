@@ -13,9 +13,9 @@ pid=$(ps -o pid= -p $$ | tr -d ' ')
 # Tell TRTLLM to spawn a additional process for the Proxy
 export TLLM_SPAWN_PROXY_PROCESS=1
 
-function mpi_size {
-    if [ -n "$SLURM_JOB_NUM_NODES" ]; then
-        echo "$SLURM_JOB_NUM_NODES"
+function mpi_world_size {
+    if [ -n "$SLURM_NTASKS" ]; then
+        echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
     else
@@ -63,9 +63,10 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
         $task_with_command
     ) &
 
-    log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_size) ..."
+    log_stderr "rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
+    log_stderr "rank0 host: $HOSTNAME"
     python3 -m tensorrt_llm.llmapi.mgmn_leader_node
 else
-    log_stderr "rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_size) ..."
+    log_stderr "rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     python3 -m tensorrt_llm.llmapi.mgmn_worker_node
 fi
