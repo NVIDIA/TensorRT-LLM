@@ -161,6 +161,9 @@ mistralai/Mixtral-8x7B-v0.1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.109
+mistralai/Mixtral-8x22B-v0.1:
+  - quant_algo: FP8
+    accuracy: 21.5
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16

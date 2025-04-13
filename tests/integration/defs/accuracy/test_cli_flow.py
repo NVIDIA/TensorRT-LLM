@@ -114,8 +114,7 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8_lm_head(self):
-        self.run(quant_algo=QuantAlgo.FP8,
-                 extra_convert_args=["--quantize_lm_head"])
+        self.run(quant_algo=QuantAlgo.FP8, t=["--quantize_lm_head"])
 
 
 class TestSantacoder(CliFlowAccuracyTestHarness):
@@ -849,6 +848,24 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
+
+
+class TestMixtral8x22B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mixtral-8x22B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x22B-v0.1"
+    EXAMPLE_FOLDER = "llama"
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8_tp2pp2(self):
+        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 tp_size=2,
+                 pp_size=2,
+                 extra_convert_args=["--calib_size=32"],
+                 extra_build_args=["--gemm_plugin=auto"])
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):
