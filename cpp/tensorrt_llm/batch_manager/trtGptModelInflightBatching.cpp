@@ -662,7 +662,7 @@ void TrtGptModelInflightBatching::createCustomAllReduceWorkspace()
     auto const& manager = mRuntime->getBufferManager();
     auto const hiddenSize = mModelConfig.getHiddenSize();
 
-    mAllReduceBuffers = std::make_shared<AllReduceBuffers>(getMaxBatchSize(), getMaxBeamWidth(), getMaxSequenceLen(),
+    mAllReduceBuffers = std::make_unique<AllReduceBuffers>(getMaxBatchSize(), getMaxBeamWidth(), getMaxSequenceLen(),
         hiddenSize, manager, mWorldConfig, mRuntime->isUserBufferEnabled());
 
     TensorMap inputBuffers;
@@ -1364,7 +1364,7 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     mBuffers.clear();
     for (SizeType32 i = 0; i < mNumBuffers; ++i)
     {
-        mBuffers.emplace_back(std::make_shared<RuntimeBuffers>(getMaxBatchSize(), mOperatingBeamWidth,
+        mBuffers.emplace_back(std::make_unique<RuntimeBuffers>(getMaxBatchSize(), mOperatingBeamWidth,
             getMaxAttentionWindowVec(), getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig,
             mWorldConfig, decodingConfig, getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs));
     }
@@ -1380,13 +1380,13 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     }
 
     mDecoderBuffers
-        = std::make_shared<DecoderBuffers>(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(),
+        = std::make_unique<DecoderBuffers>(getMaxNumSequences(), mOperatingBeamWidth, getMaxAttentionWindow(),
             mModelConfig.getMaxDecodingTokens(), mRuntime->getBufferManager(), mModelConfig, mWorldConfig);
 
     mSlotDecoderBuffers.clear();
     for (SizeType32 i = 0; i < getMaxNumSequences(); ++i)
     {
-        mSlotDecoderBuffers.emplace_back(std::make_shared<SlotDecoderBuffers>(
+        mSlotDecoderBuffers.emplace_back(std::make_unique<SlotDecoderBuffers>(
             mOperatingBeamWidth, getMaxSequenceLen(), mRuntime->getBufferManager()));
     }
 
