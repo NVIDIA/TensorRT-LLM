@@ -101,8 +101,6 @@ GenerateRequestOptions::operator()(tr::ModelConfig const& modelConfig, tr::World
             for (SizeType32 i = 0; i < vocabId; i++) {
                 vocabShift -= modelConfig.getVocabSizes()[i];
             }
-            TLLM_LOG_WARNING(">>>>>>>>slicing offset [%d, %d]; slicng size %d, input shape [%d %d], adding the vocab offset [%d]",
-                (int)vocabId, (int)inputOffset, (int)promptLen, (int)inputIdsFlatView->getShape().d[0], (int)inputIdsFlatView->getShape().d[1], (int)vocabShift);
             runtime::kernels::invokeAdd<TokenIdType>(
                 *inputView, vocabShift, bufferManager.getStream()); // restore original input ids
         }

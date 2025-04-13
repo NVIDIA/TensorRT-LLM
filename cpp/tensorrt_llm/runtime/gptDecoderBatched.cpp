@@ -87,7 +87,7 @@ void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, Tenso
 void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
     SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig)
+    WorldConfig const& worldConfig, SizeType32 vocabSize)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(maxBatchSize > 0);
@@ -111,8 +111,10 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     mDecoderStream = std::make_shared<CudaStream>();
     TLLM_CHECK(mDecoderStream->getDevice() == device);
 
-    auto const vocabSize = modelConfig.getVocabSize();
-    auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
+    if (vocabSize == 0) {
+        vocabSize = modelConfig.getVocabSize();
+    }
+    auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize(), vocabSize);
 
     mDecoder = IGptDecoder::create(mode, dtype, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
         maxSequenceLength, mDecoderStream, speculativeDecodingModulePtr);

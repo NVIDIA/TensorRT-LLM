@@ -1350,7 +1350,7 @@ void TrtGptModelInflightBatching::createDecoder(std::optional<executor::Decoding
                 getSinkTokenLen(), getMaxSequenceLen(),
                 mModelConfig.getMaxDecodingTokens(),
                 decoderType, mModelConfig,
-                mWorldConfig
+                mWorldConfig, mModelConfig.getVocabSizes()[i]
             );
             if (decodingMode.isExplicitDraftTokens())
             {
@@ -2216,7 +2216,6 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
                         auto const newTokenIdx = tc::flat_index(hostNewOutputTokensShape.d, step, seqSlot, beam);
                         auto const* const hostNewOutputTokensData = bufferCast<TokenIdType const>(*mDecoderBuffers[vid]->newOutputTokensHost);
                         auto const newToken = hostNewOutputTokensData[newTokenIdx];
-                        TLLM_LOG_WARNING(">>>>>>adding new token [%d] offset it by [%d]", (int)newToken, (int)vocabOffset);
                         llmReq->addNewToken(newToken + vocabOffset, beam);
                         TLLM_LOG_DEBUG("request ID %ld beam %d newToken %d", llmReq->mRequestId, beam, newToken);
 

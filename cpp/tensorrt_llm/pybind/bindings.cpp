@@ -305,7 +305,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("vocab_size"), py::arg("num_layers"), py::arg("num_attention_layers"), py::arg("num_rnn_layers"),
             py::arg("num_heads"), py::arg("hidden_size"), py::arg("data_type"), py::arg("vocab_sizes") = py::none())
         .def_property_readonly("vocab_size", &tr::ModelConfig::getVocabSize)
-        .def("vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"))
+        .def("vocab_size_padded", &tr::ModelConfig::getVocabSizePadded, py::arg("world_size"), py::arg("vocab_size") = 0)
         .def("num_layers", &tr::ModelConfig::getNbLayers, py::arg("pipeline_parallelism") = 1)
         .def("num_attention_layers", &tr::ModelConfig::getNbAttentionLayers, py::arg("pipeline_parallelism") = 1,
             py::arg("pipeline_parallelism_rank") = 0)

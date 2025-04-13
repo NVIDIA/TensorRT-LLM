@@ -170,9 +170,12 @@ public:
         return mVocabSizes ? *mVocabSizes : std::vector<SizeType32>{mVocabSize};
     }
 
-    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize) const noexcept
+    [[nodiscard]] SizeType32 constexpr getVocabSizePadded(SizeType32 worldSize, SizeType32 vocabSize = 0) const noexcept
     {
-        return (mVocabSize + worldSize - 1) / worldSize * worldSize;
+        if (vocabSize == 0) {
+            vocabSize = mVocabSize;
+        }
+        return (vocabSize + worldSize - 1) / worldSize * worldSize;
     }
 
     [[nodiscard]] SizeType32 countLocalLayers(

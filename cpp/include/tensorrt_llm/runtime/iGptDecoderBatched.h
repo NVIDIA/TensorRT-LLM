@@ -115,7 +115,7 @@ public:
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
         SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig)
+        WorldConfig const& worldConfig, SizeType32 vocab_size = 0)
         = 0;
 
     //! @brief Disable Lookahead decoding.
