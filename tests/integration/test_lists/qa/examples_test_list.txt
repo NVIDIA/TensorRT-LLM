@@ -161,7 +161,6 @@ examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_a
 examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-inference]
-examples/test_mixtral.py::test_llm_mixtral_fp8_4gpus_summary[Mixtral-8x22B-v0.1-nb:1]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
 examples/test_mixtral.py::test_llm_mixtral_pp_reduce_scatter_4gpus[Mixtral-8x7B-v0.1]
@@ -396,6 +395,7 @@ accuracy/test_cli_flow.py::TestMistral_7B::test_smooth_quant_tp4pp1
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
+accuracy/test_cli_flow.py::TestMixtral8x22B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int8]
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int4]
