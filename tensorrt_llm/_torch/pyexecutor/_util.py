@@ -41,6 +41,7 @@ GB = 1 << 30
 def get_cache_size_per_token(model_config, mapping):
     mem_per_token = 2
     quant_config = model_config.quant_config
+    quant_config = model_config.quant_config
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         mem_per_token = 1
 
@@ -178,7 +179,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     kv_stats = py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").get_kv_cache_stats()
 
-    draft_model_config = draft_model_engine.model.model if draft_model_engine is not None else None
+    draft_model_config = draft_model_engine.model.model_config if draft_model_engine is not None else None
     kv_cache_max_tokens = cal_max_tokens(
         peak_memory, total_gpu_memory, fraction,
         model_engine.model.model_config, draft_model_config, mapping,
