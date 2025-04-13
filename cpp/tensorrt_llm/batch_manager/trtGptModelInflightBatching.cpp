@@ -332,14 +332,14 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
             [this]() { TLLM_CUDA_CHECK(cudaSetDevice(mWorldConfig.getDevice())); });
 
         auto const& commSession = COMM_SESSION;
-        mMpiCommPipelinePara = std::make_shared<tensorrt_llm::mpi::MpiComm>(
+        mMpiCommPipelinePara = std::make_unique<tensorrt_llm::mpi::MpiComm>(
             commSession.split(mWorldConfig.getTensorParallelRank(), mWorldConfig.getPipelineParallelRank()));
         mDecSlotAsyncSndHdls.reserve(getMaxBatchSize());
     }
     if (mWorldConfig.isTensorParallel())
     {
         auto const& commSession = COMM_SESSION;
-        mMpiCommTensorPara = std::make_shared<tensorrt_llm::mpi::MpiComm>(
+        mMpiCommTensorPara = std::make_unique<tensorrt_llm::mpi::MpiComm>(
             commSession.split(mWorldConfig.getPipelineParallelRank(), mWorldConfig.getTensorParallelRank()));
     }
 
@@ -1852,20 +1852,20 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
 
             auto const peerSend = 0;
             mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
-                outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, mMpiCommPipelinePara, peerSend));
+                outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, *mMpiCommPipelinePara, peerSend));
         }
     }
     else
     {
         auto const peerRecv = mWorldConfig.getPipelineParallelRank() == 0 ? mWorldConfig.getPipelineParallelism() - 1
                                                                           : mWorldConfig.getPipelineParallelRank() - 1;
-        DecoderSlotAsyncSend::recv(*mSlotDecoderBuffers[seqSlot], returnLogProbs, mMpiCommPipelinePara, peerRecv);
+        DecoderSlotAsyncSend::recv(*mSlotDecoderBuffers[seqSlot], returnLogProbs, *mMpiCommPipelinePara, peerRecv);
 
         auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
         if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
         {
             mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
-                *mSlotDecoderBuffers[seqSlot], returnLogProbs, mMpiCommPipelinePara, peerSend));
+                *mSlotDecoderBuffers[seqSlot], returnLogProbs, *mMpiCommPipelinePara, peerSend));
         }
     }
     sync_check_cuda_error(mRuntime->getStream().get());
@@ -2081,7 +2081,7 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
         if (broadcastPostDecoder())
         {
             DecoderStepAsyncSend::bcast(decoderOutputBuffers, *mDecoderBuffers, returnLogProbs, mOperatingBeamWidth,
-                mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), mMpiCommTensorPara, 0);
+                mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommTensorPara, 0);
         }
 
         if (mWorldConfig.isPipelineParallel())
@@ -2089,7 +2089,7 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
             auto const peerSend = 0;
             asyncHandles.emplace_back(std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, *mDecoderBuffers,
                 returnLogProbs, mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(),
-                mMpiCommPipelinePara, peerSend));
+                *mMpiCommPipelinePara, peerSend));
         }
     }
     else
@@ -2097,13 +2097,13 @@ std::vector<std::unique_ptr<DecoderStepAsyncSend>> TrtGptModelInflightBatching::
         auto const peerRecv = mWorldConfig.isFirstPipelineParallelRank() ? mWorldConfig.getPipelineParallelism() - 1
                                                                          : mWorldConfig.getPipelineParallelRank() - 1;
         DecoderStepAsyncSend::recv(decoderOutputBuffers, *mDecoderBuffers, returnLogProbs, mOperatingBeamWidth,
-            mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), mMpiCommPipelinePara, peerRecv);
+            mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(), *mMpiCommPipelinePara, peerRecv);
         auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
         if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
         {
             asyncHandles.emplace_back(std::make_unique<DecoderStepAsyncSend>(decoderOutputBuffers, *mDecoderBuffers,
                 returnLogProbs, mOperatingBeamWidth, mModelConfig.getSpeculativeDecodingMode().needsKVCacheRewind(),
-                mMpiCommPipelinePara, peerSend));
+                *mMpiCommPipelinePara, peerSend));
         }
     }
     TLLM_CHECK_WITH_INFO(asyncHandles.size() <= 2, "Up to two decoder step async handles expected");

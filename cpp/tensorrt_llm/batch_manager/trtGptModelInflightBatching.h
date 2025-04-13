@@ -474,13 +474,13 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::GuidedDecoder> mGuidedDecoder;
 
     /******************** Pipeline parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> mDecStepAsyncSndHdls;
     std::vector<std::unique_ptr<DecoderSlotAsyncSend>> mDecSlotAsyncSndHdls;
     std::unique_ptr<tensorrt_llm::mpi::MpiWaitThread> mAsyncSendWaitThread;
 
     /******************** Tensor parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
     std::shared_ptr<runtime::AllReduceBuffers> mAllReduceBuffers;
 
     /******************** Runtime parameters ********************/
