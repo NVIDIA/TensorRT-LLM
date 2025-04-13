@@ -10,7 +10,7 @@ from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf)
-from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
+from .linear import TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -270,15 +270,10 @@ class FusedMoE(nn.Module):
         self.use_dp = model_config.mapping.enable_attention_dp
 
         # All ranks participate in allreduce regardless of EP/TP combination
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
-        self.parallel_size = self.parallel_config.tensor_parallel_size
+        self.mapping = model_config.mapping
+        self.parallel_size = self.mapping.tp_size
 
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.all_reduce = AllReduce(self.mapping)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
@@ -510,7 +505,7 @@ class FusedMoE(nn.Module):
 
         flatten_outputs = allgather(
             torch.cat(flatten_inputs),
-            self.parallel_config,
+            self.mapping,
             gather_dim=0,
         ).view(self.parallel_size, -1)
 
@@ -532,9 +527,7 @@ class FusedMoE(nn.Module):
         outputs = inputs
         if self.parallel_size > 1:
             if self.use_dp:
-                outputs = reducescatter(inputs,
-                                        self.parallel_config,
-                                        scatter_dim=0)
+                outputs = reducescatter(inputs, self.mapping, scatter_dim=0)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
@@ -595,7 +588,7 @@ class FusedMoE(nn.Module):
         ):
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
-            x = allgather(x, self.parallel_config, gather_dim=0)
+            x = allgather(x, self.mapping, gather_dim=0)
             token_selected_experts = token_selected_experts.flatten(
                 0, 1).contiguous()
             token_final_scales = token_final_scales.flatten(0, 1).contiguous()
@@ -624,11 +617,16 @@ class FusedMoE(nn.Module):
         if min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
+        else:
+            # Custom op requires all inputs are in the same type.
+            # Only in min_latency_mode, the output is a list of tensors.
+            # Otherwise, the output should be unpacked as a single tensor.
+            final_hidden_states = final_hidden_states[0]
 
         if self.reduce_results and self.parallel_size > 1:
             return self.all_reduce(final_hidden_states)
         else:
-            return final_hidden_states[0]
+            return final_hidden_states
 
     def forward(
         self,
@@ -696,7 +694,7 @@ class FusedMoE(nn.Module):
             self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
         if self.use_dp:
-            rank = self.parallel_config.tensor_parallel_rank
+            rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
 
@@ -812,9 +810,18 @@ class FusedMoE(nn.Module):
                                            dtype=torch.float32)
         tmp_fc2_input_scale = torch.empty(self.num_experts, dtype=torch.float32)
         for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights[f"gate_up_proj_input_scale"]
+                w3_input_scale = weights[f"gate_up_proj_input_scale"]
+                w2_input_scale = weights[f"down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             load_expert_fc31_input_scale_fp8_qdq(
                 w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
@@ -878,9 +885,18 @@ class FusedMoE(nn.Module):
             dst_w2_weight_scale.copy_(w2_weight_scale[...].reshape([]))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-            w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-            w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w3_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w2_weight_scale = weights[f"down_proj_weight_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             expert_idx = expert_id - self.expert_start
 

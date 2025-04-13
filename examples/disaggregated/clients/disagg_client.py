@@ -63,6 +63,61 @@ async def send_request(session, server_host, server_port, model, prompt,
             return text
 
 
+async def send_chat_request(session, server_host, server_port, model, prompt,
+                            max_tokens, temperature, streaming):
+    url = f"http://{server_host}:{server_port}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "model":
+        model,
+        "messages": [{
+            "role": "system",
+            "content": "You are a helpfule assistant."
+        }, {
+            "role": "user",
+            "content": prompt
+        }],
+        "max_tokens":
+        max_tokens,
+        "temperature":
+        temperature
+    }
+    if streaming:
+        data["stream"] = True
+
+    async with session.post(url, headers=headers, json=data) as response:
+        if response.status != 200:
+            raise Exception(f"Error: {await response.text()}")
+
+        if streaming:
+            text = ""
+            iter = 0
+            async for line in response.content:
+                if line:
+                    line = line.decode('utf-8').strip()
+                    if line == "data: [DONE]":
+                        break
+                    if line.startswith("data: "):
+                        line = line[len("data: "):]
+                        response_json = json.loads(line)
+                        if iter == 0:
+                            text += response_json["choices"][0]["message"][
+                                "content"]
+                        else:
+                            if "content" in response_json["choices"][0][
+                                    "delta"]:
+                                text += response_json["choices"][0]["delta"][
+                                    "content"]
+                        iter += 1
+            logging.info(text)
+            return text
+        else:
+            response_json = await response.json()
+            text = response_json["choices"][0]["message"]["content"]
+            logging.info(text)
+            return text
+
+
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c",
@@ -85,6 +140,11 @@ async def main():
                         type=int,
                         help="Time to wait for server to start",
                         default=None)
+    parser.add_argument("-e",
+                        "--endpoint",
+                        type=str,
+                        help="Endpoint to use",
+                        default="completions")
     parser.add_argument("-o",
                         "--output-file",
                         type=str,
@@ -111,11 +171,18 @@ async def main():
             await wait_for_server(session, server_host, server_port,
                                   args.server_start_timeout)
 
-        tasks = [
-            send_request(session, server_host, server_port, model, prompt,
-                         args.max_tokens, args.temperature, args.streaming)
-            for prompt in prompts
-        ]
+        if args.endpoint == "completions":
+            tasks = [
+                send_request(session, server_host, server_port, model, prompt,
+                             args.max_tokens, args.temperature, args.streaming)
+                for prompt in prompts
+            ]
+        elif args.endpoint == "chat":
+            tasks = [
+                send_chat_request(session, server_host, server_port, model,
+                                  prompt, args.max_tokens, args.temperature,
+                                  args.streaming) for prompt in prompts
+            ]
 
         responses = await asyncio.gather(*tasks)
 

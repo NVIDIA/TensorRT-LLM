@@ -62,7 +62,7 @@ private:
     CudaEvent mForwardEvent;
     TensorPtr mFinishedSum;
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsDecoder; // [maxBatchSize], int32_t, address map, pinned
 };
 
 } // namespace tensorrt_llm::runtime

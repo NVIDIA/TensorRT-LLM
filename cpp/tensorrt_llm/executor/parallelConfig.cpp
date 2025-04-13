@@ -26,12 +26,13 @@ namespace tensorrt_llm::executor
 {
 ParallelConfig::ParallelConfig(CommunicationType commType, CommunicationMode commMode,
     std::optional<std::vector<SizeType32>> deviceIds, std::optional<std::vector<SizeType32>> participantIds,
-    std::optional<OrchestratorConfig> const& orchestratorConfig)
+    std::optional<OrchestratorConfig> const& orchestratorConfig, std::optional<SizeType32> numNodes)
     : mCommType(commType)
     , mCommMode(commMode)
     , mDeviceIds(std::move(deviceIds))
     , mParticipantIds(std::move(participantIds))
     , mOrchestratorConfig(orchestratorConfig)
+    , mNumNodes(numNodes)
 {
     if (mDeviceIds)
     {
@@ -64,6 +65,11 @@ std::optional<OrchestratorConfig> ParallelConfig::getOrchestratorConfig() const
     return mOrchestratorConfig;
 }
 
+std::optional<SizeType32> ParallelConfig::getNumNodes() const
+{
+    return mNumNodes;
+}
+
 void ParallelConfig::setCommunicationType(CommunicationType type)
 {
     mCommType = type;
@@ -88,6 +94,11 @@ void ParallelConfig::setParticipantIds(std::vector<SizeType32> const& participan
 void ParallelConfig::setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig)
 {
     mOrchestratorConfig = orchestratorConfig;
+}
+
+void ParallelConfig::setNumNodes(SizeType32 numNodes)
+{
+    mNumNodes = numNodes;
 }
 
 } // namespace tensorrt_llm::executor
