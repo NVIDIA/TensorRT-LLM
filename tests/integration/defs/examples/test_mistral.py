@@ -32,7 +32,7 @@ from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
                                 EVALTOOL_WIKILINGUA_RESULT_FILE)
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import BuildConfig, CalibConfig, QuantAlgo, QuantConfig
+from tensorrt_llm.llmapi import BuildConfig, QuantAlgo, QuantConfig
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -301,61 +301,6 @@ def test_llm_mistral_v1_1gpu(run_type, data_type, llama_example_root,
         venv_check_call(llm_venv, summary_cmd, env=env)
 
 
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
-                         indirect=True)
-def test_llm_mistral_v1_smooth_quant_4gpus(llama_example_root,
-                                           llm_mistral_model_root,
-                                           llm_datasets_root, llm_rouge_root,
-                                           llm_venv, cmodel_dir, engine_dir):
-    "Run smooth quant test on 4 gpus"
-    data_type = "float16"
-    # --per_token & --per_channel are mandatory
-    model_dir = convert_weights(
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        cmodel_dir=cmodel_dir,
-        model="mistral-sq",
-        model_path=llm_mistral_model_root,
-        tp_size=4,
-        pp_size=1,
-        smoothquant=0.5,
-        per_channel=True,
-        per_token=True,
-        data_type=data_type,
-        calib_dataset=f"{llm_datasets_root}/ccdv/cnn_dailymail")
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        "--max_input_len=1024",
-        "--max_batch_size=1",
-        "--context_fmha=enable",
-        "--max_beam_width=4",
-        "--workers=4",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run summarize...")
-    summary_cmd = generate_summary_cmd(llama_example_root,
-                                       hf_model_dir=llm_mistral_model_root,
-                                       data_type="fp16",
-                                       num_beams=4,
-                                       engine_dir=engine_dir,
-                                       tensorrt_llm_rouge1_threshold=23,
-                                       dataset_dir=llm_datasets_root,
-                                       rouge_dir=llm_rouge_root)
-
-    venv_mpi_check_call(llm_venv, ["mpirun", "-n", "4", "--allow-run-as-root"],
-                        summary_cmd)
-
-
-@skip_pre_ada
 @pytest.mark.parametrize("run_type", ['inference', 'summarization'])
 @pytest.mark.parametrize("mistral_nemo_model_root", ['Mistral-Nemo-12b-Base'],
                          indirect=True)
@@ -479,68 +424,6 @@ def test_llm_mistral_nemo_minitron_fp8_quantization(
         llama_example_root,
         hf_model_dir=mistral_nemo_minitron_model_root,
         data_type=data_type,
-        num_beams=num_beams,
-        tensorrt_llm_rouge1_threshold=tensorrt_llm_rouge1_threshold,
-        engine_dir=engine_dir,
-        dataset_dir=llm_datasets_root,
-        rouge_dir=llm_rouge_root)
-
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        summary_cmd)
-
-
-@skip_pre_ada
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("num_beams", [1, 4],
-                         ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("qformat", ['fp8'])
-@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
-                         indirect=True)
-def test_llm_mistral_quantization_8gpus_summary(
-        llama_example_root, llm_mistral_model_root, llm_datasets_root,
-        llm_rouge_root, llm_venv, engine_dir, num_beams, qcache_dir, qformat):
-    "run mixtral fp8 on 2gpus"
-    data_type = "float16"
-    tp_size, pp_size = 4, 2
-    world_size = tp_size * pp_size
-
-    print("Quantizing engine...")
-    # Quantize HF llama checkpoint into FP8 format
-    model_dir = quantize_data(
-        llm_venv,
-        llama_example_root,
-        model_dir=llm_mistral_model_root,
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        dtype=data_type,
-        qformat=qformat,
-        quantize_dir=qcache_dir,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        calib_size=32)
-
-    print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--gpt_attention_plugin={data_type}",
-        f"--gemm_plugin={data_type}",
-        f"--moe_plugin={data_type}",
-        f"--max_beam_width={num_beams}",
-        "--context_fmha=enable",
-        f"--workers={world_size}",
-    ]
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run summarize...")
-    tensorrt_llm_rouge1_threshold = 22.0
-
-    summary_cmd = generate_summary_cmd(
-        llama_example_root,
-        hf_model_dir=llm_mistral_model_root,
-        data_type="fp16",
         num_beams=num_beams,
         tensorrt_llm_rouge1_threshold=tensorrt_llm_rouge1_threshold,
         engine_dir=engine_dir,
@@ -750,43 +633,21 @@ def test_mistral_nemo_minitron_fp8_with_bf16_lora(
 @skip_pre_ada
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("quant", ['int4', 'int4_awq', 'int8_awq'])
 @pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.3'],
                          indirect=True)
-def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
-                                               llm_mistral_model_root,
-                                               llm_datasets_root, llm_venv,
-                                               engine_dir, quant,
-                                               mmlu_dataset_root):
-    "run mixtral weight only int4/int8 on 4gpus"
+def test_llm_mistral_int4_4gpus_llmapi(llm_mistral_model_root, engine_dir):
 
-    tp_size = 4
-
-    if quant == 'int4':
-        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
-    elif quant == 'int4_awq':
-        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
-    elif quant == 'int8_awq':
-        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
-
-    calib_config = CalibConfig(
-        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
-        calib_batches=512,
-        calib_max_seq_length=2048)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
 
     build_config = BuildConfig()
     build_config.max_batch_size = 1
     build_config.max_input_len = 1900
-    build_config.plugin_config.context_fmha = True
     build_config.plugin_config.paged_kv_cache = True
-    build_config.plugin_config._use_paged_context_fmha = True
 
     llm = LLM(model=llm_mistral_model_root,
-              auto_parallel_world_size=tp_size,
-              tensor_parallel_size=tp_size,
+              tensor_parallel_size=4,
               build_config=build_config,
-              quant_config=quant_config,
-              calib_config=calib_config)
+              quant_config=quant_config)
 
     llm.save(engine_dir)
 
@@ -801,18 +662,9 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
         print(
             f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}"
         )
-        # Assert that output contains "Assistant" or "AI agent"
         generated_text = output.outputs[0].text.strip()
         assert ("Assistant" in generated_text) or (
             "AI agent" in generated_text
         ), "Generated text should start with either 'Assistant' or 'AI agent'"
 
-    threshold = 55 if 'int4' in quant else 60
-
-    mmlu_cmd = [
-        "trtllm-eval", f"--model={engine_dir}",
-        f"--tokenizer={llm_mistral_model_root}", f"--tp_size={tp_size}",
-        "--backend=tensorrt", "mmlu", f"--dataset_path={mmlu_dataset_root}",
-        "--check_accuracy", f"--accuracy_threshold={threshold}"
-    ]
-    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+    del llm

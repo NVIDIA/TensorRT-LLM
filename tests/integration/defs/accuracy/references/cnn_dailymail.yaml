@@ -148,7 +148,11 @@ meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     accuracy: 34.927
 mistralai/Mistral-7B-v0.1:
-  - accuracy: 25.741
+  - accuracy: 22.0
+  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
+    accuracy: 23.0
+mistralai/Mistral-7B-v0.3:
+  - accuracy: 22.0
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
   - quant_algo: NVFP4

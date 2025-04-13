@@ -156,13 +156,8 @@ examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v
 examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs1]
 examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
 examples/test_mistral.py::test_llm_mistral_lora_1gpu[komt-mistral-7b-v1-lora-komt-mistral-7b-v1]
-examples/test_mistral.py::test_llm_mistral_quantization_8gpus_summary[mistral-7b-v0.1-fp8-nb:4]
-examples/test_mistral.py::test_llm_mistral_quantization_4gpus_llmapi[mistral-7b-v0.3-int4]
-examples/test_mistral.py::test_llm_mistral_quantization_4gpus_llmapi[mistral-7b-v0.3-int4_awq]
-examples/test_mistral.py::test_llm_mistral_quantization_4gpus_llmapi[mistral-7b-v0.3-int8_awq]
-examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization]
+examples/test_mistral.py::test_llm_mistral_int4_4gpus_llmapi[mistral-7b-v0.3]
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long]
-examples/test_mistral.py::test_llm_mistral_v1_smooth_quant_4gpus[mistral-7b-v0.1]
 examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-inference]
@@ -395,6 +390,9 @@ accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_rowwise
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_weight_streaming[1.0]
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
+accuracy/test_cli_flow.py::TestMistral_7B::test_beam_search
+accuracy/test_cli_flow.py::TestMistral_7B::test_fp8_tp4pp2
+accuracy/test_cli_flow.py::TestMistral_7B::test_smooth_quant_tp4pp1
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
@@ -418,6 +416,9 @@ accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_0_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
+accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4]
+accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4_awq]
+accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int8_awq]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4

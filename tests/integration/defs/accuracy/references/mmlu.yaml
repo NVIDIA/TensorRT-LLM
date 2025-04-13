@@ -37,6 +37,10 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
 mistralai/Mistral-7B-v0.1:
   - accuracy: 66
+mistralai/Mistral-7B-v0.3:
+  - accuracy: 60.0
+  - quant_algo: W4A16;W4A16_AWQ
+    accuracy: 55.0
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 71.35
   - quant_algo: FP8
