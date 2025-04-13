@@ -32,7 +32,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 class RuntimeBuffers;
-class DecoderBuffers;
+class DraftBuffers;
 class MedusaBuffers;
 
 namespace tr = tensorrt_llm::runtime;
@@ -49,8 +49,9 @@ public:
 
     tr::SizeType32 operator()(RequestVector const& contextRequests,
         std::vector<tr::SizeType32> const& numContextLogitsVec, tr::ITensor::SharedPtr const& logits,
-        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-        tensorrt_llm::runtime::CudaStream const& stream, OptionalRef<MedusaBuffers> medusaBuffers) const;
+        std::vector<tr::ITensor::SharedPtr>& seqSlotLogits, tr::ModelConfig const& modelConfig,
+        tr::BufferManager const& manager, tensorrt_llm::runtime::CudaStream const& stream,
+        OptionalRef<DraftBuffers> draftBuffers, OptionalRef<MedusaBuffers> medusaBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager
