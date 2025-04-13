@@ -530,7 +530,8 @@ class TRTLLMSampler(Sampler):
                            buffer_manager, self.model_config,
                            self.world_config),
             "decoder_input_buffers":
-            DecoderInputBuffers(self.executor_config.max_batch_size,
+            DecoderInputBuffers(self.max_num_sequences,
+                                self.executor_config.max_batch_size,
                                 self.MAX_DECODING_TOKENS, buffer_manager),
             "new_tokens_device_tensor":
             torch.empty((
@@ -615,12 +616,14 @@ class TRTLLMSampler(Sampler):
                 batch_index] = request.context_chunk_size if request.py_return_context_logits else 1
 
         logits_index = self.algs.handle_context_logits(
-            scheduled_requests.context_requests, num_context_logits,
-            model_outputs["logits"], self.store["decoder_buffers"])
+            self.store["decoder_input_buffers"],
+            scheduled_requests.context_requests, model_outputs["logits"],
+            num_context_logits)
 
         self.algs.handle_generation_logits(
-            logits_index, scheduled_requests.generation_requests,
-            self.store["decoder_buffers"], model_outputs["logits"])
+            self.store["decoder_input_buffers"],
+            scheduled_requests.generation_requests, model_outputs["logits"],
+            logits_index)
 
         decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
             scheduled_requests.context_requests,
