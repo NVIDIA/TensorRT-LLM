@@ -232,12 +232,9 @@ public:
 
     GenerationLogitsCache generationLogitsCache;
 
-    //! Helper for KV cache rewind
+    //! Mapping from batch idx to slot id
     TensorPtr seqSlots;
     TensorPtr seqSlotsDevice;
-    //! For KV cache rewind
-    TensorPtr seqSlotRemappingHost;   // [numSequences]
-    TensorPtr seqSlotRemappingDevice; // [numSequences]
 
     //! Explicitly device-copy src offsets to reduce warp stalls in copy batch kernel invocation
     //! [mMaxNumRequests], on gpu

@@ -104,9 +104,6 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         logits = manager.emptyTensor(MemoryType::kGPU, logitsType);
     }
 
-    seqSlotRemappingHost = manager.emptyTensor(MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
-    seqSlotRemappingDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
-
     // TODO: check which tensors can be allocated as pinned for max size
     requestTypes = manager.emptyTensor(MemoryType::kCPU, TRTDataType<runtime::RequestType>::value);
 
@@ -382,8 +379,6 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     auto const numRequestsShape = ITensor::makeShape({numRequests});
     seqSlots->reshape(numRequestsShape);
     seqSlotsDevice->reshape(numRequestsShape);
-    seqSlotRemappingHost->reshape(numRequestsShape);
-    seqSlotRemappingDevice->reshape(numRequestsShape);
 
     auto const numTokens = getNumTokens();
     inputsIds->reshape(ITensor::makeShape({numTokens}));
@@ -737,13 +732,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
             std::fill_n(contextLengthsHostPtr + numSequences, reqBeamWidth, contextQLength);
             std::fill_n(sequenceLengthsHostPtr + numSequences, reqBeamWidth, sequenceLen);
             numSequences += reqBeamWidth;
-        }
-        if (modelConfig.getSpeculativeDecodingMode().needsKVCacheRewind())
-        {
-            auto remappingSeqSlotIndices = BufferRange<SizeType32>(*seqSlotRemappingHost);
-
-            std::iota(remappingSeqSlotIndices.begin(), remappingSeqSlotIndices.end(), 0);
-            manager.copy(*seqSlotRemappingHost, *seqSlotRemappingDevice);
         }
         if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
         {
