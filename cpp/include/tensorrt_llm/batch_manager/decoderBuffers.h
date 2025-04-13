@@ -110,7 +110,6 @@ public:
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
-    TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
