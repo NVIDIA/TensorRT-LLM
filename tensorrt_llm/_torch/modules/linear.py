@@ -10,9 +10,9 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..utils import Fp4QuantizedTensor
 
 E2M1_MAX = 6.0
@@ -31,6 +31,15 @@ class WeightMode(str, enum.Enum):
 class WeightsLoadingConfig:
     weight_mode: WeightMode = WeightMode.VANILLA
     ignore_tensor_parallel: bool = False
+
+
+class TensorParallelMode(str, enum.Enum):
+    COLUMN = 'column'
+    ROW = 'row'
+
+    @classmethod
+    def split_dim(cls, mode):
+        return 1 if mode == cls.ROW else 0
 
 
 def load_weight_shard(
@@ -135,7 +144,9 @@ class Linear(nn.Module):
         out_features: int,
         bias: bool = True,
         dtype: torch.dtype = None,
-        parallel_config: Optional[ParallelConfig] = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,
         quant_config: Optional[QuantConfig] = None,
         weights_loading_config: Optional[WeightsLoadingConfig] = None,
         is_expert: bool = False,
@@ -147,38 +158,37 @@ class Linear(nn.Module):
         super().__init__()
         self.has_bias = bias
         self.dtype = dtype
-        self.parallel_config = parallel_config or ParallelConfig()
+        self.mapping = mapping or Mapping()
         # could be modified later
         self.quant_config = quant_config
         self.weights_loading_config = weights_loading_config or WeightsLoadingConfig(
         )
-        self.tp_size = self.parallel_config.tensor_parallel_size
-        self.tp_rank = self.parallel_config.tensor_parallel_rank
-        self.tp_mode = self.parallel_config.tensor_parallel_mode
+        self.tp_size = self.mapping.tp_size
+        self.tp_rank = self.mapping.tp_rank
+        self.tp_mode = tensor_parallel_mode
+        self.gather_output = gather_output
 
         local_in_features = in_features
         local_out_features = out_features
 
-        if self.parallel_config.tensor_parallel_mode == TensorParallelMode.ROW:
+        if self.tp_mode == TensorParallelMode.ROW:
             assert in_features % self.tp_size == 0, (
                 f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
             )
             local_in_features = in_features // self.tp_size
-        elif self.parallel_config.tensor_parallel_mode == TensorParallelMode.COLUMN:
+        elif self.tp_mode == TensorParallelMode.COLUMN:
             assert out_features % self.tp_size == 0, (
                 f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
             )
             local_out_features = out_features // self.tp_size
         else:
-            assert self.parallel_config.tensor_parallel_mode is None, (
-                'unsupported tensor parallel mode: {self.parallel_config.tensor_parallel_mode}'
-            )
+            assert self.tp_mode is None, (
+                'unsupported tensor parallel mode: {self.tp_mode}')
 
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(
-            self.parallel_config) if not is_expert else None
+        self.all_reduce = AllReduce(self.mapping) if not is_expert else None
         self._weights_created = False
         self.is_expert = is_expert
         self.use_custom_cublas_mm = use_custom_cublas_mm
@@ -385,8 +395,8 @@ class Linear(nn.Module):
                 output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
             output = self.apply_linear(input, self.weight, self.bias)
-            if self.parallel_config.gather_output:
-                output = allgather(output, self.parallel_config)
+            if self.gather_output:
+                output = allgather(output, self.mapping)
         else:
             output = self.apply_linear(input, self.weight, self.bias)
 

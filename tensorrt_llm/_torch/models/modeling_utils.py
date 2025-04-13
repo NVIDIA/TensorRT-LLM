@@ -11,14 +11,15 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm.mapping import Mapping
+
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
-from ..modules.linear import Linear, WeightMode
+from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_procesor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
@@ -112,6 +113,13 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
                             -1)[:, None, :, :].expand(num_kv_heads, reps,
                                                       head_dim, weight.shape[1])
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
+
+
+def unpack_hidden_states(hidden_states):
+    if isinstance(hidden_states, (tuple, list)):
+        return hidden_states
+    else:
+        return hidden_states, None
 
 
 def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
@@ -281,12 +289,19 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # local forward pass
+        local_decoder_layers = ([
+            self.layers[layer_id] for layer_id in self.pp_layer_list
+        ] if self.pp_size > 1 else self.layers)
+
         # unpack pp_interface or embedding lookup for the input
         if self.pp_rank != 0:
             if pipeline_interface is None:
                 raise ValueError(
                     "pipeline_interface is required for non-first pp rank.")
             hidden_states, residual = pipeline_interface  # unpack pp_interface
+            hidden_states, residual = local_decoder_layers[0].input_layernorm(
+                hidden_states, residual)
         else:
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
@@ -297,11 +312,6 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 inputs_embeds = self.embed_tokens(input_ids)
             hidden_states = inputs_embeds
             residual = None
-
-        # local forward pass
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
 
         for decoder_layer in local_decoder_layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
@@ -314,8 +324,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             return PipelineInterface(hidden_states,
                                      residual)  # pack pp_interface
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        else:
+            return hidden_states
 
 
 class PostInitCaller(type):
@@ -356,14 +366,13 @@ class DecoderModelForCausalLM(nn.Module,
                     vocab_size,
                     hidden_size,
                     dtype=config.pretrained_config.torch_dtype,
-                    parallel_config=ParallelConfig(
-                        tensor_parallel_rank=0,
-                        tensor_parallel_size=1,
-                        tensor_parallel_mode=None,
-                        gather_output=False,
-                        pipeline_parallel_size=config.mapping.pp_size,
-                        parallel_rank=config.mapping.rank,
+                    mapping=Mapping(
+                        world_size=1,
+                        tp_size=1,
+                        rank=0,
                     ),
+                    tensor_parallel_mode=None,
+                    gather_output=False,
                 )
             else:
                 # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
@@ -372,15 +381,9 @@ class DecoderModelForCausalLM(nn.Module,
                     vocab_size,
                     hidden_size,
                     dtype=config.pretrained_config.torch_dtype,
-                    parallel_config=ParallelConfig(
-                        tensor_parallel_size=config.mapping.tp_size,
-                        tensor_parallel_rank=config.mapping.tp_rank,
-                        tensor_parallel_mode=TensorParallelMode.COLUMN,
-                        gather_output=True,
-                        gpus_per_node=config.mapping.gpus_per_node,
-                        pipeline_parallel_size=config.mapping.pp_size,
-                        parallel_rank=config.mapping.rank,
-                    ),
+                    mapping=config.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
                 )
 
             # use embedding weights in lm_head if tie word embedding is enabled

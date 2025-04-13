@@ -31,6 +31,11 @@ class DecoderBuffers;
 class RuntimeBuffers;
 } // namespace tensorrt_llm::batch_manager
 
+namespace tensorrt_llm::runtime::decoder
+{
+class DecoderState;
+} // namespace tensorrt_llm::runtime::decoder
+
 namespace tensorrt_llm::batch_manager
 {
 class MakeDecodingBatchInputOutput : Algorithm
@@ -49,9 +54,14 @@ public:
     std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
     operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
         DecoderBuffers& decoderBuffers, DecoderInputBuffers const& inputBuffers,
-        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences, SizeType32 beamWidth,
-        runtime::BufferManager const& manager, runtime::CudaStream const& stream,
-        OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+        runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
+        SizeType32 maxNumSequences, SizeType32 beamWidth, runtime::BufferManager const& manager,
+        runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+
+    [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
+        std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
+        std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
+        TensorPtr const& cacheIndirectionInput);
 };
 
 } // namespace tensorrt_llm::batch_manager
