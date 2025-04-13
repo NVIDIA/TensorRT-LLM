@@ -74,8 +74,9 @@ void setupMedusaLogits(std::vector<TensorPtr>& medusaLogitsHeads, TensorPtr cons
 } // namespace
 
 void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector const& generationRequests,
-    DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, BufferManager const& manager,
-    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers) const
+    std::vector<TensorPtr>& seqSlotLogits, tr::ModelConfig const& modelConfig, BufferManager const& manager,
+    TensorPtr const& logits, OptionalRef<RuntimeBuffers> genRuntimeBuffers,
+    OptionalRef<DraftBuffers> draftBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(HandleGenerationLogits);
@@ -99,7 +100,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         TensorPtr logitsView = ITensor::slice(logits, logitsIndex, numLogits);
         TLLM_CHECK_DEBUG_WITH_INFO(tru::tensorHasInvalid<float>(*logitsView, manager, "logits") == false,
             "Found invalid number (NaN or Inf) in logits");
-        auto& decoderLogits = decoderBuffers.logits.at(seqSlot);
+        auto& decoderLogits = seqSlotLogits.at(seqSlot);
         auto const logitsViewShape = logitsView->getShape();
         if (reqBeamWidth > 1)
         {
@@ -137,7 +138,7 @@ void HandleGenerationLogits::operator()(SizeType32 logitsIndex, RequestVector co
         if (modelConfig.getSpeculativeDecodingMode().hasDraftLogits())
         {
             TLLM_CHECK(genRuntimeBuffers);
-            auto& medusaLogitsHeads = decoderBuffers.draftBuffers.predictedDraftLogits.at(seqSlot);
+            auto& medusaLogitsHeads = draftBuffers->predictedDraftLogits.at(seqSlot);
             setupMedusaLogits(medusaLogitsHeads, genRuntimeBuffers->medusaBuffers->medusaLogitsDevice,
                 modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(), logitsIndex, draftLength);
         }
