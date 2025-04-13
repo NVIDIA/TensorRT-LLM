@@ -1816,21 +1816,21 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
             event.synchronize();
 
             auto const peerSend = 0;
-            mDecSlotAsyncSndHdls.emplace_back(SlotDecoderBuffers::asyncSend(
-                mMpiCommPipelinePara, outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, peerSend));
+            mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
+                outputIds, sequenceLengthView, cumLogProbs, logProbs, returnLogProbs, mMpiCommPipelinePara, peerSend));
         }
     }
     else
     {
         auto const peerRecv = mWorldConfig.getPipelineParallelRank() == 0 ? mWorldConfig.getPipelineParallelism() - 1
                                                                           : mWorldConfig.getPipelineParallelRank() - 1;
-        mSlotDecoderBuffers[seqSlot]->recv(mMpiCommPipelinePara, returnLogProbs, peerRecv);
+        DecoderSlotAsyncSend::recv(*mSlotDecoderBuffers[seqSlot], returnLogProbs, mMpiCommPipelinePara, peerRecv);
 
         auto const peerSend = mWorldConfig.getPipelineParallelRank() + 1;
         if (peerSend != mWorldConfig.getPipelineParallelism() - 1)
         {
-            mDecSlotAsyncSndHdls.emplace_back(
-                mSlotDecoderBuffers[seqSlot]->asyncSend(mMpiCommPipelinePara, returnLogProbs, peerSend));
+            mDecSlotAsyncSndHdls.emplace_back(std::make_unique<DecoderSlotAsyncSend>(
+                *mSlotDecoderBuffers[seqSlot], returnLogProbs, mMpiCommPipelinePara, peerSend));
         }
     }
     sync_check_cuda_error(mRuntime->getStream().get());

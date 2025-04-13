@@ -130,28 +130,6 @@ private:
     std::shared_ptr<mpi::MpiRequest> mRequest9;
 };
 
-class DecoderSlotAsyncSend
-{
-public:
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
-    DecoderSlotAsyncSend(std::shared_ptr<mpi::MpiComm> const& commSession, TensorPtr const& outputIdsView,
-        TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView, TensorPtr const& logProbsView,
-        bool returnLogProbs, int peer);
-
-    ~DecoderSlotAsyncSend();
-
-    static auto constexpr kMpiTagOffset = 9;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
-    static_assert(kMpiTagOffset >= DecoderStepAsyncSend::kMpiTagUpperBound);
-
-private:
-    std::shared_ptr<mpi::MpiRequest> mRequest1;
-    std::shared_ptr<mpi::MpiRequest> mRequest2;
-    std::shared_ptr<mpi::MpiRequest> mRequest3;
-    std::shared_ptr<mpi::MpiRequest> mRequest4;
-};
-
 class SlotDecoderBuffers
 {
 public:
@@ -169,15 +147,33 @@ public:
     TensorPtr finishReasonsHost;   // [beamWidth]
 
     SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, runtime::BufferManager const& manager);
+};
 
-    static std::unique_ptr<DecoderSlotAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-        TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,
-        TensorPtr const& logProbsView, bool returnLogProbs, int peer);
+class DecoderSlotAsyncSend
+{
+public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
 
-    std::unique_ptr<DecoderSlotAsyncSend> asyncSend(
-        std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer) const;
+    DecoderSlotAsyncSend(TensorPtr const& outputIds, TensorPtr const& sequenceLengths, TensorPtr const& cumLogProbs,
+        TensorPtr const& logProbs, bool returnLogProbs, std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
 
-    void recv(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer);
+    DecoderSlotAsyncSend(SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs,
+        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+
+    ~DecoderSlotAsyncSend();
+
+    static void recv(SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs,
+        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+
+    static auto constexpr kMpiTagOffset = 9;
+    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
+    static_assert(kMpiTagOffset >= DecoderStepAsyncSend::kMpiTagUpperBound);
+
+private:
+    std::shared_ptr<mpi::MpiRequest> mRequest1;
+    std::shared_ptr<mpi::MpiRequest> mRequest2;
+    std::shared_ptr<mpi::MpiRequest> mRequest3;
+    std::shared_ptr<mpi::MpiRequest> mRequest4;
 };
 
 } // namespace tensorrt_llm::batch_manager
