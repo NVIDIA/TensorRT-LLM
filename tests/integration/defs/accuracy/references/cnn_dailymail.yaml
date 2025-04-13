@@ -151,15 +151,23 @@ mistralai/Mistral-7B-v0.1:
   - accuracy: 22.0
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
     accuracy: 23.0
+  - quant_algo: FP8
+    extra_acc_spec: beam_width=4
+    accuracy: 28.321
 mistralai/Mistral-7B-v0.3:
-  - accuracy: 22.0
+  - quant_algo: W4A16
+    accuracy: 31.372
+  - quant_algo: W4A16_AWQ
+    accuracy: 31.457
+  - quant_algo: W4A8_AWQ
+    accuracy: 31.201
 NeMo/Mistral_Nemo_12B_Base:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 24.0
 NeMo/Mistral_NeMo_Minitron_8B_Instruct:
   - quant_algo: FP8
-    accuracy: 22.0
+    accuracy: 32.553
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
   - quant_algo: NVFP4
@@ -172,14 +180,16 @@ mistralai/Mixtral-8x7B-v0.1:
     accuracy: 18.0
   - quant_algo: W8A16
     extra_acc_spec: beam_width=4
-    accuracy: 22.0
+    accuracy: 29.955
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 23.0
+    accuracy: 27.979
   - extra_acc_spec: ootb_except_mha
     accuracy: 21.0
-  - extra_acc_spec: plugin
+  - quant_algo: W8A16
+    extra_acc_spec: plugin
     accuracy: 21.0
-  - extra_acc_spec: pp_reduce_scatter
+  - quant_algo: W8A16
+    extra_acc_spec: pp_reduce_scatter
     accuracy: 23.0
 mistralai/Mixtral-8x7B-v0.1-AWQ:
   - accuracy: 19.5

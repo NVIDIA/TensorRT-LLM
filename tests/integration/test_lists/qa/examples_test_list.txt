@@ -412,8 +412,8 @@ accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
 accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4]
 accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4_awq]
 accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int8_awq]
-accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8_summarization
-accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8_summarization
+accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8
+accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8
 accuracy/test_llm_api.py::TestMixtral8x7B::test_tp2
 accuracy/test_llm_api.py::TestMixtral8x7B::test_smooth_quant_tp2pp2
 accuracy/test_llm_api.py::TestMixtral8x7B::test_awq
