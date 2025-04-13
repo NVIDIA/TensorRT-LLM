@@ -766,6 +766,40 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
                  ])
 
 
+class TestMistral_7B(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-7B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-7B-v0.1"
+    EXAMPLE_FOLDER = "llama"
+
+    def test_beam_search(self):
+        self.run(extra_acc_spec="beam_width=4",
+                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
+                 extra_summarize_args=["--num_beams=4"])
+        for num_beams in [1, 2]:
+            self.extra_summarize_args = [f"--num_beams={num_beams}"]
+            self.evaluate()
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(8)
+    def test_fp8_tp4pp2(self):
+        self.run(quant_algo=QuantAlgo.FP8,
+                 tp_size=4,
+                 pp_size=2,
+                 extra_convert_args=["--calib_size=4"],
+                 extra_acc_spec="beam_width=4",
+                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
+                 extra_summarize_args=["--num_beams=4"])
+
+    @pytest.mark.skip_less_device(4)
+    def test_smooth_quant_tp4pp1(self):
+        self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
+                 tp_size=4,
+                 pp_size=1,
+                 extra_acc_spec="beam_width=4",
+                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
+                 extra_summarize_args=["--num_beams=4"])
+
+
 class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"

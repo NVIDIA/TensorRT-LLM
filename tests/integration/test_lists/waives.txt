@@ -267,7 +267,7 @@ full:B200/examples/test_llama.py::test_llm_llama_int8_kv_1gpu_summary[llama-7b-e
 full:B200/examples/test_llama.py::test_llm_llama_int8_kv_1gpu_summary[llama-7b-disable_weight_only-nb:1] SKIP (not support on B200)
 full:B200/examples/test_llama.py::test_llm_llama_v2_int8sq_2gpu_tp2[llama-v2-7b-hf-bfloat16-nb:1] SKIP (not support on B200)
 full:B200/examples/test_llama.py::test_llm_llama_int8_kv_awq_1gpu_summary[llama-7b-nb:1] SKIP (not support on B200)
-full:B200/examples/test_mistral.py::test_llm_mistral_v1_smooth_quant_4gpus[mistral-7b-v0.1] SKIP (not support on B200)
+full:B200/examples/accuracy/test_cli_flow.py::TestMistral_7B::test_smooth_quant_tp4pp1 SKIP (not support on B200)
 full:B200/examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int4-nb:1] SKIP (not support on B200)
 full:B200/examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int8-nb:4] SKIP (not support on B200)
 full:B200/examples/test_llama.py::test_llm_llama_v3_1_1node_multi_gpus[llama-3.1-8b-enable_fp8] SKIP (not support on B200)
