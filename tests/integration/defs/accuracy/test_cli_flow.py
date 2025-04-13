@@ -767,7 +767,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 
 class TestMistral_7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-7B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
     EXAMPLE_FOLDER = "llama"
 
     def test_beam_search(self):
@@ -822,7 +822,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     def test_weight_only_int4_tp2(self):
         self.run(quant_algo=QuantAlgo.W4A16,
                  tp_size=2,
-                 xtra_build_args=["--gemm_plugin=auto"])
+                 extra_build_args=["--gemm_plugin=auto"])
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
@@ -839,7 +839,6 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,
                  pp_size=2,
-                 extra_acc_spec="beam_width=4",
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--pp_reduce_scatter=enable"

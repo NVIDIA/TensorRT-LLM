@@ -40,7 +40,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
 class TestMistral_7B_0_3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.3"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-7B-v0.3"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
 
     @skip_post_blackwell
     @skip_pre_ada
@@ -74,7 +74,7 @@ class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
     MODEL_NAME = "NeMo/Mistral_Nemo_12B_Base"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
-    def test_fp8_summarization(self):
+    def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
 
@@ -93,7 +93,7 @@ class TestMistral_NeMo_Minitron_8B_Instruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Mistral-NeMo-Minitron-8B-Instruct"
 
     @skip_pre_ada
-    def test_fp8_summarization(self):
+    def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
 
         build_config = BuildConfig()

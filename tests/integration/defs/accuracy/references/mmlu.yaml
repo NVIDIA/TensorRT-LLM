@@ -34,14 +34,17 @@ meta-llama/Llama-3.3-70B-Instruct:
 mistralai/Mistral-7B-v0.1:
   - accuracy: 66
 mistralai/Mistral-7B-v0.3:
-  - accuracy: 60.0
-  - quant_algo: W4A16;W4A16_AWQ
-    accuracy: 55.0
+  - quant_algo: W4A16
+    accuracy: 59.23
+  - quant_algo: W4A16_AWQ
+    accuracy: 61.06
+  - quant_algo: W4A8_AWQ
+    accuracy: 60.04
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 71.35
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 71.27
+    accuracy: 72.17
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 69.64
