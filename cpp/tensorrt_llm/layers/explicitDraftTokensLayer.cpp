@@ -288,7 +288,7 @@ void ExplicitDraftTokensLayer<T>::packAcceptedPaths(ExplicitDraftTokensOutputs c
         numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for ExplicitDraftTokensLayer");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for ExplicitDraftTokensLayer");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIndicesSlotsPtr,
-        lastDraftIndicesSlotsPtr, batchSlots, nullptr, batchSize, batchSize,
+        lastDraftIndicesSlotsPtr, batchSlots, batchSize, batchSize,
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), false, getStream());
 
