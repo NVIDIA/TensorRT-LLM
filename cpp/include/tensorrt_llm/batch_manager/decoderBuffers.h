@@ -51,55 +51,6 @@ public:
     std::vector<TensorPtr> forwardBatchSlots;
 };
 
-class DecoderStepAsyncSend
-{
-public:
-    using BufferPtr = runtime::IBuffer::SharedPtr;
-
-    DecoderStepAsyncSend(std::shared_ptr<mpi::MpiComm> const& commSession, BufferPtr const& newOutputTokensHost,
-        BufferPtr const& finished, BufferPtr const& sequenceLengthsHost, BufferPtr const& cumLogProbsHost,
-        BufferPtr const& logProbsHost, BufferPtr const& cacheIndirectionOutput, BufferPtr const& acceptedCumSum,
-        BufferPtr const& packedPaths, BufferPtr const& finishReasonsHost, int peer);
-
-    ~DecoderStepAsyncSend();
-
-    static auto constexpr kMpiTagOffset = 0;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 9;
-
-private:
-    std::shared_ptr<mpi::MpiRequest> mRequest1;
-    std::shared_ptr<mpi::MpiRequest> mRequest2;
-    std::shared_ptr<mpi::MpiRequest> mRequest3;
-    std::shared_ptr<mpi::MpiRequest> mRequest4;
-    std::shared_ptr<mpi::MpiRequest> mRequest5;
-    std::shared_ptr<mpi::MpiRequest> mRequest6;
-    std::shared_ptr<mpi::MpiRequest> mRequest7;
-    std::shared_ptr<mpi::MpiRequest> mRequest8;
-    std::shared_ptr<mpi::MpiRequest> mRequest9;
-};
-
-class DecoderSlotAsyncSend
-{
-public:
-    using TensorPtr = runtime::ITensor::SharedPtr;
-
-    DecoderSlotAsyncSend(std::shared_ptr<mpi::MpiComm> const& commSession, TensorPtr const& outputIdsView,
-        TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView, TensorPtr const& logProbsView,
-        bool returnLogProbs, int peer);
-
-    ~DecoderSlotAsyncSend();
-
-    static auto constexpr kMpiTagOffset = 9;
-    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
-    static_assert(kMpiTagOffset >= DecoderStepAsyncSend::kMpiTagUpperBound);
-
-private:
-    std::shared_ptr<mpi::MpiRequest> mRequest1;
-    std::shared_ptr<mpi::MpiRequest> mRequest2;
-    std::shared_ptr<mpi::MpiRequest> mRequest3;
-    std::shared_ptr<mpi::MpiRequest> mRequest4;
-};
-
 class DecoderBuffers
 {
 public:
@@ -143,17 +94,62 @@ public:
         SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
-    std::unique_ptr<DecoderStepAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, int peer);
-
-    void recv(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, SizeType32 maxBeamWidth,
-        bool useMedusa, int peer);
-
-    void bcast(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, SizeType32 maxBeamWidth,
-        bool useMedusa, int root);
-
     void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
     void disableLookaheadDecoding(SizeType32 maxNumSequences);
+};
+
+class DecoderStepAsyncSend
+{
+public:
+    using SizeType32 = runtime::SizeType32;
+    using BufferPtr = runtime::IBuffer::SharedPtr;
+
+    DecoderStepAsyncSend(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+
+    ~DecoderStepAsyncSend();
+
+    static void recv(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa,
+        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+
+    static void bcast(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession, int root);
+
+    static auto constexpr kMpiTagOffset = 0;
+    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 9;
+
+private:
+    std::shared_ptr<mpi::MpiRequest> mRequest1;
+    std::shared_ptr<mpi::MpiRequest> mRequest2;
+    std::shared_ptr<mpi::MpiRequest> mRequest3;
+    std::shared_ptr<mpi::MpiRequest> mRequest4;
+    std::shared_ptr<mpi::MpiRequest> mRequest5;
+    std::shared_ptr<mpi::MpiRequest> mRequest6;
+    std::shared_ptr<mpi::MpiRequest> mRequest7;
+    std::shared_ptr<mpi::MpiRequest> mRequest8;
+    std::shared_ptr<mpi::MpiRequest> mRequest9;
+};
+
+class DecoderSlotAsyncSend
+{
+public:
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+    DecoderSlotAsyncSend(std::shared_ptr<mpi::MpiComm> const& commSession, TensorPtr const& outputIdsView,
+        TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView, TensorPtr const& logProbsView,
+        bool returnLogProbs, int peer);
+
+    ~DecoderSlotAsyncSend();
+
+    static auto constexpr kMpiTagOffset = 9;
+    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
+    static_assert(kMpiTagOffset >= DecoderStepAsyncSend::kMpiTagUpperBound);
+
+private:
+    std::shared_ptr<mpi::MpiRequest> mRequest1;
+    std::shared_ptr<mpi::MpiRequest> mRequest2;
+    std::shared_ptr<mpi::MpiRequest> mRequest3;
+    std::shared_ptr<mpi::MpiRequest> mRequest4;
 };
 
 class SlotDecoderBuffers
