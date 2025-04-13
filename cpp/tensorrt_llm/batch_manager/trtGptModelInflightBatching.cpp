@@ -1326,6 +1326,7 @@ executor::DecodingMode getDecodingMode(SpeculativeDecodingMode specDecodingMode,
         TLLM_LOG_WARNING("Overwriting decoding mode to external draft token");
         decodingMode = executor::DecodingMode::ExternalDraftTokens();
     }
+    TLLM_LOG_DEBUG("DecodingMode: %s", decodingMode.getName());
     return decodingMode;
 }
 } // namespace
