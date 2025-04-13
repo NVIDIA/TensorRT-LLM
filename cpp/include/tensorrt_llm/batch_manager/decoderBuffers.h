@@ -117,18 +117,15 @@ public:
     using BufferPtr = runtime::IBuffer::SharedPtr;
 
     DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
-        int peer);
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
 
     ~DecoderStepAsyncSend();
 
     static void recv(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
-        int peer);
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int peer);
 
     static void bcast(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
-        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
-        int root);
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, mpi::MpiComm const& commSession, int root);
 
     static auto constexpr kMpiTagOffset = 0;
     static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 9;
@@ -170,15 +167,15 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     DecoderSlotAsyncSend(TensorPtr const& outputIds, TensorPtr const& sequenceLengths, TensorPtr const& cumLogProbs,
-        TensorPtr const& logProbs, bool returnLogProbs, std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+        TensorPtr const& logProbs, bool returnLogProbs, mpi::MpiComm const& commSession, int peer);
 
-    DecoderSlotAsyncSend(SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs,
-        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+    DecoderSlotAsyncSend(
+        SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs, mpi::MpiComm const& commSession, int peer);
 
     ~DecoderSlotAsyncSend();
 
-    static void recv(SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs,
-        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+    static void recv(
+        SlotDecoderBuffers const& slotDecoderBuffers, bool returnLogProbs, mpi::MpiComm const& commSession, int peer);
 
     static auto constexpr kMpiTagOffset = 9;
     static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
