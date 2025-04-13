@@ -281,20 +281,45 @@ void DecoderStepAsyncSend::bcast(DecoderBuffers const& decoderBuffers, bool cons
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-DecoderSlotAsyncSend::DecoderSlotAsyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-    TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,
-    TensorPtr const& logProbsView, bool const returnLogProbs, int const peer)
+DecoderSlotAsyncSend::DecoderSlotAsyncSend(TensorPtr const& outputIds, TensorPtr const& sequenceLengths,
+    TensorPtr const& cumLogProbs, TensorPtr const& logProbs, bool const returnLogProbs,
+    std::shared_ptr<mpi::MpiComm> const& commSession, int const peer)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_LOG_DEBUG("start send outputs of SlotDecoderBuffers to rank %d", peer);
 
-    mRequest1 = commSession->sendAsync(*outputIdsView, peer, kMpiTagOffset);
-    mRequest2 = commSession->sendAsync(*sequenceLengthView, peer, kMpiTagOffset + 1);
-    mRequest3 = returnLogProbs ? commSession->sendAsync(*cumLogProbsView, peer, kMpiTagOffset + 2) : nullptr;
-    mRequest4 = returnLogProbs ? commSession->sendAsync(*logProbsView, peer, kMpiTagOffset + 3) : nullptr;
+    mRequest1 = commSession->sendAsync(*outputIds, peer, kMpiTagOffset);
+    mRequest2 = commSession->sendAsync(*sequenceLengths, peer, kMpiTagOffset + 1);
+    mRequest3 = returnLogProbs ? commSession->sendAsync(*cumLogProbs, peer, kMpiTagOffset + 2) : nullptr;
+    mRequest4 = returnLogProbs ? commSession->sendAsync(*logProbs, peer, kMpiTagOffset + 3) : nullptr;
 
     static_assert(kMpiTagUpperBound >= kMpiTagOffset + 4);
 
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+DecoderSlotAsyncSend::DecoderSlotAsyncSend(SlotDecoderBuffers const& slotDecoderBuffers, bool const returnLogProbs,
+    std::shared_ptr<mpi::MpiComm> const& commSession, int const peer)
+    : DecoderSlotAsyncSend(slotDecoderBuffers.outputIds, slotDecoderBuffers.sequenceLengths,
+        slotDecoderBuffers.cumLogProbs, slotDecoderBuffers.logProbs, returnLogProbs, commSession, peer)
+{
+}
+
+void DecoderSlotAsyncSend::recv(SlotDecoderBuffers const& slotDecoderBuffers, bool const returnLogProbs,
+    std::shared_ptr<mpi::MpiComm> const& commSession, int const peer)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("start recv outputs of SlotDecoderBuffers from rank %d", peer);
+
+    commSession->recv(*slotDecoderBuffers.outputIds, peer, DecoderSlotAsyncSend::kMpiTagOffset);
+    commSession->recv(*slotDecoderBuffers.sequenceLengths, peer, DecoderSlotAsyncSend::kMpiTagOffset + 1);
+    if (returnLogProbs)
+    {
+        commSession->recv(*slotDecoderBuffers.cumLogProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 2);
+        commSession->recv(*slotDecoderBuffers.logProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 3);
+    }
+
+    TLLM_LOG_DEBUG("end recv outputs of SlotDecoderBuffers from rank %d", peer);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -310,39 +335,6 @@ DecoderSlotAsyncSend::~DecoderSlotAsyncSend()
         mRequest4->wait();
 
     TLLM_LOG_DEBUG("end send outputs of SlotDecoderBuffers");
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-    TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,
-    TensorPtr const& logProbsView, bool const returnLogProbs, int const peer)
-{
-    auto decSlotAsyncSndHdl = std::make_unique<DecoderSlotAsyncSend>(
-        commSession, outputIdsView, sequenceLengthView, cumLogProbsView, logProbsView, returnLogProbs, peer);
-    return decSlotAsyncSndHdl;
-}
-
-std::unique_ptr<DecoderSlotAsyncSend> SlotDecoderBuffers::asyncSend(
-    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer) const
-{
-    return asyncSend(commSession, outputIds, sequenceLengths, cumLogProbs, logProbs, returnLogProbs, peer);
-}
-
-void SlotDecoderBuffers::recv(
-    std::shared_ptr<mpi::MpiComm> const& commSession, bool const returnLogProbs, int const peer)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_LOG_DEBUG("start recv outputs of SlotDecoderBuffers from rank %d", peer);
-
-    commSession->recv(*outputIds, peer, DecoderSlotAsyncSend::kMpiTagOffset);
-    commSession->recv(*sequenceLengths, peer, DecoderSlotAsyncSend::kMpiTagOffset + 1);
-    if (returnLogProbs)
-    {
-        commSession->recv(*cumLogProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 2);
-        commSession->recv(*logProbs, peer, DecoderSlotAsyncSend::kMpiTagOffset + 3);
-    }
-
-    TLLM_LOG_DEBUG("end recv outputs of SlotDecoderBuffers from rank %d", peer);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
