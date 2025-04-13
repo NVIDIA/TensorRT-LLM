@@ -65,7 +65,7 @@ PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_
 PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
 PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
-PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py --has_tllm_checkpoint
+PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py
 ```
 
 It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
