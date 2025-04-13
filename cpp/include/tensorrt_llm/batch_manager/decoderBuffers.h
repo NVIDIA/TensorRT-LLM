@@ -51,6 +51,26 @@ public:
     std::vector<TensorPtr> forwardBatchSlots;
 };
 
+class DecoderOutputBuffers
+{
+public:
+    using SizeType32 = runtime::SizeType32;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+    DecoderOutputBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxSeqLen,
+        SizeType32 maxTokensPerStep, runtime::BufferManager const& manager);
+
+    void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
+    void disableLookaheadDecoding(SizeType32 maxNumSequences);
+
+    TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
+    TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
+    TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
+    TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
+    TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
+    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
+};
+
 class DecoderBuffers
 {
 public:
@@ -58,14 +78,9 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     std::vector<TensorPtr> logits;
+
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
-    TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
-    TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
-    TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
-    TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
-    TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
-    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
 
     class DraftBuffers
     {
@@ -91,11 +106,8 @@ public:
     std::optional<runtime::LookaheadDecodingBuffers> lookaheadBuffers;
 
     DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-        SizeType32 maxSeqLen, SizeType32 maxTokensPerStep, runtime::BufferManager const& manager,
-        runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
-
-    void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
-    void disableLookaheadDecoding(SizeType32 maxNumSequences);
+        SizeType32 maxTokensPerStep, runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig);
 };
 
 class DecoderStepAsyncSend
@@ -104,16 +116,19 @@ public:
     using SizeType32 = runtime::SizeType32;
     using BufferPtr = runtime::IBuffer::SharedPtr;
 
-    DecoderStepAsyncSend(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth,
-        bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+    DecoderStepAsyncSend(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
+        int peer);
 
     ~DecoderStepAsyncSend();
 
-    static void recv(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa,
-        std::shared_ptr<mpi::MpiComm> const& commSession, int peer);
+    static void recv(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
+        int peer);
 
-    static void bcast(DecoderBuffers const& decoderBuffers, bool returnLogProbs, SizeType32 maxBeamWidth,
-        bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession, int root);
+    static void bcast(DecoderOutputBuffers const& decoderOutputBuffers, DecoderBuffers const& decoderBuffers,
+        bool returnLogProbs, SizeType32 maxBeamWidth, bool useMedusa, std::shared_ptr<mpi::MpiComm> const& commSession,
+        int root);
 
     static auto constexpr kMpiTagOffset = 0;
     static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 9;

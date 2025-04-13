@@ -61,6 +61,7 @@ class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
+class DecoderOutputBuffers;
 class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
@@ -514,8 +515,10 @@ private:
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.
     std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
-    // Decoder buffers for each micro batch.
+    // Decoder input buffers for each micro batch.
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
+    // Decoder output buffers for each micro batch.
+    std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
     // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
     std::shared_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
