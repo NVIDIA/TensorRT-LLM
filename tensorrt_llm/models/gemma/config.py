@@ -148,8 +148,11 @@ class GemmaConfig(PretrainedConfig):
     @staticmethod
     def get_hf_config(config_dir: "Union[str, PathLike]"):
         import transformers
-        SUPPORTED_HF_ARCHITECTURES = (transformers.GemmaConfig,
-                                      transformers.Gemma2Config)
+        SUPPORTED_HF_ARCHITECTURES = (
+            transformers.GemmaConfig,
+            transformers.Gemma2Config,
+            transformers.Gemma3Config,
+        )
         hf_config = transformers.AutoConfig.from_pretrained(config_dir)
         assert isinstance(hf_config, SUPPORTED_HF_ARCHITECTURES)
         return hf_config
