@@ -202,7 +202,6 @@ void DecoderState::setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeT
     auto const maxBatchSizeXmaxBeamWidthShape = ITensor::makeShape({mMaxBatchSize, mMaxBeamWidth});
 
     const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeShape);
-    const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
     auto& sequenceLimitLength = const_cast<ITensor&>(*dInput.sequenceLimitLength);
     sequenceLimitLength.reshape(maxBatchSizeShape);
     kernels::invokeFill(sequenceLimitLength, mMaxSequenceLength, stream);

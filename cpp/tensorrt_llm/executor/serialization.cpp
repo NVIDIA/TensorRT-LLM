@@ -1199,8 +1199,9 @@ ParallelConfig Serialization::deserializeParallelConfig(std::istream& is)
     auto deviceIds = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto participantids = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto orchestratorConfig = su::deserialize<std::optional<OrchestratorConfig>>(is);
+    auto numNodes = su::deserialize<std::optional<SizeType32>>(is);
 
-    return ParallelConfig{commType, commMode, deviceIds, participantids, orchestratorConfig};
+    return ParallelConfig{commType, commMode, deviceIds, participantids, orchestratorConfig, numNodes};
 }
 
 void Serialization::serialize(ParallelConfig const& parallelConfig, std::ostream& os)
@@ -1210,6 +1211,7 @@ void Serialization::serialize(ParallelConfig const& parallelConfig, std::ostream
     su::serialize(parallelConfig.getDeviceIds(), os);
     su::serialize(parallelConfig.getParticipantIds(), os);
     su::serialize(parallelConfig.getOrchestratorConfig(), os);
+    su::serialize(parallelConfig.getNumNodes(), os);
 }
 
 size_t Serialization::serializedSize(ParallelConfig const& parallelConfig)
@@ -1220,6 +1222,7 @@ size_t Serialization::serializedSize(ParallelConfig const& parallelConfig)
     totalSize += su::serializedSize(parallelConfig.getDeviceIds());
     totalSize += su::serializedSize(parallelConfig.getParticipantIds());
     totalSize += su::serializedSize(parallelConfig.getOrchestratorConfig());
+    totalSize += su::serializedSize(parallelConfig.getNumNodes());
     return totalSize;
 }
 

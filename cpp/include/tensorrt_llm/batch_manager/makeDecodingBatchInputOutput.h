@@ -57,6 +57,11 @@ public:
         runtime::decoder::DecoderState& decoderState, runtime::ModelConfig const& modelConfig,
         SizeType32 maxNumSequences, SizeType32 beamWidth, runtime::BufferManager const& manager,
         runtime::CudaStream const& stream, OptionalRef<RuntimeBuffers> fusedRuntimeBuffers) const;
+
+    [[nodiscard]] static std::unique_ptr<runtime::decoder_batch::Input> createDecoderBatchInputs(
+        std::vector<SizeType32> const& activeSlots, runtime::decoder::DecoderState const& decoderState,
+        std::vector<TensorPtr> const& logits, SizeType32 maxNumSequences, std::vector<TensorPtr> const& batchSlots,
+        TensorPtr const& cacheIndirectionInput);
 };
 
 } // namespace tensorrt_llm::batch_manager

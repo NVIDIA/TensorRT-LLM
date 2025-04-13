@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/torch.h"

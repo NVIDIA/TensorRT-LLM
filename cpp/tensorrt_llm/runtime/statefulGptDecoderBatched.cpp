@@ -17,6 +17,7 @@
 #include "tensorrt_llm/runtime/statefulGptDecoderBatched.h"
 
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/generationOutput.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -94,7 +95,7 @@ void StatefulGptDecoderBatched::setup(executor::DecodingMode const& mode, SizeTy
         maxTokensPerStep, dtype, modelConfig, worldConfig);
 
     mBatchSlotsSetup->reshape(ITensor::makeShape({maxBatchSize}));
-    mBatchSlotsDecoder->reshape(ITensor::makeShape({maxTokensPerStep, maxBatchSize}));
+    mBatchSlotsDecoder->reshape(ITensor::makeShape({maxBatchSize}));
 }
 
 void StatefulGptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
@@ -202,7 +203,7 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     auto const& logitsShape = input.logits->getShape();
     auto const batchSize = logitsShape.d[0];
     auto constexpr singleRequest = 1;
-    std::vector<ITensor::SharedPtr> logits;
+    std::vector<ITensor::SharedConstPtr> logits;
     logits.reserve(batchSize);
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
@@ -213,7 +214,12 @@ void StatefulGptDecoderBatched::forwardAsync(decoder::Output& output, decoder::I
     }
 
     decoder_batch::Input batchInput{logits};
-    batchInput.batchSlots = mBatchSlotsDecoder;
+    mBatchSlotsDecoder->resize(batchSize);
+    auto forwardBatchSlotsRange = BufferRange<SizeType32>(*mBatchSlotsDecoder);
+    std::iota(forwardBatchSlotsRange.begin(), forwardBatchSlotsRange.end(), 0);
+    batchInput.batchSlots = {mBatchSlotsDecoder};
+    batchInput.batchSlotsRequestOrder = mBatchSlotsDecoder;
+
     batchInput.cacheIndirection = input.cacheIndirection;
 
     decoder_batch::Output batchOutput;
