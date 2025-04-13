@@ -99,8 +99,6 @@ void Buffers::initBindings(pybind11::module_& m)
         .def_readwrite("logits", &tb::RuntimeBuffers::logits)
         .def_readwrite("seq_slots", &tb::RuntimeBuffers::seqSlots)
         .def_readwrite("seq_slots_device", &tb::RuntimeBuffers::seqSlotsDevice)
-        .def_readwrite("seq_slot_remapping_host", &tb::RuntimeBuffers::seqSlotRemappingHost)
-        .def_readwrite("seq_slot_remapping_device", &tb::RuntimeBuffers::seqSlotRemappingDevice)
         .def_readwrite("cache_indir_decoder_io_batched_copy_src_offsets_slice_device",
             &tb::RuntimeBuffers::mCacheIndirDecoderIOBatchedCopySrcOffsetsSliceDevice)
         .def_readwrite("cache_indir_decoder_io_batched_copy_dst_offsets_slice_device",
