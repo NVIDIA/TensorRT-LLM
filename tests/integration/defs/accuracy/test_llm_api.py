@@ -69,6 +69,42 @@ class TestMistral_7B_0_3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "NeMo/Mistral_Nemo_12B_Base"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
+
+    def test_fp8_summarization(self):
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+                                   kv_cache_quant_algo=QuantAlgo.FP8)
+
+        build_config = BuildConfig()
+        build_config.plugin_config._gemm_plugin = "auto"
+
+        with LLM(self.MODEL_PATH,
+                 build_config=build_config,
+                 quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMistral_NeMo_Minitron_8B_Instruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "NeMo/Mistral_NeMo_Minitron_8B_Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-NeMo-Minitron-8B-Instruct"
+
+    @skip_pre_ada
+    def test_fp8_summarization(self):
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+
+        build_config = BuildConfig()
+        build_config.plugin_config._gemm_plugin = "auto"
+
+        with LLM(self.MODEL_PATH,
+                 build_config=build_config,
+                 quant_config=quant_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
