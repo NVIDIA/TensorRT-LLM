@@ -10,6 +10,10 @@ def add_common_args(parser):
                         type=str,
                         default='model.engine',
                         help='Name of visual TRT engine')
+    parser.add_argument('--audio_engine_name',
+                        type=str,
+                        default='model.engine',
+                        help='Name of audio TRT engine')
     parser.add_argument('--hf_model_dir',
                         type=str,
                         default=None,
@@ -55,6 +59,10 @@ def add_common_args(parser):
                         nargs='+',
                         default=None,
                         help='List of input image paths, separated by symbol')
+    parser.add_argument("--audio_path",
+                        type=str,
+                        default=None,
+                        help='input audio path')
     parser.add_argument("--path_sep",
                         type=str,
                         default=",",
