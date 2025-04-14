@@ -24,8 +24,9 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Multi-node](#multi-node)
     - [mpirun](#mpirun)
     - [Slurm](#slurm)
-  - [FlashMLA](#flashmla)
   - [DeepGEMM](#deepgemm)
+  - [FlashMLA](#flashmla)
+  - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
 - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
@@ -267,9 +268,6 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
-### FlashMLA
-TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
-
 ### DeepGEMM
 TensorRT-LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
 
@@ -323,6 +321,9 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --streaming \
       --report_json "${OUTPUT_FILENAME}.json"
 ```
+
+### FlashMLA
+TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
 
 ### FP8 KV Cache and MLA
 
