@@ -219,7 +219,6 @@ class SamplingParams:
     random_seed: Optional[int] = None
     temperature: Optional[float] = None
     min_tokens: Optional[int] = None
-    beam_width: Optional[int] = None
     min_length: Optional[int] = None
     beam_search_diversity_rate: Optional[float] = None
     repetition_penalty: Optional[float] = None
@@ -261,44 +260,9 @@ class SamplingParams:
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
 
-    @property
-    def beam_width(self) -> int:
-        if self.use_beam_search:
-            return self.best_of
-        else:
-            return 1
-
     def __post_init__(self):
         if self.pad_id is None:
             self.pad_id = self.end_id
-
-        # Handle the compatibility between OpenAI and HF style-parameters.
-        hf_style = self.beam_width > 1 or self.num_return_sequences
-        openai_style = self.n > 1 or self.best_of or self.use_beam_search
-
-        if hf_style and openai_style:
-            ambiguous_params = {
-                'beam_width': self.beam_width,
-                'num_return_sequences': self.num_return_sequences,
-                'n': self.n,
-                'best_of': self.best_of,
-                'use_beam_search': self.use_beam_search,
-            }
-            raise ValueError(
-                'Got ambiguous parameters. Please specify either Hugging Face '
-                'style parameters (beam_width or num_return_sequences) or '
-                'OpenAI style parameters (n, best_of, or use_beam_search), '
-                f'but not both: {ambiguous_params}. It is recommended to use '
-                'OpenAI style parameters (n, best_of, use_beam_search).')
-
-        if hf_style:
-            logger.warning(
-                "Please use 'n' and 'best_of' for the LLM API. The use of "
-                "'beam_width' and 'num_return_sequences' will be deprecated "
-                "in a future release.")
-            self.n = self.beam_width
-            self.best_of = self.num_return_sequences
-            self.use_beam_search = self.beam_width > 1
 
         self.best_of = self.best_of or self.n
 
@@ -315,9 +279,8 @@ class SamplingParams:
         if self.best_of is not None:
             if self.best_of > 1 and self.best_of < self.n:
                 raise ValueError(
-                    f'In beam search, beam_width ({self.beam_width}) must be '
-                    f'greater than or equal to num_return_sequences '
-                    f'({self.num_return_sequences}).')
+                    f'In beam search, beam_width ({self.best_of}) must be '
+                    f'greater than or equal to n ({self.n}).')
 
             if (self.best_of > 1 and self._greedy_decoding and
                     not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
