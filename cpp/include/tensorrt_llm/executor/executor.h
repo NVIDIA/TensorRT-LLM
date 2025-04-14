@@ -1165,23 +1165,28 @@ public:
     /// @param deviceIds The IDs of the GPUs involved in the execution of the model
     /// @param participantIds The participant IDs (MPI ranks if commType == kMPI) involved in the execution of the
     /// model. The first participant is considered to be the leader.
+    /// @param orchestratorConfig The orchestrator configuration. See OrchestratorConfig.
+    /// @param numNodes The number of nodes to use for execution. Default is 1.
     explicit ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
         CommunicationMode commMode = CommunicationMode::kLEADER,
         std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
         std::optional<std::vector<SizeType32>> participantIds = std::nullopt,
-        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt);
+        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt,
+        std::optional<SizeType32> numNodes = std::nullopt);
 
     [[nodiscard]] CommunicationType getCommunicationType() const;
     [[nodiscard]] CommunicationMode getCommunicationMode() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getDeviceIds() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getParticipantIds() const;
     [[nodiscard]] std::optional<OrchestratorConfig> getOrchestratorConfig() const;
+    [[nodiscard]] std::optional<SizeType32> getNumNodes() const;
 
     void setCommunicationType(CommunicationType type);
     void setCommunicationMode(CommunicationMode mode);
     void setDeviceIds(std::vector<SizeType32> const& deviceIds);
     void setParticipantIds(std::vector<SizeType32> const& participantIds);
     void setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig);
+    void setNumNodes(SizeType32 numNodes);
 
 private:
     friend class Serialization;
@@ -1200,6 +1205,9 @@ private:
 
     /// @brief Optional orchestrator configuration
     std::optional<OrchestratorConfig> mOrchestratorConfig;
+
+    /// @brief The number of nodes to use for execution. Default is 1.
+    std::optional<SizeType32> mNumNodes;
 };
 
 /// @brief config for PeftCacheManager

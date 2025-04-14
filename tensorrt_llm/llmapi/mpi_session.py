@@ -3,7 +3,6 @@ import itertools
 import os
 import socket
 import sys
-import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -187,10 +186,6 @@ class MpiCommSession(MpiSession):
             for i in range(self.n_workers - 1)
         ]
 
-        # A trick to wait for rank0 to be ready, or the collective tasks will hang
-        # TODO[chunweiy]: Remove this trick
-        time.sleep(10)
-
         rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
 
@@ -250,6 +245,9 @@ class RemoteMpiCommSessionClient():
             "yellow")
         self.queue.put(RemoteTask(task, args, kwargs))
         return []
+
+    def submit_sync(self, task, *args, **kwargs):
+        return self.submit(task, *args, **kwargs)
 
     def shutdown(self):
         if self._is_shutdown:
