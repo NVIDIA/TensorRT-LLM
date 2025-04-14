@@ -366,8 +366,11 @@ def test_tokenizer_decode_incrementally(tokenizer_dir: str, threshold: float):
     num_samples = 100
     cnn_dailymail = datasets.load_dataset(cnn_dailymail_path,
                                           name='3.0.0',
-                                          split='train')
-    alpaca_chinese = datasets.load_dataset(alpaca_chinese_path, split='train')
+                                          split='train',
+                                          trust_remote_code=True)
+    alpaca_chinese = datasets.load_dataset(alpaca_chinese_path,
+                                           split='train',
+                                           trust_remote_code=True)
     dataset = cnn_dailymail['article'][:num_samples // 2] + alpaca_chinese[
         'output_zh'][:num_samples // 2]
 

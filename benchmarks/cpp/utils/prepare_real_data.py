@@ -125,7 +125,8 @@ def load_dataset_from_hf(dataset_config: DatasetConfig):
         dataset = iter(
             load_dataset(*dataset_config.query,
                          split=dataset_config.split,
-                         streaming=True))
+                         streaming=True,
+                         trust_remote_code=True))
     except ValueError as e:
         if "Config" in e:
             e += "\n Please add the config name to the dataset config yaml."

@@ -312,7 +312,8 @@ def main(args):
     tokenizer.pad_token = tokenizer.eos_token
 
     dataset_openweb = load_dataset("stas/openwebtext-10k",
-                                   cache_dir=args.dataset_path)
+                                   cache_dir=args.dataset_path,
+                                   trust_remote_code=True)
     long_texts = get_long_texts(dataset_openweb)  # generator
 
     # get datapoints
