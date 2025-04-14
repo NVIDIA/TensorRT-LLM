@@ -264,10 +264,8 @@ void GptDecoderBatched::prepareForward(
             auto batchSlotsRange = BufferRange<SizeType32 const>(*dInput.batchSlots);
             for (auto batchSlot : batchSlotsRange)
             {
-                TensorPtr finishedStepsView = ITensor::slice(mDecoderState->getFinishedSteps(), 0, 1);
-                finishedStepsView->squeeze(0);
-                TensorPtr finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
-                manager.setZero(*finishedStepsView);
+                TensorPtr finishedSteps = ITensor::slice(finishedStepsInput, batchSlot, 1);
+                manager.setZero(*finishedSteps);
             }
         }
     }
