@@ -147,7 +147,7 @@ class Llama4MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               min_latency_mode):
-        router_logits = self.router(hidden_states)
+        router_logits = self.router.llama4_router_forward(hidden_states)
         routed_output = self.experts(hidden_states, router_logits,
                                      min_latency_mode)
         return routed_output
