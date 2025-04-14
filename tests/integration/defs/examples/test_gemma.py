@@ -87,14 +87,13 @@ VSWA_ATTENTION = {
 VSWA_MODELS = VSWA_ATTENTION.keys()
 
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
-"For plain, non VSWA testing"
 
 
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
-@pytest.mark.parametrize("gemma_model_root", VSWA_MODELS, indirect=True)
+@pytest.mark.parametrize("gemma_model_root", GEMMA2_MODELS, indirect=True)
 def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type,
                                              gemma_model_root, llm_venv,
                                              cmodel_dir, engine_dir,
@@ -175,7 +174,8 @@ def hf_gemma_quantization_1gpu(batch_size,
         threshold_score = 18
 
     window = [
-        f"--max_attention_window={max_attention_window}",
+        "--max_attention_window_size",
+        ','.join((str(w) for w in max_attention_window)),
     ] if max_attention_window is not None else []
 
     summary_cmd = [
@@ -306,7 +306,7 @@ def gemma_1gpu_summary(batch_size,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     window = {
-        'max_attention_window': max_attention_window
+        'max_attention_window_size': max_attention_window
     } if max_attention_window is not None else {}
 
     print("Run summarize...")
