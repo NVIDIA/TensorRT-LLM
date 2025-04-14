@@ -315,10 +315,12 @@ public:
             int hidden_size = input.size(-1);
             auto workspace_ptr = workspace.value().mutable_data_ptr();
             auto params = tensorrt_llm::kernels::AllReduceParams::deserialize(
-                reinterpret_cast<int64_t*>(workspace_ptr), tpSize, tpRank, mType, token_num, hidden_size, mOp);
+                reinterpret_cast<int64_t*>(workspace_ptr), tpSize, tpRank);
 
             params.local_input_buffer_ptr = input.data_ptr();
             params.elts_total = size;
+            TLLM_CHECK_WITH_INFO(mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM,
+                "Only RESIDUAL_RMS_PREPOST_NORM is supported for custom allreduce");
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
                 finalOutput = torch::empty_like(input);
@@ -331,16 +333,6 @@ public:
                 params.fusion_params.hidden_size = hidden_size;
                 params.fusion_params.eps = mEps;
                 params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
-                for (size_t i = 0; i < tpSize; ++i)
-                {
-                    params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
-                        = reinterpret_cast<void**>(workspace_ptr)[tpSize * 4 + i];
-                    params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE]
-                        = reinterpret_cast<void**>(workspace_ptr)[tpSize * 5 + i];
-                    params.fusion_params
-                        .lamport_peer_comm_buffer_ptrs[i + tensorrt_llm::kernels::MAX_RANKS_PER_NODE * 2]
-                        = reinterpret_cast<void**>(workspace_ptr)[tpSize * 6 + i];
-                }
             }
             else
             {

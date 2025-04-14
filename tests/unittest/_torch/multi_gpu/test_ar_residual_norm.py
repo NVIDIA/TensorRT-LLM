@@ -148,9 +148,6 @@ def row_linear_residual_norm_fusion_forward(
 @pytest.mark.parametrize("fused_add_norm", [True, False],
                          ids=["fused_add_norm", "unfused_add_norm"])
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fused_add_norm):
-    pytest.skip(
-        "Skip for now, waiting for proper fix for this issue: https://nvbugspro.nvidia.com/bug/5060957"
-    )
     torch.manual_seed(42)
     dtype = torch.bfloat16
     tensor_parallel_size = 2
