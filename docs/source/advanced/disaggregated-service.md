@@ -144,7 +144,7 @@ When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will tr
 *Q. Why do some profiling tools show that TRT-LLM's KV cache transfer does not utilize NVLink even on devices equipped with NVLink?*
 
 A. Ensure TRT-LLM is running with `UCX`-backend `CUDA-aware MPI` , and check version of `UCX` with `ucx_info -v`.
-If the version of UCX <=1.17, set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n` to enable NVLink.
+If the version of UCX <=1.17, set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n` to enable NVLink. For BlackWell architecture GPUs, UCX version >=1.19 is required to enable NVLink.
 If the version of UCX >=1.18, there are several ways to enable NVLink:
 1. Set the environment variables `UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda`, `UCX_CUDA_COPY_DMABUF=no`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
 2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
@@ -155,3 +155,35 @@ A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer,
 1. Set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
 2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
 To achieve the optimal performance when using GPU direct RDMA, it is advisable to create CUDA context before MPI initialization when TRTLLM_USE_MPI_KVCACHE=1 is set. One possible approach is to rely on MPI environment variables to set the correct device before MPI initialization.
+
+*Q. Are there any guidelines for performance tuning of KV cache transfer?*
+
+A. Depending on the user's use case, certain sets of environment variables can help avoid poor KV cache transfer performance.
+
+Environment Variable Set A
+
+```
+export UCX_RNDV_FRAG_MEM_TYPES=cuda
+export UCX_MEMTYPE_CACHE=n
+export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
+```
+This set allows KV cache transfers to utilize NVLink within nodes and GDRDMA between nodes.
+
+Environment Variable Set B
+
+```
+export UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda
+export UCX_CUDA_COPY_DMABUF=no
+export UCX_MEMTYPE_CACHE=n
+export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
+```
+Set B may provide slightly better performance on a single node compared to Set A. However, when transferring KV cache across multiple nodes, it may cause program instability.
+
+Environment Variable Set C
+
+```
+export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size
+export UCX_MEMTYPE_CACHE=n
+export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
+```
+Set C can achieve better performance than Sets A and B, both within and between nodes. However, if the KV cache size exceeds the specified $Size, performance may degrade.

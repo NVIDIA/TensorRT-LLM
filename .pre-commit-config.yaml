@@ -64,7 +64,8 @@ repos:
     -   id: codespell
         additional_dependencies:
         - tomli
-        args: ["-L", "Mor"]
+        # add ignore words list
+        args: ["-L", "Mor,ans"]
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
