@@ -281,6 +281,68 @@ class LlavaOnevisionUtils:
         return image_features
 
 
+class PhiMMUtils:
+
+    @staticmethod
+    def add_image_newline(image_features, image_newline):
+        h, w, d = image_features.shape
+        image_newline = image_newline.expand(h, 1, -1)
+        image_features_newline = torch.cat([image_features, image_newline],
+                                           dim=1).flatten(0, 1)
+        return image_features_newline
+
+    @staticmethod
+    def reshape_hd_patches(image_features, h_crop=1, w_crop=1):
+        n_crops, n_tokens, d = image_features.shape
+        assert n_crops == h_crop * w_crop
+
+        h = w = int(n_tokens**0.5)
+        image_features = image_features.reshape(
+            h_crop, w_crop, h, w,
+            d).permute(0, 2, 1, 3, 4).reshape(h_crop * h, w_crop * w, d)
+        return image_features
+
+    @staticmethod
+    def hd_feature_transform(image_features,
+                             h_crop,
+                             w_crop,
+                             sub_GN,
+                             glb_GN,
+                             patch_mask=None):
+        glb_image_features = PhiMMUtils.add_image_newline(
+            PhiMMUtils.reshape_hd_patches(image_features[:1]), sub_GN)
+
+        num_crops = h_crop * w_crop
+        sub_image_features = PhiMMUtils.reshape_hd_patches(
+            image_features[1:num_crops + 1], h_crop, w_crop)
+        if patch_mask is not None:
+            h, w = patch_mask.shape[1] // 2, patch_mask.shape[2] // 2
+            sub_image_mask = (patch_mask[1:num_crops + 1, 0::2,
+                                         0::2].bool().reshape(
+                                             h_crop, w_crop, h,
+                                             w).permute(0, 2, 1, 3).reshape(
+                                                 h_crop * h, w_crop * w))
+            hh = int(sub_image_mask[:, 0].sum().item())
+            ww = int(sub_image_mask[0, :].sum().item())
+            sub_image_features = sub_image_features[:hh, :ww]
+        sub_image_features = PhiMMUtils.add_image_newline(
+            sub_image_features, sub_GN)
+
+        image_features = torch.cat(
+            [sub_image_features,
+             glb_GN.expand(1, -1), glb_image_features])
+        return image_features
+
+    @staticmethod
+    def reshape_audio_chunks(audio_features, chunk_mask=None):
+        audio_features = audio_features.flatten(0, 1)
+        if chunk_mask is not None:
+            # only the last chunk may include paddings
+            n_tokens = math.ceil(chunk_mask.flatten().sum().item() / 8)
+            audio_features = audio_features[:n_tokens]
+        return audio_features
+
+
 class MultimodalModelRunner:
 
     def __init__(self, args):
@@ -344,6 +406,7 @@ class MultimodalModelRunner:
                 self.num_frames = 8
             assert self.args.video_path is None or self.args.image_path is None
 
+        self.audio_input_names = self.audio_output_names = None
         if self.model_type == "mllama":
             self.vision_input_names = [
                 "pixel_values",
@@ -360,6 +423,11 @@ class MultimodalModelRunner:
             self.vision_output_names = [
                 "image_features",
             ]
+        elif self.model_type == "phi-4-multimodal":
+            self.vision_input_names = ["input", "attention_mask"]
+            self.audio_input_names = ["input", "attention_mask"]
+            self.audio_output_names = ["encoder_output"]
+            self.vision_output_names = ["encoder_output"]
         else:
             self.vision_input_names = ["input"]
             self.vision_output_names = ["encoder_output"]
@@ -413,6 +481,15 @@ class MultimodalModelRunner:
         self.init_image_encoder()
         self.init_llm()
 
+        if self.audio_input_names is not None:
+            with open(os.path.join(self.audio_engine_dir, "config.json"),
+                      "r") as f:
+                config = json.load(f)
+            self.audio_precision = config['builder_config']['precision']
+            self.init_audio_encoder()
+        else:
+            self.audio_encoder_session = self.audio_precision = None
+
     @property
     def cpp_e2e(self):
         return self.session == 'cpp'
@@ -428,6 +505,10 @@ class MultimodalModelRunner:
     @property
     def visual_engine_dir(self):
         return os.path.join(self.args.engine_dir, 'vision')
+
+    @property
+    def audio_engine_dir(self):
+        return os.path.join(self.args.engine_dir, 'audio')
 
     @property
     def llm_engine_dir(self):
@@ -484,7 +565,9 @@ class MultimodalModelRunner:
                 use_fast=False,
                 use_legacy=False)
         else:
-            use_fast = self.model_type in ["phi-3-vision", "internvl"]
+            use_fast = self.model_type in [
+                "phi-3-vision", "phi-4-multimodal", "internvl"
+            ]
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.hf_model_dir,
                 use_fast=use_fast,
@@ -520,7 +603,8 @@ class MultimodalModelRunner:
 
         elif self.model_type in [
                 'phi-3-vision', 'pix2struct', 'llava_next', 'llava', 'fuyu',
-                'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl'
+                'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl',
+                'phi-4-multimodal'
         ]:
             self.processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir, trust_remote_code=True, num_crops=16)
@@ -581,6 +665,23 @@ class MultimodalModelRunner:
             self.processor = MllamaProcessorWrapper(self.processor, logger)
 
     def init_image_encoder(self):
+
+        # Phi-4-multimodal uses pytorch engine due to issues with creating TRT engine.
+        if self.model_type == "phi-4-multimodal":
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map='cpu')
+            self.vision_model = model.model.embed_tokens_extend.image_embed.to(
+                self.device).eval()
+            self.image_newlines = {}
+            self.image_newlines['sub_GN'] = self.vision_model.img_projection(
+                self.vision_model.sub_GN).squeeze()
+            self.image_newlines['glb_GN'] = self.vision_model.img_projection(
+                self.vision_model.glb_GN).squeeze()
+            return
+
         if self.model_type == "phi-3-vision":
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.hf_model_dir,
@@ -627,7 +728,6 @@ class MultimodalModelRunner:
             logger.info(f'Creating session from engine {vision_encoder_path}')
             self.visual_encoder_session = Session.from_serialized_engine(
                 engine_buffer)
-
         if self.model_type in ["llava_next", "llava_onevision"]:
             self.image_newlines = {}
             image_newlines_path = os.path.join(self.visual_engine_dir,
@@ -637,6 +737,15 @@ class MultimodalModelRunner:
                            device=self.device) as f:
                 for k in f.keys():
                     self.image_newlines[k] = f.get_tensor(k)
+
+    def init_audio_encoder(self):
+        assert self.model_type == "phi-4-multimodal"
+        model = AutoModelForCausalLM.from_pretrained(self.args.hf_model_dir,
+                                                     torch_dtype=torch.float16,
+                                                     trust_remote_code=True,
+                                                     device_map='cpu')
+        self.audio_model = model.model.embed_tokens_extend.audio_embed.to(
+            self.device).eval()
 
     def init_llm(self):
         if self.decoder_llm:
@@ -733,7 +842,9 @@ class MultimodalModelRunner:
             self.vision_precision))  # [num_frames, 3, H, W]
         return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
 
-    def preprocess(self, pre_prompt, post_prompt, image, other_vision_inputs):
+    def preprocess(self, pre_prompt, post_prompt, image, other_vision_inputs,
+                   other_audio_inputs):
+        audio = None
         # same prompt for single/multiple image(s)
         n_prompts_n_images = False
         if isinstance(post_prompt,
@@ -761,6 +872,20 @@ class MultimodalModelRunner:
             input = image
             image = input['pixel_values']
             image = image.flatten(0, 1)
+        elif self.model_type == 'phi-4-multimodal':
+            input = image
+            image = input['input_image_embeds'].flatten(0, 1)
+            other_vision_inputs['attention_mask'] = input[
+                'image_attention_mask'].flatten(0, 1).bool()
+
+            audio = input['input_audio_embeds']
+            l, d = audio.shape[1], audio.shape[2]
+            pad = 4000 - l % 4000
+            audio = torch.cat([audio, audio.new_zeros(1, pad, d)],
+                              dim=1).reshape(-1, 4000, d)
+            audio_mask = audio.new_ones(*audio.shape[:2])
+            audio_mask[-1, -pad:] = 0
+            other_audio_inputs['attention_mask'] = audio_mask.bool()
         elif self.model_type == 'llava_next':
             input = image
             image = input['pixel_values']
@@ -803,6 +928,16 @@ class MultimodalModelRunner:
                     image).reshape(1, image.shape[0], -1,
                                    self.vision_model.image_dim_out)
                 visual_atts = None
+            elif self.model_type == "phi-4-multimodal":
+                visual_features = self.vision_model.get_img_features(
+                    model_runner_input.to(
+                        str_dtype_to_torch(self.vision_precision)),
+                    other_vision_inputs['attention_mask'])
+                visual_features = self.vision_model.img_projection(
+                    visual_features)
+                visual_atts = torch.ones(visual_features.size()[:-1],
+                                         dtype=torch.long).to(
+                                             model_runner_input.device)
             else:
                 if self.cpp_e2e:
                     # If using E2E C++ runtime, visual_features will not be computed here in Python runtime.
@@ -832,8 +967,13 @@ class MultimodalModelRunner:
                     visual_features, visual_atts = self.get_visual_features(
                         model_runner_input, other_vision_inputs)
                     model_runner_input = None
-
         profiler.stop("Vision encoder")
+
+        profiler.start("Audio encoder")
+        audio_features = None
+        if audio is not None:
+            audio_features = self.get_audio_features(audio, other_audio_inputs)
+        profiler.stop("Audio encoder")
 
         if self.model_type == 'fuyu':
             input_ids = image['input_ids'].to(torch.int32)
@@ -917,6 +1057,42 @@ class MultimodalModelRunner:
                                                 num_img_tokens)
             visual_features = visual_features.unsqueeze(0).repeat(
                 self.args.batch_size, 1, 1)
+            length = input_ids.shape[1]
+        elif self.model_type == 'phi-4-multimodal':
+            h, w = input["image_sizes"][0]
+            image_attention_mask = input.get("image_attention_mask")
+            if image_attention_mask is not None:
+                image_attention_mask = image_attention_mask[0].bool()
+            patch_size = 336 if self.model_type == 'phi-3-vision' else 448
+            profiler.start("Feature transform")
+            visual_features = PhiMMUtils.hd_feature_transform(
+                visual_features,
+                h // patch_size,
+                w // patch_size,
+                self.image_newlines["sub_GN"],
+                self.image_newlines["glb_GN"],
+                patch_mask=image_attention_mask)
+            profiler.stop("Feature transform")
+            input_ids = input["input_ids"].clone()
+            input_ids = input_ids.expand(self.args.batch_size,
+                                         *input_ids.shape[1:])
+            num_img_tokens = [visual_features.shape[0]]
+            if audio_features is not None:
+                dim = audio_features.shape[-1] // 2
+                audio_features = audio_features[..., -dim:]
+                audio_features = PhiMMUtils.reshape_audio_chunks(
+                    audio_features, other_audio_inputs["attention_mask"])
+                num_aud_tokens = [audio_features.shape[0]]
+            else:
+                num_aud_tokens = None
+            input_ids = self.ptuning_setup_phi3(visual_features, audio_features,
+                                                input_ids, num_img_tokens,
+                                                num_aud_tokens)
+            visual_features = visual_features.unsqueeze(0).repeat(
+                self.args.batch_size, 1, 1)
+            if audio_features is not None:
+                audio_features = audio_features.unsqueeze(0).repeat(
+                    self.args.batch_size, 1, 1)
             length = input_ids.shape[1]
         elif self.model_type == 'llava_next':
             visual_features = LlavaNextUtils.rearrange_image_features(
@@ -1023,6 +1199,12 @@ class MultimodalModelRunner:
             return input_ids, input_lengths, [
                 visual_features
             ], visual_features, model_runner_input
+        if self.model_type == 'phi-4-multimodal':
+            multimodal_features = torch.cat([visual_features, audio_features],
+                                            dim=1)
+            return input_ids, input_lengths, [
+                multimodal_features
+            ], multimodal_features, model_runner_input
 
         input_ids, ptuning_args = self.setup_fake_prompts(
             visual_features, pre_input_ids, post_input_ids, input_lengths)
@@ -1110,19 +1292,22 @@ class MultimodalModelRunner:
                  decoder_input_ids,
                  max_new_tokens,
                  other_vision_inputs={},
+                 other_audio_inputs={},
                  other_decoder_inputs={}):
         profiler.start("Generate")
         profiler.start("Preprocess")
         if 'qwen2_vl' in self.model_type:
             input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
-                pre_prompt, post_prompt, image, other_vision_inputs)
+                pre_prompt, post_prompt, image, other_vision_inputs,
+                other_audio_inputs)
             mrope_params = MropeParams(
                 mrope_rotary_cos_sin=mrope_args[0],
                 mrope_position_deltas=mrope_args[1],
             )
         else:
             input_ids, input_lengths, ptuning_args, visual_features, model_runner_input = self.preprocess(
-                pre_prompt, post_prompt, image, other_vision_inputs)
+                pre_prompt, post_prompt, image, other_vision_inputs,
+                other_audio_inputs)
         profiler.stop("Preprocess")
 
         # use prompt tuning to pass multimodal features
@@ -1371,6 +1556,14 @@ class MultimodalModelRunner:
                                 dtype=torch.long).to(image.device)
 
         return image_embeds, image_atts
+
+    def get_audio_features(self, audio, other_audio_inputs):
+        tmp_features, _ = self.audio_model.encoder(
+            audio.to(str_dtype_to_torch(self.audio_precision)),
+            other_audio_inputs['attention_mask'])
+        speech_out = self.audio_model.audio_projection['speech'](tmp_features)
+        vision_out = self.audio_model.audio_projection['vision'](tmp_features)
+        return torch.cat((speech_out, vision_out), dim=-1)
 
     def setup_fake_prompts_vila(self, batch_size, visual_features,
                                 split_input_ids, input_lengths):
@@ -1770,18 +1963,39 @@ class MultimodalModelRunner:
         input_ids = torch.tensor(input_ids)
         return input_ids
 
-    def ptuning_setup_phi3(self, visual_features, input_ids, num_img_tokens):
+    def ptuning_setup_phi3(self, visual_features, audio_features, input_ids,
+                           num_img_tokens, num_aud_tokens):
         fake_prompt_id = torch.arange(
             self.model_config.vocab_size,
             self.model_config.vocab_size + visual_features.shape[0])
-        MAX_INPUT_ID = int(1e9)
-        positions = torch.nonzero((input_ids < 0) & (input_ids > -MAX_INPUT_ID),
-                                  as_tuple=False)
+        if self.model_type == "phi-3-vision":
+            MAX_INPUT_ID = int(1e9)
+            positions = torch.nonzero(
+                (input_ids < 0) & (input_ids > -MAX_INPUT_ID), as_tuple=False)
+        elif self.model_type == "phi-4-multimodal":
+            IMAGE_TOKEN_ID = 200010
+            positions = torch.nonzero(input_ids == IMAGE_TOKEN_ID,
+                                      as_tuple=False)
         idx = 0
         for _, cnt in enumerate(num_img_tokens):
             input_ids[positions[idx, 0], positions[idx, 1]:positions[idx, 1] +
                       cnt] = fake_prompt_id[idx:idx + cnt]
             idx += cnt
+
+        if self.model_type == "phi-4-multimodal" and audio_features is not None:
+            prompt_id_offset = self.model_config.vocab_size + visual_features.shape[
+                0]
+            fake_prompt_id = torch.arange(
+                prompt_id_offset, prompt_id_offset + audio_features.shape[0])
+            AUDIO_TOKEN_ID = 200011
+            positions = torch.nonzero(input_ids == AUDIO_TOKEN_ID,
+                                      as_tuple=False)
+            idx = 0
+            for _, cnt in enumerate(num_aud_tokens):
+                input_ids[positions[idx, 0], positions[idx,
+                                                       1]:positions[idx, 1] +
+                          cnt] = fake_prompt_id[idx:idx + cnt]
+                idx += cnt
         return input_ids
 
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
@@ -1945,9 +2159,19 @@ class MultimodalModelRunner:
             images = load_images(image_path) if image_path is not None else None
         return images
 
-    def setup_inputs(self, input_text, raw_image):
+    def load_test_audio(self, audio_path):
+        if self.model_type != "phi-4-multimodal":
+            return None
+
+        assert audio_path is not None
+        import soundfile
+        audio = soundfile.read(audio_path)
+        return audio
+
+    def setup_inputs(self, input_text, raw_image, raw_audio=None):
         from ..tools.multimodal_builder import compute_rotary_pos_emb
         other_vision_inputs = {}
+        other_audio_inputs = {}
         other_decoder_inputs = {}
         if self.model_type not in ['qwen2_vl', 'vila', 'llava']:
             input_text = input_text[0] if isinstance(input_text,
@@ -2049,7 +2273,7 @@ class MultimodalModelRunner:
             other_vision_inputs['image_grid_thw'] = image_grid_thw
             other_vision_inputs['attention_mask'] = attention_mask_vit
             other_vision_inputs['rotary_pos_emb'] = rotary_pos_emb
-            return input_text, pre_prompt, post_prompt, images_qwenvl, decoder_input_ids, other_vision_inputs, other_decoder_inputs
+            return input_text, pre_prompt, post_prompt, images_qwenvl, decoder_input_ids, other_vision_inputs, other_audio_inputs, other_decoder_inputs
         elif 'nougat' in self.model_type:
             image = self.processor(raw_image,
                                    return_tensors="pt")['pixel_values']
@@ -2074,6 +2298,14 @@ class MultimodalModelRunner:
             prompt = pre_prompt + post_prompt
             image = self.processor(text=prompt,
                                    images=raw_image,
+                                   return_tensors="pt")
+        elif 'phi-4-multimodal' in self.model_type:
+            pre_prompt = "<|user|><|image_1|><|audio_1|>"
+            post_prompt = "<|end|><|assistant|>"
+            prompt = pre_prompt + post_prompt
+            image = self.processor(text=prompt,
+                                   images=[raw_image],
+                                   audios=[raw_audio],
                                    return_tensors="pt")
 
         elif 'internvl' in self.model_type:
@@ -2260,7 +2492,7 @@ class MultimodalModelRunner:
             post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'llava_next', 'internvl', 'llava_onevision'
+                'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision'
         ]:
             if image is not None:
                 if image.dim() == 5:
@@ -2297,16 +2529,17 @@ class MultimodalModelRunner:
             decoder_input_ids = decoder_input_ids.repeat(
                 (self.args.batch_size, 1))
 
-        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, other_vision_inputs, other_decoder_inputs
+        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, other_vision_inputs, other_audio_inputs, other_decoder_inputs
 
-    def run(self, input_text, input_image, max_new_tokens):
-        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, other_vision_inputs, other_decoder_inputs = self.setup_inputs(
-            input_text, input_image)
+    def run(self, input_text, input_image, input_audio, max_new_tokens):
+        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, other_vision_inputs, other_audio_inputs, other_decoder_inputs = self.setup_inputs(
+            input_text, input_image, input_audio)
         output_text = self.generate(pre_prompt,
                                     post_prompt,
                                     processed_image,
                                     decoder_input_ids,
                                     max_new_tokens,
                                     other_vision_inputs=other_vision_inputs,
+                                    other_audio_inputs=other_audio_inputs,
                                     other_decoder_inputs=other_decoder_inputs)
         return input_text, output_text

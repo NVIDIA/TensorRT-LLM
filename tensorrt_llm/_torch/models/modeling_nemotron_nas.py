@@ -4,8 +4,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.distributed import ParallelConfig, TensorParallelMode
-from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -15,6 +13,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -55,15 +54,9 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
         config.hidden_size,
         bias=False,
         dtype=config.torch_dtype,
-        parallel_config=ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank,
-            gather_output=True,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-        ),
+        mapping=model_config.mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
         quant_config=model_config.get_quant_config(),
         skip_create_weights=model_config.skip_create_weights,
     )

@@ -1,5 +1,5 @@
 import copy
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ def run_test(
     rtol: float = 1e-3,
     test_load_hook: bool = True,
     strict_loading: bool = True,
+    dynamic_shapes: Dict = None,
     *args,  # Additional arguments for transform
 ) -> GraphModule:
     # run model once
@@ -44,7 +45,7 @@ def run_test(
     print(num_params_model)
 
     # export + check (we clone the state dict to have a bit more freedom in testing below)
-    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
     print(gm)
     y_gm = gm(x)
     num_params_gm = count_parameters(gm)

@@ -538,7 +538,8 @@ class TRTLLMDecoder(Decoder):
                 scheduled_requests.context_requests,
                 scheduled_requests.generation_requests,
                 self.store["decoder_buffers"],
-                self.store["decoder_input_buffers"], self.model_config,
+                self.store["decoder_input_buffers"],
+                self.algs.decoder.decoder_state, self.model_config,
                 self.max_num_sequences, self.beam_width,
                 self.store["buffer_manager"], self.store["cuda_stream"])
             self.algs.decoder.forward_async(self.decoding_output,
@@ -557,8 +558,8 @@ class TRTLLMDecoder(Decoder):
             'cpu', non_blocking=True)
         finish_reasons_host = self.algs.decoder.decoder_state.finish_reasons.to(
             'cpu', non_blocking=True)
-        sequence_lengths_host_data = self.store[
-            "decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
+        sequence_lengths_host_data = self.algs.decoder.decoder_state.sequence_lengths.to(
+            'cpu', non_blocking=True)
 
         self.decoder_event.record()
         self.decoder_event.synchronize()

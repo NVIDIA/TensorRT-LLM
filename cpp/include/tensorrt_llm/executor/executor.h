@@ -198,22 +198,22 @@ private:
     std::optional<std::vector<SizeType32>> mBeamWidthArray;
 };
 
+/// @brief Additional output that should be gathered.
+/// @details By default gather output of shape [beamWidth, x] from each generation phase.
+///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
+class AdditionalModelOutput
+{
+public:
+    explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
+
+    std::string name;
+    bool gatherContext{false};
+};
+
 /// @brief Configuration that controls the outputs of a Result
 class OutputConfig
 {
 public:
-    /// @brief Additional output that should be gathered.
-    /// @details By default gather output of shape [beamWidth, x] from each generation phase.
-    ///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
-    class AdditionalModelOutput
-    {
-    public:
-        explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
-
-        std::string name;
-        bool gatherContext{false};
-    };
-
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
         bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
         bool returnPerfMetrics = false,
@@ -1165,23 +1165,28 @@ public:
     /// @param deviceIds The IDs of the GPUs involved in the execution of the model
     /// @param participantIds The participant IDs (MPI ranks if commType == kMPI) involved in the execution of the
     /// model. The first participant is considered to be the leader.
+    /// @param orchestratorConfig The orchestrator configuration. See OrchestratorConfig.
+    /// @param numNodes The number of nodes to use for execution. Default is 1.
     explicit ParallelConfig(CommunicationType commType = CommunicationType::kMPI,
         CommunicationMode commMode = CommunicationMode::kLEADER,
         std::optional<std::vector<SizeType32>> deviceIds = std::nullopt,
         std::optional<std::vector<SizeType32>> participantIds = std::nullopt,
-        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt);
+        std::optional<OrchestratorConfig> const& orchestratorConfig = std::nullopt,
+        std::optional<SizeType32> numNodes = std::nullopt);
 
     [[nodiscard]] CommunicationType getCommunicationType() const;
     [[nodiscard]] CommunicationMode getCommunicationMode() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getDeviceIds() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> getParticipantIds() const;
     [[nodiscard]] std::optional<OrchestratorConfig> getOrchestratorConfig() const;
+    [[nodiscard]] std::optional<SizeType32> getNumNodes() const;
 
     void setCommunicationType(CommunicationType type);
     void setCommunicationMode(CommunicationMode mode);
     void setDeviceIds(std::vector<SizeType32> const& deviceIds);
     void setParticipantIds(std::vector<SizeType32> const& participantIds);
     void setOrchestratorConfig(OrchestratorConfig const& orchestratorConfig);
+    void setNumNodes(SizeType32 numNodes);
 
 private:
     friend class Serialization;
@@ -1200,6 +1205,9 @@ private:
 
     /// @brief Optional orchestrator configuration
     std::optional<OrchestratorConfig> mOrchestratorConfig;
+
+    /// @brief The number of nodes to use for execution. Default is 1.
+    std::optional<SizeType32> mNumNodes;
 };
 
 /// @brief config for PeftCacheManager
@@ -1413,7 +1421,7 @@ public:
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
@@ -1443,7 +1451,7 @@ public:
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
-    [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
 
@@ -1469,7 +1477,7 @@ public:
     void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
-    void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
+    void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
 
@@ -1541,8 +1549,8 @@ private:
     /// @brief The guided decoding configuration
     std::optional<GuidedDecodingConfig> mGuidedDecodingConfig;
 
-    /// @brief The additional output tensor names
-    std::optional<std::vector<std::string>> mAdditionalOutputNames;
+    /// @brief The additional outputs to gather from the model.
+    std::optional<std::vector<AdditionalModelOutput>> mAdditionalModelOutputs;
 
     /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
