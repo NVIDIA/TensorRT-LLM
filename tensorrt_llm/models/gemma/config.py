@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from json import loads
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -148,13 +150,14 @@ class GemmaConfig(PretrainedConfig):
     @staticmethod
     def get_hf_config(config_dir: "Union[str, PathLike]"):
         import transformers
-        SUPPORTED_HF_ARCHITECTURES = (
-            transformers.GemmaConfig,
-            transformers.Gemma2Config,
-            transformers.Gemma3Config,
-        )
-        hf_config = transformers.AutoConfig.from_pretrained(config_dir)
-        assert isinstance(hf_config, SUPPORTED_HF_ARCHITECTURES)
+        model_type = loads(
+            (Path(config_dir) / "config.json").read_text())["model_type"]
+        HFConfigClass = {
+            "gemma2": transformers.GemmaConfig,
+            "gemma": transformers.Gemma2Config,
+            "gemma3_text": transformers.Gemma3TextConfig,
+        }[model_type]
+        hf_config = HFConfigClass.from_pretrained(config_dir)
         return hf_config
 
     @classmethod
