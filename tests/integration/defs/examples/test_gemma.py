@@ -306,9 +306,9 @@ def gemma_1gpu_summary(batch_size,
 
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
-    window = ({
+    window = {
         'max_attention_window': max_attention_window
-    }) if max_attention_window is not None else max_attention_window
+    } if max_attention_window is not None else {}
 
     print("Run summarize...")
     summary_cmd = generate_summary_cmd(gemma_example_root,
