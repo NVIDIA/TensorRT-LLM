@@ -20,3 +20,7 @@
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
 	url = https://github.com/mlc-ai/xgrammar.git
+[submodule "3rdparty/nixl"]
+	path = 3rdparty/nixl
+	url = https://github.com/ai-dynamo/nixl.git
+	branch = v0.1.0
