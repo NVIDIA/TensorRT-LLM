@@ -428,8 +428,5 @@ unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugspr
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
-examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] SKIP (https://nvbugs/5211717)
-examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1] SKIP (https://nvbugs/5211717)
-examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2] SKIP (https://nvbugs/5211717)
 accuracy/test_cli_flow.py::TestGpt2Medium::test_fp8_lm_head SKIP (https://nvbugs/5214229)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214239)
