@@ -153,18 +153,22 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         {
             int bufferId = mConcurrenceSendResource.mConcurrence++;
 
-            if (!onlyUseAsyncBuffer
-                && mConcurrenceSendResource.mSendbuffers.find(bufferId) == mConcurrenceSendResource.mSendbuffers.end())
+            if (!(common::getEnvUseNIXLKvCache()))
             {
-                if (common::getEnvKVCacheTransferUseAsyncBuffer())
+                if (!onlyUseAsyncBuffer
+                    && mConcurrenceSendResource.mSendbuffers.find(bufferId)
+                        == mConcurrenceSendResource.mSendbuffers.end())
                 {
-                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpu(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
-                }
-                else
-                {
-                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpuSync(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    if (common::getEnvKVCacheTransferUseAsyncBuffer())
+                    {
+                        mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpu(
+                            runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    }
+                    else
+                    {
+                        mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpuSync(
+                            runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    }
                 }
             }
             preAllocSendBuffer = mConcurrenceSendResource.mSendbuffers[bufferId];
@@ -307,6 +311,26 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     }
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
+}
+
+runtime::ITensor::SharedPtr CacheFormatter::getPreAllocatedRecvBuffer(std::string const& processString) const
+{
+    std::scoped_lock<std::mutex> lock(mBufferMutex);
+    auto it = mProcessToBufferIndex.find(processString);
+    if (it == mProcessToBufferIndex.end())
+    {
+        // Find first available buffer
+        for (int i = 0; i < mPreAllocatedRecvBuffers.size(); ++i)
+        {
+            if (mPreAllocatedRecvBuffers[i] != nullptr)
+            {
+                mProcessToBufferIndex[processString] = i;
+                return mPreAllocatedRecvBuffers[i];
+            }
+        }
+        TLLM_THROW("No available pre-allocated receive buffers");
+    }
+    return mPreAllocatedRecvBuffers[it->second];
 }
 
 void CacheFormatter::formatInput(LlmRequest const& llmRequest,
@@ -481,6 +505,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                             processString = llmRequest.getDataTransceiverState().getCommState()->toString();
                         }
 
+                        if (!common::getEnvUseNIXLKvCache())
                         {
                             std::scoped_lock<std::mutex> lock(mProcessToRecvBufferMutex);
                             if (mProcessToRecvBuffer.find(processString) == mProcessToRecvBuffer.end())
@@ -500,6 +525,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                                 }
                             }
                             preAllocRecvBufferTemp = mProcessToRecvBuffer[processString];
+                        }
+                        else
+                        {
+                            preAllocRecvBufferTemp = getPreAllocatedRecvBuffer(processString);
                         }
                     }
 
