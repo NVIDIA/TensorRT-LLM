@@ -490,7 +490,7 @@ def launchTestListCheck(pipeline)
             sh "tar -zxf ${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            sh "python3 ${llmSrc}/jenkins/scripts/check_test_list.py --l0 --qa"
+            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
