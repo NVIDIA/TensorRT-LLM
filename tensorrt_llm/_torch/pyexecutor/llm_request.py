@@ -38,6 +38,8 @@ REQUEST_TYPE_MAPPING = {
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     def __init__(self, *args, client_id=None, **kwargs):
+        self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
+                                                    None)
         super().__init__(*args, client_id=client_id, **kwargs)
         self.py_client_id = client_id
         self.py_request_id = self.request_id
@@ -140,6 +142,8 @@ def executor_request_to_llm_request(req_id: int,
         logits_post_processor=None,
         apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
+        py_logits_post_processors=getattr(executor_request,
+                                          "py_logits_post_processors", None),
         encoder_input_tokens=None,
         return_encoder_output=False,
         client_id=executor_request.client_id
