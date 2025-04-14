@@ -71,7 +71,7 @@ class LlmManager:
             start_timestamp=request_start_timestamp,
             end_timestamp=response_end_timestamp,
             request_id=response.request_id,
-            num_input_tokens=output._prompt_len,
+            num_input_tokens=output.prompt_len,
             response_is_final=response.finished,
             error=False,
             tokens=tokens,
