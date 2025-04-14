@@ -182,6 +182,7 @@ examples/test_mixtral.py::test_llm_mixtral_v1_smooth_quant_4gpus[Mixtral-8x7B-v0
 examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int4-nb:1]
 examples/test_mixtral.py::test_llm_mixtral_wo_2gpus_summary[Mixtral-8x7B-v0.1-int8-nb:4]
 examples/test_mixtral.py::test_llm_mixtral_1gpu_fp4_llmapi[Mixtral-8x7B-Instruct-v0.1]
+examples/test_mixtral.py::test_llm_mixtral_4gpus_fp8_mmlu_llmapi[Mixtral-8x7B-Instruct-v0.1-fp8]
 examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[mixtral-8x7b-v0.1-AWQ]
 examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[Mixtral-8x7B-Instruct-v0.1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
@@ -455,6 +456,29 @@ test_e2e.py::test_mistral_e2e[use_py_session]
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
 test_e2e.py::test_llmapi_server_example
+test_e2e.py::test_llmapi_build_command_parameters_align[llama-llama-models-v2/TinyLlama-1.1B-Chat-v1.0]
+test_e2e.py::test_llmapi_load_ckpt_from_convert_command
+test_e2e.py::test_llmapi_exit
+test_e2e.py::test_llmapi_exit_multi_gpu
+test_e2e.py::test_llmapi_chat_example
+test_e2e.py::test_llmapi_server_example
+test_e2e.py::test_llmapi_quickstart
+test_e2e.py::test_llmapi_example_inference
+test_e2e.py::test_llmapi_example_customize
+test_e2e.py::test_llmapi_example_inference_async
+test_e2e.py::test_llmapi_example_inference_async_streaming
+test_e2e.py::test_llmapi_example_quantization
+test_e2e.py::test_llmapi_example_logits_processor
+test_e2e.py::test_llmapi_example_multilora
+test_e2e.py::test_llmapi_example_guided_decoding
+test_e2e.py::test_llmapi_example_lookahead_decoding
+test_e2e.py::test_llmapi_example_medusa_decoding
+test_e2e.py::test_llmapi_example_medusa_decoding_use_modelopt
+test_e2e.py::test_llmapi_example_distributed_tp2
+test_e2e.py::test_llmapi_example_distributed_autopp_tp2
+test_e2e.py::test_llmapi_quickstart_atexit
+test_e2e.py::test_llmapi_quant_llama_70b
+
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
