@@ -348,9 +348,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY
-                    or request_type
-                    == tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
+                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
                 raise ValueError(
                     "Context only requests are not supported in pytorch backend when overlap is enabled."
                 )
@@ -419,7 +417,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params)
 
         self._results[client_id] = result
 

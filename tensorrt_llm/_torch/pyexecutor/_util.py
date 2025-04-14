@@ -64,7 +64,7 @@ def get_cache_size_per_token(model_config, mapping):
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
 
-    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
     mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
@@ -79,8 +79,11 @@ def get_fraction_from_executor_config(executor_config):
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
-                   mapping: Mapping, alloc_kv_tokens: int):
-    kv_size_per_token = get_cache_size_per_token(model_config, mapping)
+                   draft_model_config, mapping: Mapping, alloc_kv_tokens: int):
+    model_kv_size_per_token = get_cache_size_per_token(model_config, mapping)
+    draft_kv_size_per_token = get_cache_size_per_token(
+        draft_model_config, mapping) if draft_model_config is not None else 0
+    kv_size_per_token = model_kv_size_per_token + draft_kv_size_per_token
 
     available_kv_mem = (total_gpu_memory - peak_memory +
                         alloc_kv_tokens * kv_size_per_token) * fraction
@@ -175,9 +178,10 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     kv_stats = py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").get_kv_cache_stats()
 
+    draft_model_config = draft_model_engine.model.model_config if draft_model_engine is not None else None
     kv_cache_max_tokens = cal_max_tokens(
         peak_memory, total_gpu_memory, fraction,
-        model_engine.model.model_config, mapping,
+        model_engine.model.model_config, draft_model_config, mapping,
         kv_stats.max_num_blocks * kv_stats.tokens_per_block)
 
     if kv_cache_max_tokens_in is not None and kv_cache_max_tokens is not None:
@@ -217,8 +221,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
 
-        num_hidden_layers = len(
-            mapping.pp_layers_torch(config.num_hidden_layers))
+        num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
         # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
         if config.architectures[0] == "Nemotron5ForCausalLM":
             # attention layers are derived from configuration (hybrid_override_pattern)

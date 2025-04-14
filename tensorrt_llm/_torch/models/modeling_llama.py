@@ -6,8 +6,8 @@ from torch import nn
 from transformers import Llama4Config, LlamaConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, TensorParallelMode)
+                                             AllReduceParams, DeepseekAllReduce)
+from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -19,12 +19,15 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
+                              WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp,
+                             unpack_hidden_states)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -116,7 +119,8 @@ class Llama4MoE(nn.Module):
             reduce_results=
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
-            model_config=model_config)
+            model_config=model_config,
+            apply_router_weight_on_input=True)
 
         self.shared_expert = GatedMLP(
             hidden_size=hidden_size,
@@ -132,11 +136,8 @@ class Llama4MoE(nn.Module):
                              dtype=config.torch_dtype,
                              quant_config=None)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
@@ -177,7 +178,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if self.parallel_config.tensor_parallel_size > 1:
+        if self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -268,14 +269,11 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
-        self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
 
     def forward(
         self,
@@ -298,6 +296,10 @@ class LlamaDecoderLayer(DecoderLayer):
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
 
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
         if self.is_nope_layer:
@@ -307,9 +309,9 @@ class LlamaDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
+                                      or self.mapping.tp_size == 1)),
             **kwargs,
         )
 
@@ -324,17 +326,16 @@ class LlamaDecoderLayer(DecoderLayer):
                 ))
         else:
             # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = unpack_hidden_states(
+                self.post_attention_layernorm(hidden_states, residual))
 
         feed_forward = self.feed_forward if self.is_llama4 else self.mlp
         hidden_states = feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
+                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
+                POST_MLP_FUSION or self.mapping.tp_size == 1)),
             min_latency_mode=min_latency_mode,
         )
         if spec_metadata is not None:
@@ -369,8 +370,8 @@ class LlamaDecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
         elif self.next_layer_layernorm:
-            hidden_states, residual = self.next_layer_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = unpack_hidden_states(
+                self.next_layer_layernorm(hidden_states, residual))
 
         return hidden_states, residual
 
@@ -388,8 +389,6 @@ class Eagle3LlamaAttention(LlamaAttention):
         config = model_config.pretrained_config
 
         tp_size = model_config.mapping.tp_size
-        tp_rank = model_config.mapping.tp_rank
-        gpus_per_node = model_config.mapping.gpus_per_node
 
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
@@ -398,13 +397,8 @@ class Eagle3LlamaAttention(LlamaAttention):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=config.attention_bias,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tp_size,
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=model_config.get_quant_config(),
@@ -486,15 +480,9 @@ class LlamaModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank,
-                gather_output=True,
-                gpus_per_node=model_config.mapping.gpus_per_node,
-            ),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
@@ -513,28 +501,41 @@ class LlamaModel(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+        if self.model_config.mapping.is_first_pp_rank():
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            hidden_states = inputs_embeds
+            residual = None
+        else:
+            if pipeline_interface is None:
+                raise ValueError(
+                    "pipeline_interface is required for non-first pp rank.")
+            hidden_states, residual = pipeline_interface
+            hidden_states, residual = self.local_layers()[0].input_layernorm(
+                hidden_states, residual)
+
+        for decoder_layer in self.local_layers():
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = inputs_embeds
-
-        residual = hidden_states
-        hidden_states = self.layers[0].input_layernorm(hidden_states)
-        for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual,
-                                                    spec_metadata=spec_metadata)
-
-        return hidden_states
+        if self.model_config.mapping.is_last_pp_rank():
+            return hidden_states
+        else:
+            return PipelineInterface(hidden_states, residual)
 
 
 @register_auto_model("LlamaForCausalLM")
@@ -556,7 +557,8 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+                # layers[idx + 1] is MissingLayer for last layer in pp rank
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -592,7 +594,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -624,7 +626,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
