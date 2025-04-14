@@ -326,9 +326,11 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
 
 ### FP8 KV Cache and MLA
 
-FP8 KV Cache and MLA quantization is supported, which delivers two key performance advantages:
+FP8 KV Cache and MLA quantization could be enabled, which delivers two key performance advantages:
 - Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
 - MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
+
+FP8 KV Cache and MLA is supported on Hopper and Blackwell. On Hopper we use the [FP8 FlashMLA kernel](https://github.com/deepseek-ai/FlashMLA/pull/54) from community. On Blackwell we use the kernel generated from an internal code-gen based solution called `trtllm-gen`. Note that FP8 MLA on Blackwell currently suffers from accuracy issues and there are ongoing efforts to solve it.
 
 You can enable FP8 MLA through either of these methods:
 
