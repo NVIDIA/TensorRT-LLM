@@ -96,17 +96,8 @@ public:
         return getModelConfig().getDataType();
     }
 
-    nvinfer1::DataType getTensorDataType(std::string const& name) const override
-    {
-        auto const& engine = mRuntime->getEngine();
-        return engine.getTensorDataType(name.c_str());
-    }
-
-    nvinfer1::Dims getTensorShape(std::string const& name) const override
-    {
-        auto const& engine = mRuntime->getEngine();
-        return engine.getTensorShape(name.c_str());
-    }
+    nvinfer1::DataType getTensorDataType(std::string const& name) const override;
+    nvinfer1::Dims getTensorShape(std::string const& name) const override;
 
     [[nodiscard]] TrtGptModelType getModelType() const override
     {
