@@ -300,7 +300,8 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              cutlass_min_latency_mode):
+                              cutlass_min_latency_mode,
+                              llama4_tp8ep1_min_latency_mode):
         if self.enable_attention_dp and self.mapping.tp_size > 1:
             max_num_token_across_dp_ranks = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
@@ -311,6 +312,7 @@ class Llama4MoE(nn.Module):
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
+                                     llama4_tp8ep1_min_latency_mode,
                                      all_rank_num_tokens=all_rank_num_tokens)
         return routed_output
 
@@ -320,12 +322,14 @@ class Llama4MoE(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
+        llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
         fn0 = lambda: self.shared_expert(hidden_states)
         fn1 = lambda: self.compute_routed_output(
-            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
+            hidden_states, all_rank_num_tokens, cutlass_min_latency_mode,
+            llama4_tp8ep1_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
             fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
         if cutlass_min_latency_mode:
@@ -435,6 +439,8 @@ class Llama4DecoderLayer(DecoderLayer):
         # TODO: Remove it after we fix crash on Hopper
         major, minor = torch.cuda.get_device_capability()
         is_blackwell = (major * 10 + minor) >= 100
+        num_tokens = hidden_states.size(0)
+        llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 4 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
         # cutlass_min_latency_mode = hidden_states.size(
         #     0
         # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
@@ -470,15 +476,27 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states, residual = unpack_hidden_states(
                 self.post_attention_layernorm(hidden_states, residual))
 
-        hidden_states = self.feed_forward(
-            hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
-            cutlass_min_latency_mode=cutlass_min_latency_mode,
-        )
+        if self.is_mlp_layer:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            )
+        else:
+            hidden_states = self.feed_forward(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(enable_allreduce=not (
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+                cutlass_min_latency_mode=cutlass_min_latency_mode,
+                llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
+            )
+
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
             # PyExecutor will extract these from the model engine's spec metadata.
