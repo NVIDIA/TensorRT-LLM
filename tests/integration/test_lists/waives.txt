@@ -26,7 +26,7 @@ full:GH200/examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision
 examples/test_qwen.py::test_llm_qwen1_5_moe_single_gpu_lora[qwen1.5_moe_a2.7b_chat-Upcycled-Qwen1.5-MoE2.7B-LoRA] SKIP (https://nvbugs/4781396)
 perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-quant:fp8-tp:4] SKIP (SKIP due to timeout of quantization)
 perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:8] SKIP (SKIP due to timeout of quantization)
-test_cpp.py::test_model[encoder-90] SKIP (waive Encoder-only test because it doesn't take batched input)
+test_cpp.py::test_model[-encoder-90] SKIP (waive Encoder-only test because it doesn't take batched input)
 full:L40S/examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only] SKIP (skip on L40S commit f9a0fcb0)
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-3-small-128k-instruct-fp8-bfloat16] SKIP (https://nvbugs/4955671)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-enable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/4967883)
