@@ -1436,6 +1436,8 @@ def test_llmapi_quickstart_atexit(llm_root, engine_dir, llm_venv):
     llm_venv.run_cmd([str(script_path)])
 
 
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device_memory(80000)
 def test_llmapi_quant_llama_70b(llm_root, engine_dir, llm_venv):
     # Test quantizing llama-70b model with only 2 H100 GPUs
     # The background: there is a bug preventing quantization of llama-70b model with <tp-size> GPUs
