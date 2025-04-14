@@ -10,6 +10,7 @@ from tensorrt_llm._utils import (mpi_allgather, mpi_broadcast,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import (get_num_spec_layers, get_spec_decoder,
@@ -24,7 +25,6 @@ from .py_executor import PyExecutor
 from .resource_manager import KVCacheManager, PeftCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
-from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 
 
 def is_mla(config):
@@ -270,10 +270,17 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         return None
 
 
-def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
-                                mapping, pytorch_backend_config,
-                                executor_config, ctx_chunk_config, model_engine,
-                                draft_model_engine, start_worker, lora_config: LoraConfig = None):
+def create_py_executor_instance(dist,
+                                kv_cache_manager,
+                                draft_kv_cache_manager,
+                                mapping,
+                                pytorch_backend_config,
+                                executor_config,
+                                ctx_chunk_config,
+                                model_engine,
+                                draft_model_engine,
+                                start_worker,
+                                lora_config: LoraConfig = None):
     spec_config = model_engine.spec_config
     resources = {
         KV_CACHE_MANAGER_KEY: kv_cache_manager
@@ -310,7 +317,7 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
             raise ValueError(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
-    
+
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
         load_torch_hf_lora(lora_config)
