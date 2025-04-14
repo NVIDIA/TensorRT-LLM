@@ -53,7 +53,9 @@ class GroupRMSNorm(nn.Module):
 
     def __init__(self,
                  *,
-                 eps: float = 1e-6,
+                 hidden_sizes: list[int],
+                 eps: float = 1e-5,
+                 weight_bias: float = 0.0,
                  enable_weights: bool = False,
                  dtype: Optional[torch.dtype] = None,
                  device: Optional[torch.device] = None):
@@ -69,8 +71,16 @@ class GroupRMSNorm(nn.Module):
         """
         super().__init__()
         self.variance_epsilon = eps
+        self.weight_bias = weight_bias
         self.enable_weights = enable_weights
-        assert not enable_weights, "enable_weights is not supported yet"
+        # Create dummy weights is enable_weights is False
+        # The weights will be ignored by the CUDA kernel
+        if not enable_weights:
+            self.dummy_weights = [
+                nn.Parameter(
+                    torch.empty(hidden_size, dtype=dtype, device=device))
+                for hidden_size in hidden_sizes
+            ]
 
     def forward(
             self,
@@ -88,11 +98,16 @@ class GroupRMSNorm(nn.Module):
 
         if len(inputs) == 0:
             return []
+        if self.enable_weights:
+            assert weights is not None, "weights must be provided if enable_weights is True"
+            outputs = torch.ops.trtllm.group_rms_norm(inputs, weights,
+                                                      self.variance_epsilon,
+                                                      self.weight_bias,
+                                                      self.enable_weights)
+            return outputs
 
-        weights = [torch.ones_like(input) for input in inputs]
-
-        # Use CUDA kernel if available
-        outputs = torch.ops.trtllm.group_rms_norm(inputs, weights,
+        outputs = torch.ops.trtllm.group_rms_norm(inputs, self.dummy_weights,
                                                   self.variance_epsilon,
+                                                  self.weight_bias,
                                                   self.enable_weights)
         return outputs

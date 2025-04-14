@@ -26,6 +26,6 @@ namespace tensorrt_llm::kernels::group_rms_norm
 template <typename DType>
 void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32_t const* input_dims,
     uint32_t const* input_strides, uint32_t const* output_strides, const uint32_t batch_size, const uint32_t num_inputs,
-    float const eps, bool enable_weights, cudaStream_t stream);
+    float const eps, float const weight_bias, bool enable_weights, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::group_rms_norm
