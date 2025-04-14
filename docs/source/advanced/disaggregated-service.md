@@ -60,8 +60,6 @@ In the code example above, the `contextRequestId` assigned by the contextExecuto
 
 An `orchestrator` is required in `disaggregated-service` to manage multiple executor instances and route requests to different executors, TRT-LLM provides class `DisaggExecutorOrchestrator` in `cpp/include/tensorrt_llm/executor/disaggServerUtil.h` to launch multiple executor instances, however, `DisaggExecutorOrchestrator` only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their usage scenario.
 
-TRT-LLM currently implements KV cache transfer using `CUDA-aware MPI`, and all executor processes involved need to hold the same MPI world communicator. Therefore, TRT-LLM only supports launching multiple executors using `MPI`, and the `CommunicationMode` of the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for `disaggregated-service`, TRT-LLM will relax this restriction in future version to manage executors with greater ease.
-
 
 ## Example
 
@@ -75,15 +73,17 @@ Please refer to `benchmarks/cpp/disaggServerBenchmark.cpp` and `benchmarks/cpp/R
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-* `TRTLLM_USE_MPI_KVCACHE`: Whether to use MPI to transfer KV cache. Users need to set this environment variable to `1` to enable the disaggregated service, as TRT-LLM's disaggregated service relies on `CUDA-aware MPI` for KV cache transfer. Currently, the default value is `0`.
+* `TRTLLM_USE_MPI_KVCACHE`: Whether to use MPI to transfer KV cache. Currently, the default value is `0`.
+
+* `TRTLLM_USE_UCX_KVCACHE`: Whether to use UCX to transfer KV cache. Currently, the default value is `0`. To use disaggregated service, either `TRTLLM_USE_MPI_KVCACHE=1` or `TRTLLM_USE_UCX_KVCACHE=1` is required to be set.
 
 * `TRTLLM_PARALLEL_CACHE_SEND`: If set to `1`, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is `0`.
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
 
-* `TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL`:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank in parallel. If set to `1`, the generation rank will receive KV cache from each rank within one context instance sequentially. The default value is `0`.
+* `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL`:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to `1`, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is `0`.
 
-* `TRTLLM_REQUEST_KV_CACHE_SERIAL`: GenerationExecutor prepares independent resources for each context executor to receive KV cache. Requests whose KV cache are received from different context executors will be processed concurrently. If set to `1`, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is `0`.
+* `TRTLLM_REQUEST_KV_CACHE_CONCURRENT`: If set to `1`, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to `0`, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is `0`.
 
 * `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER`: TRT-LLM typically copies non-contiguous data into a temporary buffer before sending KV cache. If set to `1`, TRT-LLM will attempt to directly transmit each KV cache block, eliminating extra copies. The default value is `0`.
 
@@ -134,18 +134,24 @@ A. please set the environment variables
 ```
 export TRTLLM_USE_MPI_KVCACHE=1
 ```
+or
+```
+export TRTLLM_USE_UCX_KVCACHE=1
+```
+When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.
+
 
 *Q. Why do some profiling tools show that TRT-LLM's KV cache transfer does not utilize NVLink even on devices equipped with NVLink?*
 
 A. Ensure TRT-LLM is running with `UCX`-backend `CUDA-aware MPI` , and check version of `UCX` with `ucx_info -v`.
 If the version of UCX <=1.17, set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n` to enable NVLink.
 If the version of UCX >=1.18, there are several ways to enable NVLink:
-1. Set the environment variables `UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda`, `UCX_CUDA_COPY_DMABUF=no` and `UCX_MEMTYPE_CACHE=n`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size` and `UCX_MEMTYPE_CACHE=n`. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+1. Set the environment variables `UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda`, `UCX_CUDA_COPY_DMABUF=no`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
+2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
 
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer, but it is not enabled by default. There are several ways to enable GPU direct RDMA:
-1. Set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size` and `UCX_MEMTYPE_CACHE=n`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
-To achieve the optimal performance when using GPU direct RDMA, it is advisable to create CUDA context before MPI initialization. One possible approach is to rely on MPI environment variables to set the correct device before MPI initialization.
+1. Set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
+2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+To achieve the optimal performance when using GPU direct RDMA, it is advisable to create CUDA context before MPI initialization when TRTLLM_USE_MPI_KVCACHE=1 is set. One possible approach is to rely on MPI environment variables to set the correct device before MPI initialization.

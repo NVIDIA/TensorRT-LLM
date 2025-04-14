@@ -226,7 +226,7 @@ OutputConfig Serialization::deserializeOutputConfig(std::istream& is)
     auto excludeInputFromOutput = su::deserialize<bool>(is);
     auto returnEncoderOutput = su::deserialize<bool>(is);
     auto returnPerfMetrics = su::deserialize<bool>(is);
-    auto additionalOutputs = su::deserialize<std::optional<std::vector<OutputConfig::AdditionalModelOutput>>>(is);
+    auto additionalOutputs = su::deserialize<std::optional<std::vector<AdditionalModelOutput>>>(is);
     return OutputConfig{returnLogProbs, returnContextLogits, returnGenerationLogits, excludeInputFromOutput,
         returnEncoderOutput, returnPerfMetrics, additionalOutputs};
 }
@@ -255,21 +255,21 @@ size_t Serialization::serializedSize(OutputConfig const& config)
     return totalSize;
 }
 
-// OutputConfig::AdditionalModelOutput
-OutputConfig::AdditionalModelOutput Serialization::deserializeAdditionalModelOutput(std::istream& is)
+// AdditionalModelOutput
+AdditionalModelOutput Serialization::deserializeAdditionalModelOutput(std::istream& is)
 {
     auto name = su::deserialize<std::string>(is);
     auto gatherContext = su::deserialize<bool>(is);
-    return OutputConfig::AdditionalModelOutput{name, gatherContext};
+    return AdditionalModelOutput{name, gatherContext};
 }
 
-void Serialization::serialize(OutputConfig::AdditionalModelOutput const& additionalModelOutput, std::ostream& os)
+void Serialization::serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os)
 {
     su::serialize(additionalModelOutput.name, os);
     su::serialize(additionalModelOutput.gatherContext, os);
 }
 
-size_t Serialization::serializedSize(OutputConfig::AdditionalModelOutput const& additionalModelOutput)
+size_t Serialization::serializedSize(AdditionalModelOutput const& additionalModelOutput)
 {
     size_t totalSize = 0;
     totalSize += su::serializedSize(additionalModelOutput.name);
@@ -988,7 +988,8 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxSeqIdleMicroseconds)>(is);
     auto specDecConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getSpecDecConfig)>(is);
     auto guidedDecodingConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGuidedDecodingConfig)>(is);
-    auto additionalOutputNames = su::deserializeWithGetterType<decltype(&ExecutorConfig::getAdditionalOutputNames)>(is);
+    auto additionalModelOutputs
+        = su::deserializeWithGetterType<decltype(&ExecutorConfig::getAdditionalModelOutputs)>(is);
     auto gatherGenerationLogits
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGatherGenerationLogits)>(is);
 
@@ -996,7 +997,7 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
         iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens, parallelConfig,
         peftCacheConfig, std::nullopt, decodingConfig, gpuWeightsPercent, maxQueueSize, extendedRuntimePerfKnobConfig,
         debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig, guidedDecodingConfig,
-        additionalOutputNames, gatherGenerationLogits};
+        additionalModelOutputs, gatherGenerationLogits};
 }
 
 size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
@@ -1027,7 +1028,7 @@ size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
     totalSize += su::serializedSize(executorConfig.getMaxSeqIdleMicroseconds());
     totalSize += su::serializedSize(executorConfig.getSpecDecConfig());
     totalSize += su::serializedSize(executorConfig.getGuidedDecodingConfig());
-    totalSize += su::serializedSize(executorConfig.getAdditionalOutputNames());
+    totalSize += su::serializedSize(executorConfig.getAdditionalModelOutputs());
     totalSize += su::serializedSize(executorConfig.getGatherGenerationLogits());
 
     return totalSize;
@@ -1059,7 +1060,7 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
     su::serialize(executorConfig.getMaxSeqIdleMicroseconds(), os);
     su::serialize(executorConfig.getSpecDecConfig(), os);
     su::serialize(executorConfig.getGuidedDecodingConfig(), os);
-    su::serialize(executorConfig.getAdditionalOutputNames(), os);
+    su::serialize(executorConfig.getAdditionalModelOutputs(), os);
     su::serialize(executorConfig.getGatherGenerationLogits(), os);
 }
 
@@ -1198,8 +1199,9 @@ ParallelConfig Serialization::deserializeParallelConfig(std::istream& is)
     auto deviceIds = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto participantids = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     auto orchestratorConfig = su::deserialize<std::optional<OrchestratorConfig>>(is);
+    auto numNodes = su::deserialize<std::optional<SizeType32>>(is);
 
-    return ParallelConfig{commType, commMode, deviceIds, participantids, orchestratorConfig};
+    return ParallelConfig{commType, commMode, deviceIds, participantids, orchestratorConfig, numNodes};
 }
 
 void Serialization::serialize(ParallelConfig const& parallelConfig, std::ostream& os)
@@ -1209,6 +1211,7 @@ void Serialization::serialize(ParallelConfig const& parallelConfig, std::ostream
     su::serialize(parallelConfig.getDeviceIds(), os);
     su::serialize(parallelConfig.getParticipantIds(), os);
     su::serialize(parallelConfig.getOrchestratorConfig(), os);
+    su::serialize(parallelConfig.getNumNodes(), os);
 }
 
 size_t Serialization::serializedSize(ParallelConfig const& parallelConfig)
@@ -1219,6 +1222,7 @@ size_t Serialization::serializedSize(ParallelConfig const& parallelConfig)
     totalSize += su::serializedSize(parallelConfig.getDeviceIds());
     totalSize += su::serializedSize(parallelConfig.getParticipantIds());
     totalSize += su::serializedSize(parallelConfig.getOrchestratorConfig());
+    totalSize += su::serializedSize(parallelConfig.getNumNodes());
     return totalSize;
 }
 

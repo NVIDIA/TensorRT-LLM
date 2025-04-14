@@ -37,7 +37,7 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     explicit DecoderInputBuffers(
-        SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep, runtime::BufferManager const& manager);
+        SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
 
     // buffers for setup
     TensorPtr setupBatchSlots;
@@ -48,7 +48,7 @@ public:
     TensorPtr forwardBatchSlotsRequestOrderDevice;
     TensorPtr fillValues;
     TensorPtr fillValuesDevice;
-    TensorPtr forwardBatchSlots;
+    std::vector<TensorPtr> forwardBatchSlots;
 };
 
 class DecoderStepAsyncSend
@@ -111,13 +111,10 @@ public:
     TensorPtr slotOutputIdsHost; // [beamWidth, maxSeqLen], outputIds of single batch slot
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
-    TensorPtr sequenceLengths;     // [mMaxNumRequests, beamWidth]
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
     TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
-    TensorPtr cumLogProbs;         // [mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
-    TensorPtr logProbs;            // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
     TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
@@ -170,6 +167,7 @@ public:
 
     TensorPtr outputIds;           // [beamWidth, maxSeqLen], outputIds of single batch slot
     TensorPtr outputIdsHost;       // [beamWidth, maxSeqLen], outputIds of single batch slot
+    TensorPtr sequenceLengths;     // [beamWidth]
     TensorPtr sequenceLengthsHost; // [beamWidth]
     TensorPtr cumLogProbs;         // [beamWidth]
     TensorPtr cumLogProbsHost;     // [beamWidth]
@@ -183,11 +181,10 @@ public:
         TensorPtr const& outputIdsView, TensorPtr const& sequenceLengthView, TensorPtr const& cumLogProbsView,
         TensorPtr const& logProbsView, bool returnLogProbs, int peer);
 
-    std::unique_ptr<DecoderSlotAsyncSend> asyncSend(std::shared_ptr<mpi::MpiComm> const& commSession,
-        TensorPtr const& sequenceLengthView, bool returnLogProbs, int peer);
+    std::unique_ptr<DecoderSlotAsyncSend> asyncSend(
+        std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer) const;
 
-    void recv(std::shared_ptr<mpi::MpiComm> const& commSession, TensorPtr const& sequenceLengthView,
-        bool returnLogProbs, int peer);
+    void recv(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, int peer);
 };
 
 } // namespace tensorrt_llm::batch_manager

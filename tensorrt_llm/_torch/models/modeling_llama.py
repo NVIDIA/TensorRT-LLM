@@ -7,6 +7,7 @@ from transformers import Llama4Config, LlamaConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, DeepseekAllReduce)
+from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -24,7 +25,9 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp,
+                             unpack_hidden_states)
 
 
 class LlamaRotaryEmbedding(RotaryEmbedding):
@@ -292,6 +295,10 @@ class LlamaDecoderLayer(DecoderLayer):
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
 
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
         if self.is_nope_layer:
@@ -318,8 +325,8 @@ class LlamaDecoderLayer(DecoderLayer):
                 ))
         else:
             # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = unpack_hidden_states(
+                self.post_attention_layernorm(hidden_states, residual))
 
         feed_forward = self.feed_forward if self.is_llama4 else self.mlp
         hidden_states = feed_forward(
@@ -362,8 +369,8 @@ class LlamaDecoderLayer(DecoderLayer):
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
         elif self.next_layer_layernorm:
-            hidden_states, residual = self.next_layer_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = unpack_hidden_states(
+                self.next_layer_layernorm(hidden_states, residual))
 
         return hidden_states, residual
 
@@ -493,28 +500,41 @@ class LlamaModel(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+        if self.model_config.mapping.is_first_pp_rank():
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError(
+                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+                )
+
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+            hidden_states = inputs_embeds
+            residual = None
+        else:
+            if pipeline_interface is None:
+                raise ValueError(
+                    "pipeline_interface is required for non-first pp rank.")
+            hidden_states, residual = pipeline_interface
+            hidden_states, residual = self.local_layers()[0].input_layernorm(
+                hidden_states, residual)
+
+        for decoder_layer in self.local_layers():
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = inputs_embeds
-
-        residual = hidden_states
-        hidden_states = self.layers[0].input_layernorm(hidden_states)
-        for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual,
-                                                    spec_metadata=spec_metadata)
-
-        return hidden_states
+        if self.model_config.mapping.is_last_pp_rank():
+            return hidden_states
+        else:
+            return PipelineInterface(hidden_states, residual)
 
 
 @register_auto_model("LlamaForCausalLM")
@@ -536,7 +556,8 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
+                # layers[idx + 1] is MissingLayer for last layer in pp rank
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -572,7 +593,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
@@ -604,7 +625,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
-            else:
+            elif not isinstance(self.model.layers[idx + 1], MissingLayer):
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
