@@ -2471,6 +2471,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
+    // FIXME: This means that reuse will break here - the window will start writing to a reused block, and the following
+    // sequence that tries to reuse the block will read garbage. This will be fixed by removing the cyclic kv cache.
     EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 7, 8}));
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
 
