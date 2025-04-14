@@ -164,6 +164,10 @@ EagleConfig::EagleConfig(std::optional<EagleChoices> eagleChoices, bool greedySa
         TLLM_CHECK_WITH_INFO(eagleChoices.has_value() == false,
             "When dynamic tree is enabled (for Eagle-2), eagle choices should not be set.");
     }
+    if (mDynamicTreeMaxTopK.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(mDynamicTreeMaxTopK.value() > 0, "dynamicTreeMaxTopK must be positive");
+    }
 }
 
 bool EagleConfig::operator==(EagleConfig const& other) const
