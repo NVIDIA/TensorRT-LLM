@@ -1,10 +1,7 @@
-import atexit
-import os
 import threading
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
@@ -259,45 +256,3 @@ class DeepseekAllReduce(nn.Module):
             raise ValueError(f"Unsupported fusion op: {fusion_op}")
 
         return output
-
-
-class PPComm:
-    # PP communication using torch.distributed with nccl backend
-    def __init__(self, global_mapping: Mapping):
-        self.mapping = global_mapping
-        if not dist.is_initialized():
-            master_ip = os.getenv("MASTER_ADDR", "localhost")
-            master_port = os.getenv("MASTER_PORT", "6000")
-            init_method = f"tcp://{master_ip}:{master_port}"
-            dist.init_process_group(backend="nccl",
-                                    init_method=init_method,
-                                    world_size=global_mapping.world_size,
-                                    rank=global_mapping.rank)
-            atexit.register(self._cleanup)
-
-        # Force NCCL initialization and rank population via PyTorch distributed barrier.
-        # This is necessary for NOW if using pp + tp because our custom nccl allreduce
-        # op for tp groups can interfere with PyTorch's NCCL initialization when PyTorch
-        # distributed performs the first comm. op and kick off nccl init. The barrier here
-        # ensures proper NCCL setup and GPU-procs binding at beginning.
-        dist.barrier(device_ids=[torch.cuda.current_device()])
-
-    def _cleanup(self):
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-    def send(self,
-             tensor: torch.Tensor,
-             dest: Optional[int] = None,
-             tag: Optional[int] = None):
-        if dest is None:
-            dest = self.mapping.next_pp_rank()
-        dist.send(tensor, dest, tag=tag)
-
-    def recv(self,
-             tensor: torch.Tensor,
-             src: Optional[int] = None,
-             tag: Optional[int] = None):
-        if src is None:
-            src = self.mapping.prev_pp_rank()
-        dist.recv(tensor, src, tag=tag)
