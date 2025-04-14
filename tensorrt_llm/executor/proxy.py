@@ -369,7 +369,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)
