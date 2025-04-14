@@ -37,6 +37,11 @@ void MpiConnection::recv(DataContext const& ctx, void* data, size_t size) const
     mComm->recv(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
+int MpiConnection::getRank() const
+{
+    return mRank;
+}
+
 MpiConnectionManager::MpiConnectionManager(mpi::MpiComm const* comm)
     : mComm{comm}
 {

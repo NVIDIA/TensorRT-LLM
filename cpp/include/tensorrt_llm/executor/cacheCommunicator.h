@@ -61,6 +61,8 @@ public:
     {
         return false;
     }
+
+    [[nodiscard]] virtual int getRank() const = 0;
 };
 
 class ConnectionManager
