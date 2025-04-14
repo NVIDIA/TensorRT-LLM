@@ -32,7 +32,7 @@ from ..models import AutoModelForCausalLM
 from ..models.modeling_utils import MetaInitMode, timing
 from ..pipeline_interface import PipelineInterface
 from ..speculative import SpecConfig, SpecMetadata, get_spec_metadata
-from ..utils import set_torch_compiling
+from ..utils import set_torch_compiling, with_model_extra_attrs
 from .config import LoadFormat, PyTorchConfig
 from .cuda_graph_runner import DecodingCUDAGraphRunner
 from .distributed import MPIDist
@@ -263,6 +263,9 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
         )
+        # In case that some tests use stub models and override `_load_model`.
+        if not hasattr(self.model, 'extra_attrs'):
+            self.model.extra_attrs = {}
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'
@@ -287,8 +290,7 @@ class PyTorchModelEngine(ModelEngine):
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size,
-                    self.model.model_config.get_quant_config(), self.dtype)
+                    self.model.config.hidden_size)
                 self.model = torch.compile(
                     self.model,
                     backend=Backend(
@@ -946,6 +948,7 @@ class PyTorchModelEngine(ModelEngine):
                     torch.tensor([mrope_position_deltas],
                                  dtype=torch.int32).to('cuda',
                                                        non_blocking=True))
+
         is_spec_decode = len(extend_requests) > 0
         if self._enable_overlap_scheduler and is_spec_decode:
             spec_dec_mode = self.spec_config.spec_dec_mode
@@ -977,6 +980,8 @@ class PyTorchModelEngine(ModelEngine):
                               past_seen_token_num + 1 + num_draft_tokens)))
                 draft_tokens.extend(request.py_draft_tokens)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.py_batch_idx = batch_idx
+                batch_idx += 1
             else:
                 # batch index
                 previous_batch_idx = request.py_batch_idx
@@ -1036,13 +1041,7 @@ class PyTorchModelEngine(ModelEngine):
             input_ids = torch.tensor(input_ids,
                                      dtype=torch.int,
                                      pin_memory=True)
-            if len(scheduled_requests.context_requests) == 0:
-                self.input_ids_cuda[previous_batchs:num_tokens +
-                                    previous_batchs].copy_(input_ids,
-                                                           non_blocking=True)
-            else:
-                self.input_ids_cuda[:num_tokens].copy_(input_ids,
-                                                       non_blocking=True)
+            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
         if next_draft_tokens_device is not None:
             if len(previous_batch_indices) > 0:
                 previous_batch_indices = torch.tensor(previous_batch_indices,
@@ -1092,16 +1091,10 @@ class PyTorchModelEngine(ModelEngine):
                                                   pin_memory=True)
             self.previous_batch_indices_cuda[:previous_batch_tokens].copy_(
                 previous_batch_indices, non_blocking=True)
-            if len(scheduled_requests.context_requests) == 0:
-                self.input_ids_cuda[:previous_batchs].copy_(new_tokens_device[
+            self.input_ids_cuda[num_tokens:num_tokens + previous_batchs].copy_(
+                new_tokens_device[
                     self.previous_batch_indices_cuda[:previous_batchs]],
-                                                            non_blocking=True)
-            else:
-                self.input_ids_cuda[
-                    num_tokens:num_tokens + previous_batchs].copy_(
-                        new_tokens_device[
-                            self.previous_batch_indices_cuda[:previous_batchs]],
-                        non_blocking=True)
+                non_blocking=True)
 
         total_num_tokens = len(position_ids)
         position_ids = torch.tensor(position_ids,
@@ -1582,6 +1575,7 @@ class PyTorchModelEngine(ModelEngine):
                                            new_tensors_device)
 
     @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
@@ -1704,9 +1698,10 @@ class PyTorchModelEngine(ModelEngine):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
-        logits = self.model_forward(**inputs,
-                                    return_context_logits=gather_ids
-                                    is not None)
+        logits = self.model_forward(
+            **inputs,
+            return_context_logits=gather_ids is not None,
+        )
         if gather_ids is not None:
             return {'logits': logits[gather_ids]}
         else:
@@ -1746,19 +1741,8 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return {'hidden_states': hidden_states}
 
-    def _init_userbuffers(self, hidden_size, quant_config, dtype):
-        # No quant, do not allow UB
+    def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:
-            return False
-
-        if quant_config is None:
-            return False
-
-        # UB currently only support FP8 quant
-        if not quant_config.layer_quant_mode.has_fp8_qdq():
-            return False
-
-        if dtype != torch.float16 and dtype != torch.bfloat16:
             return False
 
         # Disable UB for unsupported platforms

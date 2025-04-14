@@ -274,7 +274,10 @@ if args.test_trtllm or args.test_hf:
         if args.test_trtllm:
             profiler.start('tensorrt_llm')
             _, output_text = trtllm_model.run(
-                prompts, image, max_new_tokens=args.max_new_tokens)
+                input_text=prompts,
+                input_image=image,
+                input_audio=None,
+                max_new_tokens=args.max_new_tokens)
             if runtime_rank == 0:
                 trtllm_result = output_text[0][0]
                 trtllm_correct += eval(trtllm_result, args.eval_task, data)

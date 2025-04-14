@@ -19,3 +19,6 @@ class DecoderLayer(nn.Module, ABC):
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         ...
+
+    def is_missing(self) -> bool:
+        return False
