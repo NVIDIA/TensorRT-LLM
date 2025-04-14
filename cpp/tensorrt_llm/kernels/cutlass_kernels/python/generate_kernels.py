@@ -393,7 +393,7 @@ def is_grouped_gemm_op_valid(op):
 
 
 def is_op_valid(op):
-    if op.arch >= 100:
+    if op.arch >= 100 and op.arch < 120:
         return is_gemm_op_valid_sm100(op)
 
     if op.gemm_kind == GemmKind.Gemm:
@@ -666,7 +666,8 @@ if __name__ == "__main__":
     operations = []
     operations += generate_sm100_operations(has_arch(100))
     operations += generate_sm90_operations(has_arch(90))
-    operations += generate_sm80_operations(has_arch(80) or has_arch(89))
+    operations += generate_sm80_operations(
+        has_arch(80) or has_arch(89) or has_arch(120))
 
     def should_skip(op):
         is_internal = op.gemm_kind == GemmKind.Grouped
