@@ -451,6 +451,69 @@ list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})
 include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
+# Define the ENABLE_NIXL flag with a default value
+set_ifndef(ENABLE_NIXL 1)
+
+if(ENABLE_NIXL)
+  # Check for necessary dependencies for NIXL
+  find_program(MESON_EXECUTABLE meson)
+  find_program(NINJA_EXECUTABLE ninja)
+
+  if(NOT MESON_EXECUTABLE OR NOT NINJA_EXECUTABLE)
+    message(WARNING "Meson or Ninja not found, disabling NIXL build")
+    set(ENABLE_NIXL 0)
+  else()
+    message(STATUS "Meson and Ninja found, enabling NIXL build")
+  endif()
+endif()
+
+if(ENABLE_NIXL)
+  message(STATUS "Building and installing NIXL library")
+
+  # Define the build directory for NIXL
+  set(NIXL_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/nixl_build)
+
+  # Create the build directory
+  file(MAKE_DIRECTORY ${NIXL_BUILD_DIR})
+  message(STATUS "NIXL_BUILD_DIR: ${NIXL_BUILD_DIR}")
+  # Check if the UCX path exists
+  if(EXISTS "/usr/local/ucx")
+    message(STATUS "UCX path exists: /usr/local/ucx")
+  else()
+    message(FATAL_ERROR "UCX path does not exist: /usr/local/ucx")
+  endif()
+
+  if(EXISTS "${NIXL_BUILD_DIR}")
+    message(STATUS "NIXL build directory exists: ${NIXL_BUILD_DIR}")
+  else()
+    message(
+      FATAL_ERROR "NIXL build directory does not exist: ${NIXL_BUILD_DIR}")
+  endif()
+  # Run the Meson setup and build commands
+  message(STATUS "current source dir: ${CMAKE_CURRENT_SOURCE_DIR}")
+  execute_process(
+    COMMAND ${MESON_EXECUTABLE} setup ${NIXL_BUILD_DIR}
+            -Ducx_path=/usr/local/ucx/
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/nixl
+    RESULT_VARIABLE MESON_SETUP_RESULT
+    OUTPUT_VARIABLE MESON_SETUP_OUTPUT
+    ERROR_VARIABLE MESON_SETUP_ERROR OUTPUT_STRIP_TRAILING_WHITESPACE
+                   ERROR_STRIP_TRAILING_WHITESPACE)
+  message(STATUS "Meson setup output: ${MESON_SETUP_OUTPUT}")
+  message(STATUS "Meson setup error: ${MESON_SETUP_ERROR}")
+  if(NOT MESON_SETUP_RESULT EQUAL 0)
+    message(
+      FATAL_ERROR "Meson setup failed with error code ${MESON_SETUP_RESULT}")
+  endif()
+
+  execute_process(COMMAND ${NINJA_EXECUTABLE}
+                  WORKING_DIRECTORY ${NIXL_BUILD_DIR})
+
+  execute_process(COMMAND ${NINJA_EXECUTABLE} install
+                  WORKING_DIRECTORY ${NIXL_BUILD_DIR})
+
+endif()
+
 add_subdirectory(tensorrt_llm)
 
 if(BUILD_TESTS)
