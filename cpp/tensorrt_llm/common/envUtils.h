@@ -55,6 +55,8 @@ bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
 
+bool getEnvUseNIXLKvCache();
+
 std::string getEnvUCXInterface();
 
 bool getEnvDisaggLayerwise();
