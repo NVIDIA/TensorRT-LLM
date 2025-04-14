@@ -793,7 +793,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
                  ])
 
 
-class TestMistral_7B(CliFlowAccuracyTestHarness):
+class TestMistral7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
     EXAMPLE_FOLDER = "llama"

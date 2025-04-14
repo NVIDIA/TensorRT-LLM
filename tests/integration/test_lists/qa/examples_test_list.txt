@@ -370,9 +370,9 @@ accuracy/test_cli_flow.py::TestLlama3_2_1B::test_fp8_rowwise
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_weight_streaming[1.0]
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
 accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
-accuracy/test_cli_flow.py::TestMistral_7B::test_beam_search
-accuracy/test_cli_flow.py::TestMistral_7B::test_fp8_tp4pp2
-accuracy/test_cli_flow.py::TestMistral_7B::test_smooth_quant_tp4pp1
+accuracy/test_cli_flow.py::TestMistral7B::test_beam_search
+accuracy/test_cli_flow.py::TestMistral7B::test_fp8_tp4pp2
+accuracy/test_cli_flow.py::TestMistral7B::test_smooth_quant_tp4pp1
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2[]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2[manage_weights]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
@@ -409,9 +409,9 @@ accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_0_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
-accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4]
-accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int4_awq]
-accuracy/test_llm_api.py::TestMistral_7B_0_3::test_quant_tp4[int8_awq]
+accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4]
+accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int4_awq]
+accuracy/test_llm_api.py::TestMistral7B_0_3::test_quant_tp4[int8_awq]
 accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8
 accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8
 accuracy/test_llm_api.py::TestMixtral8x7B::test_tp2

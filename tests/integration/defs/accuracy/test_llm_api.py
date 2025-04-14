@@ -39,7 +39,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestMistral_7B_0_3(LlmapiAccuracyTestHarness):
+class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.3"
     MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
 
