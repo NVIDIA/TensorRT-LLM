@@ -13,20 +13,23 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
 
 ## Table of Contents
 
-- [Table of Contents](#table-of-contents)
-- [Hardware Requirements](#hardware-requirements)
-- [Downloading the Model Weights](#downloading-the-model-weights)
-- [Quick Start](#quick-start)
-  - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
-  - [Run evaluation on GPQA dataset](#run-evaluation-on-gpqa-dataset)
-- [Serving](#serving)
-- [Advanced Usages](#advanced-usages)
-  - [Multi-node](#multi-node)
-    - [mpirun](#mpirun)
-    - [Slurm](#slurm)
-  - [FlashMLA](#flashmla)
-  - [DeepGEMM](#deepgemm)
-- [Notes and Troubleshooting](#notes-and-troubleshooting)
+- [DeepSeek‑V3 and DeepSeek-R1](#deepseekv3-and-deepseek-r1)
+  - [Table of Contents](#table-of-contents)
+  - [Hardware Requirements](#hardware-requirements)
+  - [Downloading the Model Weights](#downloading-the-model-weights)
+  - [Quick Start](#quick-start)
+    - [Run a single inference](#run-a-single-inference)
+    - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
+    - [Run evaluation on GPQA dataset](#run-evaluation-on-gpqa-dataset)
+  - [Serving](#serving)
+  - [Advanced Usages](#advanced-usages)
+    - [Multi-node](#multi-node)
+      - [mpirun](#mpirun)
+      - [Slurm](#slurm)
+      - [Example: Multi-node benchmark on GB200 Slurm cluster](#example-multi-node-benchmark-on-gb200-slurm-cluster)
+    - [FlashMLA](#flashmla)
+    - [DeepGEMM](#deepgemm)
+  - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
 ## Hardware Requirements
@@ -265,6 +268,86 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   --container-mounts=/workspace:/workspace \
   --container-workdir /workspace \
   bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+```
+
+#### Example: Multi-node benchmark on GB200 Slurm cluster
+
+Step 1: Prepare dataset and `extra-llm-api-config.yml`.
+```bash
+python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
+    --tokenizer=/path/to/DeepSeek-R1 \
+    --stdout token-norm-dist --num-requests=49152 \
+    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
+
+cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+    use_cuda_graph: true
+    cuda_graph_padding_enabled: true
+    cuda_graph_batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    print_iter_log: true
+    enable_overlap_scheduler: true
+enable_attention_dp: true
+EOF
+```
+
+Step 2: Prepare `benchmark.slurm`.
+```bash
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --ntasks=8
+#SBATCH --ntasks-per-node=4
+#SBATCH --partition=<partition>
+#SBATCH --account=<account>
+#SBATCH --time=02:00:00
+#SBATCH --job-name=<job_name>
+
+srun --container-image=${container_image} --container-mounts=${mount_dir}:${mount_dir} --mpi=pmix \
+    --output ${logdir}/bench_%j_%t.srun.out \
+    bash benchmark.sh
+```
+
+Step 3: Prepare `benchmark.sh`.
+```bash
+#!/bin/bash
+cd /path/to/TensorRT-LLM
+# pip install build/tensorrt_llm*.whl
+if [ $SLURM_LOCALID == 0 ];then
+    pip install build/tensorrt_llm*.whl
+    echo "Install dependencies on rank 0."
+else
+    echo "Sleep 60 seconds on other ranks."
+    sleep 60
+fi
+
+export PATH=${HOME}/.local/bin:${PATH}
+export PYTHONPATH=/path/to/TensorRT-LLM
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1  # optional
+
+trtllm-llmapi-launch trtllm-bench \
+    --model deepseek-ai/DeepSeek-R1 \
+    --model_path $DS_R1_NVFP4_MODEL_PATH \
+    throughput --backend pytorch \
+    --num_requests 49152 \
+    --max_batch_size 384 --max_num_tokens 1536 \
+    --concurrency 3072 \
+    --dataset /path/to/dataset.txt \
+    --tp 8 --pp 1 --ep 8 --kv_cache_free_gpu_mem_fraction 0.85 \
+    --extra_llm_api_options ./extra-llm-api-config.yml --warmup 0
+```
+
+Step 4: Submit the job to Slurm cluster to launch the benchmark by executing:
+```
+sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
 ```
 
 ### FlashMLA
