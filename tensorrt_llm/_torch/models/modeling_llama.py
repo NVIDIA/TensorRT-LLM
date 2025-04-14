@@ -146,10 +146,10 @@ class Llama4MoE(nn.Module):
         self.aux_stream = aux_stream
 
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
-                              min_latency_mode):
+                              min_latency_mode, llama4_tp8ep1_min_latency_mode):
         router_logits = self.router.llama4_router_forward(hidden_states)
         routed_output = self.experts(hidden_states, router_logits,
-                                     min_latency_mode)
+                                     min_latency_mode, llama4_tp8ep1_min_latency_mode)
         return routed_output
 
     def forward(
@@ -158,6 +158,7 @@ class Llama4MoE(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
+        llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
@@ -168,14 +169,17 @@ class Llama4MoE(nn.Module):
         if do_multi_stream:
             with torch.cuda.stream(self.aux_stream):
                 self.moe_event[0].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, all_rank_num_tokens, min_latency_mode)
+                routed_output = self.compute_routed_output(hidden_states,
+                                                           all_rank_num_tokens,
+                                                           min_latency_mode,
+                                                           llama4_tp8ep1_min_latency_mode)
                 self.moe_event[1].record()
             self.moe_event[1].wait()
         else:
             routed_output = self.compute_routed_output(hidden_states,
                                                        all_rank_num_tokens,
-                                                       min_latency_mode)
+                                                       min_latency_mode,
+                                                       llama4_tp8ep1_min_latency_mode)
         if min_latency_mode:
             return [shared_output, *routed_output]
 
@@ -202,6 +206,14 @@ class LlamaDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
         )
+        self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq()
+        self.tp_size = model_config.mapping.moe_tp_size
+        self.ep_size = model_config.mapping.moe_ep_size
+        self.num_experts = model_config.pretrained_config.num_local_experts
+        self.topk = model_config.pretrained_config.num_experts_per_tok
+        self.hidden_size = model_config.pretrained_config.hidden_size
+        self.intermediate_size = model_config.pretrained_config.intermediate_size
+
         self.fusion_config = EagerFusionConfig()
         self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
 
@@ -288,12 +300,11 @@ class LlamaDecoderLayer(DecoderLayer):
 
         # Only enable min-latency mode on Blackwell
         # TODO: Remove it after we fix crash on Hopper
-        # major, minor = torch.cuda.get_device_capability()
-        # is_blackwell = (major * 10 + minor) >= 100
-        # min_latency_mode = hidden_states.size(
-        #     0
-        # ) <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
-
+        major, minor = torch.cuda.get_device_capability()
+        is_blackwell = (major * 10 + minor) >= 100
+        num_tokens = hidden_states.size(0)
+        llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 4 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
+        # min_latency_mode = not llama4_tp8ep1_min_latency_mode and num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
 
@@ -335,6 +346,7 @@ class LlamaDecoderLayer(DecoderLayer):
                 or self.fusion_config.POST_MLP_FUSION
                 or self.parallel_config.tensor_parallel_size == 1)),
             min_latency_mode=min_latency_mode,
+            llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
         )
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
