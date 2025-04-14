@@ -268,7 +268,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     if (connections.size() > 1)
     {
-        if (common::getEnvDisableReceiveKVCacheParallel())
+        if (!common::getEnvEnableReceiveKVCacheParallel())
         {
             TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
             for (size_t i = 0; i < connections.size(); i++)
@@ -390,11 +390,10 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         bool const onlyUseAsyncBuffer = recvBufferEleSize == 0;
         if (!onlyUseAsyncBuffer)
         {
-            std::string processString = llmRequest.getDataTransceiverState().getCommState()->toString();
-
-            if (common::getEnvRequestKVCacheSerial())
+            std::string processString = "default";
+            if (common::getEnvRequestKVCacheConcurrent())
             {
-                processString = "default";
+                processString = llmRequest.getDataTransceiverState().getCommState()->toString();
             }
 
             {
@@ -484,7 +483,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
         if (pickUpConnections.size() > 1)
         {
-            if (common::getEnvDisableReceiveKVCacheParallel())
+            if (!common::getEnvEnableReceiveKVCacheParallel())
             {
 
                 for (size_t i = 0; i < pickUpConnections.size(); i++)
