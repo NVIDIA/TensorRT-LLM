@@ -108,6 +108,7 @@ class GatedMLP(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
+        llama4_tp8ep1_min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
