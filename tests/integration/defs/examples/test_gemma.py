@@ -175,7 +175,7 @@ def hf_gemma_quantization_1gpu(batch_size,
 
     window = [
         "--max_attention_window_size",
-        ','.join((str(w) for w in max_attention_window)),
+        *max_attention_window,
     ] if max_attention_window is not None else []
 
     summary_cmd = [
