@@ -504,6 +504,7 @@ class LLM:
 
         max_batch_size = self.args.max_batch_size or self.args.build_config.max_batch_size
         max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
+        max_seq_len = self.args.max_seq_len or self.args.build_config.max_seq_len
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
@@ -562,7 +563,7 @@ class LLM:
             hf_model_dir=self._hf_model_dir,
             trt_engine_dir=self._engine_dir,
             max_input_len=self.args.max_input_len,
-            max_seq_len=self.args.max_seq_len)
+            max_seq_len=max_seq_len)
         executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = self.args.gather_generation_logits or (
             self.args.build_config
