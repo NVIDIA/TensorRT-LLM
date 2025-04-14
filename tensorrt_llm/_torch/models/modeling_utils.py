@@ -17,6 +17,7 @@ from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
@@ -146,10 +147,24 @@ class MissingLayer(torch.nn.Identity):
         super().__init__()
 
 
+class MissingDecoderLayer(MissingLayer, DecoderLayer):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return hidden_states, residual
+
+    def is_missing(self) -> bool:
+        return True
+
+
 def build_pipeline_layers(layer_list,
                           num_hidden_layers,
                           layer_fn,
-                          missing_layer_fn=MissingLayer):
+                          missing_layer_fn=MissingDecoderLayer):
     layer_offset = layer_list[0]
     layers = [
         layer_fn(layer_idx - layer_offset)  # local layer idx to attn_backend
@@ -271,61 +286,21 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 self.model_config, layer_idx)
         self.layers = build_pipeline_layers(self.pp_layer_list,
                                             num_hidden_layers, layer_fn)
+        self._local_layers = [
+            layer for layer in self.layers[:config.num_hidden_layers]
+            if not layer.is_missing()
+        ]
+        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
         self.create_pipeline_interface = create_pipeline_interface_factory(
             pp_interface_keys, config.hidden_size, config.torch_dtype)
 
-        # override forward method
-        self.forward = self._pp_forward
-
-    def _pp_forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        # local forward pass
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
-
-        # unpack pp_interface or embedding lookup for the input
-        if self.pp_rank != 0:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface  # unpack pp_interface
-            hidden_states, residual = local_decoder_layers[0].input_layernorm(
-                hidden_states, residual)
-        else:
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
-            hidden_states = inputs_embeds
-            residual = None
-
-        for decoder_layer in local_decoder_layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
-
-        # pack pp_interface or return hidden_states for last pp rank
-        if not self.pp_rank == self.pp_size - 1:
-            return PipelineInterface(hidden_states,
-                                     residual)  # pack pp_interface
-
-        else:
-            return hidden_states
+    def local_layers(self) -> List[DecoderLayer]:
+        return (
+            self._local_layers if hasattr(self, "_local_layers") else
+            self.layers[:self.model_config.pretrained_config.num_hidden_layers])
 
 
 class PostInitCaller(type):

@@ -227,11 +227,21 @@ void UcxConnectionManager::addConnection(ucp_conn_request_h connRequest)
 
 UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string const& ip, uint16_t port)
 {
+    static std::mutex sAddConnectionIPMutex;
     try
     {
-        std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
-        UcxConnection::ConnectionIdType connectionId = getNewConnectionId(newEp);
-        std::shared_ptr<UcxConnection> connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+        std::shared_ptr<UcxConnection> connection;
+        UcxConnection::ConnectionIdType connectionId = 0;
+        {
+            std::scoped_lock addConnectionIPLock(sAddConnectionIPMutex);
+            // This lock ensures that only one thread can create an endpoint from hostname and establish a UCX
+            // connection at a time, guaranteeing that the only one listener will send connectionId to requester in the
+            // same time.
+            std::shared_ptr<ucxx::Endpoint> newEp = mWorkersPool.front()->createEndpointFromHostname(ip, port, true);
+            connectionId = getNewConnectionId(newEp);
+            connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+        }
+        TLLM_CHECK(connectionId != 0);
         std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
         mConnections.emplace(connectionId, connection);
         std::string address = ip + ":" + std::to_string(port);

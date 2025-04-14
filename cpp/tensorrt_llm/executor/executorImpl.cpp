@@ -751,8 +751,15 @@ void Executor::Impl::initializeWorkers(SizeType32 tp, SizeType32 pp, SizeType32 
     if (parallelConfig.getDeviceIds())
     {
         auto deviceIds = parallelConfig.getDeviceIds().value();
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(deviceIds.size()) == tp * pp * cp,
-            "When specifying deviceIds, deviceIds size must be equal to tp*pp*cp");
+        auto const hasNumNodes = parallelConfig.getNumNodes().has_value();
+        if (hasNumNodes || static_cast<SizeType32>(deviceIds.size()) != tp * pp * cp)
+        {
+            auto const numNodes = hasNumNodes ? parallelConfig.getNumNodes().value() : tensorrt_llm::mpi::getNumNodes();
+            TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(deviceIds.size() * numNodes) == tp * pp * cp,
+                tensorrt_llm::common::fmtstr("When specifying deviceIds, deviceIds (%lu) * numNodes (%u) must be equal "
+                                             "to tp*pp*cp (tp is %u, pp is %u, cp is %u)",
+                    deviceIds.size(), numNodes, tp, pp, cp));
+        }
     }
 
     // Bool that indicates if current process is worker for this model or not
