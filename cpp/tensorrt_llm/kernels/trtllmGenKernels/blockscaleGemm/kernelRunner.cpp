@@ -76,6 +76,7 @@ struct TrtllmGenBlockScaleGemmOptions
 void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale,
     void const* b, float const* bScale, void* c, float* cScale, CUstream stream)
 {
+
     TrtllmGenBlockScaleGemmOptions options;
     options.mM = m;
     options.mN = n;
@@ -98,10 +99,9 @@ void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void co
     options.mSliceK = mKernelInfo->sliceK;
 
     auto params = TrtllmGenBlockScaleGemmKernelParams::setKernelParams(options, a, aScale, b, bScale, c,
-        nullptr /* multimemC */, cScale, nullptr /* ptrPartialSumsForSplitK */,
-        nullptr /* multimemPartialSumsForSplitK */, nullptr /* ptrTileBars */, nullptr /* multimemTileBars */,
-        nullptr /* ptrCompletionBars */, nullptr /* multimemCompletionBars */, nullptr /* ptrSplitKCompletionBars */, 0,
-        1);
+        nullptr /* ptrSfc */, nullptr /* multimemC */, cScale /* ptrScaleC */, nullptr /* ptrPartialSumsForSplitK */,
+        nullptr /* ptrTileBars */, nullptr /* multimemTileBars */, nullptr /* ptrCompletionBars */,
+        nullptr /* multimemCompletionBars */, nullptr /* ptrSplitKCompletionBars */, 0, 1);
     TLLM_CHECK_WITH_INFO(sizeof(params) == 832, "Size of mismatch between trtllm-gen and trtllm");
 
     CUlaunchConfig launch_config;

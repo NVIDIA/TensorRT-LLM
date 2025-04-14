@@ -1,7 +1,8 @@
 import copy
 from abc import ABC
+from dataclasses import dataclass
 from enum import Enum
-from typing import List, Tuple
+from typing import Any, List, Mapping, Tuple
 
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
 from tensorrt_llm.scaffolding.task import (GenerationTask, RewardTask,
@@ -32,6 +33,13 @@ class Controller(ABC):
         raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class ParallelProcess:
+    controllers: List[Controller]
+    tasks_list: List[List[Task]]
+    kwargs_list: List[Mapping[str, Any]]
+
+
 # Controller runs multiple generation tasks.
 class NativeGenerationController(Controller):
 
@@ -40,22 +48,16 @@ class NativeGenerationController(Controller):
 
     def __init__(self, custom_sampling_params: dict = None):
         super().__init__()
-        self.custom_sampling_params = copy.deepcopy(custom_sampling_params)
+        self.custom_sampling_params = copy.deepcopy(
+            custom_sampling_params) if custom_sampling_params else None
 
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
-            if not isinstance(task, GenerationTask):
-                raise ValueError(
-                    "NativeGenerationController requires exactly one GenerationTask"
-                )
-
-        for task in tasks:
             task.worker_tag = self.WorkerTag.GENERATION
-            if kwargs.get("custom_sampling_params"):
-                task.custom_sampling_params = kwargs.get(
-                    "custom_sampling_params")
-            elif self.custom_sampling_params:
-                task.custom_sampling_params = self.custom_sampling_params
+            if self.custom_sampling_params:
+                for key, value in self.custom_sampling_params.items():
+                    if hasattr(task, key) and getattr(task, key) is None:
+                        setattr(task, key, value)
 
         yield tasks
 
@@ -67,11 +69,6 @@ class NativeRewardController(Controller):
         REWARD = "reward"
 
     def process(self, tasks: List[Task], **kwargs):
-        for task in tasks:
-            if not isinstance(task, RewardTask):
-                raise ValueError(
-                    "NativeRewardController requires exactly one RewardTask")
-
         for task in tasks:
             task.worker_tag = self.WorkerTag.REWARD
 
@@ -95,20 +92,27 @@ class MajorityVoteController(Controller):
         return MajorityVoteController(generation_controller,
                                       self.default_sample_num)
 
-    def process(self, tasks: List[Task], **kwargs):
-        assert len(tasks) == 1 and isinstance(tasks[0], GenerationTask), \
-            "MajorityVoteController requires exactly one GenerationTask"
+    def process(self,
+                tasks: List[Task],
+                sample_num: int = 1,
+                generation_kwargs: dict = {},
+                majority_vote_kwargs: dict = {}):
+        sample_num = max(sample_num, self.default_sample_num)
+        generation_controllers = [
+            self.generation_controller.clone() for _ in range(sample_num)
+        ]
+        tasks_list = [copy.deepcopy(tasks) for _ in range(sample_num)]
+        generation_kwargs_list = [
+            copy.deepcopy(generation_kwargs) for _ in range(sample_num)
+        ]
 
-        sample_num = kwargs.get("sample_num", self.default_sample_num)
-        generation_tasks = [copy.deepcopy(tasks[0]) for _ in range(sample_num)]
-        yield from self.generation_controller.process(
-            generation_tasks, **kwargs.get("generation_kwargs", {}))
+        yield ParallelProcess(generation_controllers, tasks_list,
+                              generation_kwargs_list)
 
-        candidates = [task.output_str for task in generation_tasks]
-        result = self.majority_vote(candidates,
-                                    **kwargs.get("majority_vote_kwargs", {}))
+        candidates = [tasks[0].output_str for tasks in tasks_list]
+        result = self.majority_vote(candidates, **majority_vote_kwargs)
 
-        assert (isinstance(result, str))
+        assert isinstance(result, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
         tasks[0].output_str = result
 
@@ -134,31 +138,51 @@ class BestOfNController(Controller):
         return BestOfNController(generation_controller, reward_controller,
                                  self.default_sample_num)
 
-    def process(self, tasks: List[Task], **kwargs):
-        assert len(tasks) == 1 and isinstance(tasks[0], GenerationTask), \
-            "BestOfNController requires exactly one GenerationTask"
-
-        sample_num = kwargs.get("sample_num", self.default_sample_num)
-        generation_tasks = [tasks[0].deepcopy() for _ in range(sample_num)]
-        yield from self.generation_controller.process(
-            generation_tasks, **kwargs.get("generation_kwargs"))
-
-        reward_tasks = [
-            RewardTask.create_from_generation_task(generation_task)
-            for generation_task in generation_tasks
+    def process(self,
+                tasks: List[Task],
+                sample_num: int = 1,
+                generation_kwargs: dict = {},
+                reward_kwargs: dict = {},
+                select_best_kwargs: dict = {}):
+        sample_num = max(sample_num, self.default_sample_num)
+        generation_controllers = [
+            self.generation_controller.clone() for _ in range(sample_num)
         ]
-        yield from self.reward_controller.process(reward_tasks,
-                                                  **kwargs.get("reward_kwargs"))
+        self.generation_tasks_list = [tasks for _ in range(sample_num)]
+        generation_kwargs_list = [generation_kwargs for _ in range(sample_num)]
+
+        yield ParallelProcess(generation_controllers,
+                              self.generation_tasks_list,
+                              generation_kwargs_list)
+
+        # Some best of N algorithms create sample_num reward task lists while some just create one.
+        # We maintain generic here as much as possible.
+        self.reward_tasks_list = self.create_reward_tasks(
+            self.generation_tasks_list)
+        reward_paraller_num = len(self.reward_tasks_list)
+        reward_controllers = [
+            self.reward_controller.clone() for _ in range(reward_paraller_num)
+        ]
+        reward_kwargs_list = [reward_kwargs for _ in range(reward_paraller_num)]
+
+        yield ParallelProcess(reward_controllers, self.reward_tasks_list,
+                              reward_kwargs_list)
 
         # may used for upper layer controllers
-        self.best_generation_task, self.best_reward_task = (self.select_best(
-            generation_tasks, reward_tasks, **kwargs.get("select_best_kwargs")))
-        tasks[0] = self.best_generation_task
+        self.best_generation_task, self.best_reward_task = self.select_best(
+            self.generation_tasks_list, self.reward_tasks_list,
+            **select_best_kwargs)
+        tasks = self.best_generation_task
 
-    def select_best(self, generation_tasks: List[GenerationTask],
-                    reward_tasks: List[RewardTask],
-                    **kwargs) -> Tuple[GenerationTask, RewardTask]:
+    def select_best(self, generation_tasks: List[List[Task]],
+                    reward_tasks: List[List[Task]],
+                    **kwargs) -> Tuple[List[Task], List[Task]]:
+        assert len(generation_tasks[0]) == 1 and isinstance(generation_tasks[0][0], GenerationTask), \
+            "Should not use default select_best implementation for BestOfNController"
+        assert len(reward_tasks[0]) == 1 and isinstance(reward_tasks[0][0], RewardTask), \
+            "Should not use default select_best implementation for BestOfNController"
+        # select the best generation task and reward task
         max_reward_value_index = reward_tasks.index(
-            max(reward_tasks, key=lambda x: x.reward_value))
+            max(reward_tasks, key=lambda x: x[0].reward_value))
         return generation_tasks[max_reward_value_index], reward_tasks[
             max_reward_value_index]

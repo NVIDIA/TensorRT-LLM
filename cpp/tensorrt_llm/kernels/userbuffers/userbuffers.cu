@@ -568,7 +568,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
-    float const sf = 1.f / *scale;
+    float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
@@ -683,7 +683,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using PackedVec = PackedVec<DType>;
     cudaTriggerProgrammaticLaunchCompletion();
-    float const sf = 1.f / *scale;
+    float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
@@ -1914,6 +1914,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
+    {
         if (kDISABLE_FP32_ACCUMULATION)
         {
             return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<half, true>(handler, offset, out_handler, out_offset,
@@ -1927,6 +1928,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
                 residual_out, comm, stream);
         }
         break;
+    }
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
     {

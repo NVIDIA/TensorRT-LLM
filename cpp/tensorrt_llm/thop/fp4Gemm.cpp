@@ -19,6 +19,7 @@
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/userbuffersTensor.h"
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/cuda/Resize.h>
@@ -72,7 +73,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 // Only NVFP4 is currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0,
-    std::optional<c10::ScalarType> out_dtype, tkc::CutlassGemmConfig const* maybe_config = nullptr)
+    std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr)
 {
     CHECK_INPUT(mat1, FLOAT4_E2M1X2);
     CHECK_INPUT(mat2, FLOAT4_E2M1X2);
@@ -127,9 +129,16 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     TORCH_CHECK(out_dtype == torch::kFloat || out_dtype == torch::kHalf || out_dtype == torch::kBFloat16,
         "out_dtype must be one of fp16/bf16/fp32. It defaults to fp16.");
 
-    at::Tensor out = (mat1.dim() == 2)
-        ? at::detail::empty_cuda({m, n}, out_dtype.value(), mat1.device(), std::nullopt)
-        : at::detail::empty_cuda({b, m, n}, out_dtype.value(), mat1.device(), std::nullopt);
+    std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
+    at::Tensor out;
+    if (to_userbuffers)
+    {
+        out = torch_ext::create_userbuffers_tensor(out_shape, out_dtype.value()).first;
+    }
+    else
+    {
+        out = at::detail::empty_cuda(out_shape, out_dtype.value(), mat1.device(), std::nullopt);
+    }
 
     switch (out_dtype.value())
     {
@@ -187,7 +196,8 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0, int64_t configIdx) const
+        at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0, bool to_userbuffers,
+        int64_t configIdx) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
         if (configIdx != -1)
@@ -195,7 +205,8 @@ public:
             TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
             config = &mConfigs.at(configIdx);
         }
-        return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, sfUseUE8M0, mOutputDtype, config);
+        return fp4_bmm_impl(
+            mat1, mat2, mat1Scale, mat2Scale, globalScale, sfUseUE8M0, mOutputDtype, to_userbuffers, config);
     }
 
     at::ScalarType getOutputDtype() const

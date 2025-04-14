@@ -8,6 +8,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
+from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -70,11 +71,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
             print_colored(
-                "Using MpiCommSession to bind to external MPI processes\n",
+                f"rank {mpi_rank()} using MpiCommSession to bind to external MPI processes\n",
                 "yellow")
         else:
-            print_colored("Using MpiPoolSession to spawn MPI processes\n",
-                          "yellow")
+            print_colored(
+                f"rank {mpi_rank()} using MpiPoolSession to spawn MPI processes\n",
+                "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
 
@@ -183,12 +185,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             data = queue.get()
         except:
-            logger.error(
+            logger.debug(
                 "proxy.py: Error in _iteration_result_task: queue.get()")
             return False
 
         if data is None:
-            logger.error("proxy.py: _iteration_result_task: data is None")
+            logger.debug("proxy.py: _iteration_result_task: data is None")
             return False  # shutdown the thread
 
         data = data if isinstance(data, list) else [data]
@@ -201,7 +203,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             for d in data:
                 if d is None:
-                    logger.error("proxy.py: _iteration_result_task: d is None")
+                    logger.debug("proxy.py: _iteration_result_task: d is None")
                     return False
 
                 if isinstance(queue, _SyncQueue):
@@ -219,7 +221,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # and therefore event loop can already be closed.
             logger.debug("proxy.py: EventLoopShutdownError")
         except Exception as e:
-            logger.error(f"proxy.py: Error in _iteration_result_task: {e}")
+            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
             raise e
 
         return True  # success
@@ -367,7 +369,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)

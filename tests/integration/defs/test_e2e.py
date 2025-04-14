@@ -1606,6 +1606,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
+    ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality):
@@ -1705,6 +1706,31 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ],
             ],
         },
+        "qwen2.5-vl-7b-instruct": {
+            "image":
+            [[
+                "The image depicts a dramatic and moody natural environment, featuring a large wave breaking on the shore. The sky is overcast with dark, heavy clouds, suggesting an impending storm or a generally stormy weather condition. The ocean appears turbulent, with the wave creating a frothy white crest as it crashes. The overall atmosphere",
+                "The image depicts a dramatic and moody seascape. The sky is filled with dark, heavy clouds, suggesting an overcast or stormy weather condition. The ocean is turbulent, with large waves crashing and creating white foam, indicating strong winds and possibly rough seas. The overall atmosphere is one of intensity and natural power"
+            ],
+             [
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground curves gently, and there are trees on either",
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground is empty, and the trees on either side",
+                 "The image features a large, prominent rock formation, likely Half Dome, which is a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground is empty, and the trees on either side of",
+                 "The image features a large, iconic granite rock formation, which is likely Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The road in the foreground curves gently, and there are trees on both",
+                 "The image features a large, iconic granite rock formation, which appears to be Half Dome, a famous landmark in Yosemite National Park, California. The rock formation is surrounded by a clear blue sky with a few scattered clouds, indicating a sunny and pleasant day. The foreground shows a paved road curving around the base of the",
+             ],
+             [
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus in the right lane, a police car in the middle lane, and a few other vehicles scattered across the lanes. The traffic seems to be",
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident."
+             ]],
+            "video":
+            [[
+                "The video depicts a woman walking down a vibrant, neon-lit street at night. She is dressed in a stylish outfit, featuring a black leather jacket, a red dress, and red boots. She carries a small handbag and wears large sunglasses. The street is wet, reflecting the colorful lights from the surrounding buildings,",
+            ],
+             [
+                 "The video shows a rotating Earth at night. The illuminated areas represent cities and populated regions, with lights visible in various parts of the world. The Earth is depicted with a dark blue ocean and a lighter blue landmass, and the night sky is black. The rotation of the Earth is smooth, giving a sense of continuous",
+             ]],
+        },
     }
 
     cmd = [
@@ -1719,8 +1745,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         *accuracy_inputs[modality]["media"],
     ]
     # NOTE
-    # Qwen2-VL model need larger max_num_tokens.
-    if model_name == "qwen2-vl-7b-instruct" and modality == "video":
+    # Qwen2-VL and Qwen2-5-VL model need larger max_num_tokens.
+    if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
+                      ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
     output = llm_venv.run_cmd(cmd, caller=check_output)
 

@@ -142,6 +142,7 @@ MODEL_NAME_PATTERN_MAP = {
     "QWen": "qwen",
     "Qwen2VLForConditionalGeneration": "qwen2_vl",
     "RecurrentGemma": "recurrentgemma",
+    "Gemma3": "gemma3",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",

@@ -177,7 +177,7 @@ void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* con
     std::ostringstream oss;
     RequestInfo::serialize(info, oss);
     auto const& serializedInfo = oss.str();
-    const std::size_t infoSize = serializedInfo.size();
+    std::size_t const infoSize = serializedInfo.size();
     Id id{Id::REQUEST_SEND};
     connection->send(executor::kv_cache::DataContext{kID_TAG}, &id, sizeof(id));
     connection->send(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
@@ -189,11 +189,10 @@ std::unique_ptr<DataReceiverImpl::ReceiveCacheResource> const& DataReceiverImpl:
 {
     std::scoped_lock<std::mutex> lock(mProcessIoResouceMutex);
     TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
-    std::string processString = llmRequest.getDataTransceiverState().getCommState()->toString();
-
-    if (common::getEnvRequestKVCacheSerial())
+    std::string processString = "default";
+    if (common::getEnvRequestKVCacheConcurrent())
     {
-        processString = "default";
+        processString = llmRequest.getDataTransceiverState().getCommState()->toString();
     }
     if (mProcessToResources.find(processString) == mProcessToResources.end())
     {
