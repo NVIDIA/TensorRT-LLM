@@ -41,7 +41,6 @@ GB = 1 << 30
 def get_cache_size_per_token(model_config, mapping):
     mem_per_token = 2
     quant_config = model_config.quant_config
-    quant_config = model_config.quant_config
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         mem_per_token = 1
 
