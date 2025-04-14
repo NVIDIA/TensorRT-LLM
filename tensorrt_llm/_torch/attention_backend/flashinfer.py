@@ -1,5 +1,5 @@
 import os
-import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Optional
 
@@ -10,6 +10,7 @@ from flashinfer.jit.core import check_cuda_arch
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
 from .vanilla import VanillaAttention
@@ -168,7 +169,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.tokens_per_block
 
     def prepare(self) -> None:
-        _thread_local.metadata = self
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            extra_attrs["attention_metadata"] = weakref.ref(self)
+        else:
+            get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
@@ -391,16 +396,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return plan_params
 
 
-_thread_local = threading.local()
-
-
-def get_metadata() -> FlashInferAttentionMetadata:
-    try:
-        return _thread_local.metadata
-    except AttributeError:
-        return None
-
-
 class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
     Metadata = FlashInferAttentionMetadata
@@ -442,7 +437,12 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         otherwise it will graph break when calling `metadata.num_contexts` since it convert tensor's sum directly to int.
         '''
         # torch.compile does not support custom object as arguments, so we have to use global function to get the metadata.
-        metadata = get_metadata()
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            metadata_ref = extra_attrs.get("attention_metadata", None)
+            metadata = metadata_ref() if metadata_ref is not None else None
+        else:
+            metadata = get_global_attrs().attention_metadata()
 
         q = q.view(-1, num_heads, head_dim)
         if k is not None:
