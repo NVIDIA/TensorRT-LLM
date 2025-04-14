@@ -15,6 +15,7 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
@@ -517,19 +518,14 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
                 -1)
-            do_multi_stream = torch.cuda.is_current_stream_capturing(
-            ) and self.aux_stream is not None
-            if do_multi_stream:
-                self.ln_events[0].record()
-                compressed_kv = self.kv_a_layernorm(compressed_kv)
-                with torch.cuda.stream(self.aux_stream):
-                    self.ln_events[0].wait()
-                    q = self.q_a_layernorm(q)
-                    self.ln_events[1].record()
-                self.ln_events[1].wait()
-            else:
-                q = self.q_a_layernorm(q)
-                compressed_kv = self.kv_a_layernorm(compressed_kv)
+
+            q, compressed_kv = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q),
+                lambda: self.kv_a_layernorm(compressed_kv),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         q = self.q_b_proj(q)
 
@@ -641,53 +637,64 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
         q_nope, q_pe = q.view([
             -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
         ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
-        # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
-        fused_q = torch.empty(
-            [
-                num_tokens, self.num_heads,
-                (self.kv_lora_rank + self.qk_rope_head_dim)
-            ],
-            dtype=q.dtype,
-            device=q.device,
+        def _run_bmm():
+            # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
+            # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
+            fused_q = torch.empty(
+                [
+                    num_tokens, self.num_heads,
+                    (self.kv_lora_rank + self.qk_rope_head_dim)
+                ],
+                dtype=q.dtype,
+                device=q.device,
+            )
+            if self.k_b_proj_trans.dtype == torch.bfloat16:
+                # [num_heads, num_tokens, self.qk_nope_head_dim]
+                q_nope_t = q_nope.transpose(0, 1)
+                # [num_heads, num_tokens, self.kv_lora_rank]
+                q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+                # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
+                # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
+                # The output of bmm is written directly into fused_q
+                torch.ops.trtllm.bmm_out(q_nope_t,
+                                         self.k_b_proj_trans.transpose(1, 2),
+                                         q_nope_out)
+            elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+                q_nope_fp8, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+                    q_nope)
+                # [num_heads, num_tokens, self.kv_lora_rank]
+                q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+
+                torch.ops.trtllm.fp8_block_scaling_bmm_out(
+                    q_nope_fp8, self.k_b_proj_trans, q_nope_scales,
+                    self.k_b_proj_trans_scale, q_nope_out)
+                q_nope_scales = None
+            else:
+                raise NotImplementedError(
+                    f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+
+            fused_q = fused_q.view([
+                num_tokens,
+                self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+            ])
+            return fused_q
+
+        def _concat_kv_cache():
+            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+            return latent_cache
+
+        fused_q, latent_cache = maybe_execute_in_parallel(
+            _run_bmm,
+            _concat_kv_cache,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
         )
-
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope = q_nope.transpose(0, 1)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
-
-            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-            # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            q_nope, q_nope_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-                q_nope)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
-
-            torch.ops.trtllm.fp8_block_scaling_bmm_out(
-                q_nope, self.k_b_proj_trans, q_nope_scales,
-                self.k_b_proj_trans_scale, q_nope_out)
-            q_nope_scales = None
-        else:
-            raise NotImplementedError(
-                f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
-
-        fused_q = fused_q.view([
-            num_tokens,
-            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
-        ])
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16

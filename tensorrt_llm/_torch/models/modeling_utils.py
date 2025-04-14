@@ -115,6 +115,13 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
+def unpack_hidden_states(hidden_states):
+    if isinstance(hidden_states, (tuple, list)):
+        return hidden_states
+    else:
+        return hidden_states, None
+
+
 def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
                                       dtype: torch.dtype):
 
@@ -282,12 +289,19 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         pipeline_interface: Optional[PipelineInterface] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # local forward pass
+        local_decoder_layers = ([
+            self.layers[layer_id] for layer_id in self.pp_layer_list
+        ] if self.pp_size > 1 else self.layers)
+
         # unpack pp_interface or embedding lookup for the input
         if self.pp_rank != 0:
             if pipeline_interface is None:
                 raise ValueError(
                     "pipeline_interface is required for non-first pp rank.")
             hidden_states, residual = pipeline_interface  # unpack pp_interface
+            hidden_states, residual = local_decoder_layers[0].input_layernorm(
+                hidden_states, residual)
         else:
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
@@ -298,11 +312,6 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 inputs_embeds = self.embed_tokens(input_ids)
             hidden_states = inputs_embeds
             residual = None
-
-        # local forward pass
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
 
         for decoder_layer in local_decoder_layers:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
@@ -315,8 +324,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
             return PipelineInterface(hidden_states,
                                      residual)  # pack pp_interface
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        else:
+            return hidden_states
 
 
 class PostInitCaller(type):

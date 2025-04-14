@@ -23,10 +23,10 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
-from ..pyexecutor.cuda_graph_runner import is_graph_capturing
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -351,27 +351,25 @@ class Deepseekv3MoE(nn.Module):
     ) -> torch.Tensor:
         if min_latency_mode:
             assert not self.use_dp
-        # Only enable multi-stream for cuda graph since switch stream has extra host overhead
-        # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        do_multi_stream = is_graph_capturing()
-        if do_multi_stream:
-            self.event_dict[EventType.Main].record()
-        shared_output = self.shared_experts(hidden_states)
-        if self.shared_output_scale is not None:
-            shared_output *= self.shared_output_scale
-        if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.Main].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, hidden_states_fp4, all_rank_num_tokens,
-                    min_latency_mode)
-                self.event_dict[EventType.MoeShared].record()
-            self.event_dict[EventType.MoeShared].wait()
-        else:
+
+        def _compute_shared_output():
+            shared_output = self.shared_experts(hidden_states)
+            if self.shared_output_scale is not None:
+                shared_output *= self.shared_output_scale
+            return shared_output
+
+        def _compute_routed_output():
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
                                                        min_latency_mode)
+            return routed_output
+
+        shared_output, routed_output = maybe_execute_in_parallel(
+            _compute_shared_output, _compute_routed_output,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared], self.aux_stream)
+
         if min_latency_mode:
             return [shared_output, *routed_output]
 
@@ -494,6 +492,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         min_latency_mode = True if hidden_states.size(
             0
         ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -827,9 +829,7 @@ class DeepseekV3Model(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        residual = hidden_states
-
-        hidden_states = self.layers[0].input_layernorm(hidden_states)
+        residual = None
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
@@ -837,53 +837,6 @@ class DeepseekV3Model(DecoderModel):
                                                     residual=residual)
 
         return hidden_states
-
-    def _pp_forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-    ) -> torch.Tensor:
-        if self.pp_rank != 0:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
-        else:
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
-
-            hidden_states = inputs_embeds
-            residual = hidden_states
-
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
-
-        if self.pp_rank == 0:
-            hidden_states = local_decoder_layers[0].input_layernorm(
-                hidden_states)
-        else:
-            hidden_states, residual = local_decoder_layers[0].input_layernorm(
-                hidden_states, residual)
-
-        for decoder_layer in local_decoder_layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
-
-        if not self.pp_rank == self.pp_size - 1:
-            return PipelineInterface(hidden_states, residual)
-        else:
-            return hidden_states
 
 
 @register_auto_model("DeepseekV3ForCausalLM")
