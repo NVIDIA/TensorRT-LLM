@@ -566,7 +566,7 @@ class FusedMoE(nn.Module):
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
-            token_final_scales = torch.ones_like(token_final_scales)
+            token_final_scales = None
 
         x_sf = None
         if self.has_any_quant:
