@@ -99,6 +99,7 @@ public:
     void setRecvBufferInfo(int rank, uint64_t request_id, std::string basicDescStr);
     void setRemoteMD(std::string const& remote_metadata, int rank);
     std::string getLocalMD() const;
+    [[nodiscard]] CommState const& getCommState() const override;
 
     // New API for registering multiple buffers at once
     struct BufferInfo
@@ -116,6 +117,8 @@ public:
 
 private:
     mpi::MpiComm const* mComm;
+    // TODO: implement comm state
+    CommState mCommState;
     nixlAgent* agent_;
     nixlBackendH* backend_;
     std::string agent_name_;

@@ -412,4 +412,10 @@ void NixlConnectionManager::updateNotifications()
     }
 }
 
+CommState const& NixlConnectionManager::getCommState() const
+{
+    // TODO: implement
+    return mCommState;
+}
+
 } // namespace tensorrt_llm::executor::kv_cache
