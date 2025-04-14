@@ -22,7 +22,7 @@ from utils.util import getSMVersion
 
 
 @pytest.mark.skipif(
-    getSMVersion() < 90,
+    getSMVersion() < 90 or getSMVersion() >= 120,
     reason="custom scaled_mm is only supported in SM90",
 )  # Skip tests that are not supported in SM90
 @pytest.mark.parametrize(
