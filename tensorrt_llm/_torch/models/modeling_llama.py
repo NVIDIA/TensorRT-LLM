@@ -307,7 +307,7 @@ class Llama4MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0,
                  max_num_token_across_dp_ranks - hidden_states.shape[0]))
-        router_logits = self.router(hidden_states)
+        router_logits = self.router.llama4_router_forward(hidden_states)
         routed_output = self.experts(hidden_states,
                                      router_logits,
                                      cutlass_min_latency_mode,
@@ -636,11 +636,10 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
-
         if config.model_type == "llama4_text":
-           inter_size = config.intermediate_size_mlp
+            inter_size = config.intermediate_size_mlp
         else:
-           inter_size = config.intermediate_size
+            inter_size = config.intermediate_size
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
