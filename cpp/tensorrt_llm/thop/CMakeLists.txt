@@ -67,7 +67,6 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   llama4RouterGemm.cpp
-  llama4QKVGemm.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
