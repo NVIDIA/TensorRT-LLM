@@ -72,38 +72,40 @@ def get_ckpt_type(model_path):
 
 
 GEMMA_2_9B_IT = "gemma-2-9b-it"
-GEMMA_2_27_IT = "gemma-2-27b-it"
+GEMMA_2_27B_IT = "gemma-2-27b-it"
 GEMMA_3_1B_IT = "gemma-3-1b-it"
-GEMMA_VSWA_ATTENTION = [(GEMMA_2_9B_IT, 4096, 8192),
-                        (GEMMA_2_27_IT, 4096, 8192),
-                        (GEMMA_3_1B_IT, 1024, 1024, 1024, 1024, 1024, 32768)]
+VSWA_ATTENTION = {
+    GEMMA_2_9B_IT: [4096, 8192],
+    GEMMA_2_27B_IT: [4096, 8192],
+    GEMMA_3_1B_IT: [512, 512, 512, 512, 512, 32768]
+}
 """
-* Gemma2: (local `4096`: https://huggingface.co/blog/gemma3#longer-context-length, global `8192`: https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json#L20)
-* Gemma3: (local `1024`: https://huggingface.co/blog/gemma3#longer-context-length, global `32768`: https://huggingface.co/google/gemma-3-1b-it/blob/9b99be8/config.json#L20)
+* Gemma-2: (local `4096`: https://huggingface.co/google/gemma-2-9b-it/blob/main/config.json#L27, global `8192`: https://huggingface.co/google/gemma-2-9b-it/blob/main/config.json#L18)
+* Gemma-3-1b: (local `512`: https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json#L31, global `32768`: https://huggingface.co/google/gemma-3-1b-it/blob/9b99be8/config.json#L20)
 * (global `131072`: All other gemma 3 models https://github.com/huggingface/transformers/blob/ae5ce226644c8576c9047987e6b1d2e9bdeaed24/src/transformers/models/gemma3/modular_gemma3.py#L200C33-L200C40)
 """
+VSWA_MODELS = VSWA_ATTENTION.keys()
 
-GEMMA_VSWA_MODELS = {GEMMA_2_27_IT, GEMMA_2_9B_IT, GEMMA_3_1B_IT}
+GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
 "For plain, non VSWA testing"
 
 
 @skip_pre_hopper
-@pytest.mark.parametrize("gemma_vswa_attention",
-                         GEMMA_VSWA_ATTENTION,
-                         ids=[str(x) for x in GEMMA_VSWA_ATTENTION])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
-def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type, llm_venv,
+@pytest.mark.parametrize("gemma_model_root", VSWA_MODELS, indirect=True)
+def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type,
+                                             gemma_model_root, llm_venv,
                                              cmodel_dir, engine_dir,
                                              gemma_example_root,
                                              llm_datasets_root, llm_rouge_root,
-                                             qformat, gemma_vswa_attention):
-    model, *max_attention_window = gemma_vswa_attention
-    hf_gemma_quantization_1gpu(batch_size, data_type, model, llm_venv,
-                               cmodel_dir, engine_dir, gemma_example_root,
-                               llm_datasets_root, llm_rouge_root, qformat,
-                               max_attention_window)
+                                             qformat):
+    max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
+    hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
+                               llm_venv, cmodel_dir, engine_dir,
+                               gemma_example_root, llm_datasets_root,
+                               llm_rouge_root, qformat, max_attention_window)
 
 
 @skip_post_blackwell
@@ -112,7 +114,7 @@ def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type, llm_venv,
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("qformat", ['fp8', 'int4_awq', 'int8_sq'])
 @pytest.mark.parametrize("gemma_model_root",
-                         ["gemma-2b", "gemma-7b", *GEMMA_VSWA_MODELS],
+                         ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
                          indirect=True)
 def test_llm_hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
                                         llm_venv, cmodel_dir, engine_dir,
@@ -194,18 +196,15 @@ def hf_gemma_quantization_1gpu(batch_size,
 
 
 # max_seq_len=3100, one local value that won't slide, and one that will
-@pytest.mark.parametrize("gemma_vswa_attention",
-                         GEMMA_VSWA_ATTENTION,
-                         ids=[str(x) for x in GEMMA_VSWA_ATTENTION])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("test_case", ['other'])
+@pytest.mark.parametrize("gemma_model_root", VSWA_MODELS, indirect=True)
 def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
                                      llm_venv, cmodel_dir, engine_dir,
                                      gemma_example_root, llm_datasets_root,
-                                     llm_rouge_root, test_case,
-                                     gemma_vswa_attention):
-    model, *max_attention_window = gemma_vswa_attention
+                                     llm_rouge_root, test_case):
+    max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
     gemma_1gpu_summary(batch_size, data_type, gemma_model_root, llm_venv,
                        cmodel_dir, engine_dir, gemma_example_root,
                        llm_datasets_root, llm_rouge_root, test_case,
@@ -225,7 +224,7 @@ def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
 @pytest.mark.parametrize("gemma_model_root", [
     "gemma-2b", "gemma-7b", "gemma-2b-torch", "gemma-7b-torch",
     "gemma-2b-keras", "gemma-7b-keras", "gemma-2b-it-flax", "gemma-7b-it-flax",
-    *GEMMA_VSWA_MODELS
+    *GEMMA2_MODELS
 ],
                          indirect=True)
 def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
@@ -526,7 +525,7 @@ def test_llm_gemma_1gpu_evaltool(gemma_model_root, llm_venv, cmodel_dir,
 
 @skip_pre_hopper
 @pytest.mark.parametrize("gemma_model_root",
-                         ["gemma-2b", "gemma-7b", *GEMMA_VSWA_MODELS],
+                         ["gemma-2b", "gemma-7b", *GEMMA2_MODELS],
                          indirect=True)
 def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            llm_venv,
