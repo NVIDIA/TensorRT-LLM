@@ -21,6 +21,8 @@ default_test_timeout = 3600
 include_test_map = {
     "gpt": ("Gpt[^j]", ),
     "gpt_executor": ("GptExecutor", ),
+    "gpt_session": ("GptSession", ),
+    "gpt_tests": ("GptTests", ),
     "gptj": ("Gptj", ),
     "llama": ("Llama", ),
     "chatglm": ("ChatGlm", ),
@@ -621,8 +623,8 @@ def prepare_model_tests(model_name: str,
             beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
-    # share the same script for gpt and gpt_executor
-    if model_name == 'gpt_executor':
+    # share the same script for gpt related tests
+    if model_name == 'gpt_executor' or model_name == 'gpt_session' or model_name == 'gpt_tests':
         model_name = 'gpt'
 
     build_engines = [
@@ -719,6 +721,12 @@ def run_single_gpu_tests(build_dir: _pl.Path,
     if "gpt" in test_list and "gpt_executor" not in test_list:
         excluded_tests.append("GptExecutor")
 
+    if "gpt" in test_list and "gpt_session" not in test_list:
+        excluded_tests.append("GptSession")
+
+    if "gpt" in test_list and "gpt_tests" not in test_list:
+        excluded_tests.append("GptTests")
+
     ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
     if included_tests:
@@ -727,6 +735,12 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             ctest.extend(["-E", "|".join(excluded_tests)])
 
         parallel = default_test_parallel
+
+        # gpt* tests are not parallelized as it would cause OOM because kv cache memory allocations
+        # exist in multiple running tests
+        if "gpt" in test_list or "gpt_session" in test_list or "gpt_tests" in test_list:
+            parallel = 1
+
         if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
                                                 None):
             parallel = int(parallel_override)
