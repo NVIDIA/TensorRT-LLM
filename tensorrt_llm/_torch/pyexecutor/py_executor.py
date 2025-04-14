@@ -32,6 +32,18 @@ from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
 from .model_engine import ModelEngine
 from .scheduler import ScheduledRequests
 
+# Environment variable to specify iteration ranges for profiling start/stop.
+# Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
+PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
+
+# Environment variable to enable garbage collection profiling.
+# Set to "1" to enable recording of garbage collection events during profiling.
+PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
+
+# Environment variable to enable PyTorch profiler tracing.
+# Set to a path to save detailed tracing of PyTorch operations.
+PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
 
 def _is_executor_request(req_queue_item) -> bool:
     return isinstance(req_queue_item, tuple)
@@ -63,9 +75,6 @@ def _get_from_request_queue(request_queue, timeout: datetime.timedelta,
     return items
 
 
-PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
-
-
 @functools.cache
 def _load_iteration_indexes(env_var: str):
     spans = os.environ.get(env_var, None)
@@ -90,9 +99,6 @@ def _load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
-
-
-PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
 
 
 class _GCNvtxHandle:
@@ -397,11 +403,36 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+        torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+        profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
+                                            None)
+        enable_torch_trace = bool(torch_trace_path and profile_start_stop)
+        if torch_trace_path and profile_start_stop is None:
+            logger.warning(
+                f"{PROFILE_START_STOP_ENV_VAR_NAME} environment variable "
+                "needs to be set to enable the torch trace. Example to profile "
+                f"iteration 10-20: export {PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
+            )
+
+        if enable_torch_trace:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+                torch.profiler.ProfilerActivity.XPU,
+            ]
+            torch_profiler = torch.profiler.profile(activities=activities,
+                                                    record_shapes=True,
+                                                    with_modules=True)
 
         def profile_step():
             nonlocal it, enabled, start_time
             if it in self.profile_stop_iters:
                 assert enabled, "Inconsistent CUDA profiling state"
+                if enable_torch_trace:
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(torch_trace_path)
+                    logger.info(f"Profiling stopped at iteration {it}, "
+                                f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
@@ -410,15 +441,23 @@ class PyExecutor:
 
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
-                print(
-                    f'iter = {self.model_engine.iter_counter}, global_rank = {self.global_rank}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {end_time - start_time}s, timestamp = {formatted_timestamp}, states = {self.model_engine.iter_states}'
-                )
+                logger.info(
+                    f"iter = {self.model_engine.iter_counter}, "
+                    f"global_rank = {self.global_rank}, "
+                    f"rank = {self.dist.rank}, "
+                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
+                    f"elapsed_time = {end_time - start_time}s, "
+                    f"timestamp = {formatted_timestamp}, "
+                    f"states = {self.model_engine.iter_states}")
 
             it += 1
 
             if it in self.profile_start_iters:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 torch.cuda.cudart().cudaProfilerStart()
+                if enable_torch_trace:
+                    torch_profiler.start()
+                logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
             start_time = time.time()
 
@@ -427,6 +466,11 @@ class PyExecutor:
         finally:
             if enabled:
                 # Stop on early exit / exception
+                if enable_torch_trace:
+                    torch_profiler.stop()
+                    torch_profiler.export_chrome_trace(torch_trace_path)
+                    logger.info(f"Profiling stopped at iteration {it}, "
+                                f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
