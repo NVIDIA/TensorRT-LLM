@@ -9,10 +9,10 @@ from defs.conftest import filter_pytest_cases, get_sm_version, llm_models_root
 
 @filter_pytest_cases(
     # QA tests
-    "bs32-enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep4-pp1-tp8-fp4-deepseek_r1",
-    "bs32-enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep4-pp1-tp8-fp4-deepseek_r1",
-    "bs32-enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep8-pp1-tp8-fp4-deepseek_r1",
-    "bs32-enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep8-pp1-tp8-fp4-deepseek_r1",
+    "enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep4-pp1-tp8-fp4-deepseek_r1",
+    "enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep4-pp1-tp8-fp4-deepseek_r1",
+    "enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep8-pp1-tp8-fp4-deepseek_r1",
+    "enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep8-pp1-tp8-fp4-deepseek_r1",
 )
 @pytest.mark.parametrize("model_name", ["DeepSeek-R1", "DeepSeek-V3"],
                          ids=["deepseek_r1", "deepseek_v3"])

@@ -2327,6 +2327,8 @@ def filter_pytest_cases(*filters: str):
                 ids = mark.kwargs.get("ids", None)
                 if ids is None:
                     ids = [str(i) for i in values]
+                elif callable(ids):
+                    ids = [ids(i) for i in values]
                 marks.append((mark.args[0], values, ids))
                 if mark.kwargs.get("indirect", False):
                     indirects.append(mark.args[0])
