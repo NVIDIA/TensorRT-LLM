@@ -161,6 +161,7 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.decoder = decoder
         self.dist = dist
+        self.enable_overlap_scheduler = enable_overlap_scheduler
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
@@ -1441,6 +1442,7 @@ class PyExecutor:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
+                req.py_decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 req.py_draft_tokens = req.context_phase_params.draft_tokens
                 beam_width = req.sampling_config.beam_width
@@ -1865,6 +1867,15 @@ class PyExecutor:
             if request.is_dummy == True:
                 requests_to_terminate.append(request)
                 continue
+
+            if request.is_generation_only_request:
+                # If request is in transmission, so we don't need to emit a response
+                # Also, for the first iteration with overlap, we should skip since first token has already been emitted by context server
+                if request.is_disagg_generation_transmission_in_progress or (
+                        self.enable_overlap_scheduler
+                        and request.py_decoding_iter <= 1):
+                    new_active_requests.append(request)
+                    continue
 
             request.draft_tokens = request.py_draft_tokens
             request.decoding_iter = request.py_decoding_iter

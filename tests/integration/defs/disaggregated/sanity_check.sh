@@ -117,6 +117,7 @@ fi
 
 if [[ "${TEST_DESC}" != "gen_only" ]]; then
   expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")
+  not_expected_strings=("Berlin Berlin")
   if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
     expected_strings=("Berlin" "Asyncio is a")
   fi
@@ -130,4 +131,10 @@ if [[ "${TEST_DESC}" != "gen_only" ]]; then
         grep "${expected_string}" output_streaming_chat.json
       fi
   done
+
+  for not_expected_string in "${not_expected_strings[@]}"; do
+      grep -v "${not_expected_string}" output.json
+      grep -v "${not_expected_string}" output_streaming.json
+  done
+
 fi
