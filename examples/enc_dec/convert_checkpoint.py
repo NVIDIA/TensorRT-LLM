@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import types
+import torch
 from ast import literal_eval
 from collections import defaultdict
 from datetime import datetime
@@ -181,6 +182,12 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     def get_attn_module_name(component, block, layer, attn_type):
         return f'{component}.block.{int(block)}.layer.{int(layer)}.{attn_type}'
 
+    # TODO: drop after testing. duplicates embeddings for decoder
+    if component == 'decoder':
+        emb = params['shared.weight']
+        params['shared.weight'] = torch.cat([emb, emb], dim=0)
+        LOGGER.info(f"Duplicate emb weights for decoder: {str(params['shared.weight'].shape)}")
+
     weights['transformer.vocab_embedding.weight'] = reshape(
         params['shared.weight'].clone(),
         None) if not config.use_parallel_embedding else reshape(
@@ -311,6 +318,12 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
         params[f'{component}.final_layer_norm.weight'].clone(), None)
 
     if component == 'decoder':
+
+        # TODO: drop after testing. duplicate lm_head for decoder
+        head = params['lm_head.weight']
+        params['lm_head.weight'] = torch.cat([head, head], dim=0)
+        LOGGER.info(f"Duplicate lm_head for decoder: {str(params['lm_head.weight'].shape)}")
+
         weights['lm_head.weight'] = reshape(
             split(params['lm_head.weight'],
                   mapping.tp_size,
@@ -1593,7 +1606,9 @@ def convert_checkpoint(args):
         'num_attention_heads': decoder_config.n_head,
         'hidden_size': decoder_config.hidden_size,
         'norm_epsilon': decoder_config.layernorm_eps,
-        'vocab_size': decoder_config.vocab_size,
+        # TODO: this is for debug only, drop once it's verified that multi-sampling works
+        'vocab_size': decoder_config.vocab_size * 2,
+        'vocab_sizes': [decoder_config.vocab_size, decoder_config.vocab_size],
         'position_embedding_type': decoder_config.position_embedding_type,
         'hidden_act': decoder_config.hidden_act,
         'quantization': {

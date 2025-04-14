@@ -25,7 +25,7 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
-                                     transpose, unsqueeze)
+                                     transpose, unsqueeze, shape, view, select, concat)
 # yapf: disable
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
@@ -62,6 +62,7 @@ class EncDecTransformer(Module):
 
     def __init__(self,
                  vocab_size,
+                 num_vocabs,
                  hidden_size,
                  has_vocab_embeddings=True,
                  max_position_embeddings=None,
@@ -84,6 +85,7 @@ class EncDecTransformer(Module):
         ln_type = layernorm_map[layernorm_type]
         self.mapping = mapping
 
+        self.num_vocabs = num_vocabs
         if self.mapping.is_first_pp_rank():
             if has_vocab_embeddings:
                 self.vocab_embedding = Embedding(
@@ -163,6 +165,17 @@ class EncDecTransformer(Module):
 
         x = self.vocab_embedding(input_ids, *args) * self.embedding_scale
         self.register_network_output('word_embeddings', x)
+
+        if self.num_vocabs > 1:
+            x = view(
+                x,
+                concat([shape(x, 0) / self.num_vocabs, self.num_vocabs, -1])
+            )  # shape [totalSeqLen, nVocab, embDim]
+            # TODO: selecting just embedding from first vocab for e2e test
+            x = select(x, 1, 0)
+
+        if self.num_vocabs > 1 and (self.position_embedding or self.token_type_embedding):
+            raise RuntimeError("For multi-vocab enc-dec, position ids and token type ids have to be repeated")
 
         if self.position_embedding:
             pos_emb = self.position_embedding(position_ids)
@@ -640,6 +653,7 @@ class EncoderModel(PretrainedModel):
 
         self.transformer = EncDecTransformer(
             self.config.vocab_size,
+            1,
             self.config.hidden_size,
             max_position_embeddings=self.config.max_position_embeddings,
             has_position_embedding=self.has_position_embedding,
@@ -1105,6 +1119,7 @@ class DecoderModel(PretrainedModel):
 
         self.transformer = EncDecTransformer(
             self.config.vocab_size,
+            len(self.config.vocab_sizes) if self.config.vocab_sizes else 1,
             self.config.hidden_size,
             max_position_embeddings=self.config.max_position_embeddings,
             has_position_embedding=self.config.has_position_embedding,
@@ -1373,6 +1388,9 @@ class DecoderModel(PretrainedModel):
         inlen_range = [
             1, 1, max_decoder_input_len
         ]  # context phase >= 1 (if forced_input_ids), generation phase = 1
+        num_vocabs = len(self.config.vocab_sizes)
+        decoder_inlen_range = [x * num_vocabs for x in inlen_range]
+
         encoder_inlen_range = [
             1, (max_encoder_input_len + 1) // 2, max_encoder_input_len
         ]
@@ -1390,6 +1408,7 @@ class DecoderModel(PretrainedModel):
             max(max_decoder_input_len * max_batch_size,
                 max_beam_width * max_batch_size),
         ]
+        io_decoder_num_tokens_range = [x * num_vocabs for x in decoder_num_tokens_range]
 
         # No enable_two_optimization_profiles support yet
 
@@ -1435,7 +1454,7 @@ class DecoderModel(PretrainedModel):
                                    shape=[-1],
                                    dim_range=OrderedDict([
                                        ('decoder_num_tokens',
-                                        [decoder_num_tokens_range]),
+                                        [io_decoder_num_tokens_range]),
                                    ]))
                 if self.has_position_embedding:
                     position_ids = Tensor(name='position_ids',
@@ -1443,7 +1462,7 @@ class DecoderModel(PretrainedModel):
                                           shape=[-1],
                                           dim_range=OrderedDict([
                                               ('decoder_num_tokens',
-                                               [decoder_num_tokens_range]),
+                                               [io_decoder_num_tokens_range]),
                                           ]))
                 if self.has_token_type_embedding:
                     token_type_ids = Tensor(
@@ -1451,7 +1470,7 @@ class DecoderModel(PretrainedModel):
                         dtype=trt.int32,
                         shape=[-1],
                         dim_range=OrderedDict([('decoder_num_tokens',
-                                                [decoder_num_tokens_range])]),
+                                                [io_decoder_num_tokens_range])]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',
@@ -1469,7 +1488,7 @@ class DecoderModel(PretrainedModel):
                                    shape=[-1, -1],
                                    dim_range=OrderedDict([
                                        ('batch_size_beam_width', [bb_range]),
-                                       ('input_len', [inlen_range]),
+                                       ('input_len', [decoder_inlen_range]),
                                    ]))
                 if self.has_position_embedding:
                     position_ids = Tensor(name='position_ids',
@@ -1478,7 +1497,7 @@ class DecoderModel(PretrainedModel):
                                           dim_range=OrderedDict([
                                               ('batch_size_beam_width',
                                                [bb_range]),
-                                              ('input_len', [inlen_range]),
+                                              ('input_len', [decoder_inlen_range]),
                                           ]))
                 if self.has_token_type_embedding:
                     token_type_ids = Tensor(
@@ -1487,7 +1506,7 @@ class DecoderModel(PretrainedModel):
                         shape=[-1, -1],
                         dim_range=OrderedDict([('batch_size_beam_width',
                                                 [bb_range]),
-                                               ('input_len', [inlen_range])]),
+                                               ('input_len', [decoder_inlen_range])]),
                     )
             else:
                 hidden_states = Tensor(name='hidden_states_input',
@@ -2061,6 +2080,7 @@ class WhisperEncoder(PretrainedModel):
                        dtype=self._dtype)
         self.transformer = EncDecTransformer(
             0,
+            1,
             self.config.hidden_size,
             has_vocab_embeddings=False,
             max_position_embeddings=self.config.max_position_embeddings,
