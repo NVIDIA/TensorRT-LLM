@@ -68,11 +68,24 @@ ncclUniqueId getUniqueId(std::set<int> const& group) noexcept
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return id;
 }
+
+bool isDevicesUnique(tensorrt_llm::mpi::MpiComm const& comm)
+{
+    int deviceId;
+    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
+    auto const size = comm.getSize();
+    std::vector<int> deviceIds(size);
+    comm.allgather(&deviceId, deviceIds.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+    return std::unordered_set<int>(deviceIds.begin(), deviceIds.end()).size() == deviceIds.size();
+}
+
 } // namespace
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
     auto const rank = COMM_SESSION.getRank();
+    TLLM_CHECK_WITH_INFO(
+        isDevicesUnique(LOCAL_COMM_SESSION), "Binding multiple ranks to a single CUDA device is not supported.");
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
     static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
