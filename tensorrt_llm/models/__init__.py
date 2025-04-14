@@ -154,6 +154,7 @@ MODEL_MAP = {
     'Phi3VForCausalLM': Phi3ForCausalLM,
     'Phi3SmallForCausalLM': Phi3ForCausalLM,
     'PhiMoEForCausalLM': Phi3ForCausalLM,
+    'Phi4MMForCausalLM': Phi3ForCausalLM,
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
