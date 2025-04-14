@@ -215,7 +215,6 @@ class LlamaDecoderLayer(DecoderLayer):
         self.intermediate_size = model_config.pretrained_config.intermediate_size
 
         self.fusion_config = EagerFusionConfig()
-        self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
 
         self.is_llama4 = config.model_type == "llama4_text"
         self.is_nope_layer = False
@@ -257,6 +256,7 @@ class LlamaDecoderLayer(DecoderLayer):
             else:
                 self.mlp = mlp
 
+            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
         else:
             self.feed_forward = Llama4MoE(
@@ -269,6 +269,7 @@ class LlamaDecoderLayer(DecoderLayer):
                 aux_stream=aux_stream,
                 dtype=config.torch_dtype)
 
+            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -285,8 +286,11 @@ class LlamaDecoderLayer(DecoderLayer):
             gpus_per_node=model_config.mapping.gpus_per_node)
         self.all_reduce = AllReduce(self.parallel_config)
         self.next_layer_layernorm: RMSNorm = None
+        self.next_attn: LlamaAttention = None
 
         self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.pre_mlp_fp8_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.post_mlp_fp8_allreduce = DeepseekAllReduce(self.parallel_config)
 
     def forward(
         self,
@@ -307,6 +311,8 @@ class LlamaDecoderLayer(DecoderLayer):
         # min_latency_mode = not llama4_tp8ep1_min_latency_mode and num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
+        use_fp8_allreduce = True if hidden_states.size(
+            0) <= 128 and self.is_fp8_quant else False
 
         # Self Attention
         # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
@@ -319,7 +325,8 @@ class LlamaDecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.PRE_MOE_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
+                or self.parallel_config.tensor_parallel_size == 1 or
+                (self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce))),
             **kwargs,
         )
 
@@ -332,6 +339,17 @@ class LlamaDecoderLayer(DecoderLayer):
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
+        elif self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce:
+            hidden_states, residual = self.pre_mlp_fp8_allreduce(
+                hidden_states,
+                [
+                    residual, self.post_attention_layernorm.weight,
+                    self.feed_forward.gate_up_proj.input_scale
+                    if self.is_llama4 else self.mlp.gate_up_proj.input_scale
+                ],
+                self.post_attention_layernorm.variance_epsilon,
+                AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+            )
         else:
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
@@ -369,6 +387,16 @@ class LlamaDecoderLayer(DecoderLayer):
                     ],
                     self.next_layer_layernorm.variance_epsilon,
                     AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+                )
+            elif self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
+                hidden_states, residual = self.post_mlp_fp8_allreduce(
+                    hidden_states,
+                    [
+                        residual, self.next_layer_layernorm.weight,
+                        self.next_attn.qkv_proj.input_scale
+                    ],
+                    self.next_layer_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                 )
             else:
                 hidden_states, residual = self.all_reduce(
@@ -576,6 +604,7 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
@@ -612,6 +641,7 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[LlamaModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
 @register_auto_model("MistralForCausalLM")
@@ -636,6 +666,7 @@ class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
 class Eagle3LlamaDraftModel(DecoderModel):

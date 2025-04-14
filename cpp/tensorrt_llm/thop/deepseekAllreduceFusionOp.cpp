@@ -114,6 +114,31 @@ public:
                     = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant;
             }
         }
+        else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_FP8)
+        {
+            TORCH_CHECK(reduce_fusion_inputs.size() == 3, "Pre-MLP fusion should have 3 inputs.");
+            auto const& inputShape = input.sizes();
+            std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+            quant_out
+                = at::detail::empty_cuda(outputShape, at::ScalarType::Float8_e4m3fn, input.device(), std::nullopt);
+            residual_out = torch::empty_like(reduce_fusion_inputs[0]);
+
+            allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+            allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_FP8)
+            {
+                norm_out = torch::empty_like(input);
+                allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+                allreduce_fusion_params.pattern
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant;
+            }
+            else
+            {
+                allreduce_fusion_params.pattern
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant;
+            }
+        }
         else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             norm_out = torch::empty_like(input);
@@ -141,7 +166,9 @@ public:
         allreduce_fusion_params.rms_eps = static_cast<float>(eps);
 
         if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4
+            || fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_FP8)
         {
             allreduce_fusion_params.scale_factor = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
         }
@@ -165,6 +192,14 @@ public:
         else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_NVFP4)
         {
             return std::vector<torch::Tensor>({norm_out, quant_out, scale_out, residual_out});
+        }
+        else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+        {
+            return std::vector<torch::Tensor>({quant_out, residual_out});
+        }
+        else if (fusion_op_type == AllReduceFusionOp::RESIDUAL_RMS_NORM_AND_QUANT_FP8)
+        {
+            return std::vector<torch::Tensor>({norm_out, quant_out, residual_out});
         }
         else
         {
