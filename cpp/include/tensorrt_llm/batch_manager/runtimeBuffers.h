@@ -144,7 +144,6 @@ private:
     TensorPtr lastTokenIdsHost;
     TensorPtr lastTokenIdsDevice;
     TensorPtr logitsIdsHost;
-    TensorPtr logitsIdsDevice;
 
     //! Pipeline-Parallelism
     TensorPtr hiddenStates;

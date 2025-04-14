@@ -114,7 +114,6 @@ void RuntimeBuffers::reshape(TllmRuntime const& runtime, ModelConfig const& mode
     lastTokenIdsHost->reshape(numLogitsShape);
     lastTokenIdsDevice->reshape(numLogitsShape);
     logitsIdsHost->reshape(numLogitsShape);
-    logitsIdsDevice->reshape(numLogitsShape);
 
     if (transformerBuffers)
     {
@@ -252,7 +251,6 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
     lastTokenIdsHost = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
     lastTokenIdsDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
     logitsIdsHost = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
-    logitsIdsDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
     inputsIds = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
 
@@ -811,7 +809,6 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
         // In generation phase, device ptr of context lengths need to be tiled.
         manager.copy(*contextLengthsHost, *contextLengthsDevice);
         manager.copy(*sequenceLengthsHost, *sequenceLengthsDevice);
-        manager.copy(*logitsIdsHost, *logitsIdsDevice);
         auto const logitsIdsHostRange = BufferRange<SizeType32>(*logitsIdsHost);
         auto lastTokenIdsHostRange = BufferRange<SizeType32>(*lastTokenIdsHost);
         common::stl_utils::inclusiveScan(

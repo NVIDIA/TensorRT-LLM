@@ -1606,12 +1606,17 @@ def test_parallel_config():
     comm_mode = trtllm.CommunicationMode.LEADER
     device_ids = [0, 1, 2, 3]
     participant_ids = [4, 5, 6, 7]
-    parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
-                                            participant_ids)
+    num_nodes = 2
+    parallel_config = trtllm.ParallelConfig(comm_type,
+                                            comm_mode,
+                                            device_ids,
+                                            participant_ids,
+                                            num_nodes=num_nodes)
     assert parallel_config.communication_type == comm_type
     assert parallel_config.communication_mode == comm_mode
     assert parallel_config.device_ids == device_ids
     assert parallel_config.participant_ids == participant_ids
+    assert parallel_config.num_nodes == num_nodes
 
     comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
     #Dummy path to worker executable
@@ -1626,6 +1631,25 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.worker_executable_path == str(
         worker_path)
     assert parallel_config.orchestrator_config.spawn_processes == True
+
+
+def test_parallel_config_pickle():
+    comm_type = trtllm.CommunicationType.MPI
+    comm_mode = trtllm.CommunicationMode.LEADER
+    device_ids = [0, 1, 2, 3]
+    participant_ids = [4, 5, 6, 7]
+    num_nodes = 2
+    parallel_config = trtllm.ParallelConfig(comm_type,
+                                            comm_mode,
+                                            device_ids,
+                                            participant_ids,
+                                            num_nodes=num_nodes)
+    parallel_config_copy = pickle.loads(pickle.dumps(parallel_config))
+    assert parallel_config_copy.communication_type == comm_type
+    assert parallel_config_copy.communication_mode == comm_mode
+    assert parallel_config_copy.device_ids == device_ids
+    assert parallel_config_copy.participant_ids == participant_ids
+    assert parallel_config_copy.num_nodes == num_nodes
 
 
 def test_peft_cache_config():
