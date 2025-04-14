@@ -405,6 +405,14 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks --extra-make-targets modelSpec"
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
+
+        // Build tritonserver artifacts
+        def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
+        sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
+
+        sh "mkdir -p TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/libtriton_tensorrtllm.so TensorRT-LLM/triton_backend/inflight_batcher_llm/"
+        sh "cp ${LLM_ROOT}/triton_backend/inflight_batcher_llm/build/trtllmExecutorWorker TensorRT-LLM/triton_backend/inflight_batcher_llm/"
     }
 
     // Step 3: packaging wheels into tarfile
