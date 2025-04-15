@@ -107,12 +107,9 @@ public:
     using TensorPtr = runtime::ITensor::SharedPtr;
 
     std::vector<TensorPtr> logits;
-    TensorPtr slotOutputIds;     // [mMaxNumRequests, beamWidth, maxSeqLen], outputIds of all batch slots
-    TensorPtr slotOutputIdsHost; // [beamWidth, maxSeqLen], outputIds of single batch slot
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
     TensorPtr sequenceLengthsHost; // [mMaxNumRequests, beamWidth], pinned host tensor
-    TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]

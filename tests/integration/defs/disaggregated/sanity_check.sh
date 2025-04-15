@@ -61,6 +61,9 @@ elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_mtp" ]]; then
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1" ]]; then
   NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp" ]]; then
+  NUM_RANKS=2
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml
 else
   echo "Invalid test description: ${TEST_DESC}"
   exit 1
@@ -117,6 +120,7 @@ fi
 
 if [[ "${TEST_DESC}" != "gen_only" ]]; then
   expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")
+  not_expected_strings=("Berlin Berlin")
   if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
     expected_strings=("Berlin" "Asyncio is a")
   fi
@@ -130,4 +134,10 @@ if [[ "${TEST_DESC}" != "gen_only" ]]; then
         grep "${expected_string}" output_streaming_chat.json
       fi
   done
+
+  for not_expected_string in "${not_expected_strings[@]}"; do
+      grep -v "${not_expected_string}" output.json
+      grep -v "${not_expected_string}" output_streaming.json
+  done
+
 fi

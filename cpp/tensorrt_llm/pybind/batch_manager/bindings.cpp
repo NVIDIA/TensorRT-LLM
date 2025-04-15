@@ -251,6 +251,7 @@ void initBindings(pybind11::module_& m)
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+        .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(
@@ -463,14 +464,10 @@ void initBindings(pybind11::module_& m)
             py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
-        .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
-        .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
         .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_property_readonly(
-            "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
         .def_property_readonly("new_output_tokens_host",
             [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
