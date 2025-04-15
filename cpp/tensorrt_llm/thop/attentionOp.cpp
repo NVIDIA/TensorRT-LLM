@@ -75,7 +75,8 @@ public:
         torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas, torch::optional<int32_t> attention_chunk_size) const
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+        torch::optional<int32_t> attention_chunk_size) const
         = 0;
 };
 
@@ -123,8 +124,8 @@ public:
         torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-        torch::optional<torch::Tensor> mrope_rotary_cos_sin,
-        torch::optional<torch::Tensor> mrope_position_deltas, torch::optional<int32_t> attention_chunk_size) const override
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+        torch::optional<int32_t> attention_chunk_size) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -359,10 +360,10 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     std::optional<int64_t> attention_input_type, bool is_mla_enable, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
-    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas, std::optional<int64_t> attention_chunk_size)
+    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
+    std::optional<int64_t> attention_chunk_size)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
-    TLLM_LOG_INFO("attention_chunk_size: %ld", attention_chunk_size.value_or(0));
 
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
