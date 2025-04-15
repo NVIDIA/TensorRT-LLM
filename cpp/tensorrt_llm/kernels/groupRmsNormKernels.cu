@@ -222,7 +222,7 @@ void GroupRMSNormKernel(GroupRMSParams<n> params)
 {
     // Kernel assertions
     constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
-    for (uint32_t i = 0; i < params.num_inputs; i++)
+    for (int i = 0; i < params.num_inputs; i++)
     {
         TLLM_CHECK_WITH_INFO(params.input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
         // Each wrap process 32 * kPackedSize tokens per round.

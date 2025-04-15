@@ -99,7 +99,6 @@ def test_group_rms_norm_benchmark(batch_size,
                                   dtype,
                                   enable_weights,
                                   eps=1e-5,
-                                  warmup_runs=10,
                                   timing_runs=100):
     """Benchmark group_rms_norm against individual RMSNorm modules."""
     assert torch.cuda.is_available(), "This test requires CUDA"
@@ -125,54 +124,66 @@ def test_group_rms_norm_benchmark(batch_size,
                                enable_weights=enable_weights)
 
     # Create streams for reference computations
-    streams = [torch.cuda.Stream() for _ in ref_norms]
+    ref_streams = [torch.cuda.Stream() for _ in ref_norms]
+    group_stream = torch.cuda.Stream()
+
+    # Capture CUDA graphs
+    ref_graphs = []  # CUDA graph
+    static_inputs = [torch.randn_like(x) for x in inputs]
+    static_weights = [torch.ones_like(x) for x in weights]
+    ref_outputs = [torch.empty_like(x) for x in inputs]
+    group_outputs = [torch.empty_like(inp) for inp in inputs]
 
     # Benchmark RMSNorm as reference with streams
-    # Warmup
-    for _ in range(warmup_runs):
-        ref_outputs = []
-        for i, norm in enumerate(ref_norms):
-            with torch.cuda.stream(streams[i]):
-                ref_outputs.append(norm(inputs[i]))
+    for i, (norm, stream) in enumerate(zip(ref_norms, ref_streams)):
+        g = torch.cuda.CUDAGraph()
+        # preload input
+        inputs[i].copy_(static_inputs[i])
+        with torch.cuda.stream(stream):
+            stream.synchronize()  # ensure stream ready
+            g.capture_begin()
+            ref_outputs[i] = norm(inputs[i])
+            g.capture_end()
+        ref_graphs.append(g)
 
-    # Timing
+    group_graph = torch.cuda.CUDAGraph()
+    for i in range(len(inputs)):
+        inputs[i].copy_(static_inputs[i])
+        weights[i].copy_(static_weights[i])
+    with torch.cuda.stream(group_stream):
+        group_stream.synchronize()
+        if enable_weights:
+            group_graph.capture_begin()
+            group_outputs = group_norms(inputs, weights)
+            group_graph.capture_end()
+        else:
+            group_graph.capture_begin()
+            group_outputs = group_norms(inputs)
+            group_graph.capture_end()
+
+    # Benchmark RMSNorm CUDA graphs with multi-stream
+    torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    torch.cuda.synchronize()
     start_event.record()
     for _ in range(timing_runs):
-        ref_outputs = []
-        for i, norm in enumerate(ref_norms):
-            with torch.cuda.stream(streams[i]):
-                ref_outputs.append(norm(inputs[i]))
+        for i, stream in enumerate(ref_streams):
+            with torch.cuda.stream(stream):
+                ref_graphs[i].replay()
         torch.cuda.synchronize()
     end_event.record()
-
     ref_time = start_event.elapsed_time(end_event) / timing_runs
 
-    # Benchmark GroupRMSNorm
-    # Warmup
-    for _ in range(warmup_runs):
-        if enable_weights:
-            group_outputs = group_norms(inputs, weights)
-        else:
-            group_outputs = group_norms(inputs)
-
-    # Timing
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
+    # Benchmark GroupRMSNorm CUDA graph
     torch.cuda.synchronize()
     start_event.record()
     for _ in range(timing_runs):
-        if enable_weights:
-            group_outputs = group_norms(inputs, weights)
-        else:
-            group_outputs = group_norms(inputs)
+        group_graph.replay()
         torch.cuda.synchronize()
     end_event.record()
     group_time = start_event.elapsed_time(end_event) / timing_runs
+
     print(
         f"Batch size: {batch_size}, hidden dims: {hidden_dims}, dtype: {dtype}, enable_weights: {enable_weights}"
     )
