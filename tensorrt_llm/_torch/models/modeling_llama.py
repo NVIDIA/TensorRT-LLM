@@ -10,8 +10,10 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+# For Llama4 attention backend
+from ..attention_backend import AttentionMetadata, TrtllmAttention
+from ..attention_backend.interface import (PositionalEmbeddingParams,
+                                           PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -21,7 +23,7 @@ from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
-from ..modules.rms_norm import RMSNorm
+from ..modules.rms_norm import L2Norm, RMSNorm
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
@@ -36,18 +38,15 @@ class Llama4Attention(Attention):
         model_config: ModelConfig[LlamaConfig],
         layer_idx: Optional[int] = None,
         use_qk_norm: bool = False,
+        nope_layer: bool = False,
+        attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
 
-        # Note the convention no_rope_layers[layer_idx] == 0 means nope_layer
-        is_nope_layer = config.no_rope_layers[layer_idx] == 0
-
-        use_rope = not is_nope_layer
-        attn_temperature_tuning = is_nope_layer and config.attn_temperature_tuning > 0
-        use_qk_norm = use_qk_norm and not is_nope_layer
-
-        if use_rope and not use_qk_norm:
+        self.use_rope = not nope_layer
+        self.use_qk_norm = use_qk_norm and not nope_layer
+        if self.use_rope and not self.use_qk_norm:
             # We can fuse pos embed only when: is_rope=True, is_qk_norm=False
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
@@ -56,7 +55,6 @@ class Llama4Attention(Attention):
             )
         else:
             pos_embd_params = None
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -67,9 +65,136 @@ class Llama4Attention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            use_qk_norm=use_qk_norm,
-            aux_stream=aux_stream,
-            attn_temperature_tuning=attn_temperature_tuning)
+            aux_stream=aux_stream)
+
+        if self.use_qk_norm:
+            self.head_dim = config.hidden_size // config.num_attention_heads
+            self.qk_norm = L2Norm(hidden_size=self.head_dim,
+                                  dtype=config.torch_dtype)
+        else:
+            self.qk_norm = None
+
+        self.attn_temperature_tuning = attn_temperature_tuning
+        self.floor_scale = getattr(config, "floor_scale", 8192.0)
+        self.attn_scale = getattr(config, "attn_scale", 0.1)
+
+    def _get_attn_scale(self, position_ids: torch.Tensor) -> torch.Tensor:
+        positions = position_ids.view(-1)
+        floor = torch.floor((positions + 1.0) / self.floor_scale)
+        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+        return attn_scale.unsqueeze(-1)
+
+    def forward(
+        self,
+        position_ids: Optional[torch.LongTensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+        mrope_config: Optional[dict] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden_states)
+        is_fused_qkv = False
+        if isinstance(self.attn, TrtllmAttention):
+            is_fused_qkv = True
+
+        if self.qk_norm is not None:
+            assert self.attn_backend == "FLASHINFER", "attention qk_norm is only supported w/ flashinfer backend"
+            # Apply rope ahead of qk_norm
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None:
+
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                    dim=-1)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+                qkv = torch.concat([q, k, v], dim=-1)
+
+            # TODO: make this more efficient.
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+            do_multi_stream = torch.cuda.is_current_stream_capturing(
+            ) and self.aux_stream is not None
+            if do_multi_stream:
+                self.ln_events[0].record()
+                k = k.reshape(-1, self.head_dim)
+                k = self.qk_norm(k).reshape(-1, self.kv_size)
+                with torch.cuda.stream(self.aux_stream):
+                    self.ln_events[0].wait()
+                    q = q.reshape(-1, self.head_dim)
+                    q = self.qk_norm(q).reshape(-1, self.q_size)
+                    self.ln_events[1].record()
+                self.ln_events[1].wait()
+            else:
+                q = q.reshape(-1, self.head_dim)
+                k = k.reshape(-1, self.head_dim)
+                q = self.qk_norm(q).reshape(-1, self.q_size)
+                k = self.qk_norm(k).reshape(-1, self.kv_size)
+            qkv = torch.concat([q, k, v], dim=-1)
+
+        if self.attn_temperature_tuning:
+            # this must be a nope layer
+            assert position_ids is not None, "attn_temperature_tuning requires position_ids"
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+            attn_scale = self._get_attn_scale(position_ids)
+            q = (q * attn_scale).to(q.dtype)
+            qkv = torch.concat(
+                [q.contiguous(), k.contiguous(),
+                 v.contiguous()], dim=-1)
+
+        if lora_params is not None:
+            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
+                                              self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
+
+            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
+                                           self.layer_idx)
+            if qkv_lora is not None:
+                qkv = qkv + qkv_lora
+
+        if is_fused_qkv:
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None and self.qk_norm is None:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                    dim=-1)
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+                qkv = torch.concat([q, k, v], dim=-1)
+
+            out_scale = None
+            if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
+                out_scale = self.o_proj.inv_input_scale
+            attn_output = self.attn.forward(qkv,
+                                            None,
+                                            None,
+                                            attn_metadata,
+                                            out_scale=out_scale,
+                                            attention_mask=attention_mask,
+                                            mrope_config=mrope_config)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+
+            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None and self.qk_norm is None:
+                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+
+            attn_output = self.attn.forward(q.contiguous(),
+                                            k.contiguous(),
+                                            v.contiguous(),
+                                            attn_metadata,
+                                            attention_mask=attention_mask,
+                                            mrope_config=mrope_config)
+
+        attn_output = self.o_proj(attn_output,
+                                  all_reduce_params=all_reduce_params)
+        if lora_params is not None:
+            attn_lora_output = self.o_lora(attn_output, lora_params,
+                                           self.layer_idx)
+            if attn_lora_output is not None:
+                attn_output = attn_output + attn_lora_output
+
+        return attn_output
 
 
 class LlamaAttention(Attention):
@@ -217,6 +342,9 @@ class Llama4DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
+            nope_layer=self.is_nope_layer,
+            attn_temperature_tuning=self.is_nope_layer
+            and config.attn_temperature_tuning > 0,
             aux_stream=aux_stream,
         )
 
@@ -473,15 +601,10 @@ class Eagle3LlamaDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
-        if config.model_type == "llama4_text":
-            inter_size = config.intermediate_size_mlp
-        else:
-            inter_size = config.intermediate_size
-
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
-            intermediate_size=inter_size,
-            bias=getattr(config, "mlp_bias", False),
+            intermediate_size=config.intermediate_size,
+            bias=config.mlp_bias,
             dtype=config.torch_dtype,
             config=model_config,
         )

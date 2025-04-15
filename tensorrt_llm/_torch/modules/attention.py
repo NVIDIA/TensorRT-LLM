@@ -20,28 +20,6 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-class L2Norm(torch.nn.Module):
-
-    def __init__(self,
-                 hidden_size: int,
-                 dtype: Optional[torch.dtype] = None,
-                 eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dtype = dtype
-        self.hidden_size = hidden_size
-
-    def _norm(self, x):
-        flash_infer_kernel = RMSNorm(hidden_size=self.hidden_size,
-                                     eps=self.eps,
-                                     dtype=self.dtype,
-                                     device=x.device)
-        return flash_infer_kernel(x)
-
-    def forward(self, x):
-        return self._norm(x).type_as(x)
-
-
 class Attention(nn.Module):
 
     def __init__(
@@ -57,9 +35,7 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        attn_temperature_tuning: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -72,7 +48,6 @@ class Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.use_qk_norm = use_qk_norm
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -105,11 +80,6 @@ class Attention(nn.Module):
                                     1) // tp_size
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
-
-        if self.use_qk_norm:
-            self.qk_norm = L2Norm(hidden_size=self.head_dim, dtype=dtype)
-        else:
-            self.qk_norm = None
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -166,12 +136,6 @@ class Attention(nn.Module):
         if not config.skip_create_weights:
             self.create_weights()
 
-        # Llama4 attention configs
-        self.attn_temperature_tuning = attn_temperature_tuning
-        self.floor_scale = getattr(config.pretrained_config, "floor_scale",
-                                   8192.0)
-        self.attn_scale = getattr(config.pretrained_config, "attn_scale", 0.1)
-
     def create_weights(self):
         self.attn = create_attention(
             self.attn_backend,
@@ -191,12 +155,6 @@ class Attention(nn.Module):
             q, k, v = qkv, None, None
         return q, k, v
 
-    def _get_attn_scale(self, position_ids: torch.Tensor) -> torch.Tensor:
-        positions = position_ids.view(-1)
-        floor = torch.floor((positions + 1.0) / self.floor_scale)
-        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
-        return attn_scale.unsqueeze(-1)
-
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
@@ -210,49 +168,6 @@ class Attention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-
-        if self.qk_norm is not None:
-            assert self.attn_backend == "FLASHINFER", "attention qk_norm is only supported w/ flashinfer backend"
-            # Apply rope ahead of qk_norm
-            if self.pos_embd_params is None and position_ids is not None and self.rotary_emb is not None:
-
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                    dim=-1)
-                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
-                qkv = torch.concat([q, k, v], dim=-1)
-
-            # TODO: make this more efficient.
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            do_multi_stream = torch.cuda.is_current_stream_capturing(
-            ) and self.aux_stream is not None
-            if do_multi_stream:
-                self.ln_events[0].record()
-                k = k.reshape(-1, self.head_dim)
-                k = self.qk_norm(k).reshape(-1, self.kv_size)
-                with torch.cuda.stream(self.aux_stream):
-                    self.ln_events[0].wait()
-                    q = q.reshape(-1, self.head_dim)
-                    q = self.qk_norm(q).reshape(-1, self.q_size)
-                    self.ln_events[1].record()
-                self.ln_events[1].wait()
-            else:
-                q = q.reshape(-1, self.head_dim)
-                k = k.reshape(-1, self.head_dim)
-                q = self.qk_norm(q).reshape(-1, self.q_size)
-                k = self.qk_norm(k).reshape(-1, self.kv_size)
-            qkv = torch.concat([q, k, v], dim=-1)
-
-        if self.attn_temperature_tuning:
-            # this must be a nope layer
-            assert position_ids is not None, "attn_temperature_tuning requires position_ids"
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            attn_scale = self._get_attn_scale(position_ids)
-            q = (q * attn_scale).to(q.dtype)
-            qkv = torch.concat(
-                [q.contiguous(), k.contiguous(),
-                 v.contiguous()], dim=-1)
 
         if lora_params is not None:
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
