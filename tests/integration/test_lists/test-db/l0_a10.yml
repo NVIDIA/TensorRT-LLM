@@ -9,18 +9,49 @@ l0_a10:
       gpu:
       - '*a10*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-pytorch-stress-stage-alone]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_model[medusa-86]
   - test_cpp.py::test_model[redrafter-86]
   - test_cpp.py::test_model[mamba-86]
   - test_cpp.py::test_model[recurrentgemma-86]
   - test_cpp.py::test_model[eagle-86]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - unittest/trt/attention/test_gpt_attention.py -k "partition0"
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
@@ -38,6 +69,7 @@ l0_a10:
   - test_e2e.py::test_llmapi_chat_example
   - test_e2e.py::test_llmapi_exit
   - test_e2e.py::test_llmapi_server_example
+  - test_e2e.py::test_trtllm_serve_example
   - test_e2e.py::test_openai_misc_example
   - test_e2e.py::test_openai_completions_example
   - test_e2e.py::test_openai_chat_example
@@ -45,7 +77,7 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
   - unittest/trt/quantization # 18 mins
-  - accuracy/test_accuracy.py::TestLlama7B::test_streamingllm # 2 mins
+  - accuracy/test_cli_flow.py::TestLlama7B::test_streamingllm # 2 mins
   - unittest/trt/functional # 37 mins
   - test_cache.py::test_cache_sanity # 1 sec
   - test_e2e.py::test_llmapi_quickstart_atexit
@@ -55,22 +87,22 @@ l0_a10:
   - unittest/llmapi/test_llm_perf_evaluator.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
-  - accuracy/test_accuracy.py::TestGpt2::test_auto_dtype # 1 min
-  - accuracy/test_accuracy.py::TestGpt2::test_beam_search # 1 min
-  - accuracy/test_accuracy.py::TestGpt2::test_beam_search_large # 6 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_cuda_graph # 1 min
-  - accuracy/test_accuracy.py::TestSantacoder::test_auto_dtype # 1.5 mins
-  - accuracy/test_accuracy.py::TestMamba130M::test_auto_dtype # 1 min
-  - accuracy/test_accuracy.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_lookahead # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
-  - accuracy/test_accuracy.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
+  - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_weight_streaming_ootb # 1.5 mins
+  - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
+  - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
+  - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
+  - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-chunked_context] # 5 mins
+  - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph-typical_acceptance] # 5 mins
+  - accuracy/test_cli_flow.py::TestLlama2_7B::test_auto_dtype
   - examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-disable_weight_only]
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - unittest/trt/attention/test_gpt_attention_no_cache.py
@@ -78,6 +110,8 @@ l0_a10:
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-trt-stress-stage-alone]
 - condition:
     ranges:
       system_gpu_count:
@@ -89,6 +123,7 @@ l0_a10:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: tensorrt
   tests:
   - test_e2e.py::test_mistral_e2e[use_py_session]
   - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
@@ -111,14 +146,14 @@ l0_a10:
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-disable_gemm_plugin] # 3 mins
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-disable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-disable_gemm_plugin] # 4 mins
-  - accuracy/test_accuracy.py::TestGpt2::test_context_fmha_disabled # 1 min
-  - accuracy/test_accuracy.py::TestLlama7B::test_auto_dtype # 2 mins
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
-  - accuracy/test_accuracy.py::TestGpt2::test_attention_ootb
-  - accuracy/test_accuracy.py::TestStarcoder2_3B::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi2::test_auto_dtype # 2 mins
-  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestGpt2::test_context_fmha_disabled # 1 min
+  - accuracy/test_cli_flow.py::TestLlama7B::test_auto_dtype # 2 mins
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache_beam_search
+  - accuracy/test_cli_flow.py::TestGpt2::test_attention_ootb
+  - accuracy/test_cli_flow.py::TestStarcoder2_3B::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi2::test_auto_dtype # 2 mins
+  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-130m-float16-enable_gemm_plugin] # 2 mins
   - test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
   - test_e2e.py::test_llmapi_load_ckpt_from_convert_command # 5min

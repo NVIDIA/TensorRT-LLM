@@ -28,6 +28,8 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
 KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
+PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
+PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -435,6 +437,16 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        block_ids_per_seq = self.get_batch_cache_indices(request_ids)
+        block_ids_per_seq_tensors = [
+            torch.tensor(sublist, dtype=torch.int)
+            for sublist in block_ids_per_seq
+        ]
+        padded_tensor = torch.nn.utils.rnn.pad_sequence(
+            block_ids_per_seq_tensors, batch_first=True, padding_value=0)
+        return padded_tensor
+
     def flush_iteration_events(self):
         self.impl.flush_iteration_events()
 
@@ -550,3 +562,91 @@ class ResourceManager:
         assert set(resource_manager_list) == set(self.resource_managers.keys())
         for resource_manager in resource_manager_list:
             self.resource_managers.move_to_end(resource_manager)
+
+
+class PeftCacheManager(BaseResourceManager):
+
+    def __init__(self, peft_cache_config: PeftCacheConfig,
+                 model_config: ModelConfig):
+        import tensorrt_llm.bindings as _tb
+
+        peft_cache_manager_config = _tb.PeftCacheManagerConfig(
+            num_host_module_layer=peft_cache_config.num_host_module_layer,
+            num_device_module_layer=peft_cache_config.num_device_module_layer,
+            optimal_adapter_size=peft_cache_config.optimal_adapter_size,
+            max_adapter_size=peft_cache_config.max_adapter_size,
+            num_put_workers=peft_cache_config.num_put_workers,
+            num_ensure_workers=peft_cache_config.num_ensure_workers,
+            num_copy_streams=peft_cache_config.num_copy_streams,
+            max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
+            max_pages_per_block_device=peft_cache_config.
+            max_pages_per_block_device,
+            device_cache_percent=peft_cache_config.device_cache_percent,
+            host_cache_size=peft_cache_config.host_cache_size,
+            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
+        )
+
+        # TODO smor- currently set manually, change that
+        world_config = _tb.WorldConfig()
+
+        BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
+        CudaStream = tensorrt_llm.bindings.internal.runtime.CudaStream
+        self._stream = torch.cuda.Stream().cuda_stream  # FIXME
+        cuda_stream = CudaStream(self._stream)
+        buffer_manager = BufferManager(cuda_stream, True)
+        self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
+                                        model_config=model_config,
+                                        world_config=world_config,
+                                        buffer_manager=buffer_manager)
+
+    def add_request_peft(self, request: LlmRequest):
+        # TODO smor- a helper function to add a request to the peft cache manager.
+        # Cosnider replacing in favor of prepare_resources
+        self.impl.add_request_peft(request, True)
+
+    def ensure_batch(self,
+                     context_batch: List[LlmRequest],
+                     generation_batch: List[LlmRequest],
+                     reset_gpu_cache: bool = False) -> List[LlmRequest]:
+        return self.impl.ensure_batch(context_batch, generation_batch,
+                                      reset_gpu_cache)
+
+    def get_max_resource_count(self) -> int:
+        return 0
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return 0
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        context_batch = scheduled_batch.context_requests
+        generation_batch = scheduled_batch.generation_requests
+        for req in context_batch:
+            if req.lora_weights is not None and req.lora_config is not None:
+                req.lora_weights = req.lora_weights.reshape(
+                    [1] + list(req.lora_weights.shape))
+                req.lora_config = req.lora_config.reshape(
+                    [1] + list(req.lora_config.shape))
+            self.impl.add_request_peft(req, True)
+            import time
+            time.sleep(0.1)  # FIXME
+
+        py_lora_task_layer_module_configs = self.impl.ensure_batch(
+            context_batch, generation_batch, False)
+
+        for req in context_batch:
+            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                req.
+                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+        for req in generation_batch:
+            req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                req.
+                py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+
+    def update_resources(self, scheduled_batch: ScheduledRequests):
+        pass
+
+    def free_resources(self, request: LlmRequest):
+        pass
+
+    def shutdown(self):
+        pass

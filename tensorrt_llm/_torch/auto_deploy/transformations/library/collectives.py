@@ -9,7 +9,7 @@ from ...utils.node_utils import get_op_overload_packet, get_user_if_pattern_matc
 from .._graph import canonicalize_graph
 
 
-# TODO (lliebenwein): This is an overly simplified model that works well for vanilla Llama models.
+# TODO: This is an overly simplified model that works well for vanilla Llama models.
 # However, we eventually want to consider more sophisticated patterns such as
 # * all_reduce(lin1(x) + lin2(x))
 # * version above with fused GEMMs (i.e. with a split node)
@@ -20,7 +20,7 @@ def fuse_collectives(gm: GraphModule) -> GraphModule:
     ad_logger.debug("Before GEMM+Collective fusion: " + str(gm))
 
     # lookup for fused ops
-    # TODO (lliebenwein): avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
+    # TODO: avoid this hardcoded lookup, e.g., by generating fused ops on the fly.
     lookup = {
         torch.ops.linear.simple: torch.ops.linear.fused_linear_all_reduce,
         torch.ops.aten.linear: torch.ops.linear.fused_linear_all_reduce,

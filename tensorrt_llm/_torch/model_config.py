@@ -3,9 +3,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generic, List, Optional, TypeVar
 
+import torch
 import transformers
 
 from tensorrt_llm import logger
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -22,6 +24,8 @@ class ModelConfig(Generic[TConfig]):
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     skip_create_weights: bool = False
     is_generation: bool = True
+    max_num_tokens: int = 8192
+    moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
 
@@ -37,6 +41,17 @@ class ModelConfig(Generic[TConfig]):
             return True
         elif self.attn_backend == 'FLASHINFER':
             return False
+        return False
+
+    @property
+    def enable_flash_mla(self):
+        if self.attn_backend == 'TRTLLM':
+            if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(
+                    self.pretrained_config, "qk_rope_head_dim"):
+                head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
+                if head_dim == 576 and torch.cuda.get_device_capability() == (
+                        9, 0):
+                    return True
         return False
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
@@ -75,8 +90,8 @@ class ModelConfig(Generic[TConfig]):
         # Find the cache path by looking for the config.json file which should be in all
         # huggingface models
         model_dir = Path(
-            transformers.file_utils.get_file_from_repo(checkpoint_dir,
-                                                       'config.json')).parent
+            transformers.utils.hub.cached_file(checkpoint_dir,
+                                               'config.json')).parent
         quant_config = QuantConfig()
         layer_quant_config = None
         # quantized ckpt in modelopt format
@@ -123,3 +138,41 @@ class ModelConfig(Generic[TConfig]):
                    quant_config=quant_config,
                    quant_config_dict=layer_quant_config,
                    **kwargs)
+
+    def get_bindings_model_config(
+            self,
+            tensor_parallelism: int = 1,
+            context_parallelism: int = 1) -> "ModelConfigCpp":
+        """
+        This method is used to construct the bindings config for the model.
+        Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
+        that an engine has been created.
+        """
+        # TODO smor- this isn't robust, and currently tested for LlamaConfig only
+        # TODO smor- currently parallelism is not supported, set default to 1
+        # TODO smor- currently assuming no rnn layers, no MOE
+        from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+
+        num_heads = self.pretrained_config.num_attention_heads // (
+            tensor_parallelism * context_parallelism)
+
+        model_config_cpp = ModelConfigCpp(
+            vocab_size=self.pretrained_config.vocab_size,
+            num_layers=self.pretrained_config.num_hidden_layers,
+            num_attention_layers=self.pretrained_config.num_hidden_layers,
+            num_rnn_layers=0,
+            num_heads=num_heads,
+            hidden_size=self.pretrained_config.hidden_size,
+            data_type=torch_dtype_to_binding(
+                self.pretrained_config.torch_dtype))
+
+        mlp_hidden_size = self.pretrained_config.intermediate_size // tensor_parallelism
+        if "head_size" in self.pretrained_config:
+            head_size = self.pretrained_config.head_size
+        else:
+            head_size = self.pretrained_config.hidden_size // num_heads
+
+        model_config_cpp.mlp_hidden_size = mlp_hidden_size
+        model_config_cpp.size_per_head = head_size
+
+        return model_config_cpp

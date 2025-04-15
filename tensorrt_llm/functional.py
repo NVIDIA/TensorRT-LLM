@@ -3904,6 +3904,8 @@ class AllReduceFusionOp(IntFlag):
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 6
+    RESIDUAL_RMS_NORM_AND_QUANT_NVFP4 = 7
 
 
 class AllReduceParams():
@@ -4781,7 +4783,7 @@ class RopeEmbeddingUtils:
         return np.random.rand(dim).astype(dtype)
 
     @staticmethod
-    def create_sinusoidal_positions_for_deepseek_attention_plugin(
+    def create_sinusoidal_positions_yarn(
             num_pos: int,
             dim: int,
             base: int = 10000,

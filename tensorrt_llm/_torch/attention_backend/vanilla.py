@@ -46,7 +46,7 @@ class VanillaAttentionMetadata(AttentionMetadata):
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+            self.request_ids) if self.kv_cache_manager is not None else None
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -67,9 +67,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+                         quant_config, **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
     def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
@@ -262,9 +263,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
                 **kwargs) -> torch.Tensor:
-        # NOTE: WAR for no kv cache attn e.g. BERT,
-        # try to separate the kv cache estimation path from no kv cache attn.
-        if metadata is not None and metadata.kv_cache_manager is None:
+
+        # This is only for memory estimation for now.
+        # NOTE: this method is not accurate while it works for most scenario.
+        if metadata.is_dummy_attention:
+            return VanillaAttention.dummy_forward(q.unsqueeze(0),
+                                                  k.unsqueeze(0),
+                                                  v.unsqueeze(0))
+        elif metadata.kv_cache_manager is None:
+            # NOTE: WAR for no kv cache attn e.g. BERT,
+            # try to separate the kv cache estimation path from no kv cache attn.
             num_heads = self.num_heads
             num_kv_heads = self.num_kv_heads
             return VanillaAttention.no_kv_cache_forward(

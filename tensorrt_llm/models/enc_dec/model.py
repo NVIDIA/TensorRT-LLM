@@ -1629,7 +1629,7 @@ class DecoderModel(PretrainedModel):
                 dim_range=OrderedDict([
                     ('decoder_num_tokens_2',
                      [decoder_num_tokens_range
-                      ]),  # TODO (bhsueh) should use same name as input_ids
+                      ]),  # TODO should use same name as input_ids
                     ('encoder_input_len_2', [encoder_input_len_range]),
                 ]),
             )

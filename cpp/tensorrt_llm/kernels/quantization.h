@@ -22,14 +22,36 @@
 namespace tensorrt_llm
 {
 
+enum class FP4QuantizationSFLayout
+{
+    // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
+    // blocks are organized in 512-byte blocks in global memory, with each block having 128x4 FP8 values.
+    // The SF matrix dimensions are therefore padded - rows to the nearest multiple of 128 and columns to
+    // the nearest multiple of 4.
+    //
+    // The scale factor block rows map to data block rows in an interleaved pattern:
+    // For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
+    // Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
+    //
+    // Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
+    SWIZZLED,
+    // Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen kernels standard.
+    LINEAR
+};
+
 #define PadUpFn(X, Y) ((X + Y - 1) / (Y) * (Y))
 
 // totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-inline int computeSFSize(int totalRow, int totalColumn)
+inline int computeFP4SwizzledLayoutSFSize(int totalRow, int totalColumn)
 {
     int paddedRow = PadUpFn(totalRow, 128);
     int paddedColumn = PadUpFn(totalColumn, 4);
     return paddedRow * paddedColumn;
+}
+
+inline int computeFP4LinearLayoutSFSize(int totalRow, int totalColumn)
+{
+    return totalRow * totalColumn;
 }
 
 namespace kernels
@@ -46,7 +68,7 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
 
 template <typename T>
 void invokeFP4Quantization(int m, int n, T const* input, float const* globalScale, int64_t* output, int32_t* SFOuput,
-    bool useUE8M0, int multiProcessorCount, cudaStream_t stream = 0);
+    bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
 
 template <typename T>
 void invokeBatchedFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,

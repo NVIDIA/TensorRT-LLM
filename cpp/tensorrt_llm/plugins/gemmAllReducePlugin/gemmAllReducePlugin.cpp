@@ -16,7 +16,7 @@
  */
 #include "gemmAllReducePlugin.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/internal_cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
 #include <unistd.h>

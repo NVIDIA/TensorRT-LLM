@@ -34,18 +34,37 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
     // clang-format off
 
-    // prob = (0.0, 0.0, 0.0, 0.0, 0.4, 0.3, 0.2, 0.1)
-    mTestLogitsInit = {
-            -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, // step 0
-            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 1
-            -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, // step 2
-            -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX  // step 3
+    // logits = (-0.9163, -1.2040, -1.6094, -2.3026) -> prob = (0.4, 0.3, 0.2, 0.1)
+    std::vector<T> testLogits = {
+                -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, // step 0
+                -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, // step 1
+                -FLT_MAX, -FLT_MAX, -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, // step 2
+                -0.9163, -1.2040, -1.6094, -2.3026, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX  // step 3
     };
 
     // clang-format on
+
+    if (params.beamWidth == 1)
+    {
+        mTestLogitsInit = testLogits;
+    }
+    else
+    {
+        for (int step = 0; step < mMaxSeqLen; ++step)
+        {
+            auto const& logitsBegin = testLogits.begin() + mVocabSize * step;
+            auto const& logitsEnd = testLogits.begin() + mVocabSize * (step + 1);
+            for (int bm = 0; bm < params.beamWidth; ++bm)
+            {
+                mTestLogitsInit.insert(mTestLogitsInit.end(), logitsBegin, logitsEnd);
+            }
+        }
+    }
+
     if (mComputeProbs)
     {
-        computeProb(mTestLogitsInit.data(), mTestLogitsInit.data(), 4, mVocabSize);
+        computeProb(mTestLogitsInit.data(), mTestLogitsInit.data(),
+            BaseSamplingLayerTest::mMaxOutputLen * params.beamWidth, mVocabSize);
     }
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
@@ -56,7 +75,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
         : mBufferManager->gpu(
             ITensor::makeShape({maxBatchSize()}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mOutputIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
     mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize()}), ptrType);
 
@@ -99,7 +118,18 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     }
 
     std::shared_ptr<DecodingSetupParams> setupParams;
-    if (!params.isExternalDraftTokensLayerTest)
+    if (params.isExternalDraftTokensLayerTest)
+    {
+        auto externalDraftTokensSetupParams = std::make_shared<ExternalDraftTokensSetupParams>();
+        externalDraftTokensSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+        externalDraftTokensSetupParams->runtimeTopK
+            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+        externalDraftTokensSetupParams->runtimeTopP
+            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+
+        setupParams = externalDraftTokensSetupParams;
+    }
+    else if (mBeamWidth == 1)
     {
         auto samplingSetupParams = std::make_shared<SamplingSetupParams>();
         samplingSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
@@ -116,22 +146,59 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
         setupParams = samplingSetupParams;
     }
-    else
+    else // Beam Search
     {
-        auto externalDraftTokensSetupParams = std::make_shared<ExternalDraftTokensSetupParams>();
-        externalDraftTokensSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-        externalDraftTokensSetupParams->runtimeTopK
-            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
-        externalDraftTokensSetupParams->runtimeTopP
-            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+        auto samplingSetupParams = std::make_shared<BeamSearchSetupParams>();
+        setupParams = samplingSetupParams;
 
-        setupParams = externalDraftTokensSetupParams;
+        mSrcCacheIndirection = mBufferManager->gpu(
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        mTgtCacheIndirection = mBufferManager->gpu(
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+        mParentIds = mBufferManager->gpu(
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+
+        auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
+        auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+        auto constexpr nvFloatType = TRTDataType<float>::value;
+        auto constexpr nvBoolType = TRTDataType<bool>::value;
+        mOutputIdsCBA
+            = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), 2 * mBeamWidth, mMaxSeqLen}), nvTokenIdType);
+        mLogProbsCBA
+            = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), 2 * mBeamWidth, mMaxSeqLen}), nvFloatType);
+        mSequenceLengthsCBA = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), 2 * mBeamWidth}), nvSizeType);
+        mCumLogProbsCBA = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), 2 * mBeamWidth}), nvFloatType);
+        mNormedScoresCBA = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), 2 * mBeamWidth}), nvFloatType);
+        mNumBeamsCBA = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvSizeType);
+        mMinNormedScoresCBA = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvFloatType);
+        mBatchDones = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvBoolType);
+        mOutputIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize()}), ptrType);
+        mParentIdsPtr = mBufferManager->pinned(ITensor::makeShape({maxBatchSize()}), ptrType);
+
+        trk::invokeFill(*mSrcCacheIndirection, int32_t{0}, *mStream);
+        trk::invokeFill(*mTgtCacheIndirection, int32_t{0}, *mStream);
+        trk::invokeFill(*mParentIds, int32_t{0}, *mStream);
+        trk::invokeFill(*mOutputIdsCBA, int32_t{0}, *mStream);
+        trk::invokeFill(*mLogProbsCBA, float{0}, *mStream);
+        trk::invokeFill(*mSequenceLengthsCBA, int32_t{0}, *mStream);
+        trk::invokeFill(*mCumLogProbsCBA, float{0}, *mStream);
+        trk::invokeFill(*mNormedScoresCBA, float{0}, *mStream);
+        trk::invokeFill(*mNumBeamsCBA, int32_t{0}, *mStream);
+        trk::invokeFill(*mMinNormedScoresCBA, float{0}, *mStream);
+        trk::invokeFill(*mBatchDones, bool{0}, *mStream);
+
+        auto outputIdsPtr = bufferCast<int*>(*mOutputIdsPtr);
+        auto parentIdsPtr = bufferCast<int*>(*mParentIdsPtr);
+        for (SizeType32 bi = 0; bi < maxBatchSize(); bi++)
+        {
+            outputIdsPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
+            parentIdsPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
+        }
     }
 
     mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
     mDecodingWorkspace->getDeviceRuntimeLogits()->reshape(ITensor::makeShape({mBatchSize, mBeamWidth, mVocabSize}));
     mSamplingLayer->setup(mBatchSize, mBeamWidth, mBatchSlots, setupParams, mDecodingWorkspace);
-
     mStream->synchronize();
 }
 
@@ -139,17 +206,24 @@ template <typename T>
 std::shared_ptr<DecodingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
-    auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
 
+    auto decodeInputTensors = (mBeamWidth > 1)
+        ? std::make_shared<DecodingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize)
+        : std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
     decodeInputTensors->logits = mDecodingWorkspace->getDeviceRuntimeLogits();
-
     decodeInputTensors->inputLengths = mContextLengthDevice;
-
     decodeInputTensors->finished = mFinishedDevice;
 
-    decodeInputTensors->probsComputed = mComputeProbs;
-
-    decodeInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    if (mBeamWidth > 1)
+    {
+        decodeInputTensors->srcCacheIndirection = mSrcCacheIndirection;
+    }
+    else
+    {
+        auto samplingInputTensors = std::dynamic_pointer_cast<SamplingInputs>(decodeInputTensors);
+        samplingInputTensors->probsComputed = mComputeProbs;
+        samplingInputTensors->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    }
 
     return decodeInputTensors;
 }
@@ -157,27 +231,43 @@ std::shared_ptr<DecodingInputs> BaseSamplingLayerTest<T>::createInputTensors(int
 template <typename T>
 std::shared_ptr<BaseDecodingOutputs> BaseSamplingLayerTest<T>::createOutputTensors()
 {
-    auto decodeOutputs = std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
+    // TODO: check log probs and cum_log_probs
+
+    auto decodeOutputs = (mBeamWidth > 1) ? std::make_shared<BeamSearchOutputs>(mOutputIdsDevice)
+                                          : std::make_shared<BaseDecodingOutputs>(mOutputIdsDevice);
     decodeOutputs->outputIdsPtr = mIdsPtrHost;
     decodeOutputs->outputIdsPtrHost = mIdsPtrHost;
-
     decodeOutputs->sequenceLength = mSeqLengthsDevice;
-
     decodeOutputs->finished = mFinishedDevice;
-
     decodeOutputs->outputLogProbs = mOutputLogProbsDevice;
-
     decodeOutputs->cumLogProbs = mCumLogProbsDevice;
 
-    // TODO(nkorobov): check log probs and cum_log_probs
+    if (mBeamWidth > 1)
+    {
+        auto beamSearchOutputs = std::dynamic_pointer_cast<BeamSearchOutputs>(decodeOutputs);
+        beamSearchOutputs->tgtCacheIndirection = mTgtCacheIndirection;
+        beamSearchOutputs->parentIds = mParentIds;
+        beamSearchOutputs->parentIdsPtr = mParentIdsPtr;
+        beamSearchOutputs->beamHypotheses = std::make_unique<tensorrt_llm::kernels::BeamHypotheses>();
+        beamSearchOutputs->beamHypotheses->outputIdsCBA = bufferCast<int>(*mOutputIdsCBA);
+        beamSearchOutputs->beamHypotheses->logProbsCBA = bufferCast<float>(*mLogProbsCBA);
+        beamSearchOutputs->beamHypotheses->sequenceLengthsCBA = bufferCast<int>(*mSequenceLengthsCBA);
+        beamSearchOutputs->beamHypotheses->cumLogProbsCBA = bufferCast<float>(*mCumLogProbsCBA);
+        beamSearchOutputs->beamHypotheses->normedScoresCBA = bufferCast<float>(*mNormedScoresCBA);
+        beamSearchOutputs->beamHypotheses->numBeamsCBA = bufferCast<int>(*mNumBeamsCBA);
+        beamSearchOutputs->beamHypotheses->minNormedScoresCBA = bufferCast<float>(*mMinNormedScoresCBA);
+        beamSearchOutputs->beamHypotheses->batchDones = bufferCast<bool>(*mBatchDones);
+    }
+
     return decodeOutputs;
 }
 
 template <typename T>
 void BaseSamplingLayerTest<T>::batchCopy(int32_t step)
 {
-    auto const logitsHost = ITensor::wrap(
-        mTestLogitsInit.data() + step * mVocabSize, TRTDataType<T>::value, ITensor::makeShape({1, mVocabSize}));
+    auto const logitsHost = ITensor::wrap(mTestLogitsInit.data() + step * mBeamWidth * mVocabSize,
+        TRTDataType<T>::value, ITensor::makeShape({mBeamWidth, mVocabSize}));
+
     for (int32_t bi = 0; bi < mBatchSize; ++bi)
     {
         auto logitsDeviceView = ITensor::slice(mDecodingWorkspace->getDeviceRuntimeLogits(), bi, 1);
@@ -191,10 +281,10 @@ bool BaseSamplingLayerTest<T>::checkResult(int32_t const* outputIds, std::vector
     assert(expectedIds.size() == mMaxSeqLen * batchBeam());
     int failures = 0;
     auto* const batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
-    for (int32_t i = 0; i < mMaxSeqLen * batchBeam(); ++i)
+    for (int32_t i = 0; i < mMaxSeqLen * mBatchSize; ++i)
     {
-        int32_t s = i / batchBeam();
-        int32_t b = i % batchBeam();
+        int32_t s = i / mBatchSize;
+        int32_t b = i % mBatchSize;
         auto const batchSlot = batchSlotsPtr[b];
         std::set<int32_t> expts = expectedIds.at(i);
         auto const outputId = outputIds[batchSlot * mMaxSeqLen + s];
@@ -225,6 +315,12 @@ void BaseSamplingLayerTest<T>::runTest(
     std::vector<std::set<int32_t>> const& expectedOutputIds, TestSamplingParams const& params, int32_t endId)
 {
     mBatchSize = params.batchSize;
+    if (params.beamWidth > 1)
+    {
+        mBeamWidth = params.beamWidth;
+        mMaxSeed = 1;
+        mComputeProbs = true;
+    }
     initLayer(params);
 
     auto const decoderDomain

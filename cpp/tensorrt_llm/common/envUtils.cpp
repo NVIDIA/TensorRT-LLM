@@ -293,10 +293,10 @@ bool getEnvParallelCacheSend()
     return parallelCacheSend;
 }
 
-bool getEnvRequestKVCacheSerial()
+bool getEnvRequestKVCacheConcurrent()
 {
-    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
-    return requestKVCacheSerial;
+    static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
+    return requestKVCacheConcurrent;
 }
 
 bool getEnvDisableKVCacheTransferOverlap()
@@ -305,10 +305,10 @@ bool getEnvDisableKVCacheTransferOverlap()
     return disableKVCacheTransferOverlap;
 }
 
-bool getEnvDisableReceiveKVCacheParallel()
+bool getEnvEnableReceiveKVCacheParallel()
 {
-    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
-    return disableReceiveParallel;
+    static bool const enableReceiveParallel = getBoolEnv("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL");
+    return enableReceiveParallel;
 }
 
 bool getEnvTryZCopyForKVCacheTransfer()

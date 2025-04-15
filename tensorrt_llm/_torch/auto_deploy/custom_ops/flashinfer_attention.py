@@ -451,7 +451,7 @@ class FlashInferAttention(AttentionDescriptor):
 
     @classmethod
     def get_attention_op(cls):
-        return torch.ops.attention.flashinfer_mha_with_cache
+        return torch.ops.attention.flashinfer_mha_with_cache, 3
 
     @classmethod
     def get_prepare_metadata_op(cls):

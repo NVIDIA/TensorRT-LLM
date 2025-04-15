@@ -5,9 +5,8 @@ import torch.multiprocessing as mp
 from tensorrt_llm.quantization import (quantize_and_export,
                                        quantize_nemo_and_export)
 
-mp.set_start_method("spawn", force=True)
-
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir",
                         help="Specify where the HuggingFace model is",

@@ -59,9 +59,8 @@ function(filter_cuda_archs ARCH SOURCES_VAR)
   endif()
 endfunction()
 
-if(ENABLE_MULTI_DEVICE EQUAL 0)
+if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
-  # list(FILTER SRC_CU EXCLUDE REGEX "allReduceFusionKernels*.*cu$")
 endif()
 
 add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})

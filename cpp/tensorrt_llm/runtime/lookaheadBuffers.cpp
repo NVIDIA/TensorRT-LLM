@@ -16,16 +16,13 @@
  */
 
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
-#include "iTensor.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
-#include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm::runtime
 {
 
 LookaheadDecodingBuffers::LookaheadDecodingBuffers(
-    SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, runtime::BufferManager const& bufferManager)
+    SizeType32 maxNumSequences, SizeType32 maxTokensPerStep, BufferManager const& bufferManager)
     : generationLengths(bufferManager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32))
     , positionOffsets(
           bufferManager.gpu(ITensor::makeShape({maxNumSequences, maxTokensPerStep}), nvinfer1::DataType::kINT32))
@@ -38,11 +35,11 @@ LookaheadDecodingBuffers::LookaheadDecodingBuffers(
 }
 
 LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-    runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, executor::DecodingConfig const& /* decodingConfig */,
-    runtime::TllmRuntime const& runtime)
+    BufferManager const& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    executor::DecodingConfig const& /* decodingConfig */, TllmRuntime const& runtime)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Lookahead decoding does not support beam search");
 
     auto const tokensPerStep = modelConfig.getMaxDecodingTokens();
@@ -181,38 +178,45 @@ void LookaheadRuntimeBuffers::reshape(SizeType32 numCtxSequences, SizeType32 num
     auto batchSlotsShape = batchSlotsHostCopy->getShape();
     batchSlotsShape.d[0] = numCtxSequences + numGenSequences;
     batchSlotsHostCopy->reshape(batchSlotsShape);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LookaheadRuntimeBuffers::enableLookaheadDecoding(SizeType32 maxBatchSize, SizeType32 tokensPerStep)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     auto const numPackedMasks = static_cast<ITensor::DimType64>(tensorrt_llm::common::divUp(tokensPerStep, 32));
     packedMasksDevice->reshape(ITensor::makeShape({maxBatchSize * tokensPerStep, numPackedMasks}));
     generationLengthsDevice->reshape(ITensor::makeShape({maxBatchSize}));
     positionOffsetsDevice->reshape(ITensor::makeShape({maxBatchSize, tokensPerStep}));
     bufferCast<SizeType32>(*useSpecDecoding)[0] = 1;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LookaheadRuntimeBuffers::disableLookaheadDecoding()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     packedMasksDevice->reshape(ITensor::makeShape({1, 1}));
     generationLengthsDevice->reshape(ITensor::makeShape({1}));
     positionOffsetsDevice->reshape(ITensor::makeShape({1, 1}));
     bufferCast<SizeType32>(*useSpecDecoding)[0] = 0;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void LookaheadRuntimeBuffers::insertInputTensors(
-    TensorMap& inputBuffers, TensorMap& /* outputBuffers */, runtime::WorldConfig const& /* worldConfig */) const
+    TensorMap& inputBuffers, TensorMap& /* outputBuffers */, WorldConfig const& /* worldConfig */) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     inputBuffers.insert_or_assign("spec_decoding_packed_mask", packedMasksDevice);
     inputBuffers.insert_or_assign("spec_decoding_generation_lengths", generationLengthsDevice);
     inputBuffers.insert_or_assign("spec_decoding_position_offsets", positionOffsetsDevice);
     inputBuffers.insert_or_assign("spec_decoding_use", useSpecDecoding);
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
+from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
@@ -43,6 +44,8 @@ from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, sk
 # The unittests are based on the tiny-llama, which is fast to build and run.
 # There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
 # test_llm_multi_gpu.py.
+
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def get_model_path(model_name):
@@ -511,7 +514,7 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 
 @pytest.fixture(scope="module")
-def llm_for_sampling_params() -> LLM:
+def llm_for_sampling_params():
     build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
@@ -519,7 +522,8 @@ def llm_for_sampling_params() -> LLM:
         kv_cache_config=global_kvcache_config,
         fast_build=True,
     )
-    return llm
+    yield llm
+    llm.shutdown()
 
 
 @pytest.mark.part0
@@ -1826,14 +1830,13 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     asyncio.run(main())
 
 
-@pytest.mark.parametrize(
-    "return_context_logits, pytorch_backend, use_overlap",
-    [
-        (True, False, False),
-        (False, False, False),
-        (False, True, False),
-        #  (False, True, True), https://nvbugspro.nvidia.com/bug/5163585
-    ])
+@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
+                         [
+                             (True, False, False),
+                             (False, False, False),
+                             (False, True, False),
+                             (False, True, True),
+                         ])
 def test_llm_get_stats_async(return_context_logits, pytorch_backend,
                              use_overlap):
     llm_get_stats_async_test_harness(
@@ -1922,11 +1925,10 @@ def test_llm_api_jupyter_scenario():
 
 
 def test_llm_dynamic_batch_config():
-    scheduler_config = tllm.SchedulerConfig(
-        dynamic_batch_config=tllm.DynamicBatchConfig(
-            enable_batch_size_tuning=True,
-            enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=128))
+    scheduler_config = SchedulerConfig(dynamic_batch_config=DynamicBatchConfig(
+        enable_batch_size_tuning=True,
+        enable_max_num_tokens_tuning=True,
+        dynamic_batch_moving_average_window=128))
     llm_test_harness(llama_model_path,
                      prompts, ["D E F G H I J K"],
                      sampling_params=SamplingParams(max_tokens=9),

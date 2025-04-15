@@ -22,7 +22,7 @@ from utils.util import getSMVersion
 
 
 @pytest.mark.skipif(
-    getSMVersion() < 90,
+    getSMVersion() < 90 or getSMVersion() >= 120,
     reason="custom scaled_mm is only supported in SM90",
 )  # Skip tests that are not supported in SM90
 @pytest.mark.parametrize(
@@ -53,7 +53,6 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         scale_w,
         bias=None,
         out_dtype=output_dtype,
-        userbuffers_id=-1,
     )
     # set pytorch's cublas workspace size to 32MB to be aligned with trtllm
     old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")

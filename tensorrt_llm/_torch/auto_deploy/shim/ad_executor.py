@@ -8,9 +8,9 @@ from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
+from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.decoder import TorchDecoder
-from ...pyexecutor.distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager
@@ -59,7 +59,7 @@ class _CacheManagerWithFakePool(KVCacheManager):
         self, kv_cache_config, head_dim, tokens_per_block, mapping, dtype, kv_factor
     ) -> Tuple[int, int]:
         """Calculate the maximum number of blocks needed for the cache."""
-        # TODO (lliebenwein): this is VERY hacky... Ideally, we want to compute the number of blocks
+        # TODO: this is VERY hacky... Ideally, we want to compute the number of blocks
         # just like in the original implementation. However, let's wait for the layer-wise attention
         # implementation before over-optimizing the function here
         ad_logger.info("Using fake cache manager with head_dim=0 and num pages:", self.num_blocks)
@@ -300,6 +300,10 @@ def create_autodeploy_executor(
         decoder=decoder,
         dist=mpi_dist,
         enable_overlap_scheduler=py_config.enable_overlap_scheduler,
+        max_input_len=executor_config.max_input_len,
         max_batch_size=executor_config.max_batch_size,
+        max_draft_tokens=executor_config.speculative_config.max_draft_tokens
+        if executor_config.speculative_config is not None
+        else 0,
     )
     return py_executor

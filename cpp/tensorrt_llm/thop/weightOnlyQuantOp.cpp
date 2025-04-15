@@ -198,7 +198,7 @@ std::vector<Tensor> symmetric_quantize_helper(
     int8_t* unprocessed_quantized_weight_ptr = get_ptr<int8_t>(unprocessed_quantized_weight);
     int8_t* processed_quantized_weight_ptr = get_ptr<int8_t>(processed_quantized_weight);
 
-    // TODO(dastokes) This should be removed if Grouped GEMM is updated to not need interleaved input
+    // TODO This should be removed if Grouped GEMM is updated to not need interleaved input
     bool force_interleave = weight.dim() == 3;
 
     if (weight.scalar_type() == at::ScalarType::Float)

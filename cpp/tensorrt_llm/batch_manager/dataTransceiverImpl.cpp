@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -26,12 +27,12 @@ namespace tensorrt_llm::batch_manager
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
     : mManager{manager}
-    , mSelfState{std::move(selfCacheState),
-          executor::kv_cache::CommState{
-              tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), selfIndex}}
+    , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
 {
+    TLLM_CHECK(mManager);
+    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
 }
 
 [[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
@@ -117,12 +118,11 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
 DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
     executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter)
     : mManager{manager}
-    , mSelfState{std::move(selfCacheState),
-          executor::kv_cache::CommState{
-              tensorrt_llm::mpi::getWorldRanks(tensorrt_llm::mpi::MpiComm::session()), selfIndex}}
+    , mSelfState{std::move(selfCacheState), executor::kv_cache::CommState{manager->getCommState()}}
     , mFormatter(std::move(formatter))
 {
     TLLM_CHECK(mManager);
+    TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
 }
 
@@ -177,7 +177,7 @@ void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* con
     std::ostringstream oss;
     RequestInfo::serialize(info, oss);
     auto const& serializedInfo = oss.str();
-    const std::size_t infoSize = serializedInfo.size();
+    std::size_t const infoSize = serializedInfo.size();
     Id id{Id::REQUEST_SEND};
     connection->send(executor::kv_cache::DataContext{kID_TAG}, &id, sizeof(id));
     connection->send(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
@@ -189,11 +189,10 @@ std::unique_ptr<DataReceiverImpl::ReceiveCacheResource> const& DataReceiverImpl:
 {
     std::scoped_lock<std::mutex> lock(mProcessIoResouceMutex);
     TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
-    std::string processString = llmRequest.getDataTransceiverState().getCommState()->toString();
-
-    if (common::getEnvRequestKVCacheSerial())
+    std::string processString = "default";
+    if (common::getEnvRequestKVCacheConcurrent())
     {
-        processString = "default";
+        processString = llmRequest.getDataTransceiverState().getCommState()->toString();
     }
     if (mProcessToResources.find(processString) == mProcessToResources.end())
     {

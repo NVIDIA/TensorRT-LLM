@@ -1,7 +1,8 @@
 import copy
-import enum
+import weakref
+from collections import namedtuple
 from dataclasses import dataclass, field
-from functools import lru_cache
+from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
@@ -15,6 +16,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..utils import get_model_extra_attrs
 
 
 @dataclass
@@ -22,6 +24,14 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
 
 
 @dataclass(kw_only=True)
@@ -38,7 +48,7 @@ class AttentionMetadata:
     kv_cache_manager: KVCacheManager
     mapping: Optional[Mapping] = None
 
-    is_mla: bool = False
+    enable_flash_mla: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
 
@@ -114,6 +124,7 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
+    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -167,6 +178,16 @@ class AttentionMetadata:
         self.on_update()
 
     @property
+    def num_generations(self) -> int:
+        return self._num_generations
+
+    @num_generations.setter
+    def num_generations(self, value: int):
+        value = value if value is not AttentionMetadata.num_generations else 0
+        self._num_generations = value
+        self.on_update()
+
+    @property
     def seq_lens_cuda(self):
         return self._seq_lens_cuda
 
@@ -215,10 +236,6 @@ class AttentionMetadata:
         return self.cross is not None and self.cross is not self
 
     @property
-    def num_generations(self) -> int:
-        return self._num_generations
-
-    @property
     def num_ctx_tokens(self) -> int:
         return self._num_ctx_tokens
 
@@ -255,6 +272,17 @@ class AttentionMetadata:
         if self.is_cross:
             cuda_graph_metadata.seq_lens_kv = torch.zeros((max_batch_size, ),
                                                           dtype=torch.int)
+        if self.enable_flash_mla:
+            if self.kv_cache_manager is not None:
+                cuda_graph_metadata.block_ids_per_seq = torch.zeros(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.max_num_requests = max_batch_size
         cuda_graph_metadata.max_num_tokens = max_batch_size * (1 +
@@ -308,6 +336,7 @@ class RopeParams:
         # rotary embedding dim.
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
+                           or getattr(config, 'qk_rope_head_dim', None)
                            or int(head_dim * rope_percentage))
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
@@ -328,57 +357,75 @@ class RopeParams:
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        elif config.model_type == "deepseek_v3":
+            rope_params.scale_type = RotaryScalingType.yarn
 
         return rope_params
 
-    @lru_cache(maxsize=1)
     def create_rope_const_params(self):
         if self.dim == 0:
             return None, None
-        assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
-        rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            self.max_positions,
-            self.dim,
-            self.theta,
-            self.scale,
-            self.scale_type,
-            rope_scaling_config={
-                "factor": self.scale,
-                "low_freq_factor": self.low_freq_factor,
-                "high_freq_factor": self.high_freq_factor,
-                "original_max_position_embeddings": self.original_max_positions,
-            })
-        rope_inv_freq = torch.torch.tensor(
-            rope_inv_freq,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        rope_cos_sin = torch.torch.tensor(
-            rope_cos_sin,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        return rope_inv_freq, rope_cos_sin
 
-    @lru_cache(maxsize=1)
-    def create_deepseek_rope_const_params(self, qk_rope_head_dim: int):
-        rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-            self.max_positions,
-            qk_rope_head_dim,
-            self.theta,
-            self.scale,
-            self.original_max_positions,
-            self.beta_fast,
-            self.beta_slow,
-            self.mscale,
-            self.mscale_all_dim,
-        )
+        RopeConstParams = namedtuple("RopeConstParams", ["inv_freq", "cos_sin"])
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            cache = extra_attrs.setdefault("rope_const_params", {})
+            rope_const_params = cache.get(self, None)
+            if rope_const_params is not None and rope_const_params.cos_sin(
+            ) is not None:
+                return (
+                    rope_const_params.inv_freq()
+                    if rope_const_params.inv_freq is not None else None,
+                    rope_const_params.cos_sin(),
+                )
+
+        if self.scale_type == RotaryScalingType.yarn:
+            rope_inv_freq = None
+            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.original_max_positions,
+                self.beta_fast,
+                self.beta_slow,
+                self.mscale,
+                self.mscale_all_dim,
+            )
+        elif self.scale_type == RotaryScalingType.longrope:
+            raise NotImplementedError("Long RoPE is not supported.")
+        else:
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.scale_type,
+                rope_scaling_config={
+                    "factor": self.scale,
+                    "low_freq_factor": self.low_freq_factor,
+                    "high_freq_factor": self.high_freq_factor,
+                    "original_max_position_embeddings":
+                    self.original_max_positions,
+                })
+        if rope_inv_freq is not None:
+            rope_inv_freq = torch.torch.tensor(
+                rope_inv_freq,
+                dtype=torch.float32,
+                device='cuda',
+            )
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
-        rope_inv_freq = None
+        if extra_attrs is not None:
+            cache[self] = RopeConstParams(
+                weakref.ref(rope_inv_freq)
+                if rope_inv_freq is not None else None,
+                weakref.ref(rope_cos_sin),
+            )
         return rope_inv_freq, rope_cos_sin
 
 
@@ -403,7 +450,7 @@ class PositionalEmbeddingParams:
 TMetadata = TypeVar("TMetadata", bound=AttentionMetadata)
 
 
-class PredefinedAttentionMask(str, enum.Enum):
+class PredefinedAttentionMask(str, Enum):
     """
     Predefined attention mask types
 
@@ -432,6 +479,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         """
         Initialize the backend.

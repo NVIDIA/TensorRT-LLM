@@ -246,7 +246,7 @@ private:
     void createRuntimeContexts();
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
-        std::optional<std::vector<std::string>> const& additionalOutputNames);
+        std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
     void createRnnStateManager();
@@ -283,7 +283,7 @@ private:
         RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers);
     runtime::CudaEvent decoderStepAsync(ScheduledRequests const& scheduledRequests);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
-        ScheduledRequests const& scheduledRequests, runtime::CudaEvent decoderFinishEvent);
+        ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
     runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
@@ -416,7 +416,7 @@ private:
     // Config for debugging output
     std::optional<executor::DebugConfig> mDebugConfig;
     // List of additional outputs for each request
-    std::optional<std::vector<std::string>> mAdditionalOutputNames;
+    std::optional<std::vector<executor::AdditionalModelOutput>> mAdditionalModelOutputs;
 
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;

@@ -208,6 +208,7 @@ class MemoryContinuousMonitorThread(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+        self.join()
 
 
 def get_host_memory_usage() -> float:

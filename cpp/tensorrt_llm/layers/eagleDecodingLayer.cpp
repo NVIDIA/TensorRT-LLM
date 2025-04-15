@@ -280,8 +280,8 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
 
     int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
     size_t offset{0};
-    nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32));
-
+    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
     SizeType32* augmentedBatchSlots = reinterpret_cast<SizeType32*>(
         nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
@@ -289,6 +289,7 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
     auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
     auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
     auto batchSlots = augmentedBatchSlots;
+    auto seqSlots = augmentedSeqSlots;
     auto bestPathIndicesSlotsPtr = bufferCast<SizeType32>(*inputs.acceptedPathIds);
     auto lastDraftPathsSlotsPtr = bufferCast<SizeType32>(*inputs.lastDraftPaths);
 
@@ -297,7 +298,7 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for EagleDecodingLayer");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for EagleDecodingLayer");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIndicesSlotsPtr,
-        lastDraftPathsSlotsPtr, batchSlots, batchSize, engineBatchSize,
+        lastDraftPathsSlotsPtr, batchSlots, seqSlots, batchSize, engineBatchSize,
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), true, getStream());
 

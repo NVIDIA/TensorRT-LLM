@@ -236,6 +236,7 @@ setup(
             'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
+            'trtllm-eval=tensorrt_llm.commands.eval:main'
         ],
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],

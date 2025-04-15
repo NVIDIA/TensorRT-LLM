@@ -194,6 +194,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     int const slot = bh.batchSlots[bid];
     size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
     size_t const nBM{bh.nBeamWidth};
+    size_t const nBMIn{bh.bVBWS ? bh.nBeamWidthIn : bh.nBeamWidth};
+    size_t const nBMOut{bh.bVBWS ? bh.nBeamWidthOut : bh.nBeamWidth};
+    size_t const nMSL{bh.nMaxSeqLen};
     size_t const nV{bh.nVocabSize};
     float const diversityRate{bh.diversityRates[slot]};
     float const lengthPenalty{bh.lengthPenalties[slot]};
@@ -210,7 +213,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
         if (bh.numBeamsCBA[slot] == 0 && tid == 0)
         {
             // Initialize worst score in the first call
-            bh.minNormedScoresCBA[slot] = FLT_MAX;
+            bh.minNormedScoresCBA[slot] = 0.0f; // logProbs is in range (-inf, 0]
         }
         else if (earlyStopping == 1 && bh.numBeamsCBA[slot] == nBM
             || earlyStopping != 1 && bh.finished[slot * nBM].isFinished())
@@ -224,11 +227,11 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
         }
     }
 
-    // Skip this TopK in V2 workflow.
+    // This TopK is needless in V2 workflow
     if constexpr (IS_V2)
     {
-        pStage2Ids += bid * nBM * 2;
-        pStage2LogProbs += bid * nBM * 2;
+        pStage2Ids += bid * nBMOut * 2;
+        pStage2LogProbs += bid * nBMOut * 2;
     }
     else
     {
@@ -297,7 +300,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
         // Select finished beams into CBA or select tokens for next step sequentially
         // Reference (might be changed along HF in the future):
         // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
-        for (int i = 0; i < 2 * nBM; ++i)
+        for (int i = 0; i < 2 * nBMOut; ++i)
         {
             int topId;
             T topLogProb;
@@ -317,7 +320,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
             bool const isEndToken = (topId % nV == bh.endIds[slot]);
             if (i < nBM && bh.numBeamsCBA != nullptr && isEndToken)
             {
-                // Condition of this branch
+                // Condition of this branch:
                 // This token is end-token and belongs to top nBM range in Beam search mode
                 int const nSeqLen = bh.sequenceLengths[slot * nBM + i] + 1 - bh.inputLengths[slot * nBM + i];
                 float const score = applyLengthPenalty(topLogProb, nSeqLen, lengthPenalty);
@@ -365,7 +368,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 // The last token
                 int indexPrev = (topId / nV) % nBM;
                 int const step = bh.sequenceLengths[slot * nBM + indexPrev];
-                int const offsetCBA = (slot * nBM * 2 + nCBA) * bh.nMaxSeqLen;
+                int const offsetCBA = (slot * nBM * 2 + nCBA) * nMSL;
                 bh.outputIdsCBA[offsetCBA + step] = bh.endIds[slot];
                 if (bh.logProbsCBA != nullptr)
                 {
@@ -374,8 +377,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 // Previous tokens
                 for (int j = step - 1; j >= 0; j--)
                 {
-                    bh.outputIdsCBA[offsetCBA + j] = bh.outputIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
-                    indexPrev = bh.parentIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
+                    bh.outputIdsCBA[offsetCBA + j] = bh.outputIdsPtr[slot][indexPrev * nMSL + j];
+                    indexPrev = bh.parentIdsPtr[slot][indexPrev * nMSL + j];
                 }
                 if (bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr)
                 {
@@ -384,7 +387,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                     {
                         int const index = (j * nMBS + slot) * nBM + indexPrev;
                         bh.logProbsCBA[offsetCBA + j] = bh.logProbsTiled[index];
-                        indexPrev = bh.parentIdsPtr[slot][indexPrev * bh.nMaxSeqLen + j];
+                        indexPrev = bh.parentIdsPtr[slot][indexPrev * nMSL + j];
                     }
                 }
                 // Other parameters
@@ -403,7 +406,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 // 3. bh.numBeamsCBA != nullptr && i >= nBM && isEndToken == false, i.e., add token at the end
                 int const step = bh.sequenceLengths[slot * nBM + nBeamForNextStep];
                 // Copy the selected token to work tree
-                bh.outputIdsPtr[slot][nBeamForNextStep * bh.nMaxSeqLen + step] = topId;
+                bh.outputIdsPtr[slot][nBeamForNextStep * nMSL + step] = topId;
                 if (bh.logProbsTiled != nullptr)
                 {
                     int const index = step * nMBS * nBM + slot * nBM + nBeamForNextStep;
@@ -420,7 +423,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 // 2. bh.numBeamsCBA != nullptr && i >= nBM && isEndToken == true, i.e., ignore the worse beams
             }
 
-            if (nBeamForNextStep >= nBM)
+            if (nBeamForNextStep >= nBMOut)
             {
                 // Condition of this branch
                 // 1. In EarlyStopping mode, and get enough candidate beams
@@ -457,7 +460,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
             if (earlyStopping != 0 && lengthPenalty > 0.0f)
             {
                 // Specialization for earlyStopping == "never" and lengthPenalty > 0 in HF
-                nSeqLen = bh.nMaxSeqLen - bh.inputLengths[slot * nBM];
+                nSeqLen = nMSL - bh.inputLengths[slot * nBM];
             }
             float const bestAttainableScore = applyLengthPenalty(bestCumLogProbs, nSeqLen, lengthPenalty);
             bh.batchDones[slot] = bh.minNormedScoresCBA[slot] >= bestAttainableScore;
@@ -472,7 +475,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     }
     __syncthreads();
 
-    if (tid < nBM)
+    if (tid < nBMIn)
     {
         int const indexBatchBeam = slot * nBM + tid;
         int const step = smemSeqLen[tid];
@@ -480,7 +483,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
         {
             smemSeqLen[tid]++;
         }
-        int const newId = bh.outputIdsPtr[slot][tid * bh.nMaxSeqLen + step];
+        int const newId = bh.outputIdsPtr[slot][tid * nMSL + step];
         int const newBeamId = (newId / nV) % nBM;
         int const newTokenId = newId % nV;
         bh.sequenceLengths[indexBatchBeam] = smemSeqLen[newBeamId];
@@ -488,8 +491,8 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
         {
             bh.finished[indexBatchBeam].setFinishedEOS();
         }
-        bh.parentIdsPtr[slot][tid * bh.nMaxSeqLen + step] = newBeamId;
-        bh.outputIdsPtr[slot][tid * bh.nMaxSeqLen + step] = newTokenId;
+        bh.parentIdsPtr[slot][tid * nMSL + step] = newBeamId;
+        bh.outputIdsPtr[slot][tid * nMSL + step] = newTokenId;
 
         if ((earlyStopping == 1) && (bh.numBeamsCBA != nullptr && bh.numBeamsCBA[slot] == nBM)
             || (earlyStopping != 1) && bh.batchDones[slot])
@@ -500,31 +503,19 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
     }
 }
 
-#define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST)                                                                      \
-    {                                                                                                                  \
-        if (IS_FAST && nByteRuntimeSharedMemory > (48 << 10))                                                          \
-        {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>,                      \
-                cudaFuncAttributeMaxDynamicSharedMemorySize, nByteRuntimeSharedMemory));                               \
-        }                                                                                                              \
-        beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>                                                                \
-            <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST * nByteRuntimeSharedMemory, stream>>>(                            \
-                pStage2Ids, pStage2LogProbs, pStage3, bh.cumLogProbs, bh.batchSlots, nV, nVPart);                      \
-    }
-
 template <typename T, int PBM, bool IS_V2>
 void beamSearchKernelLauncher(
     T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
 {
     // clang-format off
-
-    /* V1 Workflow (reference: https://github.com/NVIDIA/online-softmax):
+    /*
+    V1 Workflow (reference: https://github.com/NVIDIA/online-softmax):
     logProbs.shape = [nBS, nBM, nV]
-             nV               |<- nVChunk ->|<- nVChunk ->| <- ... ->|          |<- nBM*4 ->|<- nBM*4 ->|<- ... ->|*
+             nV               |<- nVChunk ->|<- nVChunk ->| <- ... ->|          |<- nBM*4 ->|<- nBM*4 ->|<- ... ->| ■
         ┏━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
-        ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
-    nBS ┃nBM       ┃ ---> nBS ┃nBM                                   ┃ ---> nBS ┃nBM                              ┃
+        ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  B
+    nBS ┃nBM       ┃ ---> nBS ┃nBM                                   ┃ ---> nBS ┃nBM                              ┃ --->
         ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
         ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
         ┗━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -540,7 +531,7 @@ void beamSearchKernelLauncher(
              ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛
                pStage2Ids  pStage2LogProbs
 
-    *: Each "tile" in pStage3 with shape [`nBM*4`] contains `nBM*2` top ids and corresponding `nBM*2` log probs.
+    ■: Each "tile" in pStage3 with shape [`nBM*4`] contains `nBM*2` top ids and corresponding `nBM*2` log probs.
         |<- nBm*2 ->|<- nBm*2 ->|
         ┏━━━━━━━━━━━━━━━━━━━━━━━┓
       1 ┃  top ids  | log probs ┃
@@ -568,7 +559,7 @@ void beamSearchKernelLauncher(
         ┣━━━━━━━━┫          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫          ┣━━━━━━━━━━━┫          ┏━━━━━━━━━━━┓                           |
         ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ --------------------------/
         ┗━━━━━━━━┛          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛
-         logProbs             pStage1Id     pStage1Probs           pStage1Probs           pStage2Probs
+         logProbs             pStage1Id   pStage1LogProbs        pStage1LogProbs        pStage2LogProbs
 
     A: TopK            : Get top `nBM*2` elements in `nBS*nBM` groups (`nV` elements per group)
     B: addCumLogProbs  : Add `cumLogProbs` to the elements in each beam
@@ -578,8 +569,21 @@ void beamSearchKernelLauncher(
                              + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
                              + selects BM elements for the next generation step if not.
                              + maintains related score array, min_normed_score / batchDones / finished, etc..
-    */
 
+    ===================================================================================================================================
+
+    V2 Workflow for VBWS, similar to V2 workflow above, but `nBMIn` and `nBMOut` might be different from `nBM`
+    logProbs.shape = [nBS, nBMIn, nV]
+        |<- nV ->|          |<- nBMOut*2 ->|  |<- nBMOut*2 ->|          |<- nBMOut*2 ->|          |<- nBMOut*2 ->|          |<- nBMOut*2 ->|
+        ┏━━━━━━━━┓          ┏━━━━━━━━━━━━━━┓  ┏━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━┓  D       ┏━━━━━━━━━━━━━━┓
+        ┃nBMIn   ┃          ┃nBMIn         ┃  ┃nBMIn         ┃          ┃nBMIn         ┃      nBS ┃              ┃ ---> nBS ┃              ┃ ---\
+        ┣━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━┫  ┣━━━━━━━━━━━━━━┫  B       ┣━━━━━━━━━━━━━━┫  C       ┗━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━┛    | E
+    nBS ┃nBMIn   ┃ ---> nBS ┃nBMIn         ┃  ┃nBMIn         ┃ ---> nBS ┃nBMIn         ┃ --->         pStage2Id                 pStage2Id       |--->
+        ┣━━━━━━━━┫          ┣━━━━━━━━━━━━━━┫  ┣━━━━━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━┫          ┏━━━━━━━━━━━━━━┓                              |
+        ┃nBMIn   ┃          ┃nBMIn         ┃  ┃nBMIn         ┃          ┃nBMIn         ┃      nBS ┃              ┃ -----------------------------/
+        ┗━━━━━━━━┛          ┗━━━━━━━━━━━━━━┛  ┗━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━┛
+         logProbs               pStage1Id      pStage1LogProbs           pStage1LogProbs           pStage2LogProbs
+    */
     // clang-format on
 
     size_t const nBS{bh.nBatchSize};
@@ -591,12 +595,23 @@ void beamSearchKernelLauncher(
     T* pStage2LogProbs{nullptr};
     float* pStage3{nullptr};
 
+    // VBWS:
+    //     + `nBMIn` / `nBMOut` is the beam width in the last / next network forward computation respectively
+    //     + `nBM` is the max value of the beam width array, which is used for memory allocatation
+    // Normal Beam Search:
+    //     + `nBMIn` / `nBMOut` / `nBM` share the same value
+    // TODO: now `nBMIn` and `nBMOut` of request 0 is used for the whole batch,
+    //     change to corresponding BMs if Diverse-Beam-Width-Search is supported
+    size_t const nBMIn = bh.bVBWS ? bh.nBeamWidthInHost[0] : nBM;
+    size_t const nBMOut = bh.bVBWS ? bh.nBeamWidthOutHost[0] : nBM;
+    bh.nBeamWidthIn = nBMIn;   // Save nBMIn back to bh
+    bh.nBeamWidthOut = nBMOut; // Save nBMOut back to bh
+
     if constexpr (IS_V2)
     {
         // see `BeamSearchLayer<T>::configureBeamSearchLayer()` for the workspace structure
         size_t const offsetStage1 = roundUp(nBS * nBM * nBM * 2, 4);
         size_t const offsetStage2 = roundUp(nBS * nBM * 2, 4);
-
         pStage2Ids = reinterpret_cast<int*>(workspace);
         int offset = sizeof(int) * offsetStage2;
         pStage2LogProbs = reinterpret_cast<T*>(reinterpret_cast<char*>(workspace) + offset);
@@ -609,21 +624,21 @@ void beamSearchKernelLauncher(
         void* pTopK = reinterpret_cast<void*>(reinterpret_cast<char*>(workspace) + offset);
 
         // Stage 1
-        invokeTopkLastDim<T>(nBS * nBM, nV, nBM * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
+        invokeTopkLastDim<T>(nBS * nBMIn, nV, nBMOut * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
         sync_check_cuda_error(stream);
 
-        int nThread = min(roundUp(nBM * nBM * 2, 32), 1024);
-        addCumLogProbs<<<nBS, nThread, 0, stream>>>(
-            pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds, bh.diversityRates, bh.batchSlots, nBS, nBM);
+        int nThread = min(roundUp(nBMIn * nBMOut * 2, 32), 1024);
+        addCumLogProbs<<<nBS, nThread, 0, stream>>>(pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds,
+            bh.diversityRates, bh.batchSlots, nBS, nBMIn, nBMOut, nBM);
         sync_check_cuda_error(stream);
 
         // Stage 2
         invokeTopkLastDim<T>(
-            nBS, nBM * nBM * 2, nBM * 2, true, pStage1LogProbs, pStage2LogProbs, pStage2Ids, pTopK, stream);
+            nBS, nBMIn * nBMOut * 2, nBMOut * 2, true, pStage1LogProbs, pStage2LogProbs, pStage2Ids, pTopK, stream);
         sync_check_cuda_error(stream);
 
-        nThread = min(roundUp(nBM * 2, 32), 1024);
-        gatherId<<<nBS, nThread, 0, stream>>>(pStage1Ids, pStage2Ids, nBS, nBM, nV);
+        nThread = min(roundUp(nBMOut * 2, 32), 1024);
+        gatherId<<<nBS, nThread, 0, stream>>>(pStage1Ids, pStage2Ids, nBS, nBMIn, nBMOut, nV);
         sync_check_cuda_error(stream);
     }
     else // V1
@@ -636,12 +651,23 @@ void beamSearchKernelLauncher(
 
         // Stage 1
         size_t constexpr nThreadStage1 = (PBM < 16) ? ((PBM < 8) ? kThreadForSmallBeamWidth : 128) : 64;
-        dim3 grid(nBS, nBM, bh.nVPart);
-        beamStage1Kernel<T, PBM, nThreadStage1><<<grid, nThreadStage1, bh.nByteSharedMemoryStage1, stream>>>(
+        dim3 grid(nBS, nBM, bh.nVPart), block(nThreadStage1);
+        beamStage1Kernel<T, PBM, nThreadStage1><<<grid, block, bh.nByteSharedMemoryStage1, stream>>>(
             logProbs, bias, pStage3, bh.endIds, bh.finished, nV, bh.batchSlots);
         sync_check_cuda_error(stream);
 
-        // Stage 2
+// Stage 2
+#define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST)                                                                      \
+    {                                                                                                                  \
+        if (IS_FAST && nByteRuntimeSharedMemory > (48 << 10))                                                          \
+        {                                                                                                              \
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>,                      \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, nByteRuntimeSharedMemory));                               \
+        }                                                                                                              \
+        beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>                                                                \
+            <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST * nByteRuntimeSharedMemory, stream>>>(                            \
+                pStage2Ids, pStage2LogProbs, pStage3, bh.cumLogProbs, bh.batchSlots, nV, nVPart);                      \
+    }
         // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
         size_t nByteRuntimeSharedMemory
             = sizeof(float) * nVPart * (PBM * 4) + sizeof(cub::KeyValuePair<int, T>) * PBM * 2;
@@ -664,6 +690,7 @@ void beamSearchKernelLauncher(
             BEAM_STAGE2_KERNEL(128, false)
         }
         sync_check_cuda_error(stream);
+#undef BEAM_STAGE2_KERNEL
     }
 
     // Stage 3 in common
@@ -671,6 +698,7 @@ void beamSearchKernelLauncher(
     size_t const nByteStaticSharedMemory = bh.nByteSharedMemoryStage3;
     size_t const nByteDynamicSharedMemory = (IS_V2) ? 0 : sizeof(T) * nBM * nBM * 2;
     size_t const nByteRuntimeSharedMemory = nByteStaticSharedMemory + nByteDynamicSharedMemory;
+
     if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock)
     {
         if (nByteRuntimeSharedMemory > (48 << 10))
@@ -692,6 +720,8 @@ void beamSearchKernelLauncher(
             <<<nBS, nThreadStage3, 0, stream>>>(pStage2Ids, pStage2LogProbs, pStage3, bh);
     }
     sync_check_cuda_error(stream);
+
+    return;
 }
 
 #undef BEAM_STAGE2_KERNEL

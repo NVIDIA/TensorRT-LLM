@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional, Union
 
 
@@ -20,10 +21,10 @@ class Task:
     custom_output_params: Optional[dict] = None
 
 
-@dataclass
-class TaskStatus:
-    # TODO: add fields or maybe update it to enum
-    pass
+class TaskStatus(Enum):
+    SUCCESS = "success"
+    WORKER_NOT_SUPPORTED = "worker_not_supported"
+    WORKER_EXECEPTION = "worker_exception"
 
 
 @dataclass
@@ -33,11 +34,13 @@ class GenerationTask(Task):
     input_str: Optional[str] = field(default=None)
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
-    # custom sampling params to override worker's sampling params in each generation.
-    custom_sampling_params: Optional[dict] = None
+    # sampling params
+    #custom_sampling_params: Optional[dict] = None
+    max_tokens: Optional[int] = field(default=None)
+    temperature: Optional[float] = field(default=None)
+    top_p: Optional[float] = field(default=None)
+    top_k: Optional[int] = field(default=None)
 
-    # overwrite base class default value
-    type: str = field(default="generate")
     # suggest to use Controller.WorkerTag
     # anyway, users need to ensure that the value of the worker_tag can be found in the scaffoldingLlm's workers map
     worker_tag: Union[str, "Controller.WorkerTag"] = None

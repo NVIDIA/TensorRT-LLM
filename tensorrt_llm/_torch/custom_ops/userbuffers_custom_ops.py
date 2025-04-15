@@ -1,80 +1,44 @@
-from typing import List, Optional, Tuple
-
 import torch
 
 
-@torch.library.custom_op("trtllm::ub_scaled_mm_allreduce_quant_scaled_mm_op",
-                         mutates_args=())
-def ub_scaled_mm_allreduce_quant_scaled_mm_op(
-    mm0_a: torch.Tensor,
-    mm0_b: torch.Tensor,
-    mm0_a_scale: torch.Tensor,
-    mm0_b_scale: torch.Tensor,
-    mm0_bias: Optional[torch.Tensor],
-    mm_dtype: torch.dtype,
-    residual_in: torch.Tensor,
-    gamma: torch.Tensor,
-    groups: List[int],
-    eps: float,
-    scale: torch.Tensor,
-    mm1_b: torch.Tensor,
-    mm1_b_scale: torch.Tensor,
-    mm1_bias: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    mm0_res = torch.ops.trtllm.cublas_scaled_mm(
-        mm0_a,
-        mm0_b,
-        mm0_a_scale,
-        mm0_b_scale,
-        bias=mm0_bias,
-        out_dtype=mm_dtype,
-        userbuffers_id=0,
-    )
-    from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
-    hidden, residual = torch.ops.trtllm.allreduce(
-        mm0_res,
-        None,
-        [residual_in, gamma, scale],
-        groups,
-        int(AllReduceStrategy.UB),
-        0,  # UB ar does not care about AllReduceConfig
-        int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
-        eps,
-        True,
-        False,
-        True,
-    )
-    mm1_res = torch.ops.trtllm.cublas_scaled_mm(
-        hidden,
-        mm1_b.t(),
-        scale,
-        mm1_b_scale,
-        bias=mm1_bias,
-        out_dtype=mm_dtype,
-        userbuffers_id=-1,
-    )
-    return mm1_res, residual
+@torch.library.custom_op("trtllm::copy_to_userbuffers", mutates_args=())
+def copy_to_userbuffers(a: torch.Tensor) -> torch.Tensor:
+    ub_tensor = torch.ops.trtllm.create_userbuffers_tensor(a.shape, a.dtype)
+    return ub_tensor.copy_(a, non_blocking=True)
 
 
-@ub_scaled_mm_allreduce_quant_scaled_mm_op.register_fake
-def _(
-    mm0_a: torch.Tensor,
-    mm0_b: torch.Tensor,
-    mm0_a_scale: torch.Tensor,
-    mm0_b_scale: torch.Tensor,
-    mm0_bias: Optional[torch.Tensor],
-    mm_dtype: torch.dtype,
-    residual_in: torch.Tensor,
-    gamma: torch.Tensor,
-    groups: List[int],
-    eps: float,
-    scale: torch.Tensor,
-    mm1_b: torch.Tensor,
-    mm1_b_scale: torch.Tensor,
-    mm1_bias: Optional[torch.Tensor],
-):
-    shape = [i for i in mm0_a.shape]
-    shape[-1] = mm1_b.shape[-1]
-    ret = mm0_a.new_empty(shape, dtype=mm_dtype)
-    residual = torch.empty_like(residual_in)
-    return ret, residual
+@copy_to_userbuffers.register_fake
+def _(a) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+# Custom ops below are used to avoid in-place operation added to torch fx graph.
+# According to test, exporting in-place operation leads to additional copy and may block ops using the in-place op from being optimized.
+
+
+@torch.library.custom_op("trtllm::add_to_ub", mutates_args=())
+def add_to_ub(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    shape = [max(i, j) for i, j in zip(a.shape, b.shape)]
+    ub_tensor = torch.ops.trtllm.create_userbuffers_tensor(shape, a.dtype)
+    return torch.add(a, b, out=ub_tensor)
+
+
+@add_to_ub.register_fake
+def _(a, b) -> torch.Tensor:
+    shape = [max(i, j) for i, j in zip(a.shape, b.shape)]
+    return a.new_empty(shape, dtype=a.dtype)
+
+
+@torch.library.custom_op("trtllm::matmul_to_ub", mutates_args=())
+def matmul_to_ub(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    shape = list(a.shape)
+    shape[-1] = b.shape[-1]
+    ub_tensor = torch.ops.trtllm.create_userbuffers_tensor(shape, a.dtype)
+    return torch.matmul(a, b, out=ub_tensor)
+
+
+@matmul_to_ub.register_fake
+def _(a, b) -> torch.Tensor:
+    shape = list(a.shape)
+    shape[-1] = b.shape[-1]
+    return a.new_empty(shape, dtype=a.dtype)

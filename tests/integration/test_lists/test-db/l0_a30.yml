@@ -9,22 +9,53 @@ l0_a30:
       gpu:
       - '*a30*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)"
   - unittest/_torch -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_mllama"
-  - unittest/_torch/modeling -k "modeling_nvsmall"
+  - unittest/_torch/modeling -k "modeling_nemotron_nas"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_qwen"
+  - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_vila"
   - unittest/_torch/modeling -k "modeling_nemotron"
   - unittest/_torch/auto_deploy/unit/singlegpu
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_unit_tests[80]
   - test_cpp.py::test_model[gpt-80]
+  - test_cpp.py::test_model[gpt_executor-80]
   - test_cpp.py::test_benchmarks[gpt-80]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - unittest/trt/model/test_nemotron_nas.py -k "not fp8"
   - unittest/trt/model/test_gpt.py -k "partition0" # 10 mins
@@ -36,16 +67,16 @@ l0_a30:
   - examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-v1.6-mistral-7b-hf-vision-trtllm-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
-  - accuracy/test_accuracy.py::TestMinitron4BBase::test_auto_dtype
-  - accuracy/test_accuracy.py::TestLlama2_7B::test_weight_sparsity # 4 mins
-  - accuracy/test_accuracy.py::TestLlama3_1_8BInstruct::test_medusa_fp8_pre_quantized
-  - accuracy/test_accuracy.py::TestLlama3_2_1B::test_weight_streaming[0.1]
-  - accuracy/test_accuracy.py::TestGemma2_9BIt::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3Mini4kInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3Mini128kInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestPhi3_5MiniInstruct::test_auto_dtype
-  - accuracy/test_accuracy.py::TestQwen2_0_5BInstruct::test_weight_only
-  - accuracy/test_accuracy.py::TestQwen2_5_1_5BInstruct::test_weight_only
+  - accuracy/test_cli_flow.py::TestMinitron4BBase::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestLlama2_7B::test_weight_sparsity # 4 mins
+  - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
+  - accuracy/test_cli_flow.py::TestLlama3_2_1B::test_weight_streaming[0.1]
+  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3Mini4kInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3Mini128kInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestPhi3_5MiniInstruct::test_auto_dtype
+  - accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_weight_only
+  - accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_weight_only
   - examples/test_multimodal.py::test_llm_multimodal_general[deplot-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:2-disable_fp8]
@@ -71,6 +102,7 @@ l0_a30:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: tensorrt
   tests:
   - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin]
   - examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin]
@@ -97,8 +129,8 @@ l0_a30:
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-disable_gemm_plugin-disable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-bfloat16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] # 1 mins
-  - accuracy/test_accuracy.py::TestLlama7B::test_manage_weights # 2 mins
-  - accuracy/test_accuracy.py::TestQwen2_7BInstruct::test_weight_only
+  - accuracy/test_cli_flow.py::TestLlama7B::test_manage_weights # 2 mins
+  - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_llama.py::test_llm_llama_v2_1gpu_auto_parallel[llama-v2-7b-hf] # 15 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization] # 5 mins
   - examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long] # 6 mins

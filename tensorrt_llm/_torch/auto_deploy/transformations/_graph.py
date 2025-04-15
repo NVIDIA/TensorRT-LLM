@@ -130,7 +130,7 @@ def canonicalize_graph(gm: GraphModule, shape_prop: bool = False) -> GraphModule
     gm.delete_all_unused_submodules()
     gm = legalize_graph(gm)
 
-    # NOTE (lliebenwein): shape_prop can be a littly finicky & slow, so we only run it optionally...
+    # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
     if shape_prop:
         inps = tuple([node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"])
         with lift_to_meta(gm):

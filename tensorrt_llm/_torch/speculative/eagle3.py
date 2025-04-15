@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from ..pyexecutor.decoder import TorchDecoder
+from ..pyexecutor.decoder import DecoderState, TorchDecoder
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
 
@@ -59,7 +59,7 @@ class Eagle3SpecMetadata(SpecMetadata):
                                     hidden_states: torch.Tensor,
                                     residual: torch.Tensor) -> None:
         if layer_id in self.layers_to_capture:
-            # TODO(miovine): write directly into a pre-allocated buffer for
+            # TODO: write directly into a pre-allocated buffer for
             # CUDA graph support.
             self.hidden_states.append(hidden_states + residual)
 
@@ -102,4 +102,8 @@ class Eagle3Decoder(TorchDecoder):
         new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return new_tensors_device, new_tensors_host, decoder_event
+        return DecoderState(scheduled_requests=scheduled_requests,
+                            logits=logits,
+                            new_tensors_device=new_tensors_device,
+                            new_tensors_host=new_tensors_host,
+                            decoder_event=decoder_event)

@@ -27,7 +27,7 @@ TEST(TestGetPtrCudaMemoryType, TestMemoryTypesAreAsExpected)
 {
     auto const cpuBuffer = std::make_unique<tr::HostBuffer>(1024, tr::TRTDataType<float>::value);
 
-    // Note (jdebache): this I think will change with hardware HMM support. To be confirmed. If it does, check for this
+    // Note: this I think will change with hardware HMM support. To be confirmed. If it does, check for this
     // support and change expected memory type value accordingly.
     ASSERT_EQ(tc::getPtrCudaMemoryType(cpuBuffer->data()), cudaMemoryType::cudaMemoryTypeUnregistered)
         << "Host paged memory should appear as unregistered to CUDA.";

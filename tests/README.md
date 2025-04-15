@@ -55,7 +55,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_accuracy.py::TestGpt2CnnDailymail::test_auto_dtype"
+pytest "accuracy/test_cli_flow.py::TestGpt2CnnDailymail::test_auto_dtype"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
@@ -109,7 +109,7 @@ Details on usage of the resources scripts can be found in the [C++ Test document
 
 ## 5. Performance regression test
 
-Porformance in QA tests and CI are still using TURTLE, see [legacy turtle perf test readme](./integration/README.md)
+For performance regression testing in QA and CI, see the [performance test guide](./integration/README.md).
 
 # How to add test to CI
 
@@ -212,5 +212,6 @@ test_cpp.py::test_model[eagle-86]
 3. Invoke `pytest` with TRT-LLM custom option `--test-list`:
 
 ```shell
-pytest integration --test-list="a10_list.txt"
+cd tests/integration/defs
+pytest . --test-list="a10_list.txt" --output-dir=/tmp/llm_integration_test
 ```
