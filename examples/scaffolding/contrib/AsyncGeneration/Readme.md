@@ -25,53 +25,20 @@
 
 ---
 
-## Usage in Worker
+## Usage in Controller/Worker
 
-Here's how a Worker would handler `StreamGenerationTask`
+The Controller can utilize `StreamGenerationTask` to enable efficient streaming-based generation workflows:
+- It sends tasks to the worker, which returns them when the number of newly generated tokens reaches the specified `streaming_step`.
+- It can cancel long-running tasks by setting `task.cancel_flag = True` when the number of generated tokens exceeds a predefined threshold.
+
+To support this behavior on the worker side, you need to implement a `stream_generation_handler` and register it with the worker. This handler should process `StreamGenerationTask` instances step-by-step and update relevant fields such as `output_tokens`, `output_str`.
+
+This design allows the controller and worker to coordinate generation in a token-efficient and responsive manner, ideal for real-time applications.
+
 You can see more details in stream_generation_controller.py and stream_generation_task.py
 
-```python
-async def stream_generation_handler(worker,
-                                    task: StreamGenerationTask) -> TaskStatus:
-
-    async def get_step_or_more_tokens(task: StreamGenerationTask):
-        if task.cancel_flag:
-            task.end_flag = True
-            task.request_handle.abort()
-            return TaskStatus.SUCCESS
-
-        for _ in range(task.streaming_step):
-            await task.request_handle._aresult_step()
-            if task.request_handle._done:
-                break
-        while not task.request_handle._done:
-            async_task = asyncio.create_task(
-                task.request_handle._aresult_step())
-            if not async_task.done():
-                async_task.cancel()
-                break
-
-        task.output_str = task.request_handle.outputs[0].text
-        task.output_tokens = task.request_handle.outputs[0].token_ids
-        task.cumulative_logprob = task.request_handle.outputs[
-            0].cumulative_logprob
-        task.logprobs = task.request_handle.outputs[0].logprobs
-        if task.request_handle._done:
-            task.end_flag = True
-
-    sampling_params = worker.combine_sampling_params_with_generation_task(task)
-    if task.request_handle == None:
-        task.request_handle = worker.llm.generate_async(
-            task.input_str, sampling_params=sampling_params, streaming=True)
-    await get_step_or_more_tokens(task)
-
-    # TODO: error handle
-    return TaskStatus.SUCCESS
-```
 ## Notes
 Ensure the `worker.llm.generate_async(...)` method supports streaming=True.
-
-The controller is responsible for repeatedly calling the `stream_generation_handler` until `task.end_flag` is set to True.
 
 ## TODO
 
