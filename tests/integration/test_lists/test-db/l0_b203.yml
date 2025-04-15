@@ -1,5 +1,5 @@
 version: 0.0.1
-l0_rtx_5080:
+l0_b203:
 - condition:
     ranges:
       system_gpu_count:
@@ -7,7 +7,7 @@ l0_rtx_5080:
         lte: 1
     wildcards:
       gpu:
-      - '*rtx-5080*'
+      - '*gb203*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
@@ -43,7 +43,7 @@ l0_rtx_5080:
         lte: 1
     wildcards:
       gpu:
-      - '*rtx-5080*'
+      - '*gb203*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
