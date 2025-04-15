@@ -69,10 +69,6 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     def prompt(self) -> Optional[str]:
         return self._prompt
 
-    @property
-    def prompt_len(self) -> Optional[int]:
-        return len(self.prompt_token_ids)
-
     def _repr_fields(self):
         return [
             "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
