@@ -720,10 +720,6 @@ class LlmArgs(BaseModel):
 
     # Below are all remaining arguments
 
-    modality: Optional[str] = Field(
-        default=None,
-        description="The modality (image or video) for multimodal models.")
-
     pipeline_parallel_size: int = Field(
         default=1, description="The pipeline parallel size.")
 

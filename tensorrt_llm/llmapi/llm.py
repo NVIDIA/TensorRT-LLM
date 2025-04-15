@@ -41,7 +41,6 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         request_id (int): The unique ID of the request.
         prompt (str, optional): The prompt string of the request.
         prompt_token_ids (List[int]): The token ids of the prompt.
-        prompt_len (int, optional): The length of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
         finished (bool): Whether the whole request is finished.
@@ -76,8 +75,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "prompt_len", "outputs",
-            "finished"
+            "request_id", "prompt", "prompt_token_ids", "outputs", "finished"
         ]
 
 

@@ -23,7 +23,8 @@ class LlmManager:
                  llm: LLM,
                  outbox: asyncio.Queue[PerfItemTuple],
                  streaming: bool,
-                 concurrency: int = -1) -> None:
+                 concurrency: int = -1,
+                 modality: Optional[str] = None) -> None:
         self.llm = llm
         self._inbox: asyncio.Queue[Tuple[InferenceRequest,
                                          SamplingParams]] = asyncio.Queue()
@@ -38,6 +39,7 @@ class LlmManager:
             concurrency) if concurrency > 0 else None
         self.streaming = streaming
         self.request_seen = asyncio.Event()
+        self.modality = modality
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams):
@@ -50,8 +52,7 @@ class LlmManager:
             time_on_first_token = None
             # Schedule the request in the LLM API (asynchronously)
             output: RequestOutput = self.llm.generate_async(
-                request.input_ids
-                if self.llm.args.modality is None else request.prompt,
+                request.input_ids if self.modality is None else request.prompt,
                 sampling_params=sampling_params,
                 streaming=self.streaming)
             if self.streaming:
@@ -202,6 +203,7 @@ async def async_benchmark(
     streaming: bool,
     concurrency: int = -1,
     iteration_log_addr: str = None,
+    modality: Optional[str] = None,
 ) -> StatsKeeper:
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
@@ -209,7 +211,11 @@ async def async_benchmark(
 
     try:
         logger.info("Starting benchmarking async task.")
-        backend = LlmManager(llm, outbox, streaming, concurrency=concurrency)
+        backend = LlmManager(llm,
+                             outbox,
+                             streaming,
+                             concurrency=concurrency,
+                             modality=modality)
         backend.run(iteration_addr=iteration_log_addr)
 
         enqueue_task = asyncio.create_task(

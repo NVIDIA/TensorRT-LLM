@@ -287,7 +287,6 @@ def throughput_command(
     exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
     exec_settings["settings_config"]["beam_width"] = beam_width
-    exec_settings["settings_config"]["modality"] = modality
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
@@ -324,8 +323,12 @@ def throughput_command(
             warmup_dataset = generate_warmup_dataset(requests, warmup)
             logger.info("Running warmup.")
             asyncio.run(
-                async_benchmark(llm, sampling_params, warmup_dataset, False,
-                                concurrency))
+                async_benchmark(llm,
+                                sampling_params,
+                                warmup_dataset,
+                                False,
+                                concurrency,
+                                modality=modality))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -334,8 +337,13 @@ def throughput_command(
 
         with iteration_writer.capture():
             statistics = asyncio.run(
-                async_benchmark(llm, sampling_params, requests, streaming,
-                                concurrency, iteration_writer.full_address))
+                async_benchmark(llm,
+                                sampling_params,
+                                requests,
+                                streaming,
+                                concurrency,
+                                iteration_writer.full_address,
+                                modality=modality))
 
         logger.info(f"Benchmark done. Reporting results...")
         if modality is not None:
