@@ -629,9 +629,8 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
-        # TODO smor- need to look more on this
-        # what should be chose as the tokenizer? the adapter or the base model?
-        # what happens if we have multiple adapters?
+        # TODO smor- need to refine what is the desired behavior if lora is enabled
+        # in terms of the tokenizer initialization process
         if hasattr(
                 self.args, "backend"
         ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
@@ -643,14 +642,12 @@ class LLM:
                         tokenizer_path,
                         trust_remote_code=self.args.trust_remote_code,
                         use_fast=self.args.tokenizer_mode != 'slow')
-                    return tokenizer
+                    if tokenizer is None:
+                        tokenizer_path = self.args.model
+                    else:
+                        return tokenizer
                 except Exception:
                     tokenizer_path = self.args.model
-            elif num_lora_dirs > 1:
-                # TODO smor- currently not supported, need to determine which tokenizer to use, if possible
-                raise ValueError(
-                    f"Expecting only a single lora dir, but got {num_lora_dirs}"
-                )
             else:
                 tokenizer_path = self.args.model
         else:
