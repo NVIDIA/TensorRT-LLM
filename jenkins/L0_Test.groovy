@@ -101,6 +101,8 @@ def TEST_STAGE_LIST = "stage_list"
 @Field
 def GPU_TYPE_LIST = "gpu_type"
 @Field
+def BACKEND_MODE = "backend_mode"
+@Field
 def IS_POST_MERGE = "post_merge"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
@@ -118,12 +120,13 @@ def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
-@Field
+
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
     (TEST_STAGE_LIST): null,
     (GPU_TYPE_LIST): null,
+    (BACKEND_MODE): null,
     (IS_POST_MERGE): false,
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
@@ -1533,27 +1536,48 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Check --gpu-type, filter test stages.
     if (testFilter[(GPU_TYPE_LIST)] != null) {
-        echo "Use GPU_TYPE_LIST for filtering."
+        echo "Use GPU_TYPE_LIST for filtering. GPU types: ${testFilter[(GPU_TYPE_LIST)]}."
         parallelJobsFiltered = parallelJobsFiltered.findAll {it.key.tokenize('-')[0] in testFilter[(GPU_TYPE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
 
-    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
-        echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
-        parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+    // Check --backend-mode, filter test stages.
+    if (testFilter[(BACKEND_MODE)] != null) {
+        echo "Use BACKEND_MODE for filtering. Backend mode: ${testFilter[(BACKEND_MODE)]}."
+        def backendMode = testFilter[(BACKEND_MODE)].collect { it.toLowerCase() }
+        def changeMap = [
+            "pytorch": "-PyTorch-",
+            "tensorrt": "-TensorRT-",
+            "cpp": "-CPP-",
+        ]
+        def backendModeList = backendMode.collect { changeMap[it] }.flatten()
+        def parallelJobsNoBackend = parallelJobsFiltered.findAll {key -> !changeMap.values().any{backend -> key.contains(backend)}}
+        def parallelJobsBackendMode = parallelJobsFiltered.findAll {key -> backendModeList.any{backend -> key.contains(backend)}}
+        parallelJobsFiltered = parallelJobsNoBackend + parallelJobsBackendMode
+        echo "parallelJobsBackendMode: ${parallelJobsBackendMode.keySet()}"
         println parallelJobsFiltered.keySet()
+    }
+
+    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
+        if (testFilter[(BACKEND_MODE)] != null) {
+            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(BACKEND_MODE)]}."
+        } else {
+            echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
+            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+            println parallelJobsFiltered.keySet()
+        }
     }
 
     // Check --stage-list, only run the stages in stage-list.
     if (testFilter[TEST_STAGE_LIST] != null) {
-        echo "Use TEST_STAGE_LIST for filtering."
+        echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
         parallelJobsFiltered = parallelJobs.findAll {it.key in testFilter[(TEST_STAGE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
 
     // Check --extra-stage, add the stages in extra-stage.
     if (testFilter[EXTRA_STAGE_LIST] != null) {
-        echo "Use EXTRA_STAGE_LIST for filtering."
+        echo "Use EXTRA_STAGE_LIST for filtering. Stages: ${testFilter[(EXTRA_STAGE_LIST)]}."
         parallelJobsFiltered += parallelJobs.findAll {it.key in testFilter[(EXTRA_STAGE_LIST)]}
         println parallelJobsFiltered.keySet()
     }
