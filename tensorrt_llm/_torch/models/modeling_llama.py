@@ -24,7 +24,9 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
 from ..modules.rms_norm import RMSNorm
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model, support_pp)
+                             EagerFusionConfig, MissingLayer,
+                             register_auto_model, support_pp,
+                             unpack_hidden_states)
 
 
 class Llama4Attention(Attention):
@@ -45,7 +47,7 @@ class Llama4Attention(Attention):
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
-                is_neox=not use_gptj_style_rope,
+                is_neox=False,
             )
         else:
             pos_embd_params = None
@@ -73,21 +75,16 @@ class LlamaAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=LlamaRotaryEmbedding(config),
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
