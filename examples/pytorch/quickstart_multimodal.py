@@ -45,7 +45,7 @@ def prepare_vila(args, inputs):
     return inputs
 
 
-def prepare_llava_next(args, inputs):
+def prepare_generic(args, inputs):
     processor = AutoProcessor.from_pretrained(args.model_dir)
 
     # Single-image inference chat template. For multi-image template,
@@ -59,9 +59,11 @@ def prepare_llava_next(args, inputs):
                         "type": "text",
                         "text": prompt
                     },
-                    {
-                        "type": "image"
-                    },
+                    *[
+                        {
+                            "type": "image",
+                        } for _ in multimodal_data["image"]
+                    ],
                 ],
             },
         ]
@@ -103,9 +105,10 @@ def prepare_qwen2_vl(args, inputs):
 
 MODEL_TYPE_MAP = {
     "llava_llama": prepare_vila,
-    "llava_next": prepare_llava_next,
+    "llava_next": prepare_generic,
     "qwen2_vl": prepare_qwen2_vl,
     "qwen2_5_vl": prepare_qwen2_vl,
+    "llama4": prepare_generic,
 }
 
 
