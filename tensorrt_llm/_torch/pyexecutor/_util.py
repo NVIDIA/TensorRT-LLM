@@ -150,7 +150,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     torch.cuda.reset_peak_memory_stats()
     model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
     logger.info(
-        f"Memory used for model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+        f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
     )
 
     py_executor.set_gather_responses(True)
@@ -178,7 +178,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
     peak_memory = torch_peak_memory + extra_cost
     logger.info(
-        f"Memory used for activations (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
+        f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
     )
     logger.info(
         f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
