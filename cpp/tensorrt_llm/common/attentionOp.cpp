@@ -209,7 +209,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         xqaParams.kv_cache_data_type = xqaParams.data_type;
     }
     if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM >= kSM_120)))
     {
         xqaParams.multi_block_mode = false;
     }
@@ -2276,8 +2276,8 @@ int AttentionOp::initialize() noexcept
     if (mFP8ContextFMHA)
     {
         TLLM_CHECK_WITH_INFO(mEnableContextFMHA, "FP8 FMHA cannot be enabled because Context FMHA is not supported.");
-        TLLM_CHECK_WITH_INFO(
-            mSM == 89 || mSM == 90 || mSM == 100, "FP8 FMHA can only be enabled on sm_89, sm_90 or sm_100.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
+            "FP8 FMHA can only be enabled on sm_89, sm_90, sm_100 or sm_120.");
     }
 
     // Pre-Check of FP8 Generation MLA.
@@ -2290,7 +2290,7 @@ int AttentionOp::initialize() noexcept
 
     // Check requirements for FP4 output.
     TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mEnableContextFMHA, "Context FMHA must enable if fuse_fp4_quant is enabled");
-    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || (mSM >= 100), "fuse_fp4_quant only supports SM100 and later devices.");
+    TLLM_CHECK_WITH_INFO(!mFuseFp4Quant || mSM == 100, "fuse_fp4_quant only supports SM100 devices.");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),

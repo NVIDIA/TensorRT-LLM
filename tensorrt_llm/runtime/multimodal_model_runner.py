@@ -1053,8 +1053,11 @@ class MultimodalModelRunner:
             input_ids = input_ids.expand(self.args.batch_size,
                                          *input_ids.shape[1:])
             num_img_tokens = [visual_features.shape[0]]
-            input_ids = self.ptuning_setup_phi3(visual_features, input_ids,
-                                                num_img_tokens)
+            input_ids = self.ptuning_setup_phi3(visual_features=visual_features,
+                                                audio_features=None,
+                                                input_ids=input_ids,
+                                                num_img_tokens=num_img_tokens,
+                                                num_aud_tokens=None)
             visual_features = visual_features.unsqueeze(0).repeat(
                 self.args.batch_size, 1, 1)
             length = input_ids.shape[1]
@@ -1085,9 +1088,11 @@ class MultimodalModelRunner:
                 num_aud_tokens = [audio_features.shape[0]]
             else:
                 num_aud_tokens = None
-            input_ids = self.ptuning_setup_phi3(visual_features, audio_features,
-                                                input_ids, num_img_tokens,
-                                                num_aud_tokens)
+            input_ids = self.ptuning_setup_phi3(visual_features=visual_features,
+                                                audio_features=audio_features,
+                                                input_ids=input_ids,
+                                                num_img_tokens=num_img_tokens,
+                                                num_aud_tokens=num_aud_tokens)
             visual_features = visual_features.unsqueeze(0).repeat(
                 self.args.batch_size, 1, 1)
             if audio_features is not None:

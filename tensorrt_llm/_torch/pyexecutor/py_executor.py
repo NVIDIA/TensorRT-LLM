@@ -24,8 +24,8 @@ from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
+from ..distributed import Distributed
 from .decoder import Decoder
-from .distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
@@ -1828,7 +1828,9 @@ class PyExecutor:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
-            error_responses[req_id] = ExecutorResponse(req_id, error_msg)
+            error_responses[req_id] = ExecutorResponse(
+                req_id, error_msg, client_id=request.py_client_id)
+        self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
     def _terminate_request(self, request: LlmRequest):

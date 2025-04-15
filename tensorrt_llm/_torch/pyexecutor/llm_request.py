@@ -37,8 +37,9 @@ REQUEST_TYPE_MAPPING = {
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, client_id=None, **kwargs):
+        super().__init__(*args, client_id=client_id, **kwargs)
+        self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
