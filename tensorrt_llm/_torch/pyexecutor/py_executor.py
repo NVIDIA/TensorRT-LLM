@@ -1928,6 +1928,7 @@ class PyExecutor:
                     break
                 draft_batch.generation_requests = new_requests
                 previous_batch = sample_state
+            self._update_requests(previous_batch)
 
             _pad_to_max_draft_tokens()
 
