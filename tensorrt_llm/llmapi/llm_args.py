@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field, validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.lora_manager import LoraConfig
+
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
@@ -876,6 +878,7 @@ class LlmArgs(BaseModel):
                                    description="The backend to use.",
                                    exclude=True)
 
+    lora_config: Optional[LoraConfig] = None
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,

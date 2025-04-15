@@ -77,6 +77,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         dist=dist,
         spec_config=spec_config,
         guided_decoding_config=executor_config.guided_decoding_config,
+        lora_config=lora_config,
     )
 
     if has_draft_model_engine:

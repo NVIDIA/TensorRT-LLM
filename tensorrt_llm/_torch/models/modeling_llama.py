@@ -225,6 +225,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                layer_idx=layer_idx,
             )
 
             # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
@@ -379,6 +380,7 @@ class LlamaDecoderLayer(DecoderLayer):
             bias=config.mlp_bias,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -415,7 +417,7 @@ class LlamaDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
@@ -549,6 +551,7 @@ class Llama4Model(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params=None,
     ) -> torch.Tensor:
         if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -576,6 +579,7 @@ class Llama4Model(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         if self.model_config.mapping.is_last_pp_rank():
@@ -592,14 +596,29 @@ class LlamaModel(DecoderModel):
         config = self.model_config.pretrained_config
         self.padding_idx = config.pad_token_id
 
+        vocab_size = config.vocab_size
+        # TODO smor- hack
+        if hasattr(model_config,
+                   'lora_config') and model_config.lora_config is not None:
+            from tensorrt_llm.lora_manager import HfLoraLoader
+            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+            weight = lora_loader.embed_tokens
+            # TODO smor - need to split tp matrix here
+            vocab_size = lora_loader.vocab_size
+
         self.embed_tokens = Embedding(
-            config.vocab_size,
+            vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             gather_output=True,
         )
+
+        if hasattr(model_config,
+                   'lora_config') and model_config.lora_config is not None:
+            self.embed_tokens.weight.value = weight.to(self.embed_tokens.dtype)
+
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
                 model_config,
@@ -618,6 +637,7 @@ class LlamaModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params=None,
     ) -> torch.Tensor:
         if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -643,6 +663,7 @@ class LlamaModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         if self.model_config.mapping.is_last_pp_rank():
