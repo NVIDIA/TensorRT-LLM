@@ -119,6 +119,7 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
+            use_llama4_qkv=True,
         )
         self.o_proj = Linear(
             self.hidden_size,
