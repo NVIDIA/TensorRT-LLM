@@ -126,7 +126,7 @@ class LoraLayer(torch.nn.Module):
                     True,  # transB
                     max([r.max() for r in lora_ranks]),
                     0,
-                    lora_params["remove_input_padding"],
+                    True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
                 )
                 if isinstance(lora_outputs, torch.Tensor):
                     return lora_outputs

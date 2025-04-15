@@ -7,10 +7,12 @@ import torch
 from parameterized import parameterized
 from transformers import LlamaConfig
 from transformers import LlamaForCausalLM as HFLlamaForCausalLM
-from utils.util import getSMVersion
+from utils.llm_data import llm_models_root
+from utils.util import getSMVersion, skip_gpu_memory_less_than
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.llm import LLM
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
@@ -18,8 +20,11 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.sampling_params import SamplingParams
 
 LLAMA_3_1_8B_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -363,3 +368,44 @@ class TestLlama(unittest.TestCase):
                                    rtol=0.4)
 
         kv_cache_manager.shutdown()
+
+    @skip_gpu_memory_less_than(40 * 1024 * 1024 *
+                               1024)  # 40gb, same as test_llmapi
+    def test_llama_lora(self) -> None:
+        # TODO smor- this test is running but correctness is not guaranteed.
+        # The following PR will ensure correctness
+        # We might want to change this test location elsewhere
+
+        lora_config = LoraConfig(lora_dir=[
+            f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b"
+        ],
+                                 max_lora_rank=64)
+        llm = LLM(
+            model=f"{llm_models_root()}/llama-models-v2/llama-v2-13b-hf",
+            lora_config=lora_config,
+        )
+
+        prompts = [
+            "今天天气很好，我到公园的时候，",
+        ]
+        references = [
+            "发现公园里到处都是人，有的在跑步，有的在打羽毛球，还有的",
+        ]
+        sampling_params = SamplingParams(max_tokens=20,
+                                         add_special_tokens=False)
+        lora_req = LoRARequest(
+            "task-0", 0,
+            f"{llm_models_root()}/llama-models-v2/chinese-llama-2-lora-13b")
+        lora_request = [lora_req]
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_request)
+
+        # Print the outputs.
+        for output in outputs:
+            prompt = output.prompt
+            generated_text = output.outputs[0].text
+            print(
+                f"Prompt:         {prompt!r}\nGenerated text: {generated_text!r}\nExpected:       {references[0]!r}"
+            )

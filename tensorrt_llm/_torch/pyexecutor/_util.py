@@ -394,6 +394,9 @@ def create_py_executor_instance(dist,
             peft_cache_config=executor_config.peft_cache_config,
             model_config=model_binding_config)
         resources["peft_cache_manager"] = peft_cache_manager
+        model_engine.set_lora_model_config(
+            lora_config.lora_target_modules,
+            lora_config.trtllm_modules_to_hf_modules)
 
     resource_manager = ResourceManager(resources)
 

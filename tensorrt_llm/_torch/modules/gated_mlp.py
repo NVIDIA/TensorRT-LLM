@@ -114,9 +114,27 @@ class GatedMLP(nn.Module):
 
         if self.activation == F.silu:
             h1 = self.gate_up_proj(x)
+            if bool(lora_params):
+                assert self.layer_idx is not None, "layer_idx is required for lora"
+                h1_lora = self.splitted_gate_up_lora(x, lora_params,
+                                                     self.layer_idx)
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
+
+                h1_lora = self.fused_gate_up_lora(x, lora_params,
+                                                  self.layer_idx)
+
+                if h1_lora is not None:
+                    h1 = h1 + h1_lora
+
             h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params)
+            if bool(lora_params):
+                output_lora = self.down_lora(h2, lora_params, self.layer_idx)
+                if output_lora is not None:
+                    output = output + output_lora
+
             return output
         else:
             raise NotImplementedError(
