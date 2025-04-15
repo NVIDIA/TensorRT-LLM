@@ -475,3 +475,9 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    def test_auto_dtype_cp(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
