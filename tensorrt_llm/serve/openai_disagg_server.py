@@ -168,7 +168,7 @@ class OpenAIDisaggServer:
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             return None
 
-        ctx_server = self.ctx_router.get_next_server(ctx_req)
+        ctx_server = await self.ctx_router.get_next_server(ctx_req)
         logging.info("Sending request to ctx server: %s", ctx_server)
 
         if request_type == "chat":
@@ -201,7 +201,7 @@ class OpenAIDisaggServer:
         gen_req.disaggregated_params.request_type = "generation_only"
 
         # Pick a generation server and send request
-        gen_server = self.gen_router.get_next_server(gen_req)
+        gen_server = await self.gen_router.get_next_server(gen_req)
         logging.info("Sending request to gen server: %s", gen_server)
 
         if not gen_req.stream:
