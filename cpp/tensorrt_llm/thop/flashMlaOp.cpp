@@ -52,33 +52,31 @@
 
 /**
  * @brief Get metadata for MLA computation
- * @param seqlens_k Tensor of shape (batch_size) containing sequence lengths, dtype int32
- * @param num_heads_per_head_k Equal to seq_len_q * num_heads_q / num_heads_k
- * @param num_heads_k Number of key heads
- * @return Tuple containing:
- *         - tile_scheduler_metadata: Tensor of shape (num_sm_parts, TileSchedulerMetaDataSize), dtype int32
- *         - num_splits: Tensor of shape (batch_size + 1), dtype int32
+ * @param seqlens_k Tensor of shape (batch_size), dtype int32, sequence lengths of each sequence
+ * @param tile_scheduler_metadata Tensor of shape (num_sm_parts, TileSchedulerMetaDataSize), dtype int32, metadata of
+ * each sm part
+ * @param num_splits Tensor of shape (batch_size + 1), dtype int32, split information of each sequence
+ *
+ * The function populates the provided tile_scheduler_metadata and num_splits tensors with
+ * the computed metadata required for FlashMLA computation.
  */
-std::tuple<at::Tensor, at::Tensor> get_mla_metadata(
-    at::Tensor& seqlens_k, int64_t const num_heads_per_head_k, int64_t const num_heads_k)
+void get_mla_metadata(torch::Tensor seqlens_k, torch::Tensor tile_scheduler_metadata, torch::Tensor num_splits)
 {
     // This should match the logic in the MLA kernel, see cpp/tensorrt_llm/kernels/flashMLA/
-    static constexpr int block_size_m = 64;
+    // static constexpr int block_size_m = 64;
     static constexpr int block_size_n = 64;
     static constexpr int fixed_overhead_num_blocks = 5;
 
     CHECK_INPUT(seqlens_k, torch::kInt32);
+    CHECK_INPUT(tile_scheduler_metadata, torch::kInt32);
+    CHECK_INPUT(num_splits, torch::kInt32);
 
     int batch_size = seqlens_k.size(0);
     int* seqlens_k_ptr = seqlens_k.data_ptr<int>();
-    auto options = seqlens_k.options();
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    int sm_count = dprops->multiProcessorCount;
-    int num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+    int num_sm_parts = tile_scheduler_metadata.size(0);
+    TORCH_CHECK(num_splits.size(0) == batch_size + 1, "num_splits must be of shape (batch_size + 1)");
 
-    auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
-    auto num_splits = torch::empty({batch_size + 1}, options);
     int* tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
     int* num_splits_ptr = num_splits.data_ptr<int>();
 
@@ -93,13 +91,11 @@ std::tuple<at::Tensor, at::Tensor> get_mla_metadata(
     params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
     params.num_sm_parts = num_sm_parts;
     get_mla_metadata_func(params, stream);
-
-    return std::make_tuple(tile_scheduler_metadata, num_splits);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("get_mla_metadata(Tensor seqlens_k, int num_heads_per_head_k, int num_heads_k) -> (Tensor, Tensor)");
+    m.def("get_mla_metadata(Tensor seqlens_k, Tensor tile_scheduler_metadata, Tensor num_splits) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

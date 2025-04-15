@@ -645,6 +645,21 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+def get_sm_count():
+    """Get the number of Streaming Multiprocessors (SMs) for the current CUDA device."""
+    if not torch.cuda.is_available():
+        return 0
+
+    device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+    return properties.multi_processor_count
+
+
+def ceil_div(a: int, b: int) -> int:
+    """Integer ceiling division"""
+    return (a + b - 1) // b
+
+
 def trace_func(func):
 
     @wraps(func)
