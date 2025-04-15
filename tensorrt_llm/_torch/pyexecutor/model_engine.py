@@ -1690,7 +1690,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @nvtx_range("_forward_step")
     def _forward_step(self, inputs: Dict[str, Any],
-                      gather_ids: Optional[torch.Tensor]) -> torch.Tensor:
+                      gather_ids: Optional[torch.Tensor]) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
         if self.without_logits:
             outputs = self.model_forward(**inputs)
