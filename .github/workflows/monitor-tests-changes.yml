@@ -1,0 +1,143 @@
+name: Monitor Tests Changes
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'tests/**'
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get PR information
+        id: pr-info
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const prTitle = pr.title;
+            const prAuthor = pr.user.login;
+            const prUrl = pr.html_url;
+
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('pr_title', prTitle);
+            core.setOutput('pr_author', prAuthor);
+            core.setOutput('pr_url', prUrl);
+
+      - name: Find commits modifying tests
+        id: find-commits
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          echo "Finding commits that modify the tests folder:"
+          COMMITS_JSON=$(git log --pretty=format:'{"hash":"%H","short_hash":"%h","author":"%an","subject":"%s","date":"%ad","body":"%b"}' $BASE_SHA..$HEAD_SHA -- tests/)
+
+          # Convert each commit to JSON array format
+          COMMITS_ARRAY="["
+          while IFS= read -r line; do
+            if [ ! -z "$line" ]; then
+              COMMITS_ARRAY="${COMMITS_ARRAY}${line},"
+            fi
+          done <<< "$COMMITS_JSON"
+          COMMITS_ARRAY="${COMMITS_ARRAY%,}]"  # Remove the last comma and add closing bracket
+
+          # Handle empty array case
+          if [ "$COMMITS_ARRAY" = "]" ]; then
+            COMMITS_ARRAY="[]"
+          fi
+
+          echo "commits_json<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS_ARRAY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create issues for each commit
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = '${{ steps.pr-info.outputs.pr_number }}';
+            const prTitle = '${{ steps.pr-info.outputs.pr_title }}';
+            const prAuthor = '${{ steps.pr-info.outputs.pr_author }}';
+            const prUrl = '${{ steps.pr-info.outputs.pr_url }}';
+
+            let commitsJson = '${{ steps.find-commits.outputs.commits_json }}';
+            const commits = JSON.parse(commitsJson);
+
+            if (commits.length === 0) {
+              console.log("No commits modifying the tests folder were found.");
+              return;
+            }
+
+            // Create an issue for each commit
+            for (const commit of commits) {
+              const commitUrl = `${context.payload.repository.html_url}/commit/${commit.hash}`;
+
+              // Get the files changed in this commit in the tests folder
+              const filesChangedResult = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: commit.hash
+              });
+
+              // Filter for files in the tests folder
+              const testFilesChanged = filesChangedResult.data.files
+                .filter(file => file.filename.startsWith('tests/'))
+                .map(file => {
+                  return {
+                    filename: file.filename,
+                    status: file.status,
+                    additions: file.additions,
+                    deletions: file.deletions,
+                    url: file.blob_url
+                  };
+                });
+
+              // Create file changes section
+              let filesSection = '';
+              if (testFilesChanged.length > 0) {
+                filesSection = '## Files Changed\n\n';
+                testFilesChanged.forEach(file => {
+                  filesSection += `- [${file.filename}](${file.url}) (${file.status}, +${file.additions}, -${file.deletions})\n`;
+                });
+              }
+
+              // Create the issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[Tests] ${commit.subject}`,
+                body: `
+                # Tests Folder Modification Alert
+
+                A commit in Pull Request [#${prNumber}: ${prTitle}](${prUrl}) has modified files in the \`tests\` folder.
+
+                ## Commit Details
+
+                - **Commit:** [${commit.short_hash}](${commitUrl})
+                - **Author:** ${commit.author}
+                - **Date:** ${commit.date}
+                - **Message:** ${commit.subject}
+
+                ${commit.body ? `**Description:**\n\n\`\`\`\n${commit.body}\n\`\`\`\n\n` : ''}
+
+                ${filesSection}
+
+                Please review these changes promptly.
+                `
+              });
+
+              console.log(`Created issue for commit ${commit.short_hash}: ${commit.subject}`);
+            }
