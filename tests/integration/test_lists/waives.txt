@@ -427,3 +427,4 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-rec
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 accuracy/test_cli_flow.py::TestGpt2Medium::test_fp8_lm_head SKIP (https://nvbugs/5214229)
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214239)
+examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-scienceqa-Llama-3.2-11B-Vision-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False] SKIP (https://nvbugs/5222697)
