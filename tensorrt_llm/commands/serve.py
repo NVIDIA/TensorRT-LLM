@@ -33,6 +33,7 @@ def get_llm_args(model: str,
                  free_gpu_memory_fraction: Optional[float] = None,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
+                 enable_block_reuse: bool = True,
                  **llm_args_dict: Any):
 
     if gpus_per_node is None:
@@ -46,7 +47,8 @@ def get_llm_args(model: str,
                                max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        enable_block_reuse=enable_block_reuse)
 
     pytorch_backend_config = PyTorchConfig(
         enable_overlap_scheduler=True) if backend == "pytorch" else None
@@ -156,6 +158,10 @@ def launch_server(host: str, port: int, llm_args: dict):
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
+@click.option("--disable_block_reuse",
+              is_flag=True,
+              default=False,
+              help="Disable KV Cache Reuse.")
 @click.option(
     "--num_postprocess_workers",
     type=int,
@@ -180,7 +186,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
-          extra_llm_api_options: Optional[str]):
+          disable_block_reuse: bool, extra_llm_api_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -207,6 +213,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
+        enable_block_reuse=not disable_block_reuse,
         **llm_args_dict)
 
     launch_server(host, port, llm_args)
