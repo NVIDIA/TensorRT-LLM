@@ -537,7 +537,6 @@ def worker_main(
         # Only set the log level for the leader process, the other processes will
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
-
         request_queue = IpcQueue(worker_queues.request_queue_addr,
                                  is_server=False,
                                  name="worker_request_queue")
