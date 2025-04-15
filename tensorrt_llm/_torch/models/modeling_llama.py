@@ -756,25 +756,29 @@ class Llama4InputProcessor(InputProcessor):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data")
-        if not mm_data or not mm_data.get("image"):
-            # text only
-            return token_ids, {}
+        images, do_rescale = None, True
+
+        if mm_data and mm_data.get("image"):
+            images = mm_data["image"]
+            img_type = type(mm_data["image"][0])
+            do_rescale = (img_type == Image)
+            assert all(isinstance(img, img_type) for img in mm_data["image"])
         
         # preprocess images and insert image tokens
-        img_type = type(mm_data["image"][0])
-        assert all(isinstance(img, img_type) for img in mm_data["image"])
-
         processed = self.processor(
-            text=text_prompt, images=mm_data["image"],
+            text=text_prompt, images=images,
             return_tensors="pt", device="cuda",
-            do_rescale=(img_type == Image)
+            do_rescale=do_rescale
         )
-        token_ids, pixel_values = processed["input_ids"].squeeze(), processed["pixel_values"]
-        mm_embeds = self.encoder.vision_model(pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
-        mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
-        # for fuse_input_embeds
-        token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
-        return token_ids.tolist(), {"prompt_tuning_config": [mm_embeds, None, None]}
+        if images:
+            token_ids, pixel_values = processed["input_ids"].squeeze(), processed["pixel_values"]
+            mm_embeds = self.encoder.vision_model(pixel_values.float().cuda()).last_hidden_state.flatten(0, 1)
+            mm_embeds = self.encoder.multi_modal_projector(mm_embeds)
+            # for fuse_input_embeds
+            token_ids[token_ids == self.image_token_index] = self.vocab_size + 1
+            return token_ids.tolist(), {"prompt_tuning_config": [mm_embeds, None, None]}
+        else:
+            return processed["input_ids"].squeeze().tolist(), {}
 
 
 
