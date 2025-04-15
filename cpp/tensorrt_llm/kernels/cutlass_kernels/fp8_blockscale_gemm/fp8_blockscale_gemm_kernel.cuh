@@ -992,7 +992,7 @@ __global__ void scale_1x128_kernel(
         int lane_id = threadIdx.x % 32 * 2;
 
         Input2Type input_frag2[2] = {Input2Type(0, 0), Input2Type(0, 0)};
-
+#pragma unroll
         for (int i = 0; i < 2; i++)
         {
             if (scales_idx_x * 128 + i * 64 + lane_id >= dim_x)
@@ -1005,6 +1005,7 @@ __global__ void scale_1x128_kernel(
             }
             input_line += 64;
         }
+#pragma unroll
         for (int i = 0; i < 2; i++)
         {
             if (scales_idx_x * 128 + i * 64 + lane_id >= dim_x)
@@ -1026,6 +1027,7 @@ __global__ void scale_1x128_kernel(
         }
 
         OutputType* output_line = output + (size_t) scales_idx_y * dim_x + scales_idx_x * 128;
+#pragma unroll
         for (int i = 0; i < 2; i++)
         {
             if (scales_idx_x * 128 + i * 64 + lane_id >= dim_x)
