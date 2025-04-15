@@ -9,7 +9,6 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..utils import get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
@@ -422,10 +421,8 @@ class TrtllmAttentionWrapper:
 
 @dataclass(kw_only=True)
 class FlashMlaMetadata:
-    block_ids_per_seq: torch.Tensor
-    kv_block_ids_per_seq: torch.Tensor
-    tile_scheduler_metadata: torch.Tensor
-    num_splits: torch.Tensor
+    tile_scheduler_metadata: Optional[torch.Tensor] = None
+    num_splits: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -485,7 +482,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        get_model_extra_attrs()
+        # get_model_extra_attrs()
 
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_requests, ),
@@ -523,8 +520,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=True,
             )
+
+            # TODO(lbo): Management of block ids should not be coupled with flash_mla so tightly.
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+
+            self.flash_mla_metadata = FlashMlaMetadata()
             if self.enable_flash_mla:
                 tile_scheduler_metadata_size = 8  # Note: must be aligned with TileSchedulerMetaDataSize in flash_mla.h
                 block_size_m = 64
@@ -538,33 +539,33 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 num_heads_per_head_k = predicted_tokens_per_seq * num_heads_q // num_heads_k
                 num_sm_parts = sm_count // num_heads_k // ceil_div(
                     num_heads_per_head_k, block_size_m)
-                self.flash_mla_metadata = FlashMlaMetadata(
-                    block_ids_per_seq=torch.empty(
-                        [
-                            self.kv_cache_manager.max_batch_size,
-                            self.kv_cache_manager.max_blocks_per_seq
-                        ],
-                        dtype=torch.int32,
-                        device='cuda',
-                    ),
-                    kv_block_ids_per_seq=torch.empty(
-                        [
-                            self.kv_cache_manager.max_batch_size,
-                            self.kv_cache_manager.max_blocks_per_seq
-                        ],
-                        dtype=torch.int32,
-                        device='cuda',
-                    ),
-                    tile_scheduler_metadata=torch.empty(
-                        [num_sm_parts, tile_scheduler_metadata_size],
-                        dtype=torch.int32,
-                        device='cuda',
-                    ),
-                    num_splits=torch.empty(
-                        [self.kv_cache_manager.max_batch_size + 1],
-                        dtype=torch.int32,
-                        device='cuda',
-                    ))
+
+                self.block_ids_per_seq = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.kv_block_ids_per_seq = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.flash_mla_metadata.tile_scheduler_metadata = torch.empty(
+                    [num_sm_parts, tile_scheduler_metadata_size],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.flash_mla_metadata.num_splits = torch.empty(
+                    [self.kv_cache_manager.max_batch_size + 1],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
 
     def prepare(self) -> None:
         if not self.is_dummy_attention and self.kv_cache_manager is None:
@@ -581,7 +582,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # set params that are used in wrapper.plan()
             self.kv_cache_block_offsets = None
             self.host_kv_cache_block_offsets = None
-            self.block_ids_per_seq = None
+            self.block_ids_per_seq = None  # TODO(lbo): this seems to be conflicting with block_ids_per_seq managed by flash_mla path
 
         prompt_lens = torch.tensor(
             self.prompt_lens,
@@ -800,6 +801,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             mrope_config=mrope_config,
             use_flash_mla=metadata.enable_flash_mla
             and attention_input_type == AttentionInputType.generation_only,
+            flash_mla_tile_scheduler_metadata=metadata.flash_mla_metadata.
+            tile_scheduler_metadata,
+            flash_mla_num_splits=metadata.flash_mla_metadata.num_splits,
         )
         out_dtype = None
         if out_scale is not None:
