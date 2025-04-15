@@ -186,6 +186,8 @@ struct BuildDecoderInfoParams
     float2* rotaryEmbeddingCoeffCache;
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
+    // The attention chunk size.
+    int attentionChunkSize;
 
     bool isBuildDecoderInfoKernelNeeded()
     {
@@ -264,7 +266,8 @@ struct BuildDecoderInfoParams
         ss << "rotaryEmbeddingInvFreqCache: " << rotaryEmbeddingInvFreqCache << std::endl;
         ss << "rotaryEmbeddingCoeffCache: " << rotaryEmbeddingCoeffCache << std::endl;
         ss << "rotaryEmbeddingMaxPositions: " << rotaryEmbeddingMaxPositions << std::endl;
-
+        ss << "attentionChunkSize: " << attentionChunkSize << std::endl;
+        
         return ss.str();
     }
 };

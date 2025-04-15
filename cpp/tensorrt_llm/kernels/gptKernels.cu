@@ -329,6 +329,7 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
         attentionMaskParams.maxQSeqLen = params.maxQSeqLength;
         attentionMaskParams.maxKvSeqLen = params.maxQSeqLength;
         attentionMaskParams.slidingWindowSize = params.attentionWindowSize;
+        attentionMaskParams.attentionChunkSize = params.attentionChunkSize;
         // Launch the kernel.
         invokeBuildAttentionMask(attentionMaskParams, stream);
     }

@@ -123,7 +123,8 @@ __global__ void prepareAttentionMask(AttentionMaskParams<MaskDataType> params)
     int maskQSeqLen = paddingsRemoved ? params.actualQSeqLens[batchIdx] : params.maxQSeqLen;
     // Assume that the paddings are kept in the col dimension.
     int maskKvSeqLen = params.maxKvSeqLen;
-
+    // The attention chunk size.
+    int attentionChunkSize = params.attentionChunkSize;
     // The mask offset.
     size_t maskOffset = static_cast<size_t>(qSeqOffset) * params.maxKvSeqLen;
 
@@ -142,6 +143,9 @@ __global__ void prepareAttentionMask(AttentionMaskParams<MaskDataType> params)
             if constexpr (MaskType == AttentionMaskType::CAUSAL)
             {
                 valid = row < qSeqLen && col < kvSeqLen && col <= row;
+                if (attentionChunkSize > 0) {
+                    valid = valid && ( (row/attentionChunkSize) == (col/attentionChunkSize) ); //checking at block level granularity
+                }
             }
             else if constexpr (MaskType == AttentionMaskType::SLIDING_WINDOW_CAUSAL)
             {

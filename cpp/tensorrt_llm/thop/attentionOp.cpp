@@ -75,7 +75,7 @@ public:
         torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas) const
+        torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas, torch::optional<int32_t> attention_chunk_size) const
         = 0;
 };
 
@@ -124,7 +124,7 @@ public:
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin,
-        torch::optional<torch::Tensor> mrope_position_deltas) const override
+        torch::optional<torch::Tensor> mrope_position_deltas, torch::optional<int32_t> attention_chunk_size) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -248,6 +248,7 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        common_enqueue_params.attention_chunk_size = attention_chunk_size.value_or(0);
 
         if (is_context) // context stage
         {
@@ -358,9 +359,11 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     std::optional<int64_t> attention_input_type, bool is_mla_enable, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
-    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas)
+    torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas, std::optional<int64_t> attention_chunk_size)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
+    TLLM_LOG_INFO("attention_chunk_size: %ld", attention_chunk_size.value_or(0));
+
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
         && host_kv_cache_pool_pointers.has_value() && host_kv_cache_pool_mapping.has_value();
@@ -551,7 +554,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, attention_chunk_size);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -566,7 +569,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, attention_chunk_size);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
@@ -638,6 +641,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int? v_head_dim"
         ", Tensor? mrope_rotary_cos_sin"
         ", Tensor? mrope_position_deltas"
+        ", int? attention_chunk_size"
         ") -> Tensor");
 }
 

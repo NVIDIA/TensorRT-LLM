@@ -106,6 +106,7 @@ public:
         // optional when cross attention
         int32_t const* encoder_input_lengths = nullptr;
         int64_t const* runtime_perf_knobs = nullptr;
+        int32_t attention_chunk_size = 0;
     };
 
     template <typename T>
@@ -173,6 +174,7 @@ public:
             ss << "cross_kv_length: " << this->cross_kv_length << std::endl;
             ss << "encoder_input_lengths: " << this->encoder_input_lengths << std::endl;
             ss << "num_encoder_tokens: " << this->num_encoder_tokens << std::endl;
+            ss << "attention_chunk_size: " << this->attention_chunk_size << std::endl;
             return ss.str();
         }
     };

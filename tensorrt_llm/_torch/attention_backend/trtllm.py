@@ -233,6 +233,7 @@ class TrtllmAttentionWrapper:
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        attention_chunk_size: Optional[int] = None,
     ):
         """
         Run the attention operation.
@@ -371,6 +372,7 @@ class TrtllmAttentionWrapper:
             self.v_head_dim,
             self.mrope_rotary_cos_sin,
             self.mrope_position_deltas,
+            attention_chunk_size,
         )
         return output
 
@@ -639,6 +641,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         # This is only for memory estimation for now.
@@ -733,5 +736,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   and k is None,
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
-                                  attention_mask=attention_mask)
+                                  attention_mask=attention_mask,
+                                  attention_chunk_size=attention_chunk_size)
         return output

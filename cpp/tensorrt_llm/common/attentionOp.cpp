@@ -1364,6 +1364,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // This is pre-computed when building the engines.
     decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_inv_freq;
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
+    decoder_params.attentionChunkSize = params.attention_chunk_size;
 
     invokeBuildDecoderInfo(decoder_params, stream);
     sync_check_cuda_error(stream);

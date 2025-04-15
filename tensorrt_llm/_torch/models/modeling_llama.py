@@ -42,10 +42,12 @@ class Llama4Attention(Attention):
         nope_layer: bool = False,
         attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.attention_chunk_size = attention_chunk_size
 
         self.use_rope = not nope_layer
         self.use_qk_norm = use_qk_norm and not nope_layer
@@ -111,7 +113,8 @@ class Llama4Attention(Attention):
                                         attn_metadata,
                                         out_scale=out_scale,
                                         attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+                                        mrope_config=mrope_config,
+                                        attention_chunk_size=self.attention_chunk_size)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -357,6 +360,7 @@ class Llama4DecoderLayer(DecoderLayer):
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
             aux_stream=aux_stream,
+            attention_chunk_size=getattr(config, "attention_chunk_size", None),
         )
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0
