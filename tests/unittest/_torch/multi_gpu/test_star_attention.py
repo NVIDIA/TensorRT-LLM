@@ -1,137 +1,18 @@
 import json
 import os
 
-import modelopt.torch.quantization as mtq
 import pytest
 import torch
-from modelopt.torch.export import export_hf_checkpoint
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams, logger
+from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-from tensorrt_llm.quantization.quantize_by_modelopt import get_calib_dataloader
 
 MAX_SEQ_LEN = 4096 + 1024
-
-
-def is_model_on_gpu(model) -> bool:
-    """Check if the model is fully loaded on GPUs."""
-    return all("cuda" in str(param.device) for param in model.parameters())
-
-
-def get_model(ckpt_path, device="cuda"):
-    """Load and return a model from the checkpoint path."""
-    logger.info(f"Initializing model from {ckpt_path}")
-
-    # Forcibly converting the model precision between bf16 and fp16 may introduce accuracy drop
-    model_kwargs = {"torch_dtype": "auto"}
-
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt_path,
-        device_map=device,
-        **model_kwargs,
-        trust_remote_code=True,
-    )
-    model.eval()
-
-    return model
-
-
-def get_tokenizer(ckpt_path, max_seq_len=MAX_SEQ_LEN, model_type=None):
-    """Load and return a tokenizer from the checkpoint path."""
-    logger.info(f"Initializing tokenizer from {ckpt_path}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        ckpt_path,
-        model_max_length=max_seq_len,
-        padding_side="left",
-        trust_remote_code=True,
-    )
-
-    if tokenizer.pad_token != "<unk>":
-        tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    assert tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
-
-    return tokenizer
-
-
-def calibrate_loop(model, calib_dataloader):
-    """Calibrate the model with the calibration dataloader."""
-    if calib_dataloader is None:
-        return
-
-    for idx, data in enumerate(calib_dataloader):
-        logger.debug(f"Calibrating batch {idx}")
-        data = data["input_ids"].to(model.device)
-        model(data)
-
-
-# Come from internal/examples/llm_ptq/hf_model_export.py in modelopt repo
-def quantize(model_path,
-             output_dir,
-             quant_format,
-             enable_quant_kv_cache,
-             calib_samples=512):
-    model = get_model(model_path, device="cuda")
-    tokenizer = get_tokenizer(model_path)
-
-    device = model.device if not hasattr(model, "model") else model.model.device
-
-    # Calibrate the model
-    calib_dataloader = get_calib_dataloader(
-        dataset_name_or_dir=str(llm_models_root() / "datasets/cnn_dailymail"),
-        tokenizer=tokenizer,
-        batch_size=1,
-        calib_size=calib_samples,
-        device=device,
-    )
-
-    if quant_format == "fp8":
-        quant_cfg = mtq.FP8_DEFAULT_CFG
-    elif quant_format == "fp8_pc":
-        quant_cfg = mtq.FP8_PER_CHANNEL_CFG
-    elif quant_format == "int4_awq":
-        quant_cfg = mtq.INT4_AWQ_CFG
-    elif quant_format == "nvfp4":
-        quant_cfg = mtq.NVFP4_DEFAULT_CFG
-    else:
-        raise ValueError(f"Unsupported quantization format: {quant_format}")
-
-    quant_cfg["quant_cfg"]["*output_quantizer"] = {  # type: ignore[index]
-        "num_bits": (4, 3),
-        "axis": None,
-        "enable": enable_quant_kv_cache,
-    }
-
-    model = mtq.quantize(
-        model,
-        quant_cfg,
-        forward_loop=lambda: calibrate_loop(model, calib_dataloader),
-    )
-    model.to("cpu")
-
-    # Post-process: export the quantized checkpoint with fused and packed weights, and save the quantization config
-    post_state_dict, hf_quant_config, _ = export_hf_checkpoint(
-        model,
-        dtype=model.config.torch_dtype,
-        export_dir=output_dir,
-    )
-
-    with open(f"{output_dir}/hf_quant_config.json", "w") as file:
-        json.dump(hf_quant_config, file, indent=4)
-
-    # Save the post-processed model and configs with the HF API
-    model.save_pretrained(output_dir, state_dict=post_state_dict)
-
-    # Save the tokenizer
-    tokenizer.save_pretrained(output_dir)
 
 
 @pytest.mark.parametrize("backend", ["pytorch"])
