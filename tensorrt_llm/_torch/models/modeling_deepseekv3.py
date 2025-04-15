@@ -287,14 +287,19 @@ class Deepseekv3MoE(nn.Module):
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
 
         self.shared_output_scale = None
+        # The block scale size is 128, which requires shared_expert_intermediate_size to be divisible by 128.
+        assert shared_expert_intermediate_size % 128 == 0
         if self.use_dp:
+            # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
         else:
-            assert shared_expert_intermediate_size % 128 == 0
+            # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+            # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
             shared_tp_size = math.gcd(
                 shared_expert_intermediate_size // 128,
                 model_config.mapping.tp_size,
             )
+            # If shared_tp_size has been overridden, the output of shared experts needs to be scaled down accordingly before all-reduce.
             if shared_tp_size != model_config.mapping.tp_size:
                 self.shared_output_scale = shared_tp_size / model_config.mapping.tp_size
         self.shared_experts = GatedMLP(
@@ -432,10 +437,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 aux_stream_dict=aux_stream_dict)
         else:
+            # The block scale size is 128, which requires intermediate_size to be divisible by 128.
+            assert config.intermediate_size % 128 == 0
             if self.enable_attention_dp:
+                # If using attention DP, the MLP also uses DP instead of TP.
                 self.mlp_tp_size = 1
             else:
-                assert config.intermediate_size % 128 == 0
+                # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+                # To avoid the costly inter-node all-reduce, we further restrict TP size to be divisible by gpus_per_node.
+                # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
                 self.mlp_tp_size = math.gcd(
                     math.gcd(
                         config.intermediate_size // 128,
