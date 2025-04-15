@@ -84,16 +84,16 @@ public:
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
         : TrtGptModelOptionalParams(KvCacheConfig(executorConfig.getKvCacheConfig()), false,
-              executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
-              executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
-              PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
-              executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
-              executorConfig.getUseGpuDirectStorage(), executorConfig.getGpuWeightsPercent(),
-              executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(), executorConfig.getMaxNumTokens(),
-              executorConfig.getSchedulerConfig(), executorConfig.getExtendedRuntimePerfKnobConfig(),
-              executorConfig.getDebugConfig(), executorConfig.getMaxSeqIdleMicroseconds(),
-              executorConfig.getSpecDecConfig(), executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode,
-              executorConfig.getAdditionalModelOutputs(), executorConfig.getGatherGenerationLogits())
+            executorConfig.getParallelConfig().value_or(executor::ParallelConfig()).getDeviceIds(),
+            executorConfig.getNormalizeLogProbs(), executorConfig.getEnableChunkedContext(),
+            PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
+            executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
+            executorConfig.getUseGpuDirectStorage(), executorConfig.getGpuWeightsPercent(),
+            executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(), executorConfig.getMaxNumTokens(),
+            executorConfig.getSchedulerConfig(), executorConfig.getExtendedRuntimePerfKnobConfig(),
+            executorConfig.getDebugConfig(), executorConfig.getMaxSeqIdleMicroseconds(),
+            executorConfig.getSpecDecConfig(), executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode,
+            executorConfig.getAdditionalModelOutputs(), executorConfig.getGatherGenerationLogits())
     {
     }
 

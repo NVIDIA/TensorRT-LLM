@@ -430,7 +430,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 25)
+        if (cpp_states.size() != 26)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
