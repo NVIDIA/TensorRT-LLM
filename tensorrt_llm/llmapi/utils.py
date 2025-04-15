@@ -34,6 +34,7 @@ def print_traceback_on_error(func):
         try:
             return func(*args, **kwargs)
         except Exception as e:
+            print_colored_debug(f"Exception in {func.__name__}: {e}\n", "red")
             traceback.print_exc()
             raise e
 

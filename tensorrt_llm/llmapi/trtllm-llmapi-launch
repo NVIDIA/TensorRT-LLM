@@ -24,8 +24,16 @@ function mpi_world_size {
 }
 
 function export_free_tcp_addr {
-    # find free port with python -c, the port should start from 10000
-    local free_port=$(python -c 'import socket; s=socket.socket(); s.bind(("", 10000)); print(s.getsockname()[1]); s.close()')
+    # find free port starting from 10012
+    local free_port=$(python -c 'import socket; s=socket.socket();
+port = 10012
+while True:
+    try:
+        s.bind(("", port))
+        break
+    except OSError:
+        port += 1
+print(port); s.close()')
     export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:${free_port}"
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
 }
