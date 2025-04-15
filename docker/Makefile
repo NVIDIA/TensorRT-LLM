@@ -122,10 +122,6 @@ else
 NVRTC_WRAPPER_MOUNT :=
 endif
 
-ifeq ($(LOCAL_USER),1)
-	$(call add_local_user,$(IMAGE_WITH_TAG))
-endif
-
 %_run:
 ifeq ($(DOCKER_PULL),1)
 	@$(MAKE) --no-print-directory $*_pull
