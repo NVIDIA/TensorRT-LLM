@@ -1838,12 +1838,11 @@ class PyExecutor:
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
             sample_state = self._sample_async(draft_batch, outputs)
+            previous_batch = sample_state
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(sample_state)
-
-            def _process_decoded_tokens():
+            def _process_decoded_tokens(draft_batch):
                 new_requests = []
                 for req in chain(draft_batch.context_requests,
                                  draft_batch.generation_requests):
@@ -1867,12 +1866,7 @@ class PyExecutor:
                     req.py_draft_tokens.extend(
                         0 for _ in range(max_draft_tokens - num_draft_tokens))
 
-            new_requests = _process_decoded_tokens()
-            if not new_requests:
-                _pad_to_max_draft_tokens()
-                return
-
-            draft_batch.generation_requests = new_requests
+            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
             for _ in range(spec_metadata.max_draft_tokens - 1):
@@ -1884,6 +1878,7 @@ class PyExecutor:
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
                     self.resource_manager,
+                    new_tensors_device=previous_batch.device,
                     extra_model_inputs=extra_model_inputs)
 
                 if spec_metadata.spec_dec_mode.is_eagle3() and hasattr(
@@ -1892,12 +1887,13 @@ class PyExecutor:
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(sample_state)
-
-                new_requests = _process_decoded_tokens()
+                self._update_requests(previous_batch)
+                new_requests = _process_decoded_tokens(
+                    previous_batch.scheduled_requests)
                 if not new_requests:
                     break
                 draft_batch.generation_requests = new_requests
+                previous_batch = sample_state
 
             _pad_to_max_draft_tokens()
 
