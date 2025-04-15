@@ -28,11 +28,11 @@ jobs:
   Bot-command-check:
     name: Bot command check
     if: |
-      startsWith(github.event.comment.body, '/bot') &&
-      !(startsWith(github.event.comment.body, '/bot run') ||
-      startsWith(github.event.comment.body, '/bot skip --comment') ||
-      startsWith(github.event.comment.body, '/bot reuse-pipeline') ||
-      startsWith(github.event.comment.body, '/bot kill'))
+      startsWith(github.event.comment.body.trim(), '/bot') &&
+      !(startsWith(github.event.comment.body.trim(), '/bot run') ||
+      startsWith(github.event.comment.body.trim(), '/bot skip --comment') ||
+      startsWith(github.event.comment.body.trim(), '/bot reuse-pipeline') ||
+      startsWith(github.event.comment.body.trim(), '/bot kill'))
     runs-on: ubuntu-latest
     steps:
       - name: Add bot help comment
