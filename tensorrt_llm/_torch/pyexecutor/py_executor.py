@@ -184,6 +184,10 @@ class PyExecutor:
         self.dist = dist
         self.enable_overlap_scheduler = enable_overlap_scheduler
 
+        logger.info(
+            f"PyExecutor init: device_id={self.device_id}, global_rank={self.global_rank}, local_rank={self.dist.rank}"
+        )
+
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
 
