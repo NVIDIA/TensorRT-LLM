@@ -1498,9 +1498,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           maxNumSequences, std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec,
           tempAttentionWindowInputs, dtype, mSinkBubbleLength, onboardBlocks, cacheType, secondaryOffloadMinPriority,
           std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
-    , mEnableBlockReuse(enableBlockReuse)
-    , mEnableHashKey(enableHashKey)
-
+    // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
+    , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
+    , mEnableHashKey{enableHashKey}
 {
     TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
         != maxAttentionWindowVec.end());
