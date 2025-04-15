@@ -1,4 +1,5 @@
 import copy
+from typing import Optional
 
 import tensorrt_llm
 from tensorrt_llm._utils import get_sm_version
@@ -24,7 +25,7 @@ from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None,
-                       lora_config: LoraConfig = None):
+                       lora_config: Optional[LoraConfig] = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
