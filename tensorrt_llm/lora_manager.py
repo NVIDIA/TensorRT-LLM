@@ -287,6 +287,33 @@ def get_default_trtllm_modules_to_hf_modules():
     }
 
 
+def load_torch_hf_lora(lora_config: LoraConfig):
+    """
+    This is a shortned version of load_hf_lora that is used for torch models.
+    Main problem is model.config in legacy code is custom (defined in the legacy code) whereas
+    pivot model config is the transformer's one.
+    """
+    # TODO smor- need to comibe with load_hf_lora
+    lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules(
+    )
+
+    lora_loader = HfLoraLoader(lora_config.lora_dir)
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            lora_config.trtllm_modules_to_hf_modules)
+
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. "
+            "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
+        )
+
+    missing_qkv_modules = LoraManager.get_missing_qkv_modules(
+        lora_config.lora_target_modules)
+    lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
 def load_hf_lora(
     model,
     lora_config: LoraConfig,

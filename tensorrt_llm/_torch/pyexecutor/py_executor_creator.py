@@ -4,21 +4,23 @@ import tensorrt_llm
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..distributed import MPIDist
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
 from .config import PyTorchConfig
-from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
-                       engine_dir: str = None):
+                       engine_dir: str = None,
+                       lora_config: LoraConfig = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -154,7 +156,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False)
+                                              False, lora_config)
 
     if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
@@ -185,7 +187,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, kv_cache_manager, draft_kv_cache_manager, mapping,
                 pytorch_backend_config, executor_config, ctx_chunk_config,
-                model_engine, draft_model_engine, True)
+                model_engine, draft_model_engine, True, lora_config)
 
     py_executor.start_worker()
     return py_executor

@@ -35,7 +35,6 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
 #include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
-#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
@@ -64,7 +63,6 @@
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
-#include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/sessionUtils.h"
 
@@ -80,7 +78,6 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
-namespace tru = tensorrt_llm::runtime::utils;
 namespace texe = tensorrt_llm::executor;
 
 namespace tensorrt_llm::batch_manager
@@ -1805,9 +1802,6 @@ void TrtGptModelInflightBatching::getDecoderSlotHostOutputs(
         auto cumLogProbs = mDecoder->getDecoderState().getCumLogProbs(seqSlot);
         auto logProbs = mDecoder->getDecoderState().getLogProbs(seqSlot);
 
-        runtime::CudaEvent beforeEvent{};
-        mRuntime->getStreamPtr()->record(beforeEvent);
-        mCopyBufferManager.getStream().wait(beforeEvent);
         mCopyBufferManager.copy(*sequenceLengthView, *mSlotDecoderBuffers[seqSlot]->sequenceLengths);
         mCopyBufferManager.copy(*outputIds, *mSlotDecoderBuffers[seqSlot]->outputIds);
         if (returnLogProbs)
@@ -1987,9 +1981,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::updateDecoderBuffers(
     // Chain copy after decoder event, using a different stream
     mCopyBufferManager.getStream().wait(decoderFinishEvent);
 
-    mDecoderBuffers->newOutputTokens = mDecoder->getDecoderState().getAllNewTokens();
-
-    mCopyBufferManager.copy(*mDecoderBuffers->newOutputTokens, *mDecoderBuffers->newOutputTokensHost);
+    mCopyBufferManager.copy(*mDecoder->getDecoderState().getAllNewTokens(), *mDecoderBuffers->newOutputTokensHost);
     mCopyBufferManager.copy(
         *mDecoder->getDecoderState().getJointDecodingOutput().lengths, *mDecoderBuffers->sequenceLengthsHost);
 

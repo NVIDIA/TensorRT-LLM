@@ -240,6 +240,7 @@ class FusedMoE(nn.Module):
         aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        apply_router_weight_on_input: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -301,6 +302,9 @@ class FusedMoE(nn.Module):
         self._weights_created = False
         if not model_config.skip_create_weights:
             self.create_weights()
+
+        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -558,6 +562,12 @@ class FusedMoE(nn.Module):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            token_final_scales = None
+
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq:
@@ -736,10 +746,10 @@ class FusedMoE(nn.Module):
                 w3_weight = weights[f"{expert_id}.w3.weight"]
                 w2_weight = weights[f"{expert_id}.w2.weight"]
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_idx].transpose(
+                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_idx].transpose(0, 1)
+                w2_weight = weights["down_proj"][expert_id].transpose(0, 1)
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"

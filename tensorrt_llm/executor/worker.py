@@ -757,7 +757,7 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.result.is_final:
+            if response.has_error() or response.result.is_final:
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
