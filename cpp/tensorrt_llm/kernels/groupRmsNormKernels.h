@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -23,9 +24,25 @@
 namespace tensorrt_llm::kernels::group_rms_norm
 {
 
-template <typename DType>
-void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32_t const* input_dims,
-    uint32_t const* input_strides, uint32_t const* output_strides, const uint32_t batch_size, const uint32_t num_inputs,
-    float const eps, float const weight_bias, bool enable_weights, cudaStream_t stream);
+template </*number of inputs*/ int n>
+struct GroupRMSParams
+{
+    float4 const* inputs[n];
+    float4 const* weights[n];
+    float4* outputs[n];
+    int input_dims[n];
+    int input_strides[n];
+    int output_strides[n];
+    int batch_size;
+    int num_inputs;
+    float eps;
+    float weight_bias;
+    bool enable_weights;
+    nvinfer1::DataType dtype;
+    cudaStream_t stream;
+};
+
+template <int n>
+void GroupRMSNormKernelLauncher(GroupRMSParams<n> params);
 
 } // namespace tensorrt_llm::kernels::group_rms_norm

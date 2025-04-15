@@ -31,33 +31,6 @@
 namespace torch_ext
 {
 
-template <typename DType>
-void groupRMSNormImpl(torch::TensorList const& inputs, torch::TensorList const& weights,
-    std::vector<torch::Tensor>& outputs, std::vector<uint32_t> input_dims, std::vector<uint32_t> input_strides,
-    std::vector<uint32_t> output_strides, uint32_t batch_size, uint32_t num_inputs, double eps, double weight_bias,
-    bool enable_weights, cudaStream_t stream)
-{
-    // Prepare pointer arrays on host
-    std::vector<DType*> inputs_ptr(num_inputs);
-    std::vector<DType*> weights_ptr(num_inputs, nullptr); // Initialize with nullptr
-    std::vector<DType*> outputs_ptr(num_inputs);
-
-    for (uint32_t i = 0; i < num_inputs; ++i)
-    {
-        inputs_ptr[i] = reinterpret_cast<DType*>(inputs[i].data_ptr());
-        if (enable_weights)
-        {
-            weights_ptr[i] = reinterpret_cast<DType*>(weights[i].data_ptr());
-        }
-        outputs_ptr[i] = reinterpret_cast<DType*>(outputs[i].mutable_data_ptr());
-    }
-
-    // Pass raw pointers to vectors
-    tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel(inputs_ptr.data(), weights_ptr.data(), outputs_ptr.data(),
-        input_dims.data(), input_strides.data(), output_strides.data(), batch_size, num_inputs, static_cast<float>(eps),
-        static_cast<float>(weight_bias), enable_weights, stream);
-}
-
 std::vector<torch::Tensor> groupRMSNorm(torch::TensorList const& inputs, torch::TensorList const& weights, double eps,
     double weight_bias, bool enable_weights)
 {
@@ -66,7 +39,11 @@ std::vector<torch::Tensor> groupRMSNorm(torch::TensorList const& inputs, torch::
     auto const dtype = first_input.scalar_type();
     auto const device = first_input.device();
     uint32_t const num_inputs = inputs.size();
+    TORCH_CHECK(num_inputs <= 8, "Only up to 8 inputs are supported.");
     uint32_t const batch_size = first_input.sizes()[0];
+
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(num_inputs);
 
     TORCH_CHECK(first_input.dim() == 2, "Inputs must be 2D tensors [batch_size, hidden_dim].");
     TORCH_CHECK(first_input.is_cuda(), "Inputs must be CUDA tensors.");
@@ -76,56 +53,66 @@ std::vector<torch::Tensor> groupRMSNorm(torch::TensorList const& inputs, torch::
         TORCH_CHECK(weights.size() == num_inputs, "Weights list size must match inputs list size.");
     }
 
-    std::vector<torch::Tensor> outputs;
-    std::vector<uint32_t> input_dims(num_inputs);
-    std::vector<uint32_t> input_strides(num_inputs);
-    std::vector<uint32_t> output_strides(num_inputs);
-    outputs.reserve(num_inputs);
-
     for (size_t i = 0; i < num_inputs; ++i)
     {
-        auto const& current_input = inputs[i];
-        TORCH_CHECK(current_input.dim() == 2, "All inputs must be 2D tensors.");
-        TORCH_CHECK(current_input.sizes()[0] == batch_size, "All inputs must have the same batch size.");
-        TORCH_CHECK(current_input.scalar_type() == dtype, "All inputs must have the same data type.");
-        TORCH_CHECK(current_input.device() == device, "All inputs must be on the same CUDA device.");
-
-        input_dims[i] = current_input.sizes()[1];
-        input_strides[i] = current_input.strides()[0];
-        output_strides[i] = current_input.strides()[0];
-
-        if (enable_weights)
-        {
-            auto const& current_weight = weights[i];
-            TORCH_CHECK(current_weight.dim() == 1, "Weights must be 1D tensors.");
-            TORCH_CHECK(
-                current_weight.sizes()[0] == current_input.sizes()[1], "Weight dimension must match input dimension.");
-            TORCH_CHECK(current_weight.scalar_type() == dtype, "Weights must have the same data type as inputs.");
-            TORCH_CHECK(current_weight.device() == device, "Weights must be on the same CUDA device as inputs.");
-        }
-        outputs.push_back(torch::empty_like(current_input));
-        TORCH_CHECK(outputs[i].device() == device, "Outputs must be on the same CUDA device as inputs.");
+        TORCH_CHECK(inputs[i].sizes()[0] == batch_size, "Inputs must have the same batch size.");
+        TORCH_CHECK(inputs[i].dim() == 2, "Inputs must be 2D tensors [batch_size, hidden_dim].");
+        TORCH_CHECK(inputs[i].device() == device, "Inputs must be on the same device.");
+        TORCH_CHECK(inputs[i].scalar_type() == dtype, "Inputs must be of the same type.");
+        TORCH_CHECK(
+            inputs[i].sizes()[1] == weights[i].sizes()[0], "Inputs and weights must have the same last dimension.");
+        outputs.push_back(torch::empty_like(inputs[i]));
     }
 
-    auto stream = at::cuda::getCurrentCUDAStream(inputs[0].get_device());
-    switch (dtype)
+#define DISPATCH_INPUT_SIZES(n)                                                                                        \
+    case n:                                                                                                            \
+    {                                                                                                                  \
+        tensorrt_llm::kernels::group_rms_norm::GroupRMSParams<n> params;                                               \
+        for (size_t i = 0; i < n; ++i)                                                                                 \
+        {                                                                                                              \
+            params.inputs[i] = reinterpret_cast<float4 const*>(inputs[i].data_ptr());                                  \
+            params.input_dims[i] = inputs[i].sizes()[1];                                                               \
+            params.input_strides[i] = inputs[i].strides()[0];                                                          \
+            params.output_strides[i] = inputs[i].strides()[0];                                                         \
+            if (enable_weights)                                                                                        \
+            {                                                                                                          \
+                params.weights[i] = reinterpret_cast<float4 const*>(weights[i].data_ptr());                            \
+            }                                                                                                          \
+            params.outputs[i] = reinterpret_cast<float4*>(outputs[i].mutable_data_ptr());                              \
+        }                                                                                                              \
+        /* Set remaining params */                                                                                     \
+        params.batch_size = batch_size;                                                                                \
+        params.num_inputs = n;                                                                                         \
+        params.eps = static_cast<float>(eps);                                                                          \
+        params.weight_bias = static_cast<float>(weight_bias);                                                          \
+        params.enable_weights = enable_weights;                                                                        \
+        params.stream = at::cuda::getCurrentCUDAStream(inputs[0].get_device());                                        \
+        /* Handle dtype conversion */                                                                                  \
+        switch (dtype)                                                                                                 \
+        {                                                                                                              \
+        case torch::ScalarType::Half: params.dtype = nvinfer1::DataType::kHALF; break;                                 \
+        case torch::ScalarType::BFloat16: params.dtype = nvinfer1::DataType::kBF16; break;                             \
+        case torch::ScalarType::Float: params.dtype = nvinfer1::DataType::kFLOAT; break;                               \
+        default: TORCH_CHECK(false, "Unsupported data type");                                                          \
+        }                                                                                                              \
+        tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernelLauncher<n>(params);                                  \
+        break;                                                                                                         \
+    }
+
+    switch (num_inputs)
     {
-    case torch::ScalarType::Half:
-        groupRMSNormImpl<half>(inputs, weights, outputs, input_dims, input_strides, output_strides, batch_size,
-            num_inputs, eps, weight_bias, enable_weights, stream);
-        break;
-#ifdef ENABLE_BF16
-    case torch::ScalarType::BFloat16:
-        groupRMSNormImpl<__nv_bfloat16>(inputs, weights, outputs, input_dims, input_strides, output_strides, batch_size,
-            num_inputs, eps, weight_bias, enable_weights, stream);
-        break;
-#endif
-    case torch::ScalarType::Float:
-        groupRMSNormImpl<float>(inputs, weights, outputs, input_dims, input_strides, output_strides, batch_size,
-            num_inputs, eps, weight_bias, enable_weights, stream);
-        break;
-    default: TORCH_CHECK(false, "Unsupported data type for GroupRMSNorm");
+        DISPATCH_INPUT_SIZES(1)
+        DISPATCH_INPUT_SIZES(2)
+        DISPATCH_INPUT_SIZES(3)
+        DISPATCH_INPUT_SIZES(4)
+        DISPATCH_INPUT_SIZES(5)
+        DISPATCH_INPUT_SIZES(6)
+        DISPATCH_INPUT_SIZES(7)
+        DISPATCH_INPUT_SIZES(8)
+    default: TORCH_CHECK(false, "Unsupported number of inputs (max 8)");
     }
+#undef DISPATCH_INPUT_SIZES
+
     return outputs;
 }
 

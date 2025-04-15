@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
-
 import pytest
 import torch
 
@@ -94,13 +92,15 @@ def test_group_rms_norm(batch_size, hidden_dims, eps, dtype, enable_weights):
     ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=["fp16", "bf16"])
+@pytest.mark.parametrize("enable_weights", [False, True],
+                         ids=lambda x: f"enable_weights:{x}")
 def test_group_rms_norm_benchmark(batch_size,
                                   hidden_dims,
                                   dtype,
+                                  enable_weights,
                                   eps=1e-5,
-                                  enable_weights=False,
                                   warmup_runs=10,
-                                  timing_runs=50):
+                                  timing_runs=100):
     """Benchmark group_rms_norm against individual RMSNorm modules."""
     assert torch.cuda.is_available(), "This test requires CUDA"
     device = "cuda"
@@ -109,6 +109,9 @@ def test_group_rms_norm_benchmark(batch_size,
     inputs = [
         torch.randn((batch_size, dim), dtype=dtype, device=device)
         for dim in hidden_dims
+    ]
+    weights = [
+        torch.ones((dim), dtype=dtype, device=device) for dim in hidden_dims
     ]
 
     ref_norms = [
@@ -121,30 +124,62 @@ def test_group_rms_norm_benchmark(batch_size,
                                device=device,
                                enable_weights=enable_weights)
 
-    # Benchmark RMSNorm as reference
+    # Create streams for reference computations
+    streams = [torch.cuda.Stream() for _ in ref_norms]
+
+    # Benchmark RMSNorm as reference with streams
     # Warmup
     for _ in range(warmup_runs):
-        ref_outputs = [norm(inputs[i]) for i, norm in enumerate(ref_norms)]
+        ref_outputs = []
+        for i, norm in enumerate(ref_norms):
+            with torch.cuda.stream(streams[i]):
+                ref_outputs.append(norm(inputs[i]))
 
     # Timing
-    start_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.synchronize()
+    start_event.record()
     for _ in range(timing_runs):
-        ref_outputs = [norm(inputs[i]) for i, norm in enumerate(ref_norms)]
-    end_time = time.time()
-    ref_time = end_time - start_time
-    print(f"RMSNorm time: {ref_time / timing_runs * 1000} ms")
+        ref_outputs = []
+        for i, norm in enumerate(ref_norms):
+            with torch.cuda.stream(streams[i]):
+                ref_outputs.append(norm(inputs[i]))
+    end_event.record()
+    torch.cuda.synchronize()
+
+    ref_time = start_event.elapsed_time(end_event) / timing_runs
+    print(f"RMSNorm time: {ref_time} ms")
 
     # Benchmark GroupRMSNorm
     # Warmup
     for _ in range(warmup_runs):
-        group_outputs = group_norms(inputs)
+        if enable_weights:
+            group_outputs = group_norms(inputs, weights)
+        else:
+            group_outputs = group_norms(inputs)
+
     # Timing
-    start_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.synchronize()
+    start_event.record()
     for _ in range(timing_runs):
-        group_outputs = group_norms(inputs)
-    end_time = time.time()
-    group_time = end_time - start_time
-    print(f"GroupRMSNorm time: {group_time / timing_runs * 1000} ms")
+        if enable_weights:
+            group_outputs = group_norms(inputs, weights)
+        else:
+            group_outputs = group_norms(inputs)
+    end_event.record()
+    torch.cuda.synchronize()
+    group_time = start_event.elapsed_time(end_event) / timing_runs
+    print(
+        f"Batch size: {batch_size}, hidden dims: {hidden_dims}, dtype: {dtype}, enable_weights: {enable_weights}"
+    )
+    print(
+        f"RMSNorm time: {ref_time} ms, GroupRMSNorm time: {group_time} ms, speed up: {ref_time / group_time}"
+    )
 
     for i, (group_out, ref_out) in enumerate(zip(group_outputs, ref_outputs)):
         print(f"Checking output{i}")

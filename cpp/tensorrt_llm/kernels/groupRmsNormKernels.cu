@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <numeric>
+#include <nvtx3/nvToolsExt.h>
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -30,56 +31,23 @@ using tensorrt_llm::common::deviceFree;
 namespace tensorrt_llm::kernels::group_rms_norm
 {
 
-// binary search over warp_prefix_sum to find which array this warp belongs to
-__device__ __forceinline__ uint32_t find_input_idx_for_warp(
-    uint32_t const* __restrict__ warp_prefix_sum, const uint32_t warp_idx, const uint32_t num_inputs)
+template <typename DType, typename PackedType, int n>
+__global__ void GroupRMSNormKernelWithWeights(GroupRMSParams<n> params, int rounds)
 {
-    uint32_t lo = 0, hi = num_inputs;
-    while (lo < hi)
-    {
-        uint32_t mid = (lo + hi) / 2;
-        if (warp_prefix_sum[mid + 1] <= warp_idx)
-        {
-            lo = mid + 1;
-        }
-        else
-        {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-template <typename DType, typename PackedType>
-__global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, PackedType** __restrict__ outputs,
-    PackedType** __restrict__ weights, uint32_t const* __restrict__ input_dims,
-    uint32_t const* __restrict__ input_strides, uint32_t const* __restrict__ output_strides,
-    // Starting warp idx for each input
-    uint32_t const* __restrict__ warp_prefix_sum, const uint32_t __restrict__ rounds,
-    const uint32_t __restrict__ num_inputs, float const eps, float const weight_bias)
-{
-    const uint32_t bx = blockIdx.x; // Maps to batch size
+    const uint32_t batch_idx = blockIdx.x; // Maps to batch size
+    const uint32_t input_idx = blockIdx.y; // Maps to input index
     constexpr uint32_t warp_size = 32;
     const uint32_t warp_idx = threadIdx.y;
     const uint32_t lane_idx = threadIdx.x;
 
     static constexpr int kPackedSize = sizeof(PackedType) / sizeof(DType);
-    float warp_acc = 0.0f;
-
-    // Helper variables for block reduction of all inputs.
-    // smem_input_mask[warp_idx] is the input index which the warp is processing.
-    __shared__ uint32_t smem_input_mask[32];
-    // smem_warp_sum_sqs[warp_idx] is the warp-level sum of squares of the corresponding input to the warp.
-    __shared__ float smem_warp_sum_sqs[32];
+    float acc = 0.0f;
 
     // smem_rsqrts[input_idx] is the rsqrt of the sum of squares of the input.
     __shared__ float smem_rsqrts[32];
-#pragma unroll
-    for (int i = 0; i < 32; ++i)
+    if (warp_idx == 0)
     {
-        smem_input_mask[i] = 0;
-        smem_warp_sum_sqs[i] = 0.0f;
-        smem_rsqrts[i] = 0.0f;
+        smem_rsqrts[lane_idx] = 0.0f;
     }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -88,14 +56,12 @@ __global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, 
 
     // Phase 1: Calculate the warp-level sum of squares of the corresponding input to the warp.
     // Find which input this warp operates on
-    const uint32_t input_idx = find_input_idx_for_warp(warp_prefix_sum, warp_idx, num_inputs);
-    const uint32_t warp_start = warp_prefix_sum[input_idx];
-    const uint32_t local_warp_idx = warp_idx - warp_start;
-    PackedType const* input_ptr = inputs[input_idx];
-    PackedType* output_ptr = outputs[input_idx];
+    PackedType const* input_ptr = params.inputs[input_idx];
+    PackedType const* weight_ptr = params.weights[input_idx];
+    PackedType* output_ptr = params.outputs[input_idx];
 
     // Offset for the next batch
-    uint32_t block_offset = bx * input_strides[input_idx];
+    uint32_t block_offset = batch_idx * params.input_strides[input_idx];
     // Offset for the next round
     uint32_t round_offset = warp_size * kPackedSize;
     // Offset for the next warp
@@ -104,8 +70,8 @@ __global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, 
     // Calculate sum of squares for each thread
     for (uint32_t i = 0; i < rounds; i++)
     {
-        uint32_t idx = block_offset + local_warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
-        if (idx < input_dims[input_idx] + block_offset)
+        uint32_t idx = block_offset + warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
+        if (idx < params.input_dims[input_idx] + block_offset)
         {
             // Vectorized load of the input data, 128b at once
             PackedType packed_data = input_ptr[idx / kPackedSize];
@@ -115,41 +81,32 @@ __global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, 
             for (uint32_t j = 0; j < kPackedSize; j++)
             {
                 float v = static_cast<float>(packed_input_ptr[j]);
-                warp_acc += v * v;
+                acc += v * v;
             }
         }
     }
     // For each warp, store the input index and the warp-level sum of squares for corresponding input to
-    smem_input_mask[warp_idx] = input_idx;
-    smem_warp_sum_sqs[warp_idx] = tensorrt_llm::common::warpReduceSum(warp_acc);
-
+    smem_rsqrts[warp_idx] = tensorrt_llm::common::warpReduceSum(acc);
     __syncthreads();
-
-    // Phase 2: Cross wrap reduction on all inputs and calculate the normalization factor for each input
-    warp_acc = 0.0f;
-    if (warp_idx < num_inputs)
+    if (warp_idx == 0)
     {
-        // Each warp sums one input
-        if (warp_idx == smem_input_mask[lane_idx])
-        {
-            warp_acc = smem_warp_sum_sqs[lane_idx];
-        }
-        smem_rsqrts[warp_idx] = tensorrt_llm::common::warpReduceSum(warp_acc);
-        smem_rsqrts[warp_idx] = rsqrtf(smem_rsqrts[warp_idx] / input_dims[warp_idx] + eps);
+        smem_rsqrts[0] = tensorrt_llm::common::warpReduceSum(smem_rsqrts[lane_idx]);
     }
-
     __syncthreads();
+
+    float block_rsqrt = rsqrtf(smem_rsqrts[0] / params.input_dims[input_idx] + params.eps);
 
     // Phase 3: Apply normalization for inputs
     for (uint32_t i = 0; i < rounds; i++)
     {
-        uint32_t idx = block_offset + local_warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
-        if (idx < input_dims[input_idx] + block_offset)
+        uint32_t idx = block_offset + warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
+        if (idx < params.input_dims[input_idx] + block_offset)
         {
             // Vectorized load of the input data, 128b at once
             PackedType packed_input = input_ptr[idx / kPackedSize];
             DType* packed_input_ptr = reinterpret_cast<DType*>(&packed_input);
-            PackedType packed_weight = weights[input_idx][(idx - block_offset) / kPackedSize];
+
+            PackedType packed_weight = weight_ptr[(idx - block_offset) / kPackedSize];
             DType* packed_weight_ptr = reinterpret_cast<DType*>(&packed_weight);
 
             PackedType packed_output;
@@ -157,8 +114,8 @@ __global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, 
 #pragma unroll
             for (uint32_t j = 0; j < kPackedSize; j++)
             {
-                packed_output_ptr[j] = static_cast<DType>(static_cast<float>(packed_input_ptr[j])
-                    * smem_rsqrts[input_idx] * (static_cast<float>(packed_weight_ptr[j]) + weight_bias));
+                packed_output_ptr[j] = static_cast<DType>(static_cast<float>(packed_input_ptr[j]) * block_rsqrt
+                    * (static_cast<float>(packed_weight_ptr[j]) + params.weight_bias));
             }
             // Vectorized store of the output data, 128b at once
             output_ptr[idx / kPackedSize] = packed_output;
@@ -170,36 +127,23 @@ __global__ void GroupRMSNormKernelWithWeights(PackedType** __restrict__ inputs, 
 #endif
 }
 
-template <typename DType, typename PackedType>
-__global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ inputs, PackedType** __restrict__ outputs,
-    uint32_t const* __restrict__ input_dims, uint32_t const* __restrict__ input_strides,
-    uint32_t const* __restrict__ output_strides,
-    // Starting warp idx for each input
-    uint32_t const* __restrict__ warp_prefix_sum, const uint32_t __restrict__ rounds,
-    const uint32_t __restrict__ num_inputs, float const eps)
+template <typename DType, typename PackedType, int n>
+__global__ void GroupRMSNormKernelWithoutWeights(GroupRMSParams<n> params, int rounds)
 {
-    const uint32_t bx = blockIdx.x; // Maps to batch size
+    const uint32_t batch_idx = blockIdx.x; // Maps to batch size
+    const uint32_t input_idx = blockIdx.y; // Maps to input index
     constexpr uint32_t warp_size = 32;
     const uint32_t warp_idx = threadIdx.y;
     const uint32_t lane_idx = threadIdx.x;
 
     static constexpr int kPackedSize = sizeof(PackedType) / sizeof(DType);
-    float warp_acc = 0.0f;
-
-    // Helper variables for block reduction of all inputs.
-    // smem_input_mask[warp_idx] is the input index which the warp is processing.
-    __shared__ uint32_t smem_input_mask[32];
-    // smem_warp_sum_sqs[warp_idx] is the warp-level sum of squares of the corresponding input to the warp.
-    __shared__ float smem_warp_sum_sqs[32];
+    float acc = 0.0f;
 
     // smem_rsqrts[input_idx] is the rsqrt of the sum of squares of the input.
     __shared__ float smem_rsqrts[32];
-#pragma unroll
-    for (int i = 0; i < 32; ++i)
+    if (warp_idx == 0)
     {
-        smem_input_mask[i] = 0;
-        smem_warp_sum_sqs[i] = 0.0f;
-        smem_rsqrts[i] = 0.0f;
+        smem_rsqrts[lane_idx] = 0.0f;
     }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -208,14 +152,11 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
 
     // Phase 1: Calculate the warp-level sum of squares of the corresponding input to the warp.
     // Find which input this warp operates on
-    const uint32_t input_idx = find_input_idx_for_warp(warp_prefix_sum, warp_idx, num_inputs);
-    const uint32_t warp_start = warp_prefix_sum[input_idx];
-    const uint32_t local_warp_idx = warp_idx - warp_start;
-    PackedType const* input_ptr = inputs[input_idx];
-    PackedType* output_ptr = outputs[input_idx];
+    PackedType const* input_ptr = params.inputs[input_idx];
+    PackedType* output_ptr = params.outputs[input_idx];
 
     // Offset for the next batch
-    uint32_t block_offset = bx * input_strides[input_idx];
+    uint32_t block_offset = batch_idx * params.input_strides[input_idx];
     // Offset for the next round
     uint32_t round_offset = warp_size * kPackedSize;
     // Offset for the next warp
@@ -224,8 +165,8 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
     // Calculate sum of squares for each thread
     for (uint32_t i = 0; i < rounds; i++)
     {
-        uint32_t idx = block_offset + local_warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
-        if (idx < input_dims[input_idx] + block_offset)
+        uint32_t idx = block_offset + warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
+        if (idx < params.input_dims[input_idx] + block_offset)
         {
             // Vectorized load of the input data, 128b at once
             PackedType packed_data = input_ptr[idx / kPackedSize];
@@ -235,36 +176,25 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
             for (uint32_t j = 0; j < kPackedSize; j++)
             {
                 float v = static_cast<float>(packed_input_ptr[j]);
-                warp_acc += v * v;
+                acc += v * v;
             }
         }
     }
     // For each warp, store the input index and the warp-level sum of squares for corresponding input to
-    smem_input_mask[warp_idx] = input_idx;
-    smem_warp_sum_sqs[warp_idx] = tensorrt_llm::common::warpReduceSum(warp_acc);
-
+    smem_rsqrts[warp_idx] = tensorrt_llm::common::warpReduceSum(acc);
     __syncthreads();
-
-    // Phase 2: Cross wrap reduction on all inputs and calculate the normalization factor for each input
-    warp_acc = 0.0f;
-    if (warp_idx < num_inputs)
+    if (warp_idx == 0)
     {
-        // Each warp sums one input
-        if (warp_idx == smem_input_mask[lane_idx])
-        {
-            warp_acc = smem_warp_sum_sqs[lane_idx];
-        }
-        smem_rsqrts[warp_idx] = tensorrt_llm::common::warpReduceSum(warp_acc);
-        smem_rsqrts[warp_idx] = rsqrtf(smem_rsqrts[warp_idx] / input_dims[warp_idx] + eps);
+        smem_rsqrts[0] = tensorrt_llm::common::warpReduceSum(smem_rsqrts[lane_idx]);
     }
-
     __syncthreads();
+    float block_rsqrt = rsqrtf(smem_rsqrts[0] / params.input_dims[input_idx] + params.eps);
 
     // Phase 3: Apply normalization for inputs
     for (uint32_t i = 0; i < rounds; i++)
     {
-        uint32_t idx = block_offset + local_warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
-        if (idx < input_dims[input_idx] + block_offset)
+        uint32_t idx = block_offset + warp_idx * warp_offset + i * round_offset + lane_idx * kPackedSize;
+        if (idx < params.input_dims[input_idx] + block_offset)
         {
             // Vectorized load of the input data, 128b at once
             PackedType packed_input = input_ptr[idx / kPackedSize];
@@ -275,8 +205,7 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
 #pragma unroll
             for (uint32_t j = 0; j < kPackedSize; j++)
             {
-                packed_output_ptr[j]
-                    = static_cast<DType>(static_cast<float>(packed_input_ptr[j]) * smem_rsqrts[input_idx]);
+                packed_output_ptr[j] = static_cast<DType>(static_cast<float>(packed_input_ptr[j]) * block_rsqrt);
             }
             // Vectorized store of the output data, 128b at once
             output_ptr[idx / kPackedSize] = packed_output;
@@ -288,144 +217,81 @@ __global__ void GroupRMSNormKernelWithoutWeights(PackedType** __restrict__ input
 #endif
 }
 
-template <typename DType>
-void GroupRMSNormKernel(DType** inputs, DType** weights, DType** outputs, uint32_t const* input_dims,
-    uint32_t const* input_strides, uint32_t const* output_strides, const uint32_t batch_size, const uint32_t num_inputs,
-    float const eps, float const weight_bias, bool enable_weights, cudaStream_t stream)
+template <typename DType, int n>
+void GroupRMSNormKernel(GroupRMSParams<n> params)
 {
     // Kernel assertions
     constexpr uint32_t kPackedSize = sizeof(float4) / sizeof(DType);
-    TLLM_CHECK_WITH_INFO(num_inputs <= 32, "Only up to 32 inputs are supported.");
-    for (uint32_t i = 0; i < num_inputs; i++)
+    for (uint32_t i = 0; i < params.num_inputs; i++)
     {
-        TLLM_CHECK_WITH_INFO(input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
+        TLLM_CHECK_WITH_INFO(params.input_dims[i] % 32 == 0, "Input dimension must be divisible by 32.");
         // Each wrap process 32 * kPackedSize tokens per round.
         // Need to be divisible by 32*kPackedSize
-        TLLM_CHECK_WITH_INFO(input_dims[i] % (32 * kPackedSize) == 0,
-            "Input[%u] dimension %u is not divisible by %u (32 * (128b / sizeof(dype))). Finer granularity is not "
+        TLLM_CHECK_WITH_INFO(params.input_dims[i] % kPackedSize == 0,
+            "Input[%u] dimension %u is not divisible by %u (128b / sizeof(dype)). Finer granularity is not "
             "supported yet.",
-            i, input_dims[i], 32 * kPackedSize);
-    }
-
-    // Allocate memory for inputs, weights, and outputs and cast them to float4*
-    std::vector<float4*> inputs_float4(num_inputs);
-    std::vector<float4*> outputs_float4(num_inputs);
-    std::vector<float4*> weights_float4(num_inputs);
-    for (uint32_t i = 0; i < num_inputs; ++i)
-    {
-        inputs_float4[i] = reinterpret_cast<float4*>(inputs[i]); // Safe if aligned
-        outputs_float4[i] = reinterpret_cast<float4*>(outputs[i]);
-        if (enable_weights)
-        {
-            weights_float4[i] = reinterpret_cast<float4*>(weights[i]);
-        }
-    }
-    float4** d_inputs;
-    float4** d_outputs;
-    float4** d_weights;
-
-    cudaMalloc(&d_inputs, num_inputs * sizeof(float4*));
-    cudaMemcpy(d_inputs, inputs_float4.data(), num_inputs * sizeof(float4*), cudaMemcpyHostToDevice);
-
-    cudaMalloc(&d_outputs, num_inputs * sizeof(float4*));
-    cudaMemcpy(d_outputs, outputs_float4.data(), num_inputs * sizeof(float4*), cudaMemcpyHostToDevice);
-
-    if (enable_weights)
-    {
-        cudaMalloc(&d_weights, num_inputs * sizeof(float4*));
-        cudaMemcpy(d_weights, weights_float4.data(), num_inputs * sizeof(float4*), cudaMemcpyHostToDevice);
+            i, params.input_dims[i], kPackedSize);
     }
 
     // Calculate total warps to launch and rounds needed
-    uint32_t total_input_length = std::accumulate(input_dims, input_dims + num_inputs, 0);
+    int max_input_length = *std::max_element(params.input_dims, params.input_dims + params.num_inputs);
     uint32_t input_chunk_per_warp = 32 * kPackedSize;
-    uint32_t total_warps_needed = (total_input_length + input_chunk_per_warp - 1) / input_chunk_per_warp; // ceil_div
-    uint32_t num_warps_to_launch = std::min<uint32_t>(32, total_warps_needed);
-    uint32_t rounds = (total_warps_needed + num_warps_to_launch - 1) / num_warps_to_launch;
+    uint32_t max_warps_needed = (max_input_length + input_chunk_per_warp - 1) / input_chunk_per_warp; // ceil_div
+    uint32_t num_warps_to_launch = std::min<uint32_t>(32, max_warps_needed);
+    uint32_t rounds = (max_warps_needed + num_warps_to_launch - 1) / num_warps_to_launch;
 
-    // Calculate warp_prefix_sum
-    float warps_per_token = float(num_warps_to_launch) / total_input_length;
-    std::vector<int> warps_per_array(num_inputs);
-    std::vector<uint32_t> warp_prefix_sum(num_inputs + 1);
-    warp_prefix_sum[0] = 0;
-
-    for (int i = 0; i < num_inputs; ++i)
-    {
-        warps_per_array[i] = std::max(1, int(round(input_dims[i] * warps_per_token)));
-        warp_prefix_sum[i + 1] = warp_prefix_sum[i] + warps_per_array[i];
-    }
-
-    dim3 grid_dim(batch_size);
+    dim3 grid_dim(params.batch_size, params.num_inputs);
     dim3 block_dim(32, num_warps_to_launch);
 
-    // Prepare inputs parameters for the kernel
-    uint32_t* d_input_dims;
-    uint32_t* d_input_strides;
-    uint32_t* d_output_strides;
-    uint32_t* d_warp_prefix_sum;
-
-    // Device memory allocation
-    deviceMalloc(&d_input_dims, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_input_strides, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_output_strides, num_inputs * sizeof(uint32_t));
-    deviceMalloc(&d_warp_prefix_sum, (num_inputs + 1) * sizeof(uint32_t));
-
-    cudaAutoCpy(d_input_dims, input_dims, num_inputs, stream);
-    cudaAutoCpy(d_input_strides, input_strides, num_inputs, stream);
-    cudaAutoCpy(d_output_strides, output_strides, num_inputs, stream);
-    cudaAutoCpy(d_warp_prefix_sum, warp_prefix_sum.data(), num_inputs + 1, stream);
-
-    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-
     // Shared memory size: used for the rsqrt values if each input, max 32 inputs.
-    const uint32_t smem_size = 3 * 32 * sizeof(float);
+    const uint32_t smem_size = 32 * sizeof(float);
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[1];
     cfg.gridDim = grid_dim;
     cfg.blockDim = block_dim;
     cfg.dynamicSmemBytes = smem_size;
-    cfg.stream = stream;
+    cfg.stream = params.stream;
     attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
     cfg.attrs = attribute;
     cfg.numAttrs = 1;
 
-    if (enable_weights)
+    if (params.enable_weights)
     {
-        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, GroupRMSNormKernelWithWeights<DType, float4>, d_inputs, d_outputs,
-            d_weights, d_input_dims, d_input_strides, d_output_strides, d_warp_prefix_sum, rounds, num_inputs, eps,
-            weight_bias));
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+            &cfg, (void (*)(GroupRMSParams<n>, int)) GroupRMSNormKernelWithWeights<DType, float4, n>, params, rounds));
     }
     else
     {
-        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg, GroupRMSNormKernelWithoutWeights<DType, float4>, d_inputs, d_outputs,
-            d_input_dims, d_input_strides, d_output_strides, d_warp_prefix_sum, rounds, num_inputs, eps));
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+            (void (*)(GroupRMSParams<n>, int)) GroupRMSNormKernelWithoutWeights<DType, float4, n>, params, rounds));
     }
-
-    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Cleanup device memory
-    TLLM_CUDA_CHECK(cudaFree(d_inputs));
-    TLLM_CUDA_CHECK(cudaFree(d_outputs));
-    if (enable_weights)
-    {
-        TLLM_CUDA_CHECK(cudaFree(d_weights));
-    }
-    deviceFree(d_input_dims);
-    deviceFree(d_input_strides);
-    deviceFree(d_output_strides);
-    deviceFree(d_warp_prefix_sum);
 }
 
-template void tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel<half>(half**, half**, half**, uint32_t const*,
-    uint32_t const*, uint32_t const*, uint32_t, uint32_t, float, float, bool, cudaStream_t);
+template <int n>
+void GroupRMSNormKernelLauncher(GroupRMSParams<n> params)
+{
+#define GROUP_RMS_NORM_DISPATCH1(DTYPE) return GroupRMSNormKernel<DTYPE, n>(params);
 
-#ifdef ENABLE_BF16
-template void tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel<__nv_bfloat16>(__nv_bfloat16**, __nv_bfloat16**,
-    __nv_bfloat16**, uint32_t const*, uint32_t const*, uint32_t const*, uint32_t, uint32_t, float, float, bool,
-    cudaStream_t);
-#endif
+    switch (params.dtype)
+    {
+    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_DISPATCH1(half); break;
+    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_DISPATCH1(__nv_bfloat16); break;
+    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_DISPATCH1(float); break;
+    default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNorm");
+    }
+}
 
-template void tensorrt_llm::kernels::group_rms_norm::GroupRMSNormKernel<float>(float**, float**, float**,
-    uint32_t const*, uint32_t const*, uint32_t const*, uint32_t, uint32_t, float, float, bool, cudaStream_t);
+// Explicit instantiations for n=1 to 32
+#define INSTANTIATE_GROUP_RMS_NORM(n) template void GroupRMSNormKernelLauncher<n>(GroupRMSParams<n> params);
+
+INSTANTIATE_GROUP_RMS_NORM(1)
+INSTANTIATE_GROUP_RMS_NORM(2)
+INSTANTIATE_GROUP_RMS_NORM(3)
+INSTANTIATE_GROUP_RMS_NORM(4)
+INSTANTIATE_GROUP_RMS_NORM(5)
+INSTANTIATE_GROUP_RMS_NORM(6)
+INSTANTIATE_GROUP_RMS_NORM(7)
+INSTANTIATE_GROUP_RMS_NORM(8)
+
 } // namespace tensorrt_llm::kernels::group_rms_norm
