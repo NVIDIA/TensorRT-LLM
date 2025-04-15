@@ -13,6 +13,7 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
 
 ## Table of Contents
 
+
 - [DeepSeek‑V3 and DeepSeek-R1](#deepseekv3-and-deepseek-r1)
   - [Table of Contents](#table-of-contents)
   - [Hardware Requirements](#hardware-requirements)
@@ -27,8 +28,9 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
       - [mpirun](#mpirun)
       - [Slurm](#slurm)
       - [Example: Multi-node benchmark on GB200 Slurm cluster](#example-multi-node-benchmark-on-gb200-slurm-cluster)
-    - [FlashMLA](#flashmla)
     - [DeepGEMM](#deepgemm)
+    - [FlashMLA](#flashmla)
+    - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
@@ -270,6 +272,7 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
+
 #### Example: Multi-node benchmark on GB200 Slurm cluster
 
 Step 1: Prepare dataset and `extra-llm-api-config.yml`.
@@ -350,8 +353,6 @@ Step 4: Submit the job to Slurm cluster to launch the benchmark by executing:
 sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
 ```
 
-### FlashMLA
-TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
 
 ### DeepGEMM
 TensorRT-LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
@@ -405,6 +406,46 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --num_requests ${NUM_REQUESTS} \
       --streaming \
       --report_json "${OUTPUT_FILENAME}.json"
+```
+
+### FlashMLA
+TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+
+### FP8 KV Cache and MLA
+
+FP8 KV Cache and MLA quantization could be enabled, which delivers two key performance advantages:
+- Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
+- MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
+
+FP8 KV Cache and MLA is supported on Hopper and Blackwell.
+- On Hopper we use the [FP8 FlashMLA kernel](https://github.com/deepseek-ai/FlashMLA/pull/54) from community. The accuracy loss is small, with GSM8k accuracy drop less than 1%.
+- On Blackwell we use the kernel generated from an internal code-gen based solution called `trtllm-gen`. Note that FP8 MLA on Blackwell currently suffers from accuracy issues and there are ongoing efforts to solve it.
+
+You can enable FP8 MLA through either of these methods:
+
+**Option 1: Checkpoint config**
+
+TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+
+To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
+
+```json
+{
+  "quantization": {
+    "quant_algo": "FP8_BLOCK_SCALES",
+    "kv_cache_quant_algo": "FP8"
+  }
+}
+```
+
+**Option 2: PyTorch backend config**
+
+Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
+```yaml
+# ...
+pytorch_backend_config:
+  kv_cache_dtype: fp8
+  # ...
 ```
 
 ## Notes and Troubleshooting
