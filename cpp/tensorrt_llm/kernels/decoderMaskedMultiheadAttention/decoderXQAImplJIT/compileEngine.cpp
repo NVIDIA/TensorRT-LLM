@@ -16,12 +16,12 @@
 #include "compileEngine.h"
 
 #include "cubinObj.h"
-#include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include <nvrtcWrapper.h>
 #include <string>
 #include <vector>
 
@@ -35,7 +35,8 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
         std::vector<char> log(tllmXqaJitGetLastErrorStringSize());
         tllmXqaJitGetLastErrorString(log.data());
         throw tensorrt_llm::common::TllmException(file, line,
-            tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] TllmXqaJit runtime error in %s: %s", func, log.data()));
+            tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] TllmXqaJit runtime error in %s: %s", func, log.data())
+                .c_str());
     }
 }
 

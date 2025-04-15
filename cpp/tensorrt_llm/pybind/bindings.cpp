@@ -251,7 +251,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("in_dim_first", &tr::LoraModule::inDimFirst)
         .def_property_readonly("out_dim_first", &tr::LoraModule::outDimFirst)
         .def_property_readonly("in_tp_split_dim", &tr::LoraModule::inTpSplitDim)
-        .def_property_readonly("out_tp_split_dim", &tr::LoraModule::outTpSplitDim);
+        .def_property_readonly("out_tp_split_dim", &tr::LoraModule::outTpSplitDim)
+        .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, py::arg("lora_module_names"),
+            py::arg("hidden_size"), py::arg("mlp_hidden_size"), py::arg("num_attention_heads"),
+            py::arg("num_kv_attention_heads"), py::arg("attention_head_size"), py::arg("tp_size") = 1,
+            py::arg("num_experts") = 0);
+
     py::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
@@ -346,7 +351,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property(
             "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention)
         .def_property("lora_modules", &tr::ModelConfig::getLoraModules, &tr::ModelConfig::setLoraModules)
-        .def_property("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank);
+        .def_property("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank)
+        .def_property("mlp_hidden_size", &tr::ModelConfig::getMlpHiddenSize, &tr::ModelConfig::setMlpHiddenSize)
+        .def_property("size_per_head", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead);
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -523,8 +530,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState))
-        .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
+        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
@@ -560,7 +566,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
+    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 }

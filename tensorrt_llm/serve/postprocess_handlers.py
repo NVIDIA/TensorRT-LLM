@@ -19,7 +19,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, StreamOptions, ToolCall, UsageInfo)
+                              FunctionCall, StreamOptions, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enale
 
@@ -175,11 +176,13 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
                 ])
         else:
             message = ChatMessage(role=role, content=output.text)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
+            disaggregated_params=disaggregated_params,
         )
 
         if args.return_logprobs:
@@ -281,8 +284,7 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
         text = output.text
         if args.echo:
             text = args.prompt + text
-        disaggregated_params = CompletionResponseChoice.to_disaggregated_params(
-            output.disaggregated_params)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = CompletionResponseChoice(
             text=text,
             index=args.prompt_idx * args.num_choices + output.index,

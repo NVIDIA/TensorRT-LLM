@@ -309,6 +309,8 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
                           llm_rouge_root=llm_rouge_root)
 
 
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("llm_qwen_model_root", [
     "qwen_7b_chat", "qwen1.5_7b_chat", "qwen2_7b_instruct",
     "qwen2_0.5b_instruct", "qwen2.5_1.5b_instruct"

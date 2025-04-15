@@ -7,6 +7,7 @@ from .fused_moe import *
 from .fusion import *
 from .kvcache import *
 from .quantization import *
+from .rope import *
 from .sharding import *
 
 try:

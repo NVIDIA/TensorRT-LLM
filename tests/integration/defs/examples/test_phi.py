@@ -515,6 +515,9 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
                                    cmodel_dir, engine_dir, phi_example_root,
                                    llm_datasets_root, llm_rouge_root, qformat):
     "Run phi quantization tests"
+    # Workaround for Modelopt can't convert Phi-3 on multi GPUs.
+    gpu_constraint = {"CUDA_VISIBLE_DEVICES": "0"}
+
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
         f"{phi_example_root}/../quantization/quantize.py",
@@ -525,7 +528,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--kv_cache_dtype={qformat}",
         f"--output_dir={cmodel_dir}",
     ]
-    venv_check_call(llm_venv, convert_cmd)
+    venv_check_call(llm_venv, convert_cmd, env=gpu_constraint)
 
     print("Build engines...")
     build_cmd = [
@@ -537,7 +540,11 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--max_batch_size={16}",
     ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_env = {
+        **llm_venv._new_env,
+        **gpu_constraint
+    } if llm_venv._new_env else gpu_constraint
+    check_call(" ".join(build_cmd), shell=True, env=build_env)
 
     print("Run summarize...")
     threshold_score = 24.0
@@ -558,7 +565,8 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--dataset_dir={llm_datasets_root}",
         f"--rouge_dir={llm_rouge_root}",
     ]
-    venv_check_call(llm_venv, summary_cmd)
+
+    venv_check_call(llm_venv, summary_cmd, env=gpu_constraint)
 
 
 @skip_pre_ada

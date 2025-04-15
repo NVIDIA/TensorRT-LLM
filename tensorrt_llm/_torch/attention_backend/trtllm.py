@@ -5,8 +5,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -122,16 +121,14 @@ class TrtllmAttentionWrapper:
             pos_embd_params (PositionalEmbeddingParams): Optional parameters defining how positional embedding should be applied.
             quant_config (QuantConfig): Optional quantization configuration. If None, no quantization is applied.
         """
+        rope_params = None
         if pos_embd_params is not None:
             rope_params = pos_embd_params.rope
-        else:
-            self.rotary_inv_freq = None
-            self.rotary_cos_sin = None
-            rope_params = RopeParams()
+        rope_params = rope_params or RopeParams()
+        self.rope_params = rope_params
 
         self.is_mla_enable = mla_params is not None
         self.q_scaling = q_scaling or 1.0
-        self.mla_rope_params = None
         self.predicted_tokens_per_seq = 1
 
         if self.is_mla_enable:
@@ -141,13 +138,6 @@ class TrtllmAttentionWrapper:
             self.qk_rope_head_dim = mla_params.qk_rope_head_dim
             self.v_head_dim = mla_params.v_head_dim
             self.predicted_tokens_per_seq = mla_params.predicted_tokens_per_seq
-
-            self.rotary_embedding_dim = 0
-            self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_deepseek_rope_const_params(
-                self.qk_rope_head_dim)
-            self.rotary_embedding_scale_type = RotaryScalingType.none
-            self.rotary_embedding_scale = 1.0
-            self.mla_rope_params = rope_params
         else:
             self.q_lora_rank = None
             self.kv_lora_rank = None
@@ -155,11 +145,8 @@ class TrtllmAttentionWrapper:
             self.qk_rope_head_dim = None
             self.v_head_dim = None
 
-            self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
-            )
-            self.rotary_embedding_dim = rope_params.dim
-            self.rotary_embedding_scale_type = int(rope_params.scale_type)
-            self.rotary_embedding_scale = rope_params.scale
+        self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
+        )
 
         self.layer_idx = layer_idx
         self.num_heads = num_heads
@@ -169,7 +156,10 @@ class TrtllmAttentionWrapper:
         self.quant_mode = int(quant_config.layer_quant_mode)
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
+        self.rotary_embedding_dim = rope_params.dim
         self.rotary_embedding_base = rope_params.theta
+        self.rotary_embedding_scale_type = int(rope_params.scale_type)
+        self.rotary_embedding_scale = rope_params.scale
         self.rotary_embedding_short_m_scale = rope_params.short_m_scale
         self.rotary_embedding_long_m_scale = rope_params.long_m_scale
         self.rotary_embedding_max_positions = rope_params.max_positions
@@ -268,6 +258,11 @@ class TrtllmAttentionWrapper:
             'mrope_position_deltas') if mrope_config is not None else None
         self.kwargs.update(kwargs)
         self.block_ids_per_seq = block_ids_per_seq
+        if max_sequence_length > self.rope_params.max_positions:
+            self.rope_params.max_positions = max_sequence_length
+            self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
+            )
+
         self.use_flash_mla = use_flash_mla
         self.flash_mla_tile_scheduler_metadata = None
         self.flash_mla_num_splits = None

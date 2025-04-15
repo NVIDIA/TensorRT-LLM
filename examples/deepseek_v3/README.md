@@ -1,48 +1,51 @@
-# DeepSeek‑V3
+# DeepSeek‑V3 and DeepSeek-R1
 
-This guide walks you through the complete process of running the DeepSeek‑v3 model using NVIDIA's TensorRT-LLM framework with the PyTorch backend. It covers everything from downloading the model weights, preparing the dataset and configuration files, to running the throughput benchmark.
+This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend.
+**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeablely by only replacing the model name to the other one**.
+
+To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
+
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and start a TRT-LLM docker container.
 
 > [!NOTE]
-> This guide assumes you have access to the required hardware (with sufficient GPU memory) and that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths. Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT-LLM from source and docker image.
+> This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
 
 
 ## Table of Contents
 
-- [DeepSeek‑V3](#deepseekv3)
+
+- [DeepSeek‑V3 and DeepSeek-R1](#deepseekv3-and-deepseek-r1)
   - [Table of Contents](#table-of-contents)
-  - [Overview](#overview)
-  - [Hardware](#hardware)
+  - [Hardware Requirements](#hardware-requirements)
   - [Downloading the Model Weights](#downloading-the-model-weights)
   - [Quick Start](#quick-start)
+    - [Run a single inference](#run-a-single-inference)
     - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
     - [Run evaluation on GPQA dataset](#run-evaluation-on-gpqa-dataset)
-  - [Preparing the Dataset \& Configuration for Benchmark](#preparing-the-dataset--configuration-for-benchmark)
-    - [Build the Dataset](#build-the-dataset)
-    - [Create Configuration Files](#create-configuration-files)
-  - [Running the Benchmark](#running-the-benchmark)
-    - [Parameter Overview](#parameter-overview)
   - [Serving](#serving)
-  - [Multi-node](#multi-node)
-    - [mpirun](#mpirun)
-    - [Slurm](#slurm)
-    - [Advanced Features](#advanced-features)
-    - [FlashMLA](#flashmla)
+  - [Advanced Usages](#advanced-usages)
+    - [Multi-node](#multi-node)
+      - [mpirun](#mpirun)
+      - [Slurm](#slurm)
+      - [Example: Multi-node benchmark on GB200 Slurm cluster](#example-multi-node-benchmark-on-gb200-slurm-cluster)
     - [DeepGEMM](#deepgemm)
+    - [FlashMLA](#flashmla)
+    - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
-## Overview
+## Hardware Requirements
 
-DeepSeek‑v3 is a high‑capacity language model that can be executed using NVIDIA's TensorRT-LLM framework with a PyTorch backend. This guide details a benchmark recipe where you will:
+DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory for FP8 weights, and needs more memories for activation tensors and KV cache.
+The minimum hardware requirements for running DeepSeek V3/R1 FP8&FP4 are listed as follows.
 
-- Download the model weights.
-- Build a test dataset.
-- Configure backend options.
-- Run a performance benchmark using `trtllm-bench`.
-
-
-## Hardware
-DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory. 8\*H100 (640GB) is not enough to accommodate the weights. The following steps have been tested on 8\*H20 141GB, we will test on 8*H20 96GB in the future.
+| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 |
+| -------- | ------- | -- |
+| H100 80GB | 16 | N/A |
+| H20 141GB | 8 | N/A |
+| H20 96GB | 8  | N/A |
+| H200 | 8     | N/A |
+| B200/GB200| 4 (8GPUs is recommended for best perf) | 4 (8 GPUs is recommended for best perf) |
 
 DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TensorRT-LLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
 
@@ -59,6 +62,7 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 
 ## Quick Start
 
+### Run a single inference
 To quickly run DeepSeek-V3, [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
 
 ```bash
@@ -76,7 +80,7 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py).
+To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
 ```bash
 cd examples/pytorch
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
@@ -102,92 +106,31 @@ python examples/gpqa_llmapi.py \
   --max_num_tokens 4096
 ```
 
-## Preparing the Dataset & Configuration for Benchmark
-
-### Build the Dataset
-
-Generate a synthetic dataset using the provided script. This dataset simulates token sequences required for benchmarking:
-
-```bash
-python benchmarks/cpp/prepare_dataset.py \
-  --tokenizer=deepseek-ai/DeepSeek-V3 \
-  --stdout token-norm-dist \
-  --num-requests=8192 \
-  --input-mean=1000 \
-  --output-mean=1000 \
-  --input-stdev=0 \
-  --output-stdev=0 > /workspace/dataset.txt
-```
-
-This command writes the dataset to `/workspace/dataset.txt`.
-
-### Create Configuration Files
-
-1. **Backend Configuration:**
-   Enable attention data‑parallelism and overlap scheduler:
-
-   ```bash
-   echo -e "enable_attention_dp: true\npytorch_backend_config:\n  enable_overlap_scheduler: true" > extra-llm-api-config.yml
-   ```
-
-   If you are running with low concurrency (e.g. concurrency <= 128), we suggest you to enable cuda graph and disable attention_dp for better performances. Please note that `cuda_graph_max_batch_size` should be no less than the concurrency set in the benchmark command.
-
-   ```bash
-   echo -e "enable_attention_dp: false\npytorch_backend_config:\n  enable_overlap_scheduler: true\n  use_cuda_graph: true\n  cuda_graph_max_batch_size: 128" > extra-llm-api-config.yml
-   ```
-
-2. **Quantization Configuration:**
-   Configure the quantization settings for the model:
-
-   ```bash
-   echo -e "{\"quantization\": {\"quant_algo\": \"FP8_BLOCK_SCALES\", \"kv_cache_quant_algo\": null}}" > <YOUR_MODEL_DIR>/hf_quant_config.json
-   ```
-
-> [!TIP]
-> Ensure that the quotes and formatting in the configuration files are correct to avoid issues during runtime.
-
-
-## Running the Benchmark
-
-With the model weights downloaded, the dataset prepared, and the configuration files in place, run the benchmark using the following command:
-
-```bash
-trtllm-bench \
-  --model deepseek-ai/DeepSeek-V3 \
-  --model_path  <YOUR_MODEL_DIR> \
-  throughput \
-  --backend pytorch \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
-  --dataset /workspace/dataset.txt \
-  --tp 8 \
-  --ep 4 \
-  --pp 1 \
-  --concurrency 1024 \
-  --streaming \
-  --kv_cache_free_gpu_mem_fraction 0.95 \
-  --extra_llm_api_options ./extra-llm-api-config.yml 2>&1 | tee /workspace/trt_bench.log
-```
-
-### Parameter Overview
-
-- `--model`: Specifies the model identifier.
-- `--model_path`: Path to the directory where model weights are stored.
-- `throughput`: Sets benchmark mode to measure throughput.
-- `--backend pytorch`: Selects the PyTorch backend.
-- `--max_batch_size` & `--max_num_tokens`: Define runtime batch size and token length.
-- `--tp 8`: Configures tensor parallelism.
-- `--ep 4`: Configures expert parallelism.
-- `--kv_cache_free_gpu_mem_fraction`: Allocates a fraction of GPU memory for KV cache management.
-- `--extra_llm_api_options`: Provides additional configuration options from the specified file.
-
-Benchmark logs are saved to `/workspace/trt_bench.log`.
-
-
 ## Serving
 
 To serve the model using `trtllm-serve`:
+
 ```bash
+cat >./extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+    use_cuda_graph: true
+    cuda_graph_padding_enabled: true
+    cuda_graph_batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    print_iter_log: true
+    enable_overlap_scheduler: true
+enable_attention_dp: true
+EOF
+
 trtllm-serve \
   deepseek-ai/DeepSeek-V3 \
   --host localhost \
@@ -196,7 +139,7 @@ trtllm-serve \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 8 \
-  --ep_size 4 \
+  --ep_size 8 \
   --pp_size 1 \
   --kv_cache_free_gpu_memory_fraction 0.95 \
   --extra_llm_api_options ./extra-llm-api-config.yml
@@ -216,10 +159,11 @@ curl http://localhost:8000/v1/completions \
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
 
-## Multi-node
+## Advanced Usages
+### Multi-node
 TensorRT-LLM supports multi-node inference. You can use mpirun or Slurm to launch multi-node jobs. We will use two nodes for this example.
 
-### mpirun
+#### mpirun
 mpirun requires each node to have passwordless ssh access to the other node. We need to setup the environment inside the docker container. Run the container with host network and mount the current directory as well as model directory to the container.
 
 ```bash
@@ -316,7 +260,7 @@ mpirun \
 trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
 ```
 
-### Slurm
+#### Slurm
 ```bash
   srun -N 2 -w [NODES] \
   --output=benchmark_2node.log \
@@ -328,9 +272,87 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
-### Advanced Features
-### FlashMLA
-TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+
+#### Example: Multi-node benchmark on GB200 Slurm cluster
+
+Step 1: Prepare dataset and `extra-llm-api-config.yml`.
+```bash
+python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
+    --tokenizer=/path/to/DeepSeek-R1 \
+    --stdout token-norm-dist --num-requests=49152 \
+    --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
+
+cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+    use_cuda_graph: true
+    cuda_graph_padding_enabled: true
+    cuda_graph_batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+    print_iter_log: true
+    enable_overlap_scheduler: true
+enable_attention_dp: true
+EOF
+```
+
+Step 2: Prepare `benchmark.slurm`.
+```bash
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --ntasks=8
+#SBATCH --ntasks-per-node=4
+#SBATCH --partition=<partition>
+#SBATCH --account=<account>
+#SBATCH --time=02:00:00
+#SBATCH --job-name=<job_name>
+
+srun --container-image=${container_image} --container-mounts=${mount_dir}:${mount_dir} --mpi=pmix \
+    --output ${logdir}/bench_%j_%t.srun.out \
+    bash benchmark.sh
+```
+
+Step 3: Prepare `benchmark.sh`.
+```bash
+#!/bin/bash
+cd /path/to/TensorRT-LLM
+# pip install build/tensorrt_llm*.whl
+if [ $SLURM_LOCALID == 0 ];then
+    pip install build/tensorrt_llm*.whl
+    echo "Install dependencies on rank 0."
+else
+    echo "Sleep 60 seconds on other ranks."
+    sleep 60
+fi
+
+export PATH=${HOME}/.local/bin:${PATH}
+export PYTHONPATH=/path/to/TensorRT-LLM
+DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1  # optional
+
+trtllm-llmapi-launch trtllm-bench \
+    --model deepseek-ai/DeepSeek-R1 \
+    --model_path $DS_R1_NVFP4_MODEL_PATH \
+    throughput --backend pytorch \
+    --num_requests 49152 \
+    --max_batch_size 384 --max_num_tokens 1536 \
+    --concurrency 3072 \
+    --dataset /path/to/dataset.txt \
+    --tp 8 --pp 1 --ep 8 --kv_cache_free_gpu_mem_fraction 0.85 \
+    --extra_llm_api_options ./extra-llm-api-config.yml --warmup 0
+```
+
+Step 4: Submit the job to Slurm cluster to launch the benchmark by executing:
+```
+sbatch --nodes=2 --ntasks=8 --ntasks-per-node=4 benchmark.slurm
+```
+
 
 ### DeepGEMM
 TensorRT-LLM uses DeepGEMM for DeepSeek-V3/R1, which provides significant e2e performance boost on Hopper GPUs. DeepGEMM can be disabled by setting the environment variable `TRTLLM_DG_ENABLED` to `0`:
@@ -346,7 +368,6 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 
 ```bash
 #single-node
-TRTLLM_DG_ENABLED=1 \
 trtllm-bench \
       --model deepseek-ai/DeepSeek-V3 \
       --model_path /models/DeepSeek-V3 \
@@ -387,12 +408,49 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --report_json "${OUTPUT_FILENAME}.json"
 ```
 
+### FlashMLA
+TensorRT-LLM has already integrated FlashMLA in the PyTorch backend. It is enabled automatically when running DeepSeek-V3/R1.
+
+### FP8 KV Cache and MLA
+
+FP8 KV Cache and MLA quantization could be enabled, which delivers two key performance advantages:
+- Compression of the latent KV cache enables larger batch sizes, resulting in higher throughput;
+- MLA kernel of the generation phase is accelerated by FP8 arithmetic and reduced KV cache memory access.
+
+FP8 KV Cache and MLA is supported on Hopper and Blackwell.
+- On Hopper we use the [FP8 FlashMLA kernel](https://github.com/deepseek-ai/FlashMLA/pull/54) from community. The accuracy loss is small, with GSM8k accuracy drop less than 1%.
+- On Blackwell we use the kernel generated from an internal code-gen based solution called `trtllm-gen`. Note that FP8 MLA on Blackwell currently suffers from accuracy issues and there are ongoing efforts to solve it.
+
+You can enable FP8 MLA through either of these methods:
+
+**Option 1: Checkpoint config**
+
+TensorRT-LLM automatically detects the `hf_quant_config.json` file in the model directory, which configures both GEMM and KV cache quantization. For example, see the FP4 DeepSeek-R1 checkpoint [configuration](https://huggingface.co/nvidia/DeepSeek-R1-FP4/blob/main/hf_quant_config.json) provided by [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+
+To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following shows the config for DeepSeek's block-wise FP8 GEMM quantization + FP8 MLA:
+
+```json
+{
+  "quantization": {
+    "quant_algo": "FP8_BLOCK_SCALES",
+    "kv_cache_quant_algo": "FP8"
+  }
+}
+```
+
+**Option 2: PyTorch backend config**
+
+Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
+```yaml
+# ...
+pytorch_backend_config:
+  kv_cache_dtype: fp8
+  # ...
+```
+
 ## Notes and Troubleshooting
 
 - **Model Directory:** Update `<YOUR_MODEL_DIR>` with the actual path where the model weights reside.
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-
-By following these steps, you should be able to successfully run the DeepSeek‑v3 benchmark using TensorRT-LLM with the PyTorch backend.

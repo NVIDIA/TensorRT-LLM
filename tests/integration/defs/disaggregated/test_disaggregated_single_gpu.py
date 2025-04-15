@@ -38,8 +38,7 @@ def model_path(model_name):
         raise ValueError(f"Unknown model: {model_name}")
 
 
-async def run_worker(kv_cache_config, pytorch_config, model_name, rank,
-                     attention_dp):
+async def run_worker(kv_cache_config, pytorch_config, model_name, rank):
     print(f"Running worker {rank}")
     port_name = MPI.Lookup_name('my_port')
     intercomm = MPI.COMM_WORLD.Connect(port_name)
@@ -55,8 +54,7 @@ async def run_worker(kv_cache_config, pytorch_config, model_name, rank,
                   enable_chunked_prefill=False,
                   pytorch_backend_config=pytorch_config,
                   _mpi_session=mpi_session,
-                  kv_cache_config=kv_cache_config,
-                  enable_attention_dp=attention_dp)
+                  kv_cache_config=kv_cache_config)
         print(f"LLM created")
     except Exception as e:
         print(f"Error creating LLM: {e}")
@@ -100,15 +98,12 @@ def send_requests_to_worker(requests, worker_rank, intercomm):
     return responses
 
 
-def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank,
-                       attention_dp):
+def worker_entry_point(kv_cache_config, pytorch_config, model_name, rank):
     return asyncio.run(
-        run_worker(kv_cache_config, pytorch_config, model_name, rank,
-                   attention_dp))
+        run_worker(kv_cache_config, pytorch_config, model_name, rank))
 
 
-def verify_disaggregated(model, generation_overlap, attention_dp_context,
-                         attention_dp_generation, enable_cuda_graph, prompt,
+def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
                          expected_output, expected_output_ids):
     worker_pytorch_configs = []
 
@@ -128,8 +123,7 @@ def verify_disaggregated(model, generation_overlap, attention_dp_context,
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
     worker_args = list(
-        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks,
-            [attention_dp_context, attention_dp_generation]))
+        zip(kv_cache_configs, worker_pytorch_configs, model_names, ranks))
 
     port_name = MPI.Open_port()
     MPI.Publish_name('my_port', port_name)
@@ -197,7 +191,7 @@ def verify_disaggregated(model, generation_overlap, attention_dp_context,
 def test_disaggregated_simple_llama(model, generation_overlap,
                                     enable_cuda_graph):
     verify_disaggregated(
-        model, generation_overlap, False, False, enable_cuda_graph,
+        model, generation_overlap, enable_cuda_graph,
         "What is the capital of Germany?",
         "\n<|assistant|>\nThe capital of Germany is Berlin.", [
             2, 29871, 13, 29966, 29989, 465, 22137, 29989, 29958, 13, 1576,
@@ -208,14 +202,10 @@ def test_disaggregated_simple_llama(model, generation_overlap,
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-@pytest.mark.parametrize("attention_dp_context", [False, True])
-@pytest.mark.parametrize("attention_dp_generation", [False, True])
 def test_disaggregated_simple_deepseek(model, generation_overlap,
-                                       enable_cuda_graph, attention_dp_context,
-                                       attention_dp_generation):
+                                       enable_cuda_graph):
     verify_disaggregated(
-        model, generation_overlap, attention_dp_context,
-        attention_dp_generation, enable_cuda_graph,
+        model, generation_overlap, enable_cuda_graph,
         "What is the capital of Germany?",
         " | Berlin \nWhat is the capital of France? | Paris \nWhat is the capital of Italy? | Rome \nWhat is",
         [

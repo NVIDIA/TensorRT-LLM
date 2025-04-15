@@ -1726,8 +1726,8 @@ class BertAttention(Module):
             # TRT plugin mode
             assert input_lengths is not None
             assert self.cp_size == 1
-            assert get_sm_version(
-            ) < 100, "bert_attention_plugin does not support SM >= 100"
+            assert get_sm_version() < 100 or get_sm_version() >= 120, \
+                "bert_attention_plugin does not support SM100"
             context = bert_attention(
                 qkv,
                 input_lengths,
@@ -2048,7 +2048,7 @@ class DeepseekV2Attention(Attention):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
+        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
             self.max_position_embeddings, self.qk_rope_head_dim,
             self.rotary_embedding_base, self.rotary_scaling["factor"],
             rotary_embedding_origin_max_position, rotary_embedding_beta_fast,

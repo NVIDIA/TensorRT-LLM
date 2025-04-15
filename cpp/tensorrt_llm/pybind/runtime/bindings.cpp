@@ -291,18 +291,18 @@ void initBindings(pybind11::module_& m)
     py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>, std::vector<bool>>(), py::arg("logits"), py::arg("active"))
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>>(), py::arg("logits"))
+        .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
+            py::arg("max_decoding_engine_tokens"))
+        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
-        .def_readwrite("active", &tr::decoder_batch::Input::active)
+        .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
         .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
         .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
         .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
-        .def_readwrite("cache_indirection", &tr::decoder::Output::cacheIndirection)
-        .def_readwrite("sequence_lengths", &tr::decoder::Output::sequenceLengths);
+        .def_readwrite("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
 
     py::class_<tr::decoder::Input>(m, "Input")
         .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
@@ -368,6 +368,8 @@ void initBindings(pybind11::module_& m)
             "joint_decoding_input", [](tr::decoder::DecoderState& self) { return self.getJointDecodingInput(); })
         .def_property_readonly(
             "joint_decoding_output", [](tr::decoder::DecoderState& self) { return self.getJointDecodingOutput(); })
+        .def_property_readonly("sequence_lengths",
+            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getSequenceLengths()); })
         .def_property_readonly(
             "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
         .def_property_readonly(

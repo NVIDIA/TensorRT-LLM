@@ -20,12 +20,9 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
-#include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 
 #include <memory>
-#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -35,6 +32,8 @@ class LlmRequest;
 
 namespace tensorrt_llm::runtime
 {
+class SamplingConfig;
+
 namespace decoder
 {
 class DecoderState;
@@ -49,32 +48,35 @@ public:
     using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
 
-    explicit Input(std::vector<TensorPtr> const& logits, std::vector<bool> const& active)
+    explicit Input(std::vector<std::vector<TensorConstPtr>> const& logits, SizeType32 maxDecoderSteps)
         : logits{logits}
-        , active{active}
+        , maxDecoderSteps{maxDecoderSteps}
     {
         TLLM_CHECK_WITH_INFO(
-            this->active.size() == logits.size(), "'active' vector size does not match logits vector size");
+            logits.size() == static_cast<size_t>(maxDecoderSteps), "logits vector size does not match maxDecoderSteps");
     }
 
-    explicit Input(std::vector<TensorPtr> const& logits)
-        : Input{logits, std::vector<bool>(logits.size(), true)}
+    explicit Input(std::vector<TensorConstPtr> const& logits)
+        : Input{{logits}, 1}
     {
     }
 
     //! Mandatory parameters
-    //! [batchSize][1, beamWidth, vocabSizePadded] or [generatedTokensPerStep, 1, vocabSizePadded], on gpu
-    std::vector<TensorPtr> logits;
-    //! Control activity of decoder slots in batch
-    std::vector<bool> active; // [batchSize]
-    //! Empty buffer filled in GptDecoderBatched, sorted by slots, [maxTokensPerEngineStep, batchSize]
-    TensorPtr batchSlots;
+    // FIXME: remove first dimension of tensors
+    //! [maxDecoderSteps][batchSize][1, beamWidth, vocabSizePadded], on gpu
+    std::vector<std::vector<TensorConstPtr>> logits;
+
+    //! Maximum number of decoding tokens of active slots
+    SizeType32 maxDecoderSteps;
+
+    //! Batch of active decoder slots, sorted by slots, [maxDecoderSteps][batchSize]
+    std::vector<TensorPtr> batchSlots;
     //! Filled with slots in request order, [batchSize]
     TensorPtr batchSlotsRequestOrder;
 
     //! For beam search
     //! Indices into KV cache of different rays within one beam
-    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], on gpu
+    TensorPtr cacheIndirection; // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
     //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
     std::vector<std::vector<TensorPtr>> predictedDraftLogits;
 
@@ -87,7 +89,16 @@ public:
     std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
-using Output = decoder::Output;
+class Output
+{
+public:
+    using TensorPtr = std::shared_ptr<ITensor>;
+
+    Output() = default;
+
+    // parameters for beam search
+    TensorPtr cacheIndirection; // [batchSize, maxBeamWidth, maxSeqLen], mandatory in beam search, on gpu
+};
 
 } // namespace decoder_batch
 

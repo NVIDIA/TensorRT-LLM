@@ -1,4 +1,6 @@
+import atexit
 import concurrent.futures
+import threading
 import time
 import weakref
 from typing import Dict, Optional, Union
@@ -8,6 +10,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
+from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -52,6 +55,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         )
 
         self.workers_started = False
+        self.doing_pre_shutdown = False
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
@@ -70,11 +74,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
             print_colored(
-                "Using MpiCommSession to bind to external MPI processes\n",
+                f"rank {mpi_rank()} using MpiCommSession to bind to external MPI processes\n",
                 "yellow")
         else:
-            print_colored("Using MpiPoolSession to spawn MPI processes\n",
-                          "yellow")
+            print_colored(
+                f"rank {mpi_rank()} using MpiPoolSession to spawn MPI processes\n",
+                "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
 
@@ -92,6 +97,15 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.dispatch_stats_thread: Optional[ManagedThread] = None
         self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
+
+        # MPI registers its joiner using threading._register_atexit if possible.
+        # These functions run before atexit.register, so to avoid deadlock,
+        # we have to notify workers to exit before MPI starts to wait them.
+        try:
+            threading._register_atexit(  # type: ignore[attr-defined]
+                self.pre_shutdown)
+        except AttributeError:
+            atexit.register(self.pre_shutdown)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
 
@@ -183,12 +197,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             data = queue.get()
         except:
-            logger.error(
+            logger.debug(
                 "proxy.py: Error in _iteration_result_task: queue.get()")
             return False
 
         if data is None:
-            logger.error("proxy.py: _iteration_result_task: data is None")
+            logger.debug("proxy.py: _iteration_result_task: data is None")
             return False  # shutdown the thread
 
         data = data if isinstance(data, list) else [data]
@@ -201,7 +215,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         try:
             for d in data:
                 if d is None:
-                    logger.error("proxy.py: _iteration_result_task: d is None")
+                    logger.debug("proxy.py: _iteration_result_task: d is None")
                     return False
 
                 if isinstance(queue, _SyncQueue):
@@ -219,7 +233,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # and therefore event loop can already be closed.
             logger.debug("proxy.py: EventLoopShutdownError")
         except Exception as e:
-            logger.error(f"proxy.py: Error in _iteration_result_task: {e}")
+            logger.debug(f"proxy.py: Error in _iteration_result_task: {e}")
             raise e
 
         return True  # success
@@ -288,33 +302,49 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.workers_started = True
 
-        while not self.request_error_queue.poll(1):
+        while True:
+            if self.request_error_queue.poll(1):
+                ready_signal = self.request_error_queue.get()
+                break
+            if any(fut.done() for fut in self.mpi_futures):
+                logger.error("Executor worker died during initialization.")
+                ready_signal = RuntimeError(
+                    "Executor worker died during initialization")
+                break
             self._handle_background_error()
 
-        ready_signal = self.request_error_queue.get()
         if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
-            self.mpi_session.shutdown()
+            self.mpi_session.shutdown_abort(reason=ready_signal)
             raise ready_signal
 
     def _abort_all_requests(self):
         for result in self._results.values():
             result.abort()
 
-    def shutdown(self):
+    def pre_shutdown(self):
         if not self.workers_started:
             return
-        print_colored_debug('Proxy.shutdown...\n', "yellow")
+        print_colored_debug('Proxy.pre_shutdown...\n', "yellow")
 
-        if self.doing_shutdown:
+        if self.doing_pre_shutdown:
             return
         else:
-            self.doing_shutdown = True
+            self.doing_pre_shutdown = True
 
         self._abort_all_requests()
 
-        # step1: notify the workers to quit
+        # notify the workers to quit
         if all(not f.done() for f in self.mpi_futures):
             self.request_queue.put(None)
+
+    def shutdown(self):
+        if not self.workers_started:
+            return
+
+        if not self.doing_pre_shutdown:
+            self.pre_shutdown()
+
+        print_colored_debug('Proxy.shutdown...\n', "yellow")
 
         for f in self.mpi_futures:
             try:
@@ -367,7 +397,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params)
         self._results[request.id] = result
 
         self.request_queue.put(request)

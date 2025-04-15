@@ -187,6 +187,7 @@ examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[Mixtral-8x7B-In
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
+examples/test_multimodal.py::test_llm_multimodal_general[Phi-4-multimodal-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[VILA1.5-3b-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
@@ -424,11 +425,15 @@ accuracy/test_llm_api.py::TestQwen2_5_7BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+accuracy/test_llm_api_pytorch.py::TestMistral_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
+accuracy/test_llm_api_pytorch.py::TestMinitron4BBaseInstruct::test_fp8_prequantized
+accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s
@@ -438,8 +443,6 @@ test_e2e.py::test_benchmark_sanity[roberta_base]
 test_e2e.py::test_benchmark_sanity[t5_base]
 test_e2e.py::test_benchmark_sanity_enable_fp8[gpt_350m]
 test_e2e.py::test_benchmark_sanity_enable_fp8[llama_7b]
-test_e2e.py::test_falcon_e2e[gpu_percent_0-use_py_session-gqa]
-test_e2e.py::test_falcon_e2e[gpu_percent_0_8-use_cpp_session-mqa]
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session]

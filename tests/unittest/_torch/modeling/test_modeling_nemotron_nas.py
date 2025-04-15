@@ -13,12 +13,13 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_nvsmall import NVSmallForCausalLM
+from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+    NemotronNASForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-NVSMALL_MINI_CONFIG = {
+NEMOTRON_NAS_MINI_CONFIG = {
     "architectures": ["DeciLMForCausalLM"],
     "attention_bias":
     False,
@@ -224,7 +225,8 @@ class Scenario:
         return f"backend:{self.backend.lower()}"
 
 
-def reduce_nvsmall_config(mem_for_full_model: int, config_dict: dict[str, Any]):
+def reduce_nemotron_nas_config(mem_for_full_model: int, config_dict: dict[str,
+                                                                          Any]):
     _, total_mem = torch.cuda.mem_get_info()
     # scale model down if gpu memory is low
     if total_mem < mem_for_full_model:
@@ -235,24 +237,24 @@ def reduce_nvsmall_config(mem_for_full_model: int, config_dict: dict[str, Any]):
         config_dict["block_configs"] = config_dict["block_configs"][:num_layers]
 
 
-class TestNVSmall(unittest.TestCase):
+class TestNemotronNAS(unittest.TestCase):
 
-    def test_nvsmall_sanity(self):
-        config_dict = deepcopy(NVSMALL_MINI_CONFIG)
+    def test_nemotron_nas_sanity(self):
+        config_dict = deepcopy(NEMOTRON_NAS_MINI_CONFIG)
         # 8B * sizeof(float16) plus some extra for activations
         mem_for_full_model = (2 + 1) * 8 * 2**(30)
-        reduce_nvsmall_config(mem_for_full_model, config_dict)
+        reduce_nemotron_nas_config(mem_for_full_model, config_dict)
         if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single NVSmall layer")
-        nvsmall_config = AutoConfig.from_pretrained(
+            self.skipTest("Insufficient memory for a single NemotronNAS layer")
+        nemotron_nas_config = AutoConfig.from_pretrained(
             "nvidia/Llama-3_1-Nemotron-51B-Instruct", trust_remote_code=True)
-        nvsmall_config = nvsmall_config.from_dict(config_dict)
+        nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
 
-        dtype = nvsmall_config.torch_dtype
+        dtype = nemotron_nas_config.torch_dtype
         device = torch.device('cuda')
 
-        model_config = ModelConfig(pretrained_config=nvsmall_config)
-        nvsmall = NVSmallForCausalLM(model_config).to(dtype).to(device)
+        model_config = ModelConfig(pretrained_config=nemotron_nas_config)
+        nemotron_nas = NemotronNASForCausalLM(model_config).to(dtype).to(device)
 
         input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
                                  dtype=torch.int,
@@ -272,10 +274,10 @@ class TestNVSmall(unittest.TestCase):
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
 
-        num_layers = nvsmall.config.num_hidden_layers
-        num_kv_heads = nvsmall.config.num_key_value_heads
-        num_heads = nvsmall.config.num_attention_heads
-        head_dim = nvsmall.config.hidden_size // num_heads
+        num_layers = nemotron_nas.config.num_hidden_layers
+        num_kv_heads = nemotron_nas.config.num_key_value_heads
+        num_heads = nemotron_nas.config.num_attention_heads
+        head_dim = nemotron_nas.config.hidden_size // num_heads
         max_seq_len = num_blocks * tokens_per_block
 
         context_sequence_lengths = [3, 2, 1]
@@ -329,18 +331,18 @@ class TestNVSmall(unittest.TestCase):
 
         with torch.inference_mode():
             attn_metadata.prepare()
-            logits = nvsmall.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
+            logits = nemotron_nas.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata)
 
         self.assertEqual(len(past_seen_tokens), logits.shape[0])
 
         with torch.inference_mode():
             attn_metadata.prepare()
-            logits = nvsmall.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata,
-                                     return_context_logits=True)
+            logits = nemotron_nas.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata,
+                                          return_context_logits=True)
         self.assertEqual(input_ids.shape, logits.shape[:-1])
 
         kv_cache_manager.shutdown()
@@ -352,7 +354,7 @@ class TestNVSmall(unittest.TestCase):
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
-    def test_nvsmall_allclose_to_hf(self, scenario: Scenario) -> None:
+    def test_nemotron_nas_allclose_to_hf(self, scenario: Scenario) -> None:
         """
         Compare output to HF
         """
@@ -360,34 +362,34 @@ class TestNVSmall(unittest.TestCase):
         metadata_cls = get_attention_backend(backend).Metadata
 
         torch.random.manual_seed(0)
-        config_dict = deepcopy(NVSMALL_MINI_CONFIG)
+        config_dict = deepcopy(NEMOTRON_NAS_MINI_CONFIG)
         # 8B * sizeof(float16) plus some extra for activations
         # times 2, since we'll need 2 of these
         mem_for_full_model = (2 + 1) * 8 * 2**(30) * 4
-        reduce_nvsmall_config(mem_for_full_model, config_dict)
+        reduce_nemotron_nas_config(mem_for_full_model, config_dict)
         if config_dict["num_hidden_layers"] <= 0:
-            self.skipTest("Insufficient memory for a single NVSmall layer")
-        nvsmall_config = AutoConfig.from_pretrained(
+            self.skipTest("Insufficient memory for a single NemotronNAS layer")
+        nemotron_nas_config = AutoConfig.from_pretrained(
             "nvidia/Llama-3_1-Nemotron-51B-Instruct", trust_remote_code=True)
-        nvsmall_config = nvsmall_config.from_dict(config_dict)
-        dtype = nvsmall_config.torch_dtype
+        nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
+        dtype = nemotron_nas_config.torch_dtype
         device = torch.device('cuda')
 
-        hf_nvsmall = AutoModelForCausalLM.from_pretrained(
+        hf_nemotron_nas = AutoModelForCausalLM.from_pretrained(
             llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
             trust_remote_code=True,
             device_map="meta")
-        hf_nvsmall = hf_nvsmall.__class__(nvsmall_config).to(dtype).to(
-            device).eval()
+        hf_nemotron_nas = hf_nemotron_nas.__class__(nemotron_nas_config).to(
+            dtype).to(device).eval()
         # This line populates the "variable" field in the NEED_SETUP_CACHE_CLASSES_MAPPING dict
-        hf_nvsmall._prepare_generation_config(None)
+        hf_nemotron_nas._prepare_generation_config(None)
         # And this line is the only way to access the only concrete Cache class DeciLMForCausalLM accepts
         VariableCache = NEED_SETUP_CACHE_CLASSES_MAPPING["variable"]
 
-        model_config = ModelConfig(pretrained_config=nvsmall_config,
+        model_config = ModelConfig(pretrained_config=nemotron_nas_config,
                                    attn_backend=backend)
-        nvsmall = NVSmallForCausalLM(model_config).to(dtype).to(device)
-        nvsmall.load_weights(hf_nvsmall.state_dict())
+        nemotron_nas = NemotronNASForCausalLM(model_config).to(dtype).to(device)
+        nemotron_nas.load_weights(hf_nemotron_nas.state_dict())
 
         num_blocks = 1
         tokens_per_block = 128
@@ -395,10 +397,10 @@ class TestNVSmall(unittest.TestCase):
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
 
-        num_layers = nvsmall.config.num_hidden_layers
-        num_kv_heads = nvsmall.config.num_key_value_heads
-        num_heads = nvsmall.config.num_attention_heads
-        head_dim = nvsmall.config.hidden_size // num_heads
+        num_layers = nemotron_nas.config.num_hidden_layers
+        num_kv_heads = nemotron_nas.config.num_key_value_heads
+        num_heads = nemotron_nas.config.num_attention_heads
+        head_dim = nemotron_nas.config.hidden_size // num_heads
         max_seq_len = num_blocks * tokens_per_block
         batch_size = 1
 
@@ -450,19 +452,19 @@ class TestNVSmall(unittest.TestCase):
 
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        # And, lastly, this is the simplest way of creating a Cache that `hf_nvsmall` will accept
-        past_key_values = VariableCache(config=nvsmall_config,
+        # And, lastly, this is the simplest way of creating a Cache that `hf_nemotron_nas` will accept
+        past_key_values = VariableCache(config=nemotron_nas_config,
                                         dtype=dtype,
                                         batch_size=1)
         with torch.inference_mode():
             attn_metadata.prepare()
-            logits = nvsmall.forward(input_ids=input_ids,
-                                     position_ids=position_ids,
-                                     attn_metadata=attn_metadata)
-            ref = hf_nvsmall.forward(input_ids=input_ids.unsqueeze(0),
-                                     position_ids=position_ids,
-                                     past_key_values=past_key_values,
-                                     use_cache=True)
+            logits = nemotron_nas.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata)
+            ref = hf_nemotron_nas.forward(input_ids=input_ids.unsqueeze(0),
+                                          position_ids=position_ids,
+                                          past_key_values=past_key_values,
+                                          use_cache=True)
 
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
@@ -495,13 +497,13 @@ class TestNVSmall(unittest.TestCase):
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
         with torch.inference_mode():
             attn_metadata.prepare()
-            logits = nvsmall.forward(input_ids=gen_input_ids,
-                                     position_ids=gen_position_ids,
-                                     attn_metadata=attn_metadata)
-            ref = hf_nvsmall.forward(input_ids=gen_input_ids.unsqueeze(0),
-                                     position_ids=gen_position_ids,
-                                     past_key_values=ref.past_key_values,
-                                     use_cache=True)
+            logits = nemotron_nas.forward(input_ids=gen_input_ids,
+                                          position_ids=gen_position_ids,
+                                          attn_metadata=attn_metadata)
+            ref = hf_nemotron_nas.forward(input_ids=gen_input_ids.unsqueeze(0),
+                                          position_ids=gen_position_ids,
+                                          past_key_values=ref.past_key_values,
+                                          use_cache=True)
 
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),
