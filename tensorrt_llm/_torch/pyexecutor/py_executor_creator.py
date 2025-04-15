@@ -7,12 +7,12 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..distributed import MPIDist
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
 from .config import PyTorchConfig
-from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 
 
