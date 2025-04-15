@@ -974,8 +974,6 @@ def build_phi_engine(args):
         }
     }
     to_json_file(config_args, args.output_dir + "/config.json")
-    to_json_file(config_args, args.output_dir + "audio/config.json")
-    to_json_file(config_args, args.output_dir + "vision/config.json")
     return
 
     processor = AutoProcessor.from_pretrained(args.model_path,

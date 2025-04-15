@@ -498,7 +498,7 @@ protected:
         if constexpr (std::is_same_v<KVCacheType, __nv_fp4_e2m1>)
         {
             // Quant helper functions will not work on lower SM versions.
-            return getSMVersion() < 100;
+            return getSMVersion() < 100 || getSMVersion() >= 120;
         }
 #endif
         return false;

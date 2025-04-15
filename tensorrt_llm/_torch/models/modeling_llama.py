@@ -119,7 +119,8 @@ class Llama4MoE(nn.Module):
             reduce_results=
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
-            model_config=model_config)
+            model_config=model_config,
+            apply_router_weight_on_input=True)
 
         self.shared_expert = GatedMLP(
             hidden_size=hidden_size,
