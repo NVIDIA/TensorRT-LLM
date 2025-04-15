@@ -24,8 +24,8 @@ from tensorrt_llm.bindings.executor import (FinishReason, InflightBatchingStats,
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
 from tensorrt_llm.logger import logger
 
+from ..distributed import Distributed
 from .decoder import Decoder
-from .distributed import Distributed
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
