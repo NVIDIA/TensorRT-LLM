@@ -64,7 +64,7 @@ def get_cache_size_per_token(model_config, mapping):
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
 
-    num_hidden_layers = len(mapping.pp_layers_torch(config.num_hidden_layers))
+    num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
     mem_per_token *= num_hidden_layers * head_dim
     # K and V
     mem_per_token *= kv_factor
@@ -221,8 +221,7 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
             kv_cache_dtype = str_dtype_to_binding(
                 torch_dtype_to_str(model_engine.dtype))
 
-        num_hidden_layers = len(
-            mapping.pp_layers_torch(config.num_hidden_layers))
+        num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
         # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
         if config.architectures[0] == "Nemotron5ForCausalLM":
             # attention layers are derived from configuration (hybrid_override_pattern)
