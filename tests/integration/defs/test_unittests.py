@@ -64,11 +64,7 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
-    random_number = random.choice([0, 1])
-    if random_number == 0:
-        pytest.fail("test failed")
-    elif random_number == 1:
-        return
+    pytest.fail("test failed")
 
     import pandas as pd
     import pynvml
