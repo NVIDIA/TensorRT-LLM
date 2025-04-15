@@ -25,6 +25,14 @@ template <typename ElementA, typename ElementB, typename ElementD>
 CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::CutlassFp8BlockScaleGemmRunner()
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    int sm = tensorrt_llm::common::getSMVersion();
+    if (sm != 90)
+    {
+        TLLM_THROW(
+            "FP8 Blockscale GEMM kernels are only supported on SM90 architectures, but current device compute "
+            "capability is %d.",
+            sm);
+    }
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
