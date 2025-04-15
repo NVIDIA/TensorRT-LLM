@@ -599,7 +599,8 @@ class Llama4Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
+            parallel_config=None
+            if model_config.mapping.enable_attention_dp else ParallelConfig(
                 tensor_parallel_rank=model_config.mapping.tp_rank,
                 tensor_parallel_size=model_config.mapping.tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
