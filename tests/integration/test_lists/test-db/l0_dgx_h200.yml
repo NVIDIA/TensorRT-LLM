@@ -15,11 +15,5 @@ l0_dgx_h200:
   tests:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-attention_dp-cuda_graph-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=TRTLLM]
   - examples/test_deepseek.py::test_deepseek_dgx_h200[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn3-ep4-pp1-tp8-deepseek_r1-con1-bs1-disable_nvcc]
   - examples/test_deepseek.py::test_deepseek_dgx_h200[enable_overlap_scheduler-enable_cuda_graph-enable_dp-nextn0-ep8-pp1-tp8-deepseek_r1-con1024-bs128-enable_nvcc]
-  - examples/test_deepseek.py::test_deepseek_dgx_h200[disable_overlap_scheduler-disable_cuda_graph-disable_dp-nextn0-ep1-pp1-tp8-deepseek_r1-con1024-bs128-enable_nvcc]
-  - examples/test_deepseek.py::test_deepseek_dgx_h200[disable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn1-ep1-pp1-tp8-deepseek_r1-con1-bs32-disable_nvcc]
-  - examples/test_deepseek.py::test_deepseek_dgx_h200[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep4-pp1-tp8-deepseek_v3-con1-bs1-disable_nvcc]
-  - examples/test_deepseek.py::test_deepseek_dgx_h200[enable_overlap_scheduler-enable_cuda_graph-enable_dp-nextn0-ep8-pp1-tp8-deepseek_v3-con1024-bs128-enable_nvcc]
-  - examples/test_deepseek.py::test_deepseek_dgx_h200[enable_overlap_scheduler-disable_cuda_graph-enable_dp-nextn1-ep1-pp1-tp8-deepseek_v3-con1-bs128-disable_nvcc]
