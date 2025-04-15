@@ -421,7 +421,6 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-re
 examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization] SKIP (https://nvbugspro.nvidia.com/bug/5181262)
 examples/test_qwen.py::test_llm_qwen_moe_single_gpu_summary[qwen1.5_moe_a2.7b_chat-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha] SKIP (https://nvbugs/5180961)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5214245)
-unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0" SKIP (https://nvbugspro.nvidia.com/bug/5215499)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
