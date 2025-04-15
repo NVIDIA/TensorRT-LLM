@@ -683,7 +683,7 @@ __global__ void loadPagedKVCacheForMLAKernel(T* kv_output, const tensorrt_llm::k
     }
 }
 
-// k {total_token, h, d}, v {total_token, h, d}, k_pe {total_token, h, d_rope}
+// k {total_token, h, d}, v {total_token, h, d}, k_pe {total_token, h=1, d_rope}
 // output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}
 template <typename T>
 __global__ void setPagedKVCacheForMLAKernel(T* output, T* const k_ptr, T* const v_ptr, T* const k_pe_ptr,
@@ -731,11 +731,10 @@ __global__ void setPagedKVCacheForMLAKernel(T* output, T* const k_ptr, T* const 
                 (reinterpret_cast<typename KT::VecT*>(output + st_k_global_offset))[st_k_local_offset] = k_data;
                 (reinterpret_cast<typename KT::VecT*>(output + st_v_global_offset))[st_v_local_offset] = v_data;
             }
-            // copy k_pe
+            // copy k_pe, only 1 head
             else
             {
-                int ld_rope_global_offset
-                    = (global_token_offset + local_token_idx) * num_heads * rope_dim + head_idx * rope_dim;
+                int ld_rope_global_offset = (global_token_offset + local_token_idx) * rope_dim;
                 int ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
                 auto rope_data
                     = (reinterpret_cast<typename KT::VecT*>(k_pe_ptr + ld_rope_global_offset))[ld_rope_local_offset];

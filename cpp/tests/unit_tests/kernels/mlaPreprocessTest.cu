@@ -57,7 +57,7 @@ void loadCompressedPagedKvKernelRef(T* kv_output, tensorrt_llm::kernels::KVBlock
     }
 }
 
-// k {total_token, h, uncompressed_h=128}, v {total_token, h, uncompressed_h}, k_pe {total_token, h, rope_h}
+// k {total_token, h, uncompressed_h=128}, v {total_token, h, uncompressed_h}, k_pe {total_token, h=1, rope_h}
 // output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, (uncompressed_h + rope_h)}
 // copy k, v, k_pe to a continuous memory space (then it will be packed to kv_cache)
 template <typename T>
@@ -84,7 +84,7 @@ void setPagedKvCacheForMLAKernelRef(T* output, T* const k_ptr, T* const v_ptr, T
                 // copy k, v
                 int const ld_kv_head_offset
                     = (global_token_idx * num_heads * uncompressed_head_size) + (h * uncompressed_head_size);
-                int const ld_k_pe_head_offset = (global_token_idx * num_heads * rope_size) + (h * rope_size);
+                int const ld_k_pe_head_offset = (global_token_idx * rope_size);
                 for (int d = 0; d < uncompressed_head_size; d++)
                 {
                     int const ld_kv_idx = ld_kv_head_offset + d;
@@ -97,7 +97,7 @@ void setPagedKvCacheForMLAKernelRef(T* output, T* const k_ptr, T* const v_ptr, T
                     output[st_k_idx] = k_ptr[ld_kv_idx];
                     output[st_v_idx] = v_ptr[ld_kv_idx];
                 }
-                // copy k_pe
+                // copy k_pe, head_num = 1
                 for (int d = 0; d < rope_size; d++)
                 {
                     int const ld_k_pe_idx = ld_k_pe_head_offset + d;
@@ -112,8 +112,8 @@ void setPagedKvCacheForMLAKernelRef(T* output, T* const k_ptr, T* const v_ptr, T
     }
 }
 
-// ck or cv {total_cached_token, h, uncompressed_h=128}, ck_pe {total_cached_token, h, rope_h}
-// uk or uv {total_uncached_token, h, uncompressed_h}, uk_pe {total_uncached_token, h, rope_h}
+// ck or cv {total_cached_token, h, uncompressed_h=128}, ck_pe {total_cached_token, h=1, rope_h}
+// uk or uv {total_uncached_token, h, uncompressed_h}, uk_pe {total_uncached_token, h=1, rope_h}
 // output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, (uncompressed_h + rope_h)}
 // copy k, v, k_pe to a continuous memory space (then it will be packed to kv_cache)
 template <typename T>
@@ -150,7 +150,7 @@ void setPagedKvCacheForMLAKernelRefV2(T* output, T* const ck_ptr, T* const cv_pt
                 // copy k, v
                 int const ld_kv_head_offset
                     = (global_token_idx * num_heads * uncompressed_head_size) + (h * uncompressed_head_size);
-                int const ld_k_pe_head_offset = (global_token_idx * num_heads * rope_size) + (h * rope_size);
+                int const ld_k_pe_head_offset = (global_token_idx * rope_size);
                 for (int d = 0; d < uncompressed_head_size; d++)
                 {
                     int const ld_kv_idx = ld_kv_head_offset + d;
@@ -163,7 +163,7 @@ void setPagedKvCacheForMLAKernelRefV2(T* output, T* const ck_ptr, T* const cv_pt
                     output[st_k_idx] = k_ptr[ld_kv_idx];
                     output[st_v_idx] = v_ptr[ld_kv_idx];
                 }
-                // copy k_pe
+                // copy k_pe, head_num = 1
                 for (int d = 0; d < rope_size; d++)
                 {
                     int const ld_k_pe_idx = ld_k_pe_head_offset + d;
@@ -469,7 +469,7 @@ protected:
         this->v_tensor = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mTotalTokens, this->mNumHeadsUncompressed, this->mUncompressedHeadSize}), dtype);
         this->k_pe_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mTotalTokens, this->mNumHeadsUncompressed, this->mRopeSize}), dtype);
+            ITensor::makeShape({this->mTotalTokens, this->mNumHeadsCompressed, this->mRopeSize}), dtype);
         {
             auto* k_ptr = bufferCast<DataType>(*(this->k_tensor));
             auto* v_ptr = bufferCast<DataType>(*(this->v_tensor));
@@ -486,7 +486,7 @@ protected:
             ITensor::makeShape({this->mTotalCachedTokens, this->mNumHeadsUncompressed, this->mUncompressedHeadSize}),
             dtype);
         this->k_pe_tensor_cached = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mTotalCachedTokens, this->mNumHeadsUncompressed, this->mRopeSize}), dtype);
+            ITensor::makeShape({this->mTotalCachedTokens, this->mNumHeadsCompressed, this->mRopeSize}), dtype);
         this->k_tensor_uncached = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mTotalUncachedTokens, this->mNumHeadsUncompressed, this->mUncompressedHeadSize}),
             dtype);
@@ -494,7 +494,7 @@ protected:
             ITensor::makeShape({this->mTotalUncachedTokens, this->mNumHeadsUncompressed, this->mUncompressedHeadSize}),
             dtype);
         this->k_pe_tensor_uncached = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mTotalUncachedTokens, this->mNumHeadsUncompressed, this->mRopeSize}), dtype);
+            ITensor::makeShape({this->mTotalUncachedTokens, this->mNumHeadsCompressed, this->mRopeSize}), dtype);
         {
             auto* k_cached_ptr = bufferCast<DataType>(*(this->k_tensor_cached));
             auto* v_cached_ptr = bufferCast<DataType>(*(this->v_tensor_cached));
