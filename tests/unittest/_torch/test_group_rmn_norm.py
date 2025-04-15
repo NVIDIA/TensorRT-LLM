@@ -80,7 +80,7 @@ def test_group_rms_norm(batch_size, hidden_dims, eps, dtype, enable_weights):
                                    atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 128], ids=lambda x: f"batch:{x}")
+@pytest.mark.parametrize("batch_size", [1024, 8, 1], ids=lambda x: f"batch:{x}")
 @pytest.mark.parametrize(
     "hidden_dims",
     [
@@ -146,11 +146,10 @@ def test_group_rms_norm_benchmark(batch_size,
         for i, norm in enumerate(ref_norms):
             with torch.cuda.stream(streams[i]):
                 ref_outputs.append(norm(inputs[i]))
+        torch.cuda.synchronize()
     end_event.record()
-    torch.cuda.synchronize()
 
     ref_time = start_event.elapsed_time(end_event) / timing_runs
-    print(f"RMSNorm time: {ref_time} ms")
 
     # Benchmark GroupRMSNorm
     # Warmup
@@ -171,16 +170,15 @@ def test_group_rms_norm_benchmark(batch_size,
             group_outputs = group_norms(inputs, weights)
         else:
             group_outputs = group_norms(inputs)
+        torch.cuda.synchronize()
     end_event.record()
-    torch.cuda.synchronize()
     group_time = start_event.elapsed_time(end_event) / timing_runs
     print(
         f"Batch size: {batch_size}, hidden dims: {hidden_dims}, dtype: {dtype}, enable_weights: {enable_weights}"
     )
     print(
-        f"RMSNorm time: {ref_time} ms, GroupRMSNorm time: {group_time} ms, speed up: {ref_time / group_time}"
+        f"RMSNorm time: {ref_time:.4f} ms, GroupRMSNorm time: {group_time:.4f} ms, speed up: {(ref_time / group_time):.2f}"
     )
 
     for i, (group_out, ref_out) in enumerate(zip(group_outputs, ref_outputs)):
-        print(f"Checking output{i}")
         torch.testing.assert_close(group_out, ref_out, rtol=1e-3, atol=1e-3)
