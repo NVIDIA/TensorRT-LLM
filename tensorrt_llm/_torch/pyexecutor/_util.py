@@ -1,5 +1,6 @@
 import random
 from collections.abc import Iterable
+from functools import lru_cache
 
 import torch
 
@@ -34,6 +35,22 @@ def is_mla(config):
         ), "both of kv_lora_rank and qk_rope_head_dim are required."
         return True
     return False
+
+
+@lru_cache(maxsize=1)
+def get_cuda_arch():
+    try:
+        return torch.cuda.get_device_capability()
+    except Exception:
+        return None
+
+
+def is_hopper():
+    return get_cuda_arch() == (9, 0)
+
+
+def is_blackwell():
+    return get_cuda_arch() == (10, 0)
 
 
 GB = 1 << 30
