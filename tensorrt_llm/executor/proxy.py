@@ -11,7 +11,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import mpi_rank
+from .._utils import local_mpi_size, mpi_rank
 from ..bindings import executor as tllm
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
@@ -289,7 +289,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
-        torch.cuda.Stream()
+
+        self._check_enough_devices()
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
             **worker_kwargs,
@@ -317,6 +318,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
             self.mpi_session.shutdown_abort(reason=ready_signal)
             raise ready_signal
+
+    def _check_enough_devices(self):
+        if torch.cuda.device_count() < local_mpi_size():
+            raise RuntimeError(
+                f"Not enough devices for local mpi: {torch.cuda.device_count()} < {local_mpi_size()}"
+            )
 
     def _abort_all_requests(self):
         for result in self._results.values():
