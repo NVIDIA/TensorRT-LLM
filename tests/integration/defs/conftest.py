@@ -1907,7 +1907,7 @@ skip_pre_blackwell = pytest.mark.skipif(
     reason="This test is not supported in pre-Blackwell architecture")
 
 skip_post_blackwell = pytest.mark.skipif(
-    get_sm_version() >= 100,
+    get_sm_version() >= 100 and get_sm_version() < 120,
     reason="This test is not supported in post-Blackwell architecture")
 
 skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
@@ -1921,8 +1921,8 @@ def skip_fp8_pre_ada(use_fp8):
 
 
 def skip_fp4_pre_blackwell(use_fp4):
-    "skip fp4 tests if sm version less than 10.0"
-    if use_fp4 and get_sm_version() < 100:
+    "skip fp4 tests if sm version less than 10.0 or greater or equal to 12.0"
+    if use_fp4 and (get_sm_version() < 100 or get_sm_version() >= 120):
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
 
 
