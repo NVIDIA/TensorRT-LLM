@@ -72,6 +72,16 @@ def generate_result_file_name(test_list: List[str],
         yield "fp8"
 
 
+def generate_excluded_test_list(test_list):
+    if "gpt" in test_list:
+        if "gpt_session" not in test_list:
+            yield "gpt_session"
+        if "gpt_executor" not in test_list:
+            yield "gpt_executor"
+        if "gpt_tests" not in test_list:
+            yield "gpt_tests"
+
+
 def find_dir_containing(files: Sequence[str],
                         start_dir: Optional[_pl.Path] = None) -> _pl.Path:
     if start_dir is None:
@@ -718,14 +728,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
 
     excluded_tests = ["FP8"] if not run_fp8 else []
 
-    if "gpt" in test_list and "gpt_executor" not in test_list:
-        excluded_tests.append("GptExecutor")
-
-    if "gpt" in test_list and "gpt_session" not in test_list:
-        excluded_tests.append("GptSession")
-
-    if "gpt" in test_list and "gpt_tests" not in test_list:
-        excluded_tests.append("GptTests")
+    excluded_tests.extend(list(generate_excluded_test_list(test_list)))
 
     ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
@@ -734,11 +737,11 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
 
-        parallel = default_test_parallel
+        gpt_tests = {"gpt", "gpt_session", "gpt_tests", "gpt_executor"}
 
         # gpt* tests are not parallelized as it would cause OOM because kv cache memory allocations
         # exist in multiple running tests
-        if "gpt" in test_list or "gpt_session" in test_list or "gpt_tests" in test_list:
+        if gpt_tests.intersection(test_list):
             parallel = 1
 
         if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
