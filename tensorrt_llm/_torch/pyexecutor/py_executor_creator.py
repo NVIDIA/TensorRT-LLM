@@ -1,4 +1,5 @@
 import copy
+from typing import Optional
 
 import tensorrt_llm
 from tensorrt_llm._utils import get_sm_version
@@ -25,7 +26,7 @@ from .py_executor import PyExecutor
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None,
-                       lora_config: LoraConfig = None) -> PyExecutor:
+                       lora_config: Optional[LoraConfig] = None) -> PyExecutor:
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
