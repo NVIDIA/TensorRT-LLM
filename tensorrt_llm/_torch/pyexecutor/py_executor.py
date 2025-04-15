@@ -1828,7 +1828,9 @@ class PyExecutor:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
-            error_responses[req_id] = ExecutorResponse(req_id, error_msg)
+            error_responses[req_id] = ExecutorResponse(
+                req_id, error_msg, client_id=request.py_client_id)
+        self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
     def _terminate_request(self, request: LlmRequest):
