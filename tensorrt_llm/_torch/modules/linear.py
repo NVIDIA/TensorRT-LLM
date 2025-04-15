@@ -146,6 +146,7 @@ class Linear(nn.Module):
         is_expert: bool = False,
         skip_create_weights: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_llama4_qkv: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -187,6 +188,9 @@ class Linear(nn.Module):
         self._weights_created = False
         self.is_expert = is_expert
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        # Llama4 QKV gemm kernel has hard requirement of hidden_size = 5120
+        # and soft requirement of out_features = 896.
+        self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
 
         if not skip_create_weights:
             self.create_weights()
@@ -309,15 +313,23 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                # This op does not support bias now.
-                output = torch.ops.trtllm.cublas_scaled_mm(
-                    qinput,
-                    weight.t(),
-                    scale_a=self.input_scale,
-                    scale_b=self.weight_scale,
-                    bias=None,
-                    out_dtype=self.dtype or input.dtype,
-                )
+                if self.use_llama4_qkv and qinput.shape[0] <= 4:
+                    # Kernel is only efficient when M <= 4
+                    output = torch.ops.trtllm.llama4_qkv_gemm(
+                        qinput,
+                        weight.t(),
+                        self.combined_scale
+                    )
+                else:
+                    # This op does not support bias now.
+                    output = torch.ops.trtllm.cublas_scaled_mm(
+                        qinput,
+                        weight.t(),
+                        scale_a=self.input_scale,
+                        scale_b=self.weight_scale,
+                        bias=None,
+                        out_dtype=self.dtype or input.dtype,
+                    )
                 if bias is not None:
                     output = output + bias
             elif self.has_fp8_block_scales:
@@ -484,6 +496,7 @@ class Linear(nn.Module):
                     q_weight = q_weight.to(self.dtype) * weight_scale[0]
                     k_weight = k_weight.to(self.dtype) * weight_scale[1]
                     v_weight = v_weight.to(self.dtype) * weight_scale[2]
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
