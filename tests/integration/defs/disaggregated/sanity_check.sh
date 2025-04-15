@@ -61,6 +61,9 @@ elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_mtp" ]]; then
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1" ]]; then
   NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp" ]]; then
+  NUM_RANKS=2
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml
 else
   echo "Invalid test description: ${TEST_DESC}"
   exit 1
