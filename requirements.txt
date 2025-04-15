@@ -49,4 +49,4 @@ opencv-python-headless
 xgrammar==0.1.16
 backoff
 nvtx
-matplotlib
+matplotlib # FIXME: this is added to make nvtx happy
