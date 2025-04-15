@@ -1,11 +1,11 @@
 import pytest
 import yaml
 
-from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              DisaggServerConfig,
-                                              extract_disagg_cfg,
-                                              get_server_configs_dict,
-                                              parse_disagg_config_file)
+# isort: off
+from tensorrt_llm.llmapi.disagg_utils import (
+    CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
+    extract_disagg_cfg, get_server_configs_dict, parse_disagg_config_file)
+# isort: on
 
 
 def get_yaml_config():
