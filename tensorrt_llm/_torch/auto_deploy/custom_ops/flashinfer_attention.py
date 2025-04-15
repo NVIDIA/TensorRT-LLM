@@ -353,8 +353,8 @@ def unfused_flashinfer_mha_with_cache(
     k = k.view(b * s, -1, head_dim)
     v = v.view(b * s, -1, head_dim)
 
-    n_heads = q.shape[2]
-    n_kv_heads = k.shape[2]
+    n_heads = q.shape[1]
+    n_kv_heads = k.shape[1]
 
     pp = PlanParams(
         n_heads=n_heads,
