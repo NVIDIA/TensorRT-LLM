@@ -1,8 +1,25 @@
-// Auto-generated file embedding BatchedGemmKernel_BatchM_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile128x64_Mma128x64x32_Cluster1x1x1_DsFp8_sm100a.cubin
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
-namespace tensorrt_llm::kernels{
-
+namespace tensorrt_llm::kernels
+{
+// clang-format off
 unsigned char const BatchedGemmKernel_BatchM_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile128x64_Mma128x64x32_Cluster1x1x1_DsFp8_sm100a_cubin_data[] = {
 0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x41, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 0x02, 0x00, 0xBE, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -4344,5 +4361,7 @@ unsigned char const BatchedGemmKernel_BatchM_E4m3Fp32_Bfloat16_Tile128x128x128_E
 0x88, 0x4A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x4A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
 const unsigned BatchedGemmKernel_BatchM_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile128x64_Mma128x64x32_Cluster1x1x1_DsFp8_sm100a_cubin_len = sizeof(BatchedGemmKernel_BatchM_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile128x64_Mma128x64x32_Cluster1x1x1_DsFp8_sm100a_cubin_data);
-} //namespace tensorrt_llm::kernels
+// clang-format on
+} // namespace tensorrt_llm::kernels
