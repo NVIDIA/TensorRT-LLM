@@ -418,6 +418,24 @@ class ModelLoader:
                             "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
+                # AWQ. Mistral-8x7b-v0.1-AWQ
+                elif hf_quant_config.get("quant_method") == "awq":
+                    logger.info(
+                        "AWQ quantization detected in config.json, setting up appropriate quantization parameters."
+                    )
+                    bits = hf_quant_config.get("bits", 4)
+                    if bits == 4:
+                        quant_config.quant_algo = QuantAlgo.W4A16_AWQ
+                    elif bits == 8:
+                        quant_config.quant_algo = QuantAlgo.W4A8_AWQ
+                    else:
+                        raise ValueError(
+                            f"Unsupported AWQ quantization bits: {bits}")
+
+                    quant_config.group_size = hf_quant_config.get(
+                        "group_size", 128)
+                    quant_config.has_zero_point = hf_quant_config.get(
+                        "zero_point", False)
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
