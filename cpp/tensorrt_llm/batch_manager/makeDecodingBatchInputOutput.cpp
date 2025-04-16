@@ -107,9 +107,6 @@ std::vector<SizeType32> getActiveSlots(RequestVector const& contextRequests, Req
             }
         }
     }
-
-    std::sort(activeSlots.begin(), activeSlots.end());
-
     return activeSlots;
 }
 

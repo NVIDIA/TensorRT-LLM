@@ -1643,7 +1643,9 @@ INSTANTIATE_TEST_SUITE_P(MedusaTests, ParamTest,
                 .setKVCacheType(KVCacheType::kPAGED)
                 .useMedusa()
                 .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(std::nullopt), // freeGpuMemoryFraction
@@ -1667,7 +1669,8 @@ INSTANTIATE_TEST_SUITE_P(EagleTests, ParamTest,
                 .useEagle()
                 .setBatchSizes({8})),
         testing::Values(TrtGptModelType::InflightFusedBatching),
-        testing::Values(TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}),
         testing::Values(std::nullopt), // maxTokensInPagedKvCache
         testing::Values(std::nullopt), // freeGpuMemoryFraction
@@ -1717,7 +1720,9 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
                 .useExplicitDraftTokensDecoding()
                 .setMaxOutputLength(128)
                 .setBatchSizes({8})),
-        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(TrtGptModelType::InflightFusedBatching),
+        testing::Values(
+            TrtGptModelIfbTestType::BULK, TrtGptModelIfbTestType::WAVEFRONT, TrtGptModelIfbTestType::RANDOM),
         testing::Values(BeamConfig{1, {1}}), // beamConfig
         testing::Values(std::nullopt),       // maxTokensInPagedKvCache
         testing::Values(std::nullopt),       // freeGpuMemoryFraction
