@@ -262,7 +262,7 @@ class Llama4DecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -393,7 +393,7 @@ class LlamaDecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
