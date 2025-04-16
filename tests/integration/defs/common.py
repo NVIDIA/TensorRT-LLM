@@ -298,7 +298,7 @@ def convert_weights(llm_venv,
             example_name = "gpt"
         elif "llama" in model_path:
             example_name = "llama"
-        script = f"{example_root}/../{example_name}/convert_checkpoint.py"
+        script = f"{example_root}/../models/core/{example_name}/convert_checkpoint.py"
         convert_cmd = [
             f"{script}",
             "--model_dir",
@@ -313,7 +313,7 @@ def convert_weights(llm_venv,
             example_name = "gpt"
         elif "llama" in model_path:
             example_name = "llama"
-        script = f"{example_root}/../{example_name}/convert_checkpoint.py"
+        script = f"{example_root}/../models/core/{example_name}/convert_checkpoint.py"
         convert_cmd = [
             f"{script}",
             "--model_dir",
