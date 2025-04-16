@@ -940,8 +940,8 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
-                "CapacityScheduler pick up no requests, probably because of insufficient resources such as kvCache "
-                ",will try wait for kvCache transfer to complete");
+                "CapacityScheduler didn't schedule any requests, probably because of insufficient resources such as KV "
+                "cache, will try wait for KV cache transfer to complete");
             if (mCacheTransceiver)
             {
                 mCacheTransceiver->checkContextTransferStatus(1);
@@ -963,9 +963,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         if (!currRequests.empty())
         {
             TLLM_LOG_DEBUG("Running DECODER model with batch size: %lu", currRequests.size());
+            // For overlap don't store inflight requests, so they are not skipped in scheduler
+            if (!isTrtOverlap())
             {
                 NVTX3_SCOPED_RANGE(updateInflightReqIds);
-                // Add to set of requests in flight
+                // Add requests to in-flight set, so they can be skipped in other micro batches
                 for (auto const& requests : {currRequests.contextRequests, currRequests.generationRequests})
                 {
                     for (auto const& llmReq : requests)
@@ -1066,6 +1068,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                     else if (llmReq->isGenerationInProgressState())
                     {
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
+                    }
+
+                    if (isTrtOverlap() && llmReq->willCompleteNextIteration())
+                    {
+                        llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
                     }
                 }
             }
@@ -1558,7 +1565,8 @@ void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector c
         auto& runtimeBuffers = *mBuffers[bufferId];
         runtimeBuffers.prepareStep(cacheTransCompleteRequests, {}, getMaxBeamWidth(), getMaxAttentionWindow(),
             *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
-            mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
+            mPeftTables[mMicroBatchId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits(),
+            isTrtOverlap(), nullptr);
         auto const contextBufferId = mCtxGenFusion ? getFusedBufferId() : getContextBufferId();
         setupDecoderStep(
             cacheTransCompleteRequests, *mBuffers.at(contextBufferId), mDecoderInputBuffers.at(getFusedBufferId()));
@@ -1616,10 +1624,10 @@ TrtGptModelInflightBatching::prepareBuffers(
 
     auto& runtimeBuffers = *mBuffers[bufferId];
 
-    auto [optProfileId, inputMap, outputMap]
-        = runtimeBuffers.prepareStep(contextRequests, generationRequests, mOperatingBeamWidth, getMaxAttentionWindow(),
-            *mDecoderBuffers, mKvCacheManager.get(), mCrossKvCacheManager.get(), mRnnStateManager.get(),
-            mPeftTables[bufferId], *mRuntime, mModelConfig, mWorldConfig, getGatherGenerationLogits());
+    auto [optProfileId, inputMap, outputMap] = runtimeBuffers.prepareStep(contextRequests, generationRequests,
+        mOperatingBeamWidth, getMaxAttentionWindow(), *mDecoderBuffers, mKvCacheManager.get(),
+        mCrossKvCacheManager.get(), mRnnStateManager.get(), mPeftTables[bufferId], *mRuntime, mModelConfig,
+        mWorldConfig, getGatherGenerationLogits(), isTrtOverlap(), mDecoder->getDecoderState().getAllNewTokens());
 
     mRuntime->setInputTensors(optProfileId, inputMap);
     mRuntime->setOutputTensors(optProfileId, outputMap);
@@ -1982,7 +1990,7 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto& decodingInput = mDecodingInputs.at(mMicroBatchId);
     std::tie(decodingInput, mDecodingOutput) = (*mMakeDecodingBatchInputOutput)(scheduledRequests.contextRequests,
         scheduledRequests.generationRequests, *mDecoderBuffers, mDecoderInputBuffers.at(fusedBufferId),
-        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), mOperatingBeamWidth,
+        mDecoder->getDecoderState(), mModelConfig, getMaxNumSequences(), mOperatingBeamWidth, isTrtOverlap(),
         mRuntime->getBufferManager(), mRuntime->getStream(), *fusedRuntimeBuffers);
 
     auto decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
@@ -2129,7 +2137,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
         for (auto const& llmReq : requests)
         {
             auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
-            if (llmReq->isContextInitState())
+            if (llmReq->isContextInitState() || llmReq->isGenerationCompleteState())
             {
                 continue;
             }

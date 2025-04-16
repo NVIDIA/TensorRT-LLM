@@ -32,7 +32,6 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <valarray>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -665,6 +664,12 @@ public:
     [[nodiscard]] SizeType32 getMaxNumGeneratedTokens() const
     {
         return getMaxBeamNumTokens() - mPromptLen;
+    }
+
+    /// @brief Returns true if request reaches max number of tokens in the current iteration.
+    [[nodiscard]] bool willCompleteNextIteration() const
+    {
+        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
     }
 
     [[nodiscard]] LlmRequestType getLlmRequestType() const

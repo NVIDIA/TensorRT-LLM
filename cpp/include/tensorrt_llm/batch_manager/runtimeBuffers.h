@@ -275,7 +275,8 @@ public:
         DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
         PeftTable const& peftTable, runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);
+        runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+        TensorPtr const& newOutputTokens);
 
     void prepareBuffersForCudaGraph(SizeType32 maxSequenceLength);
 
@@ -309,7 +310,7 @@ private:
         kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
         rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+        runtime::WorldConfig const& worldConfig, bool trtOverlap, TensorPtr const& newOutputTokens);
 
     void fillIOMaps(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 };
