@@ -1369,7 +1369,7 @@ INSTANTIATE_TEST_SUITE_P(GptChunkedLongContextTests, ParamTest,
         testing::Values(BeamConfig{1, {1}}), // beam config
         testing::Values(std::nullopt, 1024), // maxTokensInPagedKvCache
         testing::Values(std::nullopt),       // freeGpuMemoryFraction
-        testing::Values(false),              // enableTrtOverlap
+        testing::Values(true),               // enableTrtOverlap
         testing::Values(true),               // enableChunkedContext
         testing::Values(false),              // enableStreamingMode
         testing::Values(false),              // enableCudaGraphMode
