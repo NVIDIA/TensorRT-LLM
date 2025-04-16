@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <gtest/gtest.h>
-
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -25,7 +23,9 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+
 #include <NvInferRuntime.h>
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -109,7 +109,7 @@ void testAdd(tr::IBuffer& buffer, tr::BufferManager& manager, tr::CudaStream& st
     tr::kernels::invokeAdd(buffer, value, stream);
     tr::kernels::invokeAdd(buffer, value, stream);
     auto bufferHost = manager.copyFrom(buffer, tr::MemoryType::kCPU);
-    auto bufferPtr = tr::bufferCast<tr::SizeType32>(*bufferHost);
+    auto* bufferPtr = tr::bufferCast<tr::SizeType32>(*bufferHost);
     auto constexpr expected = 2 * value;
 
     auto anyMismatch = false;
@@ -176,7 +176,7 @@ TEST_F(RuntimeKernelTest, Transpose)
 
     auto input = mManager->copyFrom(inputHost, tr::ITensor::makeShape({batchSize, rowSize}), tr::MemoryType::kGPU);
 
-    TensorPtr output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
+    TensorPtr const output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
 
     tr::kernels::invokeTranspose(*output, *input, *mStream);
 
@@ -202,9 +202,10 @@ TEST_F(RuntimeKernelTest, TransposeWithOutputOffset)
     tr::SizeType32 const batchSize{4};
     auto const rowSize = static_cast<tr::SizeType32>(inputHost.size()) / batchSize;
 
-    TensorPtr input = mManager->copyFrom(inputHost, tr::ITensor::makeShape({batchSize, rowSize}), tr::MemoryType::kGPU);
+    TensorPtr const input
+        = mManager->copyFrom(inputHost, tr::ITensor::makeShape({batchSize, rowSize}), tr::MemoryType::kGPU);
 
-    TensorPtr output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
+    TensorPtr const output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
     mManager->setZero(*output);
 
     for (tr::SizeType32 sliceId = 0; sliceId < batchSize; ++sliceId)
@@ -236,9 +237,10 @@ TEST_F(RuntimeKernelTest, TransposeWithInputOffset)
     tr::SizeType32 const batchSize{4};
     auto const rowSize = static_cast<tr::SizeType32>(inputHost.size()) / batchSize;
 
-    TensorPtr input = mManager->copyFrom(inputHost, tr::ITensor::makeShape({batchSize, rowSize}), tr::MemoryType::kGPU);
+    TensorPtr const input
+        = mManager->copyFrom(inputHost, tr::ITensor::makeShape({batchSize, rowSize}), tr::MemoryType::kGPU);
 
-    TensorPtr output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
+    TensorPtr const output = mManager->gpu(tr::ITensor::makeShape({rowSize, batchSize}), nvinfer1::DataType::kINT32);
     mManager->setZero(*output);
 
     for (tr::SizeType32 sliceId = 0; sliceId < rowSize; ++sliceId)
@@ -318,10 +320,11 @@ TEST_F(RuntimeKernelTest, BuildTokenMask)
     tr::SizeType32 constexpr maxNewTokens{1};
     auto const maxSeqLength = maxInputLength + maxNewTokens;
 
-    TensorPtr inputLengths
+    TensorPtr const inputLengths
         = mManager->copyFrom(inputLengthsVec, tr::ITensor::makeShape({batchSize, 1}), tr::MemoryType::kGPU);
 
-    TensorPtr tokenMask = mManager->gpu(tr::ITensor::makeShape({batchSize, maxSeqLength}), nvinfer1::DataType::kINT32);
+    TensorPtr const tokenMask
+        = mManager->gpu(tr::ITensor::makeShape({batchSize, maxSeqLength}), nvinfer1::DataType::kINT32);
     tr::kernels::invokeBuildTokenMask(*tokenMask, *inputLengths, maxInputLength, *mStream);
 
     std::vector<tr::SizeType32> tokenMaskVec(tokenMask->getSize());
@@ -331,13 +334,19 @@ TEST_F(RuntimeKernelTest, BuildTokenMask)
     {
         for (tr::SizeType32 j = 0; j < maxSeqLength; ++j)
         {
-            auto const index = i * maxSeqLength + j;
+            auto const index = (i * maxSeqLength) + j;
             if (j < inputLengthsVec[i])
+            {
                 EXPECT_EQ(tokenMaskVec[index], 0) << "tokenMask should be 0 up to inputLengths[i]";
+            }
             else if (j < maxInputLength)
+            {
                 EXPECT_EQ(tokenMaskVec[index], 1) << "tokenMask should be 1 up to maxInputLength";
+            }
             else
+            {
                 EXPECT_EQ(tokenMaskVec[index], 0) << "tokenMask should be 0 after maxInputLength";
+            }
         }
     }
 }
@@ -349,9 +358,9 @@ TEST_F(RuntimeKernelTest, BuildAttentionMask)
     std::vector<std::int32_t> const input{padId, 287, 5093, 12, 50256, padId, 11, 30022, 263, 8776, 355, padId};
     auto const maxInputLength = static_cast<tr::SizeType32>(input.size());
 
-    TensorPtr inputIds
+    TensorPtr const inputIds
         = mManager->copyFrom(input, tr::ITensor::makeShape({batchSize, maxInputLength}), tr::MemoryType::kGPU);
-    TensorPtr attentionMask = mManager->copyFrom(*inputIds, tr::MemoryType::kGPU);
+    TensorPtr const attentionMask = mManager->copyFrom(*inputIds, tr::MemoryType::kGPU);
     tr::kernels::invokeBuildAttentionMask(*attentionMask, padId, *mStream);
 
     std::vector<tr::SizeType32> attentionMaskVec(attentionMask->getSize());
@@ -364,7 +373,7 @@ TEST_F(RuntimeKernelTest, BuildAttentionMask)
     {
         for (tr::SizeType32 j = 0; j < maxInputLength; ++j)
         {
-            auto const index = i * maxInputLength + j;
+            auto const index = (i * maxInputLength) + j;
             EXPECT_EQ(attentionMaskVec[index], attentionMaskHost[index]) << "Error at index (" << i << ',' << j << ')';
         }
     }
@@ -377,9 +386,9 @@ TEST_F(RuntimeKernelTest, ExtendAttentionMask)
     std::vector<std::int32_t> const input{padId, 287, 5093, 12, 50256, padId, 11, 30022, 263, 8776, 355, padId};
     auto const maxInputLength = static_cast<tr::SizeType32>(input.size());
 
-    TensorPtr inputIds
+    TensorPtr const inputIds
         = mManager->copyFrom(input, tr::ITensor::makeShape({batchSize, maxInputLength}), tr::MemoryType::kGPU);
-    TensorPtr attentionMask = mManager->copyFrom(*inputIds, tr::MemoryType::kGPU);
+    TensorPtr const attentionMask = mManager->copyFrom(*inputIds, tr::MemoryType::kGPU);
     tr::kernels::invokeBuildAttentionMask(*attentionMask, padId, *mStream);
 
     auto attentionMaskHost = mManager->copyFrom(*attentionMask, tr::MemoryType::kCPU);
@@ -392,12 +401,12 @@ TEST_F(RuntimeKernelTest, ExtendAttentionMask)
     std::vector<tr::SizeType32> attentionMaskVec(tr::ITensor::volume(newShape));
     for (tr::SizeType32 i = 0; i < batchSize; ++i)
     {
-        std::copy(attentionMaskData + i * oldLength, attentionMaskData + (i + 1) * oldLength,
-            std::begin(attentionMaskVec) + i * newLength);
-        attentionMaskVec[(i + 1) * newLength - 1] = 1;
+        std::copy(attentionMaskData + (i * oldLength), attentionMaskData + ((i + 1) * oldLength),
+            std::begin(attentionMaskVec) + (i * newLength));
+        attentionMaskVec[((i + 1) * newLength) - 1] = 1;
     }
 
-    TensorPtr newAttentionMask = mManager->gpu(newShape, nvinfer1::DataType::kINT32);
+    TensorPtr const newAttentionMask = mManager->gpu(newShape, nvinfer1::DataType::kINT32);
     mManager->setZero(*newAttentionMask);
     tr::kernels::invokeExtendAttentionMask(*newAttentionMask, *attentionMask, *mStream);
 
@@ -408,8 +417,8 @@ TEST_F(RuntimeKernelTest, ExtendAttentionMask)
     {
         for (tr::SizeType32 j = 0; j < oldLength; ++j)
         {
-            auto const oldIndex = i * oldLength + j;
-            auto const newIndex = i * newLength + j;
+            auto const oldIndex = (i * oldLength) + j;
+            auto const newIndex = (i * newLength) + j;
             EXPECT_EQ(attentionMaskVec[oldIndex], newAttentionMaskVec[newIndex])
                 << "Error at index (" << i << ',' << j << ')';
         }
@@ -440,7 +449,7 @@ TEST_F(RuntimeKernelTest, CopyInputToOutput)
     std::iota(inputLengthsHost.begin(), inputLengthsHost.end(), 1);
     auto inputLengths = mManager->copyFrom(inputLengthsHost, tr::ITensor::makeShape({batchSize}), tr::MemoryType::kGPU);
 
-    TensorPtr outputIds
+    TensorPtr const outputIds
         = mManager->gpu(tr::ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32);
 
     tr::kernels::invokeCopyInputToOutput(*outputIds, *inputIds, *inputLengths, padId, *mStream);
@@ -492,7 +501,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutput)
     }
     auto inputIds = mManager->copyFrom(inputsHost, tr::ITensor::makeShape({1, totalInputSize}), tr::MemoryType::kGPU);
 
-    TensorPtr outputIds
+    TensorPtr const outputIds
         = mManager->gpu(tr::ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32);
 
     auto inputOffsets
@@ -555,7 +564,7 @@ TEST_F(RuntimeKernelTest, CopyInputToOutputTransposed)
     std::iota(inputLengthsHost.begin(), inputLengthsHost.end(), 1);
     auto inputLengths = mManager->copyFrom(inputLengthsHost, tr::ITensor::makeShape({batchSize}), tr::MemoryType::kGPU);
 
-    TensorPtr outputIds
+    TensorPtr const outputIds
         = mManager->gpu(tr::ITensor::makeShape({maxSeqLength, batchSize, beamWidth}), nvinfer1::DataType::kINT32);
 
     tr::kernels::invokeCopyInputToOutputTransposed(*outputIds, *inputIds, *inputLengths, padId, *mStream);
@@ -609,7 +618,7 @@ TEST_F(RuntimeKernelTest, CopyPackedInputToOutputTransposed)
     }
     auto inputIds = mManager->copyFrom(inputsHost, tr::ITensor::makeShape({1, totalInputSize}), tr::MemoryType::kGPU);
 
-    TensorPtr outputIds
+    TensorPtr const outputIds
         = mManager->gpu(tr::ITensor::makeShape({maxSeqLength, batchSize, beamWidth}), nvinfer1::DataType::kINT32);
 
     auto inputOffsets
@@ -706,7 +715,7 @@ TEST_F(RuntimeKernelTest, SplitTransposed)
         tr::kernels::splitTransposed(*outputTensor, *inputTensor, split, *mStream);
         auto outputHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
         auto* outputPtr = tr::bufferCast<tr::SizeType32>(*outputHost);
-        cudaError_t cudaerr = cudaDeviceSynchronize();
+        cudaError_t const cudaerr = cudaDeviceSynchronize();
 
         for (tr::SizeType32 i = 0; i < static_cast<tr::SizeType32>(input.size()); ++i)
         {
@@ -727,7 +736,7 @@ TEST_F(RuntimeKernelTest, SplitTransposed)
         tr::kernels::splitTransposed(*outputTensor, *inputTensor, split, *mStream);
         auto outputHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
         auto* outputPtr = tr::bufferCast<tr::SizeType32>(*outputHost);
-        cudaError_t cudaerr = cudaDeviceSynchronize();
+        cudaError_t const cudaerr = cudaDeviceSynchronize();
 
         for (tr::SizeType32 i = 0; i < static_cast<tr::SizeType32>(input.size()); ++i)
         {
