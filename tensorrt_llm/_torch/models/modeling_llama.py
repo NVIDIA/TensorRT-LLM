@@ -156,7 +156,8 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            is_expert=True)
+            is_expert=True,
+            is_llama4=True)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -262,6 +263,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
+                is_llama4=True
             )
 
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()

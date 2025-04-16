@@ -36,7 +36,8 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  is_expert: bool = False,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 is_llama4: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -73,7 +74,11 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             is_expert=is_expert,
             skip_create_weights=config.skip_create_weights,
+            # During llama4, we are using the custom kernel that performs FC+SwiGLU
+            # in one kernel.
+            use_llama4_fc_swiglu=is_llama4
         )
+        self.is_llama4 = is_llama4
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,
@@ -112,21 +117,30 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
-            h1 = self.gate_up_proj(x)
-            if lora_params is not None:
-                assert self.layer_idx is not None, "layer_idx is required for lora"
-                h1_lora = self.splitted_gate_up_lora(x, lora_params,
-                                                     self.layer_idx)
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
+            if self.is_llama4 and x.shape[0] <= 4:
+                # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
+                # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
+                # Currently, we are replacing a kernel that gives fp8 in and bf16 out with
+                # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
+                # the next gemm layer's input_scale inverse to the current layer as output
+                # scaling factor.
+                h2 = self.gate_up_proj(x, inv_input_scale=self.down_proj.inv_input_scale)
+            else:
+                h1 = self.gate_up_proj(x)
+                if lora_params is not None:
+                    assert self.layer_idx is not None, "layer_idx is required for lora"
+                    h1_lora = self.splitted_gate_up_lora(x, lora_params,
+                                                        self.layer_idx)
+                    if h1_lora is not None:
+                        h1 = h1 + h1_lora
 
-                h1_lora = self.fused_gate_up_lora(x, lora_params,
-                                                  self.layer_idx)
+                    h1_lora = self.fused_gate_up_lora(x, lora_params,
+                                                    self.layer_idx)
 
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
+                    if h1_lora is not None:
+                        h1 = h1 + h1_lora
 
-            h2 = swiglu(h1)
+                h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params)
             if lora_params is not None:

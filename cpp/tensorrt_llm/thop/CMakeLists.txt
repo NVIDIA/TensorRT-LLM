@@ -55,6 +55,9 @@ add_library(
   fp8Quantize.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
+  llama4GemmSwiGLU.cpp
+  llama4RouterGemm.cpp
+  llama4QKVGemm.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
@@ -66,8 +69,6 @@ add_library(
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
-  llama4RouterGemm.cpp
-  llama4QKVGemm.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp

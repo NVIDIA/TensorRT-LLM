@@ -147,6 +147,7 @@ class Linear(nn.Module):
         skip_create_weights: bool = False,
         use_custom_cublas_mm: bool = False,
         use_llama4_qkv: bool = False,
+        use_llama4_fc_swiglu: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -191,6 +192,9 @@ class Linear(nn.Module):
         # Llama4 QKV gemm kernel has hard requirement of hidden_size = 5120
         # and soft requirement of out_features = 896.
         self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
+        # Llama4 FC+SwiGLU kernel has hard requirement of hidden_size = 5120
+        # and targets output_features = 2048 or 4096.
+        self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
 
         if not skip_create_weights:
             self.create_weights()
@@ -304,7 +308,7 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(self, input, weight, bias):
+    def apply_linear(self, input, weight, bias, inv_input_scale: Optional[torch.Tensor] = None):
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -319,6 +323,13 @@ class Linear(nn.Module):
                         qinput,
                         weight.t(),
                         self.combined_scale
+                    )
+                elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
+                    output = torch.ops.trtllm.llama4_fc_swiglu_fp8(
+                        qinput,
+                        weight.t(),
+                        self.combined_scale,
+                        inv_input_scale,
                     )
                 else:
                     # This op does not support bias now.
@@ -384,6 +395,7 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        inv_input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from ..distributed import allgather
 
@@ -408,7 +420,12 @@ class Linear(nn.Module):
             else:
                 output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            output = self.apply_linear(input, self.weight, self.bias)
+            if self.use_llama4_fc_swiglu and input.shape[0] <= 4:
+                # We are passing the input_scale's inverse of the next layer to the current layer
+                assert inv_input_scale is not None, "inv_input_scale is required for llama4_fc_swiglu"
+                output = self.apply_linear(input, self.weight, self.bias, inv_input_scale=inv_input_scale)
+            else:
+                output = self.apply_linear(input, self.weight, self.bias)
             if self.parallel_config.gather_output:
                 output = allgather(output, self.parallel_config)
         else:
@@ -558,6 +575,7 @@ class Linear(nn.Module):
                     copy(self.weight_scale, max(weight_scale))
                     gate_weight = gate_weight.to(self.dtype) * weight_scale[0]
                     up_weight = up_weight.to(self.dtype) * weight_scale[1]
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
