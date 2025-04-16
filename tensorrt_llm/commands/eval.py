@@ -20,7 +20,7 @@ import tensorrt_llm.profiler as profiler
 
 from .._torch.llm import LLM as PyTorchLLM
 from .._torch.pyexecutor.config import PyTorchConfig
-from ..evaluate import GPQA, GSM8K, MMLU, CnnDailymail
+from ..evaluate import MMLU, CnnDailymail, LmEvalEvaluator
 from ..llmapi import LLM, BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
@@ -149,8 +149,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
 main.add_command(CnnDailymail.command)
 main.add_command(MMLU.command)
-main.add_command(GSM8K.command)
-main.add_command(GPQA.command)
+main.add_command(LmEvalEvaluator.command)
 
 if __name__ == "__main__":
     main()
