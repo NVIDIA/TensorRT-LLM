@@ -1048,7 +1048,8 @@ def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
 ])
 def test_llmapi_load_engine_from_build_command_with_lora(
         llm_root, llm_venv, engine_dir, model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", model_name)
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      model_name)
     dtype = 'bfloat16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 

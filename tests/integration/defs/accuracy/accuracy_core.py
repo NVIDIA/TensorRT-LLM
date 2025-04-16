@@ -373,10 +373,10 @@ class CliFlowAccuracyTestHarness:
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
-            if self.EXAMPLE_FOLDER in ["eagle", "medusa"]:
-                script = "../quantization/quantize.py"
-            else:
+            if "core" in self.example_dir:
                 script = "../../../quantization/quantize.py"
+            else:
+                script = "../quantization/quantize.py"
         else:
             script = "convert_checkpoint.py"
 
