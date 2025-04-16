@@ -1780,7 +1780,7 @@ public:
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
 
-    // current position of the prompt tuning table
+    // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
 
 protected:

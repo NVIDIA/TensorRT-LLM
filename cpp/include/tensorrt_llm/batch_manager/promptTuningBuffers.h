@@ -38,13 +38,6 @@ public:
     runtime::PromptTuningParams mPromptTuningParams;
     SizeType32 mMaxPromptVocabSize;
 
-    bool mPromptTableOffloading;
-
-    bool mChunkPtableInitialized{false};
-    std::optional<std::array<TensorPtr, 2>> mChunkPtableBuffers;
-    std::optional<std::vector<std::vector<SizeType32>>> mChunkPtableBufferStartPositions;
-    size_t mChunkPtableCurrentIndex{0};
-
     PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
 
@@ -84,10 +77,18 @@ public:
      * - Each buffer size is limited to contextChunkSize * hiddenSize
      * - Efficient memory usage through chunk-based processing
      */
-    void initializeChunkPtableBuffers(runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
-        SizeType32 contextChunkSize, std::shared_ptr<LlmRequest> const&);
 
-    void moveToNextChunkPtableBuffer();
+    bool mPromptTableOffloading;
+
+    bool mChunkPtableInitialized{false};
+    std::optional<std::array<TensorPtr, 2>> mChunkPtableBuffers;
+    std::optional<std::vector<std::vector<SizeType32>>> mChunkPtableBufferStartPositions;
+    size_t mChunkPtableCurrentIndex{0};
+
+    void initializeChunkPtableBuffers(runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
+        SizeType32 contextChunkSize, std::shared_ptr<LlmRequest> const& llmReq);
+
+    void switchChunkPtableBuffer();
 
     size_t getChunkPtableCurrentIndex();
 

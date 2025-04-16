@@ -508,7 +508,7 @@ private:
     std::optional<SizeType32> mMaxNumTokensRuntime;
     // Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
     bool mGatherGenerationLogits{false};
-    // Whether the context is chunked
+    // offloading and prefetching the prompt tuning table (only effective in chunked prefill mode)
     bool mPromptTableOffloading;
 
     /******************** Buffers ********************/

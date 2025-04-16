@@ -1179,7 +1179,7 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
     ```
 ## Enabling Embedding Table Offloading
 
-Embedding Table Offloading is a memory optimization technique that helps manage large embedding tables  more efficiently. It offloads the embedding table to CPU memory and uses a chunked prefetching mechanism during processing. This approach is only available when operating in context chunk mode.
+Embedding Table Offloading is a memory optimization technique that helps manage large embedding tables more efficiently. It offloads the embedding table to CPU memory and uses a chunked prefetching mechanism during processing. This approach is only available when operating in context chunk mode.
 
 To enable this feature, use the `--mm_embedding_offloading` argument:
 ```bash

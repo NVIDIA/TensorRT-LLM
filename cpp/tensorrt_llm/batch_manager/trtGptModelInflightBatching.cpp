@@ -1386,9 +1386,10 @@ void TrtGptModelInflightBatching::createBuffers(executor::DecodingConfig const& 
     mBuffers.clear();
     for (SizeType32 i = 0; i < mNumBuffers; ++i)
     {
-        mBuffers.emplace_back(std::make_shared<RuntimeBuffers>(getMaxBatchSize(), mOperatingBeamWidth,
-            getMaxAttentionWindowVec(), getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig,
-            mWorldConfig, decodingConfig, getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs, mPromptTableOffloading));
+        mBuffers.emplace_back(
+            std::make_shared<RuntimeBuffers>(getMaxBatchSize(), mOperatingBeamWidth, getMaxAttentionWindowVec(),
+                getMaxAttentionWindow(), getSinkTokenLen(), *mRuntime, mModelConfig, mWorldConfig, decodingConfig,
+                getGatherGenerationLogits(), getMaxNumTokens(), additionalModelOutputs, mPromptTableOffloading));
     }
 
     for (SizeType32 i = 0; i < mNumMicroBatches; ++i)
@@ -1619,7 +1620,7 @@ void TrtGptModelInflightBatching::executeStep(
 
     if (mPromptTableOffloading)
     {
-        prefetchNextPromptTableChunk(contextRequests, true, bufferId);
+        prefetchNextPromptTableChunk(contextRequests, /* isFirstChunk */ true, bufferId);
     }
 
     auto [optProfileId, inputMap, outputMap] = prepareBuffers(contextRequests, generationRequests, bufferId);
@@ -1657,7 +1658,7 @@ void TrtGptModelInflightBatching::executeStep(
 
     if (mPromptTableOffloading)
     {
-        prefetchNextPromptTableChunk(contextRequests, false, bufferId);
+        prefetchNextPromptTableChunk(contextRequests, /* isFirstChunk */ false, bufferId);
     }
 
     executeContext(optProfileId, bufferId);
@@ -2618,11 +2619,11 @@ SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 input
  * Manages prefetching of prompt table chunks using a double-buffer strategy
  *
  * Function Flow:
- * 1. First Chunk Processing (isBeforePrepareBuffers == true):
+ * 1. First Chunk Processing (isFirstChunk == true):
  *    - Uses blocking prefetch on main runtime stream
  *    - Ensures initial data is ready before computation starts
  *
- * 2. Subsequent Chunks (isBeforePrepareBuffers == false):
+ * 2. Subsequent Chunks (isFirstChunk == false):
  *    - Uses non-blocking prefetch on separate copy stream
  *    - Overlaps data transfer with computation
  *
@@ -2642,28 +2643,28 @@ SizeType32 TrtGptModelInflightBatching::getMaxCapacityBatchSize(SizeType32 input
  *
  * 3. copyPromptTableToGpuInChunk:
  *    - Handles actual transfer from CPU pinned memory to GPU
- *    - Uses appropriate buffer manager based on isBeforePrepareBuffers
+ *    - Uses appropriate buffer manager based on isFirstChunk
  */
 void TrtGptModelInflightBatching::prefetchNextPromptTableChunk(
-    RequestVector const& contextRequests, bool isBeforePrepareBuffers, SizeType32 bufferId)
+    RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId)
 {
     auto& promptTuningBuffers = mBuffers[bufferId]->promptTuningBuffers;
 
-    if (!isBeforePrepareBuffers)
+    if (!isFirstChunk)
     {
         // Only switch buffer after prepareBuffer()
-        promptTuningBuffers->moveToNextChunkPtableBuffer();
+        promptTuningBuffers->switchChunkPtableBuffer();
     }
 
     SizeType32 contextId = 0;
     for (auto const& llmReq : contextRequests)
     {
-        if (llmReq->isFirstContextChunk() && isBeforePrepareBuffers)
+        if (llmReq->isFirstContextChunk() && isFirstChunk)
         {
             // For first chunk: Blocking prefetch on runtime stream to ensure data is ready
             remapInputTokensForPromptTable(llmReq, true, bufferId, contextId);
         }
-        else if (!isBeforePrepareBuffers) // prefetching for subsequent chunks
+        else if (!isFirstChunk) // prefetching for subsequent chunks
         {
             // For the first prefetch chunk, don't need to wait for previous prefetch to complete
             // For subsequent chunks: Need to wait for previous prefetch to complete
@@ -2684,7 +2685,7 @@ void TrtGptModelInflightBatching::prefetchNextPromptTableChunk(
 }
 
 void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
-    std::shared_ptr<LlmRequest> const& llmReq, bool isBeforePrepareBuffers, SizeType32 bufferId, SizeType32 contextId)
+    std::shared_ptr<LlmRequest> const& llmReq, bool isFirstChunk, SizeType32 bufferId, SizeType32 contextId)
 {
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "remapInputTokensForPromptTable");
     auto& promptTuningBuffers = mBuffers[bufferId]->promptTuningBuffers;
@@ -2692,7 +2693,7 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
     auto& inputTokensMutable = llmReq->getTokensMutable(0);
     auto vocabSize = mModelConfig.getVocabSize();
 
-    if (isBeforePrepareBuffers)
+    if (isFirstChunk)
     {
         promptTuningBuffers->initializeChunkPtableBuffers(
             mRuntime->getBufferManager(), mModelConfig, chunkSize, llmReq);
@@ -2701,7 +2702,7 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
     size_t processChunkSize;
     size_t beginPos;
 
-    if (!isBeforePrepareBuffers)
+    if (!isFirstChunk)
     {
         processChunkSize = std::min(chunkSize, llmReq->getContextRemainingLength() - chunkSize);
     }
@@ -2710,7 +2711,7 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
         processChunkSize = std::min(chunkSize, llmReq->getContextRemainingLength());
     }
 
-    if (!isBeforePrepareBuffers)
+    if (!isFirstChunk)
     {
         // For prefetching next chunk
         if (llmReq->getContextRemainingLength() - chunkSize <= 0)
@@ -2742,12 +2743,11 @@ void TrtGptModelInflightBatching::remapInputTokensForPromptTable(
         }
     }
 
-    copyPromptTableToGpuInChunk(llmReq, outOfVocabTokens, isBeforePrepareBuffers, bufferId, contextId);
+    copyPromptTableToGpuInChunk(llmReq, outOfVocabTokens, isFirstChunk, bufferId, contextId);
 }
 
 void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<LlmRequest> const& llmReq,
-    std::vector<int32_t> const& outOfVocabTokens, bool isBeforePrepareBuffers, SizeType32 bufferId,
-    SizeType32 contextId)
+    std::vector<int32_t> const& outOfVocabTokens, bool isFirstChunk, SizeType32 bufferId, SizeType32 contextId)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE_WITH_NAME(range, "copyPromptTableToGpuInChunk");
@@ -2762,7 +2762,7 @@ void TrtGptModelInflightBatching::copyPromptTableToGpuInChunk(std::shared_ptr<Ll
     TLLM_CHECK_WITH_INFO(promptTable.has_value(), "promptTable is empty but there's fake_prompt");
     TLLM_CHECK_WITH_INFO(promptTable.value() != nullptr, "promptTable value is null but there's fake_prompt");
 
-    auto currentBufferManager = isBeforePrepareBuffers ? mRuntime->getBufferManager() : mCopyBufferManager;
+    auto currentBufferManager = isFirstChunk ? mRuntime->getBufferManager() : mCopyBufferManager;
     auto const hiddenSize = mModelConfig.getHiddenSize();
     auto numRows = outOfVocabTokens.size();
     std::size_t sliceSize = static_cast<size_t>(numRows * hiddenSize);
