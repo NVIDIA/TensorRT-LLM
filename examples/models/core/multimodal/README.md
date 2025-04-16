@@ -71,7 +71,7 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
 
     For BLIP2-OPT family,
     ```bash
-    python ../opt/convert_checkpoint.py --model_type blip2 \
+    python ../../contrib/opt/convert_checkpoint.py --model_type blip2 \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
         --dtype float16
@@ -168,7 +168,7 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
 
 5. (Optional) INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
-    python ../opt/convert_checkpoint.py \
+    python ../../contrib/opt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --dtype float16 \
         --output_dir tmp/trt_models/${MODEL_NAME}/int4_weightonly/1-gpu \
@@ -216,7 +216,7 @@ Currently, CogVLM only support bfloat16 precision.
    CogVLM uses a Vit encoder as LLM encoder and a modified Llama as decoder.
 
     ```bash
-    python ../cogvlm/convert_checkpoint.py --model_dir tmp/hf_models/${MODEL_NAME}  --output_dir tmp/trt_models/${MODEL_NAME} --dtype bfloat16 --use_prompt_tuning
+    python ../../contrib/cogvlm/convert_checkpoint.py --model_dir tmp/hf_models/${MODEL_NAME}  --output_dir tmp/trt_models/${MODEL_NAME} --dtype bfloat16 --use_prompt_tuning
 
     trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME} \
     --output_dir tmp/trt_engines/${MODEL_NAME}/bf16/1-gpu/llm \
@@ -461,7 +461,7 @@ Firstly, please install transformers with 4.37.2
 
    ```bash
    # FP8 quantization
-   python ../quantization/quantize.py \
+   python ../../../quantization/quantize.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
         --dtype bfloat16 \
@@ -469,7 +469,7 @@ Firstly, please install transformers with 4.37.2
         --kv_cache_dtype fp8
 
    # INT8 SmoothQuant quantization
-   python ../quantization/quantize.py \
+   python ../../../quantization/quantize.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/int8/1-gpu \
         --dtype bfloat16 \
@@ -710,7 +710,7 @@ Firstly, please install transformers with 4.37.2
         --weight_only_precision int4
 
    # INT4 AWQ
-   python ../quantization/quantize.py \
+   python ../../../quantization/quantize.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/int4_awq/1-gpu \
         --dtype float16 \
@@ -737,7 +737,7 @@ For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llam
 * build engine of vision encoder model
 
 ```bash
-python examples/multimodal/build_multimodal_engine.py --model_type mllama \
+python examples/models/core/multimodal/build_multimodal_engine.py --model_type mllama \
                                                   --model_path Llama-3.2-11B-Vision/ \
                                                   --output_dir /tmp/mllama/trt_engines/vision/
 ```
@@ -745,7 +745,7 @@ python examples/multimodal/build_multimodal_engine.py --model_type mllama \
 * build engine of decoder model
 
 ```bash
-python examples/mllama/convert_checkpoint.py --model_dir Llama-3.2-11B-Vision/ \
+python examples/models/core/mllama/convert_checkpoint.py --model_dir Llama-3.2-11B-Vision/ \
                               --output_dir /tmp/mllama/trt_ckpts \
                               --dtype bfloat16
 
@@ -765,7 +765,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 * Run test on multimodal/run.py with C++ runtime (LLM part only)
 
 ```bash
-python3 examples/multimodal/run.py --engine_dir /tmp/mllama/trt_engines/ \
+python3 examples/models/core/multimodal/run.py --engine_dir /tmp/mllama/trt_engines/ \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
                                    --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
@@ -774,7 +774,7 @@ python3 examples/multimodal/run.py --engine_dir /tmp/mllama/trt_engines/ \
 
 Use model_runner_cpp by default. To switch to model_runner, set `--session python` in the command mentioned above.
 
-python3 examples/multimodal/eval.py \
+python3 examples/models/core/multimodal/eval.py \
                                    --engine_dir /tmp/mllama/trt_engines/ \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --test_trtllm \
@@ -810,14 +810,14 @@ trtllm-build --checkpoint_dir /tmp/llama-3.2-11B-Vision/fp8/ \
 
 # copy visiual engine directory `/tmp/mllama/trt_engines/vision/` to fp8 engine directory `/tmp/trt_engines/llama-3.2-11B-Vision/fp8/vision`
 
-python3 examples/multimodal/run.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
+python3 examples/models/core/multimodal/run.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
                                    --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
                                    --max_new_tokens 50 \
                                    --batch_size 2
 
-python3 examples/multimodal/eval.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
+python3 examples/models/core/multimodal/eval.py --engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/fp8/ \
                                    --hf_model_dir Llama-3.2-11B-Vision/ \
                                    --test_trtllm \
                                    --accuracy_threshold 65 \
@@ -1049,7 +1049,7 @@ pip install -r requirements-qwen2vl.txt
     ```bash
     pip install decord # used for loading video
 
-    python3 ../quantization/quantize.py \
+    python3 ../../../quantization/quantize.py \
         --nemo_ckpt_path /path/to/nemotron/model.nemo \
         --dtype bfloat16 \
         --batch_size 64 \
