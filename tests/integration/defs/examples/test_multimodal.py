@@ -86,15 +86,15 @@ def _test_llm_multimodal_general(llm_venv,
     model_name = tllm_model_name
     model_name = "pix2struct" if model_name == "deplot" else model_name
     opt_example_root = multimodal_example_root + "/../models/contrib/opt"
-    enc_dec_example_root = multimodal_example_root + "/../enc_dec"
-    llama_example_root = multimodal_example_root + "/../llama"
+    enc_dec_example_root = multimodal_example_root + "/../models/core/enc_dec"
+    llama_example_root = multimodal_example_root + "/../models/core/llama"
     cogvlm_example_root = multimodal_example_root + "/../cogvlm"
-    gpt_example_root = multimodal_example_root + "/../gpt"
-    nemotron_example_root = multimodal_example_root + "/../nemotron"
-    phi_example_root = multimodal_example_root + "/../phi"
-    mllama_example_root = multimodal_example_root + "/../mllama"
-    qwen_example_root = multimodal_example_root + "/../qwen"
-    internlm_example_root = multimodal_example_root + "/../internlm2"
+    gpt_example_root = multimodal_example_root + "/../models/core/gpt"
+    nemotron_example_root = multimodal_example_root + "/..models/core/nemotron"
+    phi_example_root = multimodal_example_root + "/../models/core/phi"
+    mllama_example_root = multimodal_example_root + "/../models/core/mllama"
+    qwen_example_root = multimodal_example_root + "/..models/core/qwen"
+    internlm_example_root = multimodal_example_root + "/../models/core/internlm2"
 
     opt_model = "opt" in model_name
     nougat_model = "nougat" in model_name
