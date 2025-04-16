@@ -607,8 +607,9 @@ def quantize_data(llm_venv,
     else:
         output_dir = os.path.join(output_dir, "no_kv_cache")
 
+    quantize_script = f"{example_root}/../../../quantization/quantize.py" if "core" in example_root else f"{example_root}/../quantization/quantize.py"
     quantize_cmd = [
-        f"{example_root}/../quantization/quantize.py",
+        quantize_script,
         f"--model_dir={model_dir}",
         f"--dtype={dtype}",
         f"--qformat={qformat}",
