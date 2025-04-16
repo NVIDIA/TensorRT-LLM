@@ -657,6 +657,12 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
+    /// @brief Returns true if request has draft tokens
+    [[nodiscard]] bool willCompleteNextIteration() const
+    {
+        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
+    }
+
     [[nodiscard]] LlmRequestType getLlmRequestType() const
     {
         return mLlmRequestType;
