@@ -146,10 +146,10 @@ class TestMixtral8x7B_Instruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1"
 
     def test_awq(self):
-        with LLM(self.MODEL_PATH) as llm:
-            quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm, quant_config=quant_config)
+            task.evaluate(llm)
 
     @skip_pre_blackwell
     def test_fp4(self, mocker):
