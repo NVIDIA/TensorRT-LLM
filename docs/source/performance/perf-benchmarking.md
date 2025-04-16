@@ -511,14 +511,7 @@ trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   --backend pytorch \
   --num_requests 10 \
   --max_batch_size 4 \
-  --extra_llm_api_options ./mm_extra.yml \
   --modality image
-```
-
-Content of `mm_extra.yml`:
-```
-pytorch_backend_config:
-  use_cuda_graph: true
 ```
 
 
@@ -567,7 +560,7 @@ Average request latency (ms):                     3671.8441
 ===========================================================
 = DATASET DETAILS
 ===========================================================
-Dataset Path:         /workspaces/tensorrt_llm/mm_data.json
+Dataset Path:         /workspaces/tensorrt_llm/mm_data.jsonl
 Number of Sequences:  10
 
 -- Percentiles statistics ---------------------------------
@@ -589,7 +582,7 @@ P99:  1059.0000           137.0000          1178.0000
 - `--output-len-dist` is a required argument for multimodal datasets.
 - Tokenizer is unused during the prepare step but it is still a required argument.
 - Since the images are converted to tokens when the model is run, `trtllm-bench` uses a default large value for the maximum input sequence length when setting up the execution settings.
-  You can also modify the behavior by specifying a different value with the flag `--max_input_seq_len_for_multimodal` that suits your use-case.
+  You can also modify the behavior by specifying a different value with the flag `--max_input_len` that suits your use-case.
 
 #### Quantization in the PyTorch Flow
 

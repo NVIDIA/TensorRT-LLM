@@ -8,7 +8,7 @@ import numpy as np
 from pydantic import BaseModel
 
 
-class Sample(BaseModel):
+class TextSample(BaseModel):
     input_len: int
     input_ids: List[int]
     output_len: int
@@ -24,7 +24,7 @@ class MultimodalSample(BaseModel):
 
 class Workload(BaseModel):
     metadata: dict
-    samples: List[Union[Sample, MultimodalSample]] = []
+    samples: List[Union[TextSample, MultimodalSample]] = []
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -40,15 +40,15 @@ class Workload(BaseModel):
         self.metadata.setdefault('workload_name', workload_name)
 
 
-def dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
-                 output_file):
+def text_dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
+                      output_file):
     samples = []
     for i in range(len(input_ids)):
         samples.append(
-            Sample(input_len=input_lens[i],
-                   input_ids=input_ids[i],
-                   output_len=output_lens[i],
-                   task_id=task_ids[i]))
+            TextSample(input_len=input_lens[i],
+                       input_ids=input_ids[i],
+                       output_len=output_lens[i],
+                       task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
@@ -70,7 +70,7 @@ def multimodal_dataset_dump(multimodal_texts, multimodal_image_paths,
         json.dump(workload.model_dump(), f)
 
 
-def print_dataset(input_ids, output_lens):
+def print_text_dataset(input_ids, output_lens):
     for i, input_tokens in enumerate(input_ids):
         d = {
             "task_id": i,

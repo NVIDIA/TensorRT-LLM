@@ -8,9 +8,9 @@ import click
 from datasets import load_dataset
 from PIL import Image
 from pydantic import BaseModel, model_validator
-from utils.utils import (dataset_dump, get_norm_dist_lengths,
-                         multimodal_dataset_dump, print_dataset,
-                         print_multimodal_dataset)
+from utils.utils import (get_norm_dist_lengths, multimodal_dataset_dump,
+                         print_multimodal_dataset, print_text_dataset,
+                         text_dataset_dump)
 
 
 def validate_output_len_dist(ctx, param, value):
@@ -210,13 +210,13 @@ def dataset(root_args, **kwargs):
     multimodal_image_paths = []
     for req in load_dataset_from_hf(dataset_config):
         if any(key in req for key in ['image', 'image_1', 'video']):
+            # multimodal input
             if 'video' in req and req['video'] is not None:
                 assert "Not supported yet"
             assert kwargs['output_len_dist'] is not None, (
                 "Output length distribution must be set for multimodal requests."
             )
             modality = 'image'
-            # multimodal request
             text = dataset_config.get_prompt(req)
             images = dataset_config.get_images(req)
             image_paths = []
@@ -234,11 +234,10 @@ def dataset(root_args, **kwargs):
                             image_paths.append(filepath)
                     else:
                         raise ValueError(f"Invalid image path: {image}")
-            # assert len(image_paths) > 0, "No image paths found."
             multimodal_texts.append(text)
             multimodal_image_paths.append(image_paths)
         else:
-            # input
+            # text input
             prompt = dataset_config.get_prompt(
                 req) + ' ' + dataset_config.get_input(req)
             logging.debug(f"Input sequence: {prompt}")
@@ -266,10 +265,10 @@ def dataset(root_args, **kwargs):
         if kwargs['num_requests'] and req_cnt >= kwargs['num_requests']:
             break
 
-    if kwargs['num_requests'] and (
-            len(input_ids) + len(multimodal_texts)) < kwargs['num_requests']:
+    if kwargs['num_requests'] and (len(input_ids) if modality is None else len(
+            multimodal_texts)) < kwargs['num_requests']:
         logging.warning(
-            f"Number of requests={len(input_ids) + len(multimodal_texts)} is"
+            f"Number of requests={len(input_ids) if modality is None else len(multimodal_texts)} is"
             f" smaller than the num-requests user set={kwargs['num_requests']}."
         )
 
@@ -285,7 +284,7 @@ def dataset(root_args, **kwargs):
     if modality is not None:
         logging.debug(f"Modality: {modality}")
 
-    if modality == 'image':
+    if modality is not None:
         if not root_args.std_out:
             multimodal_dataset_dump(
                 multimodal_texts, multimodal_image_paths, output_lens, task_ids,
@@ -303,7 +302,7 @@ def dataset(root_args, **kwargs):
             )
     else:
         if not root_args.std_out:
-            dataset_dump(
+            text_dataset_dump(
                 input_lens, input_ids, output_lens, task_ids, {
                     "workload_type": "dataset",
                     "tokenizer": root_args.tokenizer.__class__.__name__,
@@ -312,7 +311,7 @@ def dataset(root_args, **kwargs):
                     "max_output_len": max(output_lens)
                 }, root_args.output)
         else:
-            print_dataset(
+            print_text_dataset(
                 input_ids,
                 output_lens,
             )

@@ -101,7 +101,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Modality of the multimodal requests.",
 )
 @optgroup.option(
-    "--max_input_seq_len_for_multimodal",
+    "--max_input_len",
     type=int,
     default=4096,
     help=
@@ -211,8 +211,7 @@ def throughput_command(
     concurrency: int = params.pop("concurrency")
     backend: str = params.get("backend")
     modality: str = params.pop("modality")
-    max_input_seq_len_for_multimodal: int = params.pop(
-        "max_input_seq_len_for_multimodal")
+    max_input_len: int = params.pop("max_input_len")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Reporting options
@@ -235,7 +234,7 @@ def throughput_command(
             model_dir=checkpoint_path,
             model_type=model_type,
             modality=modality,
-            max_input_seq_len_for_multimodal=max_input_seq_len_for_multimodal)
+            max_input_seq_len_for_multimodal=max_input_len)
         metadata.dataset_path = dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
