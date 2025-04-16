@@ -10,8 +10,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
 from .flashinfer import FlashInferAttentionMetadata, PlanParams
-from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
-from .vanilla import VanillaAttention
+from .interface import (AttentionBackend, AttentionMask,
+                        PredefinedAttentionMask, dummy_forward)
 
 
 # Please sync with flashinfer's DISPATCH_GQA_GROUP_SIZE in include/flashinfer/utils.cuh
@@ -329,7 +329,7 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q, k, v)
+            return dummy_forward(q, k, v)
 
         num_contexts = metadata.num_contexts
         num_queries = metadata.num_queries
