@@ -1241,7 +1241,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     , mBlockManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksInPrimaryPool, blocksInSecondaryPool,
           maxNumSequences, std::move(stream), onboardBlocks, cacheType, secondaryOffloadMinPriority,
           std::move(eventManager), enableHashKey, enablePartialReuse, copyOnPartialReuse)
-    , mEnableBlockReuse{enableBlockReuse}
+    // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
+    , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
     , mEnableHashKey{enableHashKey}
 {
     // The sink tokens are stored in blocks separate from other tokens.

@@ -8,8 +8,9 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from ..llmapi.utils import (ManagedThread, enable_llm_debug, nvtx_mark,
-                            nvtx_range, print_colored, print_colored_debug)
+from .._utils import nvtx_mark, nvtx_range_debug
+from ..llmapi.utils import (ManagedThread, enable_llm_debug, print_colored,
+                            print_colored_debug)
 
 
 class ZeroMqQueue:
@@ -86,7 +87,7 @@ class ZeroMqQueue:
 
     def put(self, obj: Any):
         self.setup_lazily()
-        with nvtx_range("send", color="blue", category="IPC"):
+        with nvtx_range_debug("send", color="blue", category="IPC"):
             self.socket.send_pyobj(obj)
 
     async def put_async(self, obj: Any):
