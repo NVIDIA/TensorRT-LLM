@@ -355,6 +355,8 @@ class PyTorchModelEngine(ModelEngine):
         # accommodate certain target/draft model use cases. See
         # py_executor.py for how this is used.
         self.last_spec_metadata = None
+        self.is_draft_model = False
+        self.use_prepare_draft_tp_inputs = False
 
         self.in_warmup = False
 
@@ -1151,8 +1153,100 @@ class PyTorchModelEngine(ModelEngine):
                 inputs['attn_metadata'].kv_lens_cuda[
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+        elif self.is_draft_model and self.use_prepare_draft_tp_inputs:
+            inputs['position_ids'][0, inputs['spec_metadata'].gather_ids] += 1
+            inputs['spec_metadata'].gather_ids *= 0
+            num_seqs = inputs['attn_metadata'].num_seqs
+            inputs['attn_metadata']._seq_lens[:num_seqs].fill_(1)
+            inputs['attn_metadata']._seq_lens_cuda[:num_seqs].fill_(1)
 
         return inputs
+
+    def _prepare_draft_tp_inputs(
+            self,
+            scheduled_requests: ScheduledRequests,
+            kv_cache_manager: KVCacheManager,
+            attn_metadata: AttentionMetadata,
+            spec_metadata: Optional[SpecMetadata] = None,
+            new_tensors_device: Optional[Dict[str, torch.Tensor]] = None):
+        generation_requests = scheduled_requests.generation_requests
+        num_seqs = len(generation_requests)
+        num_tokens = num_seqs
+        last_iter_num_tokens = spec_metadata.num_tokens
+
+        num_cached_tokens_per_seq = []
+        for request in generation_requests:
+            past_seen_token_num = request.max_beam_num_tokens
+            num_cached_tokens_per_seq.append(past_seen_token_num)
+
+        # attention metadata
+        attn_metadata.num_contexts = 0
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            num_extra_kv_tokens=self.spec_config.num_extra_kv_tokens)
+        attn_metadata.kv_cache_manager = kv_cache_manager
+        attn_metadata.prepare()
+
+        # speculative decoding metadata
+        sequence_lengths = [1] * num_seqs
+        spec_metadata.num_generations = len(generation_requests)
+        spec_metadata.num_tokens = len(generation_requests)
+        spec_metadata.seq_lens = sequence_lengths
+        spec_metadata.prepare()
+
+        inputs = {
+            'attn_metadata':
+            attn_metadata,
+            'input_ids':
+            new_tensors_device["new_tokens_device"][:num_tokens],
+            'position_ids':
+            self.position_ids_cuda[:last_iter_num_tokens].unsqueeze(0),
+            'inputs_embeds':
+            None,
+            'multi_modal_data':
+            None,
+            'mrope_config':
+            None,
+            'spec_metadata':
+            spec_metadata
+        }
+
+        # support attention dp
+        if self.enable_attention_dp:
+            if spec_metadata is not None:
+                all_rank_num_tokens = self.dist.tp_allgather([
+                    attn_metadata.num_tokens, spec_metadata.num_tokens,
+                    len(sequence_lengths)
+                ])
+                attn_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
+                ]
+                spec_all_rank_num_tokens = [
+                    item[1] for item in all_rank_num_tokens
+                ]
+                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
+                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+            else:
+                all_rank_num_tokens = self.dist.tp_allgather(
+                    attn_metadata.num_tokens)
+                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        if self.mapping.has_pp():
+            pipeline_interface = None
+            if self.mapping.pp_rank > 0:
+                pipeline_interface = self.model.create_pipeline_interface(
+                    inputs['input_ids'].shape[0])
+                pipeline_interface.recv()
+            inputs['pipeline_interface'] = pipeline_interface
+
+        num_generation_tokens = len(generation_requests)
+        self.iter_states['num_ctx_requests'] = 0
+        self.iter_states['num_ctx_tokens'] = 0
+        self.iter_states['num_generation_tokens'] = num_generation_tokens
+        return inputs, None
 
     def _prepare_tp_inputs(
             self,
@@ -1999,6 +2093,7 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None):
+        self.use_prepare_draft_tp_inputs = False
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if 'star_attention' == cp_type:
@@ -2006,6 +2101,12 @@ class PyTorchModelEngine(ModelEngine):
                     scheduled_requests, kv_cache_manager, attn_metadata)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'
+        elif self.is_draft_model and new_tensors_device is not None:
+            self.use_prepare_draft_tp_inputs = True
+            return self._prepare_draft_tp_inputs(scheduled_requests,
+                                                 kv_cache_manager,
+                                                 attn_metadata, spec_metadata,
+                                                 new_tensors_device)
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
@@ -2138,6 +2239,8 @@ class PyTorchModelEngine(ModelEngine):
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
+        if inputs['spec_metadata'] is not None:
+            gather_ids = inputs['spec_metadata'].gather_ids
         if self.without_logits:
             outputs = self.model_forward(**inputs)
             return outputs
