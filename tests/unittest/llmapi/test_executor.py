@@ -89,7 +89,7 @@ def test_generation_bs2(llama_7b_bs2_path: Path):
         result = executor.generate(prompt_token_ids,
                                    sampling_params=SamplingParams(
                                        max_tokens=max_tokens,
-                                       best_of=2,
+                                       n=2,
                                        use_beam_search=True))
         assert similar(tokenizer.decode(result.outputs[0].token_ids),
                        'E F G H I J K L')

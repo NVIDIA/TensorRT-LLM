@@ -76,7 +76,8 @@ def main(model: str, tokenizer: str, tp_size: int):
 
     sampling_params = SamplingParams(max_tokens=100,
                                      temperature=0.5,
-                                     top_p=0.95)
+                                     top_p=0.95,
+                                     n=1)
 
     llm = LLM(model,
               tokenizer,

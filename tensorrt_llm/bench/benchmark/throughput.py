@@ -344,7 +344,7 @@ def throughput_command(
 
         sampling_params = SamplingParams(end_id=eos_id,
                                          pad_id=eos_id,
-                                         best_of=beam_width,
+                                         n=beam_width,
                                          use_beam_search=beam_width > 1)
 
         # Perform warmup if requested.

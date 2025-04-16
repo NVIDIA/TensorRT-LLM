@@ -205,7 +205,11 @@ def latency_command(
     kwargs = runtime_config.get_llm_args()
 
     try:
-        sampling_params = SamplingParams(end_id=eos_id, pad_id=pad_id)
+        sampling_params = SamplingParams(
+            end_id=eos_id,
+            pad_id=pad_id,
+            n=1,
+        )
         llm = LLM(**kwargs)
 
         # Perform warmup if requested.

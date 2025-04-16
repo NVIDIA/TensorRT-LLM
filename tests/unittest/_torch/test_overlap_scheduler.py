@@ -56,7 +56,9 @@ def test_overlap_scheduler_consistency(model_path, test_case,
     sampling_config = SamplingParams(max_tokens=max_new_tokens,
                                      stop=stop_words,
                                      temperature=temperature,
-                                     top_p=top_p)
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
 
     # Test with overlap scheduler enabled
     llm = create_llm(model_path,

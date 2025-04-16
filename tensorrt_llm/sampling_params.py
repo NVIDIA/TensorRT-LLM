@@ -8,7 +8,6 @@ import torch
 from pydantic import BaseModel
 
 from tensorrt_llm.bindings import executor as tllme
-from tensorrt_llm.logger import logger
 
 
 @dataclass(slots=True, kw_only=True)
@@ -114,6 +113,15 @@ class SamplingParams:
     """
     Sampling parameters for text generation.
 
+    Usage Examples:
+
+        use_beam_search is False:
+            - best_of is None: (top-p/top-k) sampling n responses and return n generations
+            - best_of is not None: (top-p/top-k) sampling best_of responses and return n generations (best_of >= n must hold)
+        use_beam_search is True:
+            - best_of is None: beam search with beam width of n, return n generations
+            - best_of is not None: beam search with beam width of best_of, return n generations (best_of >= n must hold)
+
     Args:
         end_id (int, optional): The end token id. Defaults to None.
         pad_id (int, optional): The pad token id. Defaults to None.
@@ -133,15 +141,12 @@ class SamplingParams:
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
         use_beam_search (bool): Whether to use beam search. Defaults to False.
 
-        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `n`. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
-
         top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.
         top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.
         top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
         top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
         top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
-        random_seed (int, optional): This argument is being deprecated; please use seed instead. Defaults to None.
         temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. None means using C++ runtime default 1.0f. Defaults to None.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
         beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
@@ -208,14 +213,12 @@ class SamplingParams:
     use_beam_search: bool = False
 
     # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
-    num_return_sequences: Optional[int] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
     top_p_min: Optional[float] = None
     top_p_reset_ids: Optional[int] = None
     top_p_decay: Optional[float] = None
     seed: Optional[int] = None
-    random_seed: Optional[int] = None
     temperature: Optional[float] = None
     min_tokens: Optional[int] = None
     beam_search_diversity_rate: Optional[float] = None
@@ -277,7 +280,7 @@ class SamplingParams:
         if self.best_of is not None:
             if self.best_of > 1 and self.best_of < self.n:
                 raise ValueError(
-                    f'In beam search, beam_width ({self.best_of}) must be '
+                    f'In beam search, best_of ({self.best_of}) must be '
                     f'greater than or equal to n ({self.n}).')
 
             if (self.best_of > 1 and self._greedy_decoding and
@@ -396,8 +399,11 @@ class SamplingParams:
             for f in dir(tllme.SamplingConfig) if not f.startswith('__')
         }
         unmatched_params = [
-            'num_return_sequences', 'beam_width', 'n', 'best_of',
-            'use_beam_search'
+            'num_return_sequences',
+            'beam_width',
+            'n',
+            'best_of',
+            'use_beam_search',
         ]
         llmapi_to_rt_param_map = {
             f: getattr(self, f)
