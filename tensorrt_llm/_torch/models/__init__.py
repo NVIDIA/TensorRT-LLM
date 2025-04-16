@@ -5,9 +5,9 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
-from .modeling_mamba_hybrid import MambaHybridForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
+from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
@@ -23,9 +23,9 @@ __all__ = [
     "DeepseekV3ForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
-    "MambaHybridForCausalLM",
     "MixtralForCausalLM",
     "NemotronForCausalLM",
+    "NemotronHForCausalLM",
     "NemotronNASForCausalLM",
     "Qwen2ForCausalLM",
     "Qwen2ForProcessRewardModel",

@@ -322,7 +322,7 @@ class FusedMoE(nn.Module):
                 fc_weight_scales=self.w3_w1_weight_scaling_factor,
                 proj_weight_scales=self.w2_weight_scaling_factor,
             )
-        elif self.has_nv_fp4:
+        elif self.has_nvfp4:
             self.quant_scales = FusedMoEQuantScalesNVFP4(
                 fc1_act_global=self.fc31_input_scale,
                 fc1_weight_block=self.w3_w1_weight_scale,
@@ -350,7 +350,7 @@ class FusedMoE(nn.Module):
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
-        self.has_nv_fp4 = False
+        self.has_nvfp4 = False
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             self.has_any_quant = True
             qc = self.quant_config
@@ -407,7 +407,7 @@ class FusedMoE(nn.Module):
                 self.register_parameter("w2_weight_scaling_factor",
                                         w2_weight_scaling_factor)
             elif qc.quant_mode.has_nvfp4():
-                self.has_nv_fp4 = True
+                self.has_nvfp4 = True
                 weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
                 self.scaling_vector_size = 16
                 # Divide by 16 because we use int64 to pack 16 fp4 values
@@ -573,7 +573,7 @@ class FusedMoE(nn.Module):
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
-            elif self.has_nv_fp4:
+            elif self.has_nvfp4:
                 if not disable_fp4_allgather():
                     if isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = x.fp4_tensor, x.scaling_factor
