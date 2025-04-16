@@ -53,8 +53,7 @@ public:
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false,
         std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false,
-        bool promptTableOffloading = false)
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -127,7 +126,7 @@ public:
     bool isLeaderInOrchMode;
     std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
     bool gatherGenerationLogits;
-    // Whether to offload the prompt table to the GPU
+    // Whether to offload the prompt table to CPU and prefetching to GPU
     bool promptTableOffloading;
 };
 

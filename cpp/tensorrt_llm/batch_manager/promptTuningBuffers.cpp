@@ -237,7 +237,7 @@ void PromptTuningBuffers::initializeChunkPtableBuffers(runtime::BufferManager co
     mChunkPtableInitialized = true;
 }
 
-void PromptTuningBuffers::moveToNextChunkPtableBuffer()
+void PromptTuningBuffers::switchChunkPtableBuffer()
 {
     mChunkPtableCurrentIndex = 1 - mChunkPtableCurrentIndex;
     clearBufferStartPositions(mChunkPtableCurrentIndex);
