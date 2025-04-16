@@ -132,6 +132,7 @@ public:
         kv_cache_manager::BaseKVCacheManager const* kvCacheManager,
         kv_cache_manager::BaseKVCacheManager const* crossKvCacheManager, runtime::BufferManager const& manager);
 
+    // Copy CacheIndirection from `decoderCacheIndirectionOutput` to `this->cacheIndirection`
     void copyCacheIndirection(RequestVector const& genRequests, TensorPtr const& decoderCacheIndirectionOutput,
         runtime::CudaStream const& stream);
 

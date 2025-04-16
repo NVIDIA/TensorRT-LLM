@@ -20,10 +20,10 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/fmhaDispatcher.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
@@ -263,6 +263,7 @@ public:
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kYARN
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
@@ -370,6 +371,7 @@ public:
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
+    bool mFP8GenerationMLA = false;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;

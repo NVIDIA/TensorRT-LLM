@@ -32,7 +32,7 @@ class Request::Impl
 {
 
 public:
-    // Constructor
+    // 34 parameters, 34 items in initialization list
     Impl(VecTokens inputTokenIds, SizeType32 maxNewTokens, bool streaming, SamplingConfig const& samplingConfig,
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,

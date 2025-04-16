@@ -262,7 +262,7 @@ std::optional<LookaheadDecodingConfig> DecodingConfig::getLookaheadDecodingConfi
     return mLookaheadDecodingConfig;
 }
 
-void DecodingConfig::setLookaheadDecoding(LookaheadDecodingConfig const& lookaheadDecodingConfig)
+void DecodingConfig::setLookaheadDecodingConfig(LookaheadDecodingConfig const& lookaheadDecodingConfig)
 {
     mLookaheadDecodingConfig = lookaheadDecodingConfig;
     mDecodingMode = DecodingMode::Lookahead();

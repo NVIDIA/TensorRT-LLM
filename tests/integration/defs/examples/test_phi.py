@@ -507,17 +507,17 @@ def test_llm_phi_lora_1gpu(data_type, lora_data_type, phi_example_root,
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
 @pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2",
-    "Phi-3-mini-128k-instruct",
-    "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct",
-    'Phi-3.5-MoE-instruct',
+    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
+    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
                                    cmodel_dir, engine_dir, phi_example_root,
                                    llm_datasets_root, llm_rouge_root, qformat):
     "Run phi quantization tests"
+    # Workaround for Modelopt can't convert Phi-3 on multi GPUs.
+    gpu_constraint = {"CUDA_VISIBLE_DEVICES": "0"}
+
     print("Convert checkpoint by modelopt...")
     convert_cmd = [
         f"{phi_example_root}/../quantization/quantize.py",
@@ -528,7 +528,7 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--kv_cache_dtype={qformat}",
         f"--output_dir={cmodel_dir}",
     ]
-    venv_check_call(llm_venv, convert_cmd)
+    venv_check_call(llm_venv, convert_cmd, env=gpu_constraint)
 
     print("Build engines...")
     build_cmd = [
@@ -540,7 +540,11 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--max_batch_size={16}",
     ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_env = {
+        **llm_venv._new_env,
+        **gpu_constraint
+    } if llm_venv._new_env else gpu_constraint
+    check_call(" ".join(build_cmd), shell=True, env=build_env)
 
     print("Run summarize...")
     threshold_score = 24.0
@@ -561,16 +565,14 @@ def test_llm_phi_quantization_1gpu(data_type, llm_phi_model_root, llm_venv,
         f"--dataset_dir={llm_datasets_root}",
         f"--rouge_dir={llm_rouge_root}",
     ]
-    venv_check_call(llm_venv, summary_cmd)
+
+    venv_check_call(llm_venv, summary_cmd, env=gpu_constraint)
 
 
 @skip_pre_ada
 @pytest.mark.parametrize("llm_phi_model_root", [
-    "phi-2",
-    "Phi-3-mini-128k-instruct",
-    "Phi-3-small-128k-instruct",
-    "Phi-3.5-mini-instruct",
-    "Phi-3.5-MoE-instruct",
+    "phi-2", "Phi-3-mini-128k-instruct", "Phi-3-small-128k-instruct",
+    "Phi-3.5-mini-instruct", "Phi-3.5-MoE-instruct", "Phi-4-mini-instruct"
 ],
                          indirect=True)
 def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
@@ -614,6 +616,7 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
         "Phi-3.5-mini-instruct": ["qkv_proj"],
         "Phi-3.5-MoE-instruct":
         ["q_proj", "k_proj", "v_proj", "w1", "w2", "w3"],
+        "Phi-4-mini-instruct": ["qkv_proj"],
     }
     trtllm_target_modules = {
         "phi-2": ["attn_q", "attn_k", "attn_v"],
@@ -624,6 +627,7 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
             "attn_q", "attn_k", "attn_v", "moe_h_to_4h", "moe_4h_to_h",
             "moe_gate"
         ],
+        "Phi-4-mini-instruct": ["attn_qkv"],
     }
     model_name = os.path.basename(llm_phi_model_root)
     test_multi_lora_support(

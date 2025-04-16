@@ -71,6 +71,8 @@ public:
     virtual Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) = 0;
 
     [[nodiscard]] virtual std::vector<Connection const*> getConnections(CommState const& state) = 0;
+
+    [[nodiscard]] virtual CommState const& getCommState() const = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

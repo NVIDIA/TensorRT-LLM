@@ -27,6 +27,12 @@ from ..sampling_params import SamplingParams
 
 class Evaluator(ABC):
 
+    def __init__(self,
+                 apply_chat_template: bool = False,
+                 system_prompt: Optional[str] = None):
+        self.apply_chat_template = apply_chat_template
+        self.system_prompt = system_prompt
+
     @abstractmethod
     def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()
@@ -36,6 +42,18 @@ class Evaluator(ABC):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
+    def do_apply_chat_template(self, llm: Union[LLM, PyTorchLLM],
+                               prompt: str) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        if self.system_prompt is not None:
+            messages = [{
+                "role": "system",
+                "content": self.system_prompt
+            }] + messages
+        return llm.tokenizer.apply_chat_template(messages,
+                                                 tokenize=False,
+                                                 add_generation_prompt=True)
+
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None) -> float:
@@ -43,6 +61,8 @@ class Evaluator(ABC):
         outputs, references, auxiliaries = [], [], []
         for prompt, reference, *aux in tqdm(self.generate_samples(),
                                             desc="Submitting requests"):
+            if self.apply_chat_template:
+                prompt = self.do_apply_chat_template(llm, prompt)
             output = llm.generate_async(prompt, sampling_params)
             outputs.append(output)
             references.append(reference)

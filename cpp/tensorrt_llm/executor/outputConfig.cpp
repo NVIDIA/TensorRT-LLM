@@ -33,7 +33,7 @@ OutputConfig::OutputConfig(bool inReturnLogProbs, bool inReturnContextLogits, bo
 {
 }
 
-OutputConfig::AdditionalModelOutput::AdditionalModelOutput(std::string name, bool gatherContext)
+AdditionalModelOutput::AdditionalModelOutput(std::string name, bool gatherContext)
     : name(std::move(name))
     , gatherContext(gatherContext)
 {

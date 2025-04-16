@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 
 namespace tensorrt_llm::runtime
@@ -30,7 +29,6 @@ class StatefulGptDecoderBatched : public IStatefulGptDecoder
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
     using TensorPtr = ITensor::SharedPtr;
-    using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
     StatefulGptDecoderBatched(CudaStreamPtr stream, nvinfer1::DataType dtype);
 
@@ -59,11 +57,11 @@ private:
     std::unique_ptr<GptDecoderBatched> mDecoder;
 
     // only used for IStatefulGptDecoder
-    DecoderFinishedEventPtr mDecoderFinishEvent;
+    CudaEvent mDecoderFinishEvent;
     CudaEvent mForwardEvent;
     TensorPtr mFinishedSum;
     TensorPtr mBatchSlotsSetup;   // [maxBatchSize], int32_t, address map, pinned
-    TensorPtr mBatchSlotsDecoder; // [maxTokensPerEngineStep, maxBatchSize], int32_t, address map, pinned
+    TensorPtr mBatchSlotsDecoder; // [maxBatchSize], int32_t, address map, pinned
 };
 
 } // namespace tensorrt_llm::runtime

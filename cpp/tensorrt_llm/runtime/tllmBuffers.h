@@ -709,7 +709,7 @@ public:
     {
         other.mSize = 0;
         other.mCapacity = 0;
-        other.mHandle = IpcNvlsHandle{};
+        other.mHandle = nullptr;
     }
 
     ~MulticastBuffer() override
@@ -733,7 +733,7 @@ public:
             // reset other
             other.mSize = 0;
             other.mCapacity = 0;
-            other.mHandle = IpcNvlsHandle{};
+            other.mHandle = nullptr;
         }
         return *this;
     }
@@ -741,22 +741,22 @@ public:
     // Return list of pointers to each rank
     [[nodiscard]] void* dataIpcList()
     {
-        return reinterpret_cast<void*>(mHandle.ipc_uc_ptrs.data());
+        return reinterpret_cast<void*>(mHandle->ipc_uc_ptrs.data());
     }
 
     [[nodiscard]] void const* dataIpcList() const
     {
-        return reinterpret_cast<void const*>(mHandle.ipc_uc_ptrs.data());
+        return reinterpret_cast<void const*>(mHandle->ipc_uc_ptrs.data());
     }
 
     [[nodiscard]] void* dataMC()
     {
-        return reinterpret_cast<void*>(mHandle.mc_ptr);
+        return reinterpret_cast<void*>(mHandle->mc_ptr);
     }
 
     [[nodiscard]] void const* dataMC() const
     {
-        return reinterpret_cast<void const*>(mHandle.mc_ptr);
+        return reinterpret_cast<void const*>(mHandle->mc_ptr);
     }
 
     //////////////////////////
@@ -768,13 +768,13 @@ public:
     // Return unicast pointer
     [[nodiscard]] void* data() override
     {
-        return reinterpret_cast<void*>(mHandle.uc_ptr);
+        return reinterpret_cast<void*>(mHandle->uc_ptr);
     }
 
     // Return unicast pointer
     [[nodiscard]] void const* data() const override
     {
-        return reinterpret_cast<void const*>(mHandle.uc_ptr);
+        return reinterpret_cast<void const*>(mHandle->uc_ptr);
     }
 
     [[nodiscard]] std::size_t getSize() const override
@@ -806,8 +806,8 @@ public:
             printf("MulticastBuffer resize: %d B\n", int(toBytes(newSize)));
             mHandle = ipcNvlsAllocate(toBytes(newSize), mRanks);
 
-            TLLM_CHECK(mHandle.size % BufferDataType(mType).getSize() == 0);
-            mCapacity = mHandle.size / BufferDataType(mType).getSize();
+            TLLM_CHECK(mHandle->size % BufferDataType(mType).getSize() == 0);
+            mCapacity = mHandle->size / BufferDataType(mType).getSize();
         }
         mSize = newSize;
     }
@@ -816,7 +816,7 @@ public:
     {
         if (mCapacity > 0)
         {
-            TLLM_CHECK(mHandle.size > 0);
+            TLLM_CHECK(mHandle->size > 0);
             ipcNvlsFree(mHandle);
         }
     }
@@ -826,7 +826,7 @@ private:
     std::size_t mCapacity = 0;
     nvinfer1::DataType mType;
     std::set<int> mRanks;
-    IpcNvlsHandle mHandle;
+    IpcNvlsHandle* mHandle;
 };
 
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;

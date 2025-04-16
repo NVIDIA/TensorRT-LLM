@@ -219,6 +219,44 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("ATTENTION", tr::ModelConfig::LayerType::kATTENTION)
         .value("RECURRENT", tr::ModelConfig::LayerType::kRECURRENT);
 
+    py::enum_<tr::LoraModule::ModuleType>(m, "LoraModuleType")
+        .value("INVALID", tr::LoraModule::ModuleType::kINVALID)
+        .value("ATTN_QKV", tr::LoraModule::ModuleType::kATTN_QKV)
+        .value("ATTN_Q", tr::LoraModule::ModuleType::kATTN_Q)
+        .value("ATTN_K", tr::LoraModule::ModuleType::kATTN_K)
+        .value("ATTN_V", tr::LoraModule::ModuleType::kATTN_V)
+        .value("ATTN_DENSE", tr::LoraModule::ModuleType::kATTN_DENSE)
+        .value("MLP_H_TO_4H", tr::LoraModule::ModuleType::kMLP_H_TO_4H)
+        .value("MLP_4H_TO_H", tr::LoraModule::ModuleType::kMLP_4H_TO_H)
+        .value("MLP_GATE", tr::LoraModule::ModuleType::kMLP_GATE)
+        .value("CROSS_ATTN_QKV", tr::LoraModule::ModuleType::kCROSS_ATTN_QKV)
+        .value("CROSS_ATTN_Q", tr::LoraModule::ModuleType::kCROSS_ATTN_Q)
+        .value("CROSS_ATTN_K", tr::LoraModule::ModuleType::kCROSS_ATTN_K)
+        .value("CROSS_ATTN_V", tr::LoraModule::ModuleType::kCROSS_ATTN_V)
+        .value("CROSS_ATTN_DENSE", tr::LoraModule::ModuleType::kCROSS_ATTN_DENSE)
+        .value("MOE_H_TO_4H", tr::LoraModule::ModuleType::kMOE_H_TO_4H)
+        .value("MOE_4H_TO_H", tr::LoraModule::ModuleType::kMOE_4H_TO_H)
+        .value("MOE_GATE", tr::LoraModule::ModuleType::kMOE_GATE)
+        .value("MOE_ROUTER", tr::LoraModule::ModuleType::kMOE_ROUTER)
+        .value("MLP_ROUTER", tr::LoraModule::ModuleType::kMLP_ROUTER)
+        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP);
+
+    py::class_<tr::LoraModule>(m, "LoraModule")
+        .def(py::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),
+            py::arg("module_type"), py::arg("in_dim"), py::arg("out_dim"), py::arg("in_dim_first"),
+            py::arg("out_dim_first"), py::arg("in_tp_split_dim"), py::arg("out_tp_split_dim"))
+        .def_property_readonly("module_type", &tr::LoraModule::name)
+        .def_property_readonly("in_dim", &tr::LoraModule::inDim)
+        .def_property_readonly("out_dim", &tr::LoraModule::outDim)
+        .def_property_readonly("in_dim_first", &tr::LoraModule::inDimFirst)
+        .def_property_readonly("out_dim_first", &tr::LoraModule::outDimFirst)
+        .def_property_readonly("in_tp_split_dim", &tr::LoraModule::inTpSplitDim)
+        .def_property_readonly("out_tp_split_dim", &tr::LoraModule::outTpSplitDim)
+        .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, py::arg("lora_module_names"),
+            py::arg("hidden_size"), py::arg("mlp_hidden_size"), py::arg("num_attention_heads"),
+            py::arg("num_kv_attention_heads"), py::arg("attention_head_size"), py::arg("tp_size") = 1,
+            py::arg("num_experts") = 0);
+
     py::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
@@ -311,7 +349,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::overload_cast<bool>(&tr::ModelConfig::computeGenerationLogits))
         .def_property("model_variant", &tr::ModelConfig::getModelVariant, &tr::ModelConfig::setModelVariant)
         .def_property(
-            "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention);
+            "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention)
+        .def_property("lora_modules", &tr::ModelConfig::getLoraModules, &tr::ModelConfig::setLoraModules)
+        .def_property("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank)
+        .def_property("mlp_hidden_size", &tr::ModelConfig::getMlpHiddenSize, &tr::ModelConfig::setMlpHiddenSize)
+        .def_property("size_per_head", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead);
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -488,8 +530,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("gpu_weights_percent", &tb::TrtGptModelOptionalParams::gpuWeightsPercent)
         .def_readwrite("max_beam_width", &tb::TrtGptModelOptionalParams::maxBeamWidth)
         .def_readwrite("scheduler_config", &tb::TrtGptModelOptionalParams::schedulerConfig)
-        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState))
-        .def("__eq__", &tb::TrtGptModelOptionalParams::operator==);
+        .def(py::pickle(gptModelParamsGetState, gptModelParamsSetState));
 
     py::class_<tr::MemoryCounters>(m, "MemoryCounters")
         .def_static("instance", &tr::MemoryCounters::getInstance, py::return_value_policy::reference)
@@ -525,7 +566,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
+    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, py::return_value_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 }

@@ -28,10 +28,13 @@
 #define dllGetSym(handle, name) dlsym(handle, name)
 #endif // defined(_WIN32)
 
-#include "cudaDriverWrapper.h"
 #include "tensorrt_llm/common/assert.h"
-#include <cstdio>
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
+
 #include <cuda.h>
+
+#include <cstdio>
+#include <mutex>
 
 namespace tensorrt_llm::common
 {
@@ -46,7 +49,7 @@ std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
         return result;
     }
 
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> const lock(mutex);
     result = instance.lock();
     if (!result)
     {
@@ -69,7 +72,7 @@ CUDADriverWrapper::CUDADriverWrapper()
     };
 
     *reinterpret_cast<void**>(&_cuGetErrorName) = load_sym(handle, "cuGetErrorName");
-    *reinterpret_cast<void**>(&_cuGetErrorMessage) = load_sym(handle, "cuGetErrorMessage");
+    *reinterpret_cast<void**>(&_cuGetErrorString) = load_sym(handle, "cuGetErrorString");
     *reinterpret_cast<void**>(&_cuFuncSetAttribute) = load_sym(handle, "cuFuncSetAttribute");
     *reinterpret_cast<void**>(&_cuLinkComplete) = load_sym(handle, "cuLinkComplete");
     *reinterpret_cast<void**>(&_cuModuleUnload) = load_sym(handle, "cuModuleUnload");
@@ -98,9 +101,9 @@ CUresult CUDADriverWrapper::cuGetErrorName(CUresult error, char const** pStr) co
     return (*_cuGetErrorName)(error, pStr);
 }
 
-CUresult CUDADriverWrapper::cuGetErrorMessage(CUresult error, char const** pStr) const
+CUresult CUDADriverWrapper::cuGetErrorString(CUresult error, char const** pStr) const
 {
-    return (*_cuGetErrorMessage)(error, pStr);
+    return (*_cuGetErrorString)(error, pStr);
 }
 
 CUresult CUDADriverWrapper::cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) const

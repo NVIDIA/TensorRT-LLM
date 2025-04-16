@@ -28,3 +28,4 @@ target_link_libraries(trtGptModelRealDecoderTest PRIVATE modelSpecStatic
 add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
 add_gtest(trtEncoderModelTest trtEncoderModelTest.cpp)
 add_gtest(guidedDecoderTest guidedDecoderTest.cpp)
+add_gtest(blockKeyTest blockKeyTest.cpp)

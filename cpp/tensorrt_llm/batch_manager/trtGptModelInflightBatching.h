@@ -119,7 +119,6 @@ public:
     using PeftTable = PeftCacheManager::PeftTable;
     using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
     using TensorPtr = runtime::ITensor::SharedPtr;
-    using DecoderFinishedEventPtr = std::unique_ptr<runtime::decoder_batch::DecoderFinishedEvent const>;
 
     TrtGptModelInflightBatching(std::shared_ptr<nvinfer1::ILogger> logger, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::RawEngine const& rawEngine, bool ctxGenFusion,
@@ -247,7 +246,7 @@ private:
     void createRuntimeContexts();
     void createDecoder(std::optional<executor::DecodingMode> const& decodingModeOpt);
     void createBuffers(executor::DecodingConfig const& decodingConfig,
-        std::optional<std::vector<std::string>> const& additionalOutputNames);
+        std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs);
     std::shared_ptr<KVCacheManager> createKvCacheManager(KvCacheConfig const& kvCacheConfig,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, KvCacheType kvCacheType = KvCacheType::kSELF);
     void createRnnStateManager();
@@ -282,11 +281,11 @@ private:
 
     void setupDecoderStep(
         RequestVector const& contextRequests, RuntimeBuffers const& buffers, DecoderInputBuffers const& inputBuffers);
-    DecoderFinishedEventPtr decoderStepAsync(ScheduledRequests const& scheduledRequests);
+    runtime::CudaEvent decoderStepAsync(ScheduledRequests const& scheduledRequests);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> decoderSync(
-        ScheduledRequests const& scheduledRequests, DecoderFinishedEventPtr decoderFinishEvent);
+        ScheduledRequests const& scheduledRequests, std::optional<runtime::CudaEvent> const& decoderFinishEvent);
 
-    DecoderFinishedEventPtr updateDecoderBuffers(bool returnLogProbs, DecoderFinishedEventPtr decoderFinishEvent);
+    runtime::CudaEvent updateDecoderBuffers(bool returnLogProbs, runtime::CudaEvent decoderFinishEvent);
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> communicateDecoderBuffers(bool returnLogProbs);
     void updateRequests(ScheduledRequests const& scheduledRequests);
 
@@ -417,7 +416,7 @@ private:
     // Config for debugging output
     std::optional<executor::DebugConfig> mDebugConfig;
     // List of additional outputs for each request
-    std::optional<std::vector<std::string>> mAdditionalOutputNames;
+    std::optional<std::vector<executor::AdditionalModelOutput>> mAdditionalModelOutputs;
 
     /******************** Components ********************/
     std::shared_ptr<nvinfer1::ILogger> mLogger;
@@ -426,7 +425,7 @@ private:
     // Decoder that generates new tokens from the logits.
     std::shared_ptr<runtime::GptDecoderBatched> mDecoder;
     // Synchronization handles for decoder
-    std::vector<DecoderFinishedEventPtr> mDecoderFinishedEvents;
+    std::vector<std::optional<runtime::CudaEvent>> mDecoderFinishedEvents;
 
     // Manager that maps requests to slots
     std::shared_ptr<SequenceSlotManager> mSeqSlotManager;

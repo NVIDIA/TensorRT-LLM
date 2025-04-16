@@ -19,6 +19,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
@@ -104,28 +105,42 @@ float e2M1ToFloat(uint8_t value)
 }
 
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
-inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn)
+int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensorrt_llm::FP4QuantizationSFLayout layout)
 {
     constexpr int kColumnGroup0Size = 4;
     constexpr int kRowGroup0Size = 32;
     constexpr int kRowGroup1Size = kRowGroup0Size * 4;
 
-    // int paddedRow = PadUpFn(totalRow, 128);
-    int paddedColumn = PadUpFn(totalColumn, 4);
+    // Swizzled layout is used as default layout.
+    if (layout == tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)
+    {
+        // int paddedRow = PadUpFn(totalRow, 128);
+        int paddedColumn = PadUpFn(totalColumn, 4);
 
-    int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
-    int columnGroupIdx = colIdx / kColumnGroup0Size;
-    constexpr int columnGroupStride = kColumnGroup0Size * kRowGroup1Size;
+        int columnIdxInGroup0 = colIdx % kColumnGroup0Size;
+        int columnGroupIdx = colIdx / kColumnGroup0Size;
+        int columnGroupStride = 512;
 
-    int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
-    int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
-    int rowGroupIdx = rowIdx / kRowGroup1Size;
-    constexpr int rowGroup1Stride = kColumnGroup0Size;
-    constexpr int rowGroup0Stride = kColumnGroup0Size * rowGroup1Stride;
-    int rowGroupStride = kRowGroup1Size * paddedColumn;
+        int rowIdxInGroup0 = rowIdx % kRowGroup0Size;
+        int rowGroup0Stride = 16;
+        int rowIdxInGroup1 = rowIdx % kRowGroup1Size / kRowGroup0Size;
+        int rowGroup1Stride = 4;
+        int rowGroupIdx = rowIdx / kRowGroup1Size;
+        int rowGroupStride = kRowGroup1Size * paddedColumn;
 
-    return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride
-        + rowIdxInGroup1 * rowGroup1Stride + rowGroupIdx * rowGroupStride;
+        return columnIdxInGroup0 + columnGroupIdx * columnGroupStride + rowIdxInGroup0 * rowGroup0Stride
+            + rowIdxInGroup1 * rowGroup1Stride + rowGroupIdx * rowGroupStride;
+    }
+    // Linear layout is only used in E2M1AndUFP8SFScaleToFloatV2.
+    else if (layout == tensorrt_llm::FP4QuantizationSFLayout::LINEAR)
+    {
+        // no padding needed. totalColumn is multiple of kVecSize.
+        return rowIdx * totalColumn + colIdx;
+    }
+    else
+    {
+        TLLM_THROW("Other layout not implemented yet.");
+    }
 }
 
 torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(th::Tensor floatTensor, int64_t sfVecSize, int64_t sfType)
@@ -135,8 +150,9 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(th::Tensor floatTensor,
     TORCH_CHECK(inputShape.size() == 2, "Input should be 2D tensor.");
     TORCH_CHECK(inputShape[1] % sfVecSize == 0);
     th::Tensor valueE2M1 = th::zeros({inputShape[0], inputShape[1] / 2}, th::dtype(FLOAT4_E2M1X2).requires_grad(false));
-    th::Tensor scaleFP8SF = th::zeros({tensorrt_llm::computeSFSize(inputShape[0], inputShape[1] / sfVecSize)},
-        th::dtype(SF_DTYPE).requires_grad(false));
+    th::Tensor scaleFP8SF
+        = th::zeros({tensorrt_llm::computeFP4SwizzledLayoutSFSize(inputShape[0], inputShape[1] / sfVecSize)},
+            th::dtype(SF_DTYPE).requires_grad(false));
     th::Tensor repFloat = th::zeros(inputShape, th::dtype(th::kFloat32).requires_grad(false));
 
     int hiddenDim = inputShape[1];
@@ -166,7 +182,9 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(th::Tensor floatTensor,
                 TORCH_CHECK_GT(e8M0Scale, 0);
                 TORCH_CHECK_LT(e8M0Scale, 255);
                 int8_t e8M0ScaleOut = e8M0Scale & 0xff;
-                scaleFP8SFPtr[computeSFIndex(vIdx, group, inputShape[0], groupsPerHiddenDim)] = e8M0ScaleOut;
+                scaleFP8SFPtr[computeSFIndex(
+                    vIdx, group, inputShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)]
+                    = e8M0ScaleOut;
             }
             else
             {
@@ -175,7 +193,9 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(th::Tensor floatTensor,
                 TORCH_CHECK_GT(e4M3Scale, 0);
                 TORCH_CHECK_LT(e4M3Scale, 15);
                 int8_t e4M3ScaleOut = (e4M3Scale & 0xff) << 3;
-                scaleFP8SFPtr[computeSFIndex(vIdx, group, inputShape[0], groupsPerHiddenDim)] = e4M3ScaleOut;
+                scaleFP8SFPtr[computeSFIndex(
+                    vIdx, group, inputShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)]
+                    = e4M3ScaleOut;
             }
             float scaleFloat = makeExpFloat(scaleExp);
             float invScaleFloat = 1.0 / scaleFloat;
@@ -224,7 +244,7 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
     auto rows = has_experts ? inputShape[1] : inputShape[0];
     auto cols = has_experts ? inputShape[2] : inputShape[1];
 
-    auto const expert_sf_size = tensorrt_llm::computeSFSize(rows, cols / sfVecSize);
+    auto const expert_sf_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols / sfVecSize);
 
     TORCH_CHECK(cols % sfVecSize == 0);
     std::array<int64_t, 3> shape{num_experts, rows, cols / 2};
@@ -244,7 +264,7 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
             reinterpret_cast<half*>(halfTensor.data_ptr()) + expert_elem_offset, globalScale.data_ptr<float>() + eIdx,
             reinterpret_cast<int64_t*>(valueE2M1.data_ptr()) + expert_elem_offset / FP4_PER_INT64,
             reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()) + expert_sf_offset / FP8_PER_INT32, sfType == 0,
-            mMultiProcessorCount, 0);
+            tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, 0);
     }
 
     return {valueE2M1, scaleFP8SF};
@@ -259,7 +279,7 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor blockScale)
     auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
     auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
-    auto expert_out_size = tensorrt_llm::computeSFSize(rows, cols);
+    auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
     th::Tensor interleavedBlockScale
         = th::zeros({expert_out_size * num_experts}, th::dtype(SF_DTYPE).requires_grad(false));
     for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
@@ -272,7 +292,7 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor blockScale)
             uint8_t* blockScalePtr = blockScale.data_ptr<uint8_t>() + globalRowIdx * cols;
             for (int cIdx = 0; cIdx < cols; ++cIdx)
             {
-                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols);
+                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
                 interleavedBlockScalePtr[sf_index] = blockScalePtr[cIdx];
             }
         }
@@ -289,7 +309,7 @@ th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
     auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
     auto rows = blockScaleShape.size() == 3 ? blockScaleShape[1] : blockScaleShape[0];
     auto cols = blockScaleShape.size() == 3 ? blockScaleShape[2] : blockScaleShape[1];
-    auto expert_out_size = tensorrt_llm::computeSFSize(rows, cols);
+    auto expert_out_size = tensorrt_llm::computeFP4SwizzledLayoutSFSize(rows, cols);
 
     th::Tensor reversedBlockScale = th::zeros(blockScaleShape, th::dtype(SF_DTYPE).requires_grad(false));
     std::map<int, std::array<int, 3>> identity;
@@ -299,7 +319,7 @@ th::Tensor NVFP4BlockScaleInterleaveReverse(th::Tensor blockScale)
         {
             for (int cIdx = 0; cIdx < cols; ++cIdx)
             {
-                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols);
+                int sf_index = computeSFIndex(rIdx, cIdx, rows, cols, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED);
                 identity[eIdx * expert_out_size + sf_index] = std::array<int, 3>{eIdx, rIdx, cIdx};
             }
         }
@@ -340,7 +360,8 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
             float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
             uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
-            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim)];
+            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(
+                vIdx, group, packedShape[0], groupsPerHiddenDim, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED)];
             int scale = fp8Scale;
             if (sfType == 0)
             {
@@ -369,8 +390,8 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
 }
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-th::Tensor E2M1AndUFP8SFScaleToFloatV2(
-    th::Tensor valueE2M1, th::Tensor scaleFP8SF, th::Tensor globalScale, int64_t sfVecSize, int64_t sfType)
+th::Tensor E2M1AndUFP8SFScaleToFloatV2(th::Tensor valueE2M1, th::Tensor scaleFP8SF, th::Tensor globalScale,
+    int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout)
 {
     CHECK_CPU_INPUT(valueE2M1, FLOAT4_E2M1X2);
     CHECK_CPU_INPUT(scaleFP8SF, SF_DTYPE);
@@ -388,6 +409,9 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
+    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+
     for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
     {
         for (int group = 0; group < groupsPerHiddenDim; ++group)
@@ -395,7 +419,7 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(
             float* floatPtr = floatTensor.data_ptr<float>() + vIdx * hiddenDim + group * sfVecSize;
             uint8_t* packedFp4Ptr = valueE2M1.data_ptr<uint8_t>() + vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
             uint8_t* scaleFP8SFPtr = scaleFP8SF.data_ptr<uint8_t>();
-            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim)];
+            uint8_t fp8Scale = scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim, layout)];
             float scaleFloat;
             if (sfType == 0)
             {

@@ -282,7 +282,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     }
 
     auto const reqId = llmRequest->mRequestId;
-    TLLM_LOG_DEBUG("addReqeustPeft taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+    TLLM_LOG_DEBUG("addRequestPeft taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
 
     updateTaskState(taskId, reqId);
     {
@@ -291,7 +291,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         if (mPutFutures.count(taskId))
         {
             TLLM_LOG_DEBUG(
-                "addReqeustPeft haveFuture skip taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+                "addRequestPeft haveFuture skip taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             return;
         }
     }
@@ -301,13 +301,13 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     {
         if (optLoraWeights && optLoraConfig)
         {
-            TLLM_LOG_DEBUG("addReqeustPeft put taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+            TLLM_LOG_DEBUG("addRequestPeft put taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             mHostLoraCache->put(taskId, optLoraWeights.value(), optLoraConfig.value(), false);
             loadNeeded = true;
         }
         else
         {
-            TLLM_LOG_DEBUG("addReqeustPeft bump taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
+            TLLM_LOG_DEBUG("addRequestPeft bump taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(reqId));
             mHostLoraCache->bump(taskId);
             loadNeeded = false;
         }
@@ -333,7 +333,7 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         if (loadNeeded && optWeights.has_value() && optConfig.has_value())
         {
             TLLM_LOG_DEBUG(
-                "addReqeustPeft load taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(req->mRequestId));
+                "addRequestPeft load taskId=" + std::to_string(taskId) + " reqId=" + std::to_string(req->mRequestId));
             mHostLoraCache->loadWeights(taskId, optWeights.value(), optConfig.value());
             // free memory associated with lora weights in llmRequest
             req->clearLoraWeights();

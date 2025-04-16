@@ -6,7 +6,9 @@ examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streami
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[no_streaming-llama_v2-use_cpp_session-use_tokens-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_logits-draft_len_4-float16-bs2]
 examples/test_draft_target_model.py::test_llm_draft_target_model_1gpu[streaming-gpt2-use_cpp_session-use_tokens-draft_len_8-float16-bs1]
-examples/test_eagle.py::test_llm_eagle_1gpu[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
+examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
 examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
@@ -92,8 +94,6 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding]
 test_e2e.py::test_llama_e2e[use_py_session]
-test_e2e.py::test_llmapi_load_engine_from_build_command[falcon-falcon-7b-instruct] # 5min
-test_e2e.py::test_llmapi_load_engine_from_build_command[gptj-gpt-j-6b] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-codellama/CodeLlama-7b-Instruct-hf] # 5min
 test_e2e.py::test_llmapi_load_engine_from_build_command[llama-llama-models/llama-7b-hf] # 5min
 test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]
@@ -122,17 +122,17 @@ accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_fp8
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_auto_dtype
 accuracy/test_cli_flow.py::TestQwen2_0_5BInstruct::test_fp8
-accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
 accuracy/test_cli_flow.py::TestQwen2_7BInstruct::test_int4_awq_prequantized
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_weight_only
-accuracy/test_cli_flow.py::TestQwen2_5_1_5BInstruct::test_fp8
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_weight_only
+accuracy/test_llm_api.py::TestQwen2_5_1_5BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_nvfp4_tp2
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales
-accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[]
 
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
@@ -150,6 +150,7 @@ test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-ll
 disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]

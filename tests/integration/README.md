@@ -8,11 +8,10 @@ The following subfolder contains test definitions for Tensorrt LLM.
 ~~~
 .
 └── integration              # Root directory for integration tests
-    ├── defs            #     Tiest definitions
+    ├── defs            #     Test definitions
     ├── perf_configs    #     Configs for perf tests
     └── test_lists      #     Test lists
-        ├── bloom       #         Legacy test lists used by TURTLE (Do not add any new test lists here)
-        ├── test-db     #         Test-DB (New test list convention adopted by pytest)
+        ├── test-db     #         Test-DB that is the test list convention adopted by CI
         ├── dev         #         Other test lists used by TRT LLM developers
         ├── qa          #         Test lists used by QA
         └── waives.txt  #         Test waive list
@@ -51,4 +50,4 @@ The captured perf metrics will be saved in `/workspace/test-log/perf_scripts_tes
 ## Common Issues and solutions
 
 1. No package 'libffi' found
-Install libffi by `sudo apt-get install libffi-dev` and then remove the turtle-venv by `rm -fr build/turtle_venv`, and rerun.
+Install libffi by `sudo apt-get install libffi-dev` and rerun.

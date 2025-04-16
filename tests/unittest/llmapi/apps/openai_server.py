@@ -18,15 +18,17 @@ class RemoteOpenAIServer:
 
     def __init__(self,
                  model: str,
-                 cli_args: List[str],
+                 cli_args: List[str] = None,
                  llmapi_launch: bool = False,
                  port: int = None) -> None:
         self.host = "localhost"
         self.port = port if port is not None else find_free_port()
         self.rank = os.environ.get("SLURM_PROCID", 0)
 
-        cli_args += ["--host", f"{self.host}", "--port", f"{self.port}"]
-        launch_cmd = ["trtllm-serve"] + [model] + cli_args
+        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
+        if cli_args:
+            args += cli_args
+        launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
@@ -81,8 +83,7 @@ class RemoteOpenAIServer:
             api_key=self.DUMMY_API_KEY,
         )
 
-    def get_async_client(self):
-        return openai.AsyncOpenAI(
-            base_url=self.url_for("v1"),
-            api_key=self.DUMMY_API_KEY,
-        )
+    def get_async_client(self, **kwargs):
+        return openai.AsyncOpenAI(base_url=self.url_for("v1"),
+                                  api_key=self.DUMMY_API_KEY,
+                                  **kwargs)

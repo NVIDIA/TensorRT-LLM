@@ -32,7 +32,7 @@
 
 namespace tensorrt_llm::tests::layers
 {
-// TODO(nkorobov) verify context + gen mix
+// TODO verify context + gen mix
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::layers;

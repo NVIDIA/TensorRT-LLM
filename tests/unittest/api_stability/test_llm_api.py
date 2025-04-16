@@ -9,7 +9,6 @@ from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput)
-from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
@@ -21,6 +20,7 @@ class TestSamplingParams(ApiStabilityTestHarness):
     def test_get_sampling_config(self):
         expected_fields = {
             "beam_width",
+            "beam_width_array",
             "top_k",
             "top_p",
             "top_p_min",
@@ -40,7 +40,6 @@ class TestSamplingParams(ApiStabilityTestHarness):
             "no_repeat_ngram_size",
             "num_return_sequences",
             "min_p",
-            "beam_width_array",
         }
         found_fields = {
             f
@@ -159,10 +158,18 @@ class TestLLM(ApiStabilityTestHarness):
         with pytest.raises(AssertionError):
             self.test_docstring()
 
+    def test_fine_grained_error(self):
+        # change the dtype of max_batch_size to float to trigger a fine-grained error
+        self.reference.methods["__init__"].parameters[
+            "max_batch_size"].annotation = "float"
+        with pytest.raises(AssertionError) as e:
+            self.test_signature()
+            assert "LLM.max_batch_size annotation: typing.Optional[int] != <class 'float'>" in str(
+                e.value.__cause__)
 
-class TestLlmArgs(ApiStabilityTestHarness):
-    TEST_CLASS = LlmArgs
-    REFERENCE_FILE = "llm_args.yaml"
+        # restore the original dtype
+        self.reference.methods["__init__"].parameters[
+            "max_batch_size"].annotation = "int"
 
 
 class TestCompletionOutput(ApiStabilityTestHarness):

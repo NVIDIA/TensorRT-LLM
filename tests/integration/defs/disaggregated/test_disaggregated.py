@@ -40,6 +40,27 @@ def test_disaggregated_single_gpu_with_mpirun(disaggregated_test_root,
                cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
+                                          disaggregated_example_root, llm_venv,
+                                          llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} gen_only"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -142,9 +163,9 @@ def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
-def test_disaggregated_overlap_dp(disaggregated_test_root, llm_venv,
-                                  disaggregated_example_root,
-                                  deepseek_v3_model_root):
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -154,11 +175,73 @@ def test_disaggregated_overlap_dp(disaggregated_test_root, llm_venv,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp_8_overlap_dp"
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1"
     check_call(cmd,
                shell=True,
                env=llm_venv._new_env,
                cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1_mtp"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv,
+                                                deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8"
+    check_call(cmd, shell=True, env=env, cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1"
+    check_call(cmd, shell=True, env=env, cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -177,6 +260,71 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
             os.symlink(src, dst, target_is_directory=True)
 
     cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_attention_dp"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp_8_attention_dp_overlap"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_overlap_cuda_graph"
     check_call(cmd,
                shell=True,
                env=llm_venv._new_env,
@@ -221,6 +369,28 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
             os.symlink(src, dst, target_is_directory=True)
 
     cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_attention_dp_one_mtp"
+    check_call(cmd,
+               shell=True,
+               env=llm_venv._new_env,
+               cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp"
     check_call(cmd,
                shell=True,
                env=llm_venv._new_env,

@@ -8,9 +8,10 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
-from ..llmapi.utils import nvtx_range, print_traceback_on_error
+from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
 
@@ -70,16 +71,16 @@ class PostprocWorker:
 
     def __init__(
         self,
-        pull_pipe_addr: str,
-        push_pipe_addr: str,
+        pull_pipe_addr: tuple[str, Optional[bytes]],
+        push_pipe_addr: tuple[str, Optional[bytes]],
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
     ):
         '''
         Args:
-            pull_pipe_addr (str): The address of the input IPC.
-            push_pipe_addr (str): The address of the output IPC.
+            pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
+            push_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the output IPC.
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
@@ -119,7 +120,15 @@ class PostprocWorker:
 
     async def _handle_input(self, input: "PostprocWorker.Input") -> Any:
         ''' Handle a single response from await_response worker. '''
-        with nvtx_range("handle_input", color="yellow", category="Postproc"):
+        if input.rsp.result.context_logits is not None or \
+              input.rsp.result.generation_logits is not None:
+            raise ValueError(
+                "Context logits or generation logits are not supposed to be "
+                "sent to postprocessing workers.")
+
+        with nvtx_range_debug("handle_input",
+                              color="yellow",
+                              category="Postproc"):
             req_id = input.rsp.client_id
             if req_id not in self._records:
                 # TODO: support variant creation later
@@ -201,7 +210,8 @@ class PostprocWorker:
 
 
 @print_traceback_on_error
-def postproc_worker_main(feedin_ipc_addr: str, feedout_ipc_addr: str,
+def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
+                         feedout_ipc_addr: tuple[str, Optional[bytes]],
                          tokenizer_dir: str, record_creator: Callable):
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,

@@ -99,9 +99,10 @@ def test_llm_eagle_1gpu(batch_size, data_type, use_dynamic_tree,
 @pytest.mark.parametrize("data_type", ['float16'])
 @pytest.mark.parametrize("eagle_model_roots", ["llama3.1-eagle-8b-hf_v0.5"],
                          indirect=True)
-def test_llm_eagle_1gpu(batch_size, data_type, eagle_model_roots,
-                        eagle_example_root, llm_datasets_root, llm_rouge_root,
-                        llm_venv, cmodel_dir, engine_dir):
+def test_llm_eagle_1gpu_modelopt_ckpt(batch_size, data_type, eagle_model_roots,
+                                      eagle_example_root, llm_datasets_root,
+                                      llm_rouge_root, llm_venv, cmodel_dir,
+                                      engine_dir):
     print("Build engines...")
     model_name = "eagle"
 
@@ -308,6 +309,8 @@ def test_mistral_eagle_1gpu(llm_mistral_model_root,
                           llm_rouge_root=llm_rouge_root)
 
 
+@pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                         ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("llm_qwen_model_root", [
     "qwen_7b_chat", "qwen1.5_7b_chat", "qwen2_7b_instruct",
     "qwen2_0.5b_instruct", "qwen2.5_1.5b_instruct"

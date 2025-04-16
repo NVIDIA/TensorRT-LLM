@@ -16,7 +16,7 @@
 import pytest
 from defs.common import (convert_weights, quantize_data, venv_check_call,
                          venv_mpi_check_call)
-from defs.conftest import (get_device_count, llm_models_root, skip_fp8_pre_ada,
+from defs.conftest import (get_device_count, skip_fp8_pre_ada,
                            skip_post_blackwell)
 from defs.trt_test_alternative import check_call
 
@@ -77,12 +77,6 @@ def test_llm_enc_dec_general(llm_venv, cmodel_dir, engine_dir, data_type,
 
     if use_fp8:
         assert use_paged_kv_cache and use_attention_plugin
-        # a workaround to install pre-built whl before modelopt release new version
-        models_root = llm_models_root()  # /scratch.trt_llm_data/llm-models
-        llm_venv.run_cmd([
-            "-m", "pip", "install",
-            f"{models_root}/wheels/nvidia_modelopt-0.22.1.dev96+g22762793-py3-none-any.whl"
-        ])
         # a known apex huggingface bug for t5 only
         # t5 only takes float32 in quantization loop
         # https://github.com/huggingface/transformers/issues/34264
@@ -236,12 +230,6 @@ def test_llm_enc_dec_mmlu(llm_venv, cmodel_dir, engine_dir, data_type,
         model_type = "nmt"
 
     if use_fp8:
-        # a workaround to install pre-built whl before modelopt release new version
-        models_root = llm_models_root()  # /scratch.trt_llm_data/llm-models
-        llm_venv.run_cmd([
-            "-m", "pip", "install",
-            f"{models_root}/wheels/nvidia_modelopt-0.22.1.dev96+g22762793-py3-none-any.whl"
-        ])
         # a known apex huggingface bug for t5 only
         # t5 only takes float32 in quantization loop
         # https://github.com/huggingface/transformers/issues/34264

@@ -195,6 +195,12 @@ class ReportUtility:
         return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
 
     @property
+    def total_token_throughput_tok_s(self) -> float:
+        """Total token throughput in tokens per second."""
+        return self.convert_rate_to_s(
+            self.statistics.total_token_throughput_tok_ns)
+
+    @property
     def per_user_generation_token_throughput_s(self) -> float:
         """Output throughput per user in tokens per second."""
         return self.convert_rate_to_s(
@@ -267,24 +273,16 @@ class ReportUtility:
 
         # World and runtime info
         stats_dict["world_info"] = {
-            "tp_size":
-            self.rt_cfg.world_config.tp_size,
-            "pp_size":
-            self.rt_cfg.world_config.pp_size,
-            "ep_size":
-            self.rt_cfg.world_config.ep_size,
-            "world_size":
-            self.rt_cfg.world_config.world_size,
-            "max_batch_size":
-            self.rt_cfg.settings_config.max_batch_size,
-            "max_num_tokens":
-            self.rt_cfg.settings_config.max_num_tokens,
-            "scheduling_policy":
-            self.rt_cfg.settings_config.scheduler_policy.values[1],
+            "tp_size": self.rt_cfg.world_config.tp_size,
+            "pp_size": self.rt_cfg.world_config.pp_size,
+            "ep_size": self.rt_cfg.world_config.ep_size,
+            "world_size": self.rt_cfg.world_config.world_size,
+            "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
+            "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
+            "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
             "kv_cache_percentage":
             self.rt_cfg.settings_config.kv_cache_percent * 100.0,
-            "issue_rate":
-            self.convert_rate_to_s(self.statistics.issue_rate_ns)
+            "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
         # Request details
@@ -314,6 +312,8 @@ class ReportUtility:
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
             # Output throughput per user (average per request output throughput)
+            "system_total_throughput_tok_s":
+            self.total_token_throughput_tok_s,
             "output_throughput_per_user_tok_s":
             self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
@@ -361,12 +361,22 @@ class ReportUtility:
                     }
             }
 
+        spec_decoding, decoding_mode = False, None
         if (self.rt_cfg.decoding_config
                 and self.rt_cfg.decoding_config.decoding_mode
                 != SpeculativeDecodingMode.NONE):
+            # cpp decoding
+            spec_decoding = True
+            decoding_mode = self.rt_cfg.decoding_config.decoding_mode.values[1]
+        elif ("speculative_config" in self.kwargs
+              and self.kwargs["speculative_config"] is not None):
+            # pytorch speculative decoding
+            spec_decoding = True
+            decoding_mode = self.kwargs["speculative_config"].decoding_type
+        if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
-                self.rt_cfg.decoding_config.decoding_mode.values[1],
+                decoding_mode,
                 "acceptance_percentiles":
                 self.statistics.acceptance_percentiles.model_dump(
                     exclude_none=True, by_alias=True, mode='json')
@@ -467,6 +477,7 @@ class ReportUtility:
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
             f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
             f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
+            f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
         )

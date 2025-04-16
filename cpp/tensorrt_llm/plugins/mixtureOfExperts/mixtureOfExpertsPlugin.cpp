@@ -257,8 +257,9 @@ void MixtureOfExpertsPlugin::init()
         "MOE plugin only supports a different output type for FP4/FP8");
     TLLM_CHECK_WITH_INFO(mType != DataType::kFP8 || tensorrt_llm::common::getSMVersion() >= 89,
         "MoE FP8 is not supported for architectures less than SM89");
-    TLLM_CHECK_WITH_INFO(mType != DataType::kFP4 || tensorrt_llm::common::getSMVersion() >= 100,
-        "MoE FP4 is not supported for architectures less than SM100");
+    TLLM_CHECK_WITH_INFO(mType != DataType::kFP4
+            || (tensorrt_llm::common::getSMVersion() >= 100 && tensorrt_llm::common::getSMVersion() < 120),
+        "MoE FP4 is only supported on architecture SM100");
 
     TLLM_CHECK_WITH_INFO(!hasLora() || mLoraType == mOutputType, "The LoraType need to keep same with moe OutputType.");
 
@@ -546,9 +547,9 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
 
 auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs) const -> WorkspaceInfo
 {
-    size_t moe_workspace_size
-        = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken,
-            mActivationType, mParallelismConfig, hasLora(), /*use_fp8_block_scaling=*/false, hasExpertPrequantScales());
+    size_t moe_workspace_size = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize,
+        mNumExperts, mExpertsPerToken, mActivationType, mParallelismConfig, hasLora(), /*use_fp8_block_scaling=*/false,
+        /*min_latency_mode=*/false, hasExpertPrequantScales());
 
     // Permutation map
     size_t src_to_dest_map_size = mExpertsPerToken * num_tokens * sizeof(int);
@@ -949,6 +950,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         gemm2 = mGemmProfiler->getBestConfig(num_tokens, mGemmId2);
     }
 
+    MoeMinLatencyParams min_latency_params{};
     mMOERunner->setTactic(gemm1, gemm2);
     mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
@@ -958,7 +960,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
-        lora_params, /*use_fp8_block_scaling=*/false, stream);
+        lora_params, /*use_fp8_block_scaling=*/false, /*min_latency_mode=*/false, min_latency_params, stream);
 
     if (useSideStream())
     {
@@ -1276,5 +1278,6 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     auto& plugin = *mRunner;
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
         plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
-        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), plugin.getParallelismConfig());
+        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*minLatencyMode*/ false,
+        plugin.getParallelismConfig());
 }

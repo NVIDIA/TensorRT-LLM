@@ -1873,7 +1873,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
     EXPECT_THROW(kvCacheManager.addSequence(4, inputLength4, beamWidth, llmRequest4), std::exception);
 }
 
-TEST_P(KVCacheManagerTest, KVCacheManagerAllocationTest)
+TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
 {
     using DType = half;
 

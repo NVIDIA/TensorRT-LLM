@@ -26,18 +26,21 @@
 
 #pragma once
 
+#ifndef NVRTC_JIT_COMPILATION
 #include <cassert>
 #include <cuda.h>
 #include <cuda/barrier>
 #include <cudaTypedefs.h>
-#include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#endif
 
 #include "utils.cuh"
+#include <cuda_fp8.h>
 
 namespace deep_gemm
 {
 
+#ifndef NVRTC_JIT_COMPILATION
 template <class T>
 constexpr CUtensorMapDataType get_CUtensorMapDataType()
 {
@@ -129,6 +132,7 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2], uint6
     DG_HOST_ASSERT(result == CUDA_SUCCESS);
     return tensor_map;
 }
+#endif
 
 template <uint32_t kNumTMAMulticast = 1>
 __device__ __forceinline__ void tma_copy(

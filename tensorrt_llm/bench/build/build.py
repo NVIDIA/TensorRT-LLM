@@ -307,7 +307,7 @@ def build_command(
               pipeline_parallel_size=pp_size,
               build_config=build_config,
               quant_config=quant_config,
-              workspace=bench_env.workspace)
+              workspace=str(bench_env.workspace))
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()

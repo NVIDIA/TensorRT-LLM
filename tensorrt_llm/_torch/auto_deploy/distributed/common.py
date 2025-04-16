@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 
 from ..utils.logger import ad_logger
 
-# TODO (lliebenwein): check to what extend we can reuse _torch/distributed.py
+# TODO: check to what extend we can reuse _torch/distributed.py
 
 
 class _DistGroup:
@@ -263,5 +263,8 @@ class MultiProcessExecutor:
             self.input_queues[i].put(None)
         _join_multiprocess_job(self.processes)
         self.processes = None
-        del self.input_queues
-        del self.output_queue
+        for q in self.input_queues:
+            q.close()
+            q.join_thread()
+        self.output_queue.close()
+        self.output_queue.join_thread()

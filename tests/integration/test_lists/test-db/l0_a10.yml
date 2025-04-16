@@ -9,18 +9,49 @@ l0_a10:
       gpu:
       - '*a10*'
       linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-pytorch-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-pytorch-stress-stage-alone]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: cpp
+  tests:
   # ------------- CPP tests ---------------
   - test_cpp.py::test_model[medusa-86]
   - test_cpp.py::test_model[redrafter-86]
   - test_cpp.py::test_model[mamba-86]
   - test_cpp.py::test_model[recurrentgemma-86]
   - test_cpp.py::test_model[eagle-86]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a10*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: tensorrt
+  tests:
   # ------------- TRT tests ---------------
   - unittest/trt/attention/test_gpt_attention.py -k "partition0"
   - unittest/trt/attention/test_gpt_attention.py -k "partition1"
@@ -38,6 +69,7 @@ l0_a10:
   - test_e2e.py::test_llmapi_chat_example
   - test_e2e.py::test_llmapi_exit
   - test_e2e.py::test_llmapi_server_example
+  - test_e2e.py::test_trtllm_serve_example
   - test_e2e.py::test_openai_misc_example
   - test_e2e.py::test_openai_completions_example
   - test_e2e.py::test_openai_chat_example
@@ -78,6 +110,8 @@ l0_a10:
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_cpp_runtime]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba2-130m-float16-enable_gemm_plugin]
   - examples/test_mamba.py::test_llm_mamba_1gpu[mamba-codestral-7B-v0.1-float16-enable_gemm_plugin] # 3 mins
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-MAX_UTILIZATION-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-GUARANTEED_NO_EVICT-trt-stress-stage-alone]
 - condition:
     ranges:
       system_gpu_count:
@@ -89,6 +123,7 @@ l0_a10:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: tensorrt
   tests:
   - test_e2e.py::test_mistral_e2e[use_py_session]
   - test_e2e.py::test_mistral_e2e[use_cpp_session-remove_input_padding]

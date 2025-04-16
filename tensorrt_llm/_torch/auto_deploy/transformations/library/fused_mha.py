@@ -1,7 +1,7 @@
 """Pattern matcher to detect MHA pattern and replace with simple fused_mha op."""
 
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch._subclasses import FakeTensor
@@ -9,7 +9,7 @@ from torch.fx import Graph, GraphModule, Node
 
 from ...models.factory import PositionalEmbeddingConfig
 from ...utils.logger import ad_logger
-from ...utils.node_utils import is_dist_op, is_linear_op, is_op
+from ...utils.node_utils import bfs, is_dist_op, is_linear_op, is_op
 from .._graph import canonicalize_graph
 
 
@@ -18,16 +18,6 @@ def _is_dist_lin_op(node: Node, exclude: Optional[List[Node]] = None) -> bool:
         is_linear_op(node, include_quantization=True)
         or (is_dist_op(node) and is_linear_op(node.all_input_nodes[0], include_quantization=True))
     )
-
-
-def _bfs(node: Node, target: Callable, attr_next: str = "users") -> Node:
-    queue = [node]
-    while queue:
-        cur_node = queue.pop(0)
-        if target(cur_node):
-            return cur_node
-        queue.extend(getattr(cur_node, attr_next))
-    raise RuntimeError(f"Could not find node with target condition {target}.")
 
 
 def identify_and_fuse_mha(
@@ -66,9 +56,9 @@ def identify_and_fuse_mha(
         # from the sdpa node, identify q, k, v, and out GEMMs via BFS
         for arg in mha_node.args[:3]:
             mha_gemms[mha_node].append(
-                _bfs(arg, lambda n: _is_dist_lin_op(n, mha_gemms[mha_node]), "all_input_nodes")
+                bfs(arg, lambda n: _is_dist_lin_op(n, mha_gemms[mha_node]), "all_input_nodes")
             )
-        mha_gemms[mha_node].append(_bfs(mha_node, _is_dist_lin_op, "users"))
+        mha_gemms[mha_node].append(bfs(mha_node, _is_dist_lin_op, "users"))
 
         # get fake q tensor that is an MHA input node to retrieve head_dim
         q_fake: FakeTensor = mha_node.args[0].meta["val"]

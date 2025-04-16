@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaProfilerUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/timestampUtils.h"
@@ -44,6 +45,7 @@
 #include <cstdint>
 #include <cuda_profiler_api.h>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -384,6 +386,7 @@ Executor::Impl::~Impl()
 void Executor::Impl::initialize(ExecutorConfig const& executorConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     mShutdown = false;
     mShutdownCalled = false;
     mIterStatsMaxIterations = executorConfig.getIterStatsMaxIterations();
@@ -749,8 +752,15 @@ void Executor::Impl::initializeWorkers(SizeType32 tp, SizeType32 pp, SizeType32 
     if (parallelConfig.getDeviceIds())
     {
         auto deviceIds = parallelConfig.getDeviceIds().value();
-        TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(deviceIds.size()) == tp * pp * cp,
-            "When specifying deviceIds, deviceIds size must be equal to tp*pp*cp");
+        auto const hasNumNodes = parallelConfig.getNumNodes().has_value();
+        if (hasNumNodes || static_cast<SizeType32>(deviceIds.size()) != tp * pp * cp)
+        {
+            auto const numNodes = hasNumNodes ? parallelConfig.getNumNodes().value() : tensorrt_llm::mpi::getNumNodes();
+            TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(deviceIds.size() * numNodes) == tp * pp * cp,
+                tensorrt_llm::common::fmtstr("When specifying deviceIds, deviceIds (%lu) * numNodes (%u) must be equal "
+                                             "to tp*pp*cp (tp is %u, pp is %u, cp is %u)",
+                    deviceIds.size(), numNodes, tp, pp, cp));
+        }
     }
 
     // Bool that indicates if current process is worker for this model or not
@@ -1261,13 +1271,14 @@ void Executor::Impl::cancelledRequestsLeaderThread()
             break;
         }
 
+        std::unique_ptr<CancelledRequestsAsyncSend> cancelledRequestsAsyncSndHdl;
         {
             std::scoped_lock<std::mutex> lck(mCancelReqMtx);
-            auto cancelledRequestsAsyncSndHdl
+            cancelledRequestsAsyncSndHdl
                 = std::make_unique<CancelledRequestsAsyncSend>(mCommPipelineParallel, mPipelineCancelledReqIds, peer);
-            cancelledRequestsAsyncSndHdl.reset(nullptr);
             mPipelineCancelledReqIds.clear();
         }
+        cancelledRequestsAsyncSndHdl.reset(nullptr);
     }
     static_assert(kMpiTagUpperBound >= kMpiTagOffset + 4);
 }
@@ -1426,6 +1437,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(fetchNewRequests);
+
     // If grab requests from queue, do exchange between ranks
     auto reqWithIds = getNewReqWithIds(numActiveRequests, lowestPriorityActive);
     RequestList newRequests;
@@ -1506,7 +1518,7 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                 newReq->validate(mModel->getMaxInputLen(), mModel->getMaxSequenceLen(), mModel->getMaxDraftLen(),
                     mModel->getVocabSizePadded(),
                     mEncoderModel ? std::optional<SizeType32>(mEncoderModel->getMaxInputLen()) : std::nullopt,
-                    mEnableBlockReuse, mModel->getModelConfig().computeContextLogits());
+                    mEnableBlockReuse);
 
                 TLLM_CHECK_WITH_INFO(!mEncoderModel || !mIsSchedulerMaxUtilization,
                     "Encoder or Encoder-Decoder model don't support max utilization scheduler yet. Only max requests "

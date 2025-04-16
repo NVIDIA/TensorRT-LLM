@@ -1,6 +1,74 @@
 methods:
   __init__:
-    parameters: {}
+    parameters:
+     # Parallelism
+      cp_config:
+        annotation: Optional[dict]
+        default: null
+      auto_parallel:
+        annotation: bool
+        default: false
+      auto_parallel_world_size:
+        annotation: Optional[int]
+        default: null
+      embedding_parallel_mode:
+        annotation: str
+        default: SHARDING_ALONG_VOCAB
+      # Engine building
+      build_config:
+        annotation: Optional[tensorrt_llm.builder.BuildConfig]
+        default: null
+      enable_build_cache:
+        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
+        default: false
+      fast_build:
+        annotation: bool
+        default: false
+      # Bindings and mirrored configs
+      batching_type:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
+        default: null
+      peft_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
+        default: null
+      scheduler_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        default: null
+      extended_runtime_perf_knob_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
+        default: null
+      decoding_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
+        default: null
+      # Misc
+      backend:
+        annotation: Optional[str]
+        default: null
+      enable_attention_dp:
+        annotation: bool
+        default: false
+      normalize_log_probs:
+        annotation: bool
+        default: false
+      gather_generation_logits:
+        annotation: bool
+        default: false
+      gpus_per_node:
+        annotation: Optional[int]
+        default: null
+      iter_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      request_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+      workspace:
+        annotation: Optional[str]
+        default: null
+      kwargs:
+        annotation: Any
+        default: inspect._empty
+
     return_annotation: None
   generate:
     parameters:

@@ -298,7 +298,7 @@ void SamplingConfig::setBeamWidthArray(OptVec<SizeType32> const& beamWidthArray)
 // Checkers
 SizeType32 SamplingConfig::checkBeamWidth(SizeType32 beamWidth)
 {
-    TLLM_CHECK(beamWidth > 0 && beamWidth < static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
+    TLLM_CHECK(beamWidth > 0 && beamWidth <= static_cast<SizeType32 const>(tensorrt_llm::kernels::kMaxBeamWidth));
     return beamWidth;
 }
 

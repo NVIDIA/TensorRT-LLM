@@ -200,7 +200,7 @@ def _clean_up_input_constraints(gm: fx.GraphModule):
     canonicalize_graph(gm)
 
 
-# TODO (lliebenwein): remove once https://github.com/pytorch/pytorch/issues/140710 is resolved
+# TODO: remove once https://github.com/pytorch/pytorch/issues/140710 is resolved
 def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
     if len(args) == 0 and len(kwargs) == 0:
         return torch.nonzero(condition, as_tuple=True)
@@ -210,7 +210,7 @@ def _torch_where_patch(condition: torch.Tensor, *args, **kwargs):
 _torch_where_patch.where_original = torch.where
 
 
-# TODO (lliebenwein): remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
+# TODO: remove once https://github.com/pytorch/pytorch/issues/142439 is resolved
 def _torch_modulelist_getitem_patch(self: nn.ModuleList, idx):
     if isinstance(idx, slice):
         # return a simple list.
@@ -287,7 +287,7 @@ def torch_export_to_gm(
         # clean up args, kwargs and move to correct device
         args, kwargs = tree_to((args, kwargs or {}), device="meta")
 
-        # NOTE (lliebenwein): we always export in non-strict mode for now as it relaxes some
+        # NOTE: we always export in non-strict mode for now as it relaxes some
         # assumptions around tracing. Strict mode uses torchdynamo (symbolic bytecode analysis),
         # which can be brittle since it relies on the exact bytecode representation of the model.
         # see here as well: https://pytorch.org/docs/stable/export.html#non-strict-export

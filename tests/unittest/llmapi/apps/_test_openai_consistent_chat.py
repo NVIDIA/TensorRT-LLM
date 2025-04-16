@@ -57,8 +57,8 @@ def build_engine(model_name, request):
               build_config=build_config)
 
     engine_dir = TemporaryDirectory(suffix="-engine_dir")
-    llm.save(engine_dir.name)
-    del llm
+    with llm:
+        llm.save(engine_dir.name)
 
     yield engine_dir.name
 
