@@ -101,7 +101,7 @@ def TEST_STAGE_LIST = "stage_list"
 @Field
 def GPU_TYPE_LIST = "gpu_type"
 @Field
-def BACKEND_MODE = "backend_mode"
+def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
 @Field
@@ -126,7 +126,7 @@ def testFilter = [
     (ENABLE_SKIP_TEST): false,
     (TEST_STAGE_LIST): null,
     (GPU_TYPE_LIST): null,
-    (BACKEND_MODE): null,
+    (TEST_BACKEND): null,
     (IS_POST_MERGE): false,
     (ADD_MULTI_GPU_TEST): false,
     (ONLY_MULTI_GPU_TEST): false,
@@ -1542,9 +1542,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }
 
     // Check --backend-mode, filter test stages.
-    if (testFilter[(BACKEND_MODE)] != null) {
-        echo "Use BACKEND_MODE for filtering. Backend mode: ${testFilter[(BACKEND_MODE)]}."
-        def backendMode = testFilter[(BACKEND_MODE)].collect { it.toLowerCase() }
+    if (testFilter[(TEST_BACKEND)] != null) {
+        echo "Use TEST_BACKEND for filtering. Backend mode: ${testFilter[(TEST_BACKEND)]}."
+        def backendMode = testFilter[(TEST_BACKEND)].collect { it.toLowerCase() }
         def changeMap = [
             "pytorch": "-PyTorch-",
             "tensorrt": "-TensorRT-",
@@ -1563,8 +1563,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }
 
     if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
-        if (testFilter[(BACKEND_MODE)] != null) {
-            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(BACKEND_MODE)]}."
+        if (testFilter[(TEST_BACKEND)] != null) {
+            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
         } else {
             echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
             parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
