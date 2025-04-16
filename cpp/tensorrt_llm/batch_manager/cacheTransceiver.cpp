@@ -210,7 +210,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
-    if (mResponderFutures.find(llmRequest) != mResponderFutures.end())
+    // If context phase params is already set, it means that the KV cache
+    // transfer is already in progress.
+    if (llmRequest->getContextPhaseParams().has_value())
     {
         if (llmRequest->getContextProgress() == nullptr)
         {
@@ -220,7 +222,7 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     }
     setContextState(llmRequest);
     auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-    mResponderFutures.insert({llmRequest, std::move(future)});
+    mResponderFutures.emplace_back(llmRequest, std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -229,14 +231,14 @@ void CacheTransceiver::respondAndSendLayerWise(
     for (auto const& llmRequest : requests)
     {
         TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
-        TLLM_CHECK(mResponderFutures.find(llmRequest.get()) == mResponderFutures.end());
+        TLLM_CHECK(!llmRequest->getContextPhaseParams().has_value());
         llmRequest->setContextProgress(progress);
         TLLM_LOG_DEBUG("Request %ld is being sent layer-wise.", llmRequest->mRequestId);
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
         auto future = mDataResponder->respondAndSendAsync(*llmRequest);
-        mResponderFutures.emplace(llmRequest.get(), std::move(future));
+        mResponderFutures.emplace_back(llmRequest.get(), std::move(future));
     }
 }
 
@@ -386,16 +388,18 @@ void CacheTransceiver::checkContextTransferStatus(std::optional<int> const& atLe
          atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mResponderFutures.end();
          ++it)
     {
-        toCompleteIdSet.insert(it->first->mRequestId);
+        auto& [request, future] = *it;
+        toCompleteIdSet.insert(request->mRequestId);
     }
 
     // Complete all the requests in toCompleteIdSet
     for (auto it = mResponderFutures.begin(); it != mResponderFutures.end();)
     {
-        if (blockAll || (toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end()))
+        auto& [request, future] = *it;
+        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
-            it->second.get();
-            it->first->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            future.get();
+            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
             it = mResponderFutures.erase(it);
         }
         else
