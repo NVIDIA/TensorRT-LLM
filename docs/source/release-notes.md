@@ -5,6 +5,12 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.18.2
+
+### Key Features and Enhancements
+  - This update addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.
+
+
 ## TensorRT-LLM Release 0.18.1
 
 ### Key Features and Enhancements
