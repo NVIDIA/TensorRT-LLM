@@ -36,14 +36,6 @@ class ModelConfig(Generic[TConfig]):
                 self.pretrained_config.architectures)
 
     @property
-    def fuse_pos_embd(self):
-        if self.attn_backend == 'TRTLLM':
-            return True
-        elif self.attn_backend == 'FLASHINFER':
-            return False
-        return False
-
-    @property
     def enable_flash_mla(self):
         if self.attn_backend == 'TRTLLM':
             if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(

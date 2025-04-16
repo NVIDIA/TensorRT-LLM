@@ -247,7 +247,9 @@ class TestNemotronNAS(unittest.TestCase):
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single NemotronNAS layer")
         nemotron_nas_config = AutoConfig.from_pretrained(
-            "nvidia/Llama-3_1-Nemotron-51B-Instruct", trust_remote_code=True)
+            llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
+            trust_remote_code=True,
+        )
         nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
 
         dtype = nemotron_nas_config.torch_dtype
@@ -370,7 +372,9 @@ class TestNemotronNAS(unittest.TestCase):
         if config_dict["num_hidden_layers"] <= 0:
             self.skipTest("Insufficient memory for a single NemotronNAS layer")
         nemotron_nas_config = AutoConfig.from_pretrained(
-            "nvidia/Llama-3_1-Nemotron-51B-Instruct", trust_remote_code=True)
+            llm_models_root() / "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct",
+            trust_remote_code=True,
+        )
         nemotron_nas_config = nemotron_nas_config.from_dict(config_dict)
         dtype = nemotron_nas_config.torch_dtype
         device = torch.device('cuda')
