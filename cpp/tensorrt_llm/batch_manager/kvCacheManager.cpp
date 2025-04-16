@@ -430,14 +430,17 @@ bool BlockManager::verifyQueueIntegrity()
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
-    constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
-    auto const& cacheBlockIds = sequence.getCacheBlockIds();
-    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    if (!sequence.getContextRequiresSlidingWindowKvCache())
+    {
+        constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
+        auto const& cacheBlockIds = sequence.getCacheBlockIds();
+        auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
-    auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
-    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    }
 }
 
 void BlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -1040,52 +1043,6 @@ void BlockManager::storeBlocks(std::vector<BlockKey> blockKeys, std::vector<KVCa
     }
 }
 
-void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx)
-{
-    auto const requestId = sequence.getRequestId();
-    auto const beamWidth = sequence.getBeamWidth();
-    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-
-    if (!allocatedBlocks.at((blockIdx + 1) * beamWidth - 1)->isShared())
-    {
-        return;
-    }
-    BlockKey blockKey = allocatedBlocks.at(blockIdx * beamWidth)->getBlockKey();
-    bool isFull = allocatedBlocks.at(blockIdx * beamWidth)->isFull();
-
-    // Free shared block
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = allocatedBlocks.at(blockIdx * beamWidth + beamIdx);
-        block->decRefCount();
-        if (!block->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
-        }
-    }
-
-    // Allocate new blocks
-    TLLM_CHECK_WITH_INFO(hasFreeBlocks(beamWidth), "Can't allocate new blocks. No free blocks left.");
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = getFreeBlock();
-        block->incRefCount();
-        if (sequence.getCacheBlockIds().at(beamIdx).size() == 0)
-        {
-            block->setPrevBlockInSeq(nullptr);
-        }
-        else
-        {
-            block->setPrevBlockInSeq(mAllBlocksById.at(sequence.getCacheBlockIds()[beamIdx].back()));
-        }
-        block->setBlockKey(blockKey, isFull);
-        block->setHash();
-        sequence.changeCacheBlock(beamIdx, blockIdx, block->getBlockId());
-        allocatedBlocks.at(blockIdx * beamWidth + beamIdx) = block;
-    }
-}
-
 std::vector<KVCacheBlock::IdType> BlockManager::getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const
 {
     std::vector<KVCacheBlock::IdType> allocatedBlockIds;
@@ -1123,9 +1080,9 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence)
     sequence.removeLastBlock();
 }
 
-[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks() const noexcept
+[[nodiscard]] SizeType32 BlockManager::getNumFreeBlocks(SizeType32 cacheLevel) const noexcept
 {
-    return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+    return mEvictionPolicy->getNumFreeBlocks(cacheLevel);
 }
 
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const
@@ -1136,6 +1093,8 @@ std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::c
 void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
     auto const requestId = sequence.getRequestId();
+    auto node = mAllocatedBlocksPerSeq.extract(requestId);
+    auto& allocatedBlocks = node.mapped();
 
     // TODO: refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
     // can know which blocks to store for reuse and which to just release.
@@ -1143,15 +1102,15 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     // - Block reuse is enabled.
     // - A request was provided to this function call to identify which tokens these blocks cover
     // - Beam search is NOT enabled <=> beam width == 1
-    // - The sequence was not marked for use with cyclic kv-cache when it was added (when its context is too long to fit
-    // the max attention window).
-    // - The sequence did not switch to cyclic kv-cache during generation phase.
-    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.isCyclic();
+    // - The sequence was not marked for use with sliding window kv-cache when it was added (when its context is too
+    // long to fit the max attention window).
+    bool const storeBlocksForReuse
+        = sequence.getBeamWidth() == 1 && llmRequest.has_value() && !sequence.getContextRequiresSlidingWindowKvCache();
     if (storeBlocksForReuse)
     {
         auto constexpr beamIdx = 0;
         auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-        auto const& cacheBlockIds = sequence.getCacheBlockIds();
+        auto cacheBlockIds = sequence.getCacheBlockIds()[beamIdx];
 
         // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
         // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
@@ -1159,16 +1118,52 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
         auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+
+        // In case of sliding window attention, the number of blocks in the entire sequence can be larger than the
+        // number of blocks in the cacheBlockIds vector (which holds only the blocks in the current attention window).
+        // In this case, get all blocks in the sequence by traversing back until nullptr.
+        if (blockKeys.size() > cacheBlockIds.size())
+        {
+            auto lastBlock = allocatedBlocks.back();
+
+            // First count the number of blocks to pre-allocate the vector
+            auto currentBlock = lastBlock;
+            size_t blockCount = 0;
+            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+            {
+                blockCount++;
+                currentBlock = currentBlock->getPrevBlockInSeq();
+            }
+
+            // Pre-allocate the vector with the correct size
+            cacheBlockIds.resize(blockCount);
+            allocatedBlocks.resize(blockCount);
+
+            // Now traverse backwards and fill from the end
+            currentBlock = lastBlock;
+            size_t currentIndex = blockCount - 1;
+            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+            {
+                cacheBlockIds[currentIndex] = currentBlock->getBlockId();
+                allocatedBlocks[currentIndex] = currentBlock;
+                currentIndex--;
+                currentBlock = currentBlock->getPrevBlockInSeq();
+            }
+        }
+
+        storeBlocks(std::move(blockKeys), cacheBlockIds);
     }
 
-    auto node = mAllocatedBlocksPerSeq.extract(requestId);
-    auto& allocatedBlocks = node.mapped();
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
         // Decrease ref count
-        block->decRefCount();
+        // In case of sliding window attention + reuse, out-of-window blocks have no refs. So check before decreasing
+        // ref count.
+        if (block->hasRefs())
+        {
+            block->decRefCount();
+        }
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
@@ -1254,7 +1249,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     mMaxTokenNum = mMaxAttentionWindow + mSinkBubbleLength;
 
     // If maxBeamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
-    // tokens, when enabling cyclic kv cache.
+    // tokens, when enabling sliding window kv cache.
     mUseOneMoreBlock
         = maxSequenceLength.has_value() && maxSequenceLength.value() > mMaxAttentionWindow && maxBeamWidth > 1;
     TLLM_CHECK_WITH_INFO(!mUseOneMoreBlock || mTemporaryAttentionWindow == 0,
@@ -1264,8 +1259,11 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
         mMaxTokenNum += tokensPerBlock;
     }
 
+    // This is equivalent to mMaxAttentionWindow - sinkTokenLength + mUseOneMoreBlock*tokensPerBlock
+    mNumNonSinkTokensInWindow = mMaxTokenNum - mSinkBlockTokenLength;
+
     // Consider the mTemporaryAttentionWindow when allocating blocks.
-    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock);
+    mMaxBlocksPerSeq = tc::ceilDiv(mMaxTokenNum + mTemporaryAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
     TLLM_LOG_DEBUG("Max KV cache pages per sequence: %d", mMaxBlocksPerSeq);
@@ -1401,20 +1399,23 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const numPastTokens = req.mPromptLen + generatedTokens + mSinkBubbleLength - 1;
         auto const numNextTokens = numPastTokens + (twoStepsLookAhead ? 2 : 1) * numTokensPerStep;
 
-        if (numNextTokens > mMaxTokenNum)
-        {
-            return 0;
-        }
-
         auto const numPastBlocks = tc::ceilDiv(numPastTokens, getTokensPerBlock());
         auto const numNextBlocks = tc::ceilDiv(numNextTokens, getTokensPerBlock());
-        numRequiredBlocks = (numNextBlocks - numPastBlocks) * req.mSamplingConfig.beamWidth;
+
+        auto const numNewBlocks = (numNextTokens > mMaxTokenNum) ? std::min(numNextBlocks - numPastBlocks, 1)
+                                                                 : (numNextBlocks - numPastBlocks);
+        numRequiredBlocks = numNewBlocks * req.mSamplingConfig.beamWidth;
     }
     return numRequiredBlocks;
 }
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req) const
 {
+    if (req.isFinished())
+    {
+        return 0;
+    }
+
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
@@ -1446,12 +1447,29 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req)
         }
     }
 
-    if (numAllocBlocksPerBeam < numContextBlocks)
+    // In case of sliding window attention, a new block is allocated when the window slides (and then the out-of-window
+    // block is detached) So we need an extra block for generation if the diff between the max sequence length and the
+    // current sequence length crosses a block boundary
+    auto const isSlidingWindow
+        = req.mPromptLen + req.mMaxNewTokens > mNumNonSinkTokensInWindow + mTemporaryAttentionWindow;
+    // req.getNumTokens() does NOT include sink tokens, so don't consider them in maxSeqlenInBlocks as well
+    SizeType32 const currentSeqlenInBlocks = tc::ceilDiv(req.getNumTokens(0), getTokensPerBlock());
+    SizeType32 const maxSeqlenInBlocks = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
+    auto const willCrossBlockBoundary = maxSeqlenInBlocks > currentSeqlenInBlocks;
+    // We also need to check if the last block in the window will become full (window size does not have to be a
+    // multiple of block size)
+    auto const numSinkBlocks = mSinkBlockTokenLength / getTokensPerBlock();
+    auto const willCrossWindowBlockBoundary = maxSeqlenInBlocks + numSinkBlocks > numTotalBlocksPerBeam;
+    SizeType32 numExtraBlocksPerBeam
+        = isSlidingWindow && willCrossBlockBoundary && willCrossWindowBlockBoundary ? 1 : 0;
+
+    if (numAllocBlocksPerBeam < numContextBlocks) // Still didn't allocate all context blocks
     {
-        return numContextBlocks - numAllocBlocksPerBeam + numGenBlocksPerBeam * req.mSamplingConfig.beamWidth;
+        return numContextBlocks - numAllocBlocksPerBeam
+            + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
 
-    return (numTotalBlocksPerBeam - numAllocBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    return (numTotalBlocksPerBeam - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
 
 void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence)
@@ -1492,23 +1510,6 @@ void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence)
     }
 }
 
-void KVCacheManager::updateNewBlockPointer(GenerationRequest& sequence, SizeType32 blockIdx)
-{
-    auto const& cacheBlocks = sequence.getCacheBlockIds();
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices();
-    auto const beamWidth = sequence.getBeamWidth();
-
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
-    auto const& offsetsShape = cacheBlocksTensor.getShape();
-
-    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        auto const blockId = beamCacheBlock.at(blockIdx);
-        setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
-    }
-}
-
 void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
 {
     auto currNumTokens = sequence.getNumTokens();
@@ -1529,39 +1530,77 @@ void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
         std::swap(currNumTokens, newNumTokens);
     }
 
-    SizeType32 const cyclicTokenNum = mMaxTokenNum - mSinkBlockTokenLength;
-    SizeType32 const nextTokenIdxInCycle = (currNumTokens - mSinkBlockTokenLength) % cyclicTokenNum;
-    SizeType32 const nextTokenIdxInCache = mSinkBlockTokenLength + nextTokenIdxInCycle;
-
-    // (nextTokenIdxInCache - mSinkBlockTokenLength) % cyclicTokenNum == 0)
-    // <=> nextTokenIdxInCycle == 0
-    // <=> nextTokenIdxInCache == mSinkBlockTokenLength
-    // => nextTokenIdxInCache % getTokensPerBlock() == 0
-
-    // Check if require a new block
-    if (nextTokenIdxInCache % getTokensPerBlock() == 0)
+    auto const isBlockBoundary = (currNumTokens % getTokensPerBlock() == 0);
+    auto const shouldAllocateBlock = isBlockBoundary && (!isCrossKv() || newNumTokens <= mMaxTokenNum);
+    if (addToken)
     {
-        if (newNumTokens <= mMaxTokenNum)
+        auto const numTokensWithoutSink = newNumTokens - mSinkBlockTokenLength;
+        auto const minTokensForBlockDetach = mNumNonSinkTokensInWindow + getTokensPerBlock();
+        auto const canDetachBlock = (numTokensWithoutSink >= minTokensForBlockDetach)
+            && ((numTokensWithoutSink - minTokensForBlockDetach) % getTokensPerBlock() == 0) && !isCrossKv();
+
+        if (canDetachBlock)
         {
-            if (addToken)
+            // Get the block to detach from sequence
+            auto const requestId = sequence.getRequestId();
+            auto const beamWidth = sequence.getBeamWidth();
+            auto& allocatedBlocks = mBlockManager.mAllocatedBlocksPerSeq.at(requestId);
+            SizeType32 outOfWindowBlockIdx = mSinkBlockTokenLength / getTokensPerBlock();
+
+            auto const storeBlocksForReuse
+                = mEnableBlockReuse && beamWidth == 1 && !sequence.getContextRequiresSlidingWindowKvCache();
+
+            for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
-                mBlockManager.allocateBlock(sequence);
-                cacheNewBlockOffsets(sequence);
+                auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+
+                // Decrease ref count
+                outOfWindowBlock->decRefCount();
+
+                // If block has no refs, evict / offload it based on block reuse
+                if (!outOfWindowBlock->hasRefs())
+                {
+                    if (storeBlocksForReuse)
+                    {
+                        // If possible, offload the out-of-window block to secondary cache to save primary memory.
+                        // Block can be released only after it is added to radix tree for reuse search, which is done
+                        // after sequence is complete. Otherwise, we will create ophaned blocks and/or blocks that can't
+                        // be freed since they are not leaf blocks.
+                        if (mBlockManager.mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
+                        {
+                            mBlockManager.offloadBlock(outOfWindowBlock);
+                        }
+                    }
+                    else
+                    {
+                        mBlockManager.mEvictionPolicy->releaseBlock(outOfWindowBlock);
+                        mBlockManager.removeBlockFromHashMap(outOfWindowBlock);
+                    }
+                }
             }
-            else
-            {
-                mBlockManager.releaseLastBlock(sequence);
-            }
+
+            // Disconnect first block from sequence
+            // Remove block from allocated blocks
+            allocatedBlocks.erase(allocatedBlocks.begin() + outOfWindowBlockIdx * beamWidth,
+                allocatedBlocks.begin() + (outOfWindowBlockIdx + 1) * beamWidth);
+            // Remove stored block ids in sequence
+            sequence.removeBlock(outOfWindowBlockIdx);
         }
-        else if (sequence.getBeamWidth() > 1 || mEnableBlockReuse)
+
+        if (shouldAllocateBlock)
         {
-            TLLM_CHECK_WITH_INFO(addToken, "Remove token is not supported with beam search");
-            // Get next block index
-            SizeType32 nextBlockIdx = nextTokenIdxInCache / getTokensPerBlock();
-            // Replace the shared block with the unshared ones
-            mBlockManager.replaceSharedBlock(sequence, nextBlockIdx);
-            updateNewBlockPointer(sequence, nextBlockIdx);
+            mBlockManager.allocateBlock(sequence);
         }
+
+        if (shouldAllocateBlock || canDetachBlock)
+        {
+            cacheNewBlockOffsets(sequence);
+        }
+    }
+    else if (isBlockBoundary && newNumTokens <= mMaxTokenNum)
+    {
+        TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() <= 1, "Remove token is not supported with beam search");
+        mBlockManager.releaseLastBlock(sequence);
     }
 }
 
@@ -1592,21 +1631,27 @@ void KVCacheManager::addSequence(
     {
         auto lck = std::scoped_lock(mSequencesMtx);
         return mSequences.emplace(requestId,
-            GenerationRequest(requestId, inputLength, beamWidth, mMaxBlocksPerSeq,
-                mMinAttentionWindow + mSinkBubbleLength, // When the request has started cycling, disable reuse.
-                mBlockManager.getNumPools(), kvCacheRetentionConfig));
+            GenerationRequest(requestId, inputLength, beamWidth, mMaxBlocksPerSeq, mBlockManager.getNumPools(),
+                kvCacheRetentionConfig));
     }();
     TLLM_CHECK(emplaceDone);
     auto& sequence = seqIt->second;
 
+    // Enable sliding window kv cache when inputLength exceeds maxAttentionWindow.
+    // Note that currently sliding window kv cache doesn't work with shared kv cache of different beams.
+    sequence.setContextRequiresSlidingWindowKvCache(inputLength > mMinAttentionWindow
+            + mSinkBubbleLength); // We decide at the outset whether a request uses sliding window kv-cache or not.
+
     // Get the final token index in kv cache
     SizeType32 const finalTokenKVIdx
-        = mSinkBlockTokenLength + ((inputLength - 1 - mSinkBlockTokenLength) % (mMaxTokenNum - mSinkBlockTokenLength));
+        = mSinkBlockTokenLength + ((inputLength - 1 - mSinkBlockTokenLength) % mNumNonSinkTokensInWindow);
 
     // Get block index that with shareAmongBeams=False.
     // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
     SizeType32 unsharedBlockIdx = -1;
-    if ((!sequence.isCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
+    if ((!sequence.getContextRequiresSlidingWindowKvCache() || beamWidth > 1
+            || finalTokenKVIdx % getTokensPerBlock() > 0)
+        && !isCrossKv())
     {
         unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
             ? finalTokenKVIdx / getTokensPerBlock() + 1
@@ -1623,7 +1668,7 @@ void KVCacheManager::addSequence(
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    if (!sequence.isCyclic() && mEnableBlockReuse)
+    if (!sequence.getContextRequiresSlidingWindowKvCache() && mEnableBlockReuse)
     {
         mBlockManager.addSequence(sequence, inputLength, numContextBlocks, *llmRequest);
     }
@@ -1679,7 +1724,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
     auto& sequence = getSequence(requestId);
-    if (mEnableBlockReuse && !sequence.isCyclic())
+    if (mEnableBlockReuse && !sequence.getContextRequiresSlidingWindowKvCache())
     {
         mBlockManager.storeContextBlocks(sequence, llmRequest);
     }
@@ -1905,10 +1950,16 @@ SizeType32 KVCacheManager::getMaxCapacityBatchSize(SizeType32 inputLength, SizeT
 SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
     SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 tokensPerBlock)
 {
+    // TODO (tomer): this should probably be changed
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const actualSeqLen = std::min(sequenceLength, maxAttentionWindow);
     auto actualMaxTokenNum = actualSeqLen + sinkBubbleLength;
-    return tc::ceilDiv(actualMaxTokenNum, tokensPerBlock);
+    auto numBlocks = tc::ceilDiv(actualMaxTokenNum, tokensPerBlock);
+    if (sequenceLength > maxAttentionWindow)
+    {
+        numBlocks += kExtraBlockBuffer;
+    }
+    return numBlocks;
 }
 
 SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
@@ -1927,7 +1978,7 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     if (maxAttentionWindow <= outputLength)
     {
         return KVCacheManager::calculateMaxBlockRequirementsPerBeam(
-                   maxAttentionWindow, sinkTokenLength, maxAttentionWindow, tokensPerBlock)
+                   outputLength, sinkTokenLength, maxAttentionWindow, tokensPerBlock)
             * beamWidth;
     }
 
@@ -1938,7 +1989,11 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const numContextBlocks = (numContextTokensInAttentionWindow + sinkBubbleLength) / tokensPerBlock;
     auto const leftoverContextToken = numContextTokensInAttentionWindow - numContextBlocks * tokensPerBlock;
-    auto const numOutputBlocks = tc::ceilDiv(outputLength + leftoverContextToken, tokensPerBlock);
+    auto numOutputBlocks = tc::ceilDiv(outputLength + leftoverContextToken, tokensPerBlock);
+    if (wholeSequenceLength > maxAttentionWindow)
+    {
+        numOutputBlocks += kExtraBlockBuffer;
+    }
     return numContextBlocks + numOutputBlocks * beamWidth;
 }
 
@@ -1952,13 +2007,14 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
         = calculateMaxBlockRequirements(0, outputLength, sinkTokenLength, outputLength, beamWidth, tokensPerBlock);
     if (outputBlockRequirements > blockCapacity)
     {
-        return (blockCapacity / beamWidth) * tokensPerBlock;
+        return ((blockCapacity / beamWidth) - kExtraBlockBuffer) * tokensPerBlock;
     }
 
     // Otherwise, we need to determine how many context tokens we can fit on top of the output tokens. First, there are
     // a few context tokens we might be able to fit 'for free' because the output is not a multiple of the number of
     // tokens per block.
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
-    return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
+    return std::min(
+        outputLength + (leftoverBlockCapacity - kExtraBlockBuffer) * tokensPerBlock, inputLength + outputLength);
 }
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
