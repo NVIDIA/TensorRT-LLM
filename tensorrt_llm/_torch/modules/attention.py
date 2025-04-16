@@ -712,8 +712,8 @@ class MLA(nn.Module):
                 raise NotImplementedError(
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        if not self.enable_rope_fusion:
-            fused_q[..., self.kv_lora_rank:] = q_pe
+            if not self.enable_rope_fusion:
+                fused_q[..., self.kv_lora_rank:] = q_pe
             fused_q = fused_q.view([
                 num_tokens,
                 self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
