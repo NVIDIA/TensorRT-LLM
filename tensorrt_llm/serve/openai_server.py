@@ -9,30 +9,32 @@ from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
                     TypedDict)
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from openai.types.chat import ChatCompletionMessageParam
-from transformers import PreTrainedTokenizer
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.utils import nvtx_mark
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo)
+                                                ModelList, UsageInfo,
+                                                to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
+
+from .._utils import nvtx_mark
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -71,10 +73,9 @@ class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
-                 model: str,
-                 hf_tokenizer: PreTrainedTokenizer = None):
+                 model: str):
         self.llm = llm
-        self.tokenizer = hf_tokenizer
+        self.tokenizer = llm.tokenizer
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -96,10 +97,17 @@ class OpenAIServer:
 
         self.register_routes()
 
+    async def await_disconnected(self, raw_request: Request, promise):
+        while not await raw_request.is_disconnected():
+            await asyncio.sleep(1)
+        if not promise.finished:
+            promise.abort()
+            logger.info(
+                f"{raw_request.client} is disconnected, abort {promise.request_id}")
 
     @property
     def postproc_worker_enabled(self) -> bool:
-        return True if self.llm.args._num_postprocess_workers > 0 else False
+        return True if self.llm.args.num_postprocess_workers > 0 else False
 
     @staticmethod
     def create_error_response(
@@ -142,7 +150,7 @@ class OpenAIServer:
             stats.append(stat)
         return JSONResponse(content=stats)
 
-    async def openai_chat(self, request: ChatCompletionRequest) -> Response:
+    async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -188,6 +196,7 @@ class OpenAIServer:
                 **(request.chat_template_kwargs or {}),
             )
             sampling_params = request.to_sampling_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             postproc_args = ChatPostprocArgs.from_request(request)
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
@@ -203,7 +212,9 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params
             )
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -221,7 +232,7 @@ class OpenAIServer:
         except Exception as e:
             return self.create_error_response(str(e))
 
-    async def openai_completion(self, request: CompletionRequest) -> Response:
+    async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
 
         def merge_promises(
             promises: List[RequestOutput],
@@ -299,7 +310,7 @@ class OpenAIServer:
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             sampling_params = request.to_sampling_params()
-            disaggregated_params = request.to_llm_disaggregated_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
@@ -317,6 +328,7 @@ class OpenAIServer:
                     streaming=request.stream,
                     disaggregated_params=disaggregated_params
                 )
+                asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
                     postproc_args.tokenizer = self.tokenizer
                     postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)

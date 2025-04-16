@@ -125,8 +125,8 @@ void check(T ptr, char const* const func, char const* const file, int const line
 {
     if (ptr)
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -136,8 +136,8 @@ void checkEx(
 {
     if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
-        throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
+        throw TllmException(file, line,
+            fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)).c_str());
     }
 }
 
@@ -677,6 +677,7 @@ __host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol,
         }
         printf("\n");
     }
+    printf("\n");
 }
 
 template <typename T>
@@ -742,6 +743,19 @@ __device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int n
     printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
     print_elements(ptr, nRow, nCol, nStride);
 }
+
+template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
+#ifdef ENABLE_BF16
+template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+#endif
+#ifdef ENABLE_FP8
+template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+#endif
+template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 #ifndef CUDA_CALL
 #define CUDA_CALL(answer)                                                                                              \
@@ -1183,8 +1197,8 @@ __forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint
 }
 
 template <bool barSetTxCnt = true>
-__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, const uint32_t wrdat0,
-    const uint32_t wrdat1, const uint32_t wrdat2, const uint32_t wrdat3)
+__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, uint32_t const wrdat0,
+    uint32_t const wrdat1, uint32_t const wrdat2, uint32_t const wrdat3)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
     if (barSetTxCnt)
@@ -1360,19 +1374,6 @@ DEFINE_MEMBER_CHECKER(bias)
 DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
-
-template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
-#ifdef ENABLE_BF16
-template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
-#endif
-#ifdef ENABLE_FP8
-template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
-#endif
-template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
-template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 } // namespace tensorrt_llm::common
 

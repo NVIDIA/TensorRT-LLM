@@ -250,7 +250,7 @@ class CrossAttentionTransformerBlock(Module):
             skip_case = mlp_conditional.add_input(hidden_states)
             hidden_states = mlp_conditional.add_input(hidden_states)
 
-        attention_output = attention_output * full_text_row_masked_out_mask  # TODO(bhsueh) should move this mask into attention?
+        attention_output = attention_output * full_text_row_masked_out_mask  # TODO should move this mask into attention?
 
         residual = hidden_states * self.residual_scaling
 
@@ -1092,7 +1092,7 @@ class MLLaMAForCausalLM(PretrainedModel):
             dim_range=OrderedDict([
                 ('decoder_num_tokens_2',
                  [decoder_num_tokens_range
-                  ]),  # TODO (bhsueh) should use same name as input_ids
+                  ]),  # TODO should use same name as input_ids
                 ('encoder_input_len_2', [encoder_input_len_range]),
             ]),
         )

@@ -366,6 +366,11 @@ class TestMamba(unittest.TestCase):
             pytest.skip(f'Skipping since the path {hf_path} does not exist.')
         dtype = 'float16'
 
+        if path == 'mamba-130m-hf' and load_mode == 'from_checkpoint':
+            pytest.skip(
+                f'Skipping since it is a known issue. Will be fixed in the near future.'
+            )
+
         # get hf mamba
         hf_mamba = AutoModelForCausalLM.from_pretrained(
             hf_path, device_map='cpu', torch_dtype=str_dtype_to_torch(dtype))

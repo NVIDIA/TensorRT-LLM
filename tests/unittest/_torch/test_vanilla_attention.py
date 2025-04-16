@@ -113,6 +113,7 @@ class TestVanillaAttention(unittest.TestCase):
             buf = kv_cache_manager.get_buffers(i)
             if buf is not None:
                 torch.nn.init.normal_(buf)
+                del buf
 
         vanilla_attn = VanillaAttention(layer_idx=0,
                                         num_heads=num_heads,

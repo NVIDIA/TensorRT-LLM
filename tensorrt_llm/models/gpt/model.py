@@ -27,6 +27,7 @@ from ...module import Module
 from ...quantization import QuantMode
 from ...quantization.functional import quantize_fp8_per_token
 from ...quantization.layers import Fp8RowwiseMLP
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig)
 from .config import GPTConfig
@@ -300,6 +301,7 @@ class GPTForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
+        is_prequantized_to_fp8 = kwargs.pop('is_prequantized_to_fp8', False)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -316,13 +318,35 @@ class GPTForCausalLM(DecoderModelForCausalLM):
                                              mapping=mapping,
                                              quant_config=quant_config,
                                              **kwargs)
+        if is_prequantized_to_fp8:
+            custom_dict = {'fc': 'up_proj'}
+            loader = ModelWeightsLoader(hf_model_dir, custom_dict)
+            model = cls(config)
 
-        if not use_preloading:
-            hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
-        weights = load_weights_from_hf_model(hf_model, config)
+            # This is to account for all layernorms in nemotron variants being NemotronLayerNorm-1P.
+            def apply_layernorm_1p(weights):
+                return weights + 1.0
 
-        model = cls(config)
-        model.load(weights)
+            loader.update_key_mapping(model)
+            tllm_weights = {}
+            for tllm_key, _ in model.named_parameters():
+                if config.gpt_variant == "nemotron" and (
+                        'layernorm.weight' in tllm_key
+                        or 'ln_f.weight' in tllm_key):
+                    tllm_weights.update(
+                        loader.load(tllm_key,
+                                    preprocess=apply_layernorm_1p,
+                                    custom_postprocess_kwargs={}))
+                else:
+                    tllm_weights.update(
+                        loader.load(tllm_key, custom_postprocess_kwargs={}))
+            loader.fill(tllm_weights)
+        else:
+            if not use_preloading:
+                hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
+            weights = load_weights_from_hf_model(hf_model, config)
+            model = cls(config)
+            model.load(weights)
         return model
 
     @classmethod

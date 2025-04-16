@@ -161,7 +161,7 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = getSMVersion() < 100 && FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
         return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -334,7 +334,7 @@ protected:
             * sizeof(WeightStorage) * num_gemms / WEIGHT_ELEM_PER_BYTE;
         // Workspace size
         size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
-            num_experts, k, this->mActType, {}, mUseLora, useDeepseek, mUsePrequantScale);
+            num_experts, k, this->mActType, {}, mUseLora, useDeepseek, false, mUsePrequantScale);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -372,7 +372,7 @@ protected:
 
         bool const useDeepseek = false;
         size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, parallelism_config, mUseLora, useDeepseek, mUsePrequantScale);
+            mActType, parallelism_config, mUseLora, useDeepseek, false, mUsePrequantScale);
 
         auto const stream = mStream->get();
 
@@ -539,7 +539,7 @@ protected:
 
             invokeFP4Quantization(out_shape, in_shape, weight_start, global_scales + i,
                 reinterpret_cast<int64_t*>(quant_weight_start), reinterpret_cast<int32_t*>(scaling_factor_start), false,
-                mMultiProcessorCount, mStream->get());
+                tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
         }
     }
 
@@ -862,7 +862,7 @@ protected:
     auto getFilteredConfigs(int sm)
     {
         auto tactics = mMoERunner.getTactics();
-        if (sm == 89)
+        if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
             auto it = std::remove_if(tactics.begin(), tactics.end(),
@@ -981,11 +981,13 @@ protected:
 
         LoraParams lora_params;
         bool const useFp8BlockScales = false;
+        bool const minLatencyMode = false;
+        MoeMinLatencyParams min_latency_params;
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
             weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
             mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, stream);
+            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -1306,7 +1308,8 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+        bool should_be_deterministic
+            = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1544,7 +1547,8 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j});
-                    bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+                    bool should_be_deterministic
+                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1558,7 +1562,8 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
-                    bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+                    bool should_be_deterministic
+                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1855,7 +1860,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
                 nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, MOEParallelismConfig{1, 0, ep, ep - 1});
+                mUseLora, false, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);
@@ -1864,7 +1869,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 
             backend.prepare(num_tokens, workspace, mStream->get());
 
-            auto getNext = backend.getWorkspacePointerGenerator(workspace, num_tokens, getSMVersion() >= 90);
+            auto getNext = backend.getWorkspacePointerGenerator(
+                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
             auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
             auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
             auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());

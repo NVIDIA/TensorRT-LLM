@@ -22,7 +22,7 @@
 namespace tensorrt_llm::tests::layers::sampling
 {
 
-// TODO(nkorobov):
+// TODO:
 // Add tests for
 // - finished states
 // - finished sum
@@ -523,7 +523,7 @@ std::shared_ptr<DecodingInputs> DynamicDecodeLayerTest<T>::createInputTensors(Si
         createMedusaInputs(forwardParams);
     }
 
-    // TODO(nkorobov): extend to
+    // TODO: extend to
     // std::optional<tc::Tensor> src_cache_indirection;
     // std::optional<tc::Tensor> sequence_limit_length;
     // std::optional<tc::Tensor> input_lengths;
@@ -590,7 +590,7 @@ std::shared_ptr<BaseDecodingOutputs> DynamicDecodeLayerTest<T>::createOutputTens
         createMedusaOutputs(outputParams);
     }
 
-    // TODO(nkorobov): extend to
+    // TODO: extend to
     // std::optional<tc::Tensor> parent_ids;
     // std::optional<tc::Tensor> tgt_cache_indirection;
     // std::shared_ptr<kernels::BeamHypotheses> beamHypotheses;

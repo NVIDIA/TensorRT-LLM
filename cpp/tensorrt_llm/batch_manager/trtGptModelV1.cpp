@@ -103,13 +103,12 @@ SamplingConfig initBatchSamplingConfig(SamplingConfig const& baseSamplingConfig)
     initOptional(batchSamplingConfig.topPDecay, baseSamplingConfig.topPDecay);
     initOptional(batchSamplingConfig.topPMin, baseSamplingConfig.topPMin);
     initOptional(batchSamplingConfig.topPResetIds, baseSamplingConfig.topPResetIds);
-
     // beam search layer
     batchSamplingConfig.beamSearchDiversityRate = baseSamplingConfig.beamSearchDiversityRate;
     batchSamplingConfig.lengthPenalty = baseSamplingConfig.lengthPenalty;
     batchSamplingConfig.earlyStopping = baseSamplingConfig.earlyStopping;
-
     batchSamplingConfig.normalizeLogProbs = baseSamplingConfig.normalizeLogProbs;
+    batchSamplingConfig.beamWidthArray = baseSamplingConfig.beamWidthArray;
 
     return batchSamplingConfig;
 }

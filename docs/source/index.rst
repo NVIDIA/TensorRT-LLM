@@ -41,12 +41,13 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM API Examples
+   :caption: Examples
    :hidden:
 
-   llm-api-examples/index.rst
-   llm-api-examples/customization.md
-   llm-api-examples/llm_api_examples
+   examples/index.rst
+   examples/customization.md
+   examples/llm_api_examples
+   examples/trtllm_serve_examples
 
 
 .. toctree::

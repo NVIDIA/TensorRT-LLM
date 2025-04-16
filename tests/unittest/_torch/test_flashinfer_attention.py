@@ -132,6 +132,7 @@ class TestFlashInferAttention(unittest.TestCase):
             buf = kv_cache_manager.get_buffers(i)
             if buf is not None:
                 torch.nn.init.normal_(buf)
+                del buf
 
         if isinstance(num_kv_heads, int):
             num_kv_heads = [num_kv_heads] * num_layers
@@ -268,6 +269,7 @@ class TestFlashInferAttention(unittest.TestCase):
                     gen_vs[gen_seq_id].view(-1, num_kv_heads, head_dim))
 
             results_1.append(result_1)
+            del cache_buf
 
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)

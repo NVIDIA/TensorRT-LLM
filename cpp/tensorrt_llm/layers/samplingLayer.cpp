@@ -102,14 +102,14 @@ void SamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
 
     if (setupParams->outputLogProbs)
     {
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         mOutputLogProbs = std::any_of(setupParams->outputLogProbs->begin(), setupParams->outputLogProbs->end(),
             [this](bool outputLogProbs) { return this->mOutputLogProbs | outputLogProbs; });
     }
 
     if (setupParams->cumLogProbs)
     {
-        // FIXME(nkorobov): monotonically growing
+        // FIXME: monotonically growing
         mCumLogProbs = std::any_of(setupParams->cumLogProbs->begin(), setupParams->cumLogProbs->end(),
             [this](bool cumLogProbs) { return this->mCumLogProbs | cumLogProbs; });
     }

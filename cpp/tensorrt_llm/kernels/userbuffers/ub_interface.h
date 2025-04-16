@@ -24,7 +24,7 @@ namespace tensorrt_llm::runtime::ub
 void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
 void ub_initialize(int tp_size);
 bool ub_is_initialized();
-void* ub_allocate(int idx, size_t bytes);
+UBBuffer ub_allocate(size_t bytes);
 void ub_deallocate(void* addr);
 UBBuffer ub_get(int idx);
 communicator* ub_comm();

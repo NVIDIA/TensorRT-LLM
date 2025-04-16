@@ -69,7 +69,26 @@ void bindSet(py::module& m, std::string const& name)
         .def("__len__", [](T const& lst) { return lst.size(); })
         .def("__contains__", [](T const& s, typename T::value_type x) { return s.find(x) != s.end(); })
         .def(
-            "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>());
+            "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>())
+        .def("__eq__", [](T const& s, T const& other) { return s == other; })
+        .def(py::pickle(
+            [](T const& s) { // __getstate__
+                /* Return a tuple that fully encodes the state of the object */
+                return py::make_tuple(std::vector<typename T::value_type>(s.begin(), s.end()));
+            },
+            [](py::tuple t) { // __setstate__
+                if (t.size() != 1)
+                    throw std::runtime_error("Invalid state!");
+                /* Create a new C++ instance */
+                T s;
+                /* Assign any additional state */
+                auto state_list = t[0].cast<std::vector<typename T::value_type>>();
+                for (auto& item : state_list)
+                {
+                    s.insert(item);
+                }
+                return s;
+            }));
 }
 
 } // namespace PybindUtils

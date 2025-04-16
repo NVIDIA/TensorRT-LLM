@@ -35,18 +35,17 @@ int constexpr VOID_PTR_SZ = 2 + sizeof(void*) * 2;
 
 #if !defined(_MSC_VER)
 
-TllmException::TllmException(char const* file, std::size_t line, std::string const& msg)
+TllmException::TllmException(char const* file, std::size_t line, char const* msg)
     : std::runtime_error{""}
 {
     mNbFrames = backtrace(mCallstack.data(), MAX_FRAMES);
     auto const trace = getTrace();
-    std::runtime_error::operator=(
-        std::runtime_error{fmtstr("%s (%s:%zu)\n%s", msg.c_str(), file, line, trace.c_str())});
+    std::runtime_error::operator=(std::runtime_error{fmtstr("%s (%s:%zu)\n%s", msg, file, line, trace.c_str())});
 }
 #else
-TllmException::TllmException(char const* file, std::size_t line, std::string const& msg)
+TllmException::TllmException(char const* file, std::size_t line, char const* msg)
     : mNbFrames{}
-    , std::runtime_error{fmtstr("%s (%s:%zu)", msg.c_str(), file, line)}
+    , std::runtime_error{fmtstr("%s (%s:%zu)", msg, file, line)}
 {
 }
 #endif

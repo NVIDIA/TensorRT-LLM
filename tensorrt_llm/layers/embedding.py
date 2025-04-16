@@ -20,8 +20,8 @@ import torch
 
 from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
 from ..functional import (ACT2FN, Tensor, arange, concat, constant, cos, div,
-                          embedding, exp, identity, meshgrid2d, outer, pad,
-                          shape, sin, slice, unsqueeze, where)
+                          embedding, exp, expand, identity, meshgrid2d, outer,
+                          pad, shape, sin, slice, unsqueeze, where)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -177,6 +177,9 @@ class PromptTuningEmbedding(Embedding):
 
         # tasks: [batch_size, seq_len]
         # prompt_tokens: [batch_size, seq_len]
+        # if speculative decoding is enabled the shape of prompt_tokens is [batch_size, seq_len + max_draft_len],
+        # so we need to expand tasks to [batch_size, seq_len + max_draft_len]
+        tasks = expand(tasks, shape(prompt_tokens))
         prompt_tokens = prompt_tokens + tasks
         prompt_embeddings = embedding(prompt_tokens, prompt_embedding_table)
 

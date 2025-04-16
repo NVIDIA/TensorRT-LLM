@@ -185,7 +185,7 @@ public:
         std::shared_ptr<T> result = mObservers[key].lock();
         if (result == nullptr)
         {
-            TLLM_LOG_TRACE("creating singleton instance for CUDA context %d and thread %d", ctx, thread);
+            TLLM_LOG_TRACE("creating singleton instance for CUDA context %lu and thread %lu", ctx, thread);
             // Create the resource and register with an observer.
             result = std::shared_ptr<T>{mCreator().release(),
                 [this, key](T* obj)

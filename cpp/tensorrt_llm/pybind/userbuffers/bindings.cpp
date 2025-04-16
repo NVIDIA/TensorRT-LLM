@@ -17,6 +17,7 @@
 
 #include "bindings.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/kernels/userbuffers/userbuffersManager.h"
 
 namespace py = pybind11;
 namespace tub = tensorrt_llm::runtime::ub;
@@ -34,10 +35,11 @@ void UserBufferBindings::initBindings(pybind11::module_& m)
 
     m.def("ub_initialize", [](int tp_size) { tub::ub_initialize(tp_size); });
     m.def("ub_is_initialized", &tub::ub_is_initialized);
-    m.def(
-        "ub_allocate", [](int idx, size_t bytes) { return reinterpret_cast<intptr_t>(tub::ub_allocate(idx, bytes)); });
+    m.def("ub_allocate", [](size_t bytes) { return tub::ub_allocate(bytes); });
     m.def("ub_deallocate", [](intptr_t addr) { return tub::ub_deallocate(reinterpret_cast<void*>(addr)); });
     m.def("ub_get", &tub::ub_get);
     m.def("ub_supported", &tub::ub_supported);
+
+    m.def("initialize_userbuffers_manager", &tub::initialize_userbuffers_manager);
 }
 } // namespace tensorrt_llm::kernels::userbuffers

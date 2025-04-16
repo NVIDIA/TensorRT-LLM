@@ -1,7 +1,7 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Dict
+from typing import Callable, Dict, Set
 
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -19,54 +19,73 @@ from ...utils.node_utils import get_all_input_output_nodes, is_op
 from .._graph import add_graph_input, canonicalize_graph
 
 
-def _collect_mha_nodes_and_info(
-    egm: GraphModule, cache_config: CacheConfig
+def _collect_nodes_and_info(
+    egm: GraphModule, cache_config: CacheConfig, ops: Set[Callable], info_extractor: Callable
 ) -> Dict[Node, GetAttentionInfo]:
     graph: Graph = egm.graph
+    nodes_info: Dict[Node, GetAttentionInfo] = {}
 
-    # list of MHA kernels we would want to detect and replace
-    fused_mha_ops = {
-        torch.ops.attention.fused_mha,
-    }
-
-    # get all mha nodes and extract information needed for AttentionInfo
-    mha_info: Dict[Node, GetAttentionInfo] = {}
-    for mha_node in graph.nodes:
-        if mha_node.op != "call_function" or not is_op(mha_node, fused_mha_ops):
+    for node in graph.nodes:
+        if node.op != "call_function" or not is_op(node, ops):
             continue
 
-        # get q and k weights from the mha node
-        q_weight = egm.get_parameter(mha_node.all_input_nodes[0].args[1].target)  # [nd,hidden_size]
-        k_weight = egm.get_parameter(mha_node.all_input_nodes[1].args[1].target)  # [nd,hidden_size]
+        nodes_info[node] = info_extractor(node, egm, cache_config)
 
-        # get some more information from mha node
-        head_dim = mha_node.args[3]
-        if len(mha_node.args) > 4:
-            pos_embd_mode, rope_theta, rope_scale = mha_node.args[4:7]
-            pos_embd_config = PositionalEmbeddingConfig(
-                mode=pos_embd_mode, rope_theta=rope_theta, rope_scale=rope_scale
-            )
-        else:
-            pos_embd_config = PositionalEmbeddingConfig()
-
-        # get fake q tensor that is an MHA input node to retrieve head_dim, num_heads, and dtype
-        # also retrieve fake tensor corresponding to output of k GEMM to infer number of kv heads
-        def _get_info():
-            return AttentionInfo(
-                num_heads=q_weight.shape[0] // head_dim,
-                num_kv_heads=k_weight.shape[0] // head_dim,
-                head_dim=head_dim,
-                dtype=q_weight.dtype,
-                cache_config=cache_config,
-                pos_embd_config=pos_embd_config,
-            )
-
-        mha_info[mha_node] = _get_info
-
-    return mha_info
+    return nodes_info
 
 
-def _check_in_out_nodes(egm: GraphModule) -> Node:
+def _extract_mha_info(node: Node, egm: GraphModule, cache_config: CacheConfig) -> Callable:
+    # Extract q and k weights from the MHA node
+    q_weight = egm.get_parameter(node.all_input_nodes[0].args[1].target)  # [nd, hidden_size]
+    k_weight = egm.get_parameter(node.all_input_nodes[1].args[1].target)  # [nd, hidden_size]
+
+    # Extract additional information
+    head_dim = node.args[3]
+    if len(node.args) > 4:
+        pos_embd_mode, rope_theta, rope_scale = node.args[4:7]
+        pos_embd_config = PositionalEmbeddingConfig(
+            mode=pos_embd_mode, rope_theta=rope_theta, rope_scale=rope_scale
+        )
+    else:
+        pos_embd_config = PositionalEmbeddingConfig()
+
+    def _get_info():
+        return AttentionInfo(
+            num_heads=q_weight.shape[0] // head_dim,
+            num_kv_heads=k_weight.shape[0] // head_dim,
+            head_dim=head_dim,
+            dtype=q_weight.dtype,
+            cache_config=cache_config,
+            pos_embd_config=pos_embd_config,
+        )
+
+    return _get_info
+
+
+def _extract_mla_info(node: Node, egm: GraphModule, cache_config: CacheConfig) -> Callable:
+    # Extract information from MLA node
+    q_nope_fake = node.args[0].meta["val"]
+    q_pe_fake = node.args[1].meta["val"]
+    kv_fake = node.args[2].meta["val"]
+
+    # TODO: Extract Yarn information from MLA node and store in PositionalEmbeddingConfig
+    pos_embd_config = PositionalEmbeddingConfig()
+
+    def _get_info():
+        return AttentionInfo(
+            num_heads=q_nope_fake.shape[1],
+            num_kv_heads=kv_fake.shape[1],
+            head_dim=q_nope_fake.shape[-1],
+            rope_dim=q_pe_fake.shape[-1],
+            dtype=q_nope_fake.dtype,
+            cache_config=cache_config,
+            pos_embd_config=pos_embd_config,
+        )
+
+    return _get_info
+
+
+def check_in_out_nodes(egm: GraphModule) -> Node:
     """Check for input and output nodes in the graph and return 1st input node."""
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
@@ -114,8 +133,10 @@ def _insert_cached_nodes(
 
     # replace fused attention node with attention node that has kv cache
     for idx, (attn_node, get_info) in enumerate(attn_lookup.items()):
+        # Get attention_op
+        fused_attention_op, num_qkv_args = attention_op.get_attention_op()
         # pick out GEMMs
-        qkv = attn_node.args[:3]
+        qkv = attn_node.args[:num_qkv_args]
 
         # setup + store cache initializers and caches as input nodes
         cache_in_nodes = []
@@ -139,11 +160,43 @@ def _insert_cached_nodes(
         # insert fused replacement op
         with graph.inserting_before(attn_node):
             node_with_cache = graph.call_function(
-                attention_op.get_attention_op(),
+                fused_attention_op,
                 args=(*qkv, *metadata_nodes, *cache_in_nodes, *buffer_in_nodes, *constants),
             )
         attn_node.replace_all_uses_with(node_with_cache)
         graph.erase_node(attn_node)
+
+
+def _insert_with_kv_cache(
+    egm: GraphModule,
+    cm: CachedSequenceInterface,
+    attention_op: AttentionDescriptor,
+    cache_config: CacheConfig,
+    fused_ops: Set[Callable],
+    info_extractor: Callable,
+    op_name: str,
+    input_node: Node,
+) -> GraphModule:
+    """Shared logic to replace vanilla fused_mha/fused_mla node with corresponding custom op with KV cache."""
+    # Get all attention nodes and their info objects
+    attn_node_lookup = _collect_nodes_and_info(egm, cache_config, fused_ops, info_extractor)
+    if not attn_node_lookup:
+        # If there are no nodes for kv cache insertion found, return current graph
+        return egm
+
+    # Sanity check
+    if cm.info.is_paged:
+        assert attention_op.is_paged(), "Paged sequence info requires paged attention op."
+
+    ad_logger.info(f"Inserting {op_name} with KV cache and AttentionOp as {attention_op.__name__}")
+    ad_logger.debug(f"Before inserting {op_name} with KV cache: {egm}")
+
+    _insert_cached_nodes(egm, cm, attention_op, attn_node_lookup, input_node)
+
+    egm = canonicalize_graph(egm, shape_prop=False)
+    ad_logger.debug(f"After inserting {op_name} with KV cache: {egm}")
+
+    return egm
 
 
 def insert_mha_with_kv_cache(
@@ -151,26 +204,27 @@ def insert_mha_with_kv_cache(
     cm: CachedSequenceInterface,
     attention_op: AttentionDescriptor,
     cache_config: CacheConfig,
+    input_node: Node,
 ) -> GraphModule:
     """Replaces the vanilla fused_mha node in the graph with a custom MHA op with KV cache."""
-    # sanity check
-    if cm.info.is_paged:
-        assert attention_op.is_paged(), "Paged sequence info requires paged attention op."
+    fused_mha_ops = {torch.ops.attention.fused_mha}
+    return _insert_with_kv_cache(
+        egm, cm, attention_op, cache_config, fused_mha_ops, _extract_mha_info, "MHA", input_node
+    )
 
-    ad_logger.info(f"Inserting MHA with KV cache and AttentionOp as {attention_op.__name__}")
-    ad_logger.debug(f"Before inserting MHA with KV cache: {egm}")
 
-    # check for input node
-    input_node = _check_in_out_nodes(egm)
-
-    # get all attention nodes and their info objects
-    attn_node_lookup = _collect_mha_nodes_and_info(egm, cache_config)
-
-    _insert_cached_nodes(egm, cm, attention_op, attn_node_lookup, input_node)
-
-    egm = canonicalize_graph(egm, shape_prop=False)
-    ad_logger.debug("After inserting MHA with KV cache: " + str(egm))
-    return egm
+def insert_mla_with_kv_cache(
+    egm: GraphModule,
+    cm: CachedSequenceInterface,
+    attention_op: AttentionDescriptor,
+    cache_config: CacheConfig,
+    input_node: Node,
+) -> GraphModule:
+    """Replaces the vanilla fused_mha node in the graph with a custom MLA op with KV cache."""
+    fused_mla_ops = {torch.ops.deepseek.fused_mla}
+    return _insert_with_kv_cache(
+        egm, cm, attention_op, cache_config, fused_mla_ops, _extract_mla_info, "MLA", input_node
+    )
 
 
 def resize_kv_cache(

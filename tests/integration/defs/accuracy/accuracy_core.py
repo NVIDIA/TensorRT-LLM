@@ -15,19 +15,26 @@
 import json
 import math
 import os
-from typing import Dict, List, Optional
+import tempfile
+from typing import Dict, List, Optional, Union
 
 import pytest
 import scipy
 import yaml
 
+import tensorrt_llm.evaluate
+from tensorrt_llm._torch import LLM as PyTorchLLM
+from tensorrt_llm._torch.speculative import SpecConfig
 from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
-from ..trt_test_alternative import check_call, exists, makedirs
+from ..trt_test_alternative import check_call, exists
 
 
 def compute_threshold(num_samples: int,
@@ -55,8 +62,7 @@ class AccuracyTask:
 
     # Dataset
     DATASET = None
-    DATASET_DIR = f"{llm_models_root()}/datasets"
-    ROUGE_DIR = f"{llm_models_root()}/rouge"
+    DATASET_DIR = None
     HIGHER_IS_BETTER = True
 
     # Hypothesis testing parameters
@@ -69,6 +75,10 @@ class AccuracyTask:
     MAX_INPUT_LEN = None
     MAX_OUTPUT_LEN = None
     MAX_BATCH_SIZE = None
+
+    # Evaluator
+    EVALUATOR_CLS = None
+    EVALUATOR_KWARGS = None
 
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
@@ -125,9 +135,52 @@ class AccuracyTask:
               "===========================================================\n")
         return num_samples, threshold
 
+    def evaluate(self,
+                 llm: Union[LLM, PyTorchLLM],
+                 extra_acc_spec: Optional[str] = None,
+                 extra_evaluator_kwargs: Optional[dict] = None):
+        assert self.EVALUATOR_CLS is not None
+
+        if llm.args.speculative_config is None:
+            spec_dec_algo = None
+        elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
+            spec_dec_algo = llm.args.speculative_config.decoding_type
+        elif isinstance(llm.args.speculative_config, SpecConfig):
+            spec_dec_algo = llm.args.speculative_config.spec_dec_name
+        else:
+            raise ValueError(
+                f"Not recognized speculative_config: {llm.args.speculative_config}."
+            )
+
+        num_samples, threshold = self.get_num_samples_and_threshold(
+            dtype=llm.args.dtype,
+            quant_algo=llm.args.quant_config.quant_algo,
+            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+            spec_dec_algo=spec_dec_algo,
+            extra_acc_spec=extra_acc_spec)
+
+        sampling_params = SamplingParams(
+            max_tokens=self.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=self.MAX_INPUT_LEN)
+
+        evaluator_kwargs = {}
+        if self.EVALUATOR_KWARGS is not None:
+            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
+        if extra_evaluator_kwargs is not None:
+            evaluator_kwargs.update(extra_evaluator_kwargs)
+        evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
+                                       **evaluator_kwargs)
+        accuracy = evaluator.evaluate(llm, sampling_params)
+        if self.HIGHER_IS_BETTER:
+            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"
+        else:
+            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}"
+
 
 class CnnDailymail(AccuracyTask):
     DATASET = "cnn_dailymail"
+    DATASET_DIR = f"{llm_models_root()}/datasets/ccdv/cnn_dailymail"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -138,9 +191,16 @@ class CnnDailymail(AccuracyTask):
     MAX_INPUT_LEN = 924
     MAX_OUTPUT_LEN = 100
 
+    EVALUATOR_CLS = tensorrt_llm.evaluate.CnnDailymail
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            rouge_path=ROUGE_DIR)
+
 
 class Humaneval(AccuracyTask):
     DATASET = "humaneval"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai_humaneval"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -154,6 +214,8 @@ class Humaneval(AccuracyTask):
 
 class ZeroScrolls(AccuracyTask):
     DATASET = "zero_scrolls"
+    DATASET_DIR = f"{llm_models_root()}/datasets/tau/zero_scrolls"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -167,9 +229,11 @@ class ZeroScrolls(AccuracyTask):
 
 class SlimPajama6B(AccuracyTask):
     DATASET = "SlimPajama-6B"
+    DATASET_DIR = f"{llm_models_root()}/datasets/SlimPajama-6B"
     HIGHER_IS_BETTER = False
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
-    ALPHA = 0.002
+    ALPHA = 0.01
     BETA = 0.2
     SIGMA = 4.48
     NUM_SAMPLES = 86  # Full sample with length >= 10000
@@ -180,11 +244,11 @@ class SlimPajama6B(AccuracyTask):
     MAX_OUTPUT_LEN = 1
 
 
-class Mmlu(AccuracyTask):
+class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
-    ALPHA = 0.002
+    ALPHA = 0.01
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
@@ -192,6 +256,9 @@ class Mmlu(AccuracyTask):
     MAX_BATCH_SIZE = 128
     MAX_INPUT_LEN = 4094
     MAX_OUTPUT_LEN = 2
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.MMLU
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
 class PassKeyRetrieval64k(AccuracyTask):
@@ -224,36 +291,31 @@ class PassKeyRetrieval128k(AccuracyTask):
     MAX_OUTPUT_LEN = 50
 
 
-class AccuracyTestHarness:
+class CliFlowAccuracyTestHarness:
     # Model
     MODEL_NAME = None
     MODEL_PATH = None
     MODEL_FORMAT = "HF"
     EXAMPLE_FOLDER = None
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
     def setup_class(cls, request):
         cls.llm_venv = request.getfixturevalue("llm_venv")
         cls.llm_root = request.getfixturevalue("llm_root")
 
+    @pytest.fixture(autouse=True, scope="function")
+    def setup_method(self):
+        with tempfile.TemporaryDirectory(
+                prefix=self.MODEL_NAME.replace("/", "-"),
+                dir=self.llm_venv.get_working_directory()) as workspace:
+            self.ckpt_dir = f"{workspace}/cmodels"
+            self.engine_dir = f"{workspace}/engines"
+            yield
+
     @property
     def example_dir(self):
         return f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}"
-
-    @property
-    def ckpt_dir(self):
-        ckpt_dir = f"{self.llm_venv.get_working_directory()}/cmodels/{self.MODEL_NAME}"
-        if not exists(ckpt_dir):
-            makedirs(ckpt_dir)
-        return ckpt_dir
-
-    @property
-    def engine_dir(self):
-        engine_dir = f"{self.llm_venv.get_working_directory()}/engines/{self.MODEL_NAME}"
-        if not exists(engine_dir):
-            makedirs(engine_dir)
-        return engine_dir
 
     def install_requirements(self):
         requirements = f"{self.example_dir}/requirements.txt"
@@ -295,22 +357,22 @@ class AccuracyTestHarness:
     def convert(self):
         print("Converting model to TensorRT-LLM checkpoint...")
 
-        is_pre_quantized = False
+        is_prequantized = False
         for quant_config_file in [
                 "hf_quant_config.json", "quant_config.json",
                 "quantize_config.json"
         ]:
             if exists(f"{self.MODEL_PATH}/{quant_config_file}"):
-                is_pre_quantized = True
+                is_prequantized = True
                 break
-        if not is_pre_quantized and exists(f"{self.MODEL_PATH}/config.json"):
+        if not is_prequantized and exists(f"{self.MODEL_PATH}/config.json"):
             with open(f"{self.MODEL_PATH}/config.json") as f:
                 hf_config = json.load(f)
             if "quantization_config" in hf_config:
-                is_pre_quantized = True
+                is_prequantized = True
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
-        if not is_pre_quantized and quant_config._requires_modelopt_quantization:
+        if not is_prequantized and quant_config._requires_modelopt_quantization:
             script = "../quantization/quantize.py"
         else:
             script = "convert_checkpoint.py"
@@ -333,7 +395,7 @@ class AccuracyTestHarness:
         if self.cp_size > 1:
             convert_cmd.append(f"--cp_size={self.cp_size}")
 
-        if not is_pre_quantized and quant_config._requires_modelopt_quantization:
+        if not is_prequantized and quant_config._requires_modelopt_quantization:
             if self.quant_algo == QuantAlgo.MIXED_PRECISION:
                 assert self.extra_convert_args is not None
                 assert any(
@@ -349,7 +411,8 @@ class AccuracyTestHarness:
             if self.quant_algo == QuantAlgo.NVFP4:
                 convert_cmd.append("--use_nvfp4")
             elif self.quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--use_fp8")
+                if self.EXAMPLE_FOLDER != "gpt":  # --use_fp8 flag is not needed for gpt.
+                    convert_cmd.append("--use_fp8")
             elif self.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 convert_cmd.append("--use_fp8_rowwise")
             elif quant_config._use_plugin_sq:
@@ -378,7 +441,8 @@ class AccuracyTestHarness:
             if self.kv_cache_quant_algo == QuantAlgo.INT8:
                 convert_cmd.append("--int8_kv_cache")
             elif self.kv_cache_quant_algo == QuantAlgo.FP8:
-                convert_cmd.append("--fp8_kv_cache")
+                if self.EXAMPLE_FOLDER != "gpt":  # --fp8_kv_cache flag is not needed for gpt.
+                    convert_cmd.append("--fp8_kv_cache")
 
         if quant_config._requires_calibration:
             convert_cmd.append(
@@ -546,7 +610,7 @@ class AccuracyTestHarness:
             if isinstance(task,
                           (CnnDailymail, Humaneval, ZeroScrolls, SlimPajama6B)):
                 self.summarize(task)
-            elif isinstance(task, Mmlu):
+            elif isinstance(task, MMLU):
                 self.mmlu(task)
             elif isinstance(task, (PassKeyRetrieval64k, PassKeyRetrieval128k)):
                 self.eval_long_context(task)
@@ -587,3 +651,17 @@ class AccuracyTestHarness:
         self.convert()
         self.build()
         self.evaluate()
+
+
+class LlmapiAccuracyTestHarness:
+    # Model
+    MODEL_NAME = None
+    MODEL_PATH = None
+
+    @pytest.fixture(autouse=True, scope="class")
+    @classmethod
+    def setup_class(cls):
+        original_level = logger.level
+        logger.set_level("info")
+        yield
+        logger.set_level(original_level)

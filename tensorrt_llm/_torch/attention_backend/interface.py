@@ -1,11 +1,13 @@
 import copy
-import enum
+import weakref
+from collections import namedtuple
 from dataclasses import dataclass, field
-from functools import lru_cache
+from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
 import torch
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from typing_extensions import Self
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -15,6 +17,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..pyexecutor.resource_manager import KVCacheManager
+from ..utils import get_model_extra_attrs
 
 
 @dataclass
@@ -22,6 +25,14 @@ class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
     cache_reuse: bool = False
     has_speculative_draft_tokens: bool = False
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
 
 
 @dataclass(kw_only=True)
@@ -114,6 +125,7 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
+    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -325,6 +337,7 @@ class RopeParams:
         # rotary embedding dim.
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
+                           or getattr(config, 'qk_rope_head_dim', None)
                            or int(head_dim * rope_percentage))
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
@@ -345,57 +358,79 @@ class RopeParams:
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        elif config.model_type == "deepseek_v3":
+            rope_params.scale_type = RotaryScalingType.yarn
 
         return rope_params
 
-    @lru_cache(maxsize=1)
-    def create_rope_const_params(self):
+    def create_rope_const_params(self, interleave: bool = True):
         if self.dim == 0:
             return None, None
-        assert self.scale_type != RotaryScalingType.longrope, "Long RoPE is not yet supported."
-        rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            self.max_positions,
-            self.dim,
-            self.theta,
-            self.scale,
-            self.scale_type,
-            rope_scaling_config={
-                "factor": self.scale,
-                "low_freq_factor": self.low_freq_factor,
-                "high_freq_factor": self.high_freq_factor,
-                "original_max_position_embeddings": self.original_max_positions,
-            })
-        rope_inv_freq = torch.torch.tensor(
-            rope_inv_freq,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        rope_cos_sin = torch.torch.tensor(
-            rope_cos_sin,
-            dtype=torch.float32,
-            device='cuda',
-        )
-        return rope_inv_freq, rope_cos_sin
 
-    @lru_cache(maxsize=1)
-    def create_deepseek_rope_const_params(self, qk_rope_head_dim: int):
-        rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-            self.max_positions,
-            qk_rope_head_dim,
-            self.theta,
-            self.scale,
-            self.original_max_positions,
-            self.beta_fast,
-            self.beta_slow,
-            self.mscale,
-            self.mscale_all_dim,
-        )
+        RopeConstParams = namedtuple("RopeConstParams", ["inv_freq", "cos_sin"])
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is not None:
+            cache = extra_attrs.setdefault("rope_const_params", {})
+            rope_const_params = cache.get((self, interleave), None)
+            if rope_const_params is not None and rope_const_params.cos_sin(
+            ) is not None:
+                return (
+                    rope_const_params.inv_freq()
+                    if rope_const_params.inv_freq is not None else None,
+                    rope_const_params.cos_sin(),
+                )
+
+        if self.scale_type == RotaryScalingType.yarn:
+            rope_inv_freq = None
+            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.original_max_positions,
+                self.beta_fast,
+                self.beta_slow,
+                self.mscale,
+                self.mscale_all_dim,
+            )
+        elif self.scale_type == RotaryScalingType.longrope:
+            raise NotImplementedError("Long RoPE is not supported.")
+        else:
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                self.max_positions,
+                self.dim,
+                self.theta,
+                self.scale,
+                self.scale_type,
+                rope_scaling_config={
+                    "factor": self.scale,
+                    "low_freq_factor": self.low_freq_factor,
+                    "high_freq_factor": self.high_freq_factor,
+                    "original_max_position_embeddings":
+                    self.original_max_positions,
+                })
+        if rope_inv_freq is not None:
+            rope_inv_freq = torch.torch.tensor(
+                rope_inv_freq,
+                dtype=torch.float32,
+                device='cuda',
+            )
+        if not interleave:
+            rope_cos_sin = rope_cos_sin.reshape(
+                self.max_positions, -1,
+                2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
-        rope_inv_freq = None
+        if extra_attrs is not None:
+            cache[(self, interleave)] = RopeConstParams(
+                weakref.ref(rope_inv_freq)
+                if rope_inv_freq is not None else None,
+                weakref.ref(rope_cos_sin),
+            )
         return rope_inv_freq, rope_cos_sin
 
 
@@ -406,6 +441,7 @@ class PositionalEmbeddingParams:
 
     # RoPE params
     rope: Optional[RopeParams] = None
+    is_neox: bool = True
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -420,7 +456,7 @@ class PositionalEmbeddingParams:
 TMetadata = TypeVar("TMetadata", bound=AttentionMetadata)
 
 
-class PredefinedAttentionMask(str, enum.Enum):
+class PredefinedAttentionMask(str, Enum):
     """
     Predefined attention mask types
 
@@ -449,6 +485,7 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         """
         Initialize the backend.
@@ -499,3 +536,36 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
+
+
+@torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
+def dummy_forward(q: torch.Tensor, k: torch.Tensor,
+                  v: torch.Tensor) -> torch.Tensor:
+    """
+    Dummy attention forward function to estimate memory usage.
+    Args:
+        q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
+        k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
+        v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
+    Returns:
+        torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
+    """
+    head_dim = q.shape[2]
+    assert q.dim() == 3
+    assert k.dim() == 3 and k.size(2) == head_dim
+    assert v.dim() == 3 and v.size(2) == head_dim
+    # This is only for memory estimation for now.
+    # NOTE: this method is not accurate while it works for most scenario.
+    o = _flash_attention_forward(q.unsqueeze(0),
+                                 k.unsqueeze(0),
+                                 v.unsqueeze(0),
+                                 attention_mask=None,
+                                 query_length=q.size(0),
+                                 is_causal=True)
+    return o.reshape(o.size(1), -1)
+
+
+@dummy_forward.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    num_q_tokens = q.size(0)
+    return torch.empty_like(q).reshape(num_q_tokens, -1)

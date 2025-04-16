@@ -40,8 +40,17 @@ def mistral_example_root(llm_venv):
     if platform.system() != "Windows":
         # https://github.com/Dao-AILab/flash-attention/issues/345
         # No wheel for flash-attn on windows and compilation fails locally.
-        llm_venv.run_cmd(
-            ['-m', 'pip', 'install', '--upgrade', 'flash-attn==2.4.2'])
+        install_cmd = [
+            "MAX_JOBS=4",
+            "python3",
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "flash-attn==2.4.2",
+        ]
+
+        check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("run_type", [
@@ -796,8 +805,6 @@ def test_llm_mistral_quantization_4gpus_llmapi(llama_example_root,
         assert ("Assistant" in generated_text) or (
             "AI agent" in generated_text
         ), "Generated text should start with either 'Assistant' or 'AI agent'"
-
-    del llm
 
     threshold = 55 if 'int4' in quant else 60
 

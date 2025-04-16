@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
@@ -49,6 +50,34 @@ namespace tensorrt_llm::pybind::batch_manager
 void initBindings(pybind11::module_& m)
 {
     using GenLlmReq = tb::GenericLlmRequest<runtime::ITensor::SharedPtr>;
+
+    // Create and register exceptions in module scope
+    static PyObject* peft_exc = PyErr_NewException(
+        "tensorrt_llm.bindings.internal.batch_manager.PeftTaskNotCachedException", nullptr, nullptr);
+    static PyObject* lora_exc
+        = PyErr_NewException("tensorrt_llm.bindings.internal.batch_manager.LoraCacheFullException", nullptr, nullptr);
+
+    m.add_object("PeftTaskNotCachedException", py::handle(peft_exc));
+    m.add_object("LoraCacheFullException", py::handle(lora_exc));
+
+    // Register with no captures
+    py::register_exception_translator(
+        [](std::exception_ptr p)
+        {
+            try
+            {
+                if (p)
+                    std::rethrow_exception(p);
+            }
+            catch (const tb::PeftTaskNotCachedException& e)
+            {
+                PyErr_SetString(peft_exc, e.what());
+            }
+            catch (const tr::LoraCacheFullException& e)
+            {
+                PyErr_SetString(lora_exc, e.what());
+            }
+        });
 
     PybindUtils::bindSet<tb::ReqIdsSet>(m, "ReqIdsSet");
 
@@ -138,7 +167,8 @@ void initBindings(pybind11::module_& m)
                 }
                 return value;
             })
-        .def("lora_config",
+        .def_property(
+            "lora_config",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -148,8 +178,11 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
-        .def("lora_weights",
+            },
+            [](GenLlmReq& self, at::Tensor& loraConfig)
+            { self.setLoraConfig(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraConfig))); })
+        .def_property(
+            "lora_weights",
             [](GenLlmReq& self)
             {
                 std::optional<at::Tensor> value{std::nullopt};
@@ -159,7 +192,9 @@ void initBindings(pybind11::module_& m)
                     value = tr::Torch::tensor(*tensor);
                 }
                 return value;
-            })
+            },
+            [](GenLlmReq& self, at::Tensor& loraWeights)
+            { self.setLoraWeights(static_cast<GenLlmReq::TensorPtr>(tr::TorchView::of(loraWeights))); })
         .def("stop_words_list",
             [](GenLlmReq& self)
             {
@@ -216,6 +251,7 @@ void initBindings(pybind11::module_& m)
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+        .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(
@@ -329,6 +365,7 @@ void initBindings(pybind11::module_& m)
                      auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                      auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
+                     // 45 parameters
                      return tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                          end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
                          stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
@@ -367,7 +404,7 @@ void initBindings(pybind11::module_& m)
             py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
-            py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
+            py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
@@ -427,21 +464,13 @@ void initBindings(pybind11::module_& m)
             py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
             py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
-        .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
-        .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_property_readonly(
-            "sequence_lengths", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengths); })
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
         .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_property_readonly(
-            "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
         .def_property_readonly("new_output_tokens_host",
             [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);

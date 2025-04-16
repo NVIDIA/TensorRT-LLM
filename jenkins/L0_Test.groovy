@@ -29,11 +29,11 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
 LLM_DOCKER_IMAGE = env.dockerImage
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504101610-3421"
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.01-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.03-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -91,6 +91,7 @@ def trimForStageList(stageNameList)
     return trimedList
 }
 
+// Test filter flags
 @Field
 def REUSE_STAGE_LIST = "reuse_stage_list"
 @Field
@@ -111,7 +112,11 @@ def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
 def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
-
+@Field
+def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+@Field
+def DEBUG_MODE = "debug"
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
@@ -123,6 +128,8 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
+    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (DEBUG_MODE): false,
 ]
 
 String getShortenedJobName(String path)
@@ -257,8 +264,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 due to the hardware stability.
-        if (type.contains("dgx-h100") && hasMultipleGPUs)
+        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
+        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
@@ -272,7 +279,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type == "b100-ts2" || type.contains("dgx-h100") || type == "gh200" ) {
+        if (type == "b100-ts2" || type.contains("dgx-h100") || type.contains("dgx-h200") || type == "gh200" ) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -451,7 +458,9 @@ def runLLMDocBuild(pipeline, config)
                 pip3 install -r requirements.txt && \
                 pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
                 doxygen Doxygen && \
-                make html
+                make html && \
+                cd build/html && \
+                touch .nojekyll
             """
         )
     }
@@ -477,7 +486,7 @@ def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
         </failure></testcase></testsuite></testsuites>"""
 }
 
-def getMakoOpts(getMakoScript, makoArgs="") {
+def getMakoOpts(getMakoScript, makoArgs=[]) {
     // We want to save a map for the Mako opts
     def makoOpts = [:]
     def turtleOutput = ""
@@ -491,8 +500,9 @@ def getMakoOpts(getMakoScript, makoArgs="") {
         getMakoScript,
         "--device 0"].join(" ")
 
-    if (makoArgs != "") {
-        listMakoCmd = [listMakoCmd, "--mako-opt ${makoArgs}"].join(" ")
+    if (makoArgs) {
+        def makoOptArgs = makoArgs.collect { "--mako-opt " + it }
+        listMakoCmd += " " + makoOptArgs.join(" ")
     }
     // Add the withCredentials step to access gpu-chip-mapping file
     withCredentials([file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')]) {
@@ -556,13 +566,29 @@ def getMakoOpts(getMakoScript, makoArgs="") {
 }
 
 def renderTestDB(testContext, llmSrc, stageName) {
-    def makoOpts = ""
     def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
-    if (stageName.contains("Post-Merge")) {
-        makoOpts = getMakoOpts(scriptPath, "stage=post_merge")
+    def makoArgs = []
+    def isPostMerge = stageName.contains("Post-Merge")
+    makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
+    // Determine the backend type based on keywords in stageName
+    if (stageName.contains("-PyTorch-")) {
+        // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
+        // At this point, only tests with backend=pytorch or unspecified backend will be run
+        makoArgs += ["backend=pytorch"]
+    } else if (stageName.contains("-TensorRT-")) {
+        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
+        // At this point, only tests with backend=tensorrt or unspecified backend will be run
+        makoArgs += ["backend=tensorrt"]
+    } else if (stageName.contains("-CPP-")) {
+        // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
+        // At this point, only tests with backend=cpp or unspecified backend will be run
+        makoArgs += ["backend=cpp"]
     } else {
-        makoOpts = getMakoOpts(scriptPath)
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", or "-CPP-", do not add any backend
+        // At this point, all tests will be run
+        // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
+    def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
@@ -576,48 +602,76 @@ def renderTestDB(testContext, llmSrc, stageName) {
         "--test-names",
         "--output",
         testList,
-        "--match-exact",
+        "--match",
         "'${makoOpts}'"
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    if (stageName.contains("Post-Merge")){
-        // Using the "stage: post_merge" mako will contain pre-merge tests by default.
-        // But currently post-merge test stages only run post-merge tests for
-        // triaging failures efficiently. We need to remove pre-merge tests explicitly.
-        // This behavior may change in the future.
-        def jsonSlurper = new JsonSlurper()
-        def jsonMap = jsonSlurper.parseText(makoOpts)
-        if (jsonMap.containsKey('stage') && jsonMap.stage == 'post_merge') {
-            jsonMap.remove('stage')
-        }
-        def updatedMakoOptsJson = JsonOutput.toJson(jsonMap)
-        def defaultTestList = "${llmSrc}/default_test.txt"
-        def updatedTestDBQueryCmd = [
-            "trt-test-db",
-            "-d",
-            testDBPath,
-            "--context",
-            testContext,
-            "--test-names",
-            "--output",
-            defaultTestList,
-            "--match-exact",
-            "'${updatedMakoOptsJson}'"
-        ].join(" ")
-        sh(label: "Render default test list from test-db", script: updatedTestDBQueryCmd)
-        def linesToRemove = readFile(defaultTestList).readLines().collect { it.trim() }.toSet()
-        def updatedLines = readFile(testList).readLines().findAll { line ->
-            !linesToRemove.contains(line.trim())
-        }
-        def contentToWrite = updatedLines.join('\n')
-        sh "echo \"${contentToWrite}\" > ${testList}"
-    }
     sh(script: "cat ${testList}")
 
     return testList
 }
 
+def getSSHConnectionPorts(portConfigFile, stageName)
+{
+    def type = stageName.split('-')[0]
+    echo "The type is: ${type}"
+    def fileContent = sh(script: "cat ${portConfigFile}", returnStdout: true).trim()
+
+    // Get available VM port list from portConfigFile based on stage name (e.g. A10: [10022, 10023])
+    def portList = []
+    fileContent.split('\n').each { line ->
+        def matcher = (line =~ /(.+?)=\[(.+?)\]/)
+        if (matcher) {
+            def key = matcher[0][1].replaceAll("\\s","")
+            def values = matcher[0][2].replaceAll("\\s","").split(',').collect { it.replaceAll("\\s","") }
+            if (key == type) {
+                portList.addAll(values)
+            }
+        }
+    }
+    echo "Port List for ${type}: ${portList}"
+
+    // Get current port usage status
+    def portUsage = ""
+    withCredentials([
+        usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
+        string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
+        ]) {
+        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'netstat -tuln'",returnStdout: true)
+    }
+    echo "Port Usage: ${portUsage}"
+
+    // Get an available VM port
+    def userPort = 0
+    while (portList.size() > 0) {
+        def randomIndex = (int)(Math.random() * portList.size())
+        def curPort = portList[randomIndex].toInteger()
+        if (!portUsage.contains(":${curPort}")) {
+            userPort = curPort
+            break
+        }
+        portList.remove(randomIndex)
+    }
+
+    if (userPort == 0) {
+        echo "There is no available port for ${type}"
+        return [0, 0]
+    }
+
+    echo "The chosen port is: ${userPort}"
+
+    // Calculate autossh monitor port by subtracting 9000 from VM port (e.g. 10022 -> 1022)
+    // If monitor port is already in use, randomly assign a value between 2000-3000
+    def monitorPort = userPort - 9000
+    while (portUsage.contains(":${monitorPort}")) {
+        monitorPort = 2000 + (int)(Math.random() * 1000)
+    }
+
+    echo "The monitor port is: ${monitorPort}"
+
+    return [userPort, monitorPort]
+}
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
@@ -679,6 +733,77 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
     }
 
+    if (testFilter[(DEBUG_MODE)]) {
+        stage("Interactive debug session")
+        {
+            testFilter[(DEBUG_MODE)] = false
+
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install openssh-server -y")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install autossh -y")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get install sshpass -y")
+
+            sh """
+                echo 'Port 22' >> /etc/ssh/sshd_config
+                echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+                echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+                echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
+                echo 'AllowTcpForwarding yes' >> /etc/ssh/sshd_config
+                echo 'GatewayPorts yes' >> /etc/ssh/sshd_config
+                cat /etc/ssh/sshd_config
+            """
+
+            sh "service ssh restart"
+            sh "service ssh status"
+
+            sh "ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N '' -q"
+
+            sh """
+                chmod 700 ~/.ssh
+                chmod 400 ~/.ssh/id_rsa
+                touch ~/.ssh/authorized_keys
+                chmod 600 ~/.ssh/authorized_keys
+            """
+
+            // The portConfig file is in the VM
+            def portConfigFilePath = "/root/.ssh/ports_config.txt"
+
+            withCredentials([
+                usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
+                string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
+                ]) {
+                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
+
+                def (int userPort, int monitorPort) = getSSHConnectionPorts(portConfigFilePath, stageName)
+                if (userPort == 0) {
+                    echo "Fail to setup an interactive debug session and exit the debug mode."
+                    testFilter[(DEBUG_MODE)] = false
+                    return
+                }
+
+                sh "ssh -f -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "autossh -fNR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "ps aux | grep ssh"
+                try {
+                    timeout(time: 2, unit: 'HOURS') {
+                        input message: "Pause 2 hours for Pre-Debug. Please type 'ssh root@${HOST_NAME} -p ${userPort}' on the CLI to create the connection. Please press the button to proceed when you finish debugging."
+                    }
+                } catch (InterruptedException e) {
+                    echo "Pre-debug session was interrupted by user or timeout"
+                    currentBuild.result = 'ABORTED'
+                    error("Pipeline aborted during pre-debug session")
+                } catch (Exception e) {
+                    echo "An error occurred during pre-debug session: ${e.message}"
+                    currentBuild.result = 'FAILURE'
+                    error("Error in pre-debug session: ${e.message}")
+                }
+            }
+
+            testFilter[(DEBUG_MODE)] = true
+        }
+    }
+
     stage ("[${stageName}] Run Pytest")
     {
         echoNodeAndGpuInfo(pipeline, stageName)
@@ -690,8 +815,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-        // CPP test execution is timing out easily, so we always override the timeout to 3600
-        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=3600"
+        // CPP test execution is timing out easily, so we always override the timeout to 7200
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
@@ -791,6 +916,21 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
     }, {
+        if (testFilter[(DEBUG_MODE)]) {
+            try {
+                timeout(time: 2, unit: 'HOURS') {
+                    input message: "Pause 2 hours for Post-Debug. Please press the button to proceed when you finish debugging."
+                }
+            } catch (InterruptedException e) {
+                echo "Post-debug session was interrupted by user or timeout"
+                currentBuild.result = 'ABORTED'
+                error("Pipeline aborted during post-debug session")
+            } catch (Exception e) {
+                echo "An error occurred during post-debug session: ${e.message}"
+                currentBuild.result = 'FAILURE'
+                error("Error in post-debug session: ${e.message}")
+            }
+        }
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
         def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
         // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
@@ -1012,59 +1152,66 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
-        "DGX_H100-4_GPUs-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 4, 4],
-        "DGX_H100-4_GPUs-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 4, 4],
-        "DGX_H100-4_GPUs-3": ["dgx-h100-x4", "l0_dgx_h100", 3, 4, 4],
-        "DGX_H100-4_GPUs-4": ["dgx-h100-x4", "l0_dgx_h100", 4, 4, 4],
-        "A10-1": ["a10", "l0_a10", 1, 8],
-        "A10-2": ["a10", "l0_a10", 2, 8],
-        "A10-3": ["a10", "l0_a10", 3, 8],
-        "A10-4": ["a10", "l0_a10", 4, 8],
-        "A10-5": ["a10", "l0_a10", 5, 8],
-        "A10-6": ["a10", "l0_a10", 6, 8],
-        "A10-7": ["a10", "l0_a10", 7, 8],
-        "A10-8": ["a10", "l0_a10", 8, 8],
-        "A30-1": ["a30", "l0_a30", 1, 8],
-        "A30-2": ["a30", "l0_a30", 2, 8],
-        "A30-3": ["a30", "l0_a30", 3, 8],
-        "A30-4": ["a30", "l0_a30", 4, 8],
-        "A30-5": ["a30", "l0_a30", 5, 8],
-        "A30-6": ["a30", "l0_a30", 6, 8],
-        "A30-7": ["a30", "l0_a30", 7, 8],
-        "A30-8": ["a30", "l0_a30", 8, 8],
-        "A100X-1": ["a100x", "l0_a100", 1, 4],
-        "A100X-2": ["a100x", "l0_a100", 2, 4],
-        "A100X-3": ["a100x", "l0_a100", 3, 4],
-        "A100X-4": ["a100x", "l0_a100", 4, 4],
-        "L40S-1": ["l40s", "l0_l40s", 1, 4],
-        "L40S-2": ["l40s", "l0_l40s", 2, 4],
-        "L40S-3": ["l40s", "l0_l40s", 3, 4],
-        "L40S-4": ["l40s", "l0_l40s", 4, 4],
-        "H100_PCIe-1": ["h100-cr", "l0_h100", 1, 7],
-        "H100_PCIe-2": ["h100-cr", "l0_h100", 2, 7],
-        "H100_PCIe-3": ["h100-cr", "l0_h100", 3, 7],
-        "H100_PCIe-4": ["h100-cr", "l0_h100", 4, 7],
-        "H100_PCIe-5": ["h100-cr", "l0_h100", 5, 7],
-        "H100_PCIe-6": ["h100-cr", "l0_h100", 6, 7],
-        "H100_PCIe-7": ["h100-cr", "l0_h100", 7, 7],
-        "B200_PCIe-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-2": ["b100-ts2", "l0_b200", 2, 2],
+        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
+        "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
+        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 6],
+        "A10-TensorRT-2": ["a10", "l0_a10", 2, 6],
+        "A10-TensorRT-3": ["a10", "l0_a10", 3, 6],
+        "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
+        "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
+        "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
+        "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
+        "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 2],
+        "A30-CPP-2": ["a30", "l0_a30", 2, 2],
+        "A30-TensorRT-1": ["a30", "l0_a30", 1, 4],
+        "A30-TensorRT-2": ["a30", "l0_a30", 2, 4],
+        "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
+        "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
+        "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
+        "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
+        "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
+        "A100X-TensorRT-4": ["a100x", "l0_a100", 4, 4],
+        "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 1],
+        "L40S-TensorRT-1": ["l40s", "l0_l40s", 1, 3],
+        "L40S-TensorRT-2": ["l40s", "l0_l40s", 2, 3],
+        "L40S-TensorRT-3": ["l40s", "l0_l40s", 3, 3],
+        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 2],
+        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 5],
+        "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 5],
+        "H100_PCIe-TensorRT-3": ["h100-cr", "l0_h100", 3, 5],
+        "H100_PCIe-TensorRT-4": ["h100-cr", "l0_h100", 4, 5],
+        "H100_PCIe-TensorRT-5": ["h100-cr", "l0_h100", 5, 5],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
-        "A10-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
-        "A30-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
-        "A30-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
-        "A100X-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
-        "L40S-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
-        "L40S-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 3],
-        "H100_PCIe-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 3],
-        "H100_PCIe-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 3],
-        "DGX_H100-4_GPUs-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "A100_80GB_PCIE-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
-        "H100_PCIe-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
+        "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
+        "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
+        "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
+        "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+        "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 2],
+        "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 2],
+        "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 2],
+        "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 2],
+        "DGX_H100-4_GPUs-PyTorch-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-TensorRT-[Post-Merge]": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "A100_80GB_PCIE-TensorRT-Perf": ["a100-80gb-pcie", "l0_perf", 1, 1],
+        "H100_PCIe-TensorRT-Perf": ["h100-cr", "l0_perf", 1, 1],
+        "DGX_H200-8_GPUs-PyTorch-[Post-Merge]": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
     ]
 
     parallelJobs = turtleConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1118,7 +1265,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     sanityCheckConfigs = [
-        "pytorch": [
+        "DLFW": [
             LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
@@ -1150,7 +1297,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         sanityCheckConfigs = [
-            "pytorch": [
+            "DLFW": [
                 LLM_DOCKER_IMAGE,
                 "GH200",
                 AARCH64_TRIPLE,
@@ -1162,7 +1309,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         ]
     }
 
-    fullSet += [toStageName("GH200", "pytorch")]
+    fullSet += [toStageName("GH200", "DLFW")]
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -1267,7 +1414,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }, {}, true)
     }]}
 
-    multiGpuJobs = parallelJobs.findAll{it.key.contains("4_GPUs") && !it.key.contains("Post-Merge")}
+    multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
 
     parallelJobs += docBuildJobs
@@ -1315,6 +1462,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     if (testFilter[(GPU_TYPE_LIST)] != null) {
         echo "Use GPU_TYPE_LIST for filtering."
         parallelJobsFiltered = parallelJobsFiltered.findAll {it.key.tokenize('-')[0] in testFilter[(GPU_TYPE_LIST)]}
+        println parallelJobsFiltered.keySet()
+    }
+
+    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
+        echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
+        parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
         println parallelJobsFiltered.keySet()
     }
 
@@ -1423,9 +1576,9 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSign = "DGX_H100"
-                        singleGpuJobs = parallelJobs.findAll{!it.key.contains(dgxSign)}
-                        dgxJobs = parallelJobs.findAll{it.key.contains(dgxSign)}
+                        def dgxSigns = ["DGX_H100", "DGX_H200"]
+                        singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
+                        dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
                     if (singleGpuJobs.size() > 0) {

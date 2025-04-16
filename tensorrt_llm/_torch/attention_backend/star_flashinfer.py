@@ -9,10 +9,9 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
-from ..modules.linear import ParallelConfig
 from .flashinfer import FlashInferAttentionMetadata, PlanParams
-from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
-from .vanilla import VanillaAttention
+from .interface import (AttentionBackend, AttentionMask,
+                        PredefinedAttentionMask, dummy_forward)
 
 
 # Please sync with flashinfer's DISPATCH_GQA_GROUP_SIZE in include/flashinfer/utils.cuh
@@ -304,9 +303,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+                         quant_config, **kwargs)
 
     def forward(self,
                 q: torch.Tensor,
@@ -329,7 +329,7 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q, k, v)
+            return dummy_forward(q, k, v)
 
         num_contexts = metadata.num_contexts
         num_queries = metadata.num_queries
@@ -439,12 +439,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
             out_tmp = output
             lse = lse.unsqueeze(-1) / np.log2(np.e)  # [b * s, nheads, 1]
             if metadata.mapping.cp_size != 1:
-                parallel_cfg = ParallelConfig(
-                    tensor_parallel_size=metadata.mapping.cp_size,
-                    tensor_parallel_rank=metadata.mapping.cp_rank,
-                    pipeline_parallel_size=metadata.mapping.pp_size)
-                output_tensor = allgather(output, parallel_cfg, gather_dim=0)
-                lse_tensor = allgather(lse, parallel_cfg, gather_dim=0)
+                output_tensor = allgather(output,
+                                          metadata.mapping,
+                                          gather_dim=0)
+                lse_tensor = allgather(lse, metadata.mapping, gather_dim=0)
                 output_tensor = output_tensor.to(torch.float32)
             else:
                 lse_tensor = lse

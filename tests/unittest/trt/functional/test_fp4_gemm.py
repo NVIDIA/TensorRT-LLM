@@ -58,10 +58,11 @@ def e2m1_and_ufp8_scale_to_float_tensor_v2(e2m1_tensor: torch.Tensor,
                                            ufp8_scale_tensor: torch.Tensor,
                                            global_scale_tensor: torch.Tensor,
                                            sf_vec_size,
-                                           ufp8_type: int = 1):
+                                           ufp8_type: int = 1,
+                                           is_sf_swizzled_layout: bool = True):
     float_tensor = torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
         e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
-        ufp8_type)
+        ufp8_type, is_sf_swizzled_layout)
     return float_tensor
 
 

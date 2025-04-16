@@ -2,7 +2,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -12,7 +11,7 @@ except ImportError:
     AttentionMaskConverter = None
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+                        PredefinedAttentionMask, dummy_forward)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -46,7 +45,7 @@ class VanillaAttentionMetadata(AttentionMetadata):
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+            self.request_ids) if self.kv_cache_manager is not None else None
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
@@ -67,9 +66,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
-                         quant_config)
+                         quant_config, **kwargs)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
 
     def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
@@ -222,38 +222,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
 
-    @torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
-    @staticmethod
-    def dummy_forward(q: torch.Tensor, k: torch.Tensor,
-                      v: torch.Tensor) -> torch.Tensor:
-        """
-        Dummy attention forward function to estimate memory usage.
-        Args:
-            q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
-            k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-            v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-        Returns:
-            torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
-        """
-        head_dim = q.shape[2]
-        assert q.dim() == 3
-        assert k.dim() == 3 and k.size(2) == head_dim
-        assert v.dim() == 3 and v.size(2) == head_dim
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        o = _flash_attention_forward(q.unsqueeze(0),
-                                     k.unsqueeze(0),
-                                     v.unsqueeze(0),
-                                     attention_mask=None,
-                                     query_length=q.size(0),
-                                     is_causal=True)
-        return o.reshape(o.size(1), -1)
-
-    @dummy_forward.register_fake
-    def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        num_q_tokens = q.size(0)
-        return torch.empty_like(q).reshape(num_q_tokens, -1)
-
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
@@ -262,9 +230,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
                 **kwargs) -> torch.Tensor:
-        # NOTE: WAR for no kv cache attn e.g. BERT,
-        # try to separate the kv cache estimation path from no kv cache attn.
-        if metadata is not None and metadata.kv_cache_manager is None:
+
+        # This is only for memory estimation for now.
+        # NOTE: this method is not accurate while it works for most scenario.
+        if metadata.is_dummy_attention:
+            return dummy_forward(q, k, v)
+        elif metadata.kv_cache_manager is None:
+            # NOTE: WAR for no kv cache attn e.g. BERT,
+            # try to separate the kv cache estimation path from no kv cache attn.
             num_heads = self.num_heads
             num_kv_heads = self.num_kv_heads
             return VanillaAttention.no_kv_cache_forward(
@@ -279,7 +252,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            return VanillaAttention.dummy_forward(q, k, v)
+            return dummy_forward(q, k, v)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [

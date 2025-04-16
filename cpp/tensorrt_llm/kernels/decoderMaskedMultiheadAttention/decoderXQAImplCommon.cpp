@@ -17,12 +17,24 @@
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams)
+uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit)
+{
+    if (!isSpecDec)
+    {
+        return headGrpSize;
+    }
+    if (isXqaJit)
+    {
+        return 64;
+    }
+    uint32_t const gemmM = qSeqLen * headGrpSize;
+    return gemmM < 16 ? 16 : 32;
+}
+
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit)
 {
     unsigned int head_size = xqaParams.head_size;
     unsigned int num_q_heads = xqaParams.num_q_heads;
@@ -37,12 +49,12 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
     unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
     // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-    unsigned int kernel_m_tilesize = xqaParams.multi_query_tokens ? mTileSize : num_q_heads_over_kv;
+    unsigned int kernel_m_tilesize
+        = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit);
 
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
         xqaParams.multi_query_tokens};
 }
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels
