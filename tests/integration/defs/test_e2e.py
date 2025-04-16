@@ -1524,6 +1524,7 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
 ])
 def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
         llm_root, llm_venv, model_name, model_path):
+    # "RCCA https://nvbugs/5163844"
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
     llm_venv.run_cmd([
