@@ -924,11 +924,6 @@ TEST_P(ParamTest, Test)
 
         beamResults.emplace_back(beamWidth, (resultsPath / modelSpec.getResultsFile()).string(), contextLogitsPath,
             generationLogitsPath, cumLogProbsPath, logProbsPath);
-
-        if (useRandomEndId && beamWidth > 1)
-        {
-            GTEST_SKIP() << "Test does not support endId test with beam search";
-        }
     }
 
     auto const modelType = std::get<2>(GetParam());
@@ -950,6 +945,11 @@ TEST_P(ParamTest, Test)
 
     for (auto beamWidth : beamWidths)
     {
+        if (useRandomEndId && beamWidth > 1)
+        {
+            GTEST_SKIP() << "Test does not support endId test with beam search";
+        }
+
         if (modelSpec.mMaxDraftTokens > 0 && (beamWidth > 1 || modelType == TrtGptModelType::V1))
         {
             GTEST_SKIP() << "Target model in speculative decoding does not support beam search and V1";
@@ -999,6 +999,19 @@ TEST_P(ParamTest, Test)
         && (modelOptionalParams.kvCacheConfig.maxTokens.has_value() || modelOptionalParams.enableTrtOverlap))
     {
         GTEST_SKIP() << "Not running V1 with Inflight batching optional params";
+    }
+
+    for (auto beamWidth : beamWidths)
+    {
+        if (modelOptionalParams.enableTrtOverlap && beamWidth > 1)
+        {
+            GTEST_SKIP() << "TrtOverlap is not supported with beam search";
+        }
+    }
+
+    if (modelOptionalParams.enableTrtOverlap && modelSpec.mMaxDraftTokens > 0)
+    {
+        GTEST_SKIP() << "TrtOverlap is not supported with speculative decoding";
     }
 
     // Warning: This should be the last check before running the test.
