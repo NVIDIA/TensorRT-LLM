@@ -317,7 +317,7 @@ def test_llm_enc_dec_mmlu(llm_venv, cmodel_dir, engine_dir, data_type,
     accuracy_threshold = accuracy_threshold_map[tllm_model_name][precision]
 
     mmlu_cmd = [
-        f"{enc_dec_example_root}/../mmlu.py",
+        f"{enc_dec_example_root}/../../../mmlu.py",
         f"--data_dir={mmlu_dataset_root}",
         f"--hf_model_dir={model_ckpt_path}",
         "--test_trt_llm",
