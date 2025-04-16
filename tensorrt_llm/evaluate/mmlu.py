@@ -225,6 +225,8 @@ class MMLU(Evaluator):
     @click.option("--num_samples", type=int, default=None)
     @click.option("--num_train", type=int, default=5)
     @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4094)
     @click.option("--max_output_length", type=int, default=2)
     @click.option("--check_accuracy", is_flag=True, default=False)
@@ -232,8 +234,10 @@ class MMLU(Evaluator):
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, num_train: int,
-                random_seed: int, max_input_length: int, max_output_length: int,
-                check_accuracy: bool, accuracy_threshold: float) -> None:
+                random_seed: int, apply_chat_template: bool,
+                system_prompt: Optional[str], max_input_length: int,
+                max_output_length: int, check_accuracy: bool,
+                accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -241,7 +245,9 @@ class MMLU(Evaluator):
         evaluator = MMLU(dataset_path,
                          num_samples=num_samples,
                          num_train=num_train,
-                         random_seed=random_seed)
+                         random_seed=random_seed,
+                         apply_chat_template=apply_chat_template,
+                         system_prompt=system_prompt)
         accuracy = evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 
