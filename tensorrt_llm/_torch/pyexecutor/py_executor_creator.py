@@ -12,7 +12,7 @@ from ..distributed import MPIDist
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
-                    is_mla)
+                    is_blackwell, is_hopper, is_mla)
 from .config import PyTorchConfig
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 
@@ -131,7 +131,16 @@ def create_py_executor(executor_config: ExecutorConfig,
             logger.info(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
             )
-        executor_config.kv_cache_config.enable_block_reuse = False
+        if executor_config.kv_cache_config.enable_block_reuse:
+            if is_hopper() or is_blackwell():
+                logger.info(
+                    f"Enable block reuse for MLA, performance may have regression in some cases"
+                )
+            else:
+                logger.warning(
+                    f"Block reuse for MLA only can be enabled on Hopper/Blackwell, change enable_block_reuse to False"
+                )
+                executor_config.kv_cache_config.enable_block_reuse = False
         executor_config.enable_chunked_context = False
 
     kv_cache_manager = None

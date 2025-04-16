@@ -17,6 +17,7 @@
 #include "attentionOp.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
@@ -1513,12 +1514,44 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     == false,
                 "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
+
+        KVBlockArray mla_context_paged_kv_cache_buffer;
         if (mIsMLAEnabled)
         {
             params.mla_param->cache_type = cache_type;
             params.mla_param->cu_q_seqlens = cu_q_seqlens;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
-            invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+            if (mPagedContextFMHA && mPagedKVCache)
+            {
+                TLLM_CHECK_WITH_INFO(params.mla_param->context_paged_kv_ptr != nullptr,
+                    "Paged kv cache is not set for MLA context kernel");
+                TLLM_CHECK_WITH_INFO(params.mla_param->context_kv_cache_block_offsets_ptr != nullptr,
+                    "Paged kv cache block offsets is not set for MLA context kernel");
+                // build another KVBlockArray for MLA context kernel to read paged kv cache, which is built by the
+                // PyTorch backend assume the dtype of paged kv cache is the same as the T
+                auto const elemSize = sizeof(T);
+                auto const headSize = params.mla_param->meta.qk_nope_head_dim + params.mla_param->meta.qk_rope_head_dim;
+                // mNumKVHeads is 1 for writing, we use mNumHeads for reading paged kv cache
+                auto sizePerToken = mNumHeads * headSize * elemSize;
+                auto maxBlocksPerSeq = params.mla_param->context_paged_kv_max_blocks_per_seq;
+                TLLM_LOG_DEBUG(
+                    "AttentionOp building KVBlockArray for MLA context kernel, elemSize: %d, headSize: %d, mNumHeads: "
+                    "%d, sizePerToken: %d, batchSize: %d, maxBlocksPerSeq: %d, tokensPerBlock: %d, maxAttentionWindow: "
+                    "%d, "
+                    "sinkTokenLen: %d, canUseOneMoreBlock: %d",
+                    elemSize, headSize, mNumHeads, sizePerToken, params.batch_size, maxBlocksPerSeq, mTokensPerBlock,
+                    params.cyclic_attention_window_size, params.sink_token_length, params.can_use_one_more_block);
+                mla_context_paged_kv_cache_buffer = KVBlockArray(params.batch_size, maxBlocksPerSeq, mTokensPerBlock,
+                    sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
+                    params.sink_token_length, params.can_use_one_more_block, params.mla_param->context_paged_kv_ptr,
+                    nullptr,
+                    static_cast<KVBlockArray::DataType*>(params.mla_param->context_kv_cache_block_offsets_ptr));
+            }
+            else
+            {
+                // compute RoPE and set compressed_kv + k_pe by invokeMLARopeContext if not using paged context FMHA
+                invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
+            }
         }
         else
         {
@@ -1581,7 +1614,15 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
-            fmhaParams.pagedKvCache = kv_cache_buffer;
+            if (mIsMLAEnabled && mPagedContextFMHA && mPagedKVCache)
+            {
+                fmhaParams.pagedKvCache = mla_context_paged_kv_cache_buffer;
+                fmhaParams.qPtr = reinterpret_cast<void const*>(attention_input);
+            }
+            else
+            {
+                fmhaParams.pagedKvCache = kv_cache_buffer;
+            }
         }
         fmhaParams.cuQSeqLenPtr = cu_q_seqlens;
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
@@ -1597,7 +1638,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
         sync_check_cuda_error(stream);
-
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
         invokeKvCachePostprocessing(preprocessingParams, stream);
@@ -2402,9 +2442,8 @@ int AttentionOp::initialize() noexcept
         }
         else
         {
-            fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA && !mIsMLAEnabled)
-                ? AttentionInputLayout::Q_PAGED_KV
-                : AttentionInputLayout::PACKED_QKV;
+            fmhaParams.attentionInputLayout = (mPagedKVCache && mPagedContextFMHA) ? AttentionInputLayout::Q_PAGED_KV
+                                                                                   : AttentionInputLayout::PACKED_QKV;
         }
         fmhaParams.isSPadded = !mRemovePadding;
         fmhaParams.numQHeads = mNumAttnHeads;

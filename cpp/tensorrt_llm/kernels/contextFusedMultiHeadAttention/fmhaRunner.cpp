@@ -469,11 +469,13 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.force_unroll = true;
         mLaunchParams.kernel_s = 0;
 
-        // Now we have SM90 generation MLA kernels. These treatments are only for context MLA and non SM90 generation
-        // MLA.
-        bool isFP8GenerationMLA = mFixedParams.dataType == DATA_TYPE_E4M3
-            && (mFixedParams.headSize == 576 && mFixedParams.headSizeV == 512);
-        if (!isFP8GenerationMLA)
+        // Now we have SM90 context BF16 and generation FP8 MLA kernels
+        bool isFP8GenerationMLA = mFixedParams.dataType == DATA_TYPE_E4M3 && mFixedParams.headSizeV == 512;
+        bool isHopperBF16ContextMLA
+            = isSm90 && mFixedParams.headSizeV == 128 && mFixedParams.dataType == DATA_TYPE_BF16;
+
+        // These treatments are only for other MLA cases
+        if (!isFP8GenerationMLA && !isHopperBF16ContextMLA)
         {
             mLaunchParams.granular_tiling = true;
             // Even on SM90, we use ampere-style kernel, will be optimized later
@@ -551,7 +553,7 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     uint64_t tensor_stride_qkv[3];
     tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType); // d
     tensor_stride_qkv[1] = tensor_size_qkv[1] * tensor_stride_qkv[0];                    // d*h
-    tensor_stride_qkv[2] = tensor_size_qkv[2] * tensor_stride_qkv[1];                    // d*h*3
+    tensor_stride_qkv[2] = mKernelParams.qkv_stride_in_bytes;
 
     uint64_t tensor_stride_o[3];
     tensor_stride_o[0] = get_size_in_bytes(tensor_size_o[0], mFixedParams.dataTypeOut); // d
@@ -599,6 +601,24 @@ void FusedMHARunnerV2::setPackedQkvTmaDescriptors(MHARunnerParams runnerParams)
     qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
         swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED, tensor_size_qkv, tensor_stride_qkv,
         traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32, &mKernelParams.tma_desc_kv);
+
+    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
+    if (mKernelParams.d != mKernelParams.dv)
+    {
+        // view V as [total_seq_len, 1, h, dv]
+        tensor_size_qkv[0] = mKernelParams.dv;
+        tensor_size_qkv[1] = mKernelParams.h;
+        tensor_size_qkv[2] = 1;
+
+        tensor_stride_qkv[0] = get_size_in_bytes(tensor_size_qkv[0], mFixedParams.dataType);
+        tensor_stride_qkv[1] = 0; // not used
+
+        size_t v_offset = 2 * mKernelParams.h * mKernelParams.d * get_size_in_bytes(mFixedParams.dataType);
+        qkv_tma_descriptor.set_tma_desctriptor(qkv_ptr + v_offset, desc_format,
+            cudaTmaDescInterleave::INTERLEAVE_DISABLED, swizzle_mode, cudaTmaDescPromotion::PROMOTION_DISABLED,
+            tensor_size_qkv, tensor_stride_qkv, traversal_stride_qkv, box_size, oob_fill, fp32_to_tf32,
+            &mKernelParams.tma_desc_v);
+    }
 
     // O: 16
     // Note: sliding window causal kernel currently has reg spill when TMA store is enabled

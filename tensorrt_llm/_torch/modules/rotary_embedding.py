@@ -6,6 +6,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from ..attention_backend import IS_FLASHINFER_AVAIABLE, AttentionMetadata
+from ..attention_backend.interface import RopeParams
 
 
 def compute_default_rope_parameters(
@@ -19,8 +20,6 @@ def compute_default_rope_parameters(
             The model configuration.
         device (`torch.device`):
             The device to use for initialization of the inverse frequencies.
-        seq_len (`int`, *optional*):
-            The current sequence length. Unused for this type of RoPE.
     Returns:
         Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
         post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
@@ -88,6 +87,100 @@ def compute_llama3_parameters(
     return inv_freq_llama, attention_factor
 
 
+def compute_deepseek_parameters(
+    config: PretrainedConfig,
+    device: Optional[torch.device] = None,
+) -> "Tuple[torch.Tensor, float]":
+    """
+    Computes the inverse frequencies according to the Deepseek RoPE implementation
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+    # use numpy here to align with the implementation in tensorrt_llm/functional.py
+    import numpy as np
+    dtype = np.float32
+
+    dim = config.hidden_size // config.num_attention_heads
+
+    rope_params = RopeParams.from_config(config)
+    base = rope_params.theta
+    scaling_factor = rope_params.scale
+    original_max_position_embeddings = rope_params.original_max_positions
+    beta_fast = rope_params.beta_fast
+    beta_slow = rope_params.beta_slow
+    mscale = rope_params.mscale
+    mscale_all_dim = rope_params.mscale_all_dim
+
+    # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
+    # Inverse dim formula to find dim based on number of rotations
+    def yarn_find_correction_dim(num_rotations,
+                                 dim,
+                                 base=10000,
+                                 max_position_embeddings=2048):
+        return (dim *
+                math.log(max_position_embeddings /
+                         (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+    # Find dim range bounds based on rotations
+    def yarn_find_correction_range(low_rot,
+                                   high_rot,
+                                   dim,
+                                   base=10000,
+                                   max_position_embeddings=2048):
+        low = math.floor(
+            yarn_find_correction_dim(low_rot, dim, base,
+                                     max_position_embeddings))
+        high = math.ceil(
+            yarn_find_correction_dim(high_rot, dim, base,
+                                     max_position_embeddings))
+        if low < 0:
+            low = 0
+        if high > dim - 1:
+            high = dim - 1
+        return low, high  # Clamp values just in case
+
+    def yarn_get_mscale(scale=1, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    def yarn_linear_ramp_mask(min, max, dim):
+        if min == max:
+            max += 0.001  # Prevent singularity
+
+        linear_func = (np.arange(dim, dtype=dtype) - min) / (max - min)
+        ramp_func = np.clip(linear_func, 0, 1)
+        return ramp_func
+
+    freq_extra = 1.0 / (base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+    freq_inter = 1.0 / (scaling_factor *
+                        base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+
+    low, high = yarn_find_correction_range(
+        beta_fast,
+        beta_slow,
+        dim,
+        base,
+        original_max_position_embeddings,
+    )
+    inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
+                                                dim // 2).astype(dtype)
+    inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+
+    attention_factor = float(
+        yarn_get_mscale(scaling_factor, mscale) /
+        yarn_get_mscale(scaling_factor, mscale_all_dim))
+
+    inv_freq = torch.from_numpy(inv_freq).to(device)
+    return inv_freq, attention_factor
+
+
 class RotaryEmbedding(nn.Module):
 
     def __init__(
@@ -99,6 +192,7 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int,
         device: Optional[torch.device] = None,
         rope_type: Literal['default', 'llama3'] = "default",
+        permute_before_rope: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -108,7 +202,12 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len_cached = max_position_embeddings
         self.original_max_seq_len = max_position_embeddings
 
-        rope_init_fn = compute_llama3_parameters if rope_type == "llama3" else compute_default_rope_parameters
+        if rope_type == "llama3":
+            rope_init_fn = compute_llama3_parameters
+        elif rope_type == "deepseek":
+            rope_init_fn = compute_deepseek_parameters
+        else:
+            rope_init_fn = compute_default_rope_parameters
 
         inv_freq, self.attention_scaling = rope_init_fn(config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -120,6 +219,9 @@ class RotaryEmbedding(nn.Module):
         self.rotary_dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
                            or int(head_dim * rope_percentage))
+        # permute last dim before rope, needed for Deepseek V3
+        # e.g. from [0,1,2,3] to [0,2,1,3]
+        self.permute_before_rope = permute_before_rope
 
     def forward(
         self,
@@ -143,6 +245,10 @@ class RotaryEmbedding(nn.Module):
                 elif isinstance(attn_metadata, FlashInferAttentionMetadata):
                     from ..custom_ops import flashinfer_apply_rope_inplace
                     assert len(targets) == 2
+                    if self.permute_before_rope:
+                        raise NotImplementedError(
+                            "Permute before rope is not supported for FlashInferAttention"
+                        )
                     q = targets[0]
                     seq_len = q.size()[0]
                     q = targets[0].view(seq_len, -1, self.head_dim)
@@ -218,7 +324,8 @@ class RotaryEmbedding(nn.Module):
         def rope_target(target):
             target = target.view(bsz, seq_len, -1,
                                  self.head_dim).transpose(1, 2)
-            target = RotaryEmbedding.apply_rotary_pos_emb(target, cos, sin)
+            target = RotaryEmbedding.apply_rotary_pos_emb(
+                target, cos, sin, permute_before_rope=self.permute_before_rope)
             target = target.transpose(1, 2).contiguous()
             if remove_input_padding:
                 target = target.view(seq_len, -1)
@@ -232,7 +339,9 @@ class RotaryEmbedding(nn.Module):
     def apply_rotary_pos_emb(q_or_k: torch.Tensor,
                              cos: torch.Tensor,
                              sin: torch.Tensor,
-                             unsqueeze_dim: int = 1) -> torch.Tensor:
+                             unsqueeze_dim: int = 1,
+                             *,
+                             permute_before_rope: bool = False) -> torch.Tensor:
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:
@@ -255,6 +364,11 @@ class RotaryEmbedding(nn.Module):
         rot_dim = cos.shape[-1]
         # If q_or_k_pass is empty, rotary pos embedding is applied to all tensor
         q_or_k, q_or_k_pass = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]
+
+        if permute_before_rope:
+            shape = q_or_k.shape
+            q_or_k = q_or_k.view(*shape[:-1], -1,
+                                 2).transpose(-2, -1).reshape(*shape)
 
         embed = (q_or_k * cos) + (RotaryEmbedding.rotate_half(q_or_k) * sin)
         return torch.cat((embed, q_or_k_pass), dim=-1)

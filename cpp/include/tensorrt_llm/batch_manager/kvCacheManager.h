@@ -427,6 +427,7 @@ class KVCacheBlockPool
 {
 public:
     SizeType32 numLayers;
+    SizeType32 kvFactor;
     SizeType32 numKvHeads;
     SizeType32 sizePerHead;
     SizeType32 tokensPerBlock;
@@ -440,10 +441,11 @@ public:
     // FP4 KV caches have extra pools that contain second level scales for dequantization.
     bool containsBlockScales;
 
-    KVCacheBlockPool(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
+    KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
+        SizeType32 tokensPerBlock, SizeType32 quantSize, runtime::ITensor::SharedPtr primaryPtr = nullptr,
         runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false)
         : numLayers(numLayers)
+        , kvFactor(kvFactor)
         , numKvHeads(numKvHeads)
         , sizePerHead(sizePerHead)
         , tokensPerBlock(tokensPerBlock)
