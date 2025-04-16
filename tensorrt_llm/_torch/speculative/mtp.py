@@ -200,6 +200,9 @@ class MTPDecoder(TorchDecoder):
         idx = 0
         beam_idx = 0
         for request in decoder_state.scheduled_requests.context_requests:
+            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPDecoder"
+            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPDecoder"
+            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPDecoder"
             if request.get_context_remaining_length() != 0:
                 idx += 1
                 continue
@@ -218,6 +221,9 @@ class MTPDecoder(TorchDecoder):
             idx += 1
 
         for request in decoder_state.scheduled_requests.generation_requests:
+            assert not request.py_return_context_logits, "return_context_logits not implemented for MTPDecoder"
+            assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPDecoder"
+            assert not request.py_return_log_probs, "return_log_probs not implemented for MTPDecoder"
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_tokens = new_tokens_list[idx]
                 num_new_tokens = new_tokens_lens_list[idx]
