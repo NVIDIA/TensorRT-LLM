@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from abc import abstractmethod
+import os
 from contextlib import contextmanager
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import click
 from tqdm import tqdm
@@ -40,6 +40,23 @@ class LmEvalWrapper(TemplateLM):
     @property
     def eot_token_id(self) -> int:
         return self.llm.tokenizer.eos_token_id
+
+    def apply_chat_template(self,
+                            chat_history: List[Dict[str, str]],
+                            add_generation_prompt: bool = True) -> str:
+        """
+        Method to apply a chat template to a list of chat history between user and model.
+        """
+        return self.llm.tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+        )
+
+    @property
+    def tokenizer_name(self) -> str:
+        return self.llm.tokenizer.name_or_path.replace("/", "__")
 
     def tok_encode(self, string: str, **kwargs) -> List[int]:
         return self.llm.tokenizer.encode(string, **kwargs)
@@ -97,10 +114,14 @@ class LmEvalEvaluator(Evaluator):
             raise NotImplementedError("lm-eval does not support system_prompt.")
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template)
+        self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
         with self._patch_lm_eval():
-            self.task_dict = lm_eval.tasks.get_task_dict(task_name)
+            task_manager = lm_eval.tasks.TaskManager(
+                include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
+            self.task_dict = lm_eval.tasks.get_task_dict(
+                task_name, task_manager=task_manager)
 
     @contextmanager
     def _patch_lm_eval(self):
@@ -129,9 +150,9 @@ class LmEvalEvaluator(Evaluator):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
-    @abstractmethod
     def get_score(self, results: dict):
-        raise NotImplementedError()
+        return results["results"][
+            self.task_name]["exact_match,strict-match"] * 100
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
@@ -147,39 +168,25 @@ class LmEvalEvaluator(Evaluator):
         logger.info(f"Lm eval results:\n{lm_eval.utils.make_table(results)}")
         return self.get_score(results)
 
-
-class GSM8K(LmEvalEvaluator):
-
-    def __init__(self,
-                 dataset_path: str = None,
-                 num_samples: int = None,
-                 random_seed: int = 0,
-                 apply_chat_template: bool = False,
-                 system_prompt: Optional[str] = None):
-        super().__init__(task_name="gsm8k",
-                         dataset_path=dataset_path,
-                         num_samples=num_samples,
-                         random_seed=random_seed,
-                         apply_chat_template=apply_chat_template,
-                         system_prompt=system_prompt)
-
-    def get_score(self, results: dict):
-        return results["results"]["gsm8k"]["exact_match,strict-match"] * 100
-
-    @click.command("gsm8k")
+    @click.command("lm_eval")
+    @click.option("--task_name", type=str, required=True)
     @click.option("--dataset_path", type=str, default=None)
     @click.option("--num_samples", type=int, default=None)
     @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
-    def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
+    def command(ctx, task_name, dataset_path: str, num_samples: int,
+                random_seed: int, apply_chat_template: bool,
                 check_accuracy: bool, accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
-        evaluator = GSM8K(dataset_path,
-                          num_samples=num_samples,
-                          random_seed=random_seed)
+        evaluator = LmEvalEvaluator(task_name=task_name,
+                                    dataset_path=dataset_path,
+                                    num_samples=num_samples,
+                                    random_seed=random_seed,
+                                    apply_chat_template=apply_chat_template)
         accuracy = evaluator.evaluate(llm)
         llm.shutdown()
 

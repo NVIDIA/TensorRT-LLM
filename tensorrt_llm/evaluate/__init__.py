@@ -14,8 +14,7 @@
 # limitations under the License.
 
 from .cnn_dailymail import CnnDailymail
-from .gpqa import GPQA
-from .lm_eval import GSM8K
+from .lm_eval import LmEvalEvaluator
 from .mmlu import MMLU
 
-__all__ = ["CnnDailymail", "MMLU", "GSM8K", "GPQA"]
+__all__ = ["CnnDailymail", "MMLU", "LmEvalEvaluator"]
