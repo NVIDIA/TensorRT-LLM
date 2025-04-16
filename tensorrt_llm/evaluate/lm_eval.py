@@ -110,10 +110,9 @@ class LmEvalEvaluator(Evaluator):
                 f"Evaluation task {self.__class__.__name__} requires `lm_eval`. "
                 "Please install the package first, e.g., `pip install lm_eval`."
             ) from e
-        if system_prompt is not None:
-            raise NotImplementedError("lm-eval does not support system_prompt.")
         super().__init__(random_seed=random_seed,
-                         apply_chat_template=apply_chat_template)
+                         apply_chat_template=apply_chat_template,
+                         system_prompt=system_prompt)
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
@@ -164,7 +163,8 @@ class LmEvalEvaluator(Evaluator):
         results = lm_eval.evaluate(lm=LmEvalWrapper(llm),
                                    task_dict=self.task_dict,
                                    limit=self.num_samples,
-                                   apply_chat_template=self.apply_chat_template)
+                                   apply_chat_template=self.apply_chat_template,
+                                   system_instruction=self.system_prompt)
         logger.info(f"Lm eval results:\n{lm_eval.utils.make_table(results)}")
         return self.get_score(results)
 
@@ -174,19 +174,22 @@ class LmEvalEvaluator(Evaluator):
     @click.option("--num_samples", type=int, default=None)
     @click.option("--random_seed", type=int, default=0)
     @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, task_name, dataset_path: str, num_samples: int,
                 random_seed: int, apply_chat_template: bool,
-                check_accuracy: bool, accuracy_threshold: float) -> None:
+                system_prompt: Optional[str], check_accuracy: bool,
+                accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         evaluator = LmEvalEvaluator(task_name=task_name,
                                     dataset_path=dataset_path,
                                     num_samples=num_samples,
                                     random_seed=random_seed,
-                                    apply_chat_template=apply_chat_template)
+                                    apply_chat_template=apply_chat_template,
+                                    system_prompt=system_prompt)
         accuracy = evaluator.evaluate(llm)
         llm.shutdown()
 
