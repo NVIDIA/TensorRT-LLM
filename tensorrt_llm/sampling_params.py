@@ -144,7 +144,6 @@ class SamplingParams:
         random_seed (int, optional): This argument is being deprecated; please use seed instead. Defaults to None.
         temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. None means using C++ runtime default 1.0f. Defaults to None.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
-        min_length (int, optional): This argument is being deprecated; please use min_tokens instead. Defaults to None.
         beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
@@ -219,7 +218,6 @@ class SamplingParams:
     random_seed: Optional[int] = None
     temperature: Optional[float] = None
     min_tokens: Optional[int] = None
-    min_length: Optional[int] = None
     beam_search_diversity_rate: Optional[float] = None
     repetition_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
