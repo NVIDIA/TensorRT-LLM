@@ -116,11 +116,18 @@ class LmEvalEvaluator(Evaluator):
         self.task_name = task_name
         self.dataset_path = dataset_path
         self.num_samples = num_samples
+
+        task_manager = lm_eval.tasks.TaskManager(
+            include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
         with self._patch_lm_eval():
-            task_manager = lm_eval.tasks.TaskManager(
-                include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
             self.task_dict = lm_eval.tasks.get_task_dict(
                 task_name, task_manager=task_manager)
+        # Few-shot random seed
+        self.task_dict[self.task_name].set_fewshot_seed(random_seed)
+        # Shuffle dataset
+        data = self.task_dict[self.task_name].dataset
+        for split in data.keys():
+            data[split] = data[split].shuffle(random_seed)
 
     @contextmanager
     def _patch_lm_eval(self):
