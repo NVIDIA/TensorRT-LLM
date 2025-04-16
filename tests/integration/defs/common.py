@@ -945,7 +945,18 @@ def get_dummy_spec_decoding_heads(hf_model_dir,
     )
 
     quant_cfg = getattr(mtq, "FP8_DEFAULT_CFG")
+    # Following quantizers are needed for KV cache quantization.
     quant_cfg["quant_cfg"]["*output_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None,
+        "enable": True,
+    }
+    quant_cfg["quant_cfg"]["*k_bmm_quantizer"] = {
+        "num_bits": (4, 3),
+        "axis": None,
+        "enable": True,
+    }
+    quant_cfg["quant_cfg"]["*v_bmm_quantizer"] = {
         "num_bits": (4, 3),
         "axis": None,
         "enable": True,
