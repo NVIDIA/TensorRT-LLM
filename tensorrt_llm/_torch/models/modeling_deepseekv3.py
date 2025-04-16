@@ -25,7 +25,6 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -60,20 +59,6 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
-class DeepseekV3RotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
-
 class DeepseekV3Attention(MLA):
 
     def __init__(
@@ -83,14 +68,6 @@ class DeepseekV3Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
-
         predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -103,8 +80,11 @@ class DeepseekV3Attention(MLA):
                          predicted_tokens_per_seq=predicted_tokens_per_seq,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=DeepseekV3RotaryEmbedding(config),
-                         pos_embd_params=pos_embd_params,
+                         pos_embd_params=PositionalEmbeddingParams(
+                             type=PositionEmbeddingType.yarn,
+                             rope=RopeParams.from_config(config),
+                             is_neox=False,
+                         ),
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,

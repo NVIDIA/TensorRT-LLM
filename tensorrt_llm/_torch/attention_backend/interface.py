@@ -364,7 +364,7 @@ class RopeParams:
 
         return rope_params
 
-    def create_rope_const_params(self):
+    def create_rope_const_params(self, interleave: bool = True):
         if self.dim == 0:
             return None, None
 
@@ -372,7 +372,7 @@ class RopeParams:
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
             cache = extra_attrs.setdefault("rope_const_params", {})
-            rope_const_params = cache.get(self, None)
+            rope_const_params = cache.get((self, interleave), None)
             if rope_const_params is not None and rope_const_params.cos_sin(
             ) is not None:
                 return (
@@ -416,13 +416,17 @@ class RopeParams:
                 dtype=torch.float32,
                 device='cuda',
             )
+        if not interleave:
+            rope_cos_sin = rope_cos_sin.reshape(
+                self.max_positions, -1,
+                2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
         if extra_attrs is not None:
-            cache[self] = RopeConstParams(
+            cache[(self, interleave)] = RopeConstParams(
                 weakref.ref(rope_inv_freq)
                 if rope_inv_freq is not None else None,
                 weakref.ref(rope_cos_sin),
@@ -437,6 +441,7 @@ class PositionalEmbeddingParams:
 
     # RoPE params
     rope: Optional[RopeParams] = None
+    is_neox: bool = True
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():

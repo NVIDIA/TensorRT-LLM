@@ -22,28 +22,11 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
                              register_auto_model, support_pp,
                              unpack_hidden_states)
-
-
-class LlamaRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(
-        self,
-        config: LlamaConfig,
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__(
-            config,
-            head_dim=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            device=device,
-            rope_type="default" if config.rope_scaling is None else "llama3")
 
 
 class Llama4Attention(Attention):
@@ -60,11 +43,11 @@ class Llama4Attention(Attention):
         # Note the convention no_rope_layers[layer_idx] == 0 means nope_layer
         is_nope_layer = config.no_rope_layers[layer_idx] == 0
 
-        use_rope = not is_nope_layer
-        if use_rope and model_config.fuse_pos_embd:
+        if not is_nope_layer:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
+                is_neox=False,
             )
         else:
             pos_embd_params = None
@@ -75,7 +58,6 @@ class Llama4Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=LlamaRotaryEmbedding(config),
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
@@ -93,21 +75,16 @@ class LlamaAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=LlamaRotaryEmbedding(config),
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
