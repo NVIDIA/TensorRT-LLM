@@ -491,7 +491,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         min_latency_mode = True if hidden_states.size(
             0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
+        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and not using_prev_fusion else False
 
         if residual is None:
             residual = hidden_states
@@ -510,6 +510,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         )
 
         if self.fusion_config.PRE_MOE_FUSION:
+            hidden_states_fp4 = None
             # Custom AR Fusion for DeepseekV3
             if using_prev_fusion:
                 # Custom AR Fusion for DeepseekV3
