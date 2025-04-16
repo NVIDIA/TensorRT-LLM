@@ -39,4 +39,9 @@ AdditionalModelOutput::AdditionalModelOutput(std::string name, bool gatherContex
 {
 }
 
+bool AdditionalModelOutput::operator==(AdditionalModelOutput const& other) const
+{
+    return name == other.name && gatherContext == other.gatherContext;
+}
+
 } // namespace tensorrt_llm::executor

@@ -1526,6 +1526,7 @@ def test_executor_config():
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
     assert config.use_variable_beam_width_search is False
+    assert config.enable_trt_overlap == False
 
     kwargs = {
         "max_beam_width":
@@ -1575,7 +1576,9 @@ def test_executor_config():
         "gather_generation_logits":
         True,
         "use_variable_beam_width_search":
-        True
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1599,6 +1602,7 @@ def test_executor_config():
     assert config.additional_model_outputs[0].gather_context is False
     assert config.gather_generation_logits is True
     assert config.use_variable_beam_width_search is True
+    assert config.enable_trt_overlap is True
 
 
 def test_parallel_config():
@@ -2325,7 +2329,16 @@ def test_executor_config_pickle():
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
         "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True)
+        trtllm.SpeculativeDecodingConfig(fast_logits=True),
+        "guided_decoding_config":
+        trtllm.GuidedDecodingConfig(
+            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+            encoded_vocab=["eos", "a", "b", "c", "d"]),
+        "additional_output_names": ["topKLogits"],
+        "gather_generation_logits":
+        True,
+        "enable_trt_overlap":
+        True,
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -2354,6 +2367,16 @@ def test_executor_config_pickle():
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
     assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
+
+    assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
+    assert config_copy.guided_decoding_config.encoded_vocab == config.guided_decoding_config.encoded_vocab
+    assert config_copy.guided_decoding_config.tokenizer_str == config.guided_decoding_config.tokenizer_str
+    assert config_copy.guided_decoding_config.stop_token_ids == config.guided_decoding_config.stop_token_ids
+
+    assert config.additional_output_names == config_copy.additional_output_names
+    assert config_copy.additional_output_names[0] == "topKLogits"
+    assert config.gather_generation_logits == config_copy.gather_generation_logits
+    assert config.enable_trt_overlap == config_copy.enable_trt_overlap
 
 
 def test_return_full_tokens():
