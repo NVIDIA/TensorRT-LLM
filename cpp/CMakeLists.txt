@@ -358,8 +358,6 @@ if(ENABLE_MULTI_DEVICE)
   find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
 endif()
 
-find_package(tensorrt_llm_nvrtc_wrapper REQUIRED)
-
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
@@ -371,7 +369,6 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
   ${NCCL_INCLUDE_DIR}
-  ${tensorrt_llm_nvrtc_wrapper_INCLUDE_DIRS}
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include

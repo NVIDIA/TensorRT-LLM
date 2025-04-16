@@ -7,6 +7,7 @@ from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
 import torch
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from typing_extensions import Self
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -363,7 +364,7 @@ class RopeParams:
 
         return rope_params
 
-    def create_rope_const_params(self):
+    def create_rope_const_params(self, interleave: bool = True):
         if self.dim == 0:
             return None, None
 
@@ -371,7 +372,7 @@ class RopeParams:
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is not None:
             cache = extra_attrs.setdefault("rope_const_params", {})
-            rope_const_params = cache.get(self, None)
+            rope_const_params = cache.get((self, interleave), None)
             if rope_const_params is not None and rope_const_params.cos_sin(
             ) is not None:
                 return (
@@ -415,13 +416,17 @@ class RopeParams:
                 dtype=torch.float32,
                 device='cuda',
             )
+        if not interleave:
+            rope_cos_sin = rope_cos_sin.reshape(
+                self.max_positions, -1,
+                2)[:, :self.dim // 2, :].transpose(0, 2, 1).reshape(1, -1)
         rope_cos_sin = torch.torch.tensor(
             rope_cos_sin,
             dtype=torch.float32,
             device='cuda',
         )
         if extra_attrs is not None:
-            cache[self] = RopeConstParams(
+            cache[(self, interleave)] = RopeConstParams(
                 weakref.ref(rope_inv_freq)
                 if rope_inv_freq is not None else None,
                 weakref.ref(rope_cos_sin),
@@ -436,6 +441,7 @@ class PositionalEmbeddingParams:
 
     # RoPE params
     rope: Optional[RopeParams] = None
+    is_neox: bool = True
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -530,3 +536,36 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
+
+
+@torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
+def dummy_forward(q: torch.Tensor, k: torch.Tensor,
+                  v: torch.Tensor) -> torch.Tensor:
+    """
+    Dummy attention forward function to estimate memory usage.
+    Args:
+        q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
+        k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
+        v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
+    Returns:
+        torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
+    """
+    head_dim = q.shape[2]
+    assert q.dim() == 3
+    assert k.dim() == 3 and k.size(2) == head_dim
+    assert v.dim() == 3 and v.size(2) == head_dim
+    # This is only for memory estimation for now.
+    # NOTE: this method is not accurate while it works for most scenario.
+    o = _flash_attention_forward(q.unsqueeze(0),
+                                 k.unsqueeze(0),
+                                 v.unsqueeze(0),
+                                 attention_mask=None,
+                                 query_length=q.size(0),
+                                 is_causal=True)
+    return o.reshape(o.size(1), -1)
+
+
+@dummy_forward.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    num_q_tokens = q.size(0)
+    return torch.empty_like(q).reshape(num_q_tokens, -1)

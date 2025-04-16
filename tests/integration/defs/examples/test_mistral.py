@@ -40,8 +40,17 @@ def mistral_example_root(llm_venv):
     if platform.system() != "Windows":
         # https://github.com/Dao-AILab/flash-attention/issues/345
         # No wheel for flash-attn on windows and compilation fails locally.
-        llm_venv.run_cmd(
-            ['-m', 'pip', 'install', '--upgrade', 'flash-attn==2.4.2'])
+        install_cmd = [
+            "MAX_JOBS=4",
+            "python3",
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "flash-attn==2.4.2",
+        ]
+
+        check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("run_type", [

@@ -107,24 +107,12 @@ DOCKER_RUN_OPTS   ?= --rm -it --ipc=host --ulimit memlock=-1 --ulimit stack=6710
 DOCKER_RUN_ARGS   ?=
 GPU_OPTS          ?= --gpus=all
 SOURCE_DIR        ?= $(shell readlink -f ..)
-NVRTC_WRAPPER_DIR ?=
 CODE_DIR          ?= /code/tensorrt_llm
 CCACHE_DIR        ?= ${CODE_DIR}/cpp/.ccache
-CONAN_DIR         ?= ${CODE_DIR}/cpp/.conan
 RUN_CMD           ?=
 CONTAINER_NAME    ?= tensorrt_llm
 WORK_DIR          ?= $(CODE_DIR)
 DOCKER_PULL       ?= 0
-
-ifneq ($(NVRTC_WRAPPER_DIR), )
-NVRTC_WRAPPER_MOUNT := --volume $(NVRTC_WRAPPER_DIR):/mnt/src/tensorrt_llm_nvrtc_wrapper
-else
-NVRTC_WRAPPER_MOUNT :=
-endif
-
-ifeq ($(LOCAL_USER),1)
-	$(call add_local_user,$(IMAGE_WITH_TAG))
-endif
 
 %_run:
 ifeq ($(DOCKER_PULL),1)
@@ -136,10 +124,8 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
-    		$(NVRTC_WRAPPER_MOUNT) \
     		--env "CCACHE_DIR=${CCACHE_DIR}" \
     		--env "CCACHE_BASEDIR=${CODE_DIR}" \
-    	    --env "CONAN_HOME=${CONAN_DIR}" \
     		--workdir $(WORK_DIR) \
     		--hostname $(shell hostname)-$* \
     		--name $(CONTAINER_NAME)-$*-$(USER_NAME) \
@@ -166,16 +152,16 @@ jenkins-aarch64_%: STAGE = devel
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell grep 'LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins-rockylinux8_%: STAGE = devel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.8.0-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 12.8.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = devel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.8.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 12.8.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.8.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.8.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

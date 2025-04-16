@@ -10,6 +10,7 @@ from tensorrt_llm._utils import (mpi_allgather, mpi_broadcast,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..speculative import (get_num_spec_layers, get_spec_decoder,
@@ -21,7 +22,7 @@ from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import KVCacheManager, ResourceManager
+from .resource_manager import KVCacheManager, PeftCacheManager, ResourceManager
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 
@@ -148,6 +149,10 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    logger.info(
+        f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+    )
 
     py_executor.set_gather_responses(True)
     origin_iter_stats = py_executor.enable_iter_perf_stats
@@ -170,10 +175,14 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     end, total_gpu_memory = torch.cuda.mem_get_info()
     torch_used_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
     total_used_bytes = total_gpu_memory - end
+    activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
     peak_memory = torch_peak_memory + extra_cost
     logger.info(
-        f"Memory used outside torch in memory usage profiling: {extra_cost / (GB):.2f} GiB"
+        f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
+    )
+    logger.info(
+        f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
     )
     kv_stats = py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").get_kv_cache_stats()
@@ -267,10 +276,17 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
         return None
 
 
-def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
-                                mapping, pytorch_backend_config,
-                                executor_config, ctx_chunk_config, model_engine,
-                                draft_model_engine, start_worker):
+def create_py_executor_instance(dist,
+                                kv_cache_manager,
+                                draft_kv_cache_manager,
+                                mapping,
+                                pytorch_backend_config,
+                                executor_config,
+                                ctx_chunk_config,
+                                model_engine,
+                                draft_model_engine,
+                                start_worker,
+                                lora_config: LoraConfig = None):
     spec_config = model_engine.spec_config
     resources = {
         KV_CACHE_MANAGER_KEY: kv_cache_manager
@@ -307,6 +323,39 @@ def create_py_executor_instance(dist, kv_cache_manager, draft_kv_cache_manager,
             raise ValueError(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
+
+    if lora_config is not None:
+        from tensorrt_llm.bindings import LoraModule
+        load_torch_hf_lora(lora_config)
+        model_binding_config = model_engine.model.model_config.get_bindings_model_config(
+        )
+        lora_modules = LoraModule.create_lora_modules(
+            lora_config.lora_target_modules, model_binding_config.hidden_size,
+            model_binding_config.mlp_hidden_size,
+            model_binding_config.num_heads, model_binding_config.num_heads,
+            model_binding_config.head_size)
+        model_binding_config.use_lora_plugin = True
+        model_binding_config.lora_modules = lora_modules
+        model_binding_config.max_lora_rank = lora_config.max_lora_rank
+
+        max_lora_rank = lora_config.max_lora_rank
+        num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
+            len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+
+        # TODO smor- need to figure out how to set these values
+        max_loras = 4
+        max_cpu_loras = 4
+        executor_config.peft_cache_config = tllm.executor.PeftCacheConfig(
+            num_device_module_layer=max_lora_rank * num_lora_modules *
+            max_loras,
+            num_host_module_layer=max_lora_rank * num_lora_modules *
+            max_cpu_loras,
+        )
+
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=executor_config.peft_cache_config,
+            model_config=model_binding_config)
+        resources["peft_cache_manager"] = peft_cache_manager
 
     resource_manager = ResourceManager(resources)
 
