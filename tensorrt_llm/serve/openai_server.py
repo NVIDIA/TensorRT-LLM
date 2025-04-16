@@ -156,10 +156,7 @@ class OpenAIServer:
         events = []
         try:
             async for event in self.llm.get_kv_cache_events_async(2):
-                if isinstance(event, list):
-                    events += event
-                else:
-                    events.append(event)
+                events.append(event)
         except IndexError:
             # queue is empty, no more events
             pass

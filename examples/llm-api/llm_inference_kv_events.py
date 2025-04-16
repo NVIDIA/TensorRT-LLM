@@ -7,6 +7,7 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 def main():
     pytorch_config = PyTorchConfig(enable_overlap_scheduler=True,
+                                   autotuner_enabled=False,
                                    kv_cache_dtype='auto')
 
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -42,7 +43,8 @@ def main():
     print(kv_events)
 
     # Got output like follows:
-    # {'event_id': 0, 'data': {'type': 'created', 'num_blocks_per_cache_level': [101230, 0]}}, {'event_id': 1, 'data': {'type': 'stored', 'parent_hash': None, 'blocks': [{'type': 'stored_block', 'block_hash': 4203099703668305365, 'tokens': [{'type': 'unique_token', 'token_id': 1, 'token_extra_id': 0}, ...
+    # [{'event_id': 0, 'data': {'type': 'created', 'num_blocks_per_cache_level': [101230, 0]}},
+    #  {'event_id': 1, 'data': {'type': 'stored', 'parent_hash': None, 'blocks': [{'type': 'stored_block', 'block_hash': 4203099703668305365, 'tokens': [{'type': 'unique_token', 'token_id': 1, 'token_extra_id': 0}, ...
 
 
 if __name__ == '__main__':
