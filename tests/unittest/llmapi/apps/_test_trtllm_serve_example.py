@@ -31,9 +31,15 @@ def server(model_name: str):
 
     # Add multimodal and model-specific configurations
     if "Qwen2-VL-7B-Instruct" in model_name:
+        import yaml
+        config = {'kv_cache_config': {'enable_block_reuse': False}}
+        with open('extra-llm-api-config.yml', 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
         server_kwargs.update({
-            "backend": "pytorch",
-            "disable_block_reuse": True
+            "cli_args": [
+                "--backend", "pytorch", "--extra_llm_api_options",
+                "extra-llm-api-config.yml"
+            ]
         })
 
     with RemoteOpenAIServer(model_path, **server_kwargs) as remote_server:

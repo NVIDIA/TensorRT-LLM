@@ -127,8 +127,7 @@ def parse_chat_message_content_part(part: ChatCompletionMessageParam, ):
         str_content = cast(str, content)
         return str_content, mm_content
 
-    # TODO
-    # make them async on multimodal data as loading video/image is time consuming
+    # TODO: make them async on multimodal data as loading video/image is time consuming
 
     # Handle all non-text multimodal types
     if part_type == "image_url":
@@ -205,7 +204,7 @@ def resolve_hf_chat_template(
         return chat_template
 
     # 2. If tool is not provided, use the processor's default chat template
-    if tools is None and processor is not None and processor.chat_template is not None:
+    if not tools and processor and hasattr(processor, 'chat_template'):
         return processor.chat_template
 
     # 3. If tool is provided, use the tool
@@ -213,8 +212,7 @@ def resolve_hf_chat_template(
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
         logger.debug("Failed to load AutoTokenizer chat template for %s",
-                     tokenizer.name_or_path,
-                     exc_info=True)
+                     tokenizer.name_or_path)
 
     return None
 

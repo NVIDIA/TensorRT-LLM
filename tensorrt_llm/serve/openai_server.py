@@ -55,7 +55,7 @@ class OpenAIServer:
             self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
             self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
         except Exception:
-            logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path, exc_info=True)
+            logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
             self.model_config = None
 

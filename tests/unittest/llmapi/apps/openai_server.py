@@ -20,18 +20,12 @@ class RemoteOpenAIServer:
                  model: str,
                  cli_args: List[str] = None,
                  llmapi_launch: bool = False,
-                 port: int = None,
-                 backend: str = None,
-                 disable_block_reuse: bool = False) -> None:
+                 port: int = None) -> None:
         self.host = "localhost"
         self.port = port if port is not None else find_free_port()
         self.rank = os.environ.get("SLURM_PROCID", 0)
 
         args = ["--host", f"{self.host}", "--port", f"{self.port}"]
-        if backend:
-            args += ["--backend", backend]
-        if disable_block_reuse:
-            args += ["--disable_block_reuse"]
         if cli_args:
             args += cli_args
         launch_cmd = ["trtllm-serve"] + [model] + args

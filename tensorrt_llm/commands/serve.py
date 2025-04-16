@@ -158,10 +158,6 @@ def launch_server(host: str, port: int, llm_args: dict):
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
-@click.option("--disable_block_reuse",
-              is_flag=True,
-              default=False,
-              help="Disable KV Cache Reuse.")
 @click.option(
     "--num_postprocess_workers",
     type=int,
