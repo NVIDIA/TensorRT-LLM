@@ -338,8 +338,6 @@ class FusedMoE(nn.Module):
 
     def get_quant_scales(self, expert_start, expert_end):
         assert self.smart_router
-        if self.quant_scales is None or self.has_fp8_qdq:
-            return self.quant_scales
 
         if self.has_fp8_block_scales:
             return FusedMoEQuantScalesFP8BlockScales(
@@ -361,6 +359,8 @@ class FusedMoE(nn.Module):
                 fc2_global=self.fc2_alpha.narrow(0, expert_start,
                                                  expert_end - expert_start),
             )
+        else:
+            return self.quant_scales
 
     def create_weights(self):
         if self._weights_created:
