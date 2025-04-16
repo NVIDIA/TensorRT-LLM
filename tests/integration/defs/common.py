@@ -838,8 +838,9 @@ def test_multi_lora_support(
         ]
 
     print("Run inference with C++ runtime with pybind...")
+    run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
-        f"{example_root}/../run.py",
+        run_script,
         f"--tokenizer_dir={hf_model_dir}",
         f"--engine_dir={engine_dir}",
         "--input_text",
