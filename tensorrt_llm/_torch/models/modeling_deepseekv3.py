@@ -289,7 +289,7 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            is_expert=True)
+            reduce_output=False)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(self.mapping)
@@ -444,7 +444,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 dtype=config.torch_dtype,
                                 config=model_config,
                                 overridden_tp_size=self.mlp_tp_size,
-                                is_expert=False)
+                                reduce_output=True)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,

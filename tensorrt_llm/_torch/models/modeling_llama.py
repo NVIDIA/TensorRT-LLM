@@ -129,7 +129,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            is_expert=True)
+            reduce_output=False)
 
         self.router = Linear(hidden_size,
                              num_experts,
