@@ -124,7 +124,7 @@ class OpenAIDisaggServer:
                 yield chunk
 
         finally:
-            self.gen_router.finish_request(gen_req)
+            await self.gen_router.finish_request(gen_req)
 
     async def openai_completion(self, req: CompletionRequest) -> Response:
         try:
@@ -168,20 +168,25 @@ class OpenAIDisaggServer:
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
             return None
 
-        ctx_server = await self.ctx_router.get_next_server(ctx_req)
-        logging.info("Sending request to ctx server: %s", ctx_server)
+        try:
+            if request_type == "chat":
+                ctx_req.max_completion_tokens = 1
+            elif request_type == "completion":
+                ctx_req.max_tokens = 1
+            ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
+            ctx_req.stream = False
+            ctx_req.stream_options = None
 
-        if request_type == "chat":
-            ctx_req.max_completion_tokens = 1
-        elif request_type == "completion":
-            ctx_req.max_tokens = 1
-        ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-        ctx_req.stream = False
-        ctx_req.stream_options = None
+            ctx_server = await self.ctx_router.get_next_server(ctx_req)
+            logging.info("Sending request to ctx server: %s", ctx_server)
 
-        response = await self.send_chat_request(ctx_server, ctx_req) if request_type == "chat" else await self.send_completion_request(ctx_server, ctx_req)
-        self.ctx_router.finish_request(ctx_req)
-        return response
+            if request_type == "chat":
+                response = await self.send_chat_request(ctx_server, ctx_req)
+            else:
+                response = await self.send_completion_request(ctx_server, ctx_req)
+            return response  # Don't forget to return the response if needed
+        finally:
+            await self.ctx_router.finish_request(ctx_req)
 
     async def _process_generation_server_request(self, gen_req, ctx_response):
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
@@ -205,14 +210,15 @@ class OpenAIDisaggServer:
         logging.info("Sending request to gen server: %s", gen_server)
 
         if not gen_req.stream:
-            if isinstance(gen_req, CompletionRequest):
-                gen_response = await self.send_completion_request(gen_server, gen_req)
-            elif isinstance(gen_req, ChatCompletionRequest):
-                gen_response = await self.send_chat_request(gen_server, gen_req)
+            try:
+                if isinstance(gen_req, CompletionRequest):
+                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                elif isinstance(gen_req, ChatCompletionRequest):
+                    gen_response = await self.send_chat_request(gen_server, gen_req)
 
-            self.gen_router.finish_request(gen_req)
-
-            return gen_response
+                return gen_response
+            finally:
+                await self.gen_router.finish_request(gen_req)
         else:
             # Return a streaming response that combines both context and generation responses
             return StreamingResponse(

@@ -148,7 +148,7 @@ def create_router(router_type: str, servers: List[str]) -> Router:
     Args:
         router_type (str): Type of router to create. Supported values:
             - "round_robin": Creates a RoundRobinRouter
-            - "request_load_balancing": Creates a LoadBalancingRouter, which balances requests across instances
+            - "requests_load_balancing": Creates a LoadBalancingRouter, which balances requests across instances
             - "tokens_load_balancing": Creates a LoadBalancingRouter, which balances tokens across instances
         servers: List of server URLs
 
@@ -161,7 +161,7 @@ def create_router(router_type: str, servers: List[str]) -> Router:
 
     router_map = {
         "round_robin": RoundRobinRouter,
-        "request_load_balancing": LoadBalancingRouter,
+        "requests_load_balancing": LoadBalancingRouter,
         "tokens_load_balancing": LoadBalancingRouter
     }
 

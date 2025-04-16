@@ -207,10 +207,10 @@ def test_create_router(servers):
     round_robin_router = create_router("round_robin", servers)
     assert isinstance(round_robin_router, RoundRobinRouter)
 
-    request_load_balancing_router = create_router("request_load_balancing",
-                                                  servers)
-    assert isinstance(request_load_balancing_router, LoadBalancingRouter)
-    assert not request_load_balancing_router._use_tokens
+    requests_load_balancing_router = create_router("requests_load_balancing",
+                                                   servers)
+    assert isinstance(requests_load_balancing_router, LoadBalancingRouter)
+    assert not requests_load_balancing_router._use_tokens
 
     tokens_load_balancing_router = create_router("tokens_load_balancing",
                                                  servers)

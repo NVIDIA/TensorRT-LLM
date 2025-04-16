@@ -20,7 +20,7 @@ def get_yaml_config():
             "pipeline_parallel_size": 1,
         },
         "generation_servers": {
-            "router_type": "request_load_balancing",
+            "router_type": "requests_load_balancing",
             "num_instances": 1,
             "urls": ["host3:8003"],
             "tensor_parallel_size": 1,
@@ -52,7 +52,7 @@ def test_parse_disagg_config_file(sample_yaml_file):
     assert config.hostname == "test_host"
     assert config.port == 9000
     assert config.ctx_router_type == "round_robin"
-    assert config.gen_router_type == "request_load_balancing"
+    assert config.gen_router_type == "requests_load_balancing"
     assert len(config.server_configs) == 3
 
 
@@ -62,7 +62,7 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.hostname == "test_host"
     assert config.port == 9000
     assert config.ctx_router_type == "round_robin"
-    assert config.gen_router_type == "request_load_balancing"
+    assert config.gen_router_type == "requests_load_balancing"
     assert len(config.server_configs) == 3
 
 
