@@ -36,7 +36,7 @@ class GatedMLP(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
-                 is_expert: bool = False,
+                 reduce_output: bool = True,
                  layer_idx: Optional[int] = None):
         super().__init__()
         self.layer_idx = layer_idx
@@ -73,7 +73,7 @@ class GatedMLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
-            is_expert=is_expert,
+            reduce_output=False,
             skip_create_weights=config.skip_create_weights,
         )
         self.down_proj = Linear(
@@ -84,7 +84,7 @@ class GatedMLP(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
-            is_expert=is_expert,
+            reduce_output=reduce_output,
             skip_create_weights=config.skip_create_weights,
         )
 
@@ -107,31 +107,50 @@ class GatedMLP(nn.Module):
         min_latency_mode: Optional[bool] = False,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        if lora_params is not None:
+            return self.forward_lora(x, all_rank_num_tokens,
+                                     final_all_reduce_params, min_latency_mode,
+                                     lora_params)
+
         if self.activation == F.silu:
             h1 = self.gate_up_proj(x)
-            if lora_params is not None:
-                assert self.layer_idx is not None, "layer_idx is required for lora"
-                h1_lora = self.splitted_gate_up_lora(x, lora_params,
-                                                     self.layer_idx)
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
-
-                h1_lora = self.fused_gate_up_lora(x, lora_params,
-                                                  self.layer_idx)
-
-                if h1_lora is not None:
-                    h1 = h1 + h1_lora
-
             h2 = swiglu(h1)
             output = self.down_proj(h2,
                                     all_reduce_params=final_all_reduce_params)
-            if lora_params is not None:
-                output_lora = self.down_lora(h2, lora_params, self.layer_idx)
-                if output_lora is not None:
-                    output = output + output_lora
-
             return output
         else:
             raise NotImplementedError(
                 f"Activation {self.activation} not yet implemented for fused GatedMLP"
             )
+
+    def forward_lora(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        min_latency_mode: Optional[bool] = False,
+        lora_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        assert lora_params is not None
+        assert self.layer_idx is not None, "layer_idx is required for lora"
+        assert self.activation == F.silu
+
+        h1 = self.gate_up_proj(x)
+
+        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
+        if h1_lora is not None:
+            h1 = h1 + h1_lora
+
+        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
+
+        if h1_lora is not None:
+            h1 = h1 + h1_lora
+
+        h2 = swiglu(h1)
+        output = self.down_proj(h2, all_reduce_params=final_all_reduce_params)
+
+        output_lora = self.down_lora(h2, lora_params, self.layer_idx)
+        if output_lora is not None:
+            output = output + output_lora
+
+        return output
