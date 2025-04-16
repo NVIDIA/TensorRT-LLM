@@ -88,7 +88,7 @@ def test_llm_hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
     print("Convert checkpoint by modelopt...")
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
-        f"{gemma_example_root}/../quantization/quantize.py",
+        f"{gemma_example_root}/../../../quantization/quantize.py",
         f"--model_dir={gemma_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",
@@ -122,7 +122,7 @@ def test_llm_hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
         threshold_score = 18
 
     summary_cmd = [
-        f"{gemma_example_root}/../summarize.py",
+        f"{gemma_example_root}/../../../summarize.py",
         "--test_trt_llm",
         f"--hf_model_dir={gemma_model_root}",
         f"--tokenizer_dir={gemma_model_root}",
@@ -454,7 +454,7 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
     print("Convert checkpoint by modelopt...")
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
-        f"{gemma_example_root}/../quantization/quantize.py",
+        f"{gemma_example_root}/../../../quantization/quantize.py",
         f"--model_dir={gemma_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={data_type}",

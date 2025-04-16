@@ -1444,7 +1444,7 @@ def test_llm_llama_1gpu_batched_beam_search(llama_example_root,
     # run.py test.
     num_beams = 4
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1532,7 +1532,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1549,7 +1549,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
 
     print("Run Summarization test with batch size = 1")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
@@ -1568,7 +1568,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
     if mmlu_test:
         print("Run MMLU test")
         mmlu_cmd = [
-            f"{llama_example_root}/../mmlu_llmapi.py",
+            f"{llama_example_root}/../../../mmlu_llmapi.py",
             f"--data_dir={mmlu_dataset_root}",
             f"--hf_model_dir={llama_model_root}",
             f"--engine_dir={engine_dir}",
@@ -1612,7 +1612,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1629,7 +1629,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
 
     print("Run Summarization test with batch size = 1")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
@@ -1686,7 +1686,7 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1703,7 +1703,7 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
     print("Run Summarization test")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
