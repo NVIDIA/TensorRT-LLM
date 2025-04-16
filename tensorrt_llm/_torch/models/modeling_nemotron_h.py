@@ -3,7 +3,11 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformer_engine.pytorch import RMSNorm
+
+try:
+    from transformer_engine.pytorch import RMSNorm
+except ImportError:
+    RMSNorm = None
 from transformers import AutoConfig, PretrainedConfig
 
 from ..attention_backend import AttentionMetadata
@@ -108,6 +112,8 @@ class NemotronHLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
+        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
+
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -181,6 +187,8 @@ class NemotronHModel(DecoderModel):
                 ValueError(f"{layer_type} is not supported")
             layers.append(NemotronHLayer(model_config, layer_idx, layer_type))
         self.layers = nn.ModuleList(layers)
+
+        assert RMSNorm is not None, "RMSNorm from transformer_engine is not installed, install it with `pip3 install transformer_engine[pytorch]`"
 
         # final norm
         self.norm_f = RMSNorm(
