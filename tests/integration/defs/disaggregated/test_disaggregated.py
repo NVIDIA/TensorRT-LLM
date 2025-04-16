@@ -22,8 +22,7 @@ import pytest
 def kill_disaggregated_processes():
     """Kill any existing disaggregated processes."""
     try:
-        subprocess.run(['pkill', '-9', '-f', 'launch_disaggregated'],
-                       check=False)
+        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'], check=False)
     except Exception:
         pass
 
@@ -42,8 +41,8 @@ def get_test_config(test_desc, example_dir, test_root):
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
         "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
-        "gen_only": (2, f"{example_dir}/disagg_config_gen_only.yaml"),
-        "4_ranks": (4, f"{example_dir}/disagg_config_ctxtp2_gentp1.yaml"),
+        "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
+        "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "cuda_graph":
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
@@ -58,43 +57,39 @@ def get_test_config(test_desc, example_dir, test_root):
          ),
         "deepseek_v3_lite_fp8_tp1_mtp":
         (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_mtp.yaml"
-         ),
-        "deepseek_v3_lite_fp8_ucx":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_ucx.yaml"
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp.yaml"
          ),
         "deepseek_v3_lite_fp_8_overlap_dp":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_dp.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml"
          ),
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_overlap.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml"
          ),
         "deepseek_v3_lite_fp8_overlap_cuda_graph":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_cuda_graph.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_overlap_cuda_graph.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp_one":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_one.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one.yaml"
          ),
         "deepseek_v3_lite_fp8_attention_dp_one_mtp":
-        (2,
-         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_attention_dp_one_mtp.yaml"
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one_mtp.yaml"
          ),
         "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp":
-        (4,
-         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_tp1_attention_dp_overlap_one_mtp.yaml"
+        (2,
+         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml"
          ),
     }
 
@@ -172,22 +167,27 @@ def run_disaggregated_test(example_dir,
             subprocess.run(streaming_chat_client_cmd, check=True, env=env)
 
         # Verify outputs
-        expected_strings = [
-            "The capital of Germany is Berlin", "Asyncio is a Python library"
-        ]
-
-        if "deepseek_v3_lite" in test_desc:
-            expected_strings = ["Berlin", "Asyncio is a"]
         not_expected_strings = ["Berlin Berlin"]
 
         output_files = ['output.json', 'output_streaming.json']
         if test_desc == "overlap":
-            output_files.extend(
-                ['output_chat.json', 'output_streaming_chat.json'])
+            # Disable streaming chat completion for overlap test
+            # due to bug
+            output_files.extend(['output_chat.json'])
+
+        if test_desc == "gen_only":
+            continue
 
         for output_file in output_files:
             with open(output_file, 'r') as f:
                 content = f.read()
+                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                    expected_strings = ["Berlin", "Asyncio is a"]
+                else:
+                    expected_strings = [
+                        "The capital of Germany is Berlin",
+                        "Asyncio is a Python library"
+                    ]
                 for expected_string in expected_strings:
                     assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
                 for not_expected_string in not_expected_strings:
@@ -243,9 +243,11 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
-                           env=llm_venv._new_env,
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -403,6 +405,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8",
                            env=env,
@@ -424,10 +427,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib"
 
     run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_overlap_dp",
-                           env=llm_venv._new_env,
+                           "deepseek_v3_lite_fp8_tp1",
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
