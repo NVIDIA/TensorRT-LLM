@@ -530,32 +530,10 @@ def similar(a, b, threshold=0.8):
     return similarity_score(a, b) >= threshold
 
 
-def generate_build_cmd(example_root, *args, **kwargs):
-    "generate build command"
-    build_cmd = [f"{example_root}/build.py"]
-    dtype = kwargs.get("dtype")
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                if ('plugin' in key) and (not "lookup" in key):
-                    build_cmd.extend([f"--{key}", dtype])
-                else:
-                    build_cmd.append(f"--{key}")
-        else:
-            build_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        build_cmd.append(f"--{arg}")
-
-    return build_cmd
-
-
 def generate_summary_cmd(example_root, *args, **kwargs):
     "generate summary command"
-    summary_cmd = [
-        f"{example_root}/../summarize.py", "--test_trt_llm", "--check_accuracy"
-    ]
+    summarize_script = f"{example_root}/../../../summarize.py" if "core" in example_root else f"{example_root}/../summarize.py"
+    summary_cmd = [summarize_script, "--test_trt_llm", "--check_accuracy"]
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
@@ -572,7 +550,8 @@ def generate_summary_cmd(example_root, *args, **kwargs):
 
 def generate_mmlu_cmd(example_root, *args, **kwargs):
     "generate mmlu command"
-    mmlu_cmd = [f"{example_root}/../mmlu_llmapi.py", "--check_accuracy"]
+    mmlu_script = f"{example_root}/../../../mmlu_llmapi.py" if "core" in example_root else f"{example_root}/../mmlu_llmapi.py"
+    mmlu_cmd = [mmlu_script, "--check_accuracy"]
 
     for key, value in kwargs.items():
         if isinstance(value, bool):

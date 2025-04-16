@@ -1005,13 +1005,12 @@ run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models/llama-7b-hf"),
-    ("gptj", "gpt-j-6b"),
-    ("falcon", "falcon-7b-instruct"),
     ("llama", "codellama/CodeLlama-7b-Instruct-hf"),
 ])
 def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", model_name)
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      model_name)
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
