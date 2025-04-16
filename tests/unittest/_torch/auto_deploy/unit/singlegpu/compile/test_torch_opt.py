@@ -19,9 +19,9 @@ class ModelWithMultipleInputs(torch.nn.Module):
     def forward(self, x0, x1=None, x2=None):
         out = self.base_model(x0)
         if x1 is not None:
-            out += self.base_model(x1)
+            out = out + self.base_model(x1)
         if x2 is not None:
-            out += self.base_model(x2)
+            out = out + self.base_model(x2)
         return out
 
 
