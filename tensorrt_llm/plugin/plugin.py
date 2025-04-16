@@ -704,8 +704,8 @@ class CustomAllReduceHelper:
         )
 
     @staticmethod
-    def max_workspace_size_auto(tp_size: int) -> int:
-        if force_all_reduce_deterministic():
+    def max_workspace_size_auto(tp_size: int, support_deterministic) -> int:
+        if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
             return int(workspace_size)
@@ -767,13 +767,12 @@ class CustomAllReduceHelper:
             mapping: Mapping,
             size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        force_deterministic = force_all_reduce_deterministic()
         is_p2p_supported = can_access_peer(mapping)
-        ipc_buffers_size = size if force_deterministic else size * mapping.tp_size
+        ipc_buffers_size = size * mapping.tp_size
         ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
         ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size,
                                  is_p2p_supported)
-        lamport_buffers_size = 1 if force_deterministic else size * mapping.tp_size
+        lamport_buffers_size = size * mapping.tp_size
         lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size,
                                     is_p2p_supported)
         rank = mapping.rank
