@@ -139,13 +139,55 @@ find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
-# NVRTC_WRAPPER_LIB_SOURCE_REL_LOC is defined in cpp/conanfile.py
-set(NVRTC_WRAPPER_LIB_BINARY_REL_LOC
-    "kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so"
-)
-# Copy the .so to build directory, which is needed in build_wheel.py.
-configure_file(${NVRTC_WRAPPER_LIB_SOURCE_REL_LOC}
-               ${NVRTC_WRAPPER_LIB_BINARY_REL_LOC} COPYONLY)
+set(NVRTC_WRAPPER_TARGET tensorrt_llm_nvrtc_wrapper)
+set(NVRTC_WRAPPER_TARGET_ARCH ${TARGET_ARCH})
+
+if(BUILD_NVRTC_WRAPPER)
+  add_subdirectory(
+    kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper)
+else()
+  add_library(${NVRTC_WRAPPER_TARGET} SHARED IMPORTED)
+  set(NVRTC_WRAPPER_LIB_TARBALL
+      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/${NVRTC_WRAPPER_TARGET_ARCH}/${NVRTC_WRAPPER_TARGET}.tar.xz"
+  )
+  set(NVRTC_WRAPPER_LIB_BINARY_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper"
+  )
+  if(NOT WIN32) # Linux
+    set(NVRTC_WRAPPER_LIB_NAME "lib${NVRTC_WRAPPER_TARGET}.so")
+  else() # Windows
+    set(NVRTC_WRAPPER_LIB_NAME "${NVRTC_WRAPPER_TARGET}.lib")
+    set(NVRTC_WRAPPER_DLL_NAME "${NVRTC_WRAPPER_TARGET}.dll")
+    set(NVRTC_WRAPPER_DLL_PATH
+        "${NVRTC_WRAPPER_LIB_BINARY_DIR}/${NVRTC_WRAPPER_DLL_NAME}")
+  endif()
+  set(NVRTC_WRAPPER_LIB_PATH
+      "${NVRTC_WRAPPER_LIB_BINARY_DIR}/${NVRTC_WRAPPER_LIB_NAME}")
+  add_custom_command(
+    OUTPUT ${NVRTC_WRAPPER_LIB_PATH} ${NVRTC_WRAPPER_DLL_PATH}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${NVRTC_WRAPPER_LIB_BINARY_DIR}
+    COMMAND ${CMAKE_COMMAND} -E chdir ${NVRTC_WRAPPER_LIB_BINARY_DIR}
+            ${CMAKE_COMMAND} -E tar xf ${NVRTC_WRAPPER_LIB_TARBALL}
+    DEPENDS ${NVRTC_WRAPPER_LIB_TARBALL}
+    VERBATIM)
+  add_custom_target(${NVRTC_WRAPPER_TARGET}_helper
+                    DEPENDS ${NVRTC_WRAPPER_LIB_PATH} ${NVRTC_WRAPPER_DLL_PATH})
+  add_dependencies(${NVRTC_WRAPPER_TARGET} ${NVRTC_WRAPPER_TARGET}_helper)
+  set_property(TARGET ${NVRTC_WRAPPER_TARGET}
+               PROPERTY IMPORTED_LOCATION ${NVRTC_WRAPPER_LIB_PATH})
+  if(WIN32)
+    set_property(TARGET ${NVRTC_WRAPPER_TARGET}
+                 PROPERTY IMPORTED_IMPLIB ${NVRTC_WRAPPER_DLL_PATH})
+  endif()
+
+  file(SIZE ${INTERNAL_CUTLASS_KERNELS_LIB_TARBALL} NVRTC_WRAPPER_LIB_SIZE)
+  if(NVRTC_WRAPPER_LIB_SIZE LESS 1024)
+    message(
+      FATAL_ERROR
+        "The nvrtc wrapper library is truncated or incomplete. This is usually caused by using Git LFS (Large File Storage) incorrectly. Please try running command `git lfs install && git lfs pull`."
+    )
+  endif()
+endif()
 
 set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
@@ -231,9 +273,7 @@ if(NOT WIN32)
                                                     "-Wl,-rpath='$ORIGIN'")
 endif()
 
-target_link_libraries(
-  ${SHARED_TARGET}
-  PUBLIC tensorrt_llm_nvrtc_wrapper::tensorrt_llm_nvrtc_wrapper)
+target_link_libraries(${SHARED_TARGET} PUBLIC ${NVRTC_WRAPPER_TARGET})
 
 if(BUILD_PYT)
   add_subdirectory(thop)

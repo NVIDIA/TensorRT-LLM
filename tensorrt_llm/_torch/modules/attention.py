@@ -6,8 +6,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 TrtllmAttention)
+from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
@@ -49,7 +48,6 @@ class Attention(nn.Module):
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        rotary_emb: Optional[RotaryEmbedding] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
@@ -132,7 +130,17 @@ class Attention(nn.Module):
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
-        self.rotary_emb = rotary_emb
+
+        self.enable_rope_fusion = self.attn_backend == "TRTLLM"
+        self.support_fused_qkv = self.attn_backend == "TRTLLM"
+        self.support_unfused_qkv = self.attn_backend != "TRTLLM"
+        self.rotary_emb = None
+        if not self.enable_rope_fusion and pos_embd_params is not None:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -161,6 +169,14 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
         )
 
+    def convert_qkv(self, q, k, v):
+        if k is None and v is None and not self.support_fused_qkv:
+            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        elif k is not None and v is not None and not self.support_unfused_qkv:
+            qkv = torch.concat([q, k, v], dim=-1)
+            q, k, v = qkv, None, None
+        return q, k, v
+
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
@@ -174,9 +190,6 @@ class Attention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        is_fused_qkv = False
-        if isinstance(self.attn, TrtllmAttention):
-            is_fused_qkv = True
 
         if self.qk_norm is not None:
             # TODO: make this more efficient.
@@ -208,36 +221,25 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if is_fused_qkv:
-            if self.pos_embd_params is None and position_ids is not None:
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                    dim=-1)
-                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
-                qkv = torch.concat([q, k, v], dim=-1)
+        q, k, v = qkv, None, None
 
-            out_scale = None
-            if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
-                out_scale = self.o_proj.inv_input_scale
-            attn_output = self.attn.forward(qkv,
-                                            None,
-                                            None,
-                                            attn_metadata,
-                                            out_scale=out_scale,
-                                            attention_mask=attention_mask,
-                                            mrope_config=mrope_config)
-        else:
+        if self.rotary_emb is not None and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
+            q, k = self.rotary_emb(position_ids, [q, k])
 
-            if self.pos_embd_params is None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+        out_scale = None
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
+            out_scale = self.o_proj.inv_input_scale
 
-            attn_output = self.attn.forward(q.contiguous(),
-                                            k.contiguous(),
-                                            v.contiguous(),
-                                            attn_metadata,
-                                            attention_mask=attention_mask,
-                                            mrope_config=mrope_config)
+        q, k, v = self.convert_qkv(q, k, v)
+        attn_output = self.attn.forward(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        out_scale=out_scale,
+                                        attention_mask=attention_mask,
+                                        mrope_config=mrope_config)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -268,7 +270,6 @@ class MLA(nn.Module):
         bias: bool,
         aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        rotary_emb: Optional[RotaryEmbedding] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
@@ -305,6 +306,7 @@ class MLA(nn.Module):
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads}).")
+        assert pos_embd_params is not None, "pos_embd_params must be provided in MLA"
 
         # tensor parallel
         config = config or ModelConfig()
@@ -498,7 +500,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
         )
-        self.rotary_emb = rotary_emb
+
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
