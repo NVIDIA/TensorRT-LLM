@@ -82,7 +82,7 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--mm_embedding_offloading',
-        type=lambda s: s.lower() in ("yes", "true", "t", "1"),
+        type=lambda s: s.lower() == "true",
         default=None,
         help=
         'Enable position table offloading. When not specified, defaults to True if using a multimodal model with chunked context.'
