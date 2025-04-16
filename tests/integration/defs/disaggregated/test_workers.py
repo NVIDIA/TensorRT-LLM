@@ -256,11 +256,9 @@ def block_key_hasher(token_ids: List[int],
     return seed & mask64
 
 
-# TODO:placeholder of ServerState in PR 3304
-class ServerState:
+class KvCacheBlockMap:
 
     def __init__(self):
-        self.active_requests = 0
         self.kv_blocks: dict[int, CacheBlockMeta] = {}
 
     def update_with_events(self, events: List[dict]):
@@ -302,23 +300,19 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        self.server_states = {}
+        self.kv_cache_block_maps = {}
         for ctx_server in ctx_servers:
-            self.server_states[ctx_server] = ServerState()
+            self.kv_cache_block_maps[ctx_server] = KvCacheBlockMap()
         for gen_server in gen_servers:
-            if gen_server not in self.server_states:
-                self.server_states[gen_server] = ServerState()
+            if gen_server not in self.kv_cache_block_maps:
+                self.kv_cache_block_maps[gen_server] = KvCacheBlockMap()
 
     async def send_request(self, session: aiohttp.ClientSession, url: str,
                            request: dict) -> dict:
-        self.server_states[url].active_requests += 1
-        try:
-            response = await super().send_request(session, url, request)
-        finally:
-            self.server_states[url].active_requests -= 1
+        response = await super().send_request(session, url, request)
 
         events = await self.query_kv_cache_events(session, url)
-        self.server_states[url].update_with_events(events)
+        self.kv_cache_block_maps[url].update_with_events(events)
         return response
 
     async def multi_round_request(self,
@@ -343,9 +337,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                 block_hashes.append(
                     block_key_hasher(tokens[t:t + tokens_per_block],
                                      None if t == 0 else block_hashes[-1]))
-            ctx_match_count = self.server_states[
+            ctx_match_count = self.kv_cache_block_maps[
                 self.ctx_servers[0]].get_block_match_count(block_hashes)
-            gen_match_count = self.server_states[
+            gen_match_count = self.kv_cache_block_maps[
                 self.gen_servers[0]].get_block_match_count(block_hashes)
             assert ctx_match_count >= prev_ctx_match_count
             assert gen_match_count >= prev_gen_match_count

@@ -1,8 +1,6 @@
 import asyncio
 import time
 
-import pytest
-
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -121,13 +119,12 @@ def test_expected_kv_cache_events():
                 assert event["data"]["type"] == "stored"
 
 
-@pytest.mark.skip("https://nvbugs/5150466: flaky fail")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
     prompt = "Hello, my name is"
 
-    async def task0():
+    async def generate():
         async for output in llm.generate_async(prompt,
                                                streaming=True,
                                                sampling_params=sampling_params):
@@ -135,16 +132,16 @@ def test_kv_cache_event_async_api():
 
     events = []
 
-    async def task1():
+    async def get_events():
         async for event in llm.get_kv_cache_events_async():
             events.append(event)
 
         assert events
 
     async def main():
-        await asyncio.gather(task0(), task1())
-        for i in range(2):
-            await asyncio.gather(task0(), task1())
+        await generate()
+        await asyncio.gather(generate(), get_events())
+        await asyncio.gather(generate(), get_events())
 
     asyncio.run(main())
 
