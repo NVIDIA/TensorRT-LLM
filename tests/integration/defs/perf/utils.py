@@ -463,6 +463,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         # Only save perf result if the result is valid.
         if self._result_state == "valid":
+            print_info(f"Done with command {cmd_idx} - {full_test_name}")
             # Parse the perf result from the test outputs.
             if self._config.runtime == 'bench' and cmd_idx == 0:
                 print_info(
