@@ -4,8 +4,8 @@ from _graph_test_helpers import run_test
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
-    match_rope_v1,
-    match_rope_v2,
+    match_complex_rope,
+    match_explicit_rope,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -172,7 +172,7 @@ def test_match_rope(layout, num_heads, num_kv_heads):
     _ = run_test(
         model,
         x,
-        match_rope_v1,
+        match_explicit_rope,
         lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -200,7 +200,7 @@ def test_match_rope_v2(num_heads, num_kv_heads):
     _ = run_test(
         model,
         x,
-        match_rope_v2,
+        match_complex_rope,
         lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
         atol=1e-3,
