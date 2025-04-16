@@ -159,7 +159,8 @@ public:
         torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
         torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
-        int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         // Free the profile workspace to save memory
         if (mProfileWorkspace != nullptr)
@@ -244,8 +245,9 @@ public:
         torch::Tensor const& token_selected_experts, torch::optional<torch::Tensor> token_final_scales,
         torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
         torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+        int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -334,7 +336,8 @@ public:
 
     void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
         int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation)
+        int64_t const cluster_size, int64_t const cluster_rank, bool const min_latency_mode, int64_t const gemm_idx,
+        int64_t const profile_id, bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -365,7 +368,8 @@ public:
 
             // mProfiler init
             auto parallelism_config = kernels::MOEParallelismConfig(static_cast<int>(tp_size),
-                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank));
+                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank),
+                static_cast<int>(cluster_size), static_cast<int>(cluster_rank));
 
             int const GROUP_SIZE = -1;
             bool const USE_BIAS = false;

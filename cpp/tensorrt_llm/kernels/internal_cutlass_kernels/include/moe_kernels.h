@@ -694,7 +694,7 @@ public:
         mWType = wtype;
         mOType = otype;
         mNumExperts = num_experts;
-        mNumExpertsPerNode = num_experts / parallelism_config.ep_size;
+        mNumExpertsPerNode = num_experts / (parallelism_config.ep_size * parallelism_config.tp_size);
         mK = k;
         mExpertHiddenSize = hidden_size;
         mExpertInterSize = inter_size;
