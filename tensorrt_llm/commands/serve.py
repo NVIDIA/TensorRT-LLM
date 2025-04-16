@@ -182,7 +182,7 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           gpus_per_node: Optional[int],
           kv_cache_free_gpu_memory_fraction: float,
           num_postprocess_workers: int, trust_remote_code: bool,
-          disable_block_reuse: bool, extra_llm_api_options: Optional[str]):
+          extra_llm_api_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -209,7 +209,6 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        enable_block_reuse=not disable_block_reuse,
         **llm_args_dict)
 
     launch_server(host, port, llm_args)
