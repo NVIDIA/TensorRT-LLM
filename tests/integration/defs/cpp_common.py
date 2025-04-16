@@ -743,6 +743,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         # exist in multiple running tests
         if gpt_tests.intersection(test_list):
             parallel = 1
+        else:
+            parallel = default_test_parallel
 
         if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
                                                 None):
