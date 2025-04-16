@@ -75,11 +75,11 @@ def generate_result_file_name(test_list: List[str],
 def generate_excluded_test_list(test_list):
     if "gpt" in test_list:
         if "gpt_session" not in test_list:
-            yield "gpt_session"
+            yield "GptSession"
         if "gpt_executor" not in test_list:
-            yield "gpt_executor"
+            yield "GptExecutor"
         if "gpt_tests" not in test_list:
-            yield "gpt_tests"
+            yield "GptTests"
 
 
 def find_dir_containing(files: Sequence[str],
