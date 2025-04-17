@@ -45,6 +45,8 @@ class Llama4Attention(Attention):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.use_rope = not nope_layer
         self.use_qk_norm = use_qk_norm and not nope_layer
@@ -65,8 +67,7 @@ class Llama4Attention(Attention):
                          pos_embd_params=pos_embd_params,
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
-                         config=model_config,
-                         aux_stream=aux_stream)
+                         config=model_config)
 
         if self.use_rope and self.use_qk_norm:
             # here we must disable rope fusion regardless of attn_backend

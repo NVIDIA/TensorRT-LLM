@@ -35,7 +35,6 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -48,8 +47,6 @@ class Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         if dense_bias is None:
             self.dense_bias = bias
