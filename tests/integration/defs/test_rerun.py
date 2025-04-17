@@ -8,7 +8,7 @@ def parse_name(name, filename):
     if name.startswith("test_unittests_v2[unittest/") and \
        filename == "test_unittests.py":
         return name[len("test_unittests_v2["):-1]
-    else if name.contains(filename):
+    elif name.contains(filename):
         return name[name.find('/') + 1:]
     else:
         return filename + "::" + name
