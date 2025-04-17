@@ -1,7 +1,7 @@
 import atexit
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, ValuesView
 
 import numpy as np
 import torch
@@ -123,7 +123,10 @@ class MPIDist(Distributed):
     def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
         return self.recv(tensor.numpy(), src, tag)
 
-    def isend_tensor_list(self, tensor_list: list[torch.Tensor], dest, tag=0):
+    def isend_tensor_list(self,
+                          tensor_list: ValuesView[torch.Tensor],
+                          dest,
+                          tag=0):
         if len(tensor_list) == 0:
             return None
         elif len(tensor_list) == 1:
@@ -132,7 +135,10 @@ class MPIDist(Distributed):
         return self.isend(
             np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
 
-    def recv_tensor_list(self, tensor_list: list[torch.Tensor], src, tag=0):
+    def recv_tensor_list(self,
+                         tensor_list: ValuesView[torch.Tensor],
+                         src,
+                         tag=0):
         if len(tensor_list) == 0:
             return None
         elif len(tensor_list) == 1:

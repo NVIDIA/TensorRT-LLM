@@ -742,10 +742,10 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        self.dist.recv_tensor(list(previous_batch.decoder_state.
-                                                   new_tensors_host.values()),
-                                              src=self.dist.prev_pp_rank,
-                                              tag=prev_microbatch_id)
+                        self.dist.recv_tensor_list(previous_batch.decoder_state.
+                                                   new_tensors_host.values(),
+                                                   src=self.dist.prev_pp_rank,
+                                                   tag=prev_microbatch_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         previous_batch.decoder_state.decoder_event.synchronize()
@@ -756,9 +756,9 @@ class PyExecutor:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].Wait()
                         self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_tensor(
-                                list(previous_batch.decoder_state.
-                                     new_tensors_host.values()),
+                            prev_microbatch_id] = self.dist.isend_tensor_list(
+                                previous_batch.decoder_state.new_tensors_host.
+                                values(),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -1116,7 +1116,7 @@ class PyExecutor:
         prev_microbatch_id = previous_batch_state.microbatch_id
         # Receive tokens from prev pp rank w.r.t model forward direction
         self.dist.recv_tensor_list(
-            list(new_tokens_host.values()),
+            new_tokens_host.values(),
             src=self.dist.prev_pp_rank,
             tag=prev_microbatch_id  # not necessary and may discard
         )
@@ -1127,7 +1127,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
-                tensor=list(new_tokens_host.values()),
+                tensor=new_tokens_host.values(),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 
