@@ -697,10 +697,10 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
-    int selfTPInDP = selfConfig.getParallelConfig().mEnableAttenionDP
+    int selfTPInDP = selfConfig.getParallelConfig().mEnableAttentionDP
         ? selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize
         : selfConfig.getParallelConfig().mTensorParallelism;
-    int destTPInDP = destConfig.getParallelConfig().mEnableAttenionDP
+    int destTPInDP = destConfig.getParallelConfig().mEnableAttentionDP
         ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
         : destConfig.getParallelConfig().mTensorParallelism;
     int selfNumHeads = selfConfig.getModelConfig().mNbKvHeadsPerLayer[0] * selfTPInDP;

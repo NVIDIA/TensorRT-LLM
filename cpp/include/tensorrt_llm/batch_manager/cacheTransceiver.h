@@ -58,9 +58,9 @@ public:
     virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
-    virtual void checkContextTransferStatus(bool blocking = false) = 0;
+    virtual void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
-    virtual void checkGenTransferStatus(int atLeastRequestNum = 0) = 0;
+    virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 };
@@ -102,9 +102,9 @@ public:
     void requestAndReceiveSync(LlmRequest* llmRequest) override;
     void requestAndReceiveAsync(LlmRequest* llmRequest) override;
 
-    void checkContextTransferStatus(bool blocking = false) override;
+    void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
-    void checkGenTransferStatus(int atLeastRequestNum = 0) override;
+    void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
@@ -116,7 +116,7 @@ private:
     CommType mCommType;
     std::unique_ptr<DataResponder> mDataResponder;
     std::unique_ptr<DataRequester> mDataRequester;
-    std::map<LlmRequest*, std::future<void>> mResponderFutures;
+    std::vector<std::pair<LlmRequest*, std::future<void>>> mResponderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{nullptr}, *mMpiWorldComm{nullptr};
     std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,
