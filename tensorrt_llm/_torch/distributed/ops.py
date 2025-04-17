@@ -32,7 +32,8 @@ def get_deepseek_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if mapping not in deepseek_allreduce_workspaces:
         ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
             mapping,
-            CustomAllReduceHelper.max_workspace_size_auto(mapping.tp_size, support_deterministic=False),
+            CustomAllReduceHelper.max_workspace_size_auto(
+                mapping.tp_size, support_deterministic=False),
         )
         deepseek_allreduce_workspaces[mapping] = (ipc_buffers, workspace)
     return deepseek_allreduce_workspaces[mapping][1]
