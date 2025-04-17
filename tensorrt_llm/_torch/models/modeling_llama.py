@@ -86,7 +86,7 @@ class Llama4Attention(Attention):
         else:
             self.qk_norm = None
 
-        self.attn_temperature_tuning = attn_temperature_tuning
+        self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
@@ -350,15 +350,12 @@ class Llama4DecoderLayer(DecoderLayer):
         self.fusion_config.PRE_MOE_FUSION = False
         self.fusion_config.POST_MLP_FUSION = False
 
-        self.is_nope_layer = config.no_rope_layers[layer_idx] == 0
-
         self.self_attn = Llama4Attention(
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
-            nope_layer=self.is_nope_layer,
-            attn_temperature_tuning=self.is_nope_layer
-            and config.attn_temperature_tuning > 0,
+            nope_layer=config.no_rope_layers[layer_idx] == 0,
+            attn_temperature_tuning=config.attn_temperature_tuning > 0,
             aux_stream=aux_stream,
         )
 
@@ -430,10 +427,6 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # For NOPE layers (like in Llama4), the position_ids needs to be set to None, so the rotary embedding will not be applied.
-        if self.is_nope_layer and not self.self_attn.attn_temperature_tuning:
-            position_ids = None
-
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
