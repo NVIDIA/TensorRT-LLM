@@ -117,7 +117,7 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         if self.activation == F.silu:
-            if self.is_llama4 and x.shape[0] <= 4:
+            if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4:
                 # In Llama4, we have added a custom kernel that performs both FC+SwiGLU in one
                 # kernel. This was toggled by use_llama4_fc_swiglu in the Linear layer.
                 # Currently, we are replacing a kernel that gives fp8 in and bf16 out with

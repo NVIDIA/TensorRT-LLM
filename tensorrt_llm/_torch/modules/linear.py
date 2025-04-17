@@ -422,7 +422,10 @@ class Linear(nn.Module):
         elif self.tp_mode == TensorParallelMode.COLUMN:
             if self.use_llama4_fc_swiglu and input.shape[0] <= 4:
                 # We are passing the input_scale's inverse of the next layer to the current layer
-                assert inv_input_scale is not None, "inv_input_scale is required for llama4_fc_swiglu"
+                # Caller (gated_mlp.py) guards the feeding of inv_input_scale with
+                # "if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4".
+                # If the statement is not satisfied, inv_input_scale is None.
+                
                 output = self.apply_linear(input, self.weight, self.bias, inv_input_scale=inv_input_scale)
             else:
                 output = self.apply_linear(input, self.weight, self.bias)
