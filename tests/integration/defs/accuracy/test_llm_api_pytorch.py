@@ -22,7 +22,8 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, parametrize_with_ids, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper)
-from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
+                            LlmapiAccuracyTestHarness)
 
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
@@ -185,6 +186,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["B200"])
@@ -197,6 +203,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestMistral7B(LlmapiAccuracyTestHarness):

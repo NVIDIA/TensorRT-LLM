@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import random
-from abc import ABC, abstractmethod, abstractstaticmethod
+from abc import ABC, abstractmethod
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
@@ -83,6 +83,7 @@ class Evaluator(ABC):
         score = self.compute_score(outputs, references, *zip(*auxiliaries))
         return score
 
-    @abstractstaticmethod
+    @staticmethod
+    @abstractmethod
     def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()
