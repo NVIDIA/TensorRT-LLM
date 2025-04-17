@@ -20,7 +20,6 @@ generation_kwargs:
     - "</s>"
   do_sample: false
   temperature: 0.0
-  max_gen_toks: 32768
 num_fewshot: 0
 metric_list:
   - metric: exact_match

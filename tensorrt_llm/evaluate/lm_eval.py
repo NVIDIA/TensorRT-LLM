@@ -12,12 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import os
 from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import click
+import numpy as np
 from tqdm import tqdm
+
+import tensorrt_llm.profiler as profiler
 
 try:
     from lm_eval.api.model import TemplateLM
@@ -33,9 +37,12 @@ from .interface import Evaluator
 
 class LmEvalWrapper(TemplateLM):
 
-    def __init__(self, llm: Union[LLM, PyTorchLLM]):
+    def __init__(self,
+                 llm: Union[LLM, PyTorchLLM],
+                 sampling_params: Optional[SamplingParams] = None):
         super().__init__()
         self.llm = llm
+        self.sampling_params = sampling_params
 
     @property
     def eot_token_id(self) -> int:
@@ -70,18 +77,31 @@ class LmEvalWrapper(TemplateLM):
                               disable_tqdm: bool = False) -> List[float]:
         raise NotImplementedError()
 
+    def _get_sampling_params(self, gen_kwargs: dict) -> SamplingParams:
+        params_mapping = {
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "max_gen_toks": "max_tokens",
+            "until": "stop",
+        }
+        if self.sampling_params is None:
+            sampling_params = SamplingParams()
+        else:
+            sampling_params = copy.deepcopy(self.sampling_params)
+        for lm_eval_key, trtllm_key in params_mapping.items():
+            value = gen_kwargs.pop(lm_eval_key, None)
+            if value is not None:
+                setattr(sampling_params, trtllm_key, value)
+        return sampling_params
+
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+        profiler.start("trtllm exec")
         outputs = []
         for request in tqdm(requests,
                             desc="Submitting requests",
                             disable=disable_tqdm):
             prompt, gen_kwargs = request.args
-            sampling_params = SamplingParams(
-                max_tokens=gen_kwargs.get("max_gen_toks", 256),
-                top_p=gen_kwargs.get("top_p", None),
-                temperature=gen_kwargs.get("temperature", None),
-                stop=gen_kwargs.get("until", None),
-                include_stop_str_in_output=False)
+            sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params)
             outputs.append(output)
@@ -90,6 +110,9 @@ class LmEvalWrapper(TemplateLM):
                            desc="Fetching responses",
                            disable=disable_tqdm):
             output.result()
+        profiler.stop("trtllm exec")
+        elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
+        logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
 
         return [output.outputs[0].text for output in outputs]
 
@@ -156,49 +179,130 @@ class LmEvalEvaluator(Evaluator):
                       *auxiliaries) -> float:
         raise NotImplementedError()
 
-    def get_score(self, results: dict):
-        return results["results"][
-            self.task_name]["exact_match,strict-match"] * 100
-
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None) -> float:
-        if sampling_params is not None:
-            raise NotImplementedError("lm-eval handles sampling internally.")
-
         import lm_eval
-        results = lm_eval.evaluate(lm=LmEvalWrapper(llm),
+        results = lm_eval.evaluate(lm=LmEvalWrapper(llm, sampling_params),
                                    task_dict=self.task_dict,
                                    limit=self.num_samples,
                                    apply_chat_template=self.apply_chat_template,
                                    system_instruction=self.system_prompt)
-        logger.info(f"Lm eval results:\n{lm_eval.utils.make_table(results)}")
-        return self.get_score(results)
+        # Normalize scores to range 0~100
+        scores = results["results"][self.task_name]
+        for metric in scores.keys():
+            if isinstance(scores[metric], (float, int)):
+                scores[metric] *= 100
+        logger.info(
+            f"lm-eval {self.task_name} results (scores normalized to range 0~100):\n{lm_eval.utils.make_table(results)}"
+        )
 
-    @click.command("lm_eval")
-    @click.option("--task_name", type=str, required=True)
+        average_acc = np.mean(
+            [acc for m, acc in scores.items() if "_stderr" not in m])
+        logger.info(
+            f"lm-eval {self.task_name} average accuracy: {average_acc:.2f}")
+        return average_acc
+
+    @classmethod
+    def command_harness(cls, ctx, **kwargs):
+        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        evaluator = cls(dataset_path=kwargs.pop("dataset_path", None),
+                        num_samples=kwargs.pop("num_samples", None),
+                        random_seed=kwargs.pop("random_seed", 0),
+                        apply_chat_template=kwargs.pop("apply_chat_template",
+                                                       False),
+                        system_prompt=kwargs.pop("system_prompt", None))
+        sampling_params = SamplingParams(
+            max_tokens=kwargs.pop("max_output_length"),
+            truncate_prompt_tokens=kwargs.pop("max_input_length"))
+        accuracy = evaluator.evaluate(llm, sampling_params)
+        llm.shutdown()
+
+        check_accuracy = kwargs.pop("check_accuracy", False)
+        accuracy_threshold = kwargs.pop("accuracy_threshold", 15)
+        if check_accuracy:
+            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
+
+
+class GSM8K(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("gsm8k", **kwargs)
+
+    @click.command("gsm8k")
     @click.option("--dataset_path", type=str, default=None)
     @click.option("--num_samples", type=int, default=None)
     @click.option("--random_seed", type=int, default=0)
     @click.option("--apply_chat_template", is_flag=True, default=False)
     @click.option("--system_prompt", type=Optional[str], default=None)
+    @click.option("--max_input_length", type=int, default=4096)
+    @click.option("--max_output_length", type=int, default=256)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
-    def command(ctx, task_name, dataset_path: str, num_samples: int,
-                random_seed: int, apply_chat_template: bool,
-                system_prompt: Optional[str], check_accuracy: bool,
-                accuracy_threshold: float) -> None:
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
-        evaluator = LmEvalEvaluator(task_name=task_name,
-                                    dataset_path=dataset_path,
-                                    num_samples=num_samples,
-                                    random_seed=random_seed,
-                                    apply_chat_template=apply_chat_template,
-                                    system_prompt=system_prompt)
-        accuracy = evaluator.evaluate(llm)
-        llm.shutdown()
+    def command(ctx, **kwargs) -> None:
+        GSM8K.command_harness(ctx, **kwargs)
 
-        if check_accuracy:
-            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
+
+class GPQADiamond(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("gpqa_diamond_cot_zeroshot_aa", **kwargs)
+
+    @click.command("gpqa_diamond")
+    @click.option("--dataset_path", type=str, default=None)
+    @click.option("--num_samples", type=int, default=None)
+    @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
+    @click.option("--max_input_length", type=int, default=32768)
+    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--check_accuracy", is_flag=True, default=False)
+    @click.option("--accuracy_threshold", type=float, default=50)
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        GPQADiamond.command_harness(ctx, **kwargs)
+
+
+class GPQAMain(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("gpqa_main_cot_zeroshot_aa", **kwargs)
+
+    @click.command("gpqa_main")
+    @click.option("--dataset_path", type=str, default=None)
+    @click.option("--num_samples", type=int, default=None)
+    @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
+    @click.option("--max_input_length", type=int, default=32768)
+    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--check_accuracy", is_flag=True, default=False)
+    @click.option("--accuracy_threshold", type=float, default=50)
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        GPQAMain.command_harness(ctx, **kwargs)
+
+
+class GPQAExtended(LmEvalEvaluator):
+
+    def __init__(self, **kwargs):
+        super().__init__("gpqa_extended_cot_zeroshot_aa", **kwargs)
+
+    @click.command("gpqa_extended")
+    @click.option("--dataset_path", type=str, default=None)
+    @click.option("--num_samples", type=int, default=None)
+    @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
+    @click.option("--max_input_length", type=int, default=32768)
+    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--check_accuracy", is_flag=True, default=False)
+    @click.option("--accuracy_threshold", type=float, default=50)
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        GPQAExtended.command_harness(ctx, **kwargs)
