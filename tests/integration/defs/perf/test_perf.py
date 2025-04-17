@@ -1430,9 +1430,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         old_llm_venv = add_myelin_time_pass_to(llm_venv._new_env)
         if self._config.runtime == 'bench':
             #prepare dataset first for trtllm-bench
-            print_info(
-                f"Running command for generating dataset {self._current_cmd_idx}"
-            )
+            print_info(f"Running command for generating dataset")
             outputs = self.run_ex("prepare_dataset",
                                   llm_venv,
                                   gpu_clock_lock,
