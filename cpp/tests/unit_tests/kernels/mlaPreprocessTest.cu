@@ -34,7 +34,7 @@ namespace
 // compressed_kv_cache {batch, 1 (ignore v), max_seq_len / tokens_per_block, num_head, tokens_per_block, (lora_size +
 // rope_size)}
 template <typename T>
-void loadCompressedPagedKvKernelRef(T* kv_output, tensorrt_llm::kernels::KVBlockArray const& compressed_kv_cache,
+void loadPagedKvKernelRef(T* kv_output, tensorrt_llm::kernels::KVBlockArray const& compressed_kv_cache,
     int num_contexts, int64_t const* cu_ctx_cached_kv_lens, int head_dim)
 {
 
@@ -182,7 +182,7 @@ void setPagedKvCacheForMLAKernelRefV2(T* output, T* const ck_ptr, T* const cv_pt
 // rope_size)}
 // kv {total_uncached_tokens, h_k=1, lora_d}, k_pe {total_uncached_tokens, h_kpe=128, rope_d}
 template <typename T>
-void setCompressedPagedKvForMLAKernelRef(tensorrt_llm::kernels::KVBlockArray& kv_cache, T* const compressed_kv_ptr,
+void appendPagedKvForMLAKernelRef(tensorrt_llm::kernels::KVBlockArray& kv_cache, T* const compressed_kv_ptr,
     T* const k_pe_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
     int k_pe_head_num, int lora_size, int rope_size)
 {
@@ -370,12 +370,10 @@ protected:
         {
             dtype = nvinfer1::DataType::kHALF;
         }
-#ifdef ENABLE_BF16
         else if constexpr (std::is_same_v<DataType, __nv_bfloat16>)
         {
             dtype = nvinfer1::DataType::kBF16;
         }
-#endif
         else
         {
             return false;
@@ -523,7 +521,7 @@ protected:
         return true;
     }
 
-    void PerformKernel1()
+    void PerformLoadPagedKV()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* kv_k_pe_ptr = bufferCast<DataType>(*(this->kv_k_pe_tensor));
@@ -533,11 +531,11 @@ protected:
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mNumRequests, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
-        tensorrt_llm::kernels::invokeLoadPagedKVKernel<DataType>(kv_k_pe_ptr, kv_cache, this->mNumRequests,
+        tensorrt_llm::kernels::invokeMLALoadPagedKV<DataType>(kv_k_pe_ptr, kv_cache, this->mNumRequests,
             cu_ctx_cached_kv_lens_ptr, this->mMaxCachedSeqLen, this->mLoraSize + this->mRopeSize, this->mStream->get());
     }
 
-    void PerformKernel1Ref()
+    void PerformLoadPagedKVRef()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* kv_k_pe_ptr = bufferCast<DataType>(*(this->kv_k_pe_tensor_ref));
@@ -547,11 +545,11 @@ protected:
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mNumRequests, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
-        loadCompressedPagedKvKernelRef(
+        loadPagedKvKernelRef(
             kv_k_pe_ptr, kv_cache, this->mNumRequests, cu_ctx_cached_kv_lens_ptr, this->mLoraSize + this->mRopeSize);
     }
 
-    void PerformKernel2()
+    void PerformSetPagedKV()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* k_ptr = bufferCast<DataType>(*(this->k_tensor));
@@ -559,12 +557,12 @@ protected:
         auto* k_pe_ptr = bufferCast<DataType>(*(this->k_pe_tensor));
         auto* kv_cache_ptr = bufferCast<DataType>(*(this->kv_cache_tensor));
         auto* cu_seq_lens_ptr = bufferCast<int64_t>(*(this->cu_seq_lens));
-        tensorrt_llm::kernels::invokeSetPagedKVKernel<DataType>(kv_cache_ptr, k_ptr, v_ptr, k_pe_ptr,
-            this->mNumRequests, cu_seq_lens_ptr, this->mMaxSeqLen, this->mNumHeadsUncompressed,
-            this->mUncompressedHeadSize, this->mRopeSize, this->mTokensPerBlock, this->mStream->get());
+        tensorrt_llm::kernels::invokeMLASetPagedKV<DataType>(kv_cache_ptr, k_ptr, v_ptr, k_pe_ptr, this->mNumRequests,
+            cu_seq_lens_ptr, this->mMaxSeqLen, this->mNumHeadsUncompressed, this->mUncompressedHeadSize,
+            this->mRopeSize, this->mTokensPerBlock, this->mStream->get());
     }
 
-    void PerformKernel2Ref()
+    void PerformSetPagedKVRef()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* k_ptr = bufferCast<DataType>(*(this->k_tensor));
@@ -577,7 +575,7 @@ protected:
             this->mTokensPerBlock);
     }
 
-    void PerformKernel2V2()
+    void PerformSetPagedKVV2()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* k_cached_ptr = bufferCast<DataType>(*(this->k_tensor_cached));
@@ -589,13 +587,13 @@ protected:
         auto* cu_ctx_cached_kv_lens_ptr = bufferCast<int64_t>(*(this->cu_ctx_cached_kv_lens));
         auto* kv_cache_ptr = bufferCast<DataType>(*(this->kv_cache_tensor));
         auto* cu_seq_lens_ptr = bufferCast<int64_t>(*(this->cu_seq_lens));
-        tensorrt_llm::kernels::invokeSetPagedKVKernelV2<DataType>(kv_cache_ptr, k_cached_ptr, v_cached_ptr,
+        tensorrt_llm::kernels::invokeMLASetPagedKVV2<DataType>(kv_cache_ptr, k_cached_ptr, v_cached_ptr,
             k_pe_cached_ptr, k_uncached_ptr, v_uncached_ptr, k_pe_uncached_ptr, this->mNumRequests,
             cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, this->mMaxSeqLen, this->mNumHeadsUncompressed,
             this->mUncompressedHeadSize, this->mRopeSize, this->mTokensPerBlock, this->mStream->get());
     }
 
-    void PerformKernel2V2Ref()
+    void PerformSetPagedKVV2Ref()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* k_cached_ptr = bufferCast<DataType>(*(this->k_tensor_cached));
@@ -613,7 +611,7 @@ protected:
             this->mTokensPerBlock);
     }
 
-    void PerformKernel3()
+    void PerformAppendPagedKV()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* compressed_kv_ptr = bufferCast<DataType>(*(this->compressed_kv_tensor));
@@ -625,12 +623,12 @@ protected:
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mNumRequests, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
-        tensorrt_llm::kernels::invokeSetCompressedPagedKVKernel<DataType>(kv_cache, compressed_kv_ptr,
-            k_pe_full_head_ptr, this->mNumRequests, cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr,
-            this->mMaxUncachedSeqLen, this->mLoraSize + this->mRopeSize, this->mStream->get());
+        tensorrt_llm::kernels::invokeMLAAppendPagedKV<DataType>(kv_cache, compressed_kv_ptr, k_pe_full_head_ptr,
+            this->mNumRequests, cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, this->mMaxUncachedSeqLen,
+            this->mLoraSize + this->mRopeSize, this->mStream->get());
     }
 
-    void PerformKernel3Ref()
+    void PerformAppendPagedKVRef()
     {
         using tensorrt_llm::runtime::bufferCast;
         auto* compressed_kv_ptr = bufferCast<DataType>(*(this->compressed_kv_tensor));
@@ -643,7 +641,7 @@ protected:
             sizeof(DataType) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
             reinterpret_cast<tensorrt_llm::kernels::KVBlockArrayForContextFMHA::DataType*>(offset_ptr));
         // currently k_pe_head_num = 1
-        setCompressedPagedKvForMLAKernelRef(kv_cache, compressed_kv_ptr, k_pe_full_head_ptr, this->mNumRequests,
+        appendPagedKvForMLAKernelRef(kv_cache, compressed_kv_ptr, k_pe_full_head_ptr, this->mNumRequests,
             cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, 1, this->mLoraSize, this->mRopeSize);
     }
 
@@ -663,11 +661,7 @@ protected:
     }
 };
 
-using MLATypes = ::testing::Types<half,
-#ifdef ENABLE_BF16
-    __nv_bfloat16,
-#endif
-    float>;
+using MLATypes = ::testing::Types<half, __nv_bfloat16, float>;
 TYPED_TEST_SUITE(MlaPreprocessTest, MLATypes);
 
 TYPED_TEST(MlaPreprocessTest, MLAPreprocessDefault)
@@ -681,25 +675,25 @@ TYPED_TEST(MlaPreprocessTest, MLAPreprocessDefault)
     sync_check_cuda_error(this->mStream->get());
     bool allEqual{true};
 
-    this->PerformKernel1();
+    this->PerformLoadPagedKV();
     sync_check_cuda_error(this->mStream->get());
-    this->PerformKernel1Ref();
+    this->PerformLoadPagedKVRef();
     auto* kv_k_pe_ptr = bufferCast<DataType>(*(this->kv_k_pe_tensor));
     auto* kv_k_pe_ref_ptr = bufferCast<DataType>(*(this->kv_k_pe_tensor_ref));
     allEqual = this->CheckEqual(kv_k_pe_ref_ptr, kv_k_pe_ptr, this->kv_k_pe_tensor->getSize());
     EXPECT_TRUE(allEqual);
 
-    this->PerformKernel2V2();
+    this->PerformSetPagedKVV2();
     sync_check_cuda_error(this->mStream->get());
-    this->PerformKernel2V2Ref();
+    this->PerformSetPagedKVV2Ref();
     auto* kv_cache_ptr = bufferCast<DataType>(*(this->kv_cache_tensor));
     auto* kv_cache_ref_ptr = bufferCast<DataType>(*(this->kv_cache_tensor_ref));
     allEqual = this->CheckEqual(kv_cache_ref_ptr, kv_cache_ptr, this->kv_cache_tensor->getSize());
     EXPECT_TRUE(allEqual);
 
-    this->PerformKernel3();
+    this->PerformAppendPagedKV();
     sync_check_cuda_error(this->mStream->get());
-    this->PerformKernel3Ref();
+    this->PerformAppendPagedKVRef();
     auto* compressed_kv_cache_ptr = bufferCast<DataType>(*(this->compressed_kv_cache_tensor));
     auto* compressed_kv_cache_ref_ptr = bufferCast<DataType>(*(this->compressed_kv_cache_tensor_ref));
     allEqual = this->CheckEqual(
