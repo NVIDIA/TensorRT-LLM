@@ -47,3 +47,67 @@ class RMSNorm(nn.Module):
             if residual is not None:
                 return hidden_states, residual
             return hidden_states
+
+
+class GroupRMSNorm(nn.Module):
+
+    def __init__(self,
+                 *,
+                 hidden_sizes: list[int],
+                 eps: float = 1e-5,
+                 weight_bias: float = 0.0,
+                 enable_weights: bool = False,
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None):
+        """
+        Group RMS Normalization for multiple tensors.
+
+        Args:
+            hidden_sizes: List of hidden dimensions for each input tensor
+            eps: Epsilon for numerical stability
+            enable_weights: Whether to use learnable weights
+            dtype: Data type for weights
+            device: Device for weights
+        """
+        super().__init__()
+        self.variance_epsilon = eps
+        self.weight_bias = weight_bias
+        self.enable_weights = enable_weights
+        # Create dummy weights is enable_weights is False
+        # The weights will be ignored by the CUDA kernel
+        if not enable_weights:
+            self.dummy_weights = [
+                nn.Parameter(
+                    torch.empty(hidden_size, dtype=dtype, device=device))
+                for hidden_size in hidden_sizes
+            ]
+
+    def forward(
+            self,
+            inputs: list[torch.Tensor],
+            weights: Optional[list[torch.Tensor]] = None) -> list[torch.Tensor]:
+        """
+        Apply RMS normalization to a group of inputs.
+
+        Args:
+            inputs: List of tensors to normalize [batch_size, hidden_dim]
+
+        Returns:
+            List of normalized tensors with same shape as inputs
+        """
+
+        if len(inputs) == 0:
+            return []
+        if self.enable_weights:
+            assert weights is not None, "weights must be provided if enable_weights is True"
+            outputs = torch.ops.trtllm.group_rms_norm(inputs, weights,
+                                                      self.variance_epsilon,
+                                                      self.weight_bias,
+                                                      self.enable_weights)
+            return outputs
+
+        outputs = torch.ops.trtllm.group_rms_norm(inputs, self.dummy_weights,
+                                                  self.variance_epsilon,
+                                                  self.weight_bias,
+                                                  self.enable_weights)
+        return outputs
