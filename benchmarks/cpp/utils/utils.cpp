@@ -92,7 +92,12 @@ Samples parseWorkloadJson(
         {
             input_ids.resize(maxPromptLen.value());
         }
-        samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], taskId});
+        std::vector<int32_t> context_ids;
+        if (sample.count("context_ids"))
+        {
+            context_ids = sample["context_ids"].template get<std::vector<int32_t>>();
+        }
+        samples.emplace_back(Sample{std::move(input_ids), std::move(context_ids), sample["output_len"], taskId});
     }
 
     if (samples.size() < maxNumSamples)

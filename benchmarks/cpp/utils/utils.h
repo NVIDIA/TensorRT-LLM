@@ -224,6 +224,7 @@ std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric);
 struct Sample
 {
     std::vector<int32_t> inputIds;
+    std::vector<int32_t> contextIds;
     int32_t outputLen;
     int32_t taskId;
 };
