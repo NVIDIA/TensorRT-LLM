@@ -49,7 +49,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
     constexpr SizeType32 beam{0};
     auto& blockManager = mCacheManager->getBlockManager();
     size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
-    auto blockRange = BlockRange(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
     if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
     {
         // handle block reuse, the prefix blocks are reused
@@ -109,7 +109,7 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         }
         TLLM_CHECK(!inputKvCacheBlocks.empty());
         TLLM_CHECK(blockNum > 0);
-        int deviceId = mCacheManager->getBlockManager().getBufferManager().getStream().getDevice();
+        int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
         if (common::getEnvTryZCopyForKVCacheTransfer()
             && (destConfig.getParallelConfig().mPipelineParallelism
@@ -318,8 +318,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
     TLLM_CHECK(!connections.empty());
-    auto blockRange = BlockRange(*mCacheManager, mCacheManager->getNewlyAllocatedBlockIds(llmRequest.mRequestId));
-
+    auto blockRange = BlockRange::fromNewlyAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
