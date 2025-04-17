@@ -108,6 +108,7 @@ def load_dataset(args) -> datasets.Dataset:
                     'timeout': aiohttp.ClientTimeout(total=3600)
                 }
             },
+            trust_remote_code=True,
         )
     return dataset
 

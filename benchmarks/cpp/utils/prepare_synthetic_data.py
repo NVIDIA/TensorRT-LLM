@@ -1,8 +1,9 @@
 import random
 
 import click
-from utils.utils import (dataset_dump, gen_random_tokens, get_norm_dist_lengths,
-                         get_unif_dist_lengths, print_dataset)
+from utils.utils import (gen_random_tokens, get_norm_dist_lengths,
+                         get_unif_dist_lengths, print_text_dataset,
+                         text_dataset_dump)
 
 
 @click.command()
@@ -57,7 +58,7 @@ def token_norm_dist(root_args, **kwargs):
         task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
 
     if not root_args.std_out:
-        dataset_dump(
+        text_dataset_dump(
             input_lens, input_ids, output_lens, task_ids, {
                 "workload_type": "token-norm-dist",
                 "input_mean": kwargs['input_mean'],
@@ -70,7 +71,7 @@ def token_norm_dist(root_args, **kwargs):
                 "max_output_len": max_output_len
             }, root_args.output)
     else:
-        print_dataset(
+        print_text_dataset(
             input_ids,
             output_lens,
         )
@@ -127,7 +128,7 @@ def token_unif_dist(root_args, **kwargs):
         task_ids = [random.randint(min_id, max_id) for _ in range(num_reqs)]
 
     if not root_args.std_out:
-        dataset_dump(
+        text_dataset_dump(
             input_lens, input_ids, output_lens, task_ids, {
                 "workload_type": "token-unif-dist",
                 "input_min": kwargs['input_min'],
@@ -140,7 +141,7 @@ def token_unif_dist(root_args, **kwargs):
                 "max_output_len": max_output_len
             }, root_args.output)
     else:
-        print_dataset(
+        print_text_dataset(
             input_ids,
             output_lens,
         )
