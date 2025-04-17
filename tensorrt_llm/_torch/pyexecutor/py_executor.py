@@ -866,9 +866,7 @@ class PyExecutor:
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []
 
-                    self._update_requests(scheduled_batch,
-                                          decoder_state.new_tensors_host,
-                                          decoder_state.decoder_event)
+                    self._update_requests(decoder_state)
 
                     if self.kv_cache_transceiver:
                         # For context only req in transmission, we reset the state since decoder might have changed it
@@ -1790,12 +1788,11 @@ class PyExecutor:
             if spec_metadata.spec_dec_mode.is_eagle3():
                 outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
-            _, new_tensors_host, decoder_event = self._decode_async(
-                draft_batch, outputs)
+            decoder_state = self._decode_async(draft_batch, outputs)
 
             self._update_request_states(draft_batch)
 
-            self._update_requests(draft_batch, new_tensors_host, decoder_event)
+            self._update_requests(decoder_state)
 
             def _process_decoded_tokens():
                 new_requests = []
@@ -1832,11 +1829,9 @@ class PyExecutor:
                 if spec_metadata.spec_dec_mode.is_eagle3():
                     outputs[
                         'd2t'] = self.draft_model_engine.model.model.d2t.data
-                _, new_tensors_host, decoder_event = self._decode_async(
-                    draft_batch, outputs)
+                decoder_state = self._decode_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
-                self._update_requests(draft_batch, new_tensors_host,
-                                      decoder_event)
+                self._update_requests(decoder_state)
 
                 new_requests = _process_decoded_tokens()
                 if not new_requests:

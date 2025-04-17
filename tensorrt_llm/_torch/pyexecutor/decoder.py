@@ -15,8 +15,7 @@ from tensorrt_llm.bindings.internal.algorithms import (
     HandleGenerationLogits, MakeDecodingBatchInputOutput, UpdateDecoderBuffers)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
-from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaEvent,
-                                                    CudaStream,
+from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
                                                     GptDecoderBatched,
                                                     SpeculativeDecodingMode)
 from tensorrt_llm.mapping import Mapping
@@ -422,18 +421,16 @@ class TRTLLMDecoder(Decoder):
 
     def _initialize_store(self):
         torch_stream = torch.cuda.Stream()
-        buffer_manager = BufferManager(stream=torch_stream)
+        cuda_stream = CudaStream(torch_stream.cuda_stream)
+        buffer_manager = BufferManager(stream=cuda_stream)
 
         self.store = {
             "torch_stream":
             torch_stream,
             "cuda_stream":
-            CudaStream(torch_stream.cuda_stream),
+            cuda_stream,
             "buffer_manager":
-            BufferManager(stream=torch_stream),
-            "seq_slot_manager":
-            SequenceSlotManager(self.max_num_sequences,
-                                self.max_seq_idle_microseconds),
+            buffer_manager,
             "decoder_buffers":
             DecoderBuffers(self.max_num_sequences,
                            self.executor_config.max_beam_width,
@@ -598,9 +595,11 @@ class TRTLLMDecoder(Decoder):
                             new_tensors_host=new_tensors_host,
                             decoder_event=decoder_event)
 
-    def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: OrderedDict[str, torch.tensor],
-                        decoder_event: CudaEvent or None):
+    def update_requests(self, decoder_state: DecoderState):
+        scheduled_requests = decoder_state.scheduled_requests
+        new_tensors_host = decoder_state.new_tensors_host
+        decoder_event = decoder_state.decoder_event
+
         if decoder_event:
             decoder_event.synchronize()
 
