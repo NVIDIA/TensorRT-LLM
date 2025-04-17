@@ -510,7 +510,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/functional.py",
         "tensorrt_llm/mapping.py",
         "tensorrt_llm/llmapi/",
-        "tensorrt_llm/executor.py",
+        "tensorrt_llm/executor/",
         "tensorrt_llm/_ipc_utils.py",
         "tensorrt_llm/parameter.py",
         "tensorrt_llm/models/llama/",
