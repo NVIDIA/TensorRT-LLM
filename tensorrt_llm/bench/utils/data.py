@@ -1,12 +1,36 @@
 import json
 from functools import partial
-from typing import List, TextIO, Tuple
+from typing import Any, Dict, List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
+                                 default_video_loader)
+
+
+def prepare_multimodal_inputs(model_dir: str,
+                              model_type: str,
+                              modality: str,
+                              prompts: List[str],
+                              media: List[str],
+                              image_data_format: str = "pt",
+                              num_frames: int = 8) -> List[Dict[str, Any]]:
+
+    inputs = []
+    if modality == "image":
+        inputs = default_image_loader(prompts, media, image_data_format)
+    elif modality == "video":
+        inputs = default_video_loader(prompts, media, image_data_format,
+                                      num_frames)
+    else:
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
+
+    return inputs
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -92,15 +116,15 @@ def create_dataset_from_stream(
             assert modality in [
                 "image", "video"
             ], f"Modality must be one of ['image', 'video'] but got {modality}."
-            from tensorrt_llm.inputs.utils import prepare_media
 
             prompt = data.get("prompt")  # cannot be None
             media_paths = data.get("media_paths", None)
-            inputs = prepare_media(model_dir,
-                                   model_type,
-                                   modality,
-                                   prompts=[prompt],
-                                   media=media_paths)  # list of dicts
+            inputs = prepare_multimodal_inputs(
+                model_dir,
+                model_type,
+                modality,
+                prompts=[prompt],
+                media=media_paths)  # list of dicts
             logits = None  # cannot tokenize multi-modal data, handled by preprocessor
             prompt = inputs[0]
         else:
