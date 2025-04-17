@@ -153,7 +153,7 @@ class Llama4Attention(Attention):
             qkv = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
-            assert self.rotary_emb is not None and not self.enable_rope_fusion, "qk_norm requires rope fusion to be disabled"
+            assert self.rotary_emb is not None and not self.enable_rope_fusion, "qk_norm requires attention rope fusion disabled"
             q, k = self.rotary_emb(position_ids, [q, k])
             q, k = self._qk_norm(q, k)
             return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
