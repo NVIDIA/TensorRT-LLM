@@ -50,7 +50,7 @@ void NixlConnection::sendRequestInfo(std::string serializedInfo, runtime::ITenso
     std::string bufferDescStr = bufferDesc.serialize();
 
     // Create a notification message that includes both the request info and buffer descriptor
-    std::string notifMsg = serializedInfo + ":" + bufferDescStr;
+    std::string notifMsg = serializedInfo + "$" + bufferDescStr; // TODO: check with TRTLLM team
 
     // Use genNotif to send the request info and buffer descriptor
     agent_->genNotif(remote_agent_.c_str(), notifMsg);
@@ -247,7 +247,7 @@ Connection const* NixlConnectionManager::recvRequestInfo(std::string& retSeriali
                 // Parse notification
                 std::istringstream iss(notif);
                 std::string serializedInfo, bufferDescStr;
-                std::getline(iss, serializedInfo, ':');
+                std::getline(iss, serializedInfo, '$'); // TODO: check with TRTLLM team
                 std::getline(iss, bufferDescStr);
                 retBufferDescStr = bufferDescStr;
                 retSerializedInfo = serializedInfo;
