@@ -320,7 +320,7 @@ def test_llm_qwen1_5_7b_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -338,7 +338,7 @@ def test_llm_qwen1_5_7b_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -408,7 +408,7 @@ def test_llm_qwen1_5_moe_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -426,7 +426,7 @@ def test_llm_qwen1_5_moe_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -496,7 +496,7 @@ def test_llm_qwen1_5_moe_plugin_single_gpu_lora(
     input_text = "What is your name?"
     print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -514,7 +514,7 @@ def test_llm_qwen1_5_moe_plugin_single_gpu_lora(
 
     print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{qwen_example_root}/../run.py",
+        f"{qwen_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -575,7 +575,7 @@ def test_llm_qwen_7b_int8_kv_1node_1gpus(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         "--tensorrt_llm_rouge1_threshold=22",
@@ -647,7 +647,7 @@ def test_llm_qwen_7b_multi_gpus_summary(qwen_example_root, llm_qwen_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
@@ -711,7 +711,7 @@ def test_llm_qwen_smooth_quant_single_gpu_summary(qwen_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
@@ -760,7 +760,7 @@ def test_llm_qwen_int4_single_gpu_summary(qwen_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     summary_cmd = [
-        f"{qwen_example_root}/../summarize.py", "--test_trt_llm",
+        f"{qwen_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llm_qwen_model_root}", "--data_type", "fp16",
         "--check_accuracy", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}", "--tensorrt_llm_rouge1_threshold=24",
