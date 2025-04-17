@@ -346,7 +346,7 @@ class FusedMoE(nn.Module):
                 proj_weight_scales=self.w2_weight_scaling_factor.narrow(
                     0, expert_start, expert_end - expert_start),
             )
-        elif self.has_nv_fp4:
+        elif self.has_nvfp4:
             return FusedMoEQuantScalesNVFP4(
                 fc1_act_global=self.fc31_input_scale,
                 fc1_weight_block=self.w3_w1_weight_scale.narrow(
