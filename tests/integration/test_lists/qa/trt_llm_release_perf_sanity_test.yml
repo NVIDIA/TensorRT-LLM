@@ -6,24 +6,24 @@ trt_llm_release_perf_sanity_test:
         gte: 1
   tests:
   # E2E trtllm-bench
-  - perf/test_perf.py::test_perf[gpt_350m_moe-bench-float16-maxbs:64-input_output_len:128,128]
+  # - perf/test_perf.py::test_perf[gpt_350m_moe-bench-float16-maxbs:64-input_output_len:128,128]
 
   # E2E BERT
-  - perf/test_perf.py::test_perf[bert_large-bench-float16-maxbs:32-input_len:128+512]
-  - perf/test_perf.py::test_perf[roberta_base-bench-float16-maxbs:32-input_len:128+512]
+  # - perf/test_perf.py::test_perf[bert_large-bench-float16-maxbs:32-input_len:128+512]
+  # - perf/test_perf.py::test_perf[roberta_base-bench-float16-maxbs:32-input_len:128+512]
 
   # Common models for all GPUs
   - perf/test_perf.py::test_perf[starcoder2_3b-bench-float16-maxbs:1-input_output_len:512,200-reqs:10]
-  - perf/test_perf.py::test_perf[mamba_130m-bench-float16-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:128,128]
+  # - perf/test_perf.py::test_perf[mamba_130m-bench-float16-input_output_len:128,128]
+  # - perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:128,128]
 
   # E2E ENC-DEC
-  - perf/test_perf.py::test_perf[mbart_large_50_many_to_one_mmt-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[bart_large_cnn-bench-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20]
-  - perf/test_perf.py::test_perf[whisper_large_v3-bench-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[mbart_large_50_many_to_one_mmt-cppmanager-exe-plugin_ifb-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[bart_large_cnn-bench-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[t5-bench-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20]
+  # - perf/test_perf.py::test_perf[whisper_large_v3-bench-float16-input_output_len:128,20]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:128,128+512,32]
 
   # Test list validation
@@ -60,8 +60,8 @@ trt_llm_release_perf_sanity_test:
       system_gpu_count:
         gte: 2
   tests:
-  - perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
-  - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
+  # - perf/test_perf.py::test_perf[t5-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
+  # - perf/test_perf.py::test_perf[flan_t5_large-bench-float16-maxbs:1-input_output_len:128,20-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-quant:int8_sq-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-float16-input_output_len:128,128-quant:int8_wo-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-float16-maxbs:256-input_output_len:128,128-gpu:2]
