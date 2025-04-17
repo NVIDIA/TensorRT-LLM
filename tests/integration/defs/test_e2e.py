@@ -1150,7 +1150,8 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
-    llama_example_root = os.path.join(llm_root, "examples", "llama")
+    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
+                                      "llama")
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, "llama-7b-cmodel")
 
