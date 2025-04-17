@@ -10,7 +10,6 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
-# For Llama4 attention backend
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
