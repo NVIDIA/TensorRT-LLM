@@ -91,8 +91,16 @@ class Llama4Attention(Attention):
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
 
-    def _attn_qkv(self, q, k, v, attn_metadata, attention_mask, mrope_config,
-                  all_reduce_params):
+    def _attn_qkv(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+            mrope_config: Optional[dict] = None,
+            all_reduce_params: Optional[AllReduceParams] = None):
         out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
