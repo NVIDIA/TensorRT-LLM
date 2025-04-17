@@ -730,7 +730,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata = None
 
         pipeline_interface = None
-        if self.mapping.pp_rank > 0:
+        if not self.mapping.is_first_pp_rank():
             pipeline_interface = self.model.create_pipeline_interface(
                 batch_size)
         self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
@@ -1189,10 +1189,9 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.mapping.has_pp():
             pipeline_interface = None
-            if self.mapping.pp_rank > 0:
+            if not self.mapping.is_first_pp_rank():
                 pipeline_interface = self.model.create_pipeline_interface(
                     inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
             inputs['pipeline_interface'] = pipeline_interface
 
         num_generation_tokens = len(generation_requests) + len(
@@ -1323,7 +1322,6 @@ class PyTorchModelEngine(ModelEngine):
             if self.mapping.pp_rank > 0:
                 pipeline_interface = self.model.create_pipeline_interface(
                     inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
             inputs['pipeline_interface'] = pipeline_interface
 
         return inputs, None
@@ -1604,7 +1602,9 @@ class PyTorchModelEngine(ModelEngine):
                 inputs.update(extra_model_inputs)
             self.last_spec_metadata = spec_metadata
 
-            if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
+            if not self.mapping.is_first_pp_rank():
+                inputs['pipeline_interface'].recv()
+            if not self.mapping.is_last_pp_rank():
                 pp_interface = self._forward_step_intermediate(inputs)
                 pp_interface.send()
                 return self._post_forward_intermediate(inputs, pp_interface,
@@ -1637,7 +1637,9 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             if maybe_graph is None:
-                if self.mapping.has_pp() and not self.mapping.is_last_pp_rank():
+                if not self.mapping.is_first_pp_rank():
+                    inputs['pipeline_interface'].recv()
+                if not self.mapping.is_last_pp_rank():
                     pp_interface = self._forward_step_intermediate(inputs)
                     pp_interface.send()
                     outputs = self._post_forward_intermediate(
@@ -1657,6 +1659,8 @@ class PyTorchModelEngine(ModelEngine):
                                                self._cuda_graph_mem_pool)
                     self._cuda_graph_mem_pool = pool
 
+                if not self.mapping.is_first_pp_rank():
+                    inputs['pipeline_interface'].recv()
                 outputs = maybe_graph.run(inputs)
                 if not self.mapping.is_last_pp_rank():
                     pp_interface = PipelineInterface(*outputs)
