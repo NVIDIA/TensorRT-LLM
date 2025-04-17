@@ -153,14 +153,14 @@ def test_deepseek_dgx_h200(llmapi_example_root, llm_datasets_root, llm_venv,
     if use_nvcc:
         os.environ["TRTLLM_DG_JIT_USE_NVCC"] = "1"
     else:
-        del os.environ["TRTLLM_DG_JIT_USE_NVCC"]
+        os.environ.pop("TRTLLM_DG_JIT_USE_NVCC", None)
     gpqa_cmd = [
         f"{llmapi_example_root}/../gpqa_llmapi.py",
         f"--hf_model_dir={model_dir}", f"--data_dir={gpqa_data_path}",
         f"--tp_size={tp_size}", f"--ep_size={ep_size}",
         f"--concurrency={concurrency}", f"--mtp_nextn={mtp_nextn}",
         "--print_iter_log", f"--batch_size={batch_size}",
-        "--max_num_tokens=4096", "--check_accuracy",
+        "--max_num_tokens=1127", "--check_accuracy",
         "--accuracy_threshold=0.65", "--limit=0.6"
     ]
     if enable_cuda_graph:
