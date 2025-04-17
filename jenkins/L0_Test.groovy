@@ -1551,10 +1551,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             "cpp": "-CPP-",
         ]
         def backendModeList = backendMode.collect { changeMap[it] }.flatten()
-        def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ -> 
+        def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ ->
             !changeMap.values().any { backend -> key.contains(backend) }
         }
-        def parallelJobsBackendMode = parallelJobsFiltered.findAll { key, _ -> 
+        def parallelJobsBackendMode = parallelJobsFiltered.findAll { key, _ ->
             backendModeList.any { backend -> key.contains(backend) }
         }
         parallelJobsFiltered = parallelJobsNoBackend + parallelJobsBackendMode
