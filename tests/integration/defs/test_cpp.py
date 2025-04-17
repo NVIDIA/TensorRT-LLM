@@ -5,6 +5,7 @@ import pathlib as _pl
 import platform
 import shutil
 import sys as _sys
+import time
 from typing import List
 
 import defs.cpp_common as _cpp
@@ -154,13 +155,12 @@ def build_google_tests(request, build_dir):
     cuda_arch = f"{request.param}-real"
 
     print(f"Using CUDA arch: {cuda_arch}")
-    build_trt_llm(
-        cuda_architectures=cuda_arch,
-        job_count=12,
-        use_ccache=True,
-        clean=True,
-        trt_root="/usr/local/tensorrt",
-    )
+
+    build_trt_llm(cuda_architectures=cuda_arch,
+                  job_count=12,
+                  use_ccache=True,
+                  clean=True,
+                  trt_root="/usr/local/tensorrt")
 
     make_google_tests = [
         "cmake",
@@ -222,6 +222,9 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
 
     def _prepare(model_name: str):
         if platform.system() != "Windows":
+
+            start_time = time.time()
+
             _cpp.prepare_multi_gpu_model_tests(
                 test_list=[model_name],
                 python_exe=python_exe,
@@ -229,6 +232,10 @@ def prepare_model_multi_gpu(python_exe, root_dir, cpp_resources_dir,
                 resources_dir=cpp_resources_dir,
                 model_cache=model_cache,
             )
+
+            duration = time.time() - start_time
+            print(f"Built multi-GPU model: {model_name}")
+            print(f"Duration: {duration} seconds")
 
     return _prepare
 
