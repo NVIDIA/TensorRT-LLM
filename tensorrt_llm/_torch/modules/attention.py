@@ -579,7 +579,8 @@ class MLA(nn.Module):
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
                                                        k_pe_ctx, attn_metadata,
-                                                       latent_cache_ctx, position_ids)
+                                                       latent_cache_ctx,
+                                                       position_ids)
         else:
             attn_output_context = None
 
@@ -638,7 +639,6 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         latent_cache: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
@@ -675,13 +675,12 @@ class MLA(nn.Module):
 
         return attn_output
 
-    def forward_paged_context_fmha_for_mla(
+    def forward_context_with_cached_kv(
         self,
         q: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        latent_cache: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -744,9 +743,9 @@ class MLA(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
         assert q.is_contiguous()
 
-        # set compressed paged kv cache for mla
+        # append paged kv cache for mla
         # we may finish it inside the attention op by passing latent_cache
-        trtllm_attention.set_compressed_paged_kv_cache_for_mla(
+        trtllm_attention.append_paged_kv_cache_for_mla(
             compressed_kv,
             k_pe,
             attn_metadata,
@@ -805,15 +804,15 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.use_paged_context_fmha_for_mla(attn_metadata):
-                return self.forward_paged_context_fmha_for_mla(
-                    q, compressed_kv, k_pe, attn_metadata, latent_cache, position_ids)
+            if trtllm_attention.has_cached_kv_for_mla_context(attn_metadata):
+                return self.forward_context_with_cached_kv(
+                    q, compressed_kv, k_pe, attn_metadata, position_ids)
             else:
                 return self.forward_context_default(q, compressed_kv, k_pe,
-                                                    attn_metadata, latent_cache, position_ids)
+                                                    attn_metadata, latent_cache)
         else:
             return self.forward_context_default(q, compressed_kv, k_pe,
-                                                attn_metadata, latent_cache, position_ids)
+                                                attn_metadata, latent_cache)
 
     def forward_generation(
         self,

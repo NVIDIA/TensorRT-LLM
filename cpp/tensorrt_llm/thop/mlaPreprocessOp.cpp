@@ -39,7 +39,7 @@ void loadPagedKVCacheForMLAHelper(torch::Tensor& output, KVBlockArray& kv_cache,
     auto stream = at::cuda::getCurrentCUDAStream(output.get_device());
 
     T* output_ptr = static_cast<T*>(output.data_ptr());
-    tensorrt_llm::kernels::invokeLoadPagedKVKernel<T>(output_ptr, kv_cache, num_contexts,
+    tensorrt_llm::kernels::invokeMLALoadPagedKV<T>(output_ptr, kv_cache, num_contexts,
         cu_ctx_cached_kv_lens.data_ptr<int64_t>(), max_input_seq_len, head_dim, stream);
 }
 
@@ -55,7 +55,7 @@ void setPagedKVCacheForMLAHelper(torch::Tensor& output, torch::Tensor const& k, 
     T* k_pe_ptr = static_cast<T*>(k_pe.data_ptr());
     auto* cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
 
-    tensorrt_llm::kernels::invokeSetPagedKVKernel<T>(output_ptr, k_ptr, v_ptr, k_pe_ptr, num_requests, cu_seq_lens_ptr,
+    tensorrt_llm::kernels::invokeMLASetPagedKV<T>(output_ptr, k_ptr, v_ptr, k_pe_ptr, num_requests, cu_seq_lens_ptr,
         max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, stream);
 }
 
@@ -77,13 +77,13 @@ void setPagedKVCacheV2ForMLAHelper(torch::Tensor& output, torch::Tensor const& c
     auto* cu_ctx_cached_kv_lens_ptr = cu_ctx_cached_kv_lens.data_ptr<int64_t>();
     auto* cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
 
-    tensorrt_llm::kernels::invokeSetPagedKVKernelV2<T>(output_ptr, cached_k_ptr, cached_v_ptr, cached_k_pe_ptr,
-        new_k_ptr, new_v_ptr, new_k_pe_ptr, num_requests, cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, max_input_seq_len,
-        num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, stream);
+    tensorrt_llm::kernels::invokeMLASetPagedKVV2<T>(output_ptr, cached_k_ptr, cached_v_ptr, cached_k_pe_ptr, new_k_ptr,
+        new_v_ptr, new_k_pe_ptr, num_requests, cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, max_input_seq_len, num_heads,
+        kv_dim, rope_dim, kv_cache_tokens_per_block, stream);
 }
 
 template <typename T>
-void setCompressedPagedKVCacheForMLAHelper(KVBlockArray& kv_cache, torch::Tensor const& compressed_kv,
+void appendPagedKVCacheForMLAHelper(KVBlockArray& kv_cache, torch::Tensor const& compressed_kv,
     torch::Tensor const& k_pe, int const num_requests, torch::Tensor const& cu_ctx_cached_kv_lens,
     torch::Tensor const& cu_seq_lens, int const max_input_uncached_seq_len, int head_dim)
 {
@@ -92,7 +92,7 @@ void setCompressedPagedKVCacheForMLAHelper(KVBlockArray& kv_cache, torch::Tensor
     auto* const k_pe_ptr = static_cast<T* const>(k_pe.data_ptr());
     auto* const cu_seq_lens_ptr = cu_seq_lens.data_ptr<int64_t>();
     auto* const cu_ctx_cached_kv_lens_ptr = cu_ctx_cached_kv_lens.data_ptr<int64_t>();
-    tensorrt_llm::kernels::invokeSetCompressedPagedKVKernel(kv_cache, compressed_kv_ptr, k_pe_ptr, num_requests,
+    tensorrt_llm::kernels::invokeMLAAppendPagedKV(kv_cache, compressed_kv_ptr, k_pe_ptr, num_requests,
         cu_ctx_cached_kv_lens_ptr, cu_seq_lens_ptr, max_input_uncached_seq_len, head_dim, stream);
 }
 
@@ -205,13 +205,11 @@ torch::Tensor loadPagedKVCacheForMLA(torch::ScalarType out_dtype, int64_t const 
         loadPagedKVCacheForMLAHelper<float>(
             output, kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, head_size);
     }
-#ifdef ENABLE_BF16
     else if (out_dtype == torch::kBFloat16)
     {
         loadPagedKVCacheForMLAHelper<__nv_bfloat16>(
             output, kv_cache_buffer, num_contexts, cu_ctx_cached_kv_lens, max_ctx_cached_kv_len, head_size);
     }
-#endif
 
     return output;
 }
@@ -243,13 +241,11 @@ torch::Tensor setPagedKVCacheForMLA(torch::Tensor& output, torch::Tensor const& 
         setPagedKVCacheForMLAHelper<float>(output, k, v, k_pe, num_requests, cu_seq_lens, max_input_seq_len, num_heads,
             kv_dim, rope_dim, kv_cache_tokens_per_block);
     }
-#ifdef ENABLE_BF16
     else if (output.scalar_type() == torch::kBFloat16)
     {
         setPagedKVCacheForMLAHelper<__nv_bfloat16>(output, k, v, k_pe, num_requests, cu_seq_lens, max_input_seq_len,
             num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block);
     }
-#endif
 
     int64_t max_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
 
@@ -299,14 +295,12 @@ torch::Tensor setPagedKVCacheV2ForMLA(torch::Tensor& output, torch::Tensor const
             num_requests, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_seq_len, num_heads, kv_dim, rope_dim,
             kv_cache_tokens_per_block);
     }
-#ifdef ENABLE_BF16
     else if (output.scalar_type() == torch::kBFloat16)
     {
         setPagedKVCacheV2ForMLAHelper<__nv_bfloat16>(output, cached_k, cached_v, cached_k_pe, new_k, new_v, new_k_pe,
             num_requests, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_seq_len, num_heads, kv_dim, rope_dim,
             kv_cache_tokens_per_block);
     }
-#endif
 
     int64_t max_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
 
@@ -318,8 +312,8 @@ torch::Tensor setPagedKVCacheV2ForMLA(torch::Tensor& output, torch::Tensor const
     return faked_kv_cache_block_offsets;
 }
 
-void setCompressedPagedKVCacheForMLA(torch::Tensor const& compressed_kv, torch::Tensor const& k_pe,
-    int64_t const num_contexts, torch::Tensor const& cu_ctx_cached_kv_lens, torch::Tensor const& cu_seq_lens,
+void appendPagedKVCacheForMLA(torch::Tensor const& compressed_kv, torch::Tensor const& k_pe, int64_t const num_contexts,
+    torch::Tensor const& cu_ctx_cached_kv_lens, torch::Tensor const& cu_seq_lens,
     int64_t const max_input_uncached_seq_len, torch::Tensor const& kv_cache_block_offsets,
     torch::Tensor const& host_kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
     torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_orig_quant,
@@ -366,21 +360,19 @@ void setCompressedPagedKVCacheForMLA(torch::Tensor const& compressed_kv, torch::
 
     if (compressed_kv.scalar_type() == torch::kFloat16)
     {
-        setCompressedPagedKVCacheForMLAHelper<half>(kv_cache_buffer, compressed_kv, k_pe, num_contexts,
-            cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, head_size);
+        appendPagedKVCacheForMLAHelper<half>(kv_cache_buffer, compressed_kv, k_pe, num_contexts, cu_ctx_cached_kv_lens,
+            cu_seq_lens, max_input_uncached_seq_len, head_size);
     }
     else if (compressed_kv.scalar_type() == torch::kFloat32)
     {
-        setCompressedPagedKVCacheForMLAHelper<float>(kv_cache_buffer, compressed_kv, k_pe, num_contexts,
-            cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, head_size);
+        appendPagedKVCacheForMLAHelper<float>(kv_cache_buffer, compressed_kv, k_pe, num_contexts, cu_ctx_cached_kv_lens,
+            cu_seq_lens, max_input_uncached_seq_len, head_size);
     }
-#ifdef ENABLE_BF16
     else if (compressed_kv.scalar_type() == torch::kBFloat16)
     {
-        setCompressedPagedKVCacheForMLAHelper<__nv_bfloat16>(kv_cache_buffer, compressed_kv, k_pe, num_contexts,
+        appendPagedKVCacheForMLAHelper<__nv_bfloat16>(kv_cache_buffer, compressed_kv, k_pe, num_contexts,
             cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, head_size);
     }
-#endif
 }
 
 } // namespace torch_ext
@@ -467,7 +459,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "set_compressed_paged_kv_cache_for_mla("
+        "append_paged_kv_cache_for_mla("
         "Tensor compressed_kv"
         ", Tensor k_pe"
         ", int num_contexts"
@@ -492,5 +484,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("set_compressed_paged_kv_cache_for_mla", &torch_ext::setCompressedPagedKVCacheForMLA);
+    m.impl("append_paged_kv_cache_for_mla", &torch_ext::appendPagedKVCacheForMLA);
 }

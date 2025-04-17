@@ -51,11 +51,11 @@ def get_cuda_arch():
         return None
 
 
-def is_hopper():
+def is_sm90():
     return get_cuda_arch() == (9, 0)
 
 
-def is_blackwell():
+def is_sm100():
     return get_cuda_arch() == (10, 0)
 
 

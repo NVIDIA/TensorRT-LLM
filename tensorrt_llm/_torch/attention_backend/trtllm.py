@@ -760,16 +760,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
+        use_paged_context_fmha = (
+            metadata.runtime_features.chunked_prefill
+            or metadata.runtime_features.cache_reuse
+            or metadata.runtime_features.has_speculative_draft_tokens
+        ) if metadata.runtime_features else False
+
         if self.is_mla_enable:
             # for MLA, we only use paged_context_fmha when there is cached kv
-            use_paged_context_fmha = self.use_paged_context_fmha_for_mla(
+            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
                 metadata)
-        else:
-            use_paged_context_fmha = (
-                metadata.runtime_features.chunked_prefill
-                or metadata.runtime_features.cache_reuse
-                or metadata.runtime_features.has_speculative_draft_tokens
-            ) if metadata.runtime_features else False
 
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
@@ -833,18 +833,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def support_mla(cls) -> bool:
         return True
 
-    def use_paged_context_fmha_for_mla(
+    def has_cached_kv_for_mla_context(
         self,
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
-        use_paged_context_fmha = (
-            metadata.runtime_features.chunked_prefill
-            or metadata.runtime_features.cache_reuse
-            or metadata.runtime_features.has_speculative_draft_tokens
-        ) if metadata.runtime_features else False
-
-        return (self.is_mla_enable and use_paged_context_fmha
-                and metadata.kv_cache_manager is not None
+        return (self.is_mla_enable and metadata.kv_cache_manager is not None
                 and metadata.num_ctx_cached_tokens > 0)
 
     def load_paged_kv_cache_for_mla(
@@ -960,7 +953,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert paged_kv_offsets.shape == (num_contexts, 2, max_block_num)
         return paged_kv_offsets
 
-    def set_compressed_paged_kv_cache_for_mla(
+    def append_paged_kv_cache_for_mla(
         self,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
@@ -969,7 +962,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
-        torch.ops.trtllm.set_compressed_paged_kv_cache_for_mla(
+        torch.ops.trtllm.append_paged_kv_cache_for_mla(
             compressed_kv,
             k_pe,
             metadata.num_contexts,
