@@ -993,8 +993,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
-                        throw e
+                        rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
                     }
                 }
             }

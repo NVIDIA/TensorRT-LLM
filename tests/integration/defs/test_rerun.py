@@ -4,12 +4,14 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-def parse_name(name, filename):
-    if name.startswith("test_unittests_v2[unittest/") and \
+def parse_name(classname, name, filename):
+    if "test_unittests_v2[unittest/" in name and \
        filename == "test_unittests.py":
-        return name[len("test_unittests_v2["):-1]
-    elif name.contains(filename):
-        return name[name.find('/') + 1:]
+        return name[name.find("test_unittests_v2[unittest/") + 18:-1]
+    elif filename in name:
+        return name[name.find('/') + 1:]       
+    elif filename[:-2].replace("/", ".") in classname:
+        return filename + "::" + classname.split(".")[-1] + "::" + name
     else:
         return filename + "::" + name
 
@@ -39,7 +41,8 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
             if case.find('failure') is not None or \
                case.find('error') is not None:
                 duration = float(case.attrib.get('time', 0))
-                test_name = parse_name(case.attrib.get('name', ''), \
+                test_name = parse_name(case.attrib.get('classname', ''), \
+                                       case.attrib.get('name', ''), \
                                        case.attrib.get('file', ''))
                 if duration <= 5 * 60:
                     rerun_2_file.write(test_name + '\n')
