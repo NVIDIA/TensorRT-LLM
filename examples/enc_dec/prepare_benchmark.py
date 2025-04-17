@@ -9,7 +9,8 @@ def generate_samples(
         input_mean, input_std, input_min, input_max,
         context_mean, context_std, context_min, context_max,
         output_mean, output_std, output_min, output_max,
-        output_file):
+        output_file,
+        num_vocabs=8):
     
     # Create metadata
     metadata = {
@@ -19,10 +20,10 @@ def generate_samples(
         "output_mean": output_mean,
         "output_stdev": output_std,
         "num_requests": num_samples,
-        "tokenize_vocabsize": 2048 * 8,  # This seems to be a fixed value in your example
+        "tokenize_vocabsize": 2048 * num_vocabs,  # Now using num_vocabs parameter
         "max_input_len": input_max,
         "max_output_len": output_max,
-        "workload_name": f"workload_type:token-norm-dist__input_mean:{input_mean}__input_stdev:{input_std}__output_mean:{output_mean}__output_stdev:{output_std}__num_requests:{num_samples}__tokenize_vocabsize:32100__max_input_len:{input_max}__max_output_len:{output_max}"
+        "workload_name": f"workload_type:token-norm-dist__input_mean:{input_mean}__input_stdev:{input_std}__output_mean:{output_mean}__output_stdev:{output_std}__num_requests:{num_samples}__tokenize_vocabsize:{2048 * num_vocabs}__max_input_len:{input_max}__max_output_len:{output_max}"
     }
     
     samples = []
@@ -37,12 +38,12 @@ def generate_samples(
         input_ids = [random.randint(0, 2047) for _ in range(input_len)]
         
         # Generate context_ids as specified
-        context_matrix = np.random.randint(0, 2048, size=(context_len, 8))
+        context_matrix = np.random.randint(0, 2048, size=(context_len, num_vocabs))
         # Set first row to zeros
         context_matrix[0, :] = 0
         
         # Shift each column by i * 2048
-        for i in range(8):
+        for i in range(num_vocabs):
             context_matrix[:, i] += i * 2048
         
         # Flatten to 1D array
@@ -53,7 +54,7 @@ def generate_samples(
             "input_len": input_len,
             "input_ids": input_ids,
             "context_ids": context_ids,
-            "output_len": output_len * 8,
+            "output_len": output_len * num_vocabs,
             "task_id": -1  # As in your example
         }
         
@@ -76,6 +77,7 @@ def main():
     
     parser.add_argument('--samples', type=int, default=10, help='Number of samples to generate')
     parser.add_argument('--output', type=str, default='samples.json', help='Output JSON file')
+    parser.add_argument('--num_vocabs', type=int, default=8, help='Number of vocabularies')
     
     parser.add_argument('--input_len', type=int, nargs=4, metavar=('MEAN', 'STD', 'MIN', 'MAX'),
                         default=[128, 0, 128, 128], help='Input length parameters: mean, std, max')
@@ -91,7 +93,8 @@ def main():
         args.input_len[0], args.input_len[1], args.input_len[2], args.input_len[3],
         args.context_len[0], args.context_len[1], args.context_len[2], args.context_len[3],
         args.output_len[0], args.output_len[1], args.output_len[2], args.output_len[3],
-        args.output
+        args.output,
+        args.num_vocabs
     )
 
 if __name__ == "__main__":
