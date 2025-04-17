@@ -22,9 +22,16 @@ from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .model_engine import (DRAFT_KV_CACHE_MANAGER_KEY, KV_CACHE_MANAGER_KEY,
                            PyTorchModelEngine)
 from .py_executor import PyExecutor
-from .resource_manager import KVCacheManager, PeftCacheManager, ResourceManager
+from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
+                               PeftCacheManager, ResourceManager)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
+
+
+def is_nemotron_hybrid(config):
+    if hasattr(config, "hybrid_override_pattern"):
+        return True
+    return False
 
 
 def is_mla(config):
@@ -231,10 +238,6 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 torch_dtype_to_str(model_engine.dtype))
 
         num_hidden_layers = len(mapping.pp_layers(config.num_hidden_layers))
-        # the number of layers using attention in Nemotron5 is lower than the number of hidden layers
-        if config.architectures[0] == "Nemotron5ForCausalLM":
-            # attention layers are derived from configuration (hybrid_override_pattern)
-            num_hidden_layers = config.hybrid_override_pattern.count("*")
 
         if is_mla(config):
             if spec_config is not None:
@@ -254,6 +257,34 @@ def create_kv_cache_manager(model_engine: PyTorchModelEngine, mapping: Mapping,
                 dtype=kv_cache_dtype,
                 num_extra_kv_tokens=0
                 if spec_config is None else spec_config.num_extra_kv_tokens,
+            )
+        elif is_nemotron_hybrid(config):
+            config = model_engine.model.model_config.pretrained_config
+            num_layers = config.hybrid_override_pattern.count("*")
+            mamba_num_layers = num_mamba_layers = config.hybrid_override_pattern.count(
+                "M")
+            return MambaHybridCacheManager(
+                # mamba cache parameters
+                config.hidden_size,
+                config.ssm_state_size,
+                config.conv_kernel,
+                config.expand,
+                config.n_groups,
+                config.mamba_head_dim,
+                mamba_num_layers,
+                config.torch_dtype,
+                # kv cache parameters
+                executor_config.kv_cache_config,
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=num_layers,
+                num_kv_heads=num_key_value_heads,
+                head_dim=head_dim,
+                tokens_per_block=executor_config.tokens_per_block,
+                max_seq_len=executor_config.max_seq_len,
+                max_batch_size=executor_config.max_batch_size,
+                mapping=mapping,
+                dtype=kv_cache_dtype,
+                num_extra_kv_tokens=0,
             )
         else:
             if spec_config is not None:
