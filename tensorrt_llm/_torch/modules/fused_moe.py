@@ -1185,13 +1185,8 @@ class FusedMoE(nn.Module):
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
                 )
 
-            # TODO: remove w1, w3 swap when kernel is ready
-            if self.is_trtllm() and self.quant_config.quant_mode.has_nvfp4():
-                is_trtllm_nvfp4 = True
-                w1_weight, w3_weight = w3_weight, w1_weight
-            else:
-                is_trtllm_nvfp4 = False
-
+            is_trtllm_nvfp4 = self.is_trtllm(
+            ) and self.quant_config.quant_mode.has_nvfp4()
             load_expert_w3_w1_weight(w1_weight, w3_weight,
                                      self.w3_w1_weight.data[expert_idx],
                                      is_trtllm_nvfp4)
@@ -1502,10 +1497,6 @@ class FusedMoE(nn.Module):
             w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
 
             expert_idx = expert_id - self.expert_start
-
-            # TODO: remove w1, w3 swap
-            if self.is_trtllm():
-                w1_weight_scale, w3_weight_scale = w3_weight_scale, w1_weight_scale
 
             load_expert_w3_w1_weight_scale_nvfp4(
                 w1_weight_scale, w3_weight_scale,

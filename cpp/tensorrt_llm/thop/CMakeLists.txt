@@ -62,6 +62,7 @@ add_library(
   moeOp.cpp
   moeCommOp.cpp
   fp8BlockScaleMoe.cpp
+  fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
