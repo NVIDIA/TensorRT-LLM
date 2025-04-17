@@ -24,7 +24,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.rms_norm import L2Norm, RMSNorm
+from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -80,8 +80,10 @@ class Llama4Attention(Attention):
 
         if self.use_qk_norm:
             self.head_dim = config.hidden_size // config.num_attention_heads
-            self.qk_norm = L2Norm(hidden_size=self.head_dim,
-                                  dtype=config.torch_dtype)
+            self.qk_norm = RMSNorm(hidden_size=self.head_dim,
+                                   eps=1e-6,
+                                   dtype=config.torch_dtype,
+                                   has_weights=False)
         else:
             self.qk_norm = None
 
