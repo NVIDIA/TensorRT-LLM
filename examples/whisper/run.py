@@ -564,7 +564,8 @@ if __name__ == '__main__':
     normalizer = EnglishTextNormalizer()
     dataset = load_dataset(args.dataset,
                            args.dataset_name,
-                           split=args.dataset_split)
+                           split=args.dataset_split,
+                           trust_remote_code=True)
     if args.enable_warmup:
         results, total_duration = decode_dataset(
             model,
