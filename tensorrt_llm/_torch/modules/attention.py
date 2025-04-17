@@ -136,7 +136,9 @@ class Attention(nn.Module):
         self.support_fused_qkv = self.attn_backend == "TRTLLM"
         self.support_unfused_qkv = self.attn_backend != "TRTLLM"
         self.rotary_emb = None
-        if not self.enable_rope_fusion and pos_embd_params is not None:
+        self.apply_rotary_emb = (not self.enable_rope_fusion
+                                 and pos_embd_params is not None)
+        if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.head_dim,
@@ -224,7 +226,7 @@ class Attention(nn.Module):
 
         q, k, v = qkv, None, None
 
-        if self.rotary_emb is not None and position_ids is not None:
+        if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
             q, k = self.rotary_emb(position_ids, [q, k])
@@ -508,14 +510,21 @@ class MLA(nn.Module):
         self.support_fused_qkv = isinstance(self.mha, TrtllmAttention)
         self.support_unfused_qkv = not isinstance(self.mha, TrtllmAttention)
         self.rotary_emb = None
-        if not self.enable_rope_fusion:
+        self.apply_rotary_emb = not self.enable_rope_fusion
+        if self.apply_rotary_emb:
             self.rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.qk_rope_head_dim,
                 is_neox=pos_embd_params.is_neox,
             )
 
-    def apply_rope(self, q, k_pe, position_ids):
+    def apply_rope(
+        self,
+        q: torch.Tensor,
+        k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
         q_pe = q[..., self.qk_nope_head_dim:].reshape(
             -1, self.num_heads * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
@@ -563,10 +572,9 @@ class MLA(nn.Module):
             q_ctx = q[:num_ctx_tokens, ...]
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            if self.rotary_emb is not None and position_ids is not None:
-                k_pe_ctx = self.apply_rope(
-                    q_ctx.view(-1, self.num_heads, self.qk_head_dim), k_pe_ctx,
-                    position_ids)
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
                                                        k_pe_ctx, attn_metadata)
@@ -577,10 +585,9 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            if self.rotary_emb is not None and position_ids is not None:
-                k_pe_gen = self.apply_rope(
-                    q_gen.view(-1, self.num_heads, self.qk_head_dim), k_pe_gen,
-                    position_ids)
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
             attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
                                                       k_pe_gen, attn_metadata)
@@ -614,7 +621,7 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         return attn_output
 
-    def convert_qkv(self, q, k, v):
+    def _maybe_concat_qkv(self, q, k, v):
         if k is not None and v is not None and not self.support_unfused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
@@ -641,13 +648,13 @@ class MLA(nn.Module):
         k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
         k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
                                                      self.qk_nope_head_dim)
-        if not self.enable_rope_fusion:
+        if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # May concat q(including q_pe), k + k_pe, v together
-        q, k, v = self.convert_qkv(q, k, v)
+        q, k, v = self._maybe_concat_qkv(q, k, v)
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
@@ -712,7 +719,7 @@ class MLA(nn.Module):
                 raise NotImplementedError(
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-            if not self.enable_rope_fusion:
+            if self.apply_rotary_emb:
                 fused_q[..., self.kv_lora_rank:] = q_pe
             fused_q = fused_q.view([
                 num_tokens,
