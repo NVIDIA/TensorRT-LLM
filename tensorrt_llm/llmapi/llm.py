@@ -620,8 +620,21 @@ class LLM:
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
             raise RuntimeError("The engine is not built yet.")
-        if self._engine_dir.absolute() != os.path.abspath(engine_dir):
+
+        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
+            return
+
+        if not self.mpi_session or not self.mpi_session.is_comm_session():
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
+        else:
+            # NFS is fragile, so we copy files one by one
+            target_engine_dir = Path(engine_dir)
+            target_engine_dir.mkdir(parents=True, exist_ok=True)
+            # copy files one by one
+            for file in self._engine_dir.iterdir():
+                print_colored_debug(
+                    f"Copying {file} to {target_engine_dir / file.name}\n")
+                shutil.copy(file, target_engine_dir / file.name)
 
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
