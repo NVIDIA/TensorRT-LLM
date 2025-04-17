@@ -521,7 +521,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=True,
             )
 
-            # TODO(lbo): Management of block ids should not be coupled with flash_mla so tightly.
+            # TODO: Management of block ids should not be coupled with flash_mla so tightly.
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
 
@@ -582,7 +582,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # set params that are used in wrapper.plan()
             self.kv_cache_block_offsets = None
             self.host_kv_cache_block_offsets = None
-            self.block_ids_per_seq = None  # TODO(lbo): this seems to be conflicting with block_ids_per_seq managed by flash_mla path
+            self.block_ids_per_seq = None  # TODO: this seems to be conflicting with block_ids_per_seq managed by flash_mla path
 
         prompt_lens = torch.tensor(
             self.prompt_lens,
@@ -629,12 +629,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
                 block_ids_per_seq, non_blocking=True)
             self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
-                block_ids_per_seq[self.num_contexts:], non_blocking=True)
+                block_ids_per_seq[self.num_contexts:], non_blocking=True)  # TODO: block_ids_per_seq is duplicate with kv_block_ids_per_seq
 
             torch.ops.trtllm.get_mla_metadata(
-                self.kv_lens_cuda[:self.num_seqs],
+                self.kv_lens_cuda[self.num_contexts : self.num_contexts + self.num_generations],
                 self.flash_mla_metadata.tile_scheduler_metadata,
-                self.flash_mla_metadata.num_splits[:self.num_seqs + 1])
+                self.flash_mla_metadata.num_splits[:self.num_generations + 1])
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
@@ -770,6 +770,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     "FP8 attention.")
 
         num_seqs = metadata.num_seqs
+        num_generations = metadata.num_generations
         self.wrapper.plan(
             tokens_per_block=metadata.tokens_per_block,
             max_num_requests=metadata.max_num_requests,
@@ -803,7 +804,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             and attention_input_type == AttentionInputType.generation_only,
             flash_mla_tile_scheduler_metadata=metadata.flash_mla_metadata.
             tile_scheduler_metadata,
-            flash_mla_num_splits=metadata.flash_mla_metadata.num_splits,
+            flash_mla_num_splits=metadata.flash_mla_metadata.
+            num_splits[:num_generations + 1],
         )
         out_dtype = None
         if out_scale is not None:
