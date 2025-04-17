@@ -24,12 +24,12 @@ namespace torch_ext
 
 namespace tg = trtllm::gen;
 
-torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, torch::Tensor const& routing_bias,
-    torch::Tensor const& hidden_states, torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
-    torch::Tensor const& gemm1_weights_scale, torch::Tensor const& gemm2_weights,
-    torch::Tensor const& gemm2_weights_scale, int64_t const num_experts, int64_t const top_k, int64_t const n_group,
+torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logits, torch::Tensor const& routing_bias,
+    torch::Tensor const& hidden_states, torch::Tensor const& gemm1_weights, torch::Tensor const& output1_scales_scalar,
+    torch::Tensor const& output1_scales_gate_scalar, torch::Tensor const& gemm2_weights,
+    torch::Tensor const& output2_scales_scalar, int64_t const num_experts, int64_t const top_k, int64_t const n_group,
     int64_t const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor)
+    int64_t const local_num_experts, double const routed_scaling_factor, bool const use_routing_scales_on_input)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
@@ -56,11 +56,11 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     args.routing_logits = routing_logits.data_ptr<float>();
     args.routing_bias = routing_bias.data_ptr();
     args.hidden_states = hidden_states.data_ptr();
-    args.hidden_states_scale = hidden_states_scale.data_ptr<float>();
     args.gemm1_weights = gemm1_weights.data_ptr();
-    args.gemm1_weights_scale = gemm1_weights_scale.data_ptr<float>();
+    args.output1_scales_scalar = output1_scales_scalar.data_ptr<float>();
+    args.output1_scales_gate_scalar = output1_scales_gate_scalar.data_ptr<float>();
     args.gemm2_weights = gemm2_weights.data_ptr();
-    args.gemm2_weights_scale = gemm2_weights_scale.data_ptr<float>();
+    args.output2_scales_scalar = output2_scales_scalar.data_ptr<float>();
     args.num_tokens = hidden_states.sizes()[0];
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
@@ -71,7 +71,7 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
     args.local_num_experts = local_num_experts;
     args.routed_scaling_factor = routed_scaling_factor;
     args.intermediate_size = intermediate_size;
-    args.mUseDeepSeekFp8 = true;
+    args.mUseRoutingScalesOnInput = use_routing_scales_on_input;
 
     // allocate workspace for routing kernel
     at::Tensor num_tokens_per_expert
@@ -122,40 +122,36 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
         total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
         nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/, permuted_idx_to_token_idx.data_ptr<int>(),
         expert_weights.data_ptr(), num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
-        stream);
+        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
+        use_routing_scales_on_input, false /* use_deep_seek_fp8 */, stream);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");
-    TORCH_CHECK(hidden_states_scale.scalar_type() == at::ScalarType::Float, "hidden_states_scale must be float.");
-    TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be 2D.");
-    TORCH_CHECK(
-        hidden_states_scale.sizes()[0] == hidden_states.sizes()[1] / 128, "hidden_states_scale has incorrect shape.");
-    // TORCH_CHECK(hidden_states_scale.sizes()[1] == hidden_states.sizes()[0], "hidden_states_scale has incorrect
-    // shape.");
     TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights must be fp8.");
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
     TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect shape.");
     TORCH_CHECK(gemm1_weights.sizes()[2] == hidden_states.sizes()[1],
         "the third dimension of weights must be equal to hidden_size.");
-    TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float, "gemm1_weights_scale must be float.");
-    TORCH_CHECK(gemm1_weights_scale.dim() == 3, "gemm1_weights_scale must be 3D.");
-
-    TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect shape.");
     TORCH_CHECK(intermediate_size % 128 == 0, "the second dimension of weights must be a multiple of 128.");
+
+    TORCH_CHECK(output1_scales_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_scalar must be float.");
+    TORCH_CHECK(output1_scales_scalar.dim() == 1, "output1_scales_scalar must be 1D.");
+    TORCH_CHECK(output1_scales_scalar.sizes()[0] == local_num_experts, "output1_scales_scalar has incorrect dim 0.");
     TORCH_CHECK(
-        gemm1_weights_scale.sizes()[1] == 2 * intermediate_size / 128, "gemm1_weights_scale has incorrect shape.");
-    TORCH_CHECK(gemm1_weights_scale.sizes()[2] == args.hidden_size / 128, "gemm1_weights_scale has incorrect shape.");
+        output1_scales_gate_scalar.scalar_type() == at::ScalarType::Float, "output1_scales_gate_scalar must be float.");
+    TORCH_CHECK(output1_scales_gate_scalar.dim() == 1, "output1_scales_gate_scalar must be 1D.");
+    TORCH_CHECK(
+        output1_scales_gate_scalar.sizes()[0] == local_num_experts, "output1_scales_gate_scalar has incorrect dim 0.");
+
     TORCH_CHECK(gemm2_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm2_weights must be fp8.");
     TORCH_CHECK(gemm2_weights.dim() == 3, "gemm2_weights must be 3D.");
     TORCH_CHECK(gemm2_weights.sizes()[2] == intermediate_size,
         "the third dimension of weights must be equal to intermediate_size.");
-    TORCH_CHECK(gemm2_weights_scale.scalar_type() == at::ScalarType::Float, "gemm2_weights_scale must be float.");
-    TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[0] == local_num_experts, "gemm2_weights_scale has incorrect shape.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size / 128, "gemm2_weights_scale has incorrect shape.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 128, "gemm2_weights_scale has incorrect shape.");
+
+    TORCH_CHECK(output2_scales_scalar.scalar_type() == at::ScalarType::Float, "output2_scales_scalar must be float.");
+    TORCH_CHECK(output2_scales_scalar.dim() == 1, "output2_scales_scalar must be 1D.");
+    TORCH_CHECK(output2_scales_scalar.sizes()[0] == local_num_experts, "output2_scales_scalar has incorrect dim 0.");
 
     // allocate output
     at::Tensor output = at::detail::empty_cuda(
@@ -198,15 +194,15 @@ torch::Tensor fp8_block_scale_moe_runner(torch::Tensor const& routing_logits, to
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fp8_block_scale_moe_runner("
+        "fp8_per_tensor_scale_moe_runner("
         "Tensor routing_logits,"
         "Tensor routing_bias,"
         "Tensor hidden_states,"
-        "Tensor hidden_states_scale,"
         "Tensor gemm1_weights,"
-        "Tensor gemm1_weights_scale,"
+        "Tensor output1_scales_scalar,"
+        "Tensor output1_scales_gate_scalar,"
         "Tensor gemm2_weights,"
-        "Tensor gemm2_weights_scale,"
+        "Tensor output2_scales_scalar,"
         "int num_experts,"
         "int top_k,"
         "int n_group,"
@@ -214,10 +210,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int intermediate_size,"
         "int local_expert_offset,"
         "int local_num_experts,"
-        "float routed_scaling_factor) -> Tensor");
+        "float routed_scaling_factor,"
+        "bool use_routing_scales_on_input) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_block_scale_moe_runner", &torch_ext::fp8_block_scale_moe_runner);
+    m.impl("fp8_per_tensor_scale_moe_runner", &torch_ext::fp8_per_tensor_scale_moe_runner);
 }

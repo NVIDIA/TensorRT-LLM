@@ -39,10 +39,10 @@ struct __align__(8) aligned_fp8x8
 
 // This is the hand-optimized kernel by Po-Han.
 __global__ void llama4_qkv_gemv_kernel(int num_tokens,
-    __nv_fp8_e4m3 const* __restrict__ A, // Input vector [num_tokens][5120]
-    __nv_fp8_e4m3 const* __restrict__ B, // Input matrix [896][5120]
-    __nv_bfloat16* __restrict__ C,       // Output vector [num_tokens][896]
-    float const* __restrict__ scaling_factor                // New scaling factor parameter
+    __nv_fp8_e4m3 const* __restrict__ A,     // Input vector [num_tokens][5120]
+    __nv_fp8_e4m3 const* __restrict__ B,     // Input matrix [896][5120]
+    __nv_bfloat16* __restrict__ C,           // Output vector [num_tokens][896]
+    float const* __restrict__ scaling_factor // New scaling factor parameter
 )
 {
     // Shared memory for block reduction

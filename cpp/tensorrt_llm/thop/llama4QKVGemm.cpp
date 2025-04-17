@@ -47,8 +47,7 @@ public:
     {
         auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
         auto output = torch::empty(
-            {inputA.size(0), inputB.size(1)},
-            torch::TensorOptions().dtype(torch::kBFloat16).device(inputA.device()));
+            {inputA.size(0), inputB.size(1)}, torch::TensorOptions().dtype(torch::kBFloat16).device(inputA.device()));
 
         llama4_qkv_gemm_op(
             inputA.size(0), inputA.data_ptr(), inputB.data_ptr(), output.data_ptr(), scaling_factor.data_ptr(), stream);
