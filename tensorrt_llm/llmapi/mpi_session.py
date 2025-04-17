@@ -100,6 +100,9 @@ class MpiSession(abc.ABC):
     def abort(self):
         raise NotImplementedError()
 
+    def is_comm_session(self) -> bool:
+        return isinstance(self, (MpiCommSession, RemoteMpiCommSessionClient))
+
     def _abort_on_timeout(self, fut: Future, timeout: float, reason=None):
         try:
             fut.result(timeout=timeout)
@@ -261,7 +264,7 @@ class RemoteTask(NamedTuple):
     sync: bool = False  # if True, the result will be sent back to the client
 
 
-class RemoteMpiCommSessionClient():
+class RemoteMpiCommSessionClient(MpiSession):
     '''
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
     '''
@@ -279,8 +282,8 @@ class RemoteMpiCommSessionClient():
 
     def submit(self,
                task: Callable[..., T],
-               sync: bool = False,
                *args,
+               sync: bool = False,
                **kwargs) -> list:
         ''' Submit a task to the remote MPI pool. '''
         if self._is_shutdown:
@@ -297,7 +300,7 @@ class RemoteMpiCommSessionClient():
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:
         ''' Submit a task to the remote MPI pool and wait for task completion. '''
-        self.submit(task, sync=True, *args, **kwargs)
+        self.submit(task, *args, sync=True, **kwargs)
 
         while not (res := self.poll() or self._is_shutdown):
             print_colored_debug(f"Waiting for task completion... {res}\n",
@@ -340,6 +343,9 @@ class RemoteMpiCommSessionClient():
                 "red")
         finally:
             self._is_shutdown = True
+
+    def abort(self):
+        self.shutdown()
 
 
 class RemoteMpiCommSessionServer():
@@ -394,6 +400,7 @@ class RemoteMpiCommSessionServer():
             print_colored_debug(
                 f"MpiCommSession rank{mpi_rank()} task [{task}] finished\n",
                 "green")
+            mpi_barrier()
 
     def serve(self):
         print_colored_debug(
