@@ -93,7 +93,7 @@ def test_deepseek_gpqa_llmapi(llmapi_example_root, llm_datasets_root, llm_venv,
     # min latency
     "enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn3-ep4-pp1-tp8-deepseek_r1-con1-bs1-disable_nvcc",
     # max throughput
-    "enable_overlap_scheduler-enable_cuda_graph-enable_dp-nextn0-ep8-pp1-tp8-deepseek_r1-con1024-bs128-enable_nvcc",
+    "enable_overlap_scheduler-enable_cuda_graph-enable_dp-nextn0-ep8-pp1-tp8-deepseek_r1-con1024-bs32-enable_nvcc",
 
     # coverage
     "disable_overlap_scheduler-disable_cuda_graph-disable_dp-nextn0-ep1-pp1-tp8-deepseek_r1-con1024-bs128-enable_nvcc",
@@ -160,7 +160,7 @@ def test_deepseek_dgx_h200(llmapi_example_root, llm_datasets_root, llm_venv,
         f"--tp_size={tp_size}", f"--ep_size={ep_size}",
         f"--concurrency={concurrency}", f"--mtp_nextn={mtp_nextn}",
         "--print_iter_log", f"--batch_size={batch_size}",
-        "--max_num_tokens=1127", "--check_accuracy",
+        "--max_num_tokens=4096", "--check_accuracy",
         "--accuracy_threshold=0.65", "--limit=0.6"
     ]
     if enable_cuda_graph:
