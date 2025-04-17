@@ -1,5 +1,4 @@
 import random
-import re
 
 import datasets
 
@@ -7,11 +6,7 @@ import datasets
 def preprocess(text):
     if text is None:
         return " "
-    text = text.strip()
-    text = text.replace(" [title]", ". ")
-    text = re.sub("\\[.*?\\]", "", text)
-    text = text.replace("  ", " ")
-    return text
+    return text.strip()
 
 
 def process_docs(dataset: datasets.Dataset) -> datasets.Dataset:
