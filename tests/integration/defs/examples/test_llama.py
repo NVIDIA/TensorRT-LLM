@@ -1338,7 +1338,7 @@ def test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table(
     # add --run_profiling to run the request for multiple times
     print("Run inference")
     run_cmd = [
-        f"{llama_example_root}/../run.py", "--max_output_len=10",
+        f"{llama_example_root}/../../../run.py", "--max_output_len=10",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}/engines", f"--input_file={input_file}",
         f"--prompt_table_path={prompt_table_path}",
