@@ -241,29 +241,8 @@ class TrtllmAttentionWrapper:
             )
 
         self.use_flash_mla = use_flash_mla
-        self.flash_mla_tile_scheduler_metadata = None
-        self.flash_mla_num_splits = None
-        if self.is_mla_enable:
-            # max_context_length will increment 1 when overlap scheduler enabled
-            if self.max_context_length > (self.rotary_cos_sin.shape[1] /
-                                          (2 * self.qk_rope_head_dim) + 1):
-                rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-                    self.max_context_length,
-                    self.qk_rope_head_dim,
-                    self.mla_rope_params.theta,
-                    self.mla_rope_params.scale,
-                    self.mla_rope_params.original_max_positions,
-                    self.mla_rope_params.beta_fast,
-                    self.mla_rope_params.beta_slow,
-                    self.mla_rope_params.mscale,
-                    self.mla_rope_params.mscale_all_dim,
-                )
-                self.rotary_cos_sin = torch.tensor(rope_cos_sin,
-                                                   dtype=torch.float32,
-                                                   device="cuda")
-            if self.use_flash_mla:
-                self.flash_mla_tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
-                self.flash_mla_num_splits = flash_mla_num_splits
+        self.flash_mla_tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
+        self.flash_mla_num_splits = flash_mla_num_splits
 
     def run(
         self,
@@ -629,10 +608,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
                 block_ids_per_seq, non_blocking=True)
             self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
-                block_ids_per_seq[self.num_contexts:], non_blocking=True)  # TODO: block_ids_per_seq is duplicate with kv_block_ids_per_seq
+                block_ids_per_seq[self.num_contexts:], non_blocking=True
+            )  # TODO: block_ids_per_seq is duplicate with kv_block_ids_per_seq
 
             torch.ops.trtllm.get_mla_metadata(
-                self.kv_lens_cuda[self.num_contexts : self.num_contexts + self.num_generations],
+                self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                                  self.num_generations],
                 self.flash_mla_metadata.tile_scheduler_metadata,
                 self.flash_mla_metadata.num_splits[:self.num_generations + 1])
 
