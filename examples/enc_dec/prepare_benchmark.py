@@ -54,7 +54,9 @@ def generate_samples(
             "input_len": input_len,
             "input_ids": input_ids,
             "context_ids": context_ids,
-            "output_len": output_len * num_vocabs,
+            # no need to multiply by num_vocabs,
+            # this defines number of decoder iterations
+            "output_len": output_len,
             "task_id": -1  # As in your example
         }
         
