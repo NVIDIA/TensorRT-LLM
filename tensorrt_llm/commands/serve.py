@@ -33,7 +33,6 @@ def get_llm_args(model: str,
                  free_gpu_memory_fraction: Optional[float] = None,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
-                 enable_block_reuse: bool = True,
                  **llm_args_dict: Any):
 
     if gpus_per_node is None:
@@ -47,8 +46,7 @@ def get_llm_args(model: str,
                                max_seq_len=max_seq_len)
 
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction,
-        enable_block_reuse=enable_block_reuse)
+        free_gpu_memory_fraction=free_gpu_memory_fraction)
 
     pytorch_backend_config = PyTorchConfig(
         enable_overlap_scheduler=True) if backend == "pytorch" else None
