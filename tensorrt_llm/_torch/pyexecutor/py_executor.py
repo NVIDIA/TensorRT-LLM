@@ -349,6 +349,8 @@ class PyExecutor:
             if manager:
                 manager.shutdown()
         del self.model_engine
+        if self.draft_model_engine is not None:
+            del self.draft_model_engine
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -1757,14 +1759,15 @@ class PyExecutor:
             hidden_states = spec_metadata.get_hidden_states(
                 draft_batch, num_rejected_tokens)
 
-            extra_model_inputs = {'hidden_states': hidden_states}
-
             if spec_metadata.spec_dec_mode.is_eagle3():
-                # Another eagle3 hack. Eagle3 checkpoints don't have embed_tokens,
-                # so we need to provide them some other way. We can get rid of this
-                # hack if we provide our own preprocessed eagle3 checkpoints.
-                extra_model_inputs[
-                    'embed_tokens'] = self.model_engine.model.model.embed_tokens
+                # Hack for eagle3. We might need to run a matmul to reduce
+                # the dimensionality of the hidden states on the first pass
+                # through the draft model. Shape dependent control flow will
+                # not work with CUDA graphs. So we just do it here.
+                hidden_states = self.draft_model_engine.model.apply_eagle3_fc(
+                    hidden_states)
+
+            extra_model_inputs = {'hidden_states': hidden_states}
 
             outputs = self.draft_model_engine.forward(
                 draft_batch,
@@ -1800,14 +1803,10 @@ class PyExecutor:
             draft_batch.context_requests = []
 
             for _ in range(spec_metadata.max_draft_tokens - 1):
-                draft_spec_metadata = self.draft_model_engine.spec_metadata
+                draft_spec_metadata = self.draft_model_engine.last_spec_metadata
                 hidden_states = draft_spec_metadata.get_hidden_states(
                     draft_batch)
                 extra_model_inputs = {'hidden_states': hidden_states}
-                if spec_metadata.spec_dec_mode.is_eagle3():
-                    # See note above.
-                    extra_model_inputs[
-                        'embed_tokens'] = self.model_engine.model.model.embed_tokens
 
                 outputs = self.draft_model_engine.forward(
                     draft_batch,
