@@ -118,6 +118,15 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
     tree.write(merged_xml_filename, encoding='utf-8', xml_declaration=True)
 
 
+    with open(merged_xml_filename, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    content = content.replace('<?xml version="1.0" encoding="utf-8"?>\n', '<?xml version="1.0" encoding="utf-8"?>')
+
+    with open(merged_xml_filename, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
 def xml_to_html(xml_filename, html_filename, sort_by_name=False):
     # HTML template
     html_template = """
