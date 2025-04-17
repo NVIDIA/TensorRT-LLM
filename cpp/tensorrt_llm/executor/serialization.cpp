@@ -644,6 +644,7 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
+    auto promptLookupConfig = su::deserialize<std::optional<PromptLookupConfig>>(is);
 
     // 33 parameters
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId, padId,
@@ -653,7 +654,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs);
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, std::move(promptLookupConfig));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
@@ -1350,6 +1351,32 @@ size_t Serialization::serializedSize(LookaheadDecodingConfig const& lookaheadDec
     return totalSize;
 }
 
+// PromptLookupConfig
+PromptLookupConfig Serialization::deserializePromptLookupConfig(std::istream& is)
+{
+    auto promptLookupNumTokens = su::deserialize<SizeType32>(is);
+    auto maxMatchingNgramSize = su::deserialize<SizeType32>(is);
+    auto candidateSetSize = su::deserialize<SizeType32>(is);
+
+    return PromptLookupConfig{promptLookupNumTokens, maxMatchingNgramSize, candidateSetSize};
+}
+
+void Serialization::serialize(PromptLookupConfig const& promptLookupConfig, std::ostream& os)
+{
+    su::serialize(promptLookupConfig.getPromptLookupNumTokens(), os);
+    su::serialize(promptLookupConfig.getMaxMatchingNgramSize(), os);
+    su::serialize(promptLookupConfig.getCandidateSetSize(), os);
+}
+
+size_t Serialization::serializedSize(PromptLookupConfig const& promptLookupConfig)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(promptLookupConfig.getPromptLookupNumTokens());
+    totalSize += su::serializedSize(promptLookupConfig.getMaxMatchingNgramSize());
+    totalSize += su::serializedSize(promptLookupConfig.getCandidateSetSize());
+    return totalSize;
+}
+
 // EagleConfig
 EagleConfig Serialization::deserializeEagleConfig(std::istream& is)
 {
@@ -1526,8 +1553,9 @@ DecodingConfig Serialization::deserializeDecodingConfig(std::istream& is)
     auto lookaheadDecodingConfig = su::deserialize<std::optional<LookaheadDecodingConfig>>(is);
     auto medusaChoices = su::deserialize<std::optional<MedusaChoices>>(is);
     auto eagleConfig = su::deserialize<std::optional<EagleConfig>>(is);
+    auto promptLookupConfig = su::deserialize<std::optional<PromptLookupConfig>>(is);
 
-    return DecodingConfig{decodingMode, lookaheadDecodingConfig, medusaChoices, eagleConfig};
+    return DecodingConfig{decodingMode, lookaheadDecodingConfig, medusaChoices, eagleConfig, promptLookupConfig};
 }
 
 void Serialization::serialize(DecodingConfig const& decodingConfig, std::ostream& os)
@@ -1536,6 +1564,7 @@ void Serialization::serialize(DecodingConfig const& decodingConfig, std::ostream
     su::serialize(decodingConfig.getLookaheadDecodingConfig(), os);
     su::serialize(decodingConfig.getMedusaChoices(), os);
     su::serialize(decodingConfig.getEagleConfig(), os);
+    su::serialize(decodingConfig.getPromptLookupConfig(), os);
 }
 
 size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
@@ -1545,6 +1574,7 @@ size_t Serialization::serializedSize(DecodingConfig const& decodingConfig)
     totalSize += su::serializedSize(decodingConfig.getLookaheadDecodingConfig());
     totalSize += su::serializedSize(decodingConfig.getMedusaChoices());
     totalSize += su::serializedSize(decodingConfig.getEagleConfig());
+    totalSize += su::serializedSize(decodingConfig.getPromptLookupConfig());
     return totalSize;
 }
 

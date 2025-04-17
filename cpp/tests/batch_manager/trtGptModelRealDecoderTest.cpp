@@ -147,6 +147,7 @@ void verifyOutput(RequestList const& finishedRequestList,
         auto const expectedLogProbs = testData.expectedLogProbs;
         auto const draftTokens = llmReq.getDraftTokens();
         auto const isDraftTokensExternal = modelSpec.mSpecDecodingMode.isDraftTokensExternal();
+        auto const isPromptLookup = modelSpec.mSpecDecodingMode.isPromptLookup();
         auto const inputLength = givenInputLength + static_cast<SizeType32>(isDraftTokensExternal);
 
         for (auto beam = 0; beam < reqBeamWidth; ++beam)
@@ -155,7 +156,7 @@ void verifyOutput(RequestList const& finishedRequestList,
             auto const predictedTokens = llmReq.getTokens(beam);
 
             auto numPredTokens = static_cast<SizeType32>(predictedTokens.size() - inputLength);
-            if (isDraftTokensExternal && !draftTokens->empty())
+            if ((isDraftTokensExternal || isPromptLookup) && !draftTokens->empty())
             {
                 numPredTokens
                     = std::min(numPredTokens, acceptedDraftTokensLengths[givenInputIdx * reqBeamWidth + beam] + 1);
@@ -981,6 +982,10 @@ TEST_P(ParamTest, Test)
     {
         modelOptionalParams.decodingConfig.setLookaheadDecodingConfig(texec::LookaheadDecodingConfig(5, 5, 5));
     }
+    else if (modelSpec.mSpecDecodingMode == SpeculativeDecodingMode::PromptLookup())
+    {
+        modelOptionalParams.decodingConfig.setPromptLookupConfig(texec::PromptLookupConfig(4, 2, 2));
+    }
 
     if (modelType == TrtGptModelType::V1
         && (modelOptionalParams.kvCacheConfig.maxTokens.has_value() || modelOptionalParams.enableTrtOverlap))
@@ -1031,6 +1036,17 @@ std::shared_ptr<ModelSpec> getEagleTestsCompareModelSpec()
     pModelSpec->usePackedInput();
     pModelSpec->setKVCacheType(KVCacheType::kPAGED);
     pModelSpec->setMaxOutputLength(128);
+
+    return pModelSpec;
+}
+
+std::shared_ptr<ModelSpec> getPromptLookupTestsCompareModelSpec()
+{
+    auto pModelSpec = std::make_shared<ModelSpec>(INPUT_FILE, nvinfer1::DataType::kHALF);
+    pModelSpec->useGptAttentionPlugin();
+    pModelSpec->usePackedInput();
+    pModelSpec->setKVCacheType(KVCacheType::kPAGED);
+    pModelSpec->enableContextFMHAFp32Acc();
 
     return pModelSpec;
 }
@@ -1729,6 +1745,31 @@ INSTANTIATE_TEST_SUITE_P(ExplicitDraftTokensDecodingTests, ParamTest,
         testing::Values(false)               // useRandomEndId
         ),
 
+    generateTestName);
+
+INSTANTIATE_TEST_SUITE_P(PromptLookupTests, ParamTest,
+    testing::Combine(testing::Values(ModelParams{GPT_MODEL_DIR, {50256, 50256}}),
+        testing::Values(
+            //
+            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF, getPromptLookupTestsCompareModelSpec()}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .setKVCacheType(KVCacheType::kPAGED)
+                .setKVCacheReuse(true)
+                .setBatchSizes({8})
+                .enableContextFMHAFp32Acc()
+                .usePromptLookup()),
+        testing::Values(TrtGptModelType::InflightFusedBatching), testing::Values(TrtGptModelIfbTestType::BULK),
+        testing::Values(BeamConfig{1, {1}}),
+        testing::Values(std::nullopt), // maxTokensInPagedKvCache
+        testing::Values(std::nullopt), // freeGpuMemoryFraction
+        testing::Values(false),        // enableTrtOverlap
+        testing::Values(false, true),  // enableChunkedContext
+        testing::Values(false),        // enableStreamingMode
+        testing::Values(true, false),  // enableCudaGraphMode
+        testing::Values(std::nullopt), // hostCacheSize
+        testing::Values(false)         // useRandomEndId
+        ),
     generateTestName);
 
 #ifdef ENABLE_FP8

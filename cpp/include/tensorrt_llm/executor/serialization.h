@@ -186,6 +186,11 @@ public:
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
 
+    // PromptLookupConfig
+    static PromptLookupConfig deserializePromptLookupConfig(std::istream& is);
+    static void serialize(PromptLookupConfig const& promptLookupConfig, std::ostream& os);
+    static size_t serializedSize(PromptLookupConfig const& promptLookupConfig);
+
     // EagleConfig
     static EagleConfig deserializeEagleConfig(std::istream& is);
     static void serialize(EagleConfig const& eagleConfig, std::ostream& os);

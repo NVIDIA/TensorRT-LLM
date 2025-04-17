@@ -13,6 +13,7 @@ class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    PROMPT_LOOKUP = auto()
     NONE = auto()
 
     def is_mtp(self):
@@ -26,6 +27,9 @@ class SpeculativeDecodingMode(IntEnum):
 
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
+
+    def is_prompt_lookup(self):
+        return self == SpeculativeDecodingMode.PROMPT_LOOKUP
 
     def without_logits(self):
         return self.is_mtp()

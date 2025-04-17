@@ -330,6 +330,12 @@ void RuntimeBuffers::create(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         eagleBuffers.emplace(maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig);
     }
 
+    if (modelConfig.getSpeculativeDecodingMode().isPromptLookup())
+    {
+        promptLookupBuffers.emplace(
+            maxBatchSize, maxBeamWidth, manager, modelConfig, worldConfig, decodingConfig, runtime);
+    }
+
     if (modelConfig.useLanguageAdapter())
     {
         languageAdapterRoutings = manager.emptyTensor(MemoryType::kGPU, TRTDataType<SizeType32>::value);
@@ -386,6 +392,13 @@ void RuntimeBuffers::setBufferSizes(RequestVector const& contextRequests, Reques
     maxContextLength = 0;
     for (auto const& llmReq : contextRequests)
     {
+        if (llmReq->getPromptLookupConfig().has_value())
+        {
+            // Keep the request like a new one
+            llmReq->mPromptLen = llmReq->getTokens(0).size();
+            llmReq->setContextChunkSize(llmReq->getTokens(0).size());
+        }
+
         auto const draftLength = llmReq->isLastContextChunk() ? llmReq->getNumDraftTokens() : 0;
         numContextLogits += draftLength;
 

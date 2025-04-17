@@ -237,6 +237,18 @@ def build_engines(model_cache: Optional[str] = None,
         *get_ifb_args(_tb.KVCacheType.PAGED))
 
     model_spec_current = model_spec_obj.__copy__()
+    max_draft_tokens = 5
+    model_spec_current.use_prompt_lookup()
+    model_spec_current.set_draft_tokens(max_draft_tokens)
+
+    build_engine(
+        str(fp16_ckpt_dir),
+        str(engine_dir / model_spec_current.get_model_path() / tp_pp_cp_dir),
+        f'--max_draft_len={max_draft_tokens}',
+        '--speculative_decoding_mode=prompt_lookup',
+        *get_ifb_args(_tb.KVCacheType.PAGED))
+
+    model_spec_current = model_spec_obj.__copy__()
     model_spec_current.use_multiple_profiles()
 
     build_engine(

@@ -426,7 +426,7 @@ def add_common_args(parser):
         default=None,
         help=
         "Configuration of Prompt-Lookup decoding, see `examples/prompt_lookup/README.md` for more information."
-        "   E.g.: [10,2,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, device_list].",
+        "   E.g.: [10,2,4] or [10,2,4,[0]] for [prompt_lookup_num_tokens, max_matching_ngram_size, candidate_set_size, device_list].",
     )
     parser.add_argument(
         '--medusa_choices',

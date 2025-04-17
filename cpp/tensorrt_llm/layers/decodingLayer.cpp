@@ -61,7 +61,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     {
         mDecodingLayer = std::make_unique<ExplicitDraftTokensLayer<T>>(decoderDomain, mBufferManager);
     }
-    else if (mDecodingMode.isExternalDraftTokens())
+    else if (mDecodingMode.isExternalDraftTokens() || mDecodingMode.isPromptLookup())
     {
         mDecodingLayer = std::make_unique<ExternalDraftTokensLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
     }
@@ -73,7 +73,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle, PromptLookup}");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -87,25 +87,26 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
-
     TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
 
+    char const* decodingModeStr = mDecodingMode.getName();
     if (mDecodingMode.isBeamSearch())
     {
+        // Beam search needs beamWidth > 1
         TLLM_CHECK_WITH_INFO(
-            beamWidth > 1, "Decoding mode is %s, but beamWidth <= 1 (%d <= 1)", mDecodingMode.getName(), beamWidth);
+            beamWidth > 1, "Decoding mode is %s, but beamWidth <= 1 (%d <= 1)", decodingModeStr, beamWidth);
     }
-    else if (mDecodingMode.isTopKorTopP() || mDecodingMode.isMedusa() || mDecodingMode.isLookahead()
-        || mDecodingMode.isExplicitDraftTokens() || mDecodingMode.isExternalDraftTokens() || mDecodingMode.isEagle())
+    else if (decodingModeStr != std::string("Unknown"))
     {
+        // All other decoding modes need beamWidth == 1
         TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is %s, but beamWidth != 1 (%d != 1)", mDecodingMode.getName(), beamWidth);
+            beamWidth == 1, "Decoding mode is %s, but beamWidth != 1 (%d != 1)", decodingModeStr, beamWidth);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle, PromptLookup}");
     }
 
     mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
@@ -205,7 +206,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         preparedInputs = baseInputs;
         preparedOutputs = baseOutputs;
     }
-    else if (mDecodingMode.isExternalDraftTokens())
+    else if (mDecodingMode.isExternalDraftTokens() || mDecodingMode.isPromptLookup())
     {
         auto externalDraftTokenParams = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
         auto const ite = externalDraftTokenParams->ite;
@@ -254,7 +255,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle, PromptLookup}");
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {preparedOutputs, preparedInputs};

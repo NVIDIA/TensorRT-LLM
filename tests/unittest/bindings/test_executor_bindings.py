@@ -1398,6 +1398,31 @@ def test_eagle_config_pickle():
     assert config.greedy_sampling == config_copy.greedy_sampling
 
 
+def test_prompt_lookup_config():
+    config = trtllm.PromptLookupConfig(4, 3, 2)
+    assert config.prompt_lookup_num_tokens == 4
+    assert config.max_matching_ngram_size == 3
+    assert config.candidate_set_size == 2
+
+    kwargs = {
+        "prompt_lookup_num_tokens": 4,
+        "max_matching_ngram_size": 3,
+        "candidate_set_size": 2,
+    }
+
+    config = trtllm.PromptLookupConfig(**kwargs)
+    for k, v in kwargs.items():
+        assert getattr(config, k) == v
+
+
+def test_prompt_lookup_config_pickle():
+    config = trtllm.PromptLookupConfig(4, 3, 2)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.prompt_lookup_num_tokens == config_copy.prompt_lookup_num_tokens
+    assert config.max_matching_ngram_size == config_copy.max_matching_ngram_size
+    assert config.candidate_set_size == config_copy.candidate_set_size
+
+
 def test_decoding_mode():
     mode = trtllm.DecodingMode.Auto()
     assert mode.isAuto()
@@ -1426,6 +1451,9 @@ def test_decoding_mode():
     mode = trtllm.DecodingMode.Eagle()
     assert mode.isEagle()
 
+    mode = trtllm.DecodingMode.PromptLookup()
+    assert mode.isPromptLookup()
+
 
 def test_speculative_decoding_config():
     config = trtllm.DecodingConfig()
@@ -1433,6 +1461,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config is None
     assert config.medusa_choices is None
     assert config.eagle_config is None
+    assert config.prompt_lookup_config is None
 
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
@@ -1440,6 +1469,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == None
     assert config.eagle_config is None
+    assert config.prompt_lookup_config is None
 
     config = trtllm.DecodingConfig()
     la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -1451,6 +1481,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
     assert config.medusa_choices == None
     assert config.eagle_config is None
+    assert config.prompt_lookup_config is None
 
     config = trtllm.DecodingConfig()
     config.medusa_choices = [[0, 0], [0, 1]]
@@ -1459,6 +1490,7 @@ def test_speculative_decoding_config():
     assert config.lookahead_decoding_config == None
     assert config.medusa_choices == [[0, 0], [0, 1]]
     assert config.eagle_config is None
+    assert config.prompt_lookup_config is None
 
     config = trtllm.DecodingConfig()
     config.eagle_config = trtllm.EagleConfig([[0, 0], [0, 1]])
@@ -1468,6 +1500,17 @@ def test_speculative_decoding_config():
     assert config.medusa_choices == None
     assert config.eagle_config is not None
     assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
+    assert config.prompt_lookup_config is None
+
+    config = trtllm.DecodingConfig()
+    config.prompt_lookup_config = trtllm.PromptLookupConfig(4, 3, 2)
+    assert config.decoding_mode.isPromptLookup()
+    assert config.lookahead_decoding_config is None
+    assert config.medusa_choices is None
+    assert config.eagle_config is None
+    assert config.prompt_lookup_config.prompt_lookup_num_tokens == 4
+    assert config.prompt_lookup_config.max_matching_ngram_size == 3
+    assert config.prompt_lookup_config.candidate_set_size == 2
 
 
 def test_logits_post_processor_config():
@@ -2225,6 +2268,8 @@ def test_decoding_config_pickle():
     assert config_copy.decoding_mode.isBeamSearch
     assert config.lookahead_decoding_config == config_copy.lookahead_decoding_config
     assert config.medusa_choices == config_copy.medusa_choices
+    assert config.eagle_config == config_copy.eagle_config
+    assert config.prompt_lookup_config == config_copy.prompt_lookup_config
 
 
 def test_debug_config_pickle():

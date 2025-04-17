@@ -30,31 +30,46 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
         input_batch_size: int,
         prompt_lookup_num_tokens: int,
         max_matching_ngram_size: int,
+        candidate_set_size: int,
         end_id: int,
         max_seq_len: list[int],
-        is_keep_all: bool = True,
-        is_use_oldest: bool = True,
     ):
         self.input_batch_size = input_batch_size
         self.plnt = prompt_lookup_num_tokens  # Shorter name
         self.mmns = max_matching_ngram_size  # Shorter name
+        self.css = candidate_set_size  # Shorter name
         self.end_id = end_id
         self.max_seq_len = max_seq_len
-        self.is_keep_all = is_keep_all
-        self.is_use_oldest = is_use_oldest
         self.pool = [{} for _ in range(input_batch_size)]
         self.start_index = [0 for _ in range(input_batch_size)]
 
-    # modified from `transformers/generation/candidate_generator.py`
+        assert self.plnt > 0, f"prompt_lookup_num_tokens must be greater than 0, but got {self.plnt}"
+        assert self.mmns > 0, f"max_matching_ngram_size must be greater than 0, but got {self.mmns}"
+        assert self.css > 0, f"candidate_set_size must be greater than 0, but got {self.css}"
+
+    def print_pool(self):
+        """
+        For debug
+        """
+        logger.info(f"Batch size = {self.input_batch_size}")
+        for i, map in enumerate(self.pool):
+            logger.info(f"Slot {i}, size = {len(map)}")
+            for key, values in map.items():
+                logger.info(f"    {key}->{values}")
+
     def get_draft_tokens(self, prefix: list[torch.Tensor],
                          batch_slot: list[int]):
+        """
+        Get draft tokens from a batch of requests
+        modified from `transformers/generation/candidate_generator.py`
+        """
         batch_size = len(prefix)
         prefix_len = [len(prefix[bi]) for bi in range(batch_size)]
         draft_tokens = []  # `logits` is useless yet
         for bi in range(batch_size):
             gbi = batch_slot[bi]  # Global index in the input batch
-            chosen_ids = [self.end_id]
-            # Skip search if prefix is length of `max_length - 1`
+            chosen_ids = []  #[self.end_id]
+            # Skip search if length of prefix reaches `max_length - 1`
             if prefix_len[bi] >= self.max_seq_len[gbi] - 1:
                 draft_tokens.append(chosen_ids)
                 continue
@@ -67,15 +82,16 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                     r = min(l + size + self.plnt, len(sequence))
                     key = tuple(sequence[l:l + size])
                     value = tuple(sequence[l + size:r])
-                    if key not in self.pool[gbi] or not self.is_keep_all or \
+                    if key not in self.pool[gbi] or self.css == 1 or \
                         len(self.pool[gbi][key][0]) < self.plnt:
-                        # Update the value if
+                        # Replace the value if
                         # 1. the key does not exist
-                        # 2. we only keep one value for each key
+                        # 2. we only keep the newest one value for each key (MRU)
                         # 3. the length of the value saved before is less than `prompt_lookup_num_tokens`
                         self.pool[gbi][key] = OrderedSet((value, ))
-                    elif value not in self.pool[gbi][key]:
-                        # Extend the value if the key is already existed and we want to keep all of them
+                    elif value not in self.pool[gbi][key] and len(
+                            self.pool[gbi][key]) < self.css:
+                        # Extend the value if the key is already existed but count of values is not enough
                         self.pool[gbi][key].add(value)
 
             # Find match
@@ -83,12 +99,8 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
                 pattern = tuple(prefix[bi][-size:].tolist())
                 if pattern not in self.pool[gbi]:
                     continue
-                if self.is_use_oldest:
-                    # Always choose the oldest match, aligned with HF
-                    chosen_ids = self.pool[gbi][pattern][0]
-                else:
-                    # Always choose the newest match
-                    chosen_ids = self.pool[gbi][pattern][-1]
+                # Always choose the first match (aligned with HF)
+                chosen_ids = self.pool[gbi][pattern][0]
                 break
             draft_tokens.append(chosen_ids)
             self.start_index[gbi] = max(
@@ -108,24 +120,26 @@ def run_dtm_pld(batch_input_ids,
                 *,
                 target_runner=None):
     # `dtm` for Draft-Target-Model, `pld` for Prompt-Lookup-Decoding
-    assert (args.draft_target_model_config is not None) ^ (args.prompt_lookup_config is not None), \
-            "`--draft_target_model_config` and `--prompt_lookup_config` can not be specified at the same time."
-    if args.draft_target_model_config is not None:
-        assert args.draft_engine_dir is not None, "`--draft_engine_dir` must be specified in Draft-Target-Model."
     is_dtm = (args.draft_target_model_config is not None)
     is_pld = (args.prompt_lookup_config is not None)
+    assert is_dtm ^ is_pld, "`--draft_target_model_config` and `--prompt_lookup_config` can not be specified at the same time."
     if is_dtm:
+        assert args.draft_engine_dir is not None, "`--draft_engine_dir` must be specified in Draft-Target-Model."
         draft_len, draft_device_list, target_device_list, use_logits = ast.literal_eval(
             args.draft_target_model_config)
+        logger.info(f"Using Draft-Target-Model speculative decoding")
         logger.info(f"draft_len: {draft_len}")
         logger.info(f"Device(s) for draft model: {draft_device_list}")
         logger.info(f"Device(s) for target model: {target_device_list}")
         logger.info(f"Use logits to accept tokens: {use_logits}")
     if is_pld:
-        prompt_lookup_num_tokens, max_matching_ngram_size, target_device_list = ast.literal_eval(
+        logger.info(
+            f"Using Prompt-Lookup-Decoding speculative decoding V1 workflow")
+        prompt_lookup_num_tokens, max_matching_ngram_size, candidate_set_size, target_device_list = ast.literal_eval(
             args.prompt_lookup_config)
         logger.info(f"prompt_lookup_num_tokens: {prompt_lookup_num_tokens}")
         logger.info(f"max_matching_ngram_size: {max_matching_ngram_size}")
+        logger.info(f"candidate_set_size: {candidate_set_size}")
         logger.info(f"Device(s) for the model: {target_device_list}")
         use_logits = False  # `logits` is useless in this approach yet
 
@@ -145,7 +159,8 @@ def run_dtm_pld(batch_input_ids,
 
     if is_pld:
         pld_pool = PLDPool(input_batch_size, prompt_lookup_num_tokens,
-                           max_matching_ngram_size, end_id, max_seq_len)
+                           max_matching_ngram_size, candidate_set_size, end_id,
+                           max_seq_len)
 
     # Repack the output like the output of function `generate`
     outputs = {}
@@ -206,7 +221,7 @@ def run_dtm_pld(batch_input_ids,
                                     device_ids=target_device_list)
         target_runner = ModelRunnerCpp.from_dir(**target_runner_kwargs)
 
-    if is_dtm and (not use_logits) and \
+    if is_dtm and use_logits and \
         not (draft_runner.gather_generation_logits and target_runner.gather_generation_logits):
         assert False, "`--gather_generation_logits` must be specified while building draft/target models for using logits to accept"
 
