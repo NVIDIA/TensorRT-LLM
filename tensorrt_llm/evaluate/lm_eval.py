@@ -256,8 +256,8 @@ class GPQADiamond(LmEvalEvaluator):
     @click.option("--random_seed", type=int, default=0)
     @click.option("--apply_chat_template", is_flag=True, default=False)
     @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=32768)
-    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--max_input_length", type=int, default=4096)
+    @click.option("--max_output_length", type=int, default=32768)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
@@ -277,8 +277,8 @@ class GPQAMain(LmEvalEvaluator):
     @click.option("--random_seed", type=int, default=0)
     @click.option("--apply_chat_template", is_flag=True, default=False)
     @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=32768)
-    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--max_input_length", type=int, default=4096)
+    @click.option("--max_output_length", type=int, default=32768)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
@@ -298,8 +298,8 @@ class GPQAExtended(LmEvalEvaluator):
     @click.option("--random_seed", type=int, default=0)
     @click.option("--apply_chat_template", is_flag=True, default=False)
     @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=32768)
-    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--max_input_length", type=int, default=4096)
+    @click.option("--max_output_length", type=int, default=32768)
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
