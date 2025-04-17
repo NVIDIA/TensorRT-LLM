@@ -219,6 +219,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = "^ib"
 
     cmd = f"bash {disaggregated_test_root}/sanity_check.sh {disaggregated_example_root} deepseek_v3_lite_fp8"
     check_call(cmd, shell=True, env=env, cwd=llm_venv.get_working_directory())

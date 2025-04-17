@@ -45,9 +45,9 @@ The minimum hardware requirements for running DeepSeek V3/R1 FP8&FP4 are listed 
 | H20 141GB | 8 | N/A |
 | H20 96GB | 8  | N/A |
 | H200 | 8     | N/A |
-| B200/GB200| 4 (8GPUs is recommended for best perf) | 4 (8 GPUs is recommended for best perf) |
+| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) |
 
-DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TensorRT-LLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
+Ampere architecture (SM80 & SM86) is not supported.
 
 
 ## Downloading the Model Weights
