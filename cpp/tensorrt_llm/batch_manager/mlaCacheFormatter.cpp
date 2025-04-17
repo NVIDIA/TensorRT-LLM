@@ -163,18 +163,21 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
     {
         int bufferId = mConcurrenceSendResource.mConcurrence++;
 
-        if (!onlyUseAsyncBuffer
-            && mConcurrenceSendResource.mSendbuffers.find(bufferId) == mConcurrenceSendResource.mSendbuffers.end())
+        if (!(common::getEnvUseNIXLKvCache()))
         {
-            if (common::getEnvKVCacheTransferUseAsyncBuffer())
+            if (!onlyUseAsyncBuffer
+                && mConcurrenceSendResource.mSendbuffers.find(bufferId) == mConcurrenceSendResource.mSendbuffers.end())
             {
-                mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpu(
-                    runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
-            }
-            else
-            {
-                mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpuSync(
-                    runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                if (common::getEnvKVCacheTransferUseAsyncBuffer())
+                {
+                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpu(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                }
+                else
+                {
+                    mConcurrenceSendResource.mSendbuffers[bufferId] = bufferManager.gpuSync(
+                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                }
             }
         }
         preAllocSendBuffer = mConcurrenceSendResource.mSendbuffers[bufferId];
@@ -315,6 +318,41 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
 }
 
+runtime::ITensor::SharedPtr MLACacheFormatter::getPreAllocatedRecvBuffer(std::string const& processString) const
+{
+    std::scoped_lock<std::mutex> lock(mBufferMutex);
+    auto it = mProcessToBufferIndex.find(processString);
+    if (it == mProcessToBufferIndex.end())
+    {
+        // Find first available buffer that is not in use
+        for (int i = 0; i < mPreAllocatedRecvBuffers.size(); ++i)
+        {
+            if (mPreAllocatedRecvBuffers[i] != nullptr && mBufferInUse.find(i) == mBufferInUse.end())
+            {
+                mProcessToBufferIndex[processString] = i;
+                mBufferInUse.insert(i);
+                TLLM_LOG_DEBUG("Allocating pre-allocated receive buffer %d for process %s", i, processString.c_str());
+                return mPreAllocatedRecvBuffers[i];
+            }
+        }
+        TLLM_THROW("No available pre-allocated receive buffers");
+    }
+    TLLM_LOG_DEBUG("Returning pre-allocated receive buffer %d for process %s", it->second, processString.c_str());
+    return mPreAllocatedRecvBuffers[it->second];
+}
+
+void MLACacheFormatter::freePreAllocatedRecvBuffer(std::string const& processString)
+{
+    std::scoped_lock<std::mutex> lock(mBufferMutex);
+    TLLM_LOG_DEBUG("Freeing pre-allocated receive buffer for process %s", processString.c_str());
+    auto it = mProcessToBufferIndex.find(processString);
+    if (it != mProcessToBufferIndex.end())
+    {
+        mBufferInUse.erase(it->second);
+        mProcessToBufferIndex.erase(it);
+    }
+}
+
 void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
     SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
@@ -396,6 +434,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
                 processString = llmRequest.getDataTransceiverState().getCommState()->toString();
             }
 
+            if (!common::getEnvUseNIXLKvCache())
             {
                 std::scoped_lock<std::mutex> lock(mProcessToRecvBufferMutex);
                 if (mProcessToRecvBuffer.find(processString) == mProcessToRecvBuffer.end())
@@ -431,9 +470,16 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
             }
             else
             {
-
-                recvSplitCaches.push_back(runtime::ITensor::slice(
-                    preAllocRecvBufferTemp, (i - remainNoCoverTargetNum) * targetBufferSize, targetBufferSize));
+                if (common::getEnvUseNIXLKvCache())
+                {
+                    std::string bufferTag = GET_BUFFER_TAG(
+                        llmRequest.getContextPhaseParams().value().getReqId(), pickUpConnections[i]->getRank());
+                    auto recvBuffer = getPreAllocatedRecvBuffer(bufferTag);
+                    recvSplitCaches.push_back(runtime::ITensor::slice(recvBuffer, 0, targetBufferSize));
+                }
+                else
+                    recvSplitCaches.push_back(runtime::ITensor::slice(
+                        preAllocRecvBufferTemp, (i - remainNoCoverTargetNum) * targetBufferSize, targetBufferSize));
             }
         }
 
@@ -478,6 +524,12 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
                     bufferManager.getStream().synchronize();
                     remainRecvSize -= recvSize;
                 }
+            }
+            if (common::getEnvUseNIXLKvCache())
+            {
+                std::string bufferTag = GET_BUFFER_TAG(
+                    llmRequest.getContextPhaseParams().value().getReqId(), pickUpConnections[processIdx]->getRank());
+                freePreAllocatedRecvBuffer(bufferTag);
             }
         };
 
@@ -526,6 +578,16 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         else
         {
             recvBufferFun(deviceId, 0);
+        }
+        // TODO, fix later with TRT-LLM team
+        if (common::getEnvUseNIXLKvCache())
+        {
+            for (auto const& connection : connections)
+            {
+                std::string bufferTag
+                    = GET_BUFFER_TAG(llmRequest.getContextPhaseParams().value().getReqId(), connection->getRank());
+                freePreAllocatedRecvBuffer(bufferTag);
+            }
         }
 
         {

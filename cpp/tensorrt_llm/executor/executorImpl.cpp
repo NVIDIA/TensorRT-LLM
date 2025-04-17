@@ -562,6 +562,23 @@ void Executor::Impl::setOrchLeaderComm(
     {
         mOrchLeaderComm = nullptr;
     }
+
+    if (tensorrt_llm::common::getEnvUseNIXLKvCache() && mWorldRank == 0 && !mIsWorker)
+    {
+        TLLM_LOG_DEBUG("rank %d | setOrchLeaderComm | participantId.back() %d",
+            tensorrt_llm::mpi::MpiComm::world().getRank(), participantIds.back());
+        if (std::find(participantIds.begin(), participantIds.end(), worldSize - 1) != participantIds.end())
+        {
+            TLLM_LOG_DEBUG("rank %d | mWorldRank %d | splitting world comm executorImpl",
+                tensorrt_llm::mpi::MpiComm::world().getRank(), mWorldRank);
+            auto worldComm = std::addressof(tensorrt_llm::mpi::MpiComm::session());
+            worldComm->barrier();
+            TLLM_LOG_DEBUG("rank %d | mWorldRank %d | splitting world comm executorImpl - barrier passed",
+                tensorrt_llm::mpi::MpiComm::world().getRank(), mWorldRank);
+            tensorrt_llm::mpi::MpiComm selfComm = worldComm->split(1, 0);
+            TLLM_LOG_DEBUG("rank %d | selfComm: %p", mWorldRank, selfComm.getSize());
+        }
+    }
 #endif // ENABLE_MULTI_DEVICE
 }
 

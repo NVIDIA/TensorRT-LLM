@@ -34,6 +34,9 @@
 #include <unordered_map>
 #include <vector>
 
+#define GET_BUFFER_TAG(llmRequestContextReqId, remoteRank)                                                             \
+    std::to_string(llmRequestContextReqId) + ":" + std::to_string(remoteRank)
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
@@ -132,6 +135,7 @@ public:
     }
 
     runtime::ITensor::SharedPtr getPreAllocatedRecvBuffer(std::string const& processString) const;
+    void freePreAllocatedRecvBuffer(std::string const& processString);
 
     [[nodiscard]] std::vector<runtime::ITensor::SharedPtr> const& getPreAllocatedRecvBuffers() const noexcept
     {
@@ -181,6 +185,7 @@ private:
     // Map process strings to buffer indices
     mutable std::unordered_map<std::string, int> mProcessToBufferIndex;
     mutable std::mutex mBufferMutex;
+    mutable std::unordered_set<int> mBufferInUse; // Track which buffers are currently in use
 
     KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };

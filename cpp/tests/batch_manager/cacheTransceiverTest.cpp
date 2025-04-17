@@ -32,6 +32,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -384,13 +385,13 @@ protected:
     {
         if (isSender)
         {
-            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
+                nullptr, *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
         }
         else
         {
-            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                mConnectionManager.get(), *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
+            mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
+                nullptr, *mCacheState, mlocalRank, std::make_unique<CacheFormatter>(mManager.get())));
         }
     }
 
@@ -679,10 +680,12 @@ protected:
         {
             return;
         }
-        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache())
+        else if (tensorrt_llm::common::getEnvUseMPIKvCache() || tensorrt_llm::common::getEnvUseUCXKvCache()
+            || tensorrt_llm::common::getEnvUseNIXLKvCache())
         {
             bool isUcx = tensorrt_llm::common::getEnvUseUCXKvCache();
-            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : "MPI");
+            bool isNixl = tensorrt_llm::common::getEnvUseNIXLKvCache();
+            TLLM_LOG_INFO("Enable %s KV cache transport.", isUcx ? "UCX" : isNixl ? "NIXL" : "MPI");
 
             if (isUcx)
             {
@@ -707,6 +710,8 @@ protected:
                 mConnectionManager = std::make_unique<texec::kv_cache::MpiConnectionManager>(mComm);
             }
 
+            mNixlConnectionManager = isNixl ? std::make_unique<texec::kv_cache::NixlConnectionManager>(mComm) : nullptr;
+
             auto makeFormatter = [this]()
             {
                 return mIsMLA ? std::unique_ptr<IOFormatter>(std::make_unique<MLACacheFormatter>(mManager.get()))
@@ -715,13 +720,14 @@ protected:
 
             if (mIsContext)
             {
-                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(mConnectionManager.get(),
+                    mNixlConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
             else
             {
-                mRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
+                mRequester
+                    = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(mConnectionManager.get(),
+                        mNixlConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter()));
             }
 
             std::vector<int> contextRankVec(mContextRankSize);
@@ -781,6 +787,64 @@ protected:
             else
             {
                 mContextCommState = std::make_unique<tensorrt_llm::executor::kv_cache::CommState>(contextRankVec);
+            }
+
+            if (isNixl)
+            {
+                // Gather NIXL metadata using MPI
+                mComm->barrier();
+                TLLM_LOG_INFO("NIXL: Starting metadata exchange. Rank %d/%d", mComm->getRank(), mComm->getSize());
+                tensorrt_llm::mpi::MpiComm kvCacheComm(mComm->split(555, mComm->getRank()));
+                std::string localMD = mNixlConnectionManager->getLocalMD();
+                TLLM_LOG_INFO("NIXL: Rank %d local metadata size: %zu", mComm->getRank(), localMD.size());
+
+                int worldSize = kvCacheComm.getSize();
+                int rank = kvCacheComm.getRank();
+
+                // Exchange metadata sizes
+                int sendSize = static_cast<int>(localMD.size());
+                std::vector<int> recvSizes(worldSize);
+                kvCacheComm.allgather(&sendSize, recvSizes.data(), 1, tensorrt_llm::mpi::MpiType::kINT32);
+                TLLM_LOG_INFO("NIXL: Rank %d received metadata sizes from all ranks", rank);
+                for (int i = 0; i < worldSize; ++i)
+                {
+                    TLLM_LOG_INFO("NIXL: Rank %d metadata size: %d", i, recvSizes[i]);
+                }
+
+                // Calculate displacements and total size
+                std::vector<int> displacements(worldSize);
+                int totalSize = 0;
+                for (int i = 0; i < worldSize; ++i)
+                {
+                    displacements[i] = totalSize;
+                    totalSize += recvSizes[i];
+                }
+                TLLM_LOG_INFO("NIXL: Rank %d total metadata size: %d", rank, totalSize);
+
+                // Allocate buffer for all metadata
+                std::vector<char> allMetadata(totalSize);
+                std::vector<char> localMetadata(localMD.begin(), localMD.end());
+
+                // Exchange metadata
+                kvCacheComm.allgatherv(localMetadata.data(), sendSize, tensorrt_llm::mpi::MpiType::kCHAR,
+                    allMetadata.data(), recvSizes, displacements, tensorrt_llm::mpi::MpiType::kCHAR);
+                TLLM_LOG_INFO("NIXL: Rank %d completed metadata exchange", rank);
+
+                // Process received metadata and create connections for all ranks
+                for (int i = 0; i < worldSize; ++i)
+                {
+                    if (i != rank)
+                    {
+                        std::string remoteMetadata(allMetadata.data() + displacements[i], recvSizes[i]);
+                        TLLM_LOG_INFO("NIXL: Rank %d processing metadata from rank %d (size: %zu)", rank, i,
+                            remoteMetadata.size());
+                        mNixlConnectionManager->setRemoteMD(remoteMetadata, i);
+                    }
+                }
+
+                // Ensure all connections are established
+                mComm->barrier();
+                TLLM_LOG_INFO("NIXL: Rank %d completed all connection setup", rank);
             }
         }
         else
@@ -1035,6 +1099,7 @@ protected:
     std::unique_ptr<texec::kv_cache::CacheState> mContextCacheState;
     std::unique_ptr<texec::kv_cache::CommState> mContextCommState;
     std::unique_ptr<texec::kv_cache::ConnectionManager> mConnectionManager;
+    std::unique_ptr<texec::kv_cache::NixlConnectionManager> mNixlConnectionManager;
     std::mt19937 generator;
 };
 
@@ -1154,6 +1219,21 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     bool isMLA = std::get<10>(param);
     bool contextDP = std::get<11>(param);
     bool generationDP = std::get<12>(param);
+
+    TLLM_LOG_INFO("Test Parameters:");
+    TLLM_LOG_INFO("  contextTp: %d", contextTp);
+    TLLM_LOG_INFO("  contextPp: %d", contextPp);
+    TLLM_LOG_INFO("  genTp: %d", genTp);
+    TLLM_LOG_INFO("  genPp: %d", genPp);
+    TLLM_LOG_INFO("  numLayers: %d", numLayers);
+    TLLM_LOG_INFO("  numHeads: %d", numHeads);
+    TLLM_LOG_INFO("  sizePerHead: %d", sizePerHead);
+    TLLM_LOG_INFO("  tokensPerBlock: %d", tokensPerBlock);
+    TLLM_LOG_INFO("  dataType: %d", static_cast<int>(dataType));
+    TLLM_LOG_INFO("  kvFactor: %d", kvFactor);
+    TLLM_LOG_INFO("  isMLA: %d", isMLA);
+    TLLM_LOG_INFO("  contextDP: %d", contextDP);
+    TLLM_LOG_INFO("  generationDP: %d", generationDP);
 
     setUpCommunicator(contextTp, contextPp, genTp, genPp, isMLA, contextDP, generationDP);
 

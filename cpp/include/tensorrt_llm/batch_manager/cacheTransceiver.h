@@ -72,7 +72,8 @@ public:
     {
         UNKNOWN = 0,
         MPI = 1,
-        UCX = 2
+        UCX = 2,
+        NIXL = 3
     };
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
@@ -124,11 +125,13 @@ private:
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
+    std::unique_ptr<executor::kv_cache::ConnectionManager> mNixlManager;
 
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.
     static std::mutex mDllMutex;
     void* mWrapperLibHandle{nullptr};
+    void gatherAllMD();
 };
 
 } // namespace tensorrt_llm::batch_manager

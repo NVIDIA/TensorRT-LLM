@@ -18,6 +18,20 @@ target_link_libraries(modelSpec PRIVATE tensorrt_llm)
 add_library(modelSpecStatic STATIC modelSpec.cpp)
 
 add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
+target_include_directories(cacheTransceiverTest PRIVATE ${NIXL_INCLUDE_DIR})
+target_link_libraries(
+  cacheTransceiverTest
+  PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+          ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
+
+# Add rpath for runtime library loading
+if(NOT WIN32)
+  set_target_properties(
+    cacheTransceiverTest
+    PROPERTIES BUILD_RPATH "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+               INSTALL_RPATH "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"
+               INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
 
 add_gtest(trtGptModelTest trtGptModelTest.cpp)
 target_link_libraries(trtGptModelTest PRIVATE modelSpecStatic)

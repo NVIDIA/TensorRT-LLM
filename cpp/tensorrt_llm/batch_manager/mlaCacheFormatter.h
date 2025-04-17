@@ -20,6 +20,7 @@
 #include "dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -45,6 +46,49 @@ public:
         : mCacheManager{cacheManager}
     {
         TLLM_CHECK(mCacheManager);
+        if (common::getEnvUseNIXLKvCache())
+        {
+            // Pre-allocate send buffers
+            auto const sendBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
+            auto const maxConcurrenceNum = static_cast<int>(common::getEnvKVCacheSendMaxConcurrenceNum());
+            auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
+            auto const sendBufferEleSize = sendBufferSize / common::getDTypeSize(dataType);
+
+            if (sendBufferEleSize > 0) // Only pre-allocate if not using async buffer
+            {
+                // Pre-allocate send buffers
+                for (int i = 0; i < maxConcurrenceNum; i++)
+                {
+                    if (common::getEnvKVCacheTransferUseAsyncBuffer())
+                    {
+                        mConcurrenceSendResource.mSendbuffers[i]
+                            = mCacheManager->getBlockManager().getBufferManager().gpu(
+                                runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    }
+                    else
+                    {
+                        mConcurrenceSendResource.mSendbuffers[i]
+                            = mCacheManager->getBlockManager().getBufferManager().gpuSync(
+                                runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    }
+                }
+
+                // Pre-allocate receive buffers (using same number as send buffers)
+                for (int i = 0; i < maxConcurrenceNum; i++)
+                {
+                    if (common::getEnvKVCacheTransferUseAsyncBuffer())
+                    {
+                        mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpu(
+                            runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
+                    }
+                    else
+                    {
+                        mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpuSync(
+                            runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
+                    }
+                }
+            }
+        }
     }
 
     void formatOutput(LlmRequest const& llmRequest,
@@ -63,10 +107,46 @@ public:
         return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
     }
 
+    BaseKVCacheManager* getCacheManager() const noexcept
+    {
+        return mCacheManager;
+    }
+
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
     static std::vector<executor::kv_cache::Connection const*> pickRecvConnections(
         std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
         SizeType32 selfIdx, CacheState const& destConfig);
+
+    runtime::ITensor::SharedPtr getPreAllocatedRecvBuffer(std::string const& processString) const;
+    void freePreAllocatedRecvBuffer(std::string const& processString);
+
+    [[nodiscard]] std::vector<runtime::ITensor::SharedPtr> const& getPreAllocatedRecvBuffers() const noexcept
+    {
+        return mPreAllocatedRecvBuffers;
+    }
+
+    [[nodiscard]] std::vector<runtime::ITensor::SharedPtr> getPreAllocatedSendBuffers() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mConcurrenceSendResource.mSendbuffersMutex);
+        std::vector<runtime::ITensor::SharedPtr> sendBuffers;
+        sendBuffers.reserve(mConcurrenceSendResource.mSendbuffers.size());
+        TLLM_LOG_DEBUG("Getting pre-allocated send buffers. Total buffers in map: %d",
+            mConcurrenceSendResource.mSendbuffers.size());
+        for (auto const& [idx, buffer] : mConcurrenceSendResource.mSendbuffers)
+        {
+            if (buffer)
+            {
+                TLLM_LOG_DEBUG("Send buffer[%d] address: %p, size: %zu", idx, buffer->data(), buffer->getSizeInBytes());
+                sendBuffers.push_back(buffer);
+            }
+            else
+            {
+                TLLM_LOG_WARNING("Null send buffer found at index %d", idx);
+            }
+        }
+        TLLM_LOG_DEBUG("Returning %zu valid send buffers", sendBuffers.size());
+        return sendBuffers;
+    }
 
 private:
     BaseKVCacheManager* mCacheManager{};
@@ -74,7 +154,7 @@ private:
     struct ConcurrenceSendResource
     {
         std::unordered_map<int, runtime::ITensor::SharedPtr> mSendbuffers;
-        std::mutex mSendbuffersMutex;
+        mutable std::mutex mSendbuffersMutex;
         std::condition_variable mSendbuffersCV;
         std::atomic_int mConcurrence = 0;
     };
@@ -83,6 +163,12 @@ private:
 
     std::unordered_map<std::string, runtime::ITensor::SharedPtr> mProcessToRecvBuffer;
     std::mutex mProcessToRecvBufferMutex;
+    // Pre-allocated receive buffers
+    std::vector<runtime::ITensor::SharedPtr> mPreAllocatedRecvBuffers;
+    // Map process strings to buffer indices
+    mutable std::unordered_map<std::string, int> mProcessToBufferIndex;
+    mutable std::mutex mBufferMutex;
+    mutable std::unordered_set<int> mBufferInUse; // Track which buffers are currently in use
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

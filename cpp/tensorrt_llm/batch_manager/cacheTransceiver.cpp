@@ -43,6 +43,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -67,6 +68,21 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         commType = CacheTransceiver::CommType::UCX;
         TLLM_LOG_INFO("Enable UCX KV cache transport.");
     }
+    else if (common::getEnvUseNIXLKvCache())
+    {
+        auto memSizeForKVCacheTransferBuffer = common::getEnvMemSizeForKVCacheTransferBuffer();
+        // TODO: get min KV size from model config maybe zero?
+        size_t minKVsize = 100 * 1024 * 1024; // 100MB
+        if (memSizeForKVCacheTransferBuffer < minKVsize)
+        {
+            TLLM_THROW(
+                "TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE is set to non-zero value, but TRTLLM_USE_NIXL_KVCACHE is also "
+                "set. This is not allowed.");
+        }
+        commType = CacheTransceiver::CommType::NIXL;
+        TLLM_LOG_INFO(
+            " Enable NIXL KV cache transport, KV cache transfer buffer size: %zu.", memSizeForKVCacheTransferBuffer);
+    }
     else if (common::getEnvUseMPIKvCache())
     {
         commType = CacheTransceiver::CommType::MPI;
@@ -81,6 +97,49 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
             cacheManager, commType.value(), cacheStateCfg, worldConfig, modelConfig.getKvDataType(), attentionType);
     }
     return nullptr;
+}
+
+void CacheTransceiver::gatherAllMD()
+{
+    mMpiWorldComm->barrier();
+    tensorrt_llm::mpi::MpiComm kvCacheComm(mMpiWorldComm->split(555, mMpiWorldComm->getRank()));
+    std::string localMD
+        = static_cast<tensorrt_llm::executor::kv_cache::NixlConnectionManager*>(mNixlManager.get())->getLocalMD();
+    // Inline the allGatherMD logic here
+    int worldSize = kvCacheComm.getSize();
+    // TODO: TMP fix for NIXL
+    int oldWorldSize = mMpiWorldComm->getSize();
+    int flag = (worldSize != oldWorldSize) ? 1 : 0;
+    ////////////////////////////////
+    int rank = kvCacheComm.getRank();
+
+    int sendSize = static_cast<int>(localMD.size());
+
+    std::vector<int> recvSizes(worldSize);
+    kvCacheComm.allgather(&sendSize, recvSizes.data(), 1, mpi::MpiType::kINT32);
+
+    std::vector<int> displs(worldSize, 0);
+    for (int i = 1; i < worldSize; ++i)
+    {
+        displs[i] = displs[i - 1] + recvSizes[i - 1];
+    }
+
+    std::vector<char> sendBuffer(localMD.begin(), localMD.end());
+
+    int totalRecvSize = std::accumulate(recvSizes.begin(), recvSizes.end(), 0);
+    std::vector<char> recvBuffer(totalRecvSize);
+    kvCacheComm.allgatherv(
+        sendBuffer.data(), sendSize, mpi::MpiType::kCHAR, recvBuffer.data(), recvSizes, displs, mpi::MpiType::kCHAR);
+    std::vector<std::string> receivedStrings(worldSize);
+    for (int i = 0; i < worldSize; ++i)
+    {
+        receivedStrings[i] = std::string(recvBuffer.begin() + displs[i], recvBuffer.begin() + displs[i] + recvSizes[i]);
+        if (i != rank)
+        {
+            static_cast<tensorrt_llm::executor::kv_cache::NixlConnectionManager*>(mNixlManager.get())
+                ->setRemoteMD(receivedStrings[i], i + flag); // TODO tmp fix for NIXL
+        }
+    }
 }
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
@@ -155,6 +214,12 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             TLLM_LOG_INFO("MPI Connection Manager created");
         }
 
+        if (mCommType == CommType::NIXL)
+        {
+            mNixlManager = std::make_unique<executor::kv_cache::NixlConnectionManager>(mMpiWorldComm);
+            TLLM_LOG_INFO("NIXL Connection Manager created");
+        }
+
         using tensorrt_llm::batch_manager::kv_cache_manager::MLACacheFormatter;
         auto makeFormatter = [cacheManager, isMLA]() -> std::unique_ptr<IOFormatter>
         {
@@ -162,10 +227,14 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
                          : std::unique_ptr<IOFormatter>(std::make_unique<CacheFormatter>(cacheManager));
         };
 
-        mDataResponder = std::make_unique<DataResponder>(
-            std::make_unique<DataSenderImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
-        mDataRequester = std::make_unique<DataRequester>(
-            std::make_unique<DataReceiverImpl>(mManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        mDataResponder = std::make_unique<DataResponder>(std::make_unique<DataSenderImpl>(
+            mManager.get(), mNixlManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        mDataRequester = std::make_unique<DataRequester>(std::make_unique<DataReceiverImpl>(
+            mManager.get(), mNixlManager.get(), *mCacheState, worldConfig.getRank(), makeFormatter()));
+        if (mCommType == CommType::NIXL)
+        {
+            this->gatherAllMD();
+        }
     }
     else
     {

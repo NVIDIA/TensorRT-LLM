@@ -319,18 +319,33 @@ runtime::ITensor::SharedPtr CacheFormatter::getPreAllocatedRecvBuffer(std::strin
     auto it = mProcessToBufferIndex.find(processString);
     if (it == mProcessToBufferIndex.end())
     {
-        // Find first available buffer
+        // Find first available buffer that is not in use
         for (int i = 0; i < mPreAllocatedRecvBuffers.size(); ++i)
         {
-            if (mPreAllocatedRecvBuffers[i] != nullptr)
+            if (mPreAllocatedRecvBuffers[i] != nullptr && mBufferInUse.find(i) == mBufferInUse.end())
             {
                 mProcessToBufferIndex[processString] = i;
+                mBufferInUse.insert(i);
+                TLLM_LOG_DEBUG("Allocating pre-allocated receive buffer %d for process %s", i, processString.c_str());
                 return mPreAllocatedRecvBuffers[i];
             }
         }
         TLLM_THROW("No available pre-allocated receive buffers");
     }
+    TLLM_LOG_DEBUG("Returning pre-allocated receive buffer %d for process %s", it->second, processString.c_str());
     return mPreAllocatedRecvBuffers[it->second];
+}
+
+void CacheFormatter::freePreAllocatedRecvBuffer(std::string const& processString)
+{
+    std::scoped_lock<std::mutex> lock(mBufferMutex);
+    TLLM_LOG_DEBUG("Freeing pre-allocated receive buffer for process %s", processString.c_str());
+    auto it = mProcessToBufferIndex.find(processString);
+    if (it != mProcessToBufferIndex.end())
+    {
+        mBufferInUse.erase(it->second);
+        mProcessToBufferIndex.erase(it);
+    }
 }
 
 void CacheFormatter::formatInput(LlmRequest const& llmRequest,
@@ -526,10 +541,6 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                             }
                             preAllocRecvBufferTemp = mProcessToRecvBuffer[processString];
                         }
-                        else
-                        {
-                            preAllocRecvBufferTemp = getPreAllocatedRecvBuffer(processString);
-                        }
                     }
 
                     if (bufferCoverTargetNum < targetNum)
@@ -548,9 +559,18 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         }
                         else
                         {
-
-                            recvSplitCaches.push_back(runtime::ITensor::slice(preAllocRecvBufferTemp,
-                                (i - remainNoCoverTargetNum) * targetBufferSize, targetBufferSize));
+                            if (common::getEnvUseNIXLKvCache())
+                            {
+                                std::string bufferTag = GET_BUFFER_TAG(
+                                    llmRequest.getContextPhaseParams().value().getReqId(), connections[i]->getRank());
+                                auto recvBuffer = getPreAllocatedRecvBuffer(bufferTag);
+                                recvSplitCaches.push_back(runtime::ITensor::slice(recvBuffer, 0, targetBufferSize));
+                            }
+                            else
+                            {
+                                recvSplitCaches.push_back(runtime::ITensor::slice(preAllocRecvBufferTemp,
+                                    (i - remainNoCoverTargetNum) * targetBufferSize, targetBufferSize));
+                            }
                         }
                     }
                 }
@@ -618,6 +638,9 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                         }
                     }
                 }
+                std::string bufferTag = GET_BUFFER_TAG(
+                    llmRequest.getContextPhaseParams().value().getReqId(), connections[processIdx]->getRank());
+                freePreAllocatedRecvBuffer(bufferTag);
             };
             if (connections.size() > 1)
             {

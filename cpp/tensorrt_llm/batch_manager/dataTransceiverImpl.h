@@ -34,6 +34,7 @@ struct TransceiverTag
     static constexpr int32_t kID_TAG{19};
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kBUFFER_INFO_TAG{33};
 };
 
 class DataSenderImpl : public DataSender, public TransceiverTag
@@ -43,8 +44,8 @@ public:
     using RequestMapInfo
         = std::vector<std::pair<executor::kv_cache::Connection const*, executor::DataTransceiverState>>;
 
-    DataSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter);
+    DataSenderImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::ConnectionManager* mNixlManager,
+        executor::kv_cache::CacheState selfCacheState, SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter);
 
     [[nodiscard]] RequestInfo recvRequestInfo() override;
 
@@ -60,6 +61,7 @@ public:
 
 private:
     executor::kv_cache::ConnectionManager* mManager;
+    executor::kv_cache::ConnectionManager* mNixlManager;
     std::map<LlmRequest::RequestIdType, RequestMapInfo> mRequestToComms;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<IOFormatter> mFormatter;
@@ -72,7 +74,8 @@ class DataReceiverImpl : public DataReceiver, public TransceiverTag
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    DataReceiverImpl(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
+    DataReceiverImpl(executor::kv_cache::ConnectionManager* manager,
+        executor::kv_cache::ConnectionManager* mNixlManager, executor::kv_cache::CacheState selfCacheState,
         SizeType32 selfIndex, std::unique_ptr<IOFormatter> formatter);
 
     void sendRequestInfo(LlmRequest const& llmRequest) override;
@@ -92,11 +95,12 @@ private:
         }
     };
 
-    static void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info);
+    void sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info);
 
     [[nodiscard]] std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest);
 
     executor::kv_cache::ConnectionManager* mManager;
+    executor::kv_cache::ConnectionManager* mNixlManager;
     executor::DataTransceiverState mSelfState;
     std::unique_ptr<IOFormatter> mFormatter;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;

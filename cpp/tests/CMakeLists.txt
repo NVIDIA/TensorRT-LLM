@@ -13,6 +13,35 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+# Add NIXL configuration for tests
+set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
+
+# Find NIXL
+find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include
+                                        /opt/nvidia/nvda_nixl/include)
+
+# Find all required NIXL libraries
+find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+                                     /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(
+  NIXL_BUILD_LIBRARY nixl_build
+  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(
+  SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+                              /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(
+  UCX_BACKEND_LIBRARY ucx_backend
+  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(
+  UCX_UTILS_LIBRARY ucx_utils HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+                                    /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(
+  GDS_BACKEND_LIBRARY gds_backend
+  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+
 # GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
@@ -63,6 +92,13 @@ function(add_gtest test_name test_src)
   endif()
   if(ENABLE_MULTI_DEVICE)
     target_compile_definitions(${test_name} PUBLIC ENABLE_MULTI_DEVICE)
+    # Add NIXL libraries for multi-device tests
+    target_link_libraries(
+      ${test_name}
+      PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
+              ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY}
+              ${GDS_BACKEND_LIBRARY})
+    target_include_directories(${test_name} PRIVATE ${NIXL_INCLUDE_DIR})
   endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
