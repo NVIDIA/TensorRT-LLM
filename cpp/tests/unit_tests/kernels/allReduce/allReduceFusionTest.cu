@@ -49,7 +49,7 @@ __global__ void residual_add_kernel(DType* data, DType* residual, int size)
 template <typename DType>
 void residual_add(DType* data, DType* residual, int size, cudaStream_t stream)
 {
-    residual_add_kernel<<<size / 128, 128, 0, stream>>>(data, residual, size);
+    residual_add_kernel<<<(size + 127) / 128, 128, 0, stream>>>(data, residual, size);
 }
 
 template <typename DType>
@@ -64,7 +64,7 @@ __global__ void quantize_to_fp8_kernel(DType* data, __nv_fp8_e4m3* data_fp8, int
 template <typename DType>
 void quantize_to_fp8(DType* data, __nv_fp8_e4m3* data_fp8, int size, float* scale_factor, cudaStream_t stream)
 {
-    quantize_to_fp8_kernel<<<size / 128, 128, 0, stream>>>(data, data_fp8, size, scale_factor);
+    quantize_to_fp8_kernel<<<(size + 127) / 128, 128, 0, stream>>>(data, data_fp8, size, scale_factor);
 }
 
 template <typename T>
@@ -544,6 +544,44 @@ TEST(Kernel_AllReduceFusion, AllReduceAccuracyFixedTokenNum)
     }
     int iter = 10;
     std::vector<int> candidate_hidden_dim{1024, 2048, 4096, 7168, 8192};
+    int min_token_num = 1;
+    int max_token_num = 2048;
+    for (auto hidden_dim : candidate_hidden_dim)
+    {
+        Runner runner(max_token_num, hidden_dim);
+        for (int token_num = min_token_num; token_num <= max_token_num; token_num *= 2)
+        {
+            if (rank == 0)
+            {
+                printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
+            }
+            for (int i = 0; i < iter; ++i)
+            {
+                runner.reset_io();
+                runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+                runner.verify(token_num, hidden_dim);
+            }
+            if (rank == 0)
+            {
+                printf("\033[32mPass!\033[0m\n");
+            }
+        }
+    }
+}
+
+TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
+{
+    using Runner = TestRunner<half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant>;
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    if (world_size % 2)
+    {
+        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
+        return;
+    }
+    int iter = 10;
+    std::vector<int> candidate_hidden_dim{64, 128, 256, 384, 512, 640, 768, 896};
     int min_token_num = 1;
     int max_token_num = 2048;
     for (auto hidden_dim : candidate_hidden_dim)

@@ -15,7 +15,6 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -71,20 +70,6 @@ class MixtralMoE(nn.Module):
         return final_hidden_states
 
 
-class MixtralRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
-
 class MixtralAttention(Attention):
 
     def __init__(
@@ -93,21 +78,15 @@ class MixtralAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
-
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=MixtralRotaryEmbedding(config),
-                         pos_embd_params=pos_embd_params,
+                         pos_embd_params=PositionalEmbeddingParams(
+                             type=PositionEmbeddingType.rope_gpt_neox,
+                             rope=RopeParams.from_config(config),
+                         ),
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config)

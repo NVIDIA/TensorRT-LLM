@@ -1,5 +1,5 @@
 import copy
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -22,28 +22,11 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
                              register_auto_model, support_pp,
                              unpack_hidden_states)
-
-
-class LlamaRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(
-        self,
-        config: LlamaConfig,
-        device: Optional[torch.device] = None,
-    ):
-        super().__init__(
-            config,
-            head_dim=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            device=device,
-            rope_type="default" if config.rope_scaling is None else "llama3")
 
 
 class Llama4Attention(Attention):
@@ -60,11 +43,11 @@ class Llama4Attention(Attention):
         # Note the convention no_rope_layers[layer_idx] == 0 means nope_layer
         is_nope_layer = config.no_rope_layers[layer_idx] == 0
 
-        use_rope = not is_nope_layer
-        if use_rope and model_config.fuse_pos_embd:
+        if not is_nope_layer:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
                 rope=RopeParams.from_config(config),
+                is_neox=False,
             )
         else:
             pos_embd_params = None
@@ -75,7 +58,6 @@ class Llama4Attention(Attention):
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=LlamaRotaryEmbedding(config),
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
@@ -93,21 +75,16 @@ class LlamaAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
-            rotary_emb=LlamaRotaryEmbedding(config),
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -152,7 +129,7 @@ class Llama4MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            is_expert=True)
+            reduce_output=False)
 
         self.router = Linear(hidden_size,
                              num_experts,
@@ -285,7 +262,7 @@ class Llama4DecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -416,7 +393,7 @@ class LlamaDecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -754,8 +731,14 @@ class Eagle3LlamaDraftModel(DecoderModel):
 
         config = model_config.pretrained_config
         self.dtype = config.torch_dtype
+        self.hidden_size = config.hidden_size
 
-        self.fc = Linear(config.hidden_size * 3,
+        if hasattr(config, "target_hidden_size"):
+            self.hidden_size_in = config.target_hidden_size
+        else:
+            self.hidden_size_in = config.hidden_size
+
+        self.fc = Linear(self.hidden_size_in * 3,
                          config.hidden_size,
                          bias=False,
                          dtype=config.torch_dtype)
@@ -770,32 +753,50 @@ class Eagle3LlamaDraftModel(DecoderModel):
                                             dtype=torch.int64),
                                 requires_grad=False)
 
+        if self.hidden_size_in != config.hidden_size:
+            self.embed_tokens = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                dtype=config.torch_dtype,
+                parallel_config=ParallelConfig(
+                    tensor_parallel_rank=model_config.mapping.tp_rank,
+                    tensor_parallel_size=model_config.mapping.tp_size,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    pipeline_parallel_size=model_config.mapping.pp_size,
+                    parallel_rank=model_config.mapping.rank,
+                    gather_output=True,
+                    gpus_per_node=model_config.mapping.gpus_per_node,
+                ),
+            )
+        else:
+            # Shared with target model.
+            self.embed_tokens = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        embed_tokens: torch.nn.Module,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        assert self.embed_tokens is not None
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
         if inputs_embeds is None:
-            inputs_embeds = embed_tokens(input_ids).to(self.dtype)
+            inputs_embeds = self.embed_tokens(input_ids).to(self.dtype)
 
-        assert hidden_states is not None and len(hidden_states) > 0
+        assert hidden_states is not None
 
-        if len(hidden_states) > 1:
-            hidden_states = torch.cat(hidden_states, dim=-1)
-            hidden_states = self.fc(hidden_states.to(self.dtype))
-        else:
-            hidden_states = hidden_states[0].to(self.dtype)
-
+        # NOTE: If hidden states from the target model have to be concatenated,
+        # we expect that to happen outside the model definition. This helps us
+        # avoid data-dependent control flow and gives us better CUDA graph
+        # coverage.
         hidden_states, residual = self.midlayer(position_ids=position_ids,
                                                 embeds=inputs_embeds,
                                                 hidden_states=hidden_states,
@@ -804,7 +805,7 @@ class Eagle3LlamaDraftModel(DecoderModel):
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
         assert isinstance(spec_metadata, Eagle3SpecMetadata)
-        spec_metadata.hidden_states.append(hidden_states_to_save)
+        spec_metadata.maybe_capture_hidden_states(1, hidden_states_to_save)
         return hidden_states
 
 
@@ -833,17 +834,8 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if "embed_tokens" not in kwargs:
-            raise ValueError(
-                "EAGLE3 checkpoints do not include embed_tokens. "
-                "The embed_tokens module from the target model therefore needs to "
-                "be passed explicitly via extra_model_inputs. NOTE: we can "
-                "get rid of this hack by providing our own custom checkpoint "
-                "format that includes embed_tokens.")
-
         output = self.model(
             input_ids=input_ids,
-            embed_tokens=kwargs['embed_tokens'],
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
@@ -861,7 +853,41 @@ class Eagle3LlamaForCausalLM(DecoderModelForCausalLM[Eagle3LlamaDraftModel,
     def load_weights(self, weights: Dict):
         new_weights = {}
         for k, v in weights.items():
-            new_k = "model." + k if 'lm_head' not in k and "embed_tokens" not in k else k
+            new_k = "model." + k if 'lm_head' not in k else k
             new_weights[new_k] = v
 
         super().load_weights(new_weights)
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        if self.model.embed_tokens is None:
+            self.model.embed_tokens = target_model.model.embed_tokens
+
+    # TODO: should input/position IDs be included in this? Keeping it implicit
+    # for now since the shapes/dtypes are the same across all models we have.
+    def get_warmup_extra_inputs(self, batch_size: int,
+                                num_tokens: int) -> Dict[str, Any]:
+
+        hidden_states = torch.empty(batch_size * num_tokens,
+                                    self.model.hidden_size_in,
+                                    dtype=self.model.dtype,
+                                    device='cuda')
+
+        return {'hidden_states': hidden_states}
+
+    def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Hack for eagle3. We might need to run a matmul to reduce
+        the dimensionality of the hidden states on the first pass
+        through the draft model. Shape dependent control flow will
+        not work with CUDA graphs. So we have hoisted this logic out
+        of the forward pass - the pyexecutor will call this function
+        before running forward when applicable.
+        """
+        hidden_states = hidden_states.to(self.model.dtype)
+
+        expected_hidden_size = self.model.hidden_size
+        if hidden_states.shape[-1] != expected_hidden_size:
+            hidden_states = self.model.fc(hidden_states)
+
+        return hidden_states
