@@ -257,8 +257,9 @@ void MixtureOfExpertsPlugin::init()
         "MOE plugin only supports a different output type for FP4/FP8");
     TLLM_CHECK_WITH_INFO(mType != DataType::kFP8 || tensorrt_llm::common::getSMVersion() >= 89,
         "MoE FP8 is not supported for architectures less than SM89");
-    TLLM_CHECK_WITH_INFO(mType != DataType::kFP4 || tensorrt_llm::common::getSMVersion() >= 100,
-        "MoE FP4 is not supported for architectures less than SM100");
+    TLLM_CHECK_WITH_INFO(mType != DataType::kFP4
+            || (tensorrt_llm::common::getSMVersion() >= 100 && tensorrt_llm::common::getSMVersion() < 120),
+        "MoE FP4 is only supported on architecture SM100");
 
     TLLM_CHECK_WITH_INFO(!hasLora() || mLoraType == mOutputType, "The LoraType need to keep same with moe OutputType.");
 

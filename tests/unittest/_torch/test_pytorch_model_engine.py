@@ -1,10 +1,11 @@
 import unittest
 from dataclasses import dataclass
 
+import torch
+
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.distributed import *
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,

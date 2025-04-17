@@ -240,6 +240,7 @@ class FusedMoE(nn.Module):
         aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        apply_router_weight_on_input: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -302,6 +303,9 @@ class FusedMoE(nn.Module):
         if not model_config.skip_create_weights:
             self.create_weights()
 
+        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
     def setup_quant_scales(self):
         self.quant_scales = None
         if not self.has_any_quant:
@@ -318,7 +322,7 @@ class FusedMoE(nn.Module):
                 fc_weight_scales=self.w3_w1_weight_scaling_factor,
                 proj_weight_scales=self.w2_weight_scaling_factor,
             )
-        elif self.has_nv_fp4:
+        elif self.has_nvfp4:
             self.quant_scales = FusedMoEQuantScalesNVFP4(
                 fc1_act_global=self.fc31_input_scale,
                 fc1_weight_block=self.w3_w1_weight_scale,
@@ -346,7 +350,7 @@ class FusedMoE(nn.Module):
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
-        self.has_nv_fp4 = False
+        self.has_nvfp4 = False
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             self.has_any_quant = True
             qc = self.quant_config
@@ -403,7 +407,7 @@ class FusedMoE(nn.Module):
                 self.register_parameter("w2_weight_scaling_factor",
                                         w2_weight_scaling_factor)
             elif qc.quant_mode.has_nvfp4():
-                self.has_nv_fp4 = True
+                self.has_nvfp4 = True
                 weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
                 self.scaling_vector_size = 16
                 # Divide by 16 because we use int64 to pack 16 fp4 values
@@ -558,12 +562,18 @@ class FusedMoE(nn.Module):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            token_final_scales = None
+
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
-            elif self.has_nv_fp4:
+            elif self.has_nvfp4:
                 if not disable_fp4_allgather():
                     if isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = x.fp4_tensor, x.scaling_factor
@@ -736,10 +746,10 @@ class FusedMoE(nn.Module):
                 w3_weight = weights[f"{expert_id}.w3.weight"]
                 w2_weight = weights[f"{expert_id}.w2.weight"]
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_idx].transpose(
+                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_idx].transpose(0, 1)
+                w2_weight = weights["down_proj"][expert_id].transpose(0, 1)
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"

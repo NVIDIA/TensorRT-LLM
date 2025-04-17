@@ -793,7 +793,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
 
     if (std::is_same_v<input_t, float>)
     {
-        if (tensorrt_llm::common::getSMVersion() >= 90)
+        if (tensorrt_llm::common::getSMVersion() >= 90 && tensorrt_llm::common::getSMVersion() < 120)
         {
             if (B * L * D <= 262144)
             {
