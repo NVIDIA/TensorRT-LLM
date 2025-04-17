@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/llama4RouterGemm.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/llama4RouterGemm.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -42,33 +42,30 @@ namespace
 class Llama4RouterGemmOp
 {
 public:
-    Llama4RouterGemmOp()
-    {
-    }
+    Llama4RouterGemmOp() {}
 
     ~Llama4RouterGemmOp() = default;
 
     torch::Tensor run(torch::Tensor inputA, torch::Tensor inputB) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
-        auto output = torch::empty({inputA.size(0), NUM_EXPERT},
-        torch::TensorOptions()
-            .dtype(inputA.dtype())
-            .device(inputA.device()));
+        auto output = torch::empty(
+            {inputA.size(0), NUM_EXPERT}, torch::TensorOptions().dtype(inputA.dtype()).device(inputA.device()));
 
         llama4_router_gemm_op(inputA.size(0), inputA.data_ptr(), inputB.data_ptr(), output.data_ptr(), stream);
 
         return output;
     }
 
-    int initialize() noexcept {
+    int initialize() noexcept
+    {
         return 0;
     }
-
 };
 } // namespace
 
-torch::Tensor llama4_router_gemm(torch::Tensor inputA, torch::Tensor inputB) {
+torch::Tensor llama4_router_gemm(torch::Tensor inputA, torch::Tensor inputB)
+{
     Llama4RouterGemmOp op;
     return op.run(inputA, inputB);
 }

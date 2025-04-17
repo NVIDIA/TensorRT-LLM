@@ -364,7 +364,7 @@ class AutoTuner:
                         try:
                             time_measured = self._profile_single_kernel(
                                 r, tensors, tac, **kwargs)
-                        except Exception as e:
+                        except Exception:
                             # TODO: Uncomment below log statements after fixing the issue of unsupported tactics returned incorrectly
                             # logger.error(
                             #     f"[Autotuner]: Failed when profiling {r} {tac}, shapes={[t.size() for t in tensors]}. Error occurred: {e}"

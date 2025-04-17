@@ -357,7 +357,8 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states, residual = self.pre_mlp_fp8_allreduce(
                 hidden_states,
                 [
-                    residual, self.post_attention_layernorm.weight,
+                    residual,
+                    self.post_attention_layernorm.weight,
                     self.feed_forward.gate_up_proj.input_scale,
                 ],
                 self.post_attention_layernorm.variance_epsilon,

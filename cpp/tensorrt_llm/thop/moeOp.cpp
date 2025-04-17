@@ -16,9 +16,9 @@
 
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
-#include "tensorrt_llm/kernels/llama4MinLatencyMoEOp.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
+#include "tensorrt_llm/kernels/llama4MinLatencyMoEOp.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -580,8 +580,7 @@ torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, to
 
     TORCH_CHECK(input.dim() == 2, "input must be 2D.");
     TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2D.");
-    TORCH_CHECK(input.sizes()[0] == router_logits.sizes()[0],
-        "input and router_logits must have the same num tokens.");
+    TORCH_CHECK(input.sizes()[0] == router_logits.sizes()[0], "input and router_logits must have the same num tokens.");
 
     TORCH_CHECK(fc1_expert_weights.dim() == 3, "fc1_expert_weights must be 3D.");
     TORCH_CHECK(fc2_expert_weights.dim() == 3, "fc2_expert_weights must be 3D.");
@@ -589,7 +588,7 @@ torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, to
         "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
     TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * 2,
         "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
-    
+
     int64_t num_rows = input.sizes()[0];
     int64_t hidden_size = fc2_expert_weights.sizes()[1];
     int64_t inter_size = fc2_expert_weights.sizes()[2];
@@ -608,10 +607,8 @@ torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, to
     TORCH_CHECK(fc1_dequant.dim() == 1, "fc1 dequant must be 1D");
     TORCH_CHECK(fc2_quant.dim() == 0, "fc2 quant must be a scalar tensor");
     TORCH_CHECK(fc2_dequant.dim() == 1, "fc2 quant must be 1D");
-    TORCH_CHECK(
-        fc1_dequant.sizes()[0] == num_experts, "fc1 dequant size must be (num_experts,)");
-    TORCH_CHECK(
-        fc2_dequant.sizes()[0] == num_experts, "fc2 dequant size must be (num_experts,)");
+    TORCH_CHECK(fc1_dequant.sizes()[0] == num_experts, "fc1 dequant size must be (num_experts,)");
+    TORCH_CHECK(fc2_dequant.sizes()[0] == num_experts, "fc2 dequant size must be (num_experts,)");
 
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -622,12 +619,11 @@ torch::Tensor fused_moe_llama4_tp8ep1_min_latency(torch::Tensor const& input, to
     std::vector<int64_t> output_shape = {num_rows, hidden_size};
     auto output = torch::empty(output_shape, input.options().dtype(c10::ScalarType::BFloat16));
 
-    tensorrt_llm::kernels::run_moe_llama4_tp8ep1_min_latency(
-        num_rows, num_experts, input.const_data_ptr(), router_logits.const_data_ptr(),
-        fc1_expert_weights.const_data_ptr(), fc2_expert_weights.const_data_ptr(),
+    tensorrt_llm::kernels::run_moe_llama4_tp8ep1_min_latency(num_rows, num_experts, input.const_data_ptr(),
+        router_logits.const_data_ptr(), fc1_expert_weights.const_data_ptr(), fc2_expert_weights.const_data_ptr(),
         static_cast<float const*>(fc1_dequant.data_ptr()), static_cast<float const*>(fc2_quant.data_ptr()),
-        static_cast<float const*>(fc2_dequant.data_ptr()), fc2_input.data_ptr(),
-        static_cast<int*>(exp_idx.data_ptr()), output.data_ptr(), stream);
+        static_cast<float const*>(fc2_dequant.data_ptr()), fc2_input.data_ptr(), static_cast<int*>(exp_idx.data_ptr()),
+        output.data_ptr(), stream);
 
     return output;
 }

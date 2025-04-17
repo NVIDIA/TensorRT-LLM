@@ -27,6 +27,6 @@
 namespace tensorrt_llm::kernels::llama4_router_gemm
 {
 
-void llama4_router_gemm_op(int num_tokens, const void* A, const void* B, void* C, cudaStream_t stream);
+void llama4_router_gemm_op(int num_tokens, void const* A, void const* B, void* C, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::llama4_router_gemm

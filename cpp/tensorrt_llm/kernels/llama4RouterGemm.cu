@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #include "tensorrt_llm/kernels/llama4RouterGemm.h"
 
 #define GEMM_K 5120
@@ -25,7 +24,9 @@ namespace tensorrt_llm::kernels::llama4_router_gemm
 {
 
 #define VEC_SIZE 4
-struct __align__(8) aligned_bf16x4 {
+
+struct __align__(8) aligned_bf16x4
+{
     __align__(8) __nv_bfloat16 data[VEC_SIZE];
 };
 
@@ -64,16 +65,18 @@ __global__ void gemv_kernel(int num_tokens,
 
     // Process 5 chunks of 4 elements each
 #pragma unroll
-    for (int chunk = 0; chunk < GEMM_K / BLOCK_SIZE / VEC_SIZE; chunk++) {
+    for (int chunk = 0; chunk < GEMM_K / BLOCK_SIZE / VEC_SIZE; chunk++)
+    {
         // Base index for this chunk
         int base_idx = chunk * BLOCK_SIZE + tid;
 
         // Load 4 elements at once
         aligned_bf16x4 a_vec = reinterpret_cast<aligned_bf16x4 const*>(A)[token_idx * GEMM_K / VEC_SIZE + base_idx];
 #pragma unroll
-        for (int i = 0; i < VEC_SIZE; i+=2) {
+        for (int i = 0; i < VEC_SIZE; i += 2)
+        {
 
-            float2 a_val = make_float2(a_vec.data[i], a_vec.data[i+1]);
+            float2 a_val = make_float2(a_vec.data[i], a_vec.data[i + 1]);
             float2 b_val = make_float2(b_vec[chunk].data[i], b_vec[chunk].data[i + 1]);
 
 #if __CUDA_ARCH__ >= 1000
@@ -100,7 +103,8 @@ __global__ void gemv_kernel(int num_tokens,
     __syncthreads();
 
     // Final thread reduces across warps and writes the result
-    if (tid == 0) {
+    if (tid == 0)
+    {
         float block_sum = 0.0f;
         for (int i = 0; i < BLOCK_SIZE / warpSize; i++)
         {
@@ -143,9 +147,9 @@ void llama4_router_gemm_op(int num_tokens, void const* A, void const* B, void* C
 {
     __nv_bfloat16 const* A_bf16 = static_cast<__nv_bfloat16 const*>(A);
     __nv_bfloat16 const* B_bf16 = static_cast<__nv_bfloat16 const*>(B);
-    __nv_bfloat16* C_bf16 = static_cast<__nv_bfloat16*>(C); 
+    __nv_bfloat16* C_bf16 = static_cast<__nv_bfloat16*>(C);
 
     gemv_kernel_launcher(num_tokens, A_bf16, B_bf16, C_bf16, stream);
 }
 
-} // namespace tensorrt_llm::kernels::router_gemm
+} // namespace tensorrt_llm::kernels::llama4_router_gemm

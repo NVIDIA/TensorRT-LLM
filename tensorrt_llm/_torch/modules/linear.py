@@ -386,7 +386,8 @@ class Linear(nn.Module):
     def llama4_router_forward(self, input: torch.Tensor):
         # This magic number 4 is empircal choice, and can be changed later.
         if input.shape[0] <= 4:
-            return torch.ops.trtllm.llama4_router_gemm(input, torch.transpose(self.weight, 0, 1))
+            return torch.ops.trtllm.llama4_router_gemm(
+                input, torch.transpose(self.weight, 0, 1))
         else:
             return self.forward(input)
 
