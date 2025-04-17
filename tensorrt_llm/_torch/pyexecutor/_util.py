@@ -147,11 +147,12 @@ def get_token_num_for_estimation(executor_config, model_config):
         return None
 
 
-def estimate_max_kv_cache_tokens(
-        py_executor: PyExecutor, model_engine: PyTorchModelEngine,
-        executor_config: ExecutorConfig, mapping: Mapping, origin_seq_len: int,
-        ctx_chunk_config, draft_model_engine: PyTorchModelEngine,
-        pytorch_backend_config):
+def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
+                                 model_engine: PyTorchModelEngine,
+                                 executor_config: ExecutorConfig,
+                                 mapping: Mapping, origin_seq_len: int,
+                                 ctx_chunk_config,
+                                 draft_model_engine: PyTorchModelEngine):
     # TODO: support CP by generating dummy requests for it.
     if 'cp_type' in mapping.cp_config:
         return executor_config.max_num_tokens
@@ -167,14 +168,6 @@ def estimate_max_kv_cache_tokens(
     logger.info(
         f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
     )
-
-    spec_decoder = None
-    if executor_config.speculative_config is not None:
-        spec_decoder = get_spec_decoder(
-            max_seq_len=model_engine.max_seq_len,
-            spec_config=executor_config.speculative_config)
-    decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
-                                  pytorch_backend_config, mapping)
 
     py_executor.set_gather_responses(True)
     origin_iter_stats = py_executor.enable_iter_perf_stats
