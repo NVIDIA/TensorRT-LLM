@@ -131,9 +131,9 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
-        self.enable_rope_fusion = self.attn.features().has_rope()
-        self.support_fused_qkv = self.attn.features().has_fused_qkv()
-        self.support_unfused_qkv = self.attn.features().has_unfused_qkv()
+        self.enable_rope_fusion = self.attn.features().fused_rope()
+        self.support_fused_qkv = self.attn.features().fused_qkv()
+        self.support_unfused_qkv = self.attn.features().unfused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
                                  and pos_embd_params is not None)
@@ -505,9 +505,9 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = self.mha.features().has_rope()
-        self.support_fused_qkv = self.mha.features().has_fused_qkv()
-        self.support_unfused_qkv = self.mha.features().has_unfused_qkv()
+        self.enable_rope_fusion = self.mha.features().fused_rope()
+        self.support_fused_qkv = self.mha.features().fused_qkv()
+        self.support_unfused_qkv = self.mha.features().unfused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.enable_rope_fusion
         if self.apply_rotary_emb:

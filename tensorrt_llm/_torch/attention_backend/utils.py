@@ -45,7 +45,7 @@ def create_attention(
     attn_cls = get_attention_backend(backend_name)
 
     if is_mla_enable:
-        assert attn_cls.features().has_mla(
+        assert attn_cls.features().mla(
         ), f"MLA is not supported for {backend_name} backend"
         assert (q_lora_rank > 0 and kv_lora_rank > 0 and qk_rope_head_dim > 0
                 and qk_nope_head_dim > 0 and v_head_dim > 0)

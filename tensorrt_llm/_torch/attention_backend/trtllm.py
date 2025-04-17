@@ -738,4 +738,4 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @classmethod
     def features(cls) -> AttentionBackendFeature:
-        return AttentionBackendFeature.ROPE | AttentionBackendFeature.FUSED_QKV | AttentionBackendFeature.MLA
+        return AttentionBackendFeature.FUSED_ROPE | AttentionBackendFeature.FUSED_QKV | AttentionBackendFeature.MLA

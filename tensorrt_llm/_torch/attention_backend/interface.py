@@ -488,7 +488,7 @@ class AttentionBackendFeature(IntFlag):
     """
     Features supported by attention backends.
     """
-    ROPE = auto()
+    FUSED_ROPE = auto()
     FUSED_QKV = auto()
     UNFUSED_QKV = auto()
     MLA = auto()
@@ -496,16 +496,16 @@ class AttentionBackendFeature(IntFlag):
     def _any(self, bits):
         return (self & bits) != 0
 
-    def has_rope(self) -> bool:
-        return self._any(self.ROPE)
+    def fused_rope(self) -> bool:
+        return self._any(self.FUSED_ROPE)
 
-    def has_fused_qkv(self) -> bool:
+    def fused_qkv(self) -> bool:
         return self._any(self.FUSED_QKV)
 
-    def has_unfused_qkv(self) -> bool:
+    def unfused_qkv(self) -> bool:
         return self._any(self.UNFUSED_QKV)
 
-    def has_mla(self) -> bool:
+    def mla(self) -> bool:
         return self._any(self.MLA)
 
 
