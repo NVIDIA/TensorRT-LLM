@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from json import loads
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -145,6 +147,19 @@ class GemmaConfig(PretrainedConfig):
             } if self.is_gemma_3 else {})
         }
 
+    @staticmethod
+    def get_hf_config(config_dir: "Union[str, PathLike]"):
+        import transformers
+        model_type = loads(
+            (Path(config_dir) / "config.json").read_text())["model_type"]
+        HFConfigClass = {
+            "gemma2": transformers.GemmaConfig,
+            "gemma": transformers.Gemma2Config,
+            "gemma3_text": transformers.Gemma3TextConfig,
+        }[model_type]
+        hf_config = HFConfigClass.from_pretrained(config_dir)
+        return hf_config
+
     @classmethod
     def from_hugging_face(
         cls,
@@ -158,8 +173,7 @@ class GemmaConfig(PretrainedConfig):
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
-            hf_config = transformers.GemmaConfig.from_pretrained(
-                hf_config_or_dir)
+            hf_config = cls.get_hf_config(hf_config_or_dir)
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
