@@ -2,7 +2,7 @@ import copy
 import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum
+from enum import Enum, IntEnum, IntFlag, auto
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
@@ -484,6 +484,31 @@ class PredefinedAttentionMask(str, Enum):
 AttentionMask = Union[PredefinedAttentionMask]
 
 
+class AttentionBackendFeature(IntFlag):
+    """
+    Features supported by attention backends.
+    """
+    ROPE = auto()
+    FUSED_QKV = auto()
+    UNFUSED_QKV = auto()
+    MLA = auto()
+
+    def _any(self, bits):
+        return (self & bits) != 0
+
+    def has_rope(self) -> bool:
+        return self._any(self.ROPE)
+
+    def has_fused_qkv(self) -> bool:
+        return self._any(self.FUSED_QKV)
+
+    def has_unfused_qkv(self) -> bool:
+        return self._any(self.UNFUSED_QKV)
+
+    def has_mla(self) -> bool:
+        return self._any(self.MLA)
+
+
 class AttentionBackend(Generic[TMetadata]):
     """
     Base class for attention backends.
@@ -538,6 +563,10 @@ class AttentionBackend(Generic[TMetadata]):
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """
         raise NotImplementedError
+
+    @classmethod
+    def features(cls) -> AttentionBackendFeature:
+        return AttentionBackendFeature.UNFUSED_QKV
 
 
 @dataclass(kw_only=True, unsafe_hash=True)

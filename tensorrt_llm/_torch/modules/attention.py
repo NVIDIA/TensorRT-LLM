@@ -6,8 +6,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 TrtllmAttention)
+from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
@@ -132,9 +131,9 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
-        self.enable_rope_fusion = self.attn_backend == "TRTLLM"
-        self.support_fused_qkv = self.attn_backend == "TRTLLM"
-        self.support_unfused_qkv = self.attn_backend != "TRTLLM"
+        self.enable_rope_fusion = self.attn.features().has_rope()
+        self.support_fused_qkv = self.attn.features().has_fused_qkv()
+        self.support_unfused_qkv = self.attn.features().has_unfused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
                                  and pos_embd_params is not None)
@@ -506,9 +505,9 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = isinstance(self.mha, TrtllmAttention)
-        self.support_fused_qkv = isinstance(self.mha, TrtllmAttention)
-        self.support_unfused_qkv = not isinstance(self.mha, TrtllmAttention)
+        self.enable_rope_fusion = self.mha.features().has_rope()
+        self.support_fused_qkv = self.mha.features().has_fused_qkv()
+        self.support_unfused_qkv = self.mha.features().has_unfused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.enable_rope_fusion
         if self.apply_rotary_emb:
