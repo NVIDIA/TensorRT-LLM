@@ -131,19 +131,6 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
-        self.enable_rope_fusion = self.attn.features().fused_rope()
-        self.support_fused_qkv = self.attn.features().fused_qkv()
-        self.support_unfused_qkv = self.attn.features().unfused_qkv()
-        self.rotary_emb = None
-        self.apply_rotary_emb = (not self.enable_rope_fusion
-                                 and pos_embd_params is not None)
-        if self.apply_rotary_emb:
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
-
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
         # handles them as a single fused operation.
@@ -157,10 +144,23 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        if not config.skip_create_weights:
-            self.create_weights()
+        self.create_backend()
 
-    def create_weights(self):
+        self.enable_rope_fusion = self.attn.features().fused_rope()
+        self.support_fused_qkv = self.attn.features().fused_qkv()
+        self.support_unfused_qkv = self.attn.features().unfused_qkv()
+
+        self.rotary_emb = None
+        self.apply_rotary_emb = (not self.enable_rope_fusion
+                                 and pos_embd_params is not None)
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
+    def create_backend(self):
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -170,6 +170,10 @@ class Attention(nn.Module):
             pos_embd_params=self.pos_embd_params,
             quant_config=self.quant_config,
         )
+
+    def create_weights(self):
+        # recreate the backend when quant_config changes
+        self.create_backend()
 
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
