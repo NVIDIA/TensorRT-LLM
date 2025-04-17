@@ -163,7 +163,16 @@ class AttentionMetadata:
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
             self._seq_lens = self._seq_lens.pin_memory()
-            self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
+            if self.is_cuda_graph and self._seq_lens_cuda is not None:
+                # Very important: do not reallocate if we are using CUDA graphs.
+                # This copy is safe because the batch size is guaranteed to not
+                # change in the CUDA graph case. The seqlens can change if we
+                # are doing spec decode.
+                self._seq_lens_cuda.copy_(self._seq_lens)
+            else:
+                self._seq_lens_cuda = self._seq_lens.cuda(non_blocking=True)
+
         if self.has_cross_sub_metadata:
             self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
@@ -268,6 +277,9 @@ class AttentionMetadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
                 max_batch_size, True)
         if not sub_cross_metadata:
+            # Set to None to force the cuda graph metadata to allocate a tensor
+            # with the correct batch size. See seq_lens setter for how this works.
+            cuda_graph_metadata._seq_lens_cuda = None
             cuda_graph_metadata.seq_lens = torch.ones(
                 (max_batch_size, ), dtype=torch.int) * (1 + max_draft_tokens)
         if self.is_cross:
