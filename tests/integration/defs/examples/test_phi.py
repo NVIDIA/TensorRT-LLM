@@ -38,7 +38,7 @@ from evaltool.constants import (EVALTOOL_INFERENCE_SERVER_STARTUP_SCRIPT,
 @pytest.fixture(scope="module")
 def phi_example_root(llm_root, llm_venv):
     "Get phi example root"
-    example_root = os.path.join(llm_root, "examples", "phi")
+    example_root = os.path.join(llm_root, "examples", "model", "core", "phi")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
