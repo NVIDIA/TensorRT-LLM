@@ -411,10 +411,6 @@ void initBindings(pybind11::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
 
-    py::bind_vector<tb::RequestVector>(m, "RequestVector");
-    // Note: Making an opaque binding out of RequestList would impact any std::vector<unsigned> conversion
-    // PybindUtils::bindList<tb::RequestList>(m, "RequestList");
-
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
             py::arg("max_sequence_idle_microseconds"))
@@ -466,13 +462,16 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
+        .def_property_readonly("sequence_lengths_host",
+            [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengthsHost); })
+        .def_property_readonly(
+            "finished_sum_host", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.finishedSumHost); })
         .def_property_readonly("new_output_tokens_host",
             [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
         .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
         .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
+        .def_property_readonly(
+            "finish_reasons_host", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.finishReasonsHost); })
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")

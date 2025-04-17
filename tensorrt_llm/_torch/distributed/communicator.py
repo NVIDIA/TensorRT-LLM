@@ -1,7 +1,7 @@
 import atexit
 import os
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, ValuesView
 
 import numpy as np
 import torch
@@ -122,6 +122,39 @@ class MPIDist(Distributed):
 
     def recv_tensor(self, tensor: torch.Tensor, src, tag=0):
         return self.recv(tensor.numpy(), src, tag)
+
+    def isend_tensor_list(self,
+                          tensor_list: ValuesView[torch.Tensor],
+                          dest,
+                          tag=0):
+        if len(tensor_list) == 0:
+            return None
+        elif len(tensor_list) == 1:
+            return self.isend_tensor(tensor_list[0], dest, tag)
+
+        return self.isend(
+            np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
+
+    def recv_tensor_list(self,
+                         tensor_list: ValuesView[torch.Tensor],
+                         src,
+                         tag=0):
+        if len(tensor_list) == 0:
+            return None
+        elif len(tensor_list) == 1:
+            return self.recv_tensor(tensor_list[0], src, tag)
+
+        # Prepare buffer to receive tensor_list
+        recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
+                               dtype=np.uint8)
+        # Receive tensors
+        self.recv(recv_buffer, src, tag)
+        # Assign to tensor_list
+        offset = 0
+        for t in tensor_list:
+            t.copy_(torch.from_numpy(recv_buffer[offset:offset + t.numel()]))
+            offset += t.numel()
+        return None
 
     def create_tp_comm(self):
         new_group = mpi_comm().group.Incl(self.mapping.tp_group)
