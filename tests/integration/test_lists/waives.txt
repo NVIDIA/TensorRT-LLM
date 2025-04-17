@@ -456,3 +456,5 @@ examples/test_medusa.py::test_llama_medusa_1gpu[llama-3.1-8b] SKIP (https://nvbu
 examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16] SKIP (https://nvbugspro.nvidia.com/bug/5226339)
 examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:True-nb:1] SKIP (https://nvbugs/5227342)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)
+perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
+perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
