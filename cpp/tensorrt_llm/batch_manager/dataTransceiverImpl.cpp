@@ -104,7 +104,7 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
             "NIXL: Received request info %d from rank %d and buffer descriptor (addr: %p, size: %zu, devid: %d)",
             requestId, connection->getRank(), (void*) bufferDesc.addr, bufferDesc.len, bufferDesc.devId);
         // Receive buffer descriptor
-        auto tag = ((requestId & 0xFFF) << 12) | (43 & 0xFF);
+        auto tag = REQUEST_INFO_TAG(requestId);
         nixlManager1->setRecvBufferInfo(connection->getRank(), tag, bufferDescStr);
     }
     else

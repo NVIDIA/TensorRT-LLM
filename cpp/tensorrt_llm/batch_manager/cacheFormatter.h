@@ -36,6 +36,7 @@
 
 #define GET_BUFFER_TAG(llmRequestContextReqId, remoteRank)                                                             \
     std::to_string(llmRequestContextReqId) + ":" + std::to_string(remoteRank)
+#define REQUEST_INFO_TAG(requestId) ((requestId & 0xFFF) << 8) | (43 & 0xFF)
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -46,13 +47,13 @@ public:
     static void sendBuffer(
         executor::kv_cache::Connection const& connection, runtime::IBuffer const& buf, uint64_t requestId)
     {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+        int const tag = REQUEST_INFO_TAG(requestId);
         connection.send(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
     }
 
     static void recvBuffer(executor::kv_cache::Connection const& connection, runtime::IBuffer& buf, uint64_t requestId)
     {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+        int const tag = REQUEST_INFO_TAG(requestId);
         connection.recv(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
     }
 
