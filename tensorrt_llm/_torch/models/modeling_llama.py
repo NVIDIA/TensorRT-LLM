@@ -86,7 +86,8 @@ class Llama4Attention(Attention):
             config=model_config,
             use_qk_norm=use_qk_norm,
             aux_stream=aux_stream,
-            attn_temperature_tuning=attn_temperature_tuning)
+            attn_temperature_tuning=attn_temperature_tuning,
+            is_llama4=True)
 
 
 class LlamaAttention(Attention):
@@ -250,7 +251,7 @@ class Llama4DecoderLayer(DecoderLayer):
             model_config,
             layer_idx=layer_idx,
             use_qk_norm=getattr(config, "use_qk_norm", False),
-            aux_stream=aux_stream,
+            aux_stream=aux_stream
         )
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0

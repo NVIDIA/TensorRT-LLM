@@ -58,6 +58,7 @@ class Attention(nn.Module):
         use_qk_norm: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         attn_temperature_tuning: bool = False,
+        is_llama4: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -103,6 +104,7 @@ class Attention(nn.Module):
         else:
             self.qk_norm = None
 
+        self.is_llama4 = is_llama4
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -119,7 +121,7 @@ class Attention(nn.Module):
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
-            use_llama4_qkv=True,
+            use_llama4_qkv=is_llama4,
         )
         self.o_proj = Linear(
             self.hidden_size,

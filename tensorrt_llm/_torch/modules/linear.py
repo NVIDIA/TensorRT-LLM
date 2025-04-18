@@ -192,7 +192,7 @@ class Linear(nn.Module):
         # Llama4 QKV gemm kernel has hard requirement of hidden_size = 5120
         # and soft requirement of out_features = 896.
         self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
-        # Llama4 FC+SwiGLU kernel has hard requirement of hidden_size = 5120
+        # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
         self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
 
@@ -318,11 +318,11 @@ class Linear(nn.Module):
                 else:
                     qinput = input
                 if self.use_llama4_qkv and qinput.shape[0] <= 4:
-                    # Kernel is only efficient when M <= 4
+                    # Kernel is only supported when M <= 4
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput,
                         weight.t(),
-                        self.combined_scale
+                        self.combined_scale,
                     )
                 elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
                     output = torch.ops.trtllm.llama4_fc_swiglu_fp8(
@@ -468,6 +468,7 @@ class Linear(nn.Module):
                     copy(self.input_scale, input_scale[0])
                     copy(self.weight_scale, weight_scale[0])
                     self.inv_input_scale.data = 1.0 / self.input_scale
+                    self.combined_scale = self.input_scale * self.weight_scale
                 elif quant_mode.has_nvfp4():
                     input_scale, weight_scale, alpha = load_weight_scales_nvfp4(
                         weights,
