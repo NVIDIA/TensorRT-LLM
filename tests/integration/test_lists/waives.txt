@@ -458,3 +458,8 @@ examples/test_multimodal.py::test_llm_multimodal_general[neva-22b-pp:1-tp:1-bflo
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5201168)
 perf/test_perf.py::test_perf[gpt_350m-cppmanager-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
 perf/test_perf.py::test_perf[gpt_350m-cppmanager-static_batching-plugin-float16-bs:32-input_output_len:60,20] SKIP (https://nvbugs/5228840)
+examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int8_sq-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5232405)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5232406)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5232406)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5232406)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5232406)
