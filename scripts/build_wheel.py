@@ -52,7 +52,7 @@ def get_build_dir(build_dir, build_type):
         build_dir = get_source_dir() / ("build" if build_type == "Release" else
                                         f"build_{build_type}")
     else:
-        build_dir = Path(build_dir)
+        build_dir = Path(build_dir).resolve()
     return build_dir
 
 
@@ -137,8 +137,6 @@ def main(*,
     cmake_def_args = []
     cmake_generator = ""
 
-    hardware_arch = platform.machine()
-
     if on_windows:
         # Windows does not support multi-device currently.
         extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
@@ -164,21 +162,10 @@ def main(*,
         cmake_def_args.extend(set(extra_cmake_vars))
 
     if trt_root is not None:
-        trt_root = trt_root.replace("\\", "/")
-        trt_lib_dir_candidates = (
-            f"{trt_root}/targets/{hardware_arch}-linux-gnu/lib",
-            f"{trt_root}/lib")
-        try:
-            trt_lib_dir = next(
-                filter(lambda x: Path(x).exists(), trt_lib_dir_candidates))
-        except StopIteration:
-            trt_lib_dir = trt_lib_dir_candidates[0]
-        cmake_def_args.append(f"-DTRT_LIB_DIR={trt_lib_dir}")
-        cmake_def_args.append(f"-DTRT_INCLUDE_DIR={trt_root}/include")
+        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
 
     if nccl_root is not None:
-        cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
-        cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
+        cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not build_dir.exists()
