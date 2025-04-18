@@ -475,6 +475,115 @@ Total Latency (ms):             18563.6825
 
 ```
 
+#### Running multi-modal models in the PyTorch Workflow
+
+To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.
+
+First, prepare the dataset:
+```
+python ./benchmarks/cpp/prepare_dataset.py \
+  --tokenizer Qwen/Qwen2-VL-2B-Instruct \
+  --stdout \
+  dataset \
+  --dataset-name lmms-lab/MMMU \
+  --dataset-split test \
+  --dataset-image-key image \
+  --dataset-prompt-key question \
+  --num-requests 10 \
+  --output-len-dist 128,5 > mm_data.jsonl
+```
+It will download the media files to `/tmp` directory and prepare the dataset with their paths. Note that the `prompt` fields are texts and not tokenized ids. This is due to the fact that
+the `prompt` and the media (image/video) are processed by a preprocessor for multimodal files.
+
+Sample dataset for multimodal:
+```
+{"task_id":0,"prompt":"Brahma Industries sells vinyl replacement windows to home improvement retailers nationwide. The national sales manager believes that if they invest an additional $25,000 in advertising, they would increase sales volume by 10,000 units. <image 1> What is the total contribution margin?","media_paths":["/tmp/tmp9so41y3r.jpg"],"output_tokens":126}
+{"task_id":1,"prompt":"Let us compute for the missing amounts under work in process inventory, what is the cost of goods manufactured? <image 1>","media_paths":["/tmp/tmpowsrb_f4.jpg"],"output_tokens":119}
+{"task_id":2,"prompt":"Tsuji is reviewing the price of a 3-month Japanese yen/U.S. dollar currency futures contract, using the currency and interest rate data shown below. Because the 3-month Japanese interest rate has just increased to .50%, Itsuji recognizes that an arbitrage opportunity exists nd decides to borrow $1 million U.S. dollars to purchase Japanese yen. Calculate the yen arbitrage profit from Itsuji's strategy, using the following data: <image 1> ","media_paths":["/tmp/tmpxhdvasex.jpg"],"output_tokens":126}
+...
+```
+
+Run the benchmark:
+```
+trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
+  throughput \
+  --dataset mm_data.jsonl \
+  --backend pytorch \
+  --num_requests 10 \
+  --max_batch_size 4 \
+  --modality image
+```
+
+
+Sample output:
+```
+===========================================================
+= REQUEST DETAILS
+===========================================================
+Number of requests:             10
+Number of concurrent requests:  5.3019
+Average Input Length (tokens):  411.6000
+Average Output Length (tokens): 128.7000
+===========================================================
+= WORLD + RUNTIME INFORMATION
+===========================================================
+TP Size:                1
+PP Size:                1
+EP Size:                None
+Max Runtime Batch Size: 4
+Max Runtime Tokens:     12288
+Scheduling Policy:      GUARANTEED_NO_EVICT
+KV Memory Percentage:   90.00%
+Issue Rate (req/sec):   1.4117E+17
+
+===========================================================
+= PERFORMANCE OVERVIEW
+===========================================================
+Request Throughput (req/sec):                     1.4439
+Total Output Throughput (tokens/sec):             185.8351
+Per User Output Throughput (tokens/sec/user):     38.1959
+Per GPU Output Throughput (tokens/sec/gpu):       185.8351
+Total Token Throughput (tokens/sec):              780.1607
+Total Latency (ms):                               6925.4963
+Average request latency (ms):                     3671.8441
+
+-- Request Latency Breakdown (ms) -----------------------
+
+[Latency] P50    : 3936.3022
+[Latency] P90    : 5514.4701
+[Latency] P95    : 5514.4701
+[Latency] P99    : 5514.4701
+[Latency] MINIMUM: 2397.1047
+[Latency] MAXIMUM: 5514.4701
+[Latency] AVERAGE: 3671.8441
+
+===========================================================
+= DATASET DETAILS
+===========================================================
+Dataset Path:         /workspaces/tensorrt_llm/mm_data.jsonl
+Number of Sequences:  10
+
+-- Percentiles statistics ---------------------------------
+
+        Input              Output           Seq. Length
+-----------------------------------------------------------
+MIN:   167.0000           119.0000           300.0000
+MAX:  1059.0000           137.0000          1178.0000
+AVG:   411.6000           128.7000           540.3000
+P50:   299.0000           128.0000           427.0000
+P90:  1059.0000           137.0000          1178.0000
+P95:  1059.0000           137.0000          1178.0000
+P99:  1059.0000           137.0000          1178.0000
+===========================================================
+```
+
+**Notes and Limitations**:
+- Only image datasets are supported for now.
+- `--output-len-dist` is a required argument for multimodal datasets.
+- Tokenizer is unused during the prepare step but it is still a required argument.
+- Since the images are converted to tokens when the model is run, `trtllm-bench` uses a default large value for the maximum input sequence length when setting up the execution settings.
+  You can also modify the behavior by specifying a different value with the flag `--max_input_len` that suits your use-case.
+
 #### Quantization in the PyTorch Flow
 
 In order to run a quantized run with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized

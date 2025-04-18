@@ -17,7 +17,7 @@ def prepare_text_inputs(model_name, batch_size=8):
         f"HF_DATASETS_OFFLINE inside function: {datasets.config.HF_DATASETS_OFFLINE}"
     )
     if model_name == "BertForQuestionAnswering" or model_name == "RobertaForQuestionAnswering":
-        squad_dataset = load_dataset("squad_v2")
+        squad_dataset = load_dataset("squad_v2", trust_remote_code=True)
         val_dataset = squad_dataset["validation"]
         samples = val_dataset.select(range(batch_size))
 
@@ -27,7 +27,8 @@ def prepare_text_inputs(model_name, batch_size=8):
         }
         return qa_real_test_inputs
     elif model_name == "BertForSequenceClassification" or model_name == "RobertaForSequenceClassification":
-        yelp_dataset = load_dataset("fancyzhx/yelp_polarity")
+        yelp_dataset = load_dataset("fancyzhx/yelp_polarity",
+                                    trust_remote_code=True)
         val_dataset = yelp_dataset["test"]
         samples = val_dataset.select(range(batch_size))
 

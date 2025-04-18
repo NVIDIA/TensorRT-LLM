@@ -301,7 +301,6 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     run_command(command)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node_pytorch():
     nworkers = 2
@@ -313,10 +312,8 @@ def test_llm_multi_node_pytorch():
     run_command(command)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
                                   "run_llm_with_postproc.py")
@@ -436,18 +433,12 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_async_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 

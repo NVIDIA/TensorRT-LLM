@@ -36,7 +36,10 @@ class CnnDailymail(Evaluator):
                  system_prompt: Optional[str] = None):
         super().__init__(apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
-        self.data = datasets.load_dataset(dataset_path, "3.0.0", split="test")
+        self.data = datasets.load_dataset(dataset_path,
+                                          "3.0.0",
+                                          split="test",
+                                          trust_remote_code=True)
         self.data = self.data.shuffle(random_seed)
         if num_samples is None:
             self.num_samples = self.data.num_rows

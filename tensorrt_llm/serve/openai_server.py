@@ -126,6 +126,8 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        # TODO: workaround before ETCD support
+        self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -149,6 +151,16 @@ class OpenAIServer:
         async for stat in self.llm.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_kv_cache_events(self) -> JSONResponse:
+        events = []
+        try:
+            async for event in self.llm.get_kv_cache_events_async(2):
+                events.append(event)
+        except IndexError:
+            # queue is empty, no more events
+            pass
+        return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
