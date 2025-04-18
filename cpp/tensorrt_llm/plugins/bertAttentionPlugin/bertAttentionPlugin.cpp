@@ -73,7 +73,7 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
         std::vector<int> blockSizeCombination
             = {sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size};
         if (mSageAttnSupportedBlockSizes.find(blockSizeCombination) == mSageAttnSupportedBlockSizes.end()
-            || head_size == 128 || head_size == 72 || head_size == 80)
+            || (head_size != 128 && head_size != 72 && head_size != 80))
         {
             TLLM_LOG_WARNING(" Q, k ,v quant block size not support. disable sage attention");
             mSageAttn = false;

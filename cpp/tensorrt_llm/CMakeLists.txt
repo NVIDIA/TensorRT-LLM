@@ -193,6 +193,7 @@ set(TRTLLM_LINK_LIBS
     ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
+    ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
     ${TRT_LIB}
     common_src

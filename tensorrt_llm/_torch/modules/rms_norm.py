@@ -13,10 +13,18 @@ class RMSNorm(nn.Module):
                  hidden_size: int,
                  eps: float,
                  dtype: Optional[torch.dtype] = None,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 has_weights: bool = True):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=dtype, device=device))
+        if has_weights:
+            self.weight = nn.Parameter(
+                torch.ones(hidden_size, dtype=dtype, device=device))
+        else:
+            self.register_buffer('weight',
+                                 torch.ones(hidden_size,
+                                            dtype=dtype,
+                                            device=device),
+                                 persistent=False)
         self.variance_epsilon = eps
 
     def forward(

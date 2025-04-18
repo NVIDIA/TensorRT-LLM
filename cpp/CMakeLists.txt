@@ -16,13 +16,13 @@
 #
 
 cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(CheckLanguage)
-include(cmake/modules/set_ifndef.cmake)
-include(cmake/modules/find_library_create_target.cmake)
-include(cmake/modules/resolve_dirs.cmake)
-include(cmake/modules/parse_make_options.cmake)
+include(resolve_dirs)
+include(parse_make_options)
+include(cuda_configuration)
+include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
@@ -43,9 +43,6 @@ option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
-
-# Always use static NVRTC for IP protection reasons.
-set(USE_SHARED_NVRTC OFF)
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -143,158 +140,21 @@ configure_file(
   cmake/templates/version.h
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
-# Determine CUDA version before enabling the language extension
-# check_language(CUDA) clears CMAKE_CUDA_HOST_COMPILER if CMAKE_CUDA_COMPILER is
-# not set
-if(NOT CMAKE_CUDA_COMPILER AND CMAKE_CUDA_HOST_COMPILER)
-  set(CMAKE_CUDA_HOST_COMPILER_BACKUP ${CMAKE_CUDA_HOST_COMPILER})
-endif()
-check_language(CUDA)
-if(CMAKE_CUDA_HOST_COMPILER_BACKUP)
-  set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CUDA_HOST_COMPILER_BACKUP})
-  check_language(CUDA)
-endif()
-if(CMAKE_CUDA_COMPILER)
-  message(STATUS "CUDA compiler: ${CMAKE_CUDA_COMPILER}")
-  if(NOT WIN32) # Linux
-    execute_process(
-      COMMAND
-        "bash" "-c"
-        "${CMAKE_CUDA_COMPILER} --version | egrep -o 'V[0-9]+.[0-9]+.[0-9]+' | cut -c2-"
-      RESULT_VARIABLE _BASH_SUCCESS
-      OUTPUT_VARIABLE CMAKE_CUDA_COMPILER_VERSION
-                      OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-    if(NOT _BASH_SUCCESS EQUAL 0)
-      message(FATAL_ERROR "Failed to determine CUDA version")
-    endif()
-
-  else() # Windows
-    execute_process(
-      COMMAND ${CMAKE_CUDA_COMPILER} --version
-      OUTPUT_VARIABLE versionString
-      RESULT_VARIABLE versionResult)
-
-    if(versionResult EQUAL 0 AND versionString MATCHES
-                                 "V[0-9]+\\.[0-9]+\\.[0-9]+")
-      string(REGEX REPLACE "V" "" version ${CMAKE_MATCH_0})
-      set(CMAKE_CUDA_COMPILER_VERSION "${version}")
-    else()
-      message(FATAL_ERROR "Failed to determine CUDA version")
-    endif()
-  endif()
-else()
-  message(FATAL_ERROR "No CUDA compiler found")
-endif()
-
-set(CUDA_REQUIRED_VERSION "11.2")
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS CUDA_REQUIRED_VERSION)
-  message(
-    FATAL_ERROR
-      "CUDA version ${CMAKE_CUDA_COMPILER_VERSION} must be at least ${CUDA_REQUIRED_VERSION}"
-  )
-endif()
-
-# cmake-format: off
-# Initialize and normalize CMAKE_CUDA_ARCHITECTURES before enabling CUDA.
-# Special values:
-# * `native` is resolved to HIGHEST available architecture.
-#   * Fallback to `all` if detection failed.
-# * `all`/unset is resolved to a set of architectures we optimized for and compiler supports.
-# * `all-major` is unsupported.
-# Numerical architectures:
-# * PTX is never included in result binary.
-#   * `*-virtual` architectures are therefore rejected.
-#   * `-real` suffix is automatically added to exclude PTX.
-# * Always use accelerated (`-a` suffix) target for supported architectures.
-# cmake-format: on
-
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
-  # Detect highest available compute capability
-  set(OUTPUTFILE ${PROJECT_BINARY_DIR}/detect_cuda_arch)
-  set(CUDAFILE ${CMAKE_SOURCE_DIR}/cmake/utils/detect_cuda_arch.cu)
-  execute_process(COMMAND ${CMAKE_CUDA_COMPILER} -lcuda ${CUDAFILE} -o
-                          ${OUTPUTFILE})
-  message(VERBOSE "Detecting native CUDA compute capability")
-  execute_process(
-    COMMAND ${OUTPUTFILE}
-    RESULT_VARIABLE CUDA_RETURN_CODE
-    OUTPUT_VARIABLE CUDA_ARCH_OUTPUT)
-  if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
-    message(WARNING "Detecting native CUDA compute capability - fail")
-    message(
-      WARNING
-        "CUDA compute capability detection failed, compiling for all optimized architectures"
-    )
-    unset(CMAKE_CUDA_ARCHITECTURES)
-  else()
-    message(STATUS "Detecting native CUDA compute capability - done")
-    set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCH_OUTPUT}")
-  endif()
-elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all")
-  unset(CMAKE_CUDA_ARCHITECTURES)
-  message(
-    STATUS
-      "Setting CMAKE_CUDA_ARCHITECTURES to all enables all architectures TensorRT-LLM optimized for, "
-      "not all architectures CUDA compiler supports.")
-elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all-major")
-  message(
-    FATAL_ERROR
-      "Setting CMAKE_CUDA_ARCHITECTURES to all-major does not make sense for TensorRT-LLM. "
-      "Please enable all architectures you intend to run on, so we can enable optimized kernels for them."
-  )
-else()
-  unset(CMAKE_CUDA_ARCHITECTURES_CLEAN)
-  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    if(CUDA_ARCH MATCHES "^([1-9])([0-9])+a?-virtual$")
-      message(FATAL_ERROR "Including PTX in compiled binary is unsupported.")
-    elseif(CUDA_ARCH MATCHES "^(([1-9])([0-9])+)a?(-real)?$")
-      list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN ${CMAKE_MATCH_1})
-    else()
-      message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
-    endif()
-  endforeach()
-  list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
-  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
-endif()
-
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "80" "86")
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
-    list(APPEND CMAKE_CUDA_ARCHITECTURES "89" "90")
-  endif()
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
-    list(APPEND CMAKE_CUDA_ARCHITECTURES "100" "120")
-  endif()
-endif()
-
-# CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
-# automatically added -real or -a suffix.
-set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
-message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
-
-set(ARCHITECTURES_WITH_KERNELS "80" "86" "89" "90" "100" "120")
-foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
-  if(NOT "${CUDA_ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
-    message(STATUS "Excluding SM ${CUDA_ARCH}")
-  endif()
-endforeach()
-
-set(ARCHITECTURES_WITH_ACCEL "90" "100" "101" "120")
-unset(CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
-foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  if("${CUDA_ARCH}" IN_LIST ARCHITECTURES_WITH_ACCEL)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}a-real")
-  else()
-    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}-real")
-  endif()
-endforeach()
-set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NORMALIZED})
+setup_cuda_compiler()
+setup_cuda_architectures()
 
 enable_language(C CXX CUDA)
 
-find_package(CUDAToolkit REQUIRED)
+find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
+                                                  cublas cublasLt curand nvml)
+
+set(CUBLAS_LIB CUDA::cublas)
+set(CUBLASLT_LIB CUDA::cublasLt)
+set(CURAND_LIB CUDA::curand)
+set(CUDA_DRV_LIB CUDA::cuda_driver)
+set(CUDA_NVML_LIB CUDA::nvml)
+set(CUDA_RT_LIB CUDA::cudart_static)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
 
@@ -307,56 +167,17 @@ message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 # pick up on the includes
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 
-if(USE_SHARED_NVRTC)
-  if(WIN32)
-    message(FATAL_ERROR "Cannot use NVRTC shared library on Windows.")
-  else()
-    find_library(
-      NVRTC_LIB nvrtc
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-    find_library(
-      NVRTC_BUILTINS_LIB nvrtc-builtins
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-  endif()
-else()
-  if(WIN32)
-    find_library(
-      NVRTC_LIB nvrtc
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-  else()
-    find_library(
-      NVRTC_LIB nvrtc_static
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-    find_library(
-      NVRTC_BUILTINS_LIB nvrtc-builtins_static
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-    find_library(
-      NVPTXCOMPILER_LIB nvptxcompiler_static
-      HINTS ${CUDAToolkit_LIBRARY_DIR}
-      PATH_SUFFIXES lib64 lib lib/x64)
-  endif()
-endif()
-
-set(CUBLAS_LIB CUDA::cublas)
-set(CUBLASLT_LIB CUDA::cublasLt)
-set(CUDA_DRV_LIB CUDA::cuda_driver)
-set(CUDA_NVML_LIB CUDA::nvml)
-set(CUDA_RT_LIB CUDA::cudart_static)
-set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
-
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
   # NCCL dependencies
-  set_ifndef(NCCL_LIB_DIR /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/)
-  set_ifndef(NCCL_INCLUDE_DIR /usr/include/)
-  find_library(NCCL_LIB nccl HINTS ${NCCL_LIB_DIR})
+  find_package(NCCL 2 REQUIRED)
+  set(NCCL_LIB NCCL::nccl)
 endif()
+
+# TRT dependencies
+find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
+set(TRT_LIB TensorRT::NvInfer)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
@@ -368,26 +189,12 @@ include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
-  ${NCCL_INCLUDE_DIR}
+  $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
   ${3RDPARTY_DIR}/cutlass/tools/util/include
   ${3RDPARTY_DIR}/NVTX/include
   ${3RDPARTY_DIR}/json/include
   ${3RDPARTY_DIR}/pybind11/include)
-
-# TRT dependencies
-set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
-set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set(TRT_LIB nvinfer)
-
-# On Windows major version is appended to nvinfer libs.
-if(WIN32)
-  set(TRT_LIB_NAME nvinfer_10)
-else()
-  set(TRT_LIB_NAME nvinfer)
-endif()
-
-find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -503,61 +310,7 @@ if((WIN32))
   endif()
 endif()
 
-if(SANITIZE)
-  if(WIN32)
-    message(FATAL_ERROR "Sanitizing support is unimplemented on Windows.")
-  endif()
-
-  macro(add_clang_rt_lib lib_name)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      execute_process(
-        COMMAND
-          ${CMAKE_CXX_COMPILER}
-          "-print-file-name=libclang_rt.${lib_name}-${CMAKE_SYSTEM_PROCESSOR}.so"
-        OUTPUT_VARIABLE CLANG_SAN_LIBRARY_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
-      link_libraries(${CLANG_SAN_LIBRARY_PATH})
-    endif()
-  endmacro()
-
-  string(TOLOWER ${SANITIZE} SANITIZE)
-
-  if("undefined" IN_LIST SANITIZE)
-    message(STATUS "Enabling extra sub-sanitizers for UBSan")
-    list(APPEND SANITIZE "float-divide-by-zero")
-
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      list(APPEND SANITIZE "unsigned-integer-overflow" "implicit-conversion"
-           "local-bounds")
-    endif()
-    add_clang_rt_lib("ubsan_standalone")
-    add_compile_definitions("SANITIZE_UNDEFINED")
-  endif()
-
-  if("address" IN_LIST SANITIZE)
-    message(STATUS "Enabling extra sub-sanitizers for ASan")
-    list(APPEND SANITIZE "pointer-compare" "pointer-subtract")
-    add_compile_options("-fno-omit-frame-pointer;-fno-optimize-sibling-calls")
-
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      add_compile_options("-fsanitize-address-use-after-return=always")
-      add_link_options("-fsanitize-address-use-after-return=always")
-    endif()
-    add_clang_rt_lib("asan")
-  endif()
-
-  if("thread" IN_LIST SANITIZE)
-    add_compile_options("-ftls-model=local-dynamic")
-    add_clang_rt_lib("tsan")
-  endif()
-
-  list(REMOVE_DUPLICATES SANITIZE)
-  message(STATUS "Enabled sanitizers: ${SANITIZE}")
-
-  foreach(SANITIZER IN LISTS SANITIZE)
-    add_compile_options("-fsanitize=${SANITIZER}")
-    add_link_options("-fsanitize=${SANITIZER}")
-  endforeach()
-endif()
+setup_sanitizers()
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
@@ -694,32 +447,9 @@ else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=0")
 endif()
 
-file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
-     REGEX "#define NV_TENSORRT_.*")
-foreach(TYPE MAJOR MINOR PATCH BUILD)
-  string(REGEX MATCH "NV_TENSORRT_${TYPE} [0-9]+" TRT_TYPE_STRING
-               ${VERSION_STRINGS})
-  string(REGEX MATCH "[0-9]+" TRT_${TYPE} ${TRT_TYPE_STRING})
-endforeach(TYPE)
-
-set(TRT_VERSION
-    "${TRT_MAJOR}.${TRT_MINOR}.${TRT_PATCH}"
-    CACHE STRING "TensorRT project version")
-set(TRT_SOVERSION
-    "${TRT_MAJOR}"
-    CACHE STRING "TensorRT library so version")
-message(
-  STATUS
-    "Building for TensorRT version: ${TRT_VERSION}, library version: ${TRT_SOVERSION}"
-)
-
-if(${TRT_MAJOR} LESS 10)
-  message(FATAL_ERROR "TensorRT version must be at least 10.0")
-endif()
-
 list(APPEND COMMON_HEADER_DIRS)
 include_directories(${COMMON_HEADER_DIRS})
-include_directories(SYSTEM ${TORCH_INCLUDE_DIRS} ${TRT_INCLUDE_DIR})
+include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
 add_subdirectory(tensorrt_llm)
 

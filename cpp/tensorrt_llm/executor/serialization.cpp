@@ -978,6 +978,7 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
     auto parallelConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getParallelConfig)>(is);
     auto peftCacheConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getPeftCacheConfig)>(is);
     auto decodingConfig = su::deserializeWithGetterType<decltype(&ExecutorConfig::getDecodingConfig)>(is);
+    auto useGpuDirectStorage = su::deserializeWithGetterType<decltype(&ExecutorConfig::getUseGpuDirectStorage)>(is);
     auto gpuWeightsPercent = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGpuWeightsPercent)>(is);
     auto maxQueueSize = su::deserializeWithGetterType<decltype(&ExecutorConfig::getMaxQueueSize)>(is);
     auto extendedRuntimePerfKnobConfig
@@ -995,9 +996,9 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
 
     return ExecutorConfig{maxBeamWidth, schedulerConfig, kvCacheConfig, enableChunkedContext, normalizeLogProbs,
         iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens, parallelConfig,
-        peftCacheConfig, std::nullopt, decodingConfig, gpuWeightsPercent, maxQueueSize, extendedRuntimePerfKnobConfig,
-        debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig, guidedDecodingConfig,
-        additionalModelOutputs, gatherGenerationLogits};
+        peftCacheConfig, std::nullopt, decodingConfig, useGpuDirectStorage, gpuWeightsPercent, maxQueueSize,
+        extendedRuntimePerfKnobConfig, debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig,
+        guidedDecodingConfig, additionalModelOutputs, gatherGenerationLogits};
 }
 
 size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
@@ -1020,6 +1021,7 @@ size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
     totalSize += su::serializedSize(executorConfig.getParallelConfig());
     totalSize += su::serializedSize(executorConfig.getPeftCacheConfig());
     totalSize += su::serializedSize(executorConfig.getDecodingConfig());
+    totalSize += su::serializedSize(executorConfig.getUseGpuDirectStorage());
     totalSize += su::serializedSize(executorConfig.getGpuWeightsPercent());
     totalSize += su::serializedSize(executorConfig.getMaxQueueSize());
     totalSize += su::serializedSize(executorConfig.getExtendedRuntimePerfKnobConfig());
@@ -1052,6 +1054,7 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
     su::serialize(executorConfig.getParallelConfig(), os);
     su::serialize(executorConfig.getPeftCacheConfig(), os);
     su::serialize(executorConfig.getDecodingConfig(), os);
+    su::serialize(executorConfig.getUseGpuDirectStorage(), os);
     su::serialize(executorConfig.getGpuWeightsPercent(), os);
     su::serialize(executorConfig.getMaxQueueSize(), os);
     su::serialize(executorConfig.getExtendedRuntimePerfKnobConfig(), os);

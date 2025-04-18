@@ -150,7 +150,7 @@ target_link_libraries(
   ${PLUGIN_SHARED_TARGET}
   ${CUBLAS_LIB}
   ${CUBLASLT_LIB}
-  nvinfer
+  ${TRT_LIB}
   ${CUDA_DRV_LIB}
   ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
