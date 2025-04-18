@@ -372,6 +372,87 @@ def fused_flattened_mha_fake(
     return torch.empty_like(q.contiguous())
 
 
+@torch.library.custom_op("attention::flattened_mha_with_cache", mutates_args=())
+def flattened_mha_with_cache(
+    # Q, K, V
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    # METADATA
+    seq_len: torch.Tensor,
+    input_pos: torch.Tensor,
+    cache_loc: torch.Tensor,
+    seq_start: torch.Tensor,
+    # CACHES
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    # BUFFERS
+    # <none>
+    # CONSTANTS
+    # <none>
+) -> torch.Tensor:
+    """Flattened MHA with cache that takes q, k, v in BSND layout.
+
+    NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
+    """
+    # b, s info
+    # NOTE: b, s are just the shapes of the input tensor q; not necessarily the number of sequences.
+    # Generally speaking, we expect one of two cases here:
+    # 1. b > 0, s==1: this indicates a generate-only batch of tokens.
+    # 2. b==1, s > 0: this indicates a mixed context+generate phase. The actual number of sequences
+    #    and number of tokens per sequence are encoded in seq_len and seq_start.
+    head_dim = k_cache.shape[-1]
+    q_shape = q.shape
+    b, s = q.shape[:2]
+
+    # reshapes with head_dim
+    if s == 1:
+        bs_view = (b, s)
+    else:
+        bs_view = (b * s,)
+
+    q = q.view(*bs_view, -1, head_dim)
+    k = k.view(*bs_view, -1, head_dim)
+    v = v.view(*bs_view, -1, head_dim)
+
+    # run attention
+    y = torch.empty_like(q)
+    if s == 1:
+        # generate-only phase
+        _generate_mha(q, k, v, k_cache, v_cache, cache_loc, input_pos, y)
+    else:
+        # mixed context + generate phase
+        _flattened_context_mha(
+            q,
+            k,
+            v,
+            input_pos,
+            cache_loc,
+            k_cache,
+            v_cache,
+            seq_len,
+            seq_start,
+            y,
+        )
+
+    return y.view(q_shape)  # [bsnd] in the original view (might have some dims flattened)
+
+
+@flattened_mha_with_cache.register_fake
+def flattened_mha_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_len: torch.Tensor,
+    input_pos: torch.Tensor,
+    cache_loc: torch.Tensor,
+    seq_start: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+):
+    return torch.empty_like(q.contiguous())
+
+
 def _generate_mha_rope_fusion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -859,6 +940,7 @@ def fused_mha_with_paged_cache_fake(
 @torch.library.custom_op("attention::prepare_fused_mha_metadata", mutates_args=())
 def prepare_fused_mha_metadata(
     input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
@@ -878,7 +960,7 @@ def prepare_fused_mha_metadata(
 
 @prepare_fused_mha_metadata.register_fake
 def prepare_fused_mha_metadata_fake(
-    input_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
 ):
     return (
         torch.empty_like(seq_len),
@@ -951,3 +1033,14 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
         # cos and sin (real and img) are packed
         cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
         return cache.to(dtype=torch.float16)
+
+
+@AttentionRegistry.register("UnfusedTritonWithFlattenedInputs")
+class UnfusedTritonWithFlattenedInputs(TritonWithFlattenedInputs):
+    @classmethod
+    def get_attention_op(cls):
+        return torch.ops.attention.flattened_mha_with_cache, 3
+
+    @classmethod
+    def get_global_buffer_initializers(cls, get_info):
+        return {}

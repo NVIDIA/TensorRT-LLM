@@ -90,7 +90,7 @@ class ADEngine(ModelEngine):
 
         # construct model factory
         model_kwargs = {"max_position_embeddings": seq_info.max_seq_len, **ad_config.model_kwargs}
-        factory = ModelFactoryRegistry.get("hf")(
+        factory = ModelFactoryRegistry.get(ad_config.model_factory)(
             model=model,
             model_kwargs=model_kwargs,
             skip_loading_weights=ad_config.skip_loading_weights,
