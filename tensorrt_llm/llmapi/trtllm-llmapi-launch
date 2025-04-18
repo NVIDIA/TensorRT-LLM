@@ -18,6 +18,8 @@ function mpi_world_size {
         echo "$SLURM_NTASKS"
     elif [ -n "$OMPI_COMM_WORLD_SIZE" ]; then
         echo "$OMPI_COMM_WORLD_SIZE"
+    elif [ -n "$WORLD_SIZE" ]; then
+        echo "$WORLD_SIZE"
     else
         echo "1"
     fi
