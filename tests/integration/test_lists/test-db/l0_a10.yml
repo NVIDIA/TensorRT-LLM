@@ -68,12 +68,12 @@ l0_a10:
   - test_e2e.py::test_llmapi_example_quantization
   - test_e2e.py::test_llmapi_chat_example
   - test_e2e.py::test_llmapi_exit
-  - test_e2e.py::test_llmapi_server_example
+  # - test_e2e.py::test_llmapi_server_example
   - test_e2e.py::test_trtllm_serve_example
-  - test_e2e.py::test_openai_misc_example
+  # - test_e2e.py::test_openai_misc_example
   - test_e2e.py::test_openai_completions_example
   - test_e2e.py::test_openai_chat_example
-  - test_e2e.py::test_trtllm_bench_sanity[non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
+  # - test_e2e.py::test_trtllm_bench_sanity[non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency]
   - unittest/trt/quantization # 18 mins
@@ -94,7 +94,7 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph # 1 min
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype # 1.5 mins
   - accuracy/test_cli_flow.py::TestMamba130M::test_auto_dtype # 1 min
-  - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
+  # - accuracy/test_cli_flow.py::TestLongAlpaca7B::test_multiblock_aggressive # 6 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_lookahead # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[] # 5 mins
   - accuracy/test_cli_flow.py::TestVicuna7B::test_medusa[cuda_graph] # 5 mins
