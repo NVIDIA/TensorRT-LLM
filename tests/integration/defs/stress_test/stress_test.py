@@ -56,7 +56,7 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 #         [sys.executable, "-m", "pip", "install", "-r", requirements_file])
 
 # Define a constant for process termination timeouts
-GRACEFUL_TERMINATION_TIMEOUT = 10  # seconds - set longer when stress large model
+GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
 
 @dataclass(frozen=True)
@@ -384,7 +384,34 @@ def stress_test(config, test_mode, server_config=None):
     )
 
     # Define test configurations
-    performance_config = PerformanceParams() if run_performance else None
+    performance_config = None
+    if run_performance:
+        performance_config = PerformanceParams()
+
+        # For ds v3 specific parameters
+        if "DeepSeek-V3" in config.model_dir:
+            performance_config = PerformanceParams(
+                test_timeout=
+                36000  # 10 hours for ds v3, change this value if needed
+            )
+
+    # For ds v3 specific server parameters
+    if "DeepSeek-V3" in config.model_dir:
+        test_server_config = ServerConfig(
+            port=test_server_config.port,
+            host=test_server_config.host,
+            pp_size=test_server_config.pp_size,
+            ep_size=8,  # DeepSeek-V3 specific ep_size
+            max_batch_size=161,  # DeepSeek-V3 specific max_batch_size
+            max_num_tokens=1160,  # DeepSeek-V3 specific max_num_tokens
+            kv_cache_free_gpu_memory_fraction=
+            0.7,  # DeepSeek-V3 specific kv_cache fraction
+            capacity_scheduler_policy=test_server_config.
+            capacity_scheduler_policy,
+            wait_interval=test_server_config.wait_interval,
+            max_wait_seconds=7200,  # DeepSeek-V3 specific wait time (2 hours)
+            health_check_timeout=test_server_config.health_check_timeout)
+
     stress_config = StressTestConfig(
         model_config=config,
         server_config=test_server_config) if run_stress else None
@@ -405,13 +432,28 @@ def stress_test(config, test_mode, server_config=None):
     if not os.path.exists(model_path):
         raise RuntimeError(f"Model path does not exist: {model_path}")
 
-    # Create a temporary YAML file for 'capacity_scheduler_policy'
+    # Create a temporary YAML file for extra_llm_options
     extra_llm_options = {
         "scheduler_config": {
             "capacity_scheduler_policy":
             test_server_config.capacity_scheduler_policy
         }
     }
+
+    # Add DeepSeek-V3 specific configuration
+    if "DeepSeek-V3" in config.model_dir:
+
+        extra_llm_options["enable_attention_dp"] = True
+
+        if config.backend == "pytorch":
+            extra_llm_options["pytorch_backend_config"] = {
+                "use_cuda_graph": True,
+                "cuda_graph_padding_enabled": True,
+                "cuda_graph_batch_sizes":
+                [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+                "print_iter_log": True,
+                "enable_overlap_scheduler": True
+            }
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
                                      delete=False) as temp_file:
