@@ -26,7 +26,7 @@ from utils.llm_data import llm_models_root
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),
-        # small llama3.1-8B model with world_size 2 + trtllm runtime
+        # small llama3.1-8B model with world_size 2 + trtllm runtime + torch-opt
         (
             2,
             {
@@ -36,7 +36,7 @@ from utils.llm_data import llm_models_root
                 ),
                 "runtime": "trtllm",
                 "attn_backend": "TritonWithFlattenedInputs",
-                "compile_backend": "torch-simple",
+                "compile_backend": "torch-opt",
                 "model_kwargs": {"num_hidden_layers": 2},
             },
         ),

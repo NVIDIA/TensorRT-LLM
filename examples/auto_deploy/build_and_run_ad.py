@@ -96,7 +96,12 @@ def main(config: Optional[SimpleConfig] = None):
     print_outputs(outs)
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
-    if config.benchmark:
+    if config.benchmark and config.runtime != "demollm":
+        ad_logger.warning(
+            f"Benchmarking with {config.runtime=} not supported. Please use `demollm` instead for "
+            "quick benchmarking and `trtllm-bench` for full benchmarking."
+        )
+    elif config.benchmark:
         token_ids = torch.randint(0, 100, (config.benchmark_bs, config.benchmark_isl)).tolist()
         sampling_params = SamplingParams(max_tokens=config.benchmark_osl, top_k=None)
         keys = ["compile_backend", "attn_backend", "mla_backend"]
