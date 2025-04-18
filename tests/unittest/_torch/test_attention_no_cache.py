@@ -1,7 +1,8 @@
+import itertools
 import math
 import random
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import pytest
 import torch
@@ -9,6 +10,23 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+
+
+def generate_attn_scenarios(num_q_heads_kv_heads: List[Tuple[int, int]],
+                            head_dim: List[int], num_layers: List[int],
+                            dtype: List[torch.dtype]):
+    scenarios = []
+    product_iter = itertools.product(num_q_heads_kv_heads, head_dim, num_layers,
+                                     dtype)
+    for num_q_heads_kv_head, head_dim, num_layers, dtype in product_iter:
+        num_q_heads, num_kv_heads = num_q_heads_kv_head
+        scenarios.append(
+            Scenario(num_heads=num_q_heads,
+                     num_kv_heads=num_kv_heads,
+                     head_dim=head_dim,
+                     num_layers=num_layers,
+                     dtype=dtype))
+    return scenarios
 
 
 def calculate_ref_result(q: torch.Tensor,
@@ -144,24 +162,17 @@ context_sequence_lengths = [
     random_context_sequence_lengths,
 ]
 
-scenarios = [
-    # num_heads == num_kv_heads, single layer
-    Scenario(
-        num_layers=1,
-        num_heads=32,
-        num_kv_heads=32,
-        head_dim=128,
-        dtype=torch.float16,
-    ),
-    # num_heads > num_kv_heads, multi-layer
-    Scenario(
-        num_layers=2,
-        num_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        dtype=torch.float16,
-    ),
+num_q_heads_kv_heads = [
+    (32, 32),
+    (32, 8),
+    (16, 16),
 ]
+num_layers = [1, 2, 16]
+head_dim = [64, 72, 128]
+dtype = [torch.float16]
+
+scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
+                                    dtype)
 
 
 # Convert parameterized tests to pytest parametrize
