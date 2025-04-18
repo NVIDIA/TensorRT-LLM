@@ -45,7 +45,8 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     , mWorldConfig{worldConfig}
     , mDevice{runtime::utils::initDevice(worldConfig)}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.gpuWeightsPercent)}
+    , mRuntime{std::make_shared<TllmRuntime>(
+          rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage, optionalParams.gpuWeightsPercent)}
     , mMicroBatchId(0)
     , mCopyBufferManager{std::make_shared<CudaStream>()}
 {
