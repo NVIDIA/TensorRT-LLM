@@ -252,6 +252,16 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-1b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestMixtral8x7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
