@@ -15,3 +15,5 @@ l0_dgx_h200:
   tests:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-attention_dp-cuda_graph-overlap_scheduler]
+  - unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[tp8-trtllm-scout] # 1h
+  # - unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[tp8-trtllm-maverick] # 3h will timeout
