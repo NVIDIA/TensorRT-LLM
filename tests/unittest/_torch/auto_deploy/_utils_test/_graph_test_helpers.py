@@ -51,7 +51,7 @@ def run_test(
     num_params_gm = count_parameters(gm)
 
     assert num_params_model == num_params_gm
-    assert all_close(y_model, y_gm)
+    assert all_close(y_model, y_gm, atol=atol, rtol=rtol)
 
     # graph transformation + check
     gm_transformed = transform(gm, *args)

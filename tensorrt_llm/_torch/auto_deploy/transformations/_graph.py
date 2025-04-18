@@ -1,7 +1,7 @@
 """Graph-related utilities for transformations."""
 
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -113,10 +113,13 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
         )
 
 
-def canonicalize_graph(gm: GraphModule, shape_prop: bool = False) -> GraphModule:
+def canonicalize_graph(
+    gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
+) -> GraphModule:
     """Canonicalize the graph of the given GraphModule.
 
-    This function can be used to clean up the graph representation after a transformation.
+    This function can be used to clean up the graph representation after a transformation with
+    optional shape propagation.
     """
     ad_logger.debug(f"Before canonicalizing: {gm}")
 
@@ -132,9 +135,24 @@ def canonicalize_graph(gm: GraphModule, shape_prop: bool = False) -> GraphModule
 
     # NOTE: shape_prop can be a littly finicky & slow, so we only run it optionally...
     if shape_prop:
-        inps = tuple([node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"])
-        with lift_to_meta(gm):
-            FakeTensorProp(gm, _detect_fake_mode_from_gm(gm)).run(*inps)
+        fake_mode: Optional[FakeTensorMode] = _detect_fake_mode_from_gm(gm)
+
+        # get fake tensors from placeholder nodes
+        inps = [node.meta.get("val") for node in gm.graph.nodes if node.op == "placeholder"]
+
+        # check if we need to use args to create fake tensors
+        if any(inp is None for inp in inps):
+            if args_static is not None and fake_mode is not None and len(args_static) == len(inps):
+                inps = [
+                    fake_t if fake_t is not None else fake_mode.from_tensor(arg, static_shapes=True)
+                    for fake_t, arg in zip(inps, args_static)
+                ]
+
+        # run shape propagation if we have all the fake tensors
+        if all(inp is not None for inp in inps):
+            FakeTensorProp(gm, fake_mode).propagate(*inps)
+        else:
+            ad_logger.warning("No fake tensors and no args available for shape propagation")
 
     # lint the graph
     gm.graph.lint()
