@@ -588,7 +588,8 @@ class Eagle3LlamaAttention(LlamaAttention):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=model_config.get_quant_config(),
-            skip_create_weights=model_config.skip_create_weights,
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
         )
 
 

@@ -28,25 +28,27 @@ class MLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
-        self.up_proj = Linear(self.hidden_size,
-                              self.intermediate_size,
-                              bias=bias,
-                              dtype=dtype,
-                              mapping=config.mapping,
-                              tensor_parallel_mode=TensorParallelMode.COLUMN,
-                              weights_loading_config=WeightsLoadingConfig(
-                                  weight_mode=WeightMode.VANILLA),
-                              quant_config=config.get_quant_config(),
-                              skip_create_weights=config.skip_create_weights)
+        self.up_proj = Linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=bias,
+            dtype=dtype,
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            weights_loading_config=WeightsLoadingConfig(
+                weight_mode=WeightMode.VANILLA),
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init)
 
-        self.down_proj = Linear(self.intermediate_size,
-                                self.hidden_size,
-                                bias=bias,
-                                dtype=dtype,
-                                mapping=config.mapping,
-                                tensor_parallel_mode=TensorParallelMode.ROW,
-                                quant_config=config.get_quant_config(),
-                                skip_create_weights=config.skip_create_weights)
+        self.down_proj = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=bias,
+            dtype=dtype,
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=config.get_quant_config(),
+            skip_create_weights_in_init=config.skip_create_weights_in_init)
 
         self.up_lora = LoraLayer([LoraModuleType.MLP_H_TO_4H],
                                  [self.intermediate_size])

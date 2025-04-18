@@ -22,7 +22,9 @@ class ModelConfig(Generic[TConfig]):
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
-    skip_create_weights: bool = False
+    # Delay weights creation to DecoderModelForCausalLM.__post_init__
+    # to support mixed quantization.
+    skip_create_weights_in_init: bool = False
     is_generation: bool = True
     max_num_tokens: int = 8192
     moe_max_num_tokens: Optional[int] = None

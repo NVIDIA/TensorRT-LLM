@@ -68,7 +68,6 @@ class TrtllmAttentionWrapper:
         head_size: int,
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
         mla_params: Optional[MLAParams] = None,
         **kwargs,
@@ -114,8 +113,6 @@ class TrtllmAttentionWrapper:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
-        quant_config = quant_config or QuantConfig()
-        self.quant_mode = int(quant_config.layer_quant_mode)
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
         self.rotary_embedding_dim = rope_params.dim
@@ -128,6 +125,10 @@ class TrtllmAttentionWrapper:
         self.rotary_embedding_original_max_positions = rope_params.original_max_positions
         self.kwargs = {}
         self.kwargs.update(kwargs)
+
+    def set_up_quant_states(self, quant_config: Optional[QuantConfig] = None):
+        quant_config = quant_config or QuantConfig()
+        self.quant_mode = int(quant_config.layer_quant_mode)
 
     def plan(
         self,
@@ -594,13 +595,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          pos_embd_params=pos_embd_params,
                          mla_params=mla_params,
                          **kwargs)
+
         self.wrapper = TrtllmAttentionWrapper(
             layer_idx,
             num_heads,
             head_dim,
             num_kv_heads,
             pos_embd_params=pos_embd_params,
-            quant_config=quant_config,
             q_scaling=q_scaling,
             mla_params=mla_params,
         )
@@ -616,6 +617,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
         self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
+
+    def set_up_quant_states(self):
+        self.wrapper.set_up_quant_states(self.quant_config)
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config:
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()

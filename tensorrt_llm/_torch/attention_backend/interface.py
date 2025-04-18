@@ -512,6 +512,13 @@ class AttentionBackend(Generic[TMetadata]):
         self.num_kv_heads = num_kv_heads or self.num_heads
         self.quant_config = quant_config
 
+    def set_up_quant_states(self, *args, **kwargs):
+        """
+        To support mixed quantization mode, self.quant_config can be modified after __init__ is called.
+        Any states or set up related to self.quant_config must be moved to this function, which is called
+        after self.quant_config is reset.
+        """
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
