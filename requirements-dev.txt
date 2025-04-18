@@ -1,5 +1,4 @@
 -r requirements.txt
-datasets==2.19.2
 einops
 graphviz
 mypy
