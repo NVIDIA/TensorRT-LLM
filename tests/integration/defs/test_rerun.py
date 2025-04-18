@@ -60,13 +60,15 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
                     rerun_0_file.write(test_name + '\n')
                     print(test_name + " will not rerun")
 
+    # Remove empty files
     for filename in [rerun_0_filename, rerun_1_filename, rerun_2_filename]:
         if os.path.getsize(filename) == 0:
             os.remove(filename)
 
 
 def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
-    merged_root = ET.Element('testsuites')
+    # Merge xml files into one. 
+    # If deduplicate is true, remove duplicate test cases.
     merged_suite_map = {}
 
     for xml_filename in xml_filenames:
@@ -84,17 +86,20 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
                 case_list = suite.findall('testcase')
                 for case in case_list:
                     existing_case = original_suite.find(
-                        f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}']"
+                        f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}'][@file='{case.attrib['file']}']"
                     )
+                    # find the duplicate case in original_suite
                     if existing_case is not None:
                         if deduplicate:
+                            # remove the duplicate case in original_suite
                             original_suite.remove(existing_case)
                         else:
+                            # add rerun flag to the new case for rerun report
                             case.set('isrerun', 'true')
                 original_suite.extend(case_list)
 
+    # Update suite attributes
     for suite in merged_suite_map.values():
-        # Update suite attributes
         attribs = {'errors': 0, 'failures': 0, 'skipped': 0, 'tests': 0}
         for case in suite.findall('testcase'):
             attribs['tests'] += 1
@@ -108,6 +113,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
             suite.set(key, str(value))
 
         # add suite to merged_root
+        merged_root = ET.Element('testsuites')
         merged_root.append(suite)
 
     if os.path.exists(merged_xml_filename):
@@ -116,15 +122,6 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
     # Write to new file
     tree = ET.ElementTree(merged_root)
     tree.write(merged_xml_filename, encoding='utf-8', xml_declaration=True)
-
-
-    with open(merged_xml_filename, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    content = content.replace('<?xml version="1.0" encoding="utf-8"?>\n', '<?xml version="1.0" encoding="utf-8"?>')
-
-    with open(merged_xml_filename, 'w', encoding='utf-8') as f:
-        f.write(content)
 
 
 def xml_to_html(xml_filename, html_filename, sort_by_name=False):
@@ -234,7 +231,7 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
         skipped_tests_count = int(suite.attrib.get('skipped', 0))
         passed_tests_count = tests_count - failed_tests_count - skipped_tests_count
 
-        # Generate summary for this suite
+        # Generate summary for the suite
         summary = f"""
             <div class="suite-header">
                 <h3>Stage: {suite.attrib.get('name', '')}</h3>
@@ -246,7 +243,7 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
             </div>
         """
 
-        # Generate test case details for this suite
+        # Generate test case details for the suite
         test_cases_html = []
         all_test_cases = []
 
@@ -352,6 +349,7 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
 
 
 def filter_failed_tests(xml_filename, output_filename):
+    # Filter failed tests from the xml file
     filtered_root = ET.Element('testsuites')
 
     root = ET.parse(xml_filename).getroot()
@@ -382,10 +380,12 @@ def filter_failed_tests(xml_filename, output_filename):
 
 
 def generate_rerun_report(output_filename, input_filenames):
+    # Merge the input xml files (filter failed tests for results.xml)
+    # and generate the rerun report html file.
     new_filename_list = []
     for input_filename in input_filenames:
         new_filename = input_filename
-        if "rerun" not in input_filename:
+        if "/results.xml" in input_filename:
             new_filename = input_filename.replace("results.xml",
                                                   "failed_results.xml")
             filter_failed_tests(input_filename, new_filename)
@@ -393,6 +393,10 @@ def generate_rerun_report(output_filename, input_filenames):
 
     print(new_filename_list)
     merge_junit_xmls(output_filename, new_filename_list)
+    # Print the content of output XML file
+    print("Content of output XML file:")
+    with open(output_filename, 'r') as f:
+        print(f.read())
     xml_to_html(output_filename,
                 output_filename.replace(".xml", ".html"),
                 sort_by_name=True)

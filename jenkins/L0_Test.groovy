@@ -697,6 +697,7 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
     }
 
     // Rerun tests
+    isRerunFailed = false
     for (times in [1, 2]) {
         rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
         if (!fileExists(rerunTestList)) {
@@ -729,6 +730,7 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
             throw e
         } catch (Exception e) {
             echo "Rerun tests failed"
+            isRerunFailed = true
         }
     }
 
@@ -754,10 +756,11 @@ def rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout) {
 
     trtllm_utils.uploadArtifacts(
         "${WORKSPACE}/${stageName}/rerun_results.html",
-        "${UPLOAD_PATH}/${stageName}/"
+        "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
     )
 
-    echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${stageName}/rerun_results.html"
+    echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+    return isRerunFailed
 }
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
@@ -993,7 +996,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
+                        isRerunFailed = rerunFailedTests(stageName, llmSrc, extraInternalEnv, pytestTestTimeout)
+                        if (isRerunFailed) {
+                            error "Rerun tests failed"
+                        }
                     }
                 }
             }

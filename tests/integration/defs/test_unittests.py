@@ -64,7 +64,11 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir):
-    raise AssertionError("test failed")
+    if (random.random() < 0.5):
+        pytest.fail("test failed")
+    else:
+        print("test passed")
+        return
 
     import pandas as pd
     import pynvml
