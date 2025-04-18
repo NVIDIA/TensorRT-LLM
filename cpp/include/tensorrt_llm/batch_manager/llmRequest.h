@@ -657,6 +657,12 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
+    /// @brief Returns true if request has draft tokens
+    [[nodiscard]] bool willCompleteNextIteration() const
+    {
+        return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
+    }
+
     [[nodiscard]] LlmRequestType getLlmRequestType() const
     {
         return mLlmRequestType;
@@ -1520,7 +1526,7 @@ public:
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
-    [[nodiscard]] bool isLastContextChunk() const noexcept
+    [[nodiscard]] bool isLastContextChunk() const
     {
         return isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete()
             || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;

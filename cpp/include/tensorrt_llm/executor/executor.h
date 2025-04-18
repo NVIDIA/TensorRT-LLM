@@ -206,6 +206,8 @@ class AdditionalModelOutput
 public:
     explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
 
+    bool operator==(AdditionalModelOutput const& other) const;
+
     std::string name;
     bool gatherContext{false};
 };
@@ -1408,7 +1410,7 @@ public:
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
+        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false, bool enableTrtOverlap = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1440,6 +1442,7 @@ public:
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
+    [[nodiscard]] bool getEnableTrtOverlap() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1466,6 +1469,7 @@ public:
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
+    void setEnableTrtOverlap(bool enableTrtOverlap);
 
 private:
     friend class Serialization;
@@ -1479,7 +1483,7 @@ private:
     /// @brief The KV cache configuration.
     KvCacheConfig mKvCacheConfig;
 
-    /// @brief The KV cache configuration.
+    /// @brief Controls whether context is allowed to be chunked.
     bool mEnableChunkedContext;
 
     /// @brief Controls if log probabilities should be normalized or not.
@@ -1543,6 +1547,9 @@ private:
 
     /// @brief Controls if Variable-Beam-Width-Search is enabled.
     bool mUseVariableBeamWidthSearch{false};
+
+    /// @brief Controls whether preparation and TRT engine execution should be overlapped.
+    bool mEnableTrtOverlap{false};
 };
 
 struct KVCacheCreatedData

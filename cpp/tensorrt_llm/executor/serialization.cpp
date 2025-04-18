@@ -992,12 +992,13 @@ ExecutorConfig Serialization::deserializeExecutorConfig(std::istream& is)
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getAdditionalModelOutputs)>(is);
     auto gatherGenerationLogits
         = su::deserializeWithGetterType<decltype(&ExecutorConfig::getGatherGenerationLogits)>(is);
+    auto enableTrtOverlap = su::deserializeWithGetterType<decltype(&ExecutorConfig::getEnableTrtOverlap)>(is);
 
     return ExecutorConfig{maxBeamWidth, schedulerConfig, kvCacheConfig, enableChunkedContext, normalizeLogProbs,
         iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens, parallelConfig,
         peftCacheConfig, std::nullopt, decodingConfig, gpuWeightsPercent, maxQueueSize, extendedRuntimePerfKnobConfig,
         debugConfig, recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig, guidedDecodingConfig,
-        additionalModelOutputs, gatherGenerationLogits};
+        additionalModelOutputs, gatherGenerationLogits, false, enableTrtOverlap};
 }
 
 size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
@@ -1030,6 +1031,7 @@ size_t Serialization::serializedSize(ExecutorConfig const& executorConfig)
     totalSize += su::serializedSize(executorConfig.getGuidedDecodingConfig());
     totalSize += su::serializedSize(executorConfig.getAdditionalModelOutputs());
     totalSize += su::serializedSize(executorConfig.getGatherGenerationLogits());
+    totalSize += su::serializedSize(executorConfig.getEnableTrtOverlap());
 
     return totalSize;
 }
@@ -1062,6 +1064,7 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
     su::serialize(executorConfig.getGuidedDecodingConfig(), os);
     su::serialize(executorConfig.getAdditionalModelOutputs(), os);
     su::serialize(executorConfig.getGatherGenerationLogits(), os);
+    su::serialize(executorConfig.getEnableTrtOverlap(), os);
 }
 
 // KvCacheConfig
