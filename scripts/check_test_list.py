@@ -39,6 +39,8 @@ def verify_l0_test_lists(llm_src):
 
 def verify_qa_test_lists(llm_src):
     test_qa_path = f"{llm_src}/tests/integration/test_lists/qa"
+    # Remove dynamically generated perf tests
+    subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
     test_def_files = subprocess.check_output(
         f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
     for test_def_file in test_def_files:
