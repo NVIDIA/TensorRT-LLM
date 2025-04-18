@@ -1157,8 +1157,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs['position_ids'][0, inputs['spec_metadata'].gather_ids] += 1
             inputs['spec_metadata'].gather_ids *= 0
             num_seqs = inputs['attn_metadata'].num_seqs
-            inputs['attn_metadata']._seq_lens[:num_seqs].fill_(1)
             inputs['attn_metadata']._seq_lens_cuda[:num_seqs].fill_(1)
+            inputs['attn_metadata'].kv_lens_cuda[:num_seqs] += 1
 
         return inputs
 
@@ -1186,7 +1186,10 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             num_extra_kv_tokens=self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
-        attn_metadata.prepare()
+        attn_metadata._seq_lens[:num_seqs].fill_(1)
+        attn_metadata.kv_lens[:num_seqs] += 1
+        attn_metadata.host_request_types[0:num_seqs].fill_(1)
+        attn_metadata.prepare_kv_cache()
 
         # speculative decoding metadata
         sequence_lengths = [1] * num_seqs
@@ -1233,14 +1236,6 @@ class PyTorchModelEngine(ModelEngine):
                 all_rank_num_tokens = self.dist.tp_allgather(
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
-
-        if self.mapping.has_pp():
-            pipeline_interface = None
-            if self.mapping.pp_rank > 0:
-                pipeline_interface = self.model.create_pipeline_interface(
-                    inputs['input_ids'].shape[0])
-                pipeline_interface.recv()
-            inputs['pipeline_interface'] = pipeline_interface
 
         num_generation_tokens = len(generation_requests)
         self.iter_states['num_ctx_requests'] = 0
@@ -2239,7 +2234,7 @@ class PyTorchModelEngine(ModelEngine):
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
-        if inputs['spec_metadata'] is not None:
+        if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
         if self.without_logits:
             outputs = self.model_forward(**inputs)

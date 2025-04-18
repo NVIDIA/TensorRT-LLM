@@ -615,8 +615,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
 
-        if self.enable_flash_mla:
-            self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
         # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
@@ -633,6 +631,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prepare_paged_context_mla(cached_token_lens, kv_lens)
 
         # kv block offsets
+        self.prepare_kv_cache()
+
+    def prepare_kv_cache(self) -> None:
+        if self.enable_flash_mla:
+            self.prepare_flash_mla()
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.impl.copy_batch_block_offsets(
