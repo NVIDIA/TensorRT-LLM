@@ -210,6 +210,7 @@ class OpenAIServer:
             sampling_params = request.to_sampling_params()
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             postproc_args = ChatPostprocArgs.from_request(request)
+            postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
