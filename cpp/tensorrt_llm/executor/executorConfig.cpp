@@ -28,7 +28,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
     std::optional<PeftCacheConfig> const& peftCacheConfig,
     std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
-    float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
+    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
@@ -48,6 +48,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mPeftCacheConfig(peftCacheConfig)
     , mLogitsPostProcessorConfig(std::move(logitsPostProcessorConfig))
     , mDecodingConfig(std::move(decodingConfig))
+    , mUseGpuDirectStorage((useGpuDirectStorage))
     , mGpuWeightsPercent(gpuWeightPercent)
     , mMaxQueueSize(maxQueueSize)
     , mExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
@@ -144,6 +145,11 @@ std::optional<LogitsPostProcessorConfig> ExecutorConfig::getLogitsPostProcessorC
 std::optional<DecodingConfig> ExecutorConfig::getDecodingConfig() const
 {
     return mDecodingConfig;
+}
+
+bool ExecutorConfig::getUseGpuDirectStorage() const
+{
+    return mUseGpuDirectStorage;
 }
 
 float ExecutorConfig::getGpuWeightsPercent() const
@@ -274,6 +280,11 @@ void ExecutorConfig::setLogitsPostProcessorConfig(LogitsPostProcessorConfig cons
 void ExecutorConfig::setDecodingConfig(DecodingConfig const& decodingConfig)
 {
     mDecodingConfig = decodingConfig;
+}
+
+void ExecutorConfig::setUseGpuDirectStorage(bool const& useGpuDirectStorage)
+{
+    mUseGpuDirectStorage = useGpuDirectStorage;
 }
 
 void ExecutorConfig::setGpuWeightsPercent(float const& gpuWeightsPercent)
