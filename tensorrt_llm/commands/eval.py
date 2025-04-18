@@ -143,6 +143,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
+    profiler.reset("trtllm init")
 
     # Pass llm to subcommands
     ctx.obj = llm

@@ -79,6 +79,7 @@ class Evaluator(ABC):
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
+        profiler.reset("trtllm exec")
 
         score = self.compute_score(outputs, references, *zip(*auxiliaries))
         return score
