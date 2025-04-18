@@ -26,9 +26,9 @@ In this blog, we share the configurations and procedures about how to reproduce 
     - [H200 max-throughput](#h200-max-throughput)
       - [Expected Result Format](#expected-result-format-2)
   - [Exploring more ISL/OSL combinations](#exploring-more-islosl-combinations)
-      - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
-      - [WIP: Chunked context support on DeepSeek models](#wip-chunked-context-support-on-deepseek-models)
-      - [Out of memory issues](#out-of-memory-issues)
+    - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
+    - [WIP: Chunked context support on DeepSeek models](#wip-chunked-context-support-on-deepseek-models)
+    - [Out of memory issues](#out-of-memory-issues)
 
 
 ## Prerequisites: Install TensorRT-LLM and download models
@@ -354,7 +354,7 @@ Average request latency (ms):                     197768.0434
 
 To benchmark TensorRT-LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in previous section. There are some work that TensorRT-LLM is working on can make the benchmark process more smooth.
 
-#### WIP: Enable more features by default
+### WIP: Enable more features by default
 
 Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
 
@@ -364,12 +364,12 @@ Generally, you should make sure that `max_batch_size` is not too low to bottlene
 
 For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-#### WIP: Chunked context support on DeepSeek models
+### WIP: Chunked context support on DeepSeek models
 
 TensorRT-LLM team is activily working on chunked context support for DeepSeek models. Because of that missing feature, there is currently a limitation that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
 
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-#### Out of memory issues
+### Out of memory issues
 
 It's possible seeing OOM issues on some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.
