@@ -18,7 +18,6 @@ from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, register_auto_model)
 
@@ -101,22 +100,6 @@ class QwenMoE(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-class QwenMoeRotaryEmbedding(RotaryEmbedding):
-
-    def __init__(
-        self,
-        config: Qwen2MoeConfig,
-        device: Optional[torch.device] = None,
-    ):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
-
 class QwenMoeAttention(Attention):
 
     def __init__(
@@ -125,27 +108,23 @@ class QwenMoeAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            if getattr(config, "rope_scaling", None) is not None:
-                pos_embd_params = PositionalEmbeddingParams(
-                    type=PositionEmbeddingType.from_string(
-                        config.rope_scaling["type"]),
-                    rope=RopeParams.from_config(config),
-                )
-            else:
-                pos_embd_params = PositionalEmbeddingParams(
-                    type=PositionEmbeddingType.rope_gpt_neox,
-                    rope=RopeParams.from_config(config),
-                )
+        if getattr(config, "rope_scaling", None) is not None:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.from_string(
+                    config.rope_scaling["type"]),
+                rope=RopeParams.from_config(config),
+            )
         else:
-            pos_embd_params = None
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            )
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=True,
-            rotary_emb=QwenMoeRotaryEmbedding(config),
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,

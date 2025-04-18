@@ -26,7 +26,7 @@ def test_llama4(model_name, backend, tp_size):
     ]
 
     pytorch_config = PyTorchConfig(attn_backend=backend, )
-    model_dir = str(llm_models_root() / model_name)
+    model_dir = str(llm_models_root() / "llama4-models" / model_name)
 
     llm = LLM(
         model=model_dir,

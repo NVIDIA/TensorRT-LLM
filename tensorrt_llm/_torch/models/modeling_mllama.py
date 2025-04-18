@@ -32,37 +32,9 @@ from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_procesor import LogitsProcessor
+from ..modules.rms_norm import RMSNorm
 from .modeling_llama import LlamaAttention
 from .modeling_utils import duplicate_kv_weight, register_auto_model
-
-
-# TODO: For performance consideration, should use from ..modules.rms_norm import RMSNorm
-# to utilize fused add rms norm after flashinfer rmsnorm accuracy issue is resolved.
-class RMSNorm(nn.Module):
-
-    def __init__(self, hidden_size, eps=1e-6, dtype=None):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states, residual: Optional[torch.Tensor] = None):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        if residual is not None:
-            hidden_states = hidden_states + residual.to(torch.float32)
-            residual = hidden_states.to(input_dtype)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance +
-                                                    self.variance_epsilon)
-
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-
-        if residual is not None:
-            return hidden_states, residual
-        return hidden_states
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class MllamaDecoderLayer(DecoderLayer):
@@ -113,7 +85,7 @@ class MllamaDecoderLayer(DecoderLayer):
         position_ids: torch.LongTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:

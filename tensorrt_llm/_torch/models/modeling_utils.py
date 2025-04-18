@@ -3,7 +3,8 @@ import fnmatch
 import math
 import time
 from dataclasses import dataclass
-from typing import ClassVar, Dict, Generic, List, Optional, Tuple, Type, TypeVar
+from typing import (ClassVar, Dict, Generic, List, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -152,10 +153,13 @@ class MissingDecoderLayer(MissingLayer, DecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = ...,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return hidden_states, residual
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual
 
     def is_missing(self) -> bool:
         return True

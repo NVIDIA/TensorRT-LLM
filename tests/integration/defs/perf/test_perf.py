@@ -27,6 +27,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
+from .model_yaml_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes)
 
@@ -38,21 +39,43 @@ MAP_BY_SOCKET = None
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
-    "llama_v2_7b": "llama-models-v2/llama-v2-7b-hf",
-    "llama_v2_13b": "llama-models-v2/llama-v2-13b-hf",
-    "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",
-    "llama_v3_8b": "llama-models-v3/8B",
+    "llama_v2_7b": "llama-models-v2/llama-v2-7b-hf",  # not safetensors repo
+    "llama_v2_13b": "llama-models-v2/llama-v2-13b-hf",  # not safetensors repo
+    "llama_v2_70b": "llama-models-v2/llama-v2-70b-hf",  # not safetensors repo
     "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
-    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
+    "llama_v3.2_11b": "llama-3.2-models/Llama-3.2-11B-Vision",
+    # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
+    "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "deepseek_r1": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
+    "qwen2_7b_instruct": "Qwen2-7B-Instruct",
+    "qwen_14b_chat": "Qwen-14B-Chat",
+    "starcoder2_3b": "starcoder2-3b",
+    "starcoder_15b": "starcoder2-15b",
+    "t5": "t5-small",  # not supported for trtllm-bench build config
+    "flan_t5_base":
+    "flan-t5-small",  # not supported for trtllm-bench build config
+    "flan_t5_large":
+    "flan-t5-xl",  # not supported for trtllm-bench build config
+    "whisper_large_v3":
+    "whisper-models/large-v3",  # not supported for trtllm-bench tokenizer
+    "bart_large_cnn": "bart-large-cnn",  # not safetensors repo
+    "mbart_large_50_many_to_one_mmt": "mbart-large-50-many-to-one-mmt",
+    "mamba_130m": "mamba/mamba-130m-hf",
+    "mamba_370m": "mamba/mamba-370m-hf",
+    "mamba_2.8b": "mamba/mamba-2.8b-hf",
+    "gpt_20b": "gpt-neox-20b",
+    "gpt_350m_moe": "gpt2-medium",
+    "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
+    "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -70,6 +93,7 @@ HF_MODEL_PATH = {
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
+    "flan_t5_base_hf": "google/flan-t5-small",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
@@ -156,9 +180,9 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
-    re.compile(r"Average time-to-first-token \[TTFT\]\(ms\):\s+([\d\.]+)"),
+    re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
-    re.compile(r"Average time-per-output-token \[TPOT\]\(ms\):\s+([\d\.]+)"),
+    re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
 }
 # (Relative threshold, Absolute threshold) for all metric types
 PERF_METRIC_THRESHOLD = {
@@ -259,7 +283,8 @@ class PerfTestConfig:
         backend: str = "",
         mode: str = "plugin",
         data_type: str = "float16",
-        max_batch_size: int = 0,
+        max_batch_size: int = 2048,
+        max_num_tokens: int = 8192,
         gpu_weights_percent: float = -1,
         batch_sizes: List[int] = [0],
         input_lens: List[int] = [8],
@@ -294,6 +319,8 @@ class PerfTestConfig:
         self.gpu_weights_percent = gpu_weights_percent
         # Max Batch Size to build TRT engine with.
         self.max_batch_size = max_batch_size
+        # Max number of tokens to build TRT engine with.
+        self.max_num_tokens = max_num_tokens
         # List of batch sizes to run benchmark with.
         self.batch_sizes = batch_sizes
         # List of input lens to run benchmark with.
@@ -360,8 +387,10 @@ class PerfTestConfig:
             entries.append(f"mp")
 
         # Add Max batch size.
-        if self.max_batch_size > 0:
-            entries.append(f"maxbs:{self.max_batch_size}")
+        entries.append(f"maxbs:{self.max_batch_size}")
+
+        # Add Max number of tokens.
+        entries.append(f"maxnt:{self.max_num_tokens}")
 
         if self.build_only:
             entries.append(f"build_only")
@@ -466,6 +495,9 @@ class PerfTestConfig:
 
         if labels[0].startswith("maxbs"):
             self.max_batch_size = int(labels.pop(0).replace("maxbs:", ""))
+
+        if labels[0].startswith("maxnt"):
+            self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
 
         if labels[0] == "build_only":
             self.build_only = True
@@ -601,21 +633,20 @@ class PerfTestConfig:
         if self.gpu_weights_percent != -1:
             assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
         if not self.build_only:
-            if self.runtime != "cppmanager":
+            if self.runtime != "cppmanager" and self.runtime != "bench":
+                print(f"runtime: {self.runtime}")
                 # Validate max batch size.
                 if self.max_batch_size > 0:
                     assert max(
                         self.batch_sizes
                     ) <= self.max_batch_size, f"Batch Size larger than Max Batch Size!"
-                if self.runtime != "bench":
                     # Validate bs, seq lens, and num_beams.
                     assert len(
                         self.batch_sizes
                     ) > 0 and self.batch_sizes[0] > 0, f"Empty batch sizes!"
                 assert self.static_batching == "", f"Static Batching only valid for gptManagerBenchmark!"
                 assert self.api == "", f"API Type only valid for gptManagerBenchmark!"
-                if self.runtime != "bench":
-                    assert self.streaming == "", f"Streaming only valid for gptManagerBenchmark and trtllm-bench!"
+                assert self.streaming == "", f"Streaming only valid for gptManagerBenchmark and trtllm-bench!"
 
             assert len(self.input_lens) > 0, f"Empty input_lens!"
             if self.is_bert_like():
@@ -629,6 +660,10 @@ class PerfTestConfig:
 
             # BERT with small BS is very unstable. Try to avoid it.
             if self.is_bert_like():
+                if self.runtime == "trtllm-bench":
+                    self.batch_sizes[
+                        0] = self.max_batch_size if self.max_batch_size > 0 else 1
+                    print(f"batch_sizes: {self.batch_sizes}")
                 assert all(
                     [b >= 32 for b in self.batch_sizes]
                 ), f"BERT with small BS is very unstable! Please increase to at least 32."
@@ -801,7 +836,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             self._build_script, f"--output_dir={engine_dir}",
             f"--checkpoint_dir={checkpoint_dir}",
             f"--workers={self._config.tp_size}",
-            f"--use_paged_context_fmha=enable", f"--monitor_memory"
+            f"--use_paged_context_fmha=enable", f"--monitor_memory",
+            f"--max_batch_size={self._config.max_batch_size}"
         ]
         # For Multiple Profiles
         if self._config.multiple_profiles:
@@ -814,8 +850,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         gpu_percent = self._config.gpu_weights_percent
         if gpu_percent != -1:
             build_cmd += [f"--weight_streaming"]
-        if self._config.max_batch_size > 0:
-            build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
         # For engine inspector
         build_cmd.append("--profiling_verbosity=layer_names_only")
         if self._config.num_loras > 0:
@@ -868,12 +902,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             model_name = model_name + "_hf"
         hf_model_name = HF_MODEL_PATH.get(model_name, "")
         build_cmd = [
-            self._build_script, f"--workspace={engine_dir}",
-            f"--model={hf_model_name}", f"--model_path={model_dir}", "build",
-            f"--dataset={dataset_path}"
+            self._build_script, f"--log_level=info",
+            f"--workspace={engine_dir}", f"--model={hf_model_name}",
+            f"--model_path={model_dir}", "build", f"--dataset={dataset_path}",
+            f"--tp_size={self._config.tp_size}",
+            f"--pp_size={self._config.pp_size}"
         ]
-        if self._config.max_batch_size > 0:
-            build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
         max_seq_len = max(self._config.input_lens) + max(
             self._config.output_lens)
         build_cmd.append(f"--max_seq_len={max_seq_len}")
@@ -1062,6 +1096,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
         dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+        report_path = os.path.join(engine_dir, "report.json")
         if not model_name.endswith("_hf"):
             model_name = model_name + "_hf"
         hf_model_name = HF_MODEL_PATH.get(model_name, "")
@@ -1073,13 +1108,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--model_path={model_dir}",
             "throughput",
             f"--dataset={dataset_path}",
+            f"--max_batch_size={self._config.max_batch_size}",
+            f"--max_num_tokens={self._config.max_num_tokens}",
+            f"--report_json={report_path}",
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [f"--engine_dir={engine_dir}"]
         else:
             benchmark_cmd += ["--backend=pytorch"]
-        if self._config.max_batch_size > 0:
-            benchmark_cmd += [f"--max_batch_size={self._config.max_batch_size}"]
+        if self._config.num_reqs > 0:
+            benchmark_cmd += [f"--num_requests={self._config.num_reqs}"]
         if self._config.concurrency != -1:
             benchmark_cmd += [f"--concurrency={self._config.concurrency}"]
         if self._config.ep_size != None:
@@ -1093,15 +1131,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         #use default yaml config
         if self._config.backend == "pytorch":
             import yaml
-            config = {
-                'enable_attention_dp': True,
-                'pytorch_backend_config': {
-                    'enable_overlap_scheduler': True,
-                    'print_iter_log': True,
-                    'use_cuda_graph': True,
-                    'cuda_graph_batch_sizes': [1, 512]
-                }
-            }
+            config = get_model_yaml_config(self._config.to_string())
             with open('extra-llm-api-config.yml', 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
             benchmark_cmd += [
@@ -1288,6 +1318,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if len(metric_values) == 0:
             if self._build_script == "trtllm-build" and metric.metric_type == PerfMetricType.ENGINE_SIZE:
                 metric_values = [0.0]
+            elif self._build_script == "trtllm-bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
+                print_info("skip building process for multi-gpu test"
+                           )  #https://nvbugspro.nvidia.com/bug/5210111
+                metric_values = [0.0]
             else:
                 raise RuntimeError(
                     f"Cannot find perf result for {metric_name} from perf script logs!"
@@ -1318,7 +1352,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     f"Combining up enc builder_perf {enc_metrics} and dec builder_perf {dec_metrics} to {metric_values}."
                 )
             # For other models, builder metric should equal # gpus.
-            elif self._build_script != "trtllm-build":
+            elif self._build_script != "trtllm-build" and self._build_script != "trtllm-bench":
                 assert len(
                     metric_values
                 ) == num_gpus, f"num of metrics: {len(metric_values)} should match num_gpus: {num_gpus}"

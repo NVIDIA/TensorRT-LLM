@@ -611,6 +611,8 @@ bool use_oneshot(int token_num)
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
 void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 {
+    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
     static int SM = tensorrt_llm::common::getSMVersion();
     int token_num = params.size / params.hidden_dim;
     bool oneshot = use_oneshot(token_num);
@@ -632,7 +634,6 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         }
     }
     int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
-    int warps_per_token = (threads_per_token + 31) / 32;
     int cluster_size;
     if (SM >= 90)
     {
@@ -642,17 +643,18 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     {
         cluster_size = 1;
     }
-    while (warps_per_token % cluster_size != 0 && cluster_size > 1)
+    while (threads_per_token % cluster_size != 0 && cluster_size > 1)
     {
         cluster_size /= 2;
     }
-    int warps_per_block = warps_per_token / cluster_size;
-    while (warps_per_block < 4 && cluster_size >= 2)
+    int threads_per_block = threads_per_token / cluster_size;
+    while (threads_per_block < 128 && cluster_size >= 2)
     {
-        warps_per_block *= 2;
+        threads_per_block *= 2;
         cluster_size /= 2;
     }
-    int block_size = warps_per_block * 32;
+    TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
+    int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
@@ -778,8 +780,6 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
         DISPATCH_DTYPE(NRanks);                                                                                        \
     }
 
-    TLLM_CHECK(params.allreduce_in && params.residual_in && params.rms_gamma);
-    TLLM_CHECK(params.size % params.hidden_dim == 0);
     bool fp32_acc = use_fp32_acc();
     DISPATCH_RANKS(2);
     DISPATCH_RANKS(4);

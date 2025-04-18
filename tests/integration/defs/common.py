@@ -561,6 +561,8 @@ def generate_summary_cmd(example_root, *args, **kwargs):
         if isinstance(value, bool):
             if value:
                 summary_cmd.append(f"--{key}")
+        elif isinstance(value, list):  # Support max_attention_window
+            summary_cmd.extend([f"--{key}", *map(str, value)])
         else:
             summary_cmd.extend([f"--{key}", f"{value}"])
 

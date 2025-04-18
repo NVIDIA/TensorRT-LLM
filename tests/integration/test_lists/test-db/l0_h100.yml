@@ -113,7 +113,7 @@ l0_h100:
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-3.2-1b]
   - examples/test_qwen.py::test_llm_hf_qwen_multi_lora_1gpu[qwen2.5_1.5b_instruct]
   - examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it]
-  - examples/test_gemma.py::test_llm_gemma_1gpu_summary[gemma-3-1b-it-other-bfloat16-8]
+  - examples/test_gemma.py::test_llm_gemma_1gpu_summary_vswa[gemma-3-1b-it-other-bfloat16-8]
   - examples/test_phi.py::test_llm_phi_quantization_1gpu[Phi-4-mini-instruct-fp8-bfloat16]
   - unittest/trt/model_api/test_model_level_api.py # 9 mins on H100
   - unittest/trt/model_api/test_model_api_multi_gpu.py # 0.5 mins on H100

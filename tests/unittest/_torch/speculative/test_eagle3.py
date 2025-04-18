@@ -2,6 +2,9 @@ import os
 import sys
 import unittest
 
+import pytest
+import torch
+
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -11,12 +14,20 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-def test_llama_eagle3():
+@pytest.mark.parametrize("use_cuda_graph", [True, False],
+                         ids=["enable_graphs", "disable_graphs"])
+def test_llama_eagle3(use_cuda_graph: bool):
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
     models_path = llm_models_root()
 
     pytorch_config = PyTorchConfig(
         enable_overlap_scheduler=False,
-        use_cuda_graph=False,
+        use_cuda_graph=use_cuda_graph,
+        # Only create a single CUDA graph to prevent OOM in CI
+        cuda_graph_batch_sizes=[1],
     )
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional, Union
 
 from pydantic import (AliasChoices, BaseModel, Field, computed_field,
                       model_validator)
@@ -17,7 +17,7 @@ class BenchmarkEnvironment(BaseModel):
 
 class InferenceRequest(BaseModel):
     task_id: int
-    prompt: Optional[str] = None
+    prompt: Optional[Union[str, Any]] = None
     output_tokens: int
     input_ids: Optional[List[int]] = Field(
         alias=AliasChoices("input_ids", "logits"))

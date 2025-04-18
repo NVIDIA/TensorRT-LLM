@@ -25,7 +25,6 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -60,20 +59,6 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
-class DeepseekV3RotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
-
 class DeepseekV3Attention(MLA):
 
     def __init__(
@@ -83,14 +68,6 @@ class DeepseekV3Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
-
         predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -103,8 +80,11 @@ class DeepseekV3Attention(MLA):
                          predicted_tokens_per_seq=predicted_tokens_per_seq,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=DeepseekV3RotaryEmbedding(config),
-                         pos_embd_params=pos_embd_params,
+                         pos_embd_params=PositionalEmbeddingParams(
+                             type=PositionEmbeddingType.yarn,
+                             rope=RopeParams.from_config(config),
+                             is_neox=False,
+                         ),
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
@@ -287,14 +267,19 @@ class Deepseekv3MoE(nn.Module):
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
 
         self.shared_output_scale = None
+        # The block scale size is 128, which requires shared_expert_intermediate_size to be divisible by 128.
+        assert shared_expert_intermediate_size % 128 == 0
         if self.use_dp:
+            # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
         else:
-            assert shared_expert_intermediate_size % 128 == 0
+            # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+            # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
             shared_tp_size = math.gcd(
                 shared_expert_intermediate_size // 128,
                 model_config.mapping.tp_size,
             )
+            # If shared_tp_size has been overridden, the output of shared experts needs to be scaled down accordingly before all-reduce.
             if shared_tp_size != model_config.mapping.tp_size:
                 self.shared_output_scale = shared_tp_size / model_config.mapping.tp_size
         self.shared_experts = GatedMLP(
@@ -304,7 +289,7 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            is_expert=True)
+            reduce_output=False)
 
         self.mapping = model_config.mapping
         self.all_reduce = AllReduce(self.mapping)
@@ -432,10 +417,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 aux_stream_dict=aux_stream_dict)
         else:
+            # The block scale size is 128, which requires intermediate_size to be divisible by 128.
+            assert config.intermediate_size % 128 == 0
             if self.enable_attention_dp:
+                # If using attention DP, the MLP also uses DP instead of TP.
                 self.mlp_tp_size = 1
             else:
-                assert config.intermediate_size % 128 == 0
+                # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+                # To avoid the costly inter-node all-reduce, we further restrict TP size to be divisible by gpus_per_node.
+                # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
                 self.mlp_tp_size = math.gcd(
                     math.gcd(
                         config.intermediate_size // 128,
@@ -454,7 +444,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 dtype=config.torch_dtype,
                                 config=model_config,
                                 overridden_tp_size=self.mlp_tp_size,
-                                is_expert=False)
+                                reduce_output=True)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,

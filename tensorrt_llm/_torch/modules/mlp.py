@@ -58,20 +58,34 @@ class MLP(nn.Module):
         x: torch.Tensor,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        if lora_params is not None:
+            return self.forward_lora(x, lora_params=lora_params)
 
         x_up = self.up_proj(x)
-        if lora_params is not None:
-            assert self.layer_idx is not None, "layer_idx is required for lora"
-            x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
-            if x_up_lora is not None:
-                x_up = x_up + x_up_lora
+        x_act = self.activation(x_up)
+        x_down = self.down_proj(x_act)
+
+        return x_down
+
+    def forward_lora(
+        self,
+        x: torch.Tensor,
+        lora_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        assert lora_params is not None
+
+        x_up = self.up_proj(x)
+
+        assert self.layer_idx is not None, "layer_idx is required for lora"
+        x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
+        if x_up_lora is not None:
+            x_up = x_up + x_up_lora
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act)
 
-        if lora_params is not None:
-            x_down_lora = self.down_lora(x_act, lora_params, self.layer_idx)
-            if x_down_lora is not None:
-                x_down = x_down + x_down_lora
+        x_down_lora = self.down_lora(x_act, lora_params, self.layer_idx)
+        if x_down_lora is not None:
+            x_down = x_down + x_down_lora
 
         return x_down

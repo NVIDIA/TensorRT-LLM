@@ -95,90 +95,61 @@ class LoraLayer(torch.nn.Module):
     def forward(self, x, lora_params: Dict,
                 layer_idx: int) -> Optional[torch.Tensor]:
         if bool(lora_params):
+
             lora_ranks = []
             lora_weight_pointers = []
-            lora_weight_tensors = [
-            ]  # TODO (dafrimi) needs to delete this when we use loraOps which uses ptr
             active_lora_module_ids = []
             for module_idx in self.lora_module_types:
                 module_idx = int(module_idx)
                 if module_idx in lora_params[layer_idx]:
                     active_lora_module_ids.append(module_idx)
-
-                    is_dora = lora_params[layer_idx][module_idx][
-                        'is_dora']  # todo (dafrimi) use it when calling loraOP
-
+                    # TODO (dafrimi): needs to pass this is_dora arg
+                    lora_params[layer_idx][module_idx]['is_dora']
                     lora_ranks.append(
                         lora_params[layer_idx][module_idx]['adapter_size'])
                     lora_weight_pointers.append(
                         lora_params[layer_idx][module_idx]['weight_pointers'])
-                    lora_weight_tensors.append(
-                        lora_params[layer_idx][module_idx]['weight_tensors']
-                    )  # TODO (dafrimi) needs to delete this when we use loraOps which uses ptr
 
-            lora_params['num_seqs']
+            num_seqs = lora_params['num_seqs']
 
             if len(active_lora_module_ids) == 0:
                 return None
             else:
-                # If there's only one module, use the existing implementation
-                if len(active_lora_module_ids) == 1:
-                    lora_weight_tensors = lora_weight_tensors[0]
-                    lora_output = (
-                        x @ lora_weight_tensors[1].T) @ lora_weight_tensors[0].T
+                lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
+                    x,
+                    lora_params['host_request_types'][:num_seqs],
+                    lora_ranks,
+                    lora_weight_pointers,
+                    lora_params['prompt_lens_cpu'][:num_seqs],
+                    self.output_hidden_sizes,
+                    False,  # transA
+                    True,  # transB
+                    max([r.max() for r in lora_ranks]),
+                    0,
+                    lora_params["remove_input_padding"],
+                )
+                if isinstance(lora_outputs, torch.Tensor):
+                    return lora_outputs
+                else:
+                    # For multiple LoRA modules, some might not be executed in grouped gemm.
+                    # For those modules not executed, we create zero tensors with matching dimensions.
+                    # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
+                    lora_output = []
+                    for module_idx in self.lora_module_types:
+                        if int(module_idx) in active_lora_module_ids:
+                            lora_output.append(lora_outputs.pop(0))
+                        else:
+                            lora_output.append(
+                                torch.zeros(list(x.shape[:-1]) + [
+                                    self.output_hidden_sizes[
+                                        self.lora_module_types.index(
+                                            module_idx)]
+                                ],
+                                            dtype=x.dtype,
+                                            device=x.device))
+
+                    lora_output = torch.cat(lora_output, dim=-1)
                     return lora_output
-
-                # For multiple modules, compute and concatenate outputs
-                lora_outputs = []
-                for module_idx in self.lora_module_types:
-                    module_idx = int(module_idx)
-                    if module_idx in active_lora_module_ids:
-                        i = active_lora_module_ids.index(module_idx)
-                        weight_tensors = lora_weight_tensors[i]
-                        A, B = weight_tensors[0], weight_tensors[1]
-                        lora_output = (x @ B.T) @ A.T
-                        lora_outputs.append(lora_output)
-
-                # Concatenate outputs from all modules
-                lora_output = torch.cat(lora_outputs, dim=-1)
-                return lora_output
-
-                # TODO(dafrimi): use torch implementation. For now, this is just a placeholder, until we will do the biniding to lora ops C++
-                # lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
-                #     x,
-                #     lora_params['host_request_types'][:num_seqs],
-                #     lora_ranks,
-                #     lora_weight_pointers,
-                #     lora_params['prompt_lens_cpu'][:num_seqs],
-                #     self.output_hidden_sizes,
-                #     False,  # transA
-                #     True,  # transB
-                #     max([r.max() for r in lora_ranks]),
-                #     0,
-                #     True,
-                # )
-                # if isinstance(lora_outputs, torch.Tensor):
-                #     return lora_outputs
-                # else:
-                #     # For multiple LoRA modules, some might not be executed in grouped gemm.
-                #     # For those modules not executed, we create zero tensors with matching dimensions.
-                #     # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
-                #     lora_output = []
-                #     for module_idx in self.lora_module_types:
-                #         if int(module_idx) in active_lora_module_ids:
-                #             lora_output.append(lora_outputs.pop(0))
-                #         else:
-                #             lora_output.append(
-                #                 torch.zeros(list(x.shape[:-1]) + [
-                #                     self.output_hidden_sizes[
-                #                         self.lora_module_types.index(
-                #                             module_idx)]
-                #                 ],
-                #                             dtype=x.dtype,
-                #                             device=x.device))
-
-                #     lora_output = torch.cat(lora_output, dim=-1)
-                #     return lora_output
 
         else:
             return None

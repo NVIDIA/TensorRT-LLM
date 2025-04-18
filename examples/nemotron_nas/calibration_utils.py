@@ -20,7 +20,7 @@ def create_trtllm_magpie_calibration_dataset(output_dir: str,
                                              calib_size: int = 512) -> None:
     from datasets import load_dataset
 
-    dataset = load_dataset(DATASET, split="train")
+    dataset = load_dataset(DATASET, split="train", trust_remote_code=True)
 
     def transform(conversation):
         value = '\n'.join(turn['value']

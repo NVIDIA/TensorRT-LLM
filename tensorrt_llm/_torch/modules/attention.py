@@ -20,24 +20,6 @@ from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 
-class L2Norm(torch.nn.Module):
-
-    def __init__(self, dtype: Optional[torch.dtype] = None, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dtype = dtype
-
-    def _norm(self, x):
-        flash_infer_kernel = RMSNorm(hidden_size=x.shape[-1],
-                                     eps=self.eps,
-                                     dtype=self.dtype,
-                                     device=x.device)
-        return flash_infer_kernel(x)
-
-    def forward(self, x):
-        return self._norm(x).type_as(x)
-
-
 class Attention(nn.Module):
 
     def __init__(
@@ -49,13 +31,10 @@ class Attention(nn.Module):
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        rotary_emb: Optional[RotaryEmbedding] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        use_qk_norm: bool = False,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -68,9 +47,6 @@ class Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.use_qk_norm = use_qk_norm
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         if dense_bias is None:
             self.dense_bias = bias
@@ -102,11 +78,6 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        if self.use_qk_norm:
-            self.qk_norm = L2Norm(dtype=dtype)
-        else:
-            self.qk_norm = None
-
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -132,7 +103,19 @@ class Attention(nn.Module):
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
-        self.rotary_emb = rotary_emb
+
+        self.enable_rope_fusion = self.attn_backend == "TRTLLM"
+        self.support_fused_qkv = self.attn_backend == "TRTLLM"
+        self.support_unfused_qkv = self.attn_backend != "TRTLLM"
+        self.rotary_emb = None
+        self.apply_rotary_emb = (not self.enable_rope_fusion
+                                 and pos_embd_params is not None)
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -161,6 +144,14 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
         )
 
+    def convert_qkv(self, q, k, v):
+        if k is None and v is None and not self.support_fused_qkv:
+            q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        elif k is not None and v is not None and not self.support_unfused_qkv:
+            qkv = torch.concat([q, k, v], dim=-1)
+            q, k, v = qkv, None, None
+        return q, k, v
+
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
@@ -174,28 +165,6 @@ class Attention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        is_fused_qkv = False
-        if isinstance(self.attn, TrtllmAttention):
-            is_fused_qkv = True
-
-        if self.qk_norm is not None:
-            # TODO: make this more efficient.
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            do_multi_stream = torch.cuda.is_current_stream_capturing(
-            ) and self.aux_stream is not None
-            if do_multi_stream:
-                self.ln_events[0].record()
-                k = self.qk_norm(k)
-                with torch.cuda.stream(self.aux_stream):
-                    self.ln_events[0].wait()
-                    q = self.qk_norm(q)
-                    self.ln_events[1].record()
-                self.ln_events[1].wait()
-            else:
-                q = self.qk_norm(q)
-                k = self.qk_norm(k)
-            qkv = torch.concat([q, k, v], dim=-1)
 
         if lora_params is not None:
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -208,36 +177,25 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if is_fused_qkv:
-            if self.pos_embd_params is None and position_ids is not None:
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                    dim=-1)
-                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
-                qkv = torch.concat([q, k, v], dim=-1)
+        q, k, v = qkv, None, None
 
-            out_scale = None
-            if self.o_proj.has_fp8_qdq or self.o_proj.has_nv_fp4 or self.o_proj.has_fp8_block_scales:
-                out_scale = self.o_proj.inv_input_scale
-            attn_output = self.attn.forward(qkv,
-                                            None,
-                                            None,
-                                            attn_metadata,
-                                            out_scale=out_scale,
-                                            attention_mask=attention_mask,
-                                            mrope_config=mrope_config)
-        else:
+        if self.apply_rotary_emb and position_ids is not None:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
+            q, k = self.rotary_emb(position_ids, [q, k])
 
-            if self.pos_embd_params is None and position_ids is not None:
-                q, k = self.rotary_emb(position_ids, [q, k], attn_metadata)
+        out_scale = None
+        if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
+            out_scale = self.o_proj.inv_input_scale
 
-            attn_output = self.attn.forward(q.contiguous(),
-                                            k.contiguous(),
-                                            v.contiguous(),
-                                            attn_metadata,
-                                            attention_mask=attention_mask,
-                                            mrope_config=mrope_config)
+        q, k, v = self.convert_qkv(q, k, v)
+        attn_output = self.attn.forward(q,
+                                        k,
+                                        v,
+                                        attn_metadata,
+                                        out_scale=out_scale,
+                                        attention_mask=attention_mask,
+                                        mrope_config=mrope_config)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -268,7 +226,6 @@ class MLA(nn.Module):
         bias: bool,
         aux_stream: Optional[torch.cuda.Stream] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        rotary_emb: Optional[RotaryEmbedding] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
@@ -305,6 +262,7 @@ class MLA(nn.Module):
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads}).")
+        assert pos_embd_params is not None, "pos_embd_params must be provided in MLA"
 
         # tensor parallel
         config = config or ModelConfig()
@@ -347,8 +305,7 @@ class MLA(nn.Module):
 
             self.q_b_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads *
-                (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                tp_size * self.num_heads * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
@@ -367,14 +324,14 @@ class MLA(nn.Module):
 
             self.q_proj = Linear(
                 self.q_lora_rank,
-                tp_size * self.num_heads *
-                (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                tp_size * self.num_heads * self.qk_head_dim,
                 bias=bias,
                 dtype=dtype,
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
-                skip_create_weights=config.skip_create_weights)
+                skip_create_weights=config.skip_create_weights,
+            )
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -498,9 +455,35 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
         )
-        self.rotary_emb = rotary_emb
+
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+        self.enable_rope_fusion = isinstance(self.mha, TrtllmAttention)
+        self.support_fused_qkv = isinstance(self.mha, TrtllmAttention)
+        self.support_unfused_qkv = not isinstance(self.mha, TrtllmAttention)
+        self.rotary_emb = None
+        self.apply_rotary_emb = not self.enable_rope_fusion
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.qk_rope_head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
+    def apply_rope(
+        self,
+        q: torch.Tensor,
+        k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        q_pe = q[..., self.qk_nope_head_dim:].reshape(
+            -1, self.num_heads * self.qk_rope_head_dim)
+        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
+        q[..., self.qk_nope_head_dim:] = q_pe.view(-1, self.num_heads,
+                                                   self.qk_rope_head_dim)
+        return k_pe
 
     def forward(
         self,
@@ -542,6 +525,9 @@ class MLA(nn.Module):
             q_ctx = q[:num_ctx_tokens, ...]
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
             attn_output_context = self.forward_context(q_ctx, compressed_kv_ctx,
                                                        k_pe_ctx, attn_metadata)
@@ -552,6 +538,9 @@ class MLA(nn.Module):
             q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
+            if self.apply_rotary_emb:
+                assert position_ids is not None
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
             attn_output_gen = self.forward_generation(q_gen, compressed_kv_gen,
                                                       k_pe_gen, attn_metadata)
@@ -585,6 +574,12 @@ class MLA(nn.Module):
                                   all_reduce_params=all_reduce_params)
         return attn_output
 
+    def _maybe_concat_qkv(self, q, k, v):
+        if k is not None and v is not None and not self.support_unfused_qkv:
+            qkv = torch.concat([q, k, v], dim=-1)
+            q, k, v = qkv, None, None
+        return q, k, v
+
     def forward_context(
         self,
         q: torch.Tensor,
@@ -603,24 +598,24 @@ class MLA(nn.Module):
             -1,
         )
 
-        k = torch.empty_like(q).view(
-            -1, self.num_heads, (self.qk_nope_head_dim + self.qk_rope_head_dim))
+        k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
         k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
                                                      self.qk_nope_head_dim)
-        k = k.view(
-            -1,
-            self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
+        if self.apply_rotary_emb:
+            k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
+                                                       self.qk_rope_head_dim)
+        k = k.view(-1, self.num_heads * self.qk_head_dim)
 
-        # Concat q(including q_pe), k + k_pe, v together as input_qkv
-        input_qkv = torch.cat([q, k, v], dim=-1)
+        # May concat q(including q_pe), k + k_pe, v together
+        q, k, v = self._maybe_concat_qkv(q, k, v)
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
         attn_output = self.mha.forward(
-            input_qkv,
-            None,
-            None,
+            q,
+            k,
+            v,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
@@ -637,9 +632,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
-        q_nope, q_pe = q.view([
-            -1, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
-        ]).split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         def _run_bmm():
             # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
@@ -678,6 +672,8 @@ class MLA(nn.Module):
                 raise NotImplementedError(
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
+            if self.apply_rotary_emb:
+                fused_q[..., self.kv_lora_rank:] = q_pe
             fused_q = fused_q.view([
                 num_tokens,
                 self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)

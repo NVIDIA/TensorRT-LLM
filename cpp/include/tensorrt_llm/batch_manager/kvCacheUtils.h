@@ -31,24 +31,28 @@ public:
     {
     };
 
-    BlockRange(BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId, SizeType32 beam,
-        SizeType32 poolIdx = 0)
-        : mManager(&cacheManager)
-        , mPool(cacheManager.getBlockManager().getPrimaryPool(poolIdx))
-        , mBlockIds(cacheManager.getSequence(requestId).getCacheBlockIds().at(beam))
+    static BlockRange fromOldAllocatedBlockIds(BaseKVCacheManager const& cacheManager,
+        LlmRequest::RequestIdType requestId, SizeType32 beam = kFIRST_AND_ONLY_BEAM)
     {
+        assert(kFIRST_AND_ONLY_BEAM == beam);
+        auto const windowSize = firstWindowSize(cacheManager);
+        auto const blockIds = cacheManager.getSequence(requestId).getCacheBlockIds(windowSize).at(kFIRST_AND_ONLY_BEAM);
+        return BlockRange(cacheManager, blockIds, requestId);
     }
 
-    BlockRange(BaseKVCacheManager const& cacheManager, std::vector<SizeType32> blockIds, SizeType32 poolIdx = 0)
-        : mManager(&cacheManager)
-        , mPool(cacheManager.getBlockManager().getPrimaryPool(poolIdx))
-        , mBlockIds(std::move(blockIds))
+    static BlockRange fromNewlyAllocatedBlockIds(
+        BaseKVCacheManager const& cacheManager, LlmRequest::RequestIdType requestId)
     {
+        auto const windowSize = firstWindowSize(cacheManager);
+        auto const blockIds = cacheManager.getNewlyAllocatedBlockIds(requestId, windowSize);
+        return BlockRange(cacheManager, blockIds, requestId);
     }
 
-    BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds)
+    BlockRange(runtime::ITensor::SharedPtr pool, std::vector<SizeType32> const& blockIds) // Only used in tests
         : mManager{nullptr}
         , mPool{std::move(pool)}
+        , mWindowSize{0}
+        , mRequestId{0}
         , mBlockIds{blockIds}
     {
         TLLM_CHECK(mPool);
@@ -84,25 +88,51 @@ public:
         auto& blockManager = mManager->getBlockManager();
         for (auto id : mBlockIds)
         {
-            blockHashes.emplace_back(blockManager.getBlockById(id)->getHash());
+            blockHashes.emplace_back(blockManager.getBlockById(id, mWindowSize)->getHash());
         }
         return blockHashes;
     }
 
     void updatePoolIdx(SizeType32 poolIdx)
     {
-        if (mManager)
+        TLLM_CHECK(mManager);
+        mPool = mManager->getBlockManager().getPrimaryPool(poolIdx);
+        auto const newWindowSize = mManager->getBlockManager().getPoolWindowSize(poolIdx);
+        if (newWindowSize != mWindowSize)
         {
-            mPool = mManager->getBlockManager().getPrimaryPool(poolIdx);
+            mWindowSize = newWindowSize;
+            mBlockIds = mManager->getSequence(mRequestId).getCacheBlockIds(mWindowSize).at(kFIRST_AND_ONLY_BEAM);
         }
     }
 
     friend class BlockIterator;
 
 private:
+    BlockRange(
+        BaseKVCacheManager const& cacheManager, std::vector<SizeType32> blockIds, LlmRequest::RequestIdType requestId)
+        : mManager(&cacheManager)
+        , mPool(cacheManager.getBlockManager().getPrimaryPool(kFIRST_POOL_INDEX))
+        , mWindowSize(firstWindowSize(cacheManager))
+        , mRequestId(requestId)
+        , mBlockIds(std::move(blockIds))
+    {
+    }
+
+    static SizeType32 firstWindowSize(BaseKVCacheManager const& cacheManager)
+    {
+        constexpr SizeType32 FIRST_POOL_IDX = 0;
+        return cacheManager.getBlockManager().getPoolWindowSize(FIRST_POOL_IDX);
+    }
+
+private:
     BaseKVCacheManager const* mManager;
     runtime::ITensor::SharedPtr mPool;
+    SizeType32 mWindowSize;
+    const LlmRequest::RequestIdType mRequestId;
     std::vector<SizeType32> mBlockIds;
+
+    static constexpr SizeType32 kFIRST_AND_ONLY_BEAM = 0;
+    static constexpr SizeType32 kFIRST_POOL_INDEX = 0;
 };
 
 class BlockIterator
