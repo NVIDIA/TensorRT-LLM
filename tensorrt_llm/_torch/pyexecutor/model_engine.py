@@ -1276,7 +1276,7 @@ class PyTorchModelEngine(ModelEngine):
             all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         # this is for no cache attention, not for dummy attention
-        if not attn_metadata.is_dummy_attention and attn_metadata.kv_cache_manager is None:
+        if attn_metadata.kv_cache_manager is None:
             assert isinstance(
                 attn_metadata,
                 (VanillaAttentionMetadata, TrtllmAttentionMetadata)
