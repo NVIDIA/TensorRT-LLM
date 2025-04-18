@@ -68,9 +68,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         )
         llm = LLM(self.MODEL_PATH, pytorch_backend_config=pytorch_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @parametrize_with_ids("torch_compile", [False, True])
@@ -97,9 +97,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   pipeline_parallel_size=pp_size,
                   pytorch_backend_config=pytorch_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_ada
@@ -127,9 +127,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_ada
@@ -167,9 +167,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if fp8kv:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
