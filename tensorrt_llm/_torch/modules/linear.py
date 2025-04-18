@@ -194,7 +194,8 @@ class Linear(nn.Module):
         self.use_llama4_qkv = use_llama4_qkv and self.in_features == 5120 and self.out_features == 896
         # Llama4 FC13+SwiGLU kernel has hard requirement of hidden_size = 5120
         # and targets output_features = 2048 or 4096.
-        self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (self.out_features == 2048 or self.out_features == 4096)
+        self.use_llama4_fc_swiglu = use_llama4_fc_swiglu and self.in_features == 5120 and (
+            self.out_features == 2048 or self.out_features == 4096)
 
         if not skip_create_weights:
             self.create_weights()
@@ -308,7 +309,11 @@ class Linear(nn.Module):
             self.register_parameter("bias", None)
         self._weights_created = True
 
-    def apply_linear(self, input, weight, bias, inv_input_scale: Optional[torch.Tensor] = None):
+    def apply_linear(self,
+                     input,
+                     weight,
+                     bias,
+                     inv_input_scale: Optional[torch.Tensor] = None):
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -421,13 +426,17 @@ class Linear(nn.Module):
             else:
                 output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            if self.use_llama4_fc_swiglu and input.shape[0] <= 4:
+            if self.use_llama4_fc_swiglu and self.has_fp8_qdq and input.shape[
+                    0] <= 4:
                 # We are passing the input_scale's inverse of the next layer to the current layer
                 # Caller (gated_mlp.py) guards the feeding of inv_input_scale with
                 # "if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4".
                 # If the statement is not satisfied, inv_input_scale is None.
-                
-                output = self.apply_linear(input, self.weight, self.bias, inv_input_scale=inv_input_scale)
+
+                output = self.apply_linear(input,
+                                           self.weight,
+                                           self.bias,
+                                           inv_input_scale=inv_input_scale)
             else:
                 output = self.apply_linear(input, self.weight, self.bias)
             if self.parallel_config.gather_output:
