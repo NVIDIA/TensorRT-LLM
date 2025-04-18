@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tllmLogger.h"
+#include "tllmStreamReaders.h"
 
 #include "nlohmann/json.hpp"
 #include <NvInferRuntime.h>
@@ -72,36 +73,6 @@ std::vector<std::size_t> dimsToShape(nvinfer1::Dims const& dims)
 }
 
 tensorrt_llm::runtime::TllmLogger defaultLogger{};
-
-class StreamReader final : public nvinfer1::IStreamReader
-{
-public:
-    StreamReader(std::filesystem::path fp)
-    {
-        mFile.open(fp.string(), std::ios::binary | std::ios::in);
-        TLLM_CHECK_WITH_INFO(mFile.good(), std::string("Error opening engine file: " + fp.string()));
-    }
-
-    virtual ~StreamReader()
-    {
-        if (mFile.is_open())
-        {
-            mFile.close();
-        }
-    }
-
-    int64_t read(void* destination, int64_t nbBytes) final
-    {
-        if (!mFile.good())
-        {
-            return -1;
-        }
-        mFile.read(static_cast<char*>(destination), nbBytes);
-        return mFile.gcount();
-    }
-
-    std::ifstream mFile;
-};
 
 void setWeightStreaming(nvinfer1::ICudaEngine& engine, float const gpuWeightsPercent)
 {
@@ -211,22 +182,34 @@ void assessLikelihoodOfRuntimeAllocation(
             numWarnings);
     }
 }
+
 } // namespace
 
-TllmRuntime::TllmRuntime(
-    RawEngine const& rawEngine, nvinfer1::ILogger* logger, float gpuWeightsPercent, bool useShapeInference)
+TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage,
+    float gpuWeightsPercent, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
     , mUserBufferEnabled{false}
 {
+    auto const startTime = std::chrono::high_resolution_clock::now();
+
     switch (rawEngine.getType())
     {
     case RawEngine::Type::FilePath:
     {
-        auto reader = StreamReader(rawEngine.getPath());
-        mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        if (useGpuDirectStorage)
+        {
+            TLLM_LOG_INFO("GDS is used to load the engine!");
+            auto reader = GDSStreamReader(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        }
+        else
+        {
+            auto reader = StreamReader(rawEngine.getPath());
+            mEngine.reset(mRuntime->deserializeCudaEngine(reader));
+        }
         break;
     }
     case RawEngine::Type::AddressWithSize:
@@ -238,6 +221,11 @@ TllmRuntime::TllmRuntime(
         break;
     default: TLLM_THROW("Unsupported raw engine type.");
     }
+
+    auto const elapsedMs
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - startTime);
+
+    TLLM_LOG_INFO("Engine load time %lld ms", elapsedMs);
 
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "Failed to deserialize cuda engine.");
     mEngineInspector.reset(mEngine->createEngineInspector());

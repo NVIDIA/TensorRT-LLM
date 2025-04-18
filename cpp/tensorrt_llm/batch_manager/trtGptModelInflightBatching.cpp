@@ -138,8 +138,8 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mDebugConfig{optionalParams.debugConfig}
     , mAdditionalModelOutputs{optionalParams.additionalModelOutputs}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_shared<TllmRuntime>(
-          rawEngine, mLogger.get(), optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
+    , mRuntime{std::make_shared<TllmRuntime>(rawEngine, mLogger.get(), optionalParams.useGpuDirectStorage,
+          optionalParams.gpuWeightsPercent, modelConfig.useShapeInference())}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}
