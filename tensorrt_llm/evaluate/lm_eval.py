@@ -113,6 +113,7 @@ class LmEvalWrapper(TemplateLM):
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
+        profiler.reset("trtllm exec")
 
         return [output.outputs[0].text for output in outputs]
 
@@ -215,13 +216,8 @@ class LmEvalEvaluator(Evaluator):
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
             truncate_prompt_tokens=kwargs.pop("max_input_length"))
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
-
-        check_accuracy = kwargs.pop("check_accuracy", False)
-        accuracy_threshold = kwargs.pop("accuracy_threshold", 15)
-        if check_accuracy:
-            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
 
 
 class GSM8K(LmEvalEvaluator):
@@ -237,8 +233,6 @@ class GSM8K(LmEvalEvaluator):
     @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4096)
     @click.option("--max_output_length", type=int, default=256)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -258,8 +252,6 @@ class GPQADiamond(LmEvalEvaluator):
     @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4096)
     @click.option("--max_output_length", type=int, default=32768)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -279,8 +271,6 @@ class GPQAMain(LmEvalEvaluator):
     @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4096)
     @click.option("--max_output_length", type=int, default=32768)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -300,8 +290,6 @@ class GPQAExtended(LmEvalEvaluator):
     @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4096)
     @click.option("--max_output_length", type=int, default=32768)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=50)
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:

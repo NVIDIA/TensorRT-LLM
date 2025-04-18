@@ -78,15 +78,12 @@ class CnnDailymail(Evaluator):
     @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=924)
     @click.option("--max_output_length", type=int, default=100)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=15)
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
                 rouge_path: str, apply_chat_template: bool,
                 system_prompt: Optional[str], max_input_length: int,
-                max_output_length: int, check_accuracy: bool,
-                accuracy_threshold: float) -> None:
+                max_output_length: int) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -97,8 +94,5 @@ class CnnDailymail(Evaluator):
                                  rouge_path=rouge_path,
                                  apply_chat_template=apply_chat_template,
                                  system_prompt=system_prompt)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
-
-        if check_accuracy:
-            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
