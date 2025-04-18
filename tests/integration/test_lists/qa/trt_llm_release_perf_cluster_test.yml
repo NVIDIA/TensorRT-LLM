@@ -40,16 +40,15 @@ trt_llm_release_perf_cluster_test:
 
 # GB chip specific tests with high memory
 - condition:
-    ranges:
-      system_gpu_count:
-        gte: 8
-      gpu_memory:
-        gt: 100000
     wildcards:
-      chip: 'gb*'
+      gpu:
+        - '*b100*'
       linux_distribution_name: '*'
   tests:
   - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:fp8-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:1-input_output_len:1000,2000-quant:fp8-reqs:10-ep:4-tp:8-gpus:8] #min latency test
+  - perf/test_perf.py::test_perf[deepseek_r1-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:fp8-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:512-input_output_len:128,128-quant:nvfp4-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-streaming-float16-maxbs:512-input_output_len:1000,1000-quant:nvfp4-con:4096-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8] #min latency test
   - perf/test_perf.py::test_perf[deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-tp:8-gpus:8] #max throughput test
