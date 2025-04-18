@@ -18,31 +18,42 @@
 
 #include <cuda.h>
 
-#include "trtllmGen_export/GemmOptions.h"
-#include "trtllmGen_export/trtllm/gen/DtypeDecl.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
+#include <optional>
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
 
-namespace tg = trtllm::gen;
+struct TrtllmGenGemmRunnerOptions
+{
+    Dtype eltType;
+    Dtype outputType;
+    bool deepSeekFp8{false};
+    bool transposeMmaOutput{false};
+};
 
 class TrtllmGenGemmRunner
 {
 public:
-    explicit TrtllmGenGemmRunner(tg::Dtype eltType, tg::Dtype outputType);
+    explicit TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options);
 
-    [[nodiscard]] size_t getWorkspaceSizeInBytes(
-        int32_t m, int32_t n, int32_t k, tg::Dtype eltType, tg::Dtype outputType) const;
+    [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
 
     void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b, float const* bScale,
         void* c, float* cScale, void* workspace, CUstream stream, int device);
 
+    void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale, void* workspace,
+        CUstream stream, int device);
+
 private:
-    tg::Dtype mEltType;
-    tg::Dtype mOutputType;
-    gemm::GemmConfig const* mGemmConfig;
+    void selectGemmConfig(int32_t m, int32_t n, int32_t k);
+
+private:
+    TrtllmGenGemmRunnerOptions mOptions;
+    std::optional<int> mSelectedConfigIndex;
+    std::vector<int32_t> mPassingConfigIndices;
 };
 } // namespace kernels
 } // namespace tensorrt_llm

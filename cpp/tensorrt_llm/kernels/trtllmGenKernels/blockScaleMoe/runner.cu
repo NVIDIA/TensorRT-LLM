@@ -55,116 +55,121 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t num_tokens, int
     int32_t* cta_idx_xy_to_batch_idx, int32_t* cta_idx_xy_to_mn_limit, int32_t* num_non_exiting_ctas,
     tg::Dtype dtypeElt, bool use_routing_scales_on_input, bool use_deep_seek_fp8, cudaStream_t stream)
 {
-    if (top_k == 8) {
-      std::vector<int32_t> selectedIndex;
-      for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
-      {
-          auto gemmInfo = PermuteGemm1::gemmList[ii];
-          if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
-              && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-          {
-              selectedIndex.push_back(ii);
-          }
-      }
-      TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
-      TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
-      auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
-      int32_t tileN = kernelInfo.tileN;
+    if (top_k == 8)
+    {
+        std::vector<int32_t> selectedIndex;
+        for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
+        {
+            auto gemmInfo = PermuteGemm1::gemmList[ii];
+            if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
+                && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
+            {
+                selectedIndex.push_back(ii);
+            }
+        }
+        TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
+        TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
+        auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
+        int32_t tileN = kernelInfo.tileN;
 
-      moe::dev::routing::Data routingData;
-      routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-      routingData.mDtypeExpW = tg::Dtype::Bfloat16;
-      routingData.mUsePdl = true;
+        moe::dev::routing::Data routingData;
+        routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        routingData.mUsePdl = true;
 
-      // output:
-      routingData.mPtrExpertIdx = routingExpertIndexes;
-      routingData.mPtrExpertCounts = expertCountHistogram;
-      routingData.mPtrPermutedIdxSize = permuted_idx_size;
-      routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
-      routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
-      routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
-      routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
-      routingData.mPtrExpertWeights = expert_weights;
+        // output:
+        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permuted_idx_size;
+        routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
+        routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
+        routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
+        routingData.mPtrExpertWeights = expert_weights;
 
-      routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
-      routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
-      routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
-      routingData.mAllToAllRouteAct = false;
+        routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
+        routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
+        routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
+        routingData.mAllToAllRouteAct = false;
 
-      // input:
-      // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
-      routingData.mPtrRoutingBias = routingBias;
-      routingData.mPtrScores = reinterpret_cast<float *>(routingLogits);
-      // routingData.mPtrIn = args.mInputActs;
-      routingData.mNumTokens = num_tokens;
-      // routingData.mHiddenDim = args.mHiddenDim;
-      routingData.mNumExperts = num_experts;
-      routingData.mNumExpertGroups = n_group;
-      routingData.mNumLimitedGroups = topk_group;
-      routingData.mTopK = top_k;
-      routingData.mPaddingLog2 = computeLog2(tileN);
-      routingData.mLocalExpertsStartIdx = local_expert_offset;
-      routingData.mLocalExpertsStrideLog2 = 0;
-      routingData.mNumLocalExperts = local_num_experts;
-      routingData.mRouteScale = routed_scaling_factor;
-      routingData.mUseRoutingSoftmax = false;
-      moe::dev::routing::run(routingData, stream);
-    } else if (top_k == 1) {
-      std::vector<int32_t> selectedIndex;
-      for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
-      {
-          auto gemmInfo = PermuteGemm1::gemmList[ii];
-          if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
-              && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
-          {
-              selectedIndex.push_back(ii);
-          }
-      }
-      TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
-      TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
-      auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
-      int32_t tileN = kernelInfo.tileN;
+        // input:
+        // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
+        routingData.mPtrRoutingBias = routingBias;
+        routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+        // routingData.mPtrIn = args.mInputActs;
+        routingData.mNumTokens = num_tokens;
+        // routingData.mHiddenDim = args.mHiddenDim;
+        routingData.mNumExperts = num_experts;
+        routingData.mNumExpertGroups = n_group;
+        routingData.mNumLimitedGroups = topk_group;
+        routingData.mTopK = top_k;
+        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mLocalExpertsStartIdx = local_expert_offset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = local_num_experts;
+        routingData.mRouteScale = routed_scaling_factor;
+        routingData.mUseRoutingSoftmax = false;
+        moe::dev::routing::run(routingData, stream);
+    }
+    else if (top_k == 1)
+    {
+        std::vector<int32_t> selectedIndex;
+        for (size_t ii = 0; ii < PermuteGemm1::gemmList.size(); ii++)
+        {
+            auto gemmInfo = PermuteGemm1::gemmList[ii];
+            if (gemmInfo.dtypeElt == dtypeElt && gemmInfo.usePerTokenSfB == use_routing_scales_on_input
+                && gemmInfo.useDeepSeekFp8 == use_deep_seek_fp8)
+            {
+                selectedIndex.push_back(ii);
+            }
+        }
+        TLLM_CHECK_WITH_INFO(selectedIndex.size() != 0, "No kernel found for the given element type");
+        TLLM_CHECK_WITH_INFO(selectedIndex.size() == 1, "Multiple kernels found for the given element type");
+        auto const& kernelInfo = PermuteGemm1::gemmList[*selectedIndex.begin()];
+        int32_t tileN = kernelInfo.tileN;
 
-      moe::dev::routingLlama4::Data routingData;
-      // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-      routingData.mDtypeExpW = tg::Dtype::Bfloat16;
-      routingData.mUsePdl = true;
+        moe::dev::routingLlama4::Data routingData;
+        // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
+        routingData.mDtypeExpW = tg::Dtype::Bfloat16;
+        routingData.mUsePdl = true;
 
-      // output:
-      routingData.mPtrExpertIdx = routingExpertIndexes;
-      routingData.mPtrExpertCounts = expertCountHistogram;
-      routingData.mPtrPermutedIdxSize = permuted_idx_size;
-      routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
-      // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
-      routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
-      // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
-      routingData.mPtrExpertWeights = expert_weights;
+        // output:
+        routingData.mPtrExpertIdx = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permuted_idx_size;
+        routingData.mPtrExpandedIdxToPermutedIdx = expanded_idx_to_permuted_idx;
+        // routingData.mPtrPermutedIdxToExpandedIdx = permuted_idx_to_expanded_idx;
+        routingData.mPtrPermutedIdxToTokenIdx = permuted_idx_to_token_idx;
+        // routingData.mPtrNumTokensPerExpert = num_tokens_per_expert;
+        routingData.mPtrExpertWeights = expert_weights;
 
-      routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
-      routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
-      routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
-      // routingData.mAllToAllRouteAct = false;
+        routingData.mPtrCtaIdxXyToBatchIdx = cta_idx_xy_to_batch_idx;
+        routingData.mPtrCtaIdxXyToMnLimit = cta_idx_xy_to_mn_limit;
+        routingData.mPtrNumNonExitingCtas = num_non_exiting_ctas;
+        // routingData.mAllToAllRouteAct = false;
 
-      // input:
-      // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
-      // routingData.mPtrRoutingBias = routingBias;
-      routingData.mPtrScores = routingLogits;
-      // routingData.mPtrIn = args.mInputActs;
-      routingData.mNumTokens = num_tokens;
-      // routingData.mHiddenDim = args.mHiddenDim;
-      routingData.mNumExperts = num_experts;
-      // routingData.mNumExpertGroups = n_group;
-      // routingData.mNumLimitedGroups = topk_group;
-      routingData.mTopK = top_k;
-      routingData.mPaddingLog2 = computeLog2(tileN);
-      routingData.mLocalExpertsStartIdx = local_expert_offset;
-      routingData.mLocalExpertsStrideLog2 = 0;
-      routingData.mNumLocalExperts = local_num_experts;
-      // routingData.mRouteScale = routed_scaling_factor;
-      // routingData.mUseRoutingSoftmax = false;
-      moe::dev::routingLlama4::run(routingData, stream);
-    } else {
-      TLLM_CHECK_ERROR(false, "top_k can only be 1 or 8.");
+        // input:
+        // routingData.mPtrRoutingWeights = args.mRoutingWeights;  // routing weights (don't need if not using gemm)
+        // routingData.mPtrRoutingBias = routingBias;
+        routingData.mPtrScores = routingLogits;
+        // routingData.mPtrIn = args.mInputActs;
+        routingData.mNumTokens = num_tokens;
+        // routingData.mHiddenDim = args.mHiddenDim;
+        routingData.mNumExperts = num_experts;
+        // routingData.mNumExpertGroups = n_group;
+        // routingData.mNumLimitedGroups = topk_group;
+        routingData.mTopK = top_k;
+        routingData.mPaddingLog2 = computeLog2(tileN);
+        routingData.mLocalExpertsStartIdx = local_expert_offset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = local_num_experts;
+        // routingData.mRouteScale = routed_scaling_factor;
+        // routingData.mUseRoutingSoftmax = false;
+        moe::dev::routingLlama4::run(routingData, stream);
+    }
+    else
+    {
+        TLLM_CHECK_ERROR(false, "top_k can only be 1 or 8.");
     }
 }
 } // namespace Routing

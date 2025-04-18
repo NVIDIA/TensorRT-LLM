@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/llama4GemmSwiGLU.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/llama4GemmSwiGLU.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -37,9 +37,7 @@ namespace
 class Llama4GemmSwiGLUOp
 {
 public:
-    Llama4GemmSwiGLUOp()
-    {
-    }
+    Llama4GemmSwiGLUOp() {}
 
     ~Llama4GemmSwiGLUOp() = default;
 
@@ -71,14 +69,16 @@ public:
         return output;
     }
 
-    int initialize() noexcept {
+    int initialize() noexcept
+    {
         return 0;
     }
-
 };
 } // namespace
 
-torch::Tensor llama4_fc_swiglu_fp8(torch::Tensor inputA, torch::Tensor inputB, torch::Tensor in_scale, torch::Tensor out_scale_inv) {
+torch::Tensor llama4_fc_swiglu_fp8(
+    torch::Tensor inputA, torch::Tensor inputB, torch::Tensor in_scale, torch::Tensor out_scale_inv)
+{
     Llama4GemmSwiGLUOp op;
     return op.run_fp8(inputA, inputB, in_scale, out_scale_inv);
 }
