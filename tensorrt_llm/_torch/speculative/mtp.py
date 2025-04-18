@@ -953,6 +953,8 @@ class MTPEagleWorker(MTPWorker):
             req_types = attn_metadata.host_request_types[:batch_size].clone()
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
+            if hasattr(attn_metadata, 'flash_mla_metadata'):
+                flash_mla_tile_scheduler_metadata = attn_metadata.flash_mla_metadata.tile_scheduler_metadata
 
         # Prepare inputs for the 1st MTP layer
         position_ids = position_ids.squeeze(0)
@@ -997,6 +999,17 @@ class MTPEagleWorker(MTPWorker):
                     ])
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)
+
+                if attn_metadata.enable_flash_mla:
+                    # Since KV cache length is increasing, we need to update the MLA metadata.
+                    torch.ops.trtllm.get_mla_metadata(
+                        attn_metadata.kv_lens_cuda[:batch_size], attn_metadata.
+                        flash_mla_metadata.tile_scheduler_metadata_eagle,
+                        attn_metadata.flash_mla_metadata.
+                        num_splits[:batch_size + 1])
+                    # Replace tile_scheduler_metadata which is passed into the AttentionOp.
+                    attn_metadata.flash_mla_metadata.tile_scheduler_metadata = attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle
+
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             # support attention dp
@@ -1022,6 +1035,9 @@ class MTPEagleWorker(MTPWorker):
             spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens_cuda)
+            if hasattr(attn_metadata, 'flash_mla_metadata'):
+                # Restore the original tile_scheduler_metadata.
+                attn_metadata.flash_mla_metadata.tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[

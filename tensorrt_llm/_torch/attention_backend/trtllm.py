@@ -531,6 +531,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
+
+                # This is specific to MTP Eagle, where the query seqlen is always 1.
+                num_heads_per_head_k_eagle = num_heads_q // num_heads_k
+                num_sm_parts_eagle = sm_count // num_heads_k // ceil_div(
+                    num_heads_per_head_k_eagle, block_size_m)
+                self.flash_mla_metadata.tile_scheduler_metadata_eagle = torch.empty(
+                    [num_sm_parts_eagle, tile_scheduler_metadata_size],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
                 self.flash_mla_metadata.num_splits = torch.empty(
                     [self.kv_cache_manager.max_batch_size + 1],
                     dtype=torch.int32,
