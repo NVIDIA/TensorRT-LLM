@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/llama4QKVGemm.h"
 #include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerBlockTemplate.cuh"
 #include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerWarpTemplate.cuh"
+#include "tensorrt_llm/kernels/llama4QKVGemm.h"
 #include <stdexcept>
 
 #define GEMM_HIDDEN_IN 5120
@@ -49,14 +49,16 @@ void launch_kernel_fdl(
     cudaLaunchKernelExC(&config, (void const*) kernel_func, args);
 }
 
-inline int div_up(int x, int y) {
+inline int div_up(int x, int y)
+{
     return (x + y - 1) / y;
 }
 
 void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
     float const* scaling_factor, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream)
 {
-    void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor, (void*) &num_tokens, (void*) &hidden_in, (void*) &hidden_out};
+    void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor, (void*) &num_tokens,
+        (void*) &hidden_in, (void*) &hidden_out};
     if (num_tokens == 1)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 1.
@@ -98,7 +100,8 @@ void llama4_qkv_gemm_op(
     __nv_fp8_e4m3 const* B_fp8 = static_cast<__nv_fp8_e4m3 const*>(B);
     __nv_bfloat16* C_bf16 = static_cast<__nv_bfloat16*>(C);
     float const* __restrict__ scaling_factor_float = static_cast<float const*>(scaling_factor);
-    llama4_qkv_gemv_kernel_launcher(A_fp8, B_fp8, C_bf16, scaling_factor_float, num_tokens, GEMM_HIDDEN_IN, GEMM_HIDDEN_OUT, stream);
+    llama4_qkv_gemv_kernel_launcher(
+        A_fp8, B_fp8, C_bf16, scaling_factor_float, num_tokens, GEMM_HIDDEN_IN, GEMM_HIDDEN_OUT, stream);
 }
 
 } // namespace tensorrt_llm::kernels::llama4_qkv_gemm

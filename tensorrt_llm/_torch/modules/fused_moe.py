@@ -907,7 +907,8 @@ class FusedMoE(nn.Module):
                 w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_id].transpose(0, 1).contiguous()
+                w2_weight = weights["down_proj"][expert_id].transpose(
+                    0, 1).contiguous()
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
@@ -1233,10 +1234,12 @@ class FusedMoE(nn.Module):
                 w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
                 w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][expert_id].transpose(
-                    0, 1).contiguous()
-                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(2, dim=0)
-                w2_weight_scale = weights["down_proj_weight_scale"][expert_id].transpose(0, 1).contiguous()
+                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                    2, dim=0)
+                w2_weight_scale = weights["down_proj_weight_scale"][
+                    expert_id].transpose(0, 1).contiguous()
                 w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
                 w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
                 w2_weight_scale_2 = weights["down_proj_weight_scale_2"]

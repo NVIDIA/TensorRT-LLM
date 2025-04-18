@@ -77,8 +77,7 @@ class GatedMLP(nn.Module):
             skip_create_weights=config.skip_create_weights,
             # During llama4, we are using the custom kernel that performs FC+SwiGLU
             # in one kernel.
-            use_llama4_fc_swiglu=is_llama4
-        )
+            use_llama4_fc_swiglu=is_llama4)
 
         self.down_proj = Linear(
             self.intermediate_size,
@@ -125,18 +124,19 @@ class GatedMLP(nn.Module):
                 # fp8 in and fp8 out. Since next gemm is also fp8, we will need to feed
                 # the next gemm layer's input_scale inverse to the current layer as output
                 # scaling factor.
-                h2 = self.gate_up_proj(x, inv_input_scale=self.down_proj.inv_input_scale)
+                h2 = self.gate_up_proj(
+                    x, inv_input_scale=self.down_proj.inv_input_scale)
             else:
                 h1 = self.gate_up_proj(x)
                 if lora_params is not None:
                     assert self.layer_idx is not None, "layer_idx is required for lora"
-                    h1_lora = self.splitted_gate_up_lora(x, lora_params,
-                                                        self.layer_idx)
+                    h1_lora = self.splitted_gate_up_lora(
+                        x, lora_params, self.layer_idx)
                     if h1_lora is not None:
                         h1 = h1 + h1_lora
 
                     h1_lora = self.fused_gate_up_lora(x, lora_params,
-                                                    self.layer_idx)
+                                                      self.layer_idx)
 
                     if h1_lora is not None:
                         h1 = h1 + h1_lora

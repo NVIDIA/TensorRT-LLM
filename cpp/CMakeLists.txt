@@ -50,6 +50,10 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
+# Add TensorRT-LLM Gen export interface and CUDA support
+add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
+add_compile_definitions("TLLM_ENABLE_CUDA")
+
 if(EXISTS
    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/batch_manager/CMakeLists.txt")
   set(BUILD_BATCH_MANAGER_DEFAULT ON)

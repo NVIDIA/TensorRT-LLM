@@ -46,6 +46,7 @@ add_library(
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
+  fp8PerTensorScalingTrtllmGenGemm.cpp
   fp4Op.cpp
   fp4Gemm.cpp
   fp4GemmTrtllmGen.cpp

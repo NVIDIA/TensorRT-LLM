@@ -182,15 +182,21 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
     return scores
 
 
-def routing_reference_no_aux(expert_logits, routing_bias, top_k, n_groups,
-                             top_k_groups, routed_scaling, padding, use_routing_scales_on_input=False):
+def routing_reference_no_aux(expert_logits,
+                             routing_bias,
+                             top_k,
+                             n_groups,
+                             top_k_groups,
+                             routed_scaling,
+                             padding,
+                             use_routing_scales_on_input=False):
     routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
     if use_routing_scales_on_input:
-      # if using routing scales on input, topK == 1 and the score is a plain sigmoid
-      scores = F.sigmoid(routing_logits)
+        # if using routing scales on input, topK == 1 and the score is a plain sigmoid
+        scores = F.sigmoid(routing_logits)
     else:
-      scores = noaux_tc_ref(routing_logits, routing_bias, n_groups, top_k_groups,
-                            top_k, routed_scaling)
+        scores = noaux_tc_ref(routing_logits, routing_bias, n_groups,
+                              top_k_groups, top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
     # print("permute_info: ", permute_info)
     return permute_info, scores
@@ -891,10 +897,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
     gemm2_weights_quant, gemm2_global_scales = quant_fp8_per_tensor_batches(
         gemm2_weights)
 
-    permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
-                                                    top_k, n_groups,
-                                                    top_k_groups,
-                                                    routed_scaling, padding, use_routing_scales_on_input)
+    permute_info, scores = routing_reference_no_aux(
+        expert_logits, routing_bias, top_k, n_groups, top_k_groups,
+        routed_scaling, padding, use_routing_scales_on_input)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_quant, None,
@@ -957,12 +962,12 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else expert_logits,
-        routing_bias, hidden_states_quant,
-        gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
-        gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
-        top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
-        use_routing_scales_on_input)
+        expert_logits.to(torch.bfloat16)
+        if use_routing_scales_on_input else expert_logits, routing_bias,
+        hidden_states_quant, gemm1_weights_fp8_shuffled, scale_c_fc1,
+        scale_gate_fc1, gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts,
+        top_k, n_groups, top_k_groups, intermediate_size, 0, num_experts,
+        routed_scaling, use_routing_scales_on_input)
 
     output_dequant_actual = output.to(torch.float)
 
