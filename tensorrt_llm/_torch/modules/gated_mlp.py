@@ -57,6 +57,7 @@ class GatedMLP(nn.Module):
             pp_size = config.mapping.pp_size
         gpus_per_node = config.mapping.gpus_per_node
 
+        self.is_llama4 = is_llama4
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -78,7 +79,7 @@ class GatedMLP(nn.Module):
             # in one kernel.
             use_llama4_fc_swiglu=is_llama4
         )
-        self.is_llama4 = is_llama4
+
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,
