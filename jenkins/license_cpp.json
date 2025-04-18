@@ -46,6 +46,7 @@
         "tensorrt_llm/kernels/flashMLA/static_switch.h": "dual license",
         "tensorrt_llm/kernels/flashMLA/utils.h": "dual license",
         "tensorrt_llm/kernels/flashMLA/fp8_transpose_v.h": "dual license",
+        "tensorrt_llm/thop/flashMlaOp.cpp": "dual license",
         "include/tensorrt_llm/deep_gemm/fp8_gemm.cuh": "dual license",
         "include/tensorrt_llm/deep_gemm/mma_utils.cuh": "dual license",
         "include/tensorrt_llm/deep_gemm/scheduler.cuh": "dual license",
