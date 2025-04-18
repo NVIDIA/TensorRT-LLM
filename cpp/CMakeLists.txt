@@ -540,6 +540,7 @@ if(SANITIZE)
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
       add_compile_options("-fsanitize-address-use-after-return=always")
+      add_compile_options("-fbracket-depth=512")
       add_link_options("-fsanitize-address-use-after-return=always")
     endif()
     add_clang_rt_lib("asan")

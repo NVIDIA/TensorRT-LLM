@@ -41,27 +41,14 @@ void invokeAdd(IBuffer& buffer, T value, CudaStream const& stream);
 
 void reduce(IBuffer& output, IBuffer const& input, CudaStream const& stream);
 
-void invokeTranspose(ITensor& output, ITensor const& input, CudaStream const& stream);
-
 void invokeTransposeWithOutputOffset(
     ITensor& output, ITensor const& input, SizeType32 outputOffset, CudaStream const& stream);
 
-void invokeTransposeWithInputOffset(
-    ITensor& output, ITensor const& input, SizeType32 inputOffset, CudaStream const& stream);
-
 void invokeInclusiveSum(IBuffer& output, IBuffer const& input, BufferManager const& manager, CudaStream const& stream);
-
-void invokeInclusiveSum(IBuffer& output, IBuffer& tmpBuffer, IBuffer const& input, CudaStream const& stream);
-
-void invokeBuildTokenMask(
-    ITensor& tokenMask, ITensor const& inputLengths, SizeType32 maxInputLength, CudaStream const& stream);
 
 void invokeBuildAttentionMask(ITensor& attentionMask, TokenIdType padId, CudaStream const& stream);
 
 void invokeExtendAttentionMask(ITensor& newMask, ITensor const& oldMask, CudaStream const& stream);
-
-void invokeCopyInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputLengths,
-    TokenIdType padId, CudaStream const& stream);
 
 void invokeCopyPackedInputToOutputTransposed(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
     SizeType32 maxInputLength, TokenIdType padId, CudaStream const& stream);
@@ -81,8 +68,6 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, 
 void splitTransposed(ITensor& output, ITensor const& input, SizeType32 split, CudaStream const& stream);
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
-
-void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& stream);
 
 void gatherLastTokenLogits(
     ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
