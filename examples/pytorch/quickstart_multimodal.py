@@ -1,11 +1,12 @@
 import argparse
 import json
 import os
+from typing import Any, Dict, List
 
 from quickstart_advanced import add_llm_args, setup_llm
-from transformers import AutoProcessor
 
-from tensorrt_llm.inputs import load_image, load_video
+from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
+                                 default_video_loader)
 
 example_images = [
     "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
@@ -27,92 +28,32 @@ example_video_prompts = [
 ]
 
 
-def prepare_vila(args, inputs):
+def prepare_multimodal_inputs(model_dir: str,
+                              model_type: str,
+                              modality: str,
+                              prompts: List[str],
+                              media: List[str],
+                              image_data_format: str = "pt",
+                              num_frames: int = 8) -> List[Dict[str, Any]]:
 
-    def add_media_token(prompt, multi_modal_data):
-        mm_tokens = ""
-        if "image" in multi_modal_data:
-            for _ in multi_modal_data["image"]:
-                mm_tokens += "<image>"
-        elif "video" in multi_modal_data:
-            for _ in multi_modal_data["video"]:
-                mm_tokens += "<vila/video>"
-        return mm_tokens + prompt
+    inputs = []
+    if modality == "image":
+        inputs = default_image_loader(prompts, media, image_data_format)
+    elif modality == "video":
+        inputs = default_video_loader(prompts, media, image_data_format,
+                                      num_frames)
+    else:
+        raise ValueError(f"Unsupported modality: {modality}")
 
-    for input in inputs:
-        input["prompt"] = add_media_token(input["prompt"],
-                                          input["multi_modal_data"])
+    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
+
     return inputs
-
-
-def prepare_llava_next(args, inputs):
-    processor = AutoProcessor.from_pretrained(args.model_dir)
-
-    # Single-image inference chat template. For multi-image template,
-    # see https://huggingface.co/docs/transformers/en/model_doc/llava_next#multi-image-inference.
-    def apply_template(prompt, multimodal_data):
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
-                    {
-                        "type": "image"
-                    },
-                ],
-            },
-        ]
-        return processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-        )
-
-    for input in inputs:
-        input["prompt"] = apply_template(input["prompt"],
-                                         input["multi_modal_data"])
-    return inputs
-
-
-def prepare_qwen2_vl(args, inputs):
-    processor = AutoProcessor.from_pretrained(args.model_dir)
-
-    def apply_template(prompt, multimodal_data):
-        content = [{
-            "type": media_type
-        } for media_type, items in multimodal_data.items()
-                   for _ in items] + [{
-                       "type": "text",
-                       "text": prompt
-                   }]
-
-        conversation = [{"role": "user", "content": content}]
-        return processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    for input in inputs:
-        input["prompt"] = apply_template(input["prompt"],
-                                         input["multi_modal_data"])
-    return inputs
-
-
-MODEL_TYPE_MAP = {
-    "llava_llama": prepare_vila,
-    "llava_next": prepare_llava_next,
-    "qwen2_vl": prepare_qwen2_vl,
-    "qwen2_5_vl": prepare_qwen2_vl,
-}
 
 
 def add_multimodal_args(parser):
     parser.add_argument("--model_type",
                         type=str,
-                        choices=MODEL_TYPE_MAP.keys(),
+                        choices=INPUT_FORMATTER_MAP.keys(),
                         help="Model type.")
     parser.add_argument("--modality",
                         type=str,
@@ -150,50 +91,16 @@ def main():
     llm, sampling_params = setup_llm(args)
 
     image_format = "pt"  # ["pt", "pil"]
-    if args.modality == "image":
-        prompts = args.prompt if args.prompt else example_image_prompts
-        images = args.media if args.media else example_images
-        if len(images) > len(prompts) and len(prompts) == 1:
-            # 1 prompt + N media
-            images = [images]
-        inputs = [{
-            "prompt": prompt,
-            "multi_modal_data": {
-                "image": [
-                    load_image(i, format=image_format, device="cuda")
-                    for i in image
-                ] if isinstance(image, list) else
-                [load_image(image, format=image_format, device="cuda")]
-            }
-        } for prompt, image in zip(prompts, images)]
-    elif args.modality == "video":
-        prompts = args.prompt if args.prompt else example_video_prompts
-        videos = args.media if args.media else example_videos
-        if len(videos) > len(prompts) and len(prompts) == 1:
-            # 1 prompt + N media
-            videos = [videos]
-        inputs = [{
-            "prompt": prompt,
-            "multi_modal_data": {
-                "video": [
-                    load_video(
-                        i, args.num_frames, format=image_format, device="cuda")
-                    for i in video
-                ] if isinstance(video, list) else [
-                    load_video(video,
-                               args.num_frames,
-                               format=image_format,
-                               device="cuda")
-                ]
-            }
-        } for prompt, video in zip(prompts, videos)]
+    if args.model_type is not None:
+        model_type = args.model_type
     else:
-        raise ValueError(f"Unsupported modality: {args.modality}")
+        model_type = json.load(
+            open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
+    assert model_type in INPUT_FORMATTER_MAP, f"Unsupported model_type: {model_type}"
 
-    model_type = json.load(open(os.path.join(llm._hf_model_dir,
-                                             'config.json')))['model_type']
-    assert model_type in MODEL_TYPE_MAP, f"Unsupported model_type: {model_type}"
-    inputs = MODEL_TYPE_MAP[model_type](args, inputs)
+    inputs = prepare_multimodal_inputs(args.model_dir, model_type,
+                                       args.modality, args.prompt, args.media,
+                                       image_format, args.num_frames)
 
     outputs = llm.generate(inputs, sampling_params)
 
