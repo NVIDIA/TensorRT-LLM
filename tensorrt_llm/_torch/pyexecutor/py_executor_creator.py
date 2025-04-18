@@ -151,6 +151,11 @@ def create_py_executor(executor_config: ExecutorConfig,
     )
 
     if has_draft_model_engine:
+        draft_spec_config = copy.copy(spec_config)
+        # The draft model won't have any draft tokens attached to
+        # generation requests when we invoke it autoregressively
+        draft_spec_config.max_draft_tokens = 0
+
         draft_model_engine = PyTorchModelEngine(
             spec_config.eagle_weights_path,
             pytorch_backend_config,
@@ -160,9 +165,10 @@ def create_py_executor(executor_config: ExecutorConfig,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
-            spec_config=copy.copy(spec_config),
+            spec_config=draft_spec_config,
         )
         draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+        draft_model_engine.load_weights_from_target_model(model_engine.model)
     else:
         draft_model_engine = None
 
