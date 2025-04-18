@@ -436,18 +436,12 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_async_tp2(pytorch_backend):
-    if pytorch_backend:
-        pytest.skip("https://nvbugs/5150466: Flaky hang")
-        return
     llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
