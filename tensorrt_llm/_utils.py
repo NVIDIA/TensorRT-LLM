@@ -891,34 +891,33 @@ def convert_to_torch_tensor(
 
 class KVCacheEventSerializer:
 
-    def get_event_serialize_func(event_type):
+    @classmethod
+    def get_event_serialize_func(cls, event_type):
         return {
-            "KVCacheCreatedData": KVCacheEventSerializer._created_to_json,
-            "KVCacheStoredData": KVCacheEventSerializer._stored_to_json,
-            "KVCacheStoredBlockData":
-            KVCacheEventSerializer._stored_block_to_json,
-            "KVCacheRemovedData": KVCacheEventSerializer._removed_to_json,
-            "KVCacheUpdatedData": KVCacheEventSerializer._updated_to_json,
+            "KVCacheCreatedData": cls._created_to_json,
+            "KVCacheStoredData": cls._stored_to_json,
+            "KVCacheStoredBlockData": cls._stored_block_to_json,
+            "KVCacheRemovedData": cls._removed_to_json,
+            "KVCacheUpdatedData": cls._updated_to_json,
         }.get(event_type, None)
 
-    @staticmethod
-    def serialize(events):
+    @classmethod
+    def serialize(cls, events):
         if events is None:
             return None
 
         if not isinstance(events, list):
-            events = [events]
+            return cls.to_json_str(events)
 
-        return [KVCacheEventSerializer.to_json_str(event) for event in events]
+        return [cls.to_json_str(event) for event in events]
 
-    @staticmethod
-    def to_json_str(event):
+    @classmethod
+    def to_json_str(cls, event):
         if event is None:
             return {}
 
         event_type = type(event.data).__name__
-        event_serialize_func = KVCacheEventSerializer.get_event_serialize_func(
-            event_type)
+        event_serialize_func = cls.get_event_serialize_func(event_type)
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 

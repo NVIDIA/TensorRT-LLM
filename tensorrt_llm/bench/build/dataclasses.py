@@ -116,6 +116,7 @@ class ModelConfig(BaseModel):
         setting calculation.
     """
     name: str
+    model_type: str
     param_count: int
     num_hidden_layers: int = Field(validation_alias=AliasChoices(
         "num_hidden_layers",

@@ -12,7 +12,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask, dummy_forward)
+                        PredefinedAttentionMask)
 
 try:
     check_cuda_arch()
@@ -464,14 +464,6 @@ def forward_pattern(
         metadata = metadata_ref() if metadata_ref is not None else None
     else:
         metadata = get_global_attrs().attention_metadata()
-
-    # This is only for memory estimation for now.
-    # NOTE: this method is not accurate while it works for most scenario.
-    if metadata is None or metadata.kv_cache_manager is None:
-        q = q.view(-1, num_heads, head_dim)
-        k = k.view(-1, num_kv_heads, head_dim)
-        v = v.view(-1, num_kv_heads, head_dim)
-        return dummy_forward(q, k, v)
 
     assert isinstance(
         metadata,

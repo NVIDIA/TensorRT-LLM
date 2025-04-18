@@ -440,7 +440,7 @@ def main(args):
 
         outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
                               pad_id, stop_words_list, bad_words_list,
-                              tokenizer.vocab_size)
+                              len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 

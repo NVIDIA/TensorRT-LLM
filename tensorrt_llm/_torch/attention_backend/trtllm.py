@@ -10,7 +10,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         AttentionMetadata, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, dummy_forward)
+                        RopeParams)
 
 
 @dataclass(kw_only=True, init=False)
@@ -489,7 +489,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
 
-        if not self.is_dummy_attention and self.kv_cache_manager is None:
+        if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
             assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
@@ -641,31 +641,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mrope_config: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        if metadata.is_dummy_attention:
-            q_size = self.num_heads * self.head_dim
-            k_size = self.num_kv_heads * self.head_dim
-            v_size = self.num_kv_heads * self.v_head_dim
-            q, k, v = q.split([q_size, k_size, v_size], dim=-1)
-            q = q.view(-1, self.num_heads, self.head_dim)
-            k = k.view(-1, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, self.num_kv_heads, self.v_head_dim)
-            if self.head_dim != self.v_head_dim:
-                # the dummy forward doesn't support head_dim != v_head_dim case
-                # so we use a tensor with supported shape to replace the v
-                # the memory estimation is not accurate in this case
-                v = torch.randn(q.shape[0],
-                                self.num_kv_heads,
-                                self.head_dim,
-                                dtype=q.dtype,
-                                device=q.device)
-            output = dummy_forward(q, k, v)
-            if self.head_dim != self.v_head_dim:
-                output = output[..., :self.num_kv_heads *
-                                self.v_head_dim].contiguous()
-            return output
-
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,

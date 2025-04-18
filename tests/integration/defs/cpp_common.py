@@ -21,6 +21,8 @@ default_test_timeout = 3600
 include_test_map = {
     "gpt": ("Gpt[^j]", ),
     "gpt_executor": ("GptExecutor", ),
+    "gpt_session": ("GptSession", ),
+    "gpt_tests": ("GptTests", ),
     "gptj": ("Gptj", ),
     "llama": ("Llama", ),
     "chatglm": ("ChatGlm", ),
@@ -68,6 +70,16 @@ def generate_result_file_name(test_list: List[str],
 
     if run_fp8:
         yield "fp8"
+
+
+def generate_excluded_test_list(test_list):
+    if "gpt" in test_list:
+        if "gpt_session" not in test_list:
+            yield "GptSession"
+        if "gpt_executor" not in test_list:
+            yield "GptExecutor"
+        if "gpt_tests" not in test_list:
+            yield "GptTests"
 
 
 def find_dir_containing(files: Sequence[str],
@@ -621,8 +633,8 @@ def prepare_model_tests(model_name: str,
             beams_arg = ['--beams', '1,2']
         model_name = 'enc_dec'
 
-    # share the same script for gpt and gpt_executor
-    if model_name == 'gpt_executor':
+    # share the same script for gpt related tests
+    if model_name == 'gpt_executor' or model_name == 'gpt_session' or model_name == 'gpt_tests':
         model_name = 'gpt'
 
     build_engines = [
@@ -716,8 +728,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
 
     excluded_tests = ["FP8"] if not run_fp8 else []
 
-    if "gpt" in test_list and "gpt_executor" not in test_list:
-        excluded_tests.append("GptExecutor")
+    excluded_tests.extend(list(generate_excluded_test_list(test_list)))
 
     ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
@@ -726,7 +737,15 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
 
-        parallel = default_test_parallel
+        gpt_tests = {"gpt", "gpt_session", "gpt_tests", "gpt_executor"}
+
+        # gpt* tests are not parallelized as it would cause OOM because kv cache memory allocations
+        # exist in multiple running tests
+        if gpt_tests.intersection(test_list):
+            parallel = 1
+        else:
+            parallel = default_test_parallel
+
         if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
                                                 None):
             parallel = int(parallel_override)

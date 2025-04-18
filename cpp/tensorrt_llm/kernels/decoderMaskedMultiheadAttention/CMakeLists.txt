@@ -77,6 +77,7 @@ else()
   add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})
 endif()
 
+target_link_libraries(decoder_attention_src PUBLIC ${NVRTC_WRAPPER_TARGET})
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)

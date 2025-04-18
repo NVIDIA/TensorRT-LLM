@@ -1526,6 +1526,7 @@ def test_executor_config():
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
     assert config.use_variable_beam_width_search is False
+    assert config.use_gpu_direct_storage is False
 
     kwargs = {
         "max_beam_width":
@@ -1575,6 +1576,8 @@ def test_executor_config():
         "gather_generation_logits":
         True,
         "use_variable_beam_width_search":
+        True,
+        "use_gpu_direct_storage":
         True
     }
     config = trtllm.ExecutorConfig(**kwargs)
@@ -1599,6 +1602,7 @@ def test_executor_config():
     assert config.additional_model_outputs[0].gather_context is False
     assert config.gather_generation_logits is True
     assert config.use_variable_beam_width_search is True
+    assert config.use_gpu_direct_storage is True
 
 
 def test_parallel_config():
@@ -2354,6 +2358,7 @@ def test_executor_config_pickle():
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
     assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
+    assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
 
 
 def test_return_full_tokens():

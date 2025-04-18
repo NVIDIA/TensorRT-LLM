@@ -7,7 +7,6 @@ from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from typing_extensions import Self
 
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
@@ -125,7 +124,6 @@ class AttentionMetadata:
     _num_generations: int = field(init=False, default=0, repr=False)
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
-    is_dummy_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -548,36 +546,3 @@ class MLAParams:
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
     predicted_tokens_per_seq: int = 1
-
-
-@torch.library.custom_op("trtllm::attn_dummy_fwd", mutates_args=())
-def dummy_forward(q: torch.Tensor, k: torch.Tensor,
-                  v: torch.Tensor) -> torch.Tensor:
-    """
-    Dummy attention forward function to estimate memory usage.
-    Args:
-        q (torch.Tensor): Query tensor with shape (num_q_tokens, num_heads, head_dim),.
-        k (torch.Tensor): Key tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-        v (torch.Tensor): Value tensor with shape (num_new_kv_tokens, num_kv_heads, head_dim)
-    Returns:
-        torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
-    """
-    head_dim = q.shape[2]
-    assert q.dim() == 3
-    assert k.dim() == 3 and k.size(2) == head_dim
-    assert v.dim() == 3 and v.size(2) == head_dim
-    # This is only for memory estimation for now.
-    # NOTE: this method is not accurate while it works for most scenario.
-    o = _flash_attention_forward(q.unsqueeze(0),
-                                 k.unsqueeze(0),
-                                 v.unsqueeze(0),
-                                 attention_mask=None,
-                                 query_length=q.size(0),
-                                 is_causal=True)
-    return o.reshape(o.size(1), -1)
-
-
-@dummy_forward.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    num_q_tokens = q.size(0)
-    return torch.empty_like(q).reshape(num_q_tokens, -1)

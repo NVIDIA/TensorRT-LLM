@@ -123,8 +123,8 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(
     auto const executorConfig
         = executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(), kvCacheConfig, true, true, 1, 1,
             executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
-            executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt,
+            std::nullopt, std::nullopt, false, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(), std::nullopt,
+            0, executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt,
             std::vector<executor::AdditionalModelOutput>{
                 executor::AdditionalModelOutput{DecoderTestShared<TLogits>::kTopKTensorName, params.gatherContext}});
 

@@ -576,12 +576,7 @@ class PyTorchModelEngine(ModelEngine):
                              extra_model_inputs=_create_extra_inputs(bs, 1))
                 torch.cuda.synchronize()
 
-    def _set_up_attn_metadata(self,
-                              kv_cache_manager: KVCacheManager,
-                              is_dummy_forward: bool = False):
-        # is_dummy_forward is used to indicate whether the forward is
-        # a dummy forward for memory estimation OR
-        # a real forward w.o. kv cache
+    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         if kv_cache_manager is None:
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
@@ -589,8 +584,7 @@ class PyTorchModelEngine(ModelEngine):
                 kv_cache_manager=None,
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                is_dummy_attention=is_dummy_forward)
+                enable_flash_mla=self.model.model_config.enable_flash_mla)
 
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
@@ -1282,7 +1276,7 @@ class PyTorchModelEngine(ModelEngine):
             all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
         # this is for no cache attention, not for dummy attention
-        if not attn_metadata.is_dummy_attention and attn_metadata.kv_cache_manager is None:
+        if attn_metadata.kv_cache_manager is None:
             assert isinstance(
                 attn_metadata,
                 (VanillaAttentionMetadata, TrtllmAttentionMetadata)
@@ -1596,14 +1590,12 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests: ScheduledRequests,
                 resource_manager: ResourceManager,
                 new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
-                extra_model_inputs: Optional[Dict[str, Any]] = None,
-                is_dummy_forward: bool = False):
+                extra_model_inputs: Optional[Dict[str, Any]] = None):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
-                                                   is_dummy_forward)
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.spec_config is not None:
             spec_resource_manager = resource_manager.get_resource_manager(
                 'spec_resource_manager')
