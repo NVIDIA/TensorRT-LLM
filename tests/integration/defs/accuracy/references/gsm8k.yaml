@@ -4,3 +4,9 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 0
   - quant_algo: FP8
     accuracy: 0
+deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 0
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 0

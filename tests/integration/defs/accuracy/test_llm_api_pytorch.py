@@ -415,6 +415,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, False, False),
@@ -440,6 +441,47 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestDeepSeekR1(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1"
+
+    @pytest.mark.skip_less_device(8)
+    @skip_pre_blackwell
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False), (True, False, False),
+                           (False, True, False), (False, False, True),
+                           (True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [None, 2])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
+                         attention_dp, cuda_graph, overlap_scheduler):
+        pytorch_config = PyTorchConfig(
+            enable_overlap_scheduler=overlap_scheduler,
+            use_cuda_graph=cuda_graph)
+        if mtp_nextn is not None and mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        else:
+            mtp_config = None
+        llm = LLM(f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-FP4",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  pytorch_backend_config=pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  speculative_config=mtp_config)
+        assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GPQADiamond(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
