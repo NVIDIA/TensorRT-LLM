@@ -183,10 +183,14 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k,
 
 
 def routing_reference_no_aux(expert_logits, routing_bias, top_k, n_groups,
-                             top_k_groups, routed_scaling, padding):
+                             top_k_groups, routed_scaling, padding, use_routing_scales_on_input=False):
     routing_logits = expert_logits.to(dtype=torch.float, device='cuda')
-    scores = noaux_tc_ref(routing_logits, routing_bias, n_groups, top_k_groups,
-                          top_k, routed_scaling)
+    if use_routing_scales_on_input:
+      # if using routing scales on input, topK == 1 and the score is a plain sigmoid
+      scores = F.sigmoid(routing_logits)
+    else:
+      scores = noaux_tc_ref(routing_logits, routing_bias, n_groups, top_k_groups,
+                            top_k, routed_scaling)
     permute_info = routing_reference(scores, top_k, padding)
     # print("permute_info: ", permute_info)
     return permute_info, scores
@@ -259,6 +263,7 @@ def run_moe_dequant(args, quant_mode=["fp4", "dsFp8", "perTensorFp8"]):
                 # Get the permuted index for this token's k-th expert
                 expanded_idx = token_idx * args.top_k + k
                 permuted_idx = expanded_idx_to_permuted_idx[expanded_idx]
+                expert_weight = args.permute_info["topKLogits"].to(torch.float)
                 # Get the expert weight for this token and expert
                 weight = expert_weight[token_idx, k]
                 # Scale the corresponding row in gemm1_output
@@ -842,9 +847,7 @@ def test_moe_fp4(num_tokens, num_experts, hidden_size, intermediate_size):
 @pytest.mark.parametrize("num_experts", [128])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("intermediate_size", [2048])
-@pytest.mark.parametrize(
-    "use_routing_scales_on_input",
-    [False])  # FIXME: add True once Top1 routing is supported
+@pytest.mark.parametrize("use_routing_scales_on_input", [True, False])
 def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
                                   intermediate_size,
                                   use_routing_scales_on_input):
@@ -860,7 +863,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
     routed_scaling = 2.5
 
     assert top_k <= num_experts
-    assert top_k == 8
+    assert top_k == 8 or top_k == 1
     assert top_k_groups == 4
     assert num_experts > n_groups
     assert num_experts % n_groups == 0
@@ -891,7 +894,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
     permute_info, scores = routing_reference_no_aux(expert_logits, routing_bias,
                                                     top_k, n_groups,
                                                     top_k_groups,
-                                                    routed_scaling, padding)
+                                                    routed_scaling, padding, use_routing_scales_on_input)
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, padding, hidden_states_quant, None,
@@ -954,7 +957,8 @@ def test_moe_fp8_per_tensor_scale(num_tokens, num_experts, hidden_size,
                                                       args.gemm2_scales_global)
 
     output = torch.ops.trtllm.fp8_per_tensor_scale_moe_runner(
-        expert_logits, routing_bias, hidden_states_quant,
+        expert_logits.to(torch.bfloat16) if use_routing_scales_on_input else expert_logits,
+        routing_bias, hidden_states_quant,
         gemm1_weights_fp8_shuffled, scale_c_fc1, scale_gate_fc1,
         gemm2_weights_fp8_shuffled, scale_c_fc2, num_experts, top_k, n_groups,
         top_k_groups, intermediate_size, 0, num_experts, routed_scaling,
