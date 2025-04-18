@@ -9,7 +9,7 @@ def parse_name(classname, name, filename):
        filename == "test_unittests.py":
         return name[name.find("test_unittests_v2[unittest/") + 18:-1]
     elif filename in name:
-        return name[name.find('/') + 1:]       
+        return name[name.find('/') + 1:]
     elif filename[:-2].replace("/", ".") in classname:
         return filename + "::" + classname.split(".")[-1] + "::" + name
     else:
@@ -67,8 +67,9 @@ def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList):
 
 
 def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
-    # Merge xml files into one. 
+    # Merge xml files into one.
     # If deduplicate is true, remove duplicate test cases.
+    merged_root = ET.Element('testsuites')
     merged_suite_map = {}
 
     for xml_filename in xml_filenames:
@@ -86,7 +87,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
                 case_list = suite.findall('testcase')
                 for case in case_list:
                     existing_case = original_suite.find(
-                        f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}'][@file='{case.attrib['file']}']"
+                        f"testcase[@name='{case.attrib['name']}'][@classname='{case.attrib['classname']}']"
                     )
                     # find the duplicate case in original_suite
                     if existing_case is not None:
@@ -113,7 +114,6 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
             suite.set(key, str(value))
 
         # add suite to merged_root
-        merged_root = ET.Element('testsuites')
         merged_root.append(suite)
 
     if os.path.exists(merged_xml_filename):
@@ -258,7 +258,7 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
             all_test_cases.append((status, testcase))
 
         if sort_by_name:
-            all_test_cases.sort(key=lambda x: x[1].attrib.get('name', ''))
+            all_test_cases.sort(key=lambda x: x[1].attrib.get('name', '') + x[1].attrib.get('classname', ''))
         else:
             # Sort test cases: failure/error first, then skipped, then success
             status_order = {
