@@ -1,14 +1,13 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional, Type
+from typing import List, Optional, Type
 
 import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 from ..model_config import TConfig
-from ..pyexecutor.scheduler import ScheduledRequests
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -58,6 +57,9 @@ class SpeculativeDecodingMode(IntEnum):
         and the draft model needs to load weights from the separate checkpoint.
         """
         return self.is_eagle3_one_model()
+
+    def has_draft_model_engine(self):
+        return self.is_eagle3()
 
     def has_spec_decoder(self):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
@@ -120,6 +122,8 @@ class SpecMetadata:
     max_num_requests: int
     # The max number of draft tokens.
     max_draft_tokens: int
+    # The number of context sequences in the batch.
+    num_context: int = 0
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -149,9 +153,17 @@ class SpecMetadata:
     # same kv lengths for different layers. Add extra kv token in kv cache manager
     # to haddle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
+    # The number of layers
     num_layers: int = 0
+    # The last metadata
+    last_metadata: Optional["SpecMetadata"] = None
 
     def prepare(self):
+        """
+        Hook to be called before the forward step of the model.
+        """
+
+    def prepare_device(self):
         """
         Hook to be called before the forward step of the model.
         """
@@ -177,20 +189,7 @@ class SpecMetadata:
         model. Use this method to record them. By default, does nothing.
         """
 
-    def get_hidden_states(
-            self,
-            scheduled_requests: ScheduledRequests,
-            num_rejected_tokens: Optional[Dict] = None) -> List[torch.Tensor]:
+    def update_from_target_metadata(self, target_metadata):
         """
-        Return any captured hidden states. Should do any necessary
-        pre-processing.
-
-        num_rejected_tokens is a dictionary mapping request IDs to the
-        number of tokens rejected for that request. If a request ID isn't
-        in the dictionary, it means that the request is not needed for drafting.
-
-        If the dictionary is not given, this function assumes that the hidden
-        states are being prepared for running the draft model autoregressively,
-        and only the last hidden state vector for each sequence is returned.
+        Update the spec metadata from the target metadata.
         """
-        return []

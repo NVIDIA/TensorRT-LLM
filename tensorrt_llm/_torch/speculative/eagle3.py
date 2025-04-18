@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
-from itertools import chain
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -37,6 +36,7 @@ class Eagle3Config(SpecConfig):
     def update_from_model_config(self, model_config):
         self.num_layers = model_config.num_hidden_layers
         self.hidden_size = model_config.hidden_size
+        self.dtype = model_config.torch_dtype
 
     def get_draft_model_prompt(self,
                                input_tokens: torch.Tensor) -> torch.Tensor:
@@ -49,10 +49,17 @@ class Eagle3Config(SpecConfig):
 @dataclass
 class Eagle3SpecMetadata(SpecMetadata):
     hidden_states: List[torch.Tensor] = field(default_factory=list)
-    num_layers: int = 0
+    num_capture_layers: int = 3
     layers_to_capture: Tuple[int, ...] = field(init=False)
     target_model_embed_tokens: Optional[torch.nn.Module] = None
     hidden_size: int = 0
+    max_num_tokens: int = 0
+    dtype: torch.dtype = torch.bfloat16
+    is_draft_model: bool = False
+    is_first_draft: bool = False  # only used for prepare
+    apply_eagle3_fc: bool = False
+    old_request_ids: Optional[List[int]] = None
+    old_seq_lens: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.num_layers == 1:
@@ -64,66 +71,97 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                       self.num_layers - 4)
 
-        self.hidden_states = []
-        if self.is_cuda_graph:
-            # CUDA graphs need to use the same buffers between runs.
-            max_seqlen = self.max_num_requests * (self.max_draft_tokens + 1)
-            hidden_state_shape = (max_seqlen, self.hidden_size)
-            for layer in self.layers_to_capture:
-                self.hidden_states.append(
-                    torch.empty(hidden_state_shape, device='cuda'))
+        self.hidden_states = torch.empty(
+            (self.max_num_tokens, self.hidden_size * self.num_capture_layers),
+            dtype=self.dtype,
+            device='cuda')
+
+        # Initialize to 0 to avoid reading uninitialized memory during warmup
+        self.hidden_states_gather_ids = torch.zeros([self.max_num_tokens],
+                                                    dtype=torch.int,
+                                                    device='cuda')
+        self.hidden_states_write_gather_ids = torch.empty(
+            [self.max_num_requests], dtype=torch.int, device='cuda')
+        self.hidden_states_gather_ids_host = None
 
     def prepare(self):
-        if not self.is_cuda_graph:
-            self.hidden_states = []
+        # Gather ids for reading hidden states in draft model forward
+        if self.is_draft_model:
+            hidden_states_gather_ids = []
+
+            # Update old request ids and seq lens from last metadata
+            if not self.is_first_draft:
+                self.old_request_ids = self.last_metadata.request_ids
+                self.old_seq_lens = self.last_metadata.seq_lens
+            # Get the start index of each request in last forward
+            seq_start_ids, old_seq_lens = {}, {}
+            seq_start = 0
+            for req_id, seqlen in zip(self.old_request_ids, self.old_seq_lens):
+                seq_start_ids[req_id] = seq_start
+                old_seq_lens[req_id] = seqlen
+                seq_start += seqlen
+            # If this is the first draft, we need to read all of the accepted
+            # hidden states, otherwise, we only need to read the last token
+            if self.is_first_draft:
+                for req_id, seqlen in zip(self.request_ids, self.seq_lens):
+                    hidden_states_gather_ids.extend(
+                        list(
+                            range(seq_start_ids[req_id],
+                                  seq_start_ids[req_id] + seqlen)))
+            else:
+                for req_id in self.request_ids:
+                    hidden_states_gather_ids.append(seq_start_ids[req_id] +
+                                                    old_seq_lens[req_id] - 1)
+            self.hidden_states_gather_ids_host = torch.tensor(
+                hidden_states_gather_ids, dtype=torch.int, pin_memory=True)
+            self.apply_eagle3_fc = True if self.is_first_draft else False
+            self.is_first_draft = False
+
+    def prepare_device(self):
+        if self.is_draft_model:
+            self.hidden_states_gather_ids[:self.num_tokens].copy_(
+                self.hidden_states_gather_ids_host, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
-    def maybe_capture_hidden_states(self, layer_id: int,
-                                    hidden_states: torch.Tensor,
-                                    residual: torch.Tensor) -> None:
-        if not self.is_cuda_graph:
-            if layer_id in self.layers_to_capture:
-                self.hidden_states.append(hidden_states + residual)
-        else:
-            assert len(self.hidden_states) == len(self.layers_to_capture)
-            for i, captured_layer_id in enumerate(self.layers_to_capture):
-                if captured_layer_id == layer_id:
-                    self.hidden_states[i].copy_(hidden_states + residual)
-                    break
+    def maybe_capture_hidden_states(
+            self,
+            layer_id: int,
+            hidden_states: torch.Tensor,
+            residual: Optional[torch.Tensor] = None) -> None:
+        for i, captured_layer_id in enumerate(self.layers_to_capture):
+            if captured_layer_id == layer_id:
+                num_tokens = hidden_states.shape[0]
+                to_save = hidden_states + residual if residual is not None else hidden_states
+                self.hidden_states[:num_tokens, i * self.hidden_size:(i + 1) *
+                                   self.hidden_size].copy_(to_save,
+                                                           non_blocking=True)
+                break
 
     def get_hidden_states(
-            self,
-            scheduled_requests,
-            num_rejected_tokens: Optional[Dict] = None) -> torch.Tensor:
-        req_id_to_gather_ids = {}
-        seq_start = 0
-        for req_id, seqlen in zip(self.request_ids, self.seq_lens):
-            if num_rejected_tokens is not None:
-                if req_id in num_rejected_tokens:
-                    req_id_to_gather_ids[req_id] = list(
-                        range(seq_start,
-                              seq_start + seqlen - num_rejected_tokens[req_id]))
-            else:
-                req_id_to_gather_ids[req_id] = [seq_start + seqlen - 1]
-
-            seq_start += seqlen
-
-        hidden_states_gather_ids = []
-        for req in chain(scheduled_requests.context_requests,
-                         scheduled_requests.generation_requests):
-            hidden_states_gather_ids.extend(
-                req_id_to_gather_ids[req.py_request_id])
-
-        if len(self.hidden_states) == 1:
-            return self.hidden_states[0][hidden_states_gather_ids]
+        self,
+        preprocess_func: Optional[callable] = None,
+    ):
+        hidden_states = self.hidden_states[
+            self.hidden_states_gather_ids[:self.num_tokens], :]
+        if self.apply_eagle3_fc and preprocess_func is not None:
+            hidden_states = preprocess_func(hidden_states)
         else:
-            # Note that we must call cat() here. We can't have this control
-            # flow inside the model - that would break CUDA graphs.
-            return torch.cat(
-                [h[hidden_states_gather_ids] for h in self.hidden_states],
-                dim=-1)
+            hidden_states = hidden_states[:, :self.hidden_size]
+        return hidden_states
+
+    @torch.inference_mode()
+    def update_from_target_metadata(self, target_metadata):
+        num_tokens = target_metadata.num_tokens
+        hidden_size = target_metadata.hidden_size * target_metadata.num_capture_layers
+        self.hidden_states[0:num_tokens, 0:hidden_size].copy_(
+            target_metadata.hidden_states[0:num_tokens, 0:hidden_size],
+            non_blocking=True)
+        self.old_request_ids = target_metadata.request_ids
+        self.old_seq_lens = target_metadata.seq_lens
+        self.is_draft_model = True
+        self.is_first_draft = True
 
 
 class Eagle3Sampler(TorchSampler):
@@ -150,8 +188,6 @@ class Eagle3Sampler(TorchSampler):
 class Eagle3OneModelSpecMetadata(SpecMetadata):
     # The hidden states
     hidden_states: Optional[torch.Tensor] = None
-    # The number of layers
-    num_layers: int = 0
     # The layers to be captured
     layers_to_capture: Tuple[int, ...] = field(init=False)
     # The hidden size of the hidden states
