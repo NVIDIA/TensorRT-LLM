@@ -31,16 +31,21 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
     int64_t const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor, bool const use_routing_scales_on_input)
 {
+
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
-    TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
+    if (use_routing_scales_on_input) {
+      TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16.");
+    } else {
+      TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
+    }
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
     TORCH_CHECK(routing_bias.scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
     TORCH_CHECK(routing_bias.dim() == 1, "routing_bias must be 1D.");
     TORCH_CHECK(routing_bias.sizes()[0] == num_experts, "routing_bias has incorrect shape.");
 
-    TORCH_CHECK(top_k == 8, "Current routing kernel only supports top_k=8.");
+    TORCH_CHECK(top_k == 8 || top_k == 1, "Current routing kernel only supports top_k=1,8.");
     TORCH_CHECK(topk_group == 4, "Current routing kernel only supports topk_group=4.");
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts % n_group == 0, "num_experts must be divisible by n_group");
@@ -53,7 +58,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
 
     // setup args
     args.mDtypeElt = tg::Dtype::E4m3;
-    args.routing_logits = routing_logits.data_ptr<float>();
+    args.routing_logits = routing_logits.data_ptr();
     args.routing_bias = routing_bias.data_ptr();
     args.hidden_states = hidden_states.data_ptr();
     args.gemm1_weights = gemm1_weights.data_ptr();
@@ -116,7 +121,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
 
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner;
     auto const& stream = at::cuda::getCurrentCUDAStream(routing_logits.get_device());
-    routing_runner.run(routing_logits.data_ptr<float>(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
+    routing_runner.run(routing_logits.data_ptr(), routing_bias.data_ptr(), args.num_tokens, args.num_experts,
         args.top_k, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
         args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
         total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
