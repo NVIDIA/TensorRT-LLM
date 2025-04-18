@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -14,14 +13,6 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams)
 from .vanilla import VanillaAttention
-
-
-# The type of requests in qkv passed to attention
-# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
-class AttentionInputType(IntEnum):
-    mixed = 0  # contains both context and generation
-    context_only = 1
-    generation_only = 2
 
 
 @dataclass(kw_only=True, init=False)
