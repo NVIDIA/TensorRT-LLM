@@ -110,7 +110,8 @@ def main(args):
     dataset = load_dataset(dataset_name,
                            dataset_revision,
                            cache_dir=args.dataset_cache_dir,
-                           split=dataset_split)
+                           split=dataset_split,
+                           trust_remote_code=True)
     dataset = dataset.shuffle(args.random_seed)
 
     max_batch_size = args.batch_size
