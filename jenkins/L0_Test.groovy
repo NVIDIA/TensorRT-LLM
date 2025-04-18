@@ -1550,7 +1550,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
         ]
-        def backendModeList = backendMode.collect { changeMap[it] }.flatten()
+        def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
         def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ ->
             !changeMap.values().any { backend -> key.contains(backend) }
         }
