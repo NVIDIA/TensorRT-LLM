@@ -144,11 +144,13 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        self.create_backend()
+        if not config.skip_create_weights:
+            self.create_weights()
+        else:
+            self.create_backend()
 
-        self.enable_rope_fusion = self.attn.features().fused_rope()
-        self.support_fused_qkv = self.attn.features().fused_qkv()
-        self.support_unfused_qkv = self.attn.features().unfused_qkv()
+        self.enable_rope_fusion = self.attn.support_fused_rope()
+        self.support_fused_qkv = self.attn.support_fused_qkv()
 
         self.rotary_emb = None
         self.apply_rotary_emb = (not self.enable_rope_fusion
@@ -178,7 +180,7 @@ class Attention(nn.Module):
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        elif k is not None and v is not None and not self.support_unfused_qkv:
+        elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v
@@ -509,9 +511,8 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = self.mha.features().fused_rope()
-        self.support_fused_qkv = self.mha.features().fused_qkv()
-        self.support_unfused_qkv = self.mha.features().unfused_qkv()
+        self.enable_rope_fusion = self.mha.support_fused_rope()
+        self.support_fused_qkv = self.mha.support_fused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.enable_rope_fusion
         if self.apply_rotary_emb:
@@ -625,7 +626,7 @@ class MLA(nn.Module):
         return attn_output
 
     def _maybe_concat_qkv(self, q, k, v):
-        if k is not None and v is not None and not self.support_unfused_qkv:
+        if k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v

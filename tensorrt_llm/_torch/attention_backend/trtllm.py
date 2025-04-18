@@ -7,10 +7,10 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .interface import (AttentionBackend, AttentionBackendFeature,
-                        AttentionInputType, AttentionMask, AttentionMetadata,
-                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
-                        PredefinedAttentionMask, RopeParams, dummy_forward)
+from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
+                        AttentionMetadata, KVCacheParams, MLAParams,
+                        PositionalEmbeddingParams, PredefinedAttentionMask,
+                        RopeParams, dummy_forward)
 
 
 @dataclass(kw_only=True, init=False)
@@ -737,5 +737,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return output
 
     @classmethod
-    def features(cls) -> AttentionBackendFeature:
-        return AttentionBackendFeature.FUSED_ROPE | AttentionBackendFeature.FUSED_QKV | AttentionBackendFeature.MLA
+    def support_fused_rope(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True

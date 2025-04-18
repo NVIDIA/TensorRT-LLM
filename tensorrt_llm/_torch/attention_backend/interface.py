@@ -2,7 +2,7 @@ import copy
 import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum, IntFlag, auto
+from enum import Enum, IntEnum
 from typing import (Generic, List, Optional, Protocol, Tuple, Type, TypeVar,
                     Union)
 
@@ -484,31 +484,6 @@ class PredefinedAttentionMask(str, Enum):
 AttentionMask = Union[PredefinedAttentionMask]
 
 
-class AttentionBackendFeature(IntFlag):
-    """
-    Features supported by attention backends.
-    """
-    FUSED_ROPE = auto()
-    FUSED_QKV = auto()
-    UNFUSED_QKV = auto()
-    MLA = auto()
-
-    def _any(self, bits):
-        return (self & bits) != 0
-
-    def fused_rope(self) -> bool:
-        return self._any(self.FUSED_ROPE)
-
-    def fused_qkv(self) -> bool:
-        return self._any(self.FUSED_QKV)
-
-    def unfused_qkv(self) -> bool:
-        return self._any(self.UNFUSED_QKV)
-
-    def mla(self) -> bool:
-        return self._any(self.MLA)
-
-
 class AttentionBackend(Generic[TMetadata]):
     """
     Base class for attention backends.
@@ -565,8 +540,16 @@ class AttentionBackend(Generic[TMetadata]):
         raise NotImplementedError
 
     @classmethod
-    def features(cls) -> AttentionBackendFeature:
-        return AttentionBackendFeature.UNFUSED_QKV
+    def support_fused_rope(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return False
 
 
 @dataclass(kw_only=True, unsafe_hash=True)
