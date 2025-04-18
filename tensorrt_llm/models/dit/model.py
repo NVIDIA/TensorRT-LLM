@@ -134,6 +134,7 @@ class DiTBlock(Module):
                                   tp_rank=mapping.tp_rank,
                                   cp_group=mapping.cp_group,
                                   cp_size=mapping.cp_size,
+                                  cp_rank=mapping.cp_rank,
                                   dtype=dtype,
                                   quant_mode=quant_mode)
         self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
