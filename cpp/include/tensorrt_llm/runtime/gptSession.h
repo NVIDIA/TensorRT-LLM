@@ -99,6 +99,9 @@ public:
         SizeType32 maxBeamWidth;
         // The length of the longest input sequence
         SizeType32 maxSequenceLength;
+        // Enable/disable GPUDirectStorage
+        // Not supported by GptSession so hard-coded as false
+        bool useGpuDirectStorage{false};
         // Percentage of weights on the gpu at runtime
         float gpuWeightsPercent;
         // Whether the session will use a different decoder per request.
