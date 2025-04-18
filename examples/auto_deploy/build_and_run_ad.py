@@ -41,6 +41,7 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     ad_config = AutoDeployConfig(
         use_cuda_graph=config.compile_backend == "torch-opt",
         torch_compile_enabled=config.compile_backend == "torch-opt",
+        model_factory=config.model_factory,
         model_kwargs=config.model_kwargs,
         attn_backend=config.attn_backend,
         mla_backend=config.mla_backend,
@@ -52,7 +53,12 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
     # TODO: let's see if prefetching can't be done through the LLM api?
     # I believe the "classic workflow" invoked via the LLM api can do that.
     # put everything into the HF model Factory and try pre-fetching the checkpoint
-    factory = ModelFactoryRegistry.get("hf")(model=config.model, model_kwargs=config.model_kwargs)
+    factory = ModelFactoryRegistry.get(config.model_factory)(
+        model=config.model,
+        model_kwargs=config.model_kwargs,
+        tokenizer_kwargs=config.tokenizer_kwargs,
+        skip_loading_weights=config.skip_loading_weights,
+    )
 
     # construct llm high-level interface object
     llm_lookup = {
@@ -60,11 +66,12 @@ def build_llm_from_config(config: SimpleConfig) -> LLM:
         "trtllm": LLM,
     }
     llm = llm_lookup[config.runtime](
-        model=factory.ckpt_path,
+        model=factory.model,
         backend="autodeploy",
         build_config=build_config,
         pytorch_backend_config=ad_config,
         tensor_parallel_size=config.world_size,
+        tokenizer=factory.init_tokenizer() if config.customize_tokenizer else None,
     )
 
     return llm
