@@ -488,6 +488,7 @@ __global__ void routingMainKernel(KernelParams params)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(NumThreads)
     routingIndicesClusterKernel(KernelParams params)
 {
@@ -694,12 +695,17 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         }
     }
 }
-
+#else
+__global__ void routingIndicesClusterKernel(KernelParams params)
+{
+}
+#endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
@@ -880,6 +886,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
         }
     }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -896,6 +903,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
 
@@ -965,6 +973,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     // Reduce histograms with atomics.
     int32_t const localExpertCount = smemExpertCount[threadIdx.x];
     atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -972,6 +981,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
 template <typename KernelParams>
 __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(KernelParams params)
 {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // number of experts is bounded by number of threads
     __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[NumThreads];
     __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
@@ -1194,6 +1204,7 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
