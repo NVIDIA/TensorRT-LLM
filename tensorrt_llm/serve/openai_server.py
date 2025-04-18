@@ -19,7 +19,6 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.utils import nvtx_mark
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -34,6 +33,8 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
+
+from .._utils import nvtx_mark
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.

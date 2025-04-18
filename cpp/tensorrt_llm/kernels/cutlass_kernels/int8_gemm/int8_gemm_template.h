@@ -334,7 +334,7 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, 
         dispatchGemmToCutlass<T, cutlass::arch::Sm75>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
             workspaceBytes, gemmConfig, stream, occupancy);
     }
-    else if (mSm >= 80 && mSm <= 90)
+    else if (mSm >= 80 && mSm <= 90 || mSm >= 120)
     {
         dispatchGemmToCutlass<T, cutlass::arch::Sm80>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
             workspaceBytes, gemmConfig, stream, occupancy);

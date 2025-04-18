@@ -8,13 +8,15 @@ import numpy as np
 import torch
 
 import tensorrt_llm
+import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.resource_manager import (PeftCacheConfig,
                                                              PeftCacheManager)
+from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import (
     PeftTaskNotCachedException, RequestVector)
-from tensorrt_llm.lora_manager import PeftConfig
 
+LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent
@@ -85,12 +87,120 @@ class TestResourceManager(unittest.TestCase):
             self.optimal_adapter_size = 8
 
     def setUp(self):
-        self.model_config = self.MockModelConfig()
+        mock_config = self.MockModelConfig()
+        self.model_config = ModelConfigCpp(
+            vocab_size=mock_config.vocab_size,
+            num_layers=mock_config.num_hidden_layers,
+            num_attention_layers=mock_config.num_attention_layers,
+            num_rnn_layers=mock_config.num_rnn_layers,
+            num_heads=mock_config.num_attention_heads,
+            hidden_size=mock_config.hidden_size,
+            data_type=mock_config.data_type)
+        self._set_lora_modules()
+        self.model_config.use_lora_plugin = True
+        self.model_config.max_lora_rank = 64
         self.max_lora_rank = 64
         self.max_cpu_loras = 4
         self.max_loras = 4
-        self.num_lora_modules = (self.model_config.num_hidden_layers * 13
-                                 )  # TODO smor- copied directly from cpp.
+        self.num_lora_modules = (mock_config.num_hidden_layers *
+                                 len(self.model_config.lora_modules))
+
+    def _set_lora_modules(self):
+        lora_modules = [
+            LoraModule(module_type=LoraModuleType.ATTN_QKV,
+                       in_dim=16,
+                       out_dim=3 * 16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_Q,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_K,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_V,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.ATTN_DENSE,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+            LoraModule(module_type=LoraModuleType.MLP_H_TO_4H,
+                       in_dim=16,
+                       out_dim=32,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.MLP_4H_TO_H,
+                       in_dim=32,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+            LoraModule(module_type=LoraModuleType.MLP_GATE,
+                       in_dim=16,
+                       out_dim=32,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_QKV,
+                       in_dim=16,
+                       out_dim=3 * 16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_Q,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_K,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_V,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=-1,
+                       out_tp_split_dim=0),
+            LoraModule(module_type=LoraModuleType.CROSS_ATTN_DENSE,
+                       in_dim=16,
+                       out_dim=16,
+                       in_dim_first=False,
+                       out_dim_first=True,
+                       in_tp_split_dim=1,
+                       out_tp_split_dim=-1),
+        ]
+
+        self.model_config.lora_modules = lora_modules
 
     def create_peft_cache_config(self) -> PeftCacheConfig:
         # Use the exact same values from C++ test
@@ -157,12 +267,10 @@ class TestResourceManager(unittest.TestCase):
 
     def test_successful_mocked_peft_cache_manager_initialization(self):
         peft_cache_config = self.create_peft_cache_config()
-        peft_config = PeftConfig()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
             model_config=self.model_config,
-            peft_config=peft_config,
         )
 
         self.assertTrue(peft_cache_manager.impl.enabled)
@@ -172,12 +280,10 @@ class TestResourceManager(unittest.TestCase):
     def test_add_request_peft_empty_weights_config(self):
         """Test adding a request with empty LoRA task."""
         peft_cache_config = self.create_peft_cache_config()
-        peft_config = PeftConfig()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
             model_config=self.model_config,
-            peft_config=peft_config,
         )
 
         request_id = 0
@@ -191,12 +297,10 @@ class TestResourceManager(unittest.TestCase):
     def test_add_request_peft_empty_batch(self):
         """Test adding a request with empty batch."""
         peft_cache_config = self.create_peft_cache_config()
-        peft_config = PeftConfig()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
             model_config=self.model_config,
-            peft_config=peft_config,
         )
 
         empty_context = RequestVector()
@@ -208,12 +312,10 @@ class TestResourceManager(unittest.TestCase):
     def test_add_request_peft(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()
-        peft_config = PeftConfig()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
             model_config=self.model_config,
-            peft_config=peft_config,
         )
 
         request_id = 3
@@ -243,12 +345,10 @@ class TestResourceManager(unittest.TestCase):
     def test_put_get(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()
-        peft_config = PeftConfig()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
             model_config=self.model_config,
-            peft_config=peft_config,
         )
 
         request_id = 0

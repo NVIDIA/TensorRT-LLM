@@ -535,17 +535,9 @@ public:
     public:
         explicit TokenRangeRetentionConfig(SizeType32 tokenStart, std::optional<SizeType32> tokenEnd = std::nullopt,
             RetentionPriority priority = KvCacheRetentionConfig::kDefaultRetentionPriority,
-            std::optional<std::chrono::milliseconds> durationMs = std::nullopt)
-            : tokenStart{tokenStart}
-            , tokenEnd{tokenEnd}
-            , priority{priority}
-            , durationMs{durationMs}
-        {
-            TLLM_CHECK_WITH_INFO(priority >= KvCacheRetentionConfig::kMinRetentionPriority
-                    && priority <= KvCacheRetentionConfig::kMaxRetentionPriority,
-                "Invalid priority value. Must be between %d and %d", KvCacheRetentionConfig::kMinRetentionPriority,
-                KvCacheRetentionConfig::kMaxRetentionPriority);
-        };
+            std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
+
+        bool operator==(TokenRangeRetentionConfig const& other) const;
 
         /// @brief The first token of this range.
         SizeType32 tokenStart;
@@ -558,12 +550,6 @@ public:
         /// have no expiration time, and keep the block at the given priority level until it gets reclaimed. After the
         /// duration has passed, the block will be moved back to the `kDefaultRetentionPriority` level.
         std::optional<std::chrono::milliseconds> durationMs;
-
-        bool operator==(TokenRangeRetentionConfig const& other) const
-        {
-            return tokenStart == other.tokenStart && tokenEnd == other.tokenEnd && priority == other.priority
-                && durationMs == other.durationMs;
-        }
     };
 
     explicit KvCacheRetentionConfig()

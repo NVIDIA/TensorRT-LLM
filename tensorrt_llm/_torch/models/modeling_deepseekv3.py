@@ -407,7 +407,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
 
-        pp_layer_offset = model_config.mapping.pp_layers_torch(
+        pp_layer_offset = model_config.mapping.pp_layers(
             config.num_hidden_layers)[0]
         global_layer_idx = pp_layer_offset + layer_idx
 

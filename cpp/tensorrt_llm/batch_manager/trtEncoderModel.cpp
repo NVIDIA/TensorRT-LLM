@@ -106,6 +106,18 @@ BufferManager::CudaStreamPtr TrtEncoderModel::getRuntimeStreamPtr() const
     return mRuntime->getStreamPtr();
 }
 
+nvinfer1::DataType TrtEncoderModel::getTensorDataType(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorDataType(name.c_str());
+}
+
+nvinfer1::Dims TrtEncoderModel::getTensorShape(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorShape(name.c_str());
+}
+
 void TrtEncoderModel::getCurrentIterationStats(executor::IterationStats& stats) const
 {
     stats.iter = mIterCounter;

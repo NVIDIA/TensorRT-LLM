@@ -72,9 +72,6 @@ DecoderBuffers::DecoderBuffers(SizeType32 maxNumSequences, SizeType32 maxBeamWid
 
     finishedSumHost = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
-    newOutputTokens
-        = manager.gpu(ITensor::makeShape({maxTokensPerStep, maxNumSequences, maxBeamWidth}), TRTTokenIdType);
-
     newOutputTokensHost
         = BufferManager::pinned(ITensor::makeShape({maxTokensPerStep, maxNumSequences, maxBeamWidth}), TRTTokenIdType);
 
@@ -151,7 +148,6 @@ void DecoderBuffers::DraftBuffers::create(SizeType32 maxNumSequences, SizeType32
 void DecoderBuffers::enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    newOutputTokens->reshape(ITensor::makeShape({maxTokensPerStep, maxNumSequences, 1}));
     newOutputTokensHost->reshape(ITensor::makeShape({maxTokensPerStep, maxNumSequences, 1}));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -159,7 +155,6 @@ void DecoderBuffers::enableLookaheadDecoding(SizeType32 maxNumSequences, SizeTyp
 void DecoderBuffers::disableLookaheadDecoding(SizeType32 maxNumSequences)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    newOutputTokens->reshape(ITensor::makeShape({1, maxNumSequences, 1}));
     newOutputTokensHost->reshape(ITensor::makeShape({1, maxNumSequences, 1}));
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

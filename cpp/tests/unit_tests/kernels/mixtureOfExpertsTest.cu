@@ -161,7 +161,7 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = getSMVersion() < 100 && FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && FP4;
         return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -862,7 +862,7 @@ protected:
     auto getFilteredConfigs(int sm)
     {
         auto tactics = mMoERunner.getTactics();
-        if (sm == 89)
+        if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
             auto it = std::remove_if(tactics.begin(), tactics.end(),
@@ -1308,7 +1308,8 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+        bool should_be_deterministic
+            = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1546,7 +1547,8 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j});
-                    bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+                    bool should_be_deterministic
+                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1560,7 +1562,8 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j});
-                    bool should_be_deterministic = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90;
+                    bool should_be_deterministic
+                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1866,7 +1869,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 
             backend.prepare(num_tokens, workspace, mStream->get());
 
-            auto getNext = backend.getWorkspacePointerGenerator(workspace, num_tokens, getSMVersion() >= 90);
+            auto getNext = backend.getWorkspacePointerGenerator(
+                workspace, num_tokens, getSMVersion() >= 90 && getSMVersion() < 120);
             auto const* expert_first_token_offset_size = reinterpret_cast<int64_t*>(getNext());
             auto const* source_to_dest_map = reinterpret_cast<int*>(getNext());
             auto const* dest_to_source_map = reinterpret_cast<int*>(getNext());

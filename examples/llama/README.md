@@ -1443,7 +1443,6 @@ trtllm-build --checkpoint_dir llama_3.1_405B_HF_FP8_model/trt_ckpts/tp8-pp1/ \
 To run inference on the 405B model, we often need to use multi-node to accommodate the entire model. Here, we use slurm to launch the job on multiple nodes.
 
 Notes:
-* For the FP8 model, we can fit it on a single 8xH100 node, but we cannot support 128k context due to memory limitations. So, we test with 64k context in this demonstration.
 * For convenience, we use the Huggingface tokenizer for tokenization.
 
 The following script shows how to run evaluation on long context:

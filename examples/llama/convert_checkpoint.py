@@ -154,7 +154,7 @@ def parse_arguments():
         default=False,
         action="store_true",
         help=
-        'By default, we use dtype for KV cache. fp8_kv_cache chooses int8 quantization for KV'
+        'By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV'
     )
     parser.add_argument(
         '--quant_ckpt_path',

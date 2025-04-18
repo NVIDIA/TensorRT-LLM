@@ -8,7 +8,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.lora_manager import PeftConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import nvtx_range
@@ -31,8 +30,6 @@ KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEve
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
-LoraModule = tensorrt_llm.bindings.LoraModule
-LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -570,7 +567,7 @@ class ResourceManager:
 class PeftCacheManager(BaseResourceManager):
 
     def __init__(self, peft_cache_config: PeftCacheConfig,
-                 model_config: ModelConfig, peft_config: PeftConfig):
+                 model_config: ModelConfig):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -584,154 +581,10 @@ class PeftCacheManager(BaseResourceManager):
             max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
             max_pages_per_block_device=peft_cache_config.
             max_pages_per_block_device,
-            device_cache_percent=(peft_config.device_cache_percent
-                                  if peft_config.device_cache_percent else
-                                  peft_cache_config.device_cache_percent),
+            device_cache_percent=peft_cache_config.device_cache_percent,
             host_cache_size=peft_cache_config.host_cache_size,
             lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
         )
-        _model_config = _tb.ModelConfig(
-            vocab_size=model_config.vocab_size,
-            num_layers=model_config.num_hidden_layers,
-            num_attention_layers=model_config.num_attention_layers,
-            num_rnn_layers=model_config.num_rnn_layers,
-            num_heads=model_config.num_attention_heads,
-            hidden_size=model_config.hidden_size,
-            data_type=DataType.HALF)
-        # TODO smor- remove other manual settings once configuration is finalized
-
-        # TODO smor- change this. Currently copied from cpp tests definition
-        lora_modules = [
-            LoraModule(module_type=LoraModuleType.ATTN_QKV,
-                       in_dim=16,
-                       out_dim=3 * 16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.ATTN_Q,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.ATTN_K,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.ATTN_V,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.ATTN_DENSE,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=1,
-                       out_tp_split_dim=-1),
-            LoraModule(module_type=LoraModuleType.MLP_H_TO_4H,
-                       in_dim=16,
-                       out_dim=32,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.MLP_4H_TO_H,
-                       in_dim=32,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=1,
-                       out_tp_split_dim=-1),
-            LoraModule(module_type=LoraModuleType.MLP_GATE,
-                       in_dim=16,
-                       out_dim=32,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.CROSS_ATTN_QKV,
-                       in_dim=16,
-                       out_dim=3 * 16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.CROSS_ATTN_Q,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.CROSS_ATTN_K,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.CROSS_ATTN_V,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=-1,
-                       out_tp_split_dim=0),
-            LoraModule(module_type=LoraModuleType.CROSS_ATTN_DENSE,
-                       in_dim=16,
-                       out_dim=16,
-                       in_dim_first=False,
-                       out_dim_first=True,
-                       in_tp_split_dim=1,
-                       out_tp_split_dim=-1),
-        ]
-
-        # TODO smor- prettify this
-        # lora_modules = [LoraModule(
-        #         module_type=LoraModuleType.ATTN_QKV,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size * 3,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=0,
-        #     ),
-        #     LoraModule(
-        #         module_type=LoraModuleType.CROSS_ATTN_QKV,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size * 3,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=0,
-        #     ),
-        #     ]
-
-        # for module_type, rank in module_types:
-        #     module_cpp = LoraModule(
-        #         module_type=module_type,
-        #         in_dim=model_config.hidden_size,
-        #         out_dim=model_config.hidden_size,
-        #         in_dim_first=False,
-        #         out_dim_first=True,
-        #         in_tp_split_dim=-1,
-        #         out_tp_split_dim=rank,
-        #     )
-        #     lora_modules.append(module_cpp)
-
-        # FIXME
-        _model_config.lora_modules = lora_modules
-        _model_config.use_lora_plugin = True
-        _model_config.max_lora_rank = 64  # TODO smor- currently set manually, automate
 
         # TODO smor- currently set manually, change that
         world_config = _tb.WorldConfig()
@@ -742,7 +595,7 @@ class PeftCacheManager(BaseResourceManager):
         cuda_stream = CudaStream(self._stream)
         buffer_manager = BufferManager(cuda_stream, True)
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
-                                        model_config=_model_config,
+                                        model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
 

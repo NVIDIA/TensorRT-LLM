@@ -30,7 +30,7 @@ function export_free_tcp_addr {
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
 }
 
-export tllm_mpi_size=$(mpi_size)
+export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
 export_free_tcp_addr

@@ -625,10 +625,9 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                hf_folder = download_hf_model(
+                self._hf_model_dir = download_hf_model(
                     self.model_loader.model_obj.model_name,
                     self.llm_args.revision)
-                self._hf_model_dir = hf_folder
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -642,17 +641,18 @@ class CachedModelLoader:
 
             return None, self._hf_model_dir
 
+        if self.model_loader.model_obj.is_hub_model:
+            # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
+            # cache key.
+            self._hf_model_dir = download_hf_pretrained_config(
+                self.model_loader.model_obj.model_name,
+                revision=self.llm_args.revision)
+
+        elif self.model_loader.model_obj.is_local_model:
+            self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
+
         if self.build_cache_enabled:
             print_colored("Build cache is enabled.\n", 'yellow')
-            if self.model_loader.model_obj.is_hub_model:
-                # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
-                # cache key.
-                self._hf_model_dir = download_hf_pretrained_config(
-                    self.model_loader.model_obj.model_name,
-                    revision=self.llm_args.revision)
-
-            elif self.model_loader.model_obj.is_local_model:
-                self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
 
             self.engine_cache_stage = self._get_engine_cache_stage()
             if self.engine_cache_stage.is_cached():

@@ -40,7 +40,8 @@ def print_result(model, input_text, output_text, args):
                 assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                     0][0].lower()
             elif model.model_type in [
-                    'blip2', 'neva', 'phi-3-vision', 'llava_next'
+                    'blip2', 'neva', 'phi-3-vision', 'llava_next',
+                    'phi-4-multimodal'
             ]:
                 assert 'singapore' in output_text[0][0].lower()
             elif model.model_type == 'video-neva':
@@ -104,23 +105,21 @@ if __name__ == '__main__':
     logger.set_level(args.log_level)
 
     model = MultimodalModelRunner(args)
-    input_multimodal_data = model.load_test_data(args.image_path,
-                                                 args.video_path)
+    visual_data = model.load_test_data(args.image_path, args.video_path)
+    audio_data = model.load_test_audio(args.audio_path)
 
     if args.run_profiling:
         num_warmup_iters = 3  # Multiple iterations to load both vision and LLM engines into memory
         for _ in range(num_warmup_iters):
-            input_text, output_text = model.run(args.input_text,
-                                                input_multimodal_data,
-                                                args.max_new_tokens)
+            input_text, output_text = model.run(args.input_text, visual_data,
+                                                audio_data, args.max_new_tokens)
         profiler.reset()
 
     num_iters = args.profiling_iterations if args.run_profiling else 1
 
     for _ in range(num_iters):
-        input_text, output_text = model.run(args.input_text,
-                                            input_multimodal_data,
-                                            args.max_new_tokens)
+        input_text, output_text = model.run(args.input_text, visual_data,
+                                            audio_data, args.max_new_tokens)
 
     runtime_rank = tensorrt_llm.mpi_rank()
     if runtime_rank == 0:

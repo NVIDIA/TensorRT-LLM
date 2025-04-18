@@ -20,12 +20,9 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
-#include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/lookaheadBuffers.h"
 
 #include <memory>
-#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -35,6 +32,8 @@ class LlmRequest;
 
 namespace tensorrt_llm::runtime
 {
+class SamplingConfig;
+
 namespace decoder
 {
 class DecoderState;

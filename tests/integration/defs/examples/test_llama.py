@@ -14,6 +14,7 @@
 # limitations under the License.
 import copy
 import csv
+import json
 import os
 import re
 import shutil
@@ -618,6 +619,55 @@ def test_llm_llama_1gpu(run_type, data_type, fp8_cache, llama_example_root,
             rouge_dir=llm_rouge_root)
 
         venv_check_call(llm_venv, summary_cmd)
+
+
+@skip_pre_ada
+@pytest.mark.parametrize("data_type", ['bfloat16'])
+@pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
+def test_llm_llama_1gpu_fp8_kv_cache(
+    data_type,
+    llama_example_root,
+    llama_model_root,
+    llm_datasets_root,
+    llm_rouge_root,
+    llm_venv,
+    cmodel_dir,
+    engine_dir,
+    qcache_dir_without_install_package,
+):
+    # Quantize HF llama checkpoint into FP8 format
+    model_dir = quantize_data(
+        llm_venv,
+        llama_example_root,
+        model_dir=llama_model_root,
+        calib_dataset=f"{llm_datasets_root}/cnn_dailymail",
+        dtype=data_type,
+        qformat="fp8",
+        quantize_dir=qcache_dir_without_install_package,
+        calib_size=512,
+        kv_cache_dtype="fp8")
+
+    print("Build engines...")
+    build_cmd = [
+        "trtllm-build",
+        f"--checkpoint_dir={model_dir}",
+        f"--output_dir={engine_dir}",
+        f"--gpt_attention_plugin={data_type}",
+        f"--gemm_plugin={data_type}",
+        "--remove_input_padding=enable",
+        "--use_paged_context_fmha=enable",
+        "--use_fp8_context_fmha=enable",
+        "--max_beam_width=1",
+    ]
+
+    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    with open(f"{engine_dir}/config.json") as f:
+        engine_config = json.load(f)
+
+    assert engine_config["build_config"]["plugin_config"][
+        "use_fp8_context_fmha"] == True
+    assert engine_config["pretrained_config"]["quantization"][
+        "kv_cache_quant_algo"] == "FP8"
 
 
 @pytest.mark.parametrize("use_weight_sparsity", [True],

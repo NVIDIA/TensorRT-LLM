@@ -275,7 +275,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
 
         # rebuild layers with pipeline parallel support
         num_hidden_layers = len(self.layers)
-        self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
+        self.pp_layer_list = self.model_config.mapping.pp_layers(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
         if hasattr(self, 'aux_stream_dict'):  # DeepseekV3

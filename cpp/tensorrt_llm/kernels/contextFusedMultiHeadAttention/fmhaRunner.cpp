@@ -415,7 +415,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         mLaunchParams.kernel_s = 0;
         mLaunchParams.force_unroll = true;
         // enable tiled kernels on Ampere/Ada
-        if (isSm89 && mFixedParams.dataType == DATA_TYPE_E4M3)
+        if ((isSm89 || isSm120) && mFixedParams.dataType == DATA_TYPE_E4M3)
         {
             // so far Ada QMMA only supports non-tiled kernels.
             mLaunchParams.granular_tiling = false;
@@ -427,7 +427,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             // can suffer from tile quantization loss therefore use flash attention non-tiled instead
             mLaunchParams.granular_tiling = false;
         }
-        else if (isSm8x && mFixedParams.headSize < 256)
+        else if ((isSm8x || isSm120) && mFixedParams.headSize < 256)
         {
             // flash attention tiled kernel is faster on Ada and Ampere derivatives when head_size>=256
             mLaunchParams.granular_tiling = false;

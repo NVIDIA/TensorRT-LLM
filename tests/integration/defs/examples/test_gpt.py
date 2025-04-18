@@ -1033,6 +1033,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--prompt_table={squad_table}",
         f"--num_prepend_vtokens={inference_params['squad']['num_v_tokens']}",
         f"--input_text={inference_params['squad']['input']}",
+        f"--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -1054,6 +1055,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--prompt_table={train900_table}",
         f"--num_prepend_vtokens={inference_params['train900']['num_v_tokens']}",
         f"--input_text={inference_params['train900']['input']}",
+        f"--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -1081,6 +1083,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--input_text",
         inference_params["squad"]["input"],
         inference_params['train900']['input'],
+        f"--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -1117,6 +1120,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
             f"--input_text",
             inference_params["squad"]["input"],
             inference_params['train900']['input'],
+            f"--no-kv_cache_enable_block_reuse",
         ]
 
         output = venv_mpi_check_output(

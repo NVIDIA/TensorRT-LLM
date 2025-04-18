@@ -33,6 +33,7 @@ extensions = [
     'myst_parser',  # for markdown support
     "breathe",
     'sphinx.ext.todo',
+    'sphinx.ext.autosectionlabel',
     'sphinxarg.ext',
     'sphinx_click',
     'sphinx_copybutton',

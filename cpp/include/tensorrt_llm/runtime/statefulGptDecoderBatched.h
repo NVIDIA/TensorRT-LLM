@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 
 namespace tensorrt_llm::runtime

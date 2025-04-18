@@ -8,9 +8,9 @@ from ...._utils import mpi_rank, mpi_world_size
 from ....bindings.executor import ExecutorConfig
 from ....bindings.internal.batch_manager import CacheType
 from ....mapping import Mapping
+from ...distributed import MPIDist
 from ...pyexecutor.config import PyTorchConfig
 from ...pyexecutor.decoder import TorchDecoder
-from ...pyexecutor.distributed import MPIDist
 from ...pyexecutor.model_engine import ModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import KVCacheManager, ResourceManager

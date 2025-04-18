@@ -8,10 +8,11 @@ from weakref import WeakMethod
 
 import torch
 
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue, nvtx_range
+from ..llmapi.utils import AsyncQueue
 from ..sampling_params import SamplingParams
 from .utils import ErrorResponse, has_event_loop
 
@@ -219,7 +220,9 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-    @nvtx_range("handle_response", color="red", category="GenerationResultBase")
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="GenerationResultBase")
     def _handle_response(self, response: Union["PostprocWorker.Output",
                                                tllm.Response, ErrorResponse]):
 
@@ -299,9 +302,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    @nvtx_range("handle_response",
-                color="red",
-                category="DetokenizedGenerationResultBase")
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 

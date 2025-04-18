@@ -322,7 +322,7 @@ TEST_P(EncDecParamsTest, Forward)
 
             // check token-by-token match between beam 0 & ground truth
             ASSERT_TRUE(tokens.size() <= gtMaxLength)
-                << "Request ID " << reqId << "'s generated length is longer than ground truth length" << gtMaxLength;
+                << "Request ID " << reqId << "'s generated length is longer than ground truth length " << gtMaxLength;
             for (int i = 0; i < gtMaxLength; i++)
             {
                 if (outConfig.excludeInputFromOutput)
@@ -337,9 +337,8 @@ TEST_P(EncDecParamsTest, Forward)
                 }
                 else
                 {
-                    ASSERT_EQ(gtOutput[i], eosId)
-                        << "Request ID " << reqId << "'s generated length is shorter than ground truth length"
-                        << gtMaxLength;
+                    ASSERT_EQ(gtOutput[i], eosId) << "Request ID " << reqId << "'s generated length " << tokens.size()
+                                                  << " is shorter than ground truth length " << gtMaxLength;
                 }
             }
         }

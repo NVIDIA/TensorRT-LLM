@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cuda_profiler_api.h>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -1270,13 +1271,14 @@ void Executor::Impl::cancelledRequestsLeaderThread()
             break;
         }
 
+        std::unique_ptr<CancelledRequestsAsyncSend> cancelledRequestsAsyncSndHdl;
         {
             std::scoped_lock<std::mutex> lck(mCancelReqMtx);
-            auto cancelledRequestsAsyncSndHdl
+            cancelledRequestsAsyncSndHdl
                 = std::make_unique<CancelledRequestsAsyncSend>(mCommPipelineParallel, mPipelineCancelledReqIds, peer);
-            cancelledRequestsAsyncSndHdl.reset(nullptr);
             mPipelineCancelledReqIds.clear();
         }
+        cancelledRequestsAsyncSndHdl.reset(nullptr);
     }
     static_assert(kMpiTagUpperBound >= kMpiTagOffset + 4);
 }
