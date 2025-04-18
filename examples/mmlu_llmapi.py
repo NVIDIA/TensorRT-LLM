@@ -285,6 +285,13 @@ def main():
         args.num_samples_per_subject = math.ceil(args.num_samples /
                                                  len(get_subcategories()))
 
+    integration_test = os.environ.get("INTEGRATION_TEST", "0") == "1"
+    if integration_test:
+        print(
+            "Running in INTEGRATION_TEST mode - testing only one subject with minimal samples"
+        )
+        args.num_samples_per_subject = 1
+        args.ntrain = 1
     random.seed(args.random_seed)
     np.random.seed(args.random_seed)
 
@@ -359,6 +366,10 @@ def main():
     profiler.stop("trtllm exec")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
     print(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
+
+    if integration_test:
+        print("INTEGRATION_TEST mode - skipping accuracy verification")
+        return 0
 
     subcategory_corrections = {key: [] for key in subcategories}
     category_corrections = {key: [] for key in categories}
