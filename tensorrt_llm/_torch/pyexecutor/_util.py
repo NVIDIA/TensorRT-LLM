@@ -1,3 +1,4 @@
+import math
 import random
 from collections.abc import Iterable
 
@@ -25,8 +26,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        SimpleScheduler, ScheduledRequests)
-import math
+                        SimpleScheduler)
 
 
 def is_nemotron_hybrid(config):
@@ -138,8 +138,12 @@ def get_token_num_for_estimation(executor_config, model_config):
         # block (tokens_per_block tokens) if the sequence length is not perfectly divisible by tokens_per_block.
         # So we add math.ceil(max_num_tokens/max_seq_len) * tokens_per_block extra tokens.
         return min(
-            max(executor_config.max_batch_size, executor_config.max_num_tokens + math.ceil(executor_config.max_num_tokens / executor_config.max_seq_len) * executor_config.tokens_per_block,
-                executor_config.max_seq_len), max_tokens_limit)
+            max(
+                executor_config.max_batch_size, executor_config.max_num_tokens +
+                math.ceil(executor_config.max_num_tokens /
+                          executor_config.max_seq_len) *
+                executor_config.tokens_per_block, executor_config.max_seq_len),
+            max_tokens_limit)
     else:
         return None
 
