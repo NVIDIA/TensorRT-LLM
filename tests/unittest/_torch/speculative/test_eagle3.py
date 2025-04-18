@@ -14,9 +14,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
 
 
-@pytest.mark.parametrize("use_cuda_graph", [True, False],
-                         ids=["enable_graphs", "disable_graphs"])
-def test_llama_eagle3(use_cuda_graph: bool):
+@pytest.mark.parametrize("use_cuda_graph,attn_backend",
+                         [[True, "TRTLLM"], [False, "TRTLLM"],
+                          [True, "FLASHINFER"], [False, "FLASHINFER"]])
+def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -27,6 +28,7 @@ def test_llama_eagle3(use_cuda_graph: bool):
         enable_overlap_scheduler=False,
         use_cuda_graph=use_cuda_graph,
         # Only create a single CUDA graph to prevent OOM in CI
+        attn_backend=attn_backend,
         cuda_graph_batch_sizes=[1],
     )
 

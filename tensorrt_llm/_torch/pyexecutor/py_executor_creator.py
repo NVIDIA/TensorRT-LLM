@@ -90,7 +90,6 @@ def create_py_executor(executor_config: ExecutorConfig,
             pytorch_backend_config,
             batch_size=executor_config.max_batch_size,
             max_num_tokens=executor_config.max_num_tokens,
-            max_seq_len=executor_config.max_seq_len,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
@@ -111,7 +110,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     if spec_config is not None:
         max_seq_len += spec_config.num_extra_kv_tokens
-        max_seq_len += spec_config.max_draft_tokens
+        max_seq_len += spec_config.max_draft_tokens - 1
 
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
