@@ -14,8 +14,8 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
-                      mpi_rank, nvtx_range_debug)
+from .._utils import (KVCacheEventSerializer, global_mpi_rank, local_mpi_size,
+                      mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
@@ -110,7 +110,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            device_id = self.global_rank % torch.cuda.device_count()
+            device_id = self.global_rank % local_mpi_size()
             torch.cuda.set_device(device_id)
             return create_executor(executor_config=executor_config,
                                    checkpoint_dir=executor_config.hf_model_dir,
