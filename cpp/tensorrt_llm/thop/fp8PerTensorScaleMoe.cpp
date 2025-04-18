@@ -34,10 +34,13 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::Tensor const& routing_logit
 
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP8 block scale MOE");
-    if (use_routing_scales_on_input) {
-      TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16.");
-    } else {
-      TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
+    if (use_routing_scales_on_input)
+    {
+        TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16.");
+    }
+    else
+    {
+        TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float.");
     }
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");

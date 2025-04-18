@@ -16,8 +16,6 @@
  */
 #pragma once
 
-#define TLLM_ENABLE_CUDA
-
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/SfLayoutDecl.h"
 
@@ -140,6 +138,26 @@ struct KernelParams
     //
     // Otherwise should be set to nullptr.
     void const* ptrSfB;
+
+    // The per-token scaling factors from scale A.
+    //
+    // This is used for either:
+    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
+    //   * When the routing scales are applied to the input activations (only when output is not
+    //   transposed). The dtype is Dtype::Bfloat16
+    //
+    // The shape is [M]
+    void const* ptrPerTokenSfA;
+
+    // The per-token scaling factors from scale B.
+    //
+    // This is used for either:
+    //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
+    //   * When the routing scales are applied to the input activations (only when output is
+    //   transposed). The dtype is Dtype::Bfloat16
+    //
+    // The shape is [N]
+    void const* ptrPerTokenSfB;
 
     // The scaling factors calculated when quantizing C, for MxFp{4,8} and NvFp4 formats, also
     // used for the DeepSeek FP8 recipe.
@@ -373,10 +391,10 @@ struct KernelParams
     // Setup the kernel parameters.
     template <class GemmOptions_>
     static KernelParams setKernelParams(GemmOptions_ const& options, void const* ptrA, void const* ptrSfA,
-        void const* ptrB, void const* ptrSfB, void* ptrC, void* ptrSfC, void* multimemC, float* ptrScaleC,
-        void* ptrPartialSumsForSplitK, void* ptrTileBars, void* multimemTileBars, void* ptrCompletionBars,
-        void* multimemCompletionBars, void* ptrSplitKCompletionBars, int32_t* ptrNumNonExitingCtas, int rank,
-        int tpGrpSize)
+        void const* ptrPerTokenSfA, void const* ptrB, void const* ptrSfB, void const* ptrPerTokenSfB, void* ptrC,
+        void* ptrSfC, void* multimemC, float* ptrScaleC, void* ptrPartialSumsForSplitK, void* ptrTileBars,
+        void* multimemTileBars, void* ptrCompletionBars, void* multimemCompletionBars, void* ptrSplitKCompletionBars,
+        int32_t* ptrNumNonExitingCtas, int rank, int tpGrpSize)
     {
 
         // Is one-shot all-reduce?
@@ -448,6 +466,10 @@ struct KernelParams
         // Set the dequantization factors for A and B when DeepSeek FP8 recipe is used.
         params.ptrSfA = ptrSfA;
         params.ptrSfB = ptrSfB;
+
+        // Set the per-token scale factors for MetaFP8 or scale inputs
+        params.ptrPerTokenSfA = ptrPerTokenSfA;
+        params.ptrPerTokenSfB = ptrPerTokenSfB;
 
         // Also set ptrC (it may be used by the NCCL reduction code in "layers/Llama").
         params.ptrC = ptrC;
