@@ -65,7 +65,6 @@ It contains the following predefined fields:
 | request_ids | List[int] | The request ID of each sequence in the batch. |
 | prompt_lens | List[int] | The prompt length of each sequence in the batch. |
 | kv_cache_params | KVCacheParams | The parameters for the KV cache. |
-| is_dummy_attention | bool | Indicates whether this is a simulation-only attention operation used for KV cache memory estimation. Defaults to False. |
 
 During `AttentionMetadata.__init__`, you can initialize additional fields for the new attention metadata.
 For example, the Flashinfer metadata initializes `decode_wrapper` here.
