@@ -46,7 +46,7 @@ class Runner
 public:
     explicit Runner();
 
-    void run(float* routingLogits, void* routingBias, int32_t num_tokens, int32_t num_experts, int32_t top_k,
+    void run(void* routingLogits, void* routingBias, int32_t num_tokens, int32_t num_experts, int32_t top_k,
         int32_t n_groups, int32_t topk_groups, int32_t local_expert_offset, int32_t local_num_experts,
         float routed_scaling_factor, int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
         int32_t* permuted_idx_size, int32_t* expanded_idx_to_permuted_idx, int32_t* permuted_idx_to_expanded_idx,
@@ -100,7 +100,7 @@ namespace tg = trtllm::gen;
 
 struct MoERunnerArgs
 {
-    float* routing_logits
+    void* routing_logits
         = nullptr; // [num_tokens, num_experts] in float, generated after gemm(hidden_state, routing_weights)
     void* routing_bias = nullptr;  // [num_experts] in bfloat16 for now = mDtypeExpW
     void* hidden_states = nullptr; // [num_tokens, hidden_size] in fp8 = mDtypeElt
