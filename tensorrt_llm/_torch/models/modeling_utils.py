@@ -693,4 +693,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 else:
                     for n, p in module._parameters.items():
                         if p is not None:
-                            p.data.copy_(module_weights[n][:])
+                            # Hack for Gemma3 RMSNorm.
+                            if 'norm' in names[-1]:
+                                p.data.copy_(module_weights[n][:] + 1)
+                            else:
+                                p.data.copy_(module_weights[n][:])
