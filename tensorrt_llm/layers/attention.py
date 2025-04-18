@@ -1608,6 +1608,7 @@ class BertAttention(Module):
                  tp_rank=0,
                  cp_group=None,
                  cp_size=1,
+                 cp_rank=0,
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
@@ -1628,6 +1629,7 @@ class BertAttention(Module):
         self.tp_rank = tp_rank
         self.cp_group = cp_group
         self.cp_size = cp_size
+        self.cp_rank = cp_rank
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -1725,7 +1727,6 @@ class BertAttention(Module):
         if default_net().plugin_config.bert_attention_plugin:
             # TRT plugin mode
             assert input_lengths is not None
-            assert self.cp_size == 1
             assert get_sm_version() < 100 or get_sm_version() >= 120, \
                 "bert_attention_plugin does not support SM100"
             context = bert_attention(
@@ -1738,7 +1739,10 @@ class BertAttention(Module):
                 max_distance=self.max_distance,
                 relative_attention_bias=self.rel_attn_table.value
                 if self.relative_attention else None,
-                max_input_length=max_input_length)
+                max_input_length=max_input_length,
+                cp_group=self.cp_group,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank)
         else:
             # plain TRT mode
             def transpose_for_scores(x):
