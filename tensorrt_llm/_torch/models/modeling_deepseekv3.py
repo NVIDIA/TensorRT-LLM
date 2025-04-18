@@ -32,7 +32,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from examples.infinitebench import args
 import triton
 import triton.language as tl
 from torch import nn
@@ -269,13 +268,9 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
         topk_group: int,
         routed_scaling_factor: float,
         dtype: Optional[torch.dtype] = None,
-<<<<<<< HEAD
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
-=======
-        is_thop: bool = True,
         moe_backend: str = 'CUTLASS',
->>>>>>> 14626789cf (Add TRT-LLM Gen MOE to Deepseek)
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
@@ -358,12 +353,9 @@ class Deepseekv3MoE(nn.Module):
             topk_group=config.topk_group,
             routed_scaling_factor=config.routed_scaling_factor,
             dtype=dtype,
-<<<<<<< HEAD
             fuse_routing_kernel=True,
-            apply_routing=False)
-=======
+            apply_routing=False,
             moe_backend=model_config.moe_backend)
->>>>>>> 14626789cf (Add TRT-LLM Gen MOE to Deepseek)
         self.experts = FusedMoE(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -651,7 +643,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
-            **args,
+            **kwargs,
         )
 
         # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
