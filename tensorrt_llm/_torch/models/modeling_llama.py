@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -24,6 +24,7 @@ from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
+from ..utils import Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, MissingLayer,
                              register_auto_model, support_pp,
@@ -236,6 +237,8 @@ class Llama4DecoderLayer(DecoderLayer):
         )
         self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq(
         )
+        self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
+        )
         self.tp_size = model_config.mapping.moe_tp_size
         self.ep_size = model_config.mapping.moe_ep_size
         self.num_experts = model_config.pretrained_config.num_local_experts
@@ -264,8 +267,7 @@ class Llama4DecoderLayer(DecoderLayer):
                 bias=getattr(config, "mlp_bias", False),
                 dtype=config.torch_dtype,
                 config=model_config,
-                is_llama4=True
-            )
+                is_llama4=True)
 
             self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp()
@@ -300,13 +302,13 @@ class Llama4DecoderLayer(DecoderLayer):
         self.next_attn: LlamaAttention = None
 
         self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
-        self.pre_mlp_fp8_allreduce = DeepseekAllReduce(self.parallel_config)
-        self.post_mlp_fp8_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.pre_mlp_quant_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.post_quant_allreduce = DeepseekAllReduce(self.parallel_config)
 
     def forward(
         self,
         position_ids: torch.LongTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
@@ -317,13 +319,14 @@ class Llama4DecoderLayer(DecoderLayer):
         # TODO: Remove it after we fix crash on Hopper
         major, minor = torch.cuda.get_device_capability()
         is_blackwell = (major * 10 + minor) >= 100
-        num_tokens = hidden_states.size(0)
+        num_tokens = hidden_states.fp4_tensor.size(0) if isinstance(
+            hidden_states, Fp4QuantizedTensor) else hidden_states.size(0)
         llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 4 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
         # min_latency_mode = not llama4_tp8ep1_min_latency_mode and num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
-        use_fp8_allreduce = True if hidden_states.size(
-            0) <= 128 and self.is_fp8_quant else False
+        use_fp8_allreduce = True if num_tokens <= 128 and self.is_fp8_quant else False
+        use_fp4_allreduce = True if num_tokens <= 128 and self.is_nvfp4 else False
 
         if residual is None:
             residual = hidden_states
@@ -340,22 +343,13 @@ class Llama4DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.PRE_MOE_FUSION
-                or self.parallel_config.tensor_parallel_size == 1 or
-                (self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce))),
+                or self.fusion_config.PRE_MLP_FUSION
+                or self.parallel_config.tensor_parallel_size == 1)),
             **kwargs,
         )
 
-        if self.fusion_config.PRE_MOE_FUSION:
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
-        elif self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce:
-            hidden_states, residual = self.pre_mlp_fp8_allreduce(
+        if self.fusion_config.PRE_MLP_FUSION and use_fp8_allreduce:
+            hidden_states, residual = self.pre_mlp_quant_allreduce(
                 hidden_states,
                 [
                     residual,
@@ -365,8 +359,27 @@ class Llama4DecoderLayer(DecoderLayer):
                 self.post_attention_layernorm.variance_epsilon,
                 AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
             )
+        elif self.fusion_config.PRE_MLP_FUSION and use_fp4_allreduce:
+            act_fp4, act_sf, residual = self.pre_mlp_quant_allreduce(
+                hidden_states,
+                [
+                    residual, self.post_attention_layernorm.weight,
+                    self.feed_forward.gate_up_proj.input_scale
+                ],
+                self.post_attention_layernorm.variance_epsilon,
+                AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+            )
+            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+        elif self.fusion_config.PRE_MOE_FUSION or self.fusion_config.PRE_MLP_FUSION:
+            hidden_states, residual = self.all_reduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
         else:
-            # Fully Connected
             hidden_states, residual = unpack_hidden_states(
                 self.post_attention_layernorm(hidden_states, residual))
 
@@ -384,26 +397,27 @@ class Llama4DecoderLayer(DecoderLayer):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
 
-        if self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
-            if min_latency_mode:
-                shared_output = hidden_states[0]
-                hidden_states_activated_experts = hidden_states[1]
-                num_activated_experts_per_node = hidden_states[2]
-                experts_to_token_score = hidden_states[3]
-                activated_expert_global_ids = hidden_states[4]
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states_activated_experts,  # not used
-                    [
-                        residual, self.next_layer_layernorm.weight,
-                        num_activated_experts_per_node, experts_to_token_score,
-                        hidden_states_activated_experts, shared_output,
-                        activated_expert_global_ids
-                    ],
-                    self.next_layer_layernorm.variance_epsilon,
-                    AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
-                )
-            elif self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
-                hidden_states, residual = self.post_mlp_fp8_allreduce(
+        if min_latency_mode:
+            shared_output = hidden_states[0]
+            hidden_states_activated_experts = hidden_states[1]
+            num_activated_experts_per_node = hidden_states[2]
+            experts_to_token_score = hidden_states[3]
+            activated_expert_global_ids = hidden_states[4]
+            hidden_states, residual = self.deepseek_allreduce(
+                hidden_states_activated_experts,  # not used
+                [
+                    residual, self.next_layer_layernorm.weight,
+                    num_activated_experts_per_node, experts_to_token_score,
+                    hidden_states_activated_experts, shared_output,
+                    activated_expert_global_ids
+                ],
+                self.next_layer_layernorm.variance_epsilon,
+                AllReduceFusionOp.MOE_ALLREDUCE_RESIDUAL_RMS_NORM,
+            )
+        elif self.fusion_config.POST_MOE_FUSION or self.fusion_config.POST_MLP_FUSION:
+            # fp8 POST_MOE_FUSION case might have illegal memory access issue. Disable it temporarily.
+            if self.fusion_config.POST_MLP_FUSION and use_fp8_allreduce and self.next_attn is not None:
+                hidden_states, residual = self.post_quant_allreduce(
                     hidden_states,
                     [
                         residual, self.next_layer_layernorm.weight,
@@ -412,6 +426,17 @@ class Llama4DecoderLayer(DecoderLayer):
                     self.next_layer_layernorm.variance_epsilon,
                     AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                 )
+            elif use_fp4_allreduce and self.next_attn is not None:
+                act_fp4, act_sf, residual = self.post_quant_allreduce(
+                    hidden_states,
+                    [
+                        residual, self.next_layer_layernorm.weight,
+                        self.next_attn.qkv_proj.input_scale
+                    ],
+                    self.next_layer_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                )
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
             else:
                 hidden_states, residual = self.all_reduce(
                     hidden_states,
