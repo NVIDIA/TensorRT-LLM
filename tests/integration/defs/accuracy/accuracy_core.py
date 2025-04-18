@@ -281,7 +281,7 @@ class GPQADiamond(AccuracyTask):
     DATASET = "gpqa_diamond"
     DATASET_DIR = f"{llm_models_root()}/datasets/gpqa"
 
-    ALPHA = 0.02
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 198  # Full sample
