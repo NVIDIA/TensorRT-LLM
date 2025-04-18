@@ -13,11 +13,11 @@
 # License for the specific language governing permissions and limitations under
 # the License. cmake needs this line
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.27)
 
 set(TRTLLM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
-include(${TRTLLM_DIR}/cpp/cmake/modules/set_ifndef.cmake)
-include(${TRTLLM_DIR}/cpp/cmake/modules/find_library_create_target.cmake)
+list(APPEND CMAKE_MODULE_PATH "${TRTLLM_DIR}/cpp/cmake/modules")
+
 if(NOT TRTLLM_BUILD_DIR)
   set(TRTLLM_BUILD_DIR "${TRTLLM_DIR}/cpp/build")
 endif()
@@ -52,25 +52,14 @@ set(CMAKE_CXX_FLAGS "-Wall -pthread -lstdc++ -DENABLE_MULTI_DEVICE=1")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_BUILD_TYPE release)
 
-find_package(CUDAToolkit REQUIRED)
+find_package(CUDAToolkit REQUIRED COMPONENTS cuda_driver cudart_static nvml)
 message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
 
 # TRT dependencies
-set_ifndef(TRT_LIB_DIR ${CMAKE_BINARY_DIR})
-set_ifndef(TRT_INCLUDE_DIR /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-set(TRT_LIB nvinfer)
-# On Windows major version is appended to nvinfer libs.
-if(WIN32)
-  set(TRT_LIB_NAME nvinfer_10)
-else()
-  set(TRT_LIB_NAME nvinfer)
-endif()
-find_library_create_target(${TRT_LIB} ${TRT_LIB_NAME} SHARED ${TRT_LIB_DIR})
-message(${TRT_INCLUDE_DIR})
-include_directories("${TRT_INCLUDE_DIR}")
+find_package(TensorRT 10 REQUIRED)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
