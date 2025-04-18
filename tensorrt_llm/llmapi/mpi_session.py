@@ -263,13 +263,15 @@ class RemoteMpiCommSessionClient():
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
     '''
 
-    def __init__(self, addr: str):
+    def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
         print_colored_debug(
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
-        self.queue = ZeroMqQueue(addr, is_server=False)
+        self.queue = ZeroMqQueue((addr, hmac_key),
+                                 is_server=False,
+                                 use_hmac_encryption=bool(hmac_key))
         self._is_shutdown = False
 
     def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
@@ -311,12 +313,15 @@ class RemoteMpiCommSessionServer():
     def __init__(self,
                  n_workers: int = 0,
                  addr: str = f'tcp://127.0.0.1:*',
+                 hmac_key: Optional[bytes] = None,
                  comm=None,
                  is_comm: bool = False):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
-        self.queue = ZeroMqQueue(addr, is_server=True)
+        self.queue = ZeroMqQueue((addr, hmac_key),
+                                 is_server=True,
+                                 use_hmac_encryption=bool(hmac_key))
         self.comm = comm
 
         if self.comm is not None:

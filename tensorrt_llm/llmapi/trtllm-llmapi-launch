@@ -23,17 +23,28 @@ function mpi_world_size {
     fi
 }
 
-function export_free_tcp_addr {
-    # find free port with python -c, the port should start from 10000
-    local free_port=$(python -c 'import socket; s=socket.socket(); s.bind(("", 10000)); print(s.getsockname()[1]); s.close()')
+function export_free_tcp_addr_for_spawn_proxy_process {
+    # find free port starting from 10012
+    local free_port=$(python -c 'import socket; s=socket.socket();
+port = 10012
+while True:
+    try:
+        s.bind(("", port))
+        break
+    except OSError:
+        port += 1
+print(port); s.close()')
     export TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR="tcp://127.0.0.1:${free_port}"
     log_stderr "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: $TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
+
+    export TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY=$(openssl rand -hex 32)
 }
+
 
 export tllm_mpi_size=$(mpi_world_size)
 log_stderr "tllm_mpi_size: $tllm_mpi_size"
 
-export_free_tcp_addr
+export_free_tcp_addr_for_spawn_proxy_process
 
 if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     log_stderr "rank${mpi_rank} run ${task_with_command} in background"
