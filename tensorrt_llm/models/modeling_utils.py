@@ -221,6 +221,14 @@ class QuantConfig:
             return None
 
     def is_module_excluded_from_quantization(self, name: str) -> bool:
+        """Check if the module is excluded from quantization.
+
+        Args:
+            name (str): The name of the module.
+
+        Returns:
+            bool: True if the module is excluded from quantization, False otherwise.
+        """
         if self.exclude_modules is not None:
             for exclude_module in self.exclude_modules:
                 if fnmatch.fnmatchcase(name, exclude_module):

@@ -15,6 +15,7 @@
 
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 from utils.util import skip_pre_blackwell_unittest, unittest_name_func

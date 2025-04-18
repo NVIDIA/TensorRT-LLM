@@ -144,7 +144,7 @@ int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn, tensor
 }
 
 torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
-    th::Tensor floatTensor, int64_t sfVecSize, int64_t sfType, bool isSfSwizzledLayout = true)
+    th::Tensor floatTensor, int64_t sfVecSize, int64_t sfType, torch::optional<bool> isSfSwizzledLayout)
 {
     CHECK_CPU_INPUT(floatTensor, th::kFloat32);
     auto inputShape = floatTensor.sizes();
@@ -160,8 +160,10 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-                                                                      : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    // Note: if isSfSwizzledLayout is provided, use its value; otherwise default to true.
+    tensorrt_llm::FP4QuantizationSFLayout layout = isSfSwizzledLayout.value_or(true)
+        ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
+        : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
 
     for (size_t vIdx = 0; vIdx < static_cast<size_t>(inputShape[0]); ++vIdx)
     {
