@@ -16,7 +16,7 @@
 #include "compileEngine.h"
 
 #include "cubinObj.h"
-#include "nvrtcWrapper/include/nvrtcWrapper.h"
+#include "nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"

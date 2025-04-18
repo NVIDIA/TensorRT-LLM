@@ -51,38 +51,19 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
+set(INTERNAL_CUTLASS_KERNELS_PATH
+    ""
+    CACHE
+      PATH
+      "The path to internal cutlass kernels sources. Prebuilt binary for internal cutlass kernels and NVRTC wrapper will be used if this is not set."
 )
-  set(BUILD_NVRTC_WRAPPER_DEFAULT ON)
+if(INTERNAL_CUTLASS_KERNELS_PATH)
+  message(
+    STATUS
+      "Building internal cutlass kernels and nvrtc wrapper from source at ${INTERNAL_CUTLASS_KERNELS_PATH}"
+  )
 else()
-  set(BUILD_NVRTC_WRAPPER_DEFAULT OFF)
-endif()
-
-option(BUILD_NVRTC_WRAPPER "Build nvrtc wrapper from source"
-       ${BUILD_NVRTC_WRAPPER_DEFAULT})
-
-if(BUILD_NVRTC_WRAPPER)
-  message(STATUS "Building nvrtc wrapper")
-else()
-  message(STATUS "Importing nvrtc wrapper")
-endif()
-
-if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
-)
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
-else()
-  set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT OFF)
-endif()
-option(BUILD_INTERNAL_CUTLASS_KERNELS
-       "Build internal cutlass kernels from source"
-       ${BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT})
-
-if(BUILD_INTERNAL_CUTLASS_KERNELS)
-  message(STATUS "Building internal cutlass kernels")
-else()
-  message(STATUS "Importing internal cutlass kernels")
+  message(STATUS "Importing internal cutlass kernels and nvrtc wrapper")
 endif()
 
 if(BUILD_PYT)
