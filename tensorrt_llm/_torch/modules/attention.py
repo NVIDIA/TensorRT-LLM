@@ -6,8 +6,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 TrtllmAttention)
+from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
@@ -104,19 +103,6 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
-        self.enable_rope_fusion = self.attn_backend == "TRTLLM"
-        self.support_fused_qkv = self.attn_backend == "TRTLLM"
-        self.support_unfused_qkv = self.attn_backend != "TRTLLM"
-        self.rotary_emb = None
-        self.apply_rotary_emb = (not self.enable_rope_fusion
-                                 and pos_embd_params is not None)
-        if self.apply_rotary_emb:
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
-
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
         # handles them as a single fused operation.
@@ -132,8 +118,23 @@ class Attention(nn.Module):
 
         if not config.skip_create_weights:
             self.create_weights()
+        else:
+            self.create_backend()
 
-    def create_weights(self):
+        self.enable_rope_fusion = self.attn.support_fused_rope()
+        self.support_fused_qkv = self.attn.support_fused_qkv()
+
+        self.rotary_emb = None
+        self.apply_rotary_emb = (not self.enable_rope_fusion
+                                 and pos_embd_params is not None)
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
+    def create_backend(self):
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -144,10 +145,14 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
         )
 
+    def create_weights(self):
+        # recreate the backend when quant_config changes
+        self.create_backend()
+
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        elif k is not None and v is not None and not self.support_unfused_qkv:
+        elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v
@@ -459,9 +464,8 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = isinstance(self.mha, TrtllmAttention)
-        self.support_fused_qkv = isinstance(self.mha, TrtllmAttention)
-        self.support_unfused_qkv = not isinstance(self.mha, TrtllmAttention)
+        self.enable_rope_fusion = self.mha.support_fused_rope()
+        self.support_fused_qkv = self.mha.support_fused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.enable_rope_fusion
         if self.apply_rotary_emb:
@@ -575,7 +579,7 @@ class MLA(nn.Module):
         return attn_output
 
     def _maybe_concat_qkv(self, q, k, v):
-        if k is not None and v is not None and not self.support_unfused_qkv:
+        if k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v

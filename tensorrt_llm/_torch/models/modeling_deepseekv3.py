@@ -99,14 +99,14 @@ class Deepseekv3RoutingImpl():
         n_group: int,
         topk_group: int,
         routed_scaling_factor: float,
-        is_thop: bool = True,
+        is_fused: bool = True,
     ):
         super().__init__()
         self.top_k = top_k
         self.topk_group = topk_group
         self.n_group = n_group
         self.routed_scaling_factor = routed_scaling_factor
-        self.is_thop = is_thop
+        self.is_fused = is_fused
 
     def noaux_tc(self, logits, e_score_correction_bias):
         n_group = self.n_group
@@ -121,7 +121,7 @@ class Deepseekv3RoutingImpl():
                     "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
                 )
 
-        if self.is_thop == False:
+        if not self.is_fused:
             group_scores = torch.sum(torch.topk(
                 scores_with_bias.view(scores_shape[:-1] +
                                       [n_group, scores_shape[-1] // n_group]),
@@ -171,7 +171,7 @@ class Deepseekv3RoutingImpl():
         return topk_indices.to(torch.int32), topk_values.to(torch.float32)
 
 
-class Deepseekv3Gate(BaseMoeRoutingMethod):
+class DeepseekV3Gate(BaseMoeRoutingMethod):
 
     def __init__(
         self,
@@ -182,7 +182,8 @@ class Deepseekv3Gate(BaseMoeRoutingMethod):
         topk_group: int,
         routed_scaling_factor: float,
         dtype: Optional[torch.dtype] = None,
-        is_thop: bool = True,
+        fuse_routing_kernel: bool = True,
+        apply_routing: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
@@ -192,18 +193,20 @@ class Deepseekv3Gate(BaseMoeRoutingMethod):
             (num_experts), dtype=torch.float32),
                                                     requires_grad=False)
 
-        # TODO: e_score_correction_bias makes sense to live in this gate class, but it is needed for the routing impl
-        #       So we don't run into issues with weight loading, we make this gate object the BaseMoeRoutingMethod
-        #       and then dispatch to the routing impl for the actual implementation.
-        #       This is a bit of a hack and we should clean this up in the future.
+        assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
+
+        # TODO: e_score_correction_bias belongs in this gate class but is required by the routing impl.
+        # To avoid weight-loading issues, we treat this gate as the BaseMoeRoutingMethod and dispatch to the routing impl.
+        # This is a temporary hack that should be refactored later.
         self.routing_impl = Deepseekv3RoutingImpl(
             top_k=top_k,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
-            is_thop=is_thop)
+            is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # router gemm
         logits = torch.ops.trtllm.cublas_mm(hidden_states,
                                             self.weight.t(),
                                             bias=None,
@@ -219,6 +222,7 @@ class Deepseekv3Gate(BaseMoeRoutingMethod):
             weights[0]["e_score_correction_bias"][:].to(torch.float32))
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # topk routing
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
 
     @property
@@ -247,14 +251,16 @@ class Deepseekv3MoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.gate = Deepseekv3Gate(
+        self.gate = DeepseekV3Gate(
             hidden_size,
             num_experts,
             top_k=top_k,
             n_group=config.n_group,
             topk_group=config.topk_group,
             routed_scaling_factor=config.routed_scaling_factor,
-            dtype=dtype)
+            dtype=dtype,
+            fuse_routing_kernel=True,
+            apply_routing=False)
         self.experts = FusedMoE(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -262,7 +268,7 @@ class Deepseekv3MoE(nn.Module):
             intermediate_size=intermediate_size,
             dtype=dtype,
             reduce_results=
-            False,  # In both low latency and attention dp scenarios, FusedMoE needs not to do allreduce inside op.
+            False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
 
@@ -282,6 +288,7 @@ class Deepseekv3MoE(nn.Module):
             # If shared_tp_size has been overridden, the output of shared experts needs to be scaled down accordingly before all-reduce.
             if shared_tp_size != model_config.mapping.tp_size:
                 self.shared_output_scale = shared_tp_size / model_config.mapping.tp_size
+
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
@@ -301,28 +308,26 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
+        # max-throughput
         if self.use_dp and self.mapping.tp_size > 1:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
+            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
+            # to reduce allreduce BW
             if disable_fp4_allgather():
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           gather_dim=0)
+
         router_logits = self.gate(hidden_states)
 
-        if hidden_states_fp4 is not None:
-            routed_output = self.experts(hidden_states_fp4,
-                                         router_logits,
-                                         min_latency_mode,
-                                         output_dtype=hidden_states.dtype)
-        else:
-            routed_output = self.experts(
-                hidden_states,
-                router_logits,
-                min_latency_mode,
-                all_rank_num_tokens=all_rank_num_tokens)
+        routed_output = self.experts(hidden_states_fp4 or hidden_states,
+                                     router_logits,
+                                     min_latency_mode,
+                                     output_dtype=hidden_states.dtype,
+                                     all_rank_num_tokens=all_rank_num_tokens)
 
         return routed_output
 
@@ -330,7 +335,7 @@ class Deepseekv3MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
-        all_rank_num_tokens=None,
+        all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         min_latency_mode: Optional[bool] = False,
     ) -> torch.Tensor:
@@ -357,15 +362,16 @@ class Deepseekv3MoE(nn.Module):
 
         if min_latency_mode:
             return [shared_output, *routed_output]
+        else:
+            assert shared_output.size() == routed_output.size(
+            ), f'unmatched tensor shape'
+            final_hidden_states = shared_output + routed_output
+            if not self.use_dp and self.mapping.tp_size > 1:
+                final_hidden_states = self.all_reduce(
+                    final_hidden_states,
+                    all_reduce_params=final_all_reduce_params)
 
-        assert shared_output.size() == routed_output.size(
-        ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
-        if not self.use_dp and self.mapping.tp_size > 1:
-            final_hidden_states = self.all_reduce(
-                final_hidden_states, all_reduce_params=final_all_reduce_params)
-
-        return final_hidden_states
+            return final_hidden_states
 
 
 class DeepseekV3DecoderLayer(DecoderLayer):
@@ -381,31 +387,35 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
+        self.mapping = model_config.mapping
+        mapping = self.mapping
+
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention])
         self.fusion_config = EagerFusionConfig()
-        self.enable_attention_dp = model_config.mapping.enable_attention_dp
-        self.mlp_tp_size = model_config.mapping.tp_size
+        self.enable_attention_dp = mapping.enable_attention_dp
+        self.mlp_tp_size = mapping.tp_size
 
-        self.enable_fusion = os.environ.get(
-            "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-
-        pp_layer_offset = model_config.mapping.pp_layers(
-            config.num_hidden_layers)[0]
+        pp_layer_offset = mapping.pp_layers(config.num_hidden_layers)[0]
         global_layer_idx = pp_layer_offset + layer_idx
 
+        enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED",
+                                       "0") == "0"
+        self.enable_fusion = enable_fusion and not self.enable_attention_dp
+
         self.is_nvfp4 = model_config.quant_config.layer_quant_mode.has_nvfp4()
+        has_tp = mapping.has_tp()
+        has_pp = mapping.has_pp()
 
         if (config.n_routed_experts is not None
                 and global_layer_idx >= config.first_k_dense_replace
                 and global_layer_idx % config.moe_layer_freq == 0):
-            self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp
-            self.fusion_config.POST_MOE_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and not self.enable_attention_dp and not model_config.mapping.has_pp(
-            )
+
+            self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+            self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+
             self.mlp = Deepseekv3MoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
@@ -429,15 +439,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.mlp_tp_size = math.gcd(
                     math.gcd(
                         config.intermediate_size // 128,
-                        model_config.mapping.tp_size,
+                        mapping.tp_size,
                     ),
-                    model_config.mapping.
-                    gpus_per_node,  # Avoid costly inter-node TP
+                    mapping.gpus_per_node,  # Avoid costly inter-node TP
                 )
-            self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and model_config.mapping.has_tp(
-            ) and self.is_nvfp4 and not self.enable_attention_dp
-            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not self.enable_attention_dp and not model_config.mapping.has_pp(
-            )
+
+            self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_tp and self.is_nvfp4
+            self.fusion_config.POST_MLP_FUSION = self.enable_fusion and self.mlp_tp_size > 1 and not has_pp
+
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,
                                 bias=False,
@@ -450,17 +459,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
 
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.fusion_config.PRE_MLP_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
+
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.mapping = model_config.mapping
         self.layer_idx = layer_idx
         self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
         self.deepseek_allreduce_disabled = os.environ.get(
             "TRTLLM_DEEPSEEK_ALLREDUCE_FUSION_DISABLED", "0") == "1"
-        if model_config.mapping.is_multi_node():
+        if mapping.is_multi_node():
             self.deepseek_allreduce_disabled = True
 
         if not self.deepseek_allreduce_disabled:
@@ -474,15 +487,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-
-        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
-        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
-            0) > 128
-
-        min_latency_mode = True if hidden_states.size(
-            0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -492,12 +496,18 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION
-                or self.fusion_config.PRE_MLP_FUSION
-                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
+
+        # deepseek allreduce kernel is better when m < 512, two shot(128~512) has acc bug, waive
+        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
+            0) > 128
+
+        min_latency_mode = True if hidden_states.size(
+            0
+        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
 
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
@@ -710,9 +720,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
-                or self.enable_attention_dp)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
 
@@ -858,6 +867,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         if model_config.spec_config is not None:
             assert not model_config.mapping.has_pp(
             ), "PP + MTP combination is not supported"
+
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers

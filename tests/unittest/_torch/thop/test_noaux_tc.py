@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3Gate
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
 
 
 @pytest.mark.parametrize("seq_len", [1, 32, 8192])
@@ -30,14 +30,17 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     weights["e_score_correction_bias"] = e_score_correction_bias
 
     # Run the thop
-    gate = Deepseekv3Gate(hidden_size=HIDDEN_SIZE,
-                          num_experts=num_experts,
-                          top_k=top_k,
-                          n_group=n_group,
-                          topk_group=topk_group,
-                          routed_scaling_factor=ROUTED_SCALING_FACTOR,
-                          dtype=dtype,
-                          is_thop=True)
+    gate = DeepseekV3Gate(
+        hidden_size=HIDDEN_SIZE,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+        dtype=dtype,
+        fuse_routing_kernel=True,
+        apply_routing=False,
+    )
     gate.load_weights([weights])
     gate.cuda()
     with torch.inference_mode():
@@ -45,14 +48,17 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
             gate.forward(logits))
 
     # Run the original version
-    ref_gate = Deepseekv3Gate(hidden_size=HIDDEN_SIZE,
-                              num_experts=num_experts,
-                              top_k=top_k,
-                              n_group=n_group,
-                              topk_group=topk_group,
-                              routed_scaling_factor=ROUTED_SCALING_FACTOR,
-                              dtype=dtype,
-                              is_thop=False)
+    ref_gate = DeepseekV3Gate(
+        hidden_size=HIDDEN_SIZE,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=ROUTED_SCALING_FACTOR,
+        dtype=dtype,
+        fuse_routing_kernel=False,
+        apply_routing=False,
+    )
     ref_gate.load_weights([weights])
     ref_gate.cuda()
     with torch.inference_mode():

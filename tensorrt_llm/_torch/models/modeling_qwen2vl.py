@@ -312,7 +312,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
-                        inputs.get("multi_modal_data"), inputs.get("mm_processor_kwargs", {})
+                        inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
         # NOTE: Since we are passed in Tensor images, we don't need to rescale them.
         mm_processor_kwargs['do_rescale'] = False
