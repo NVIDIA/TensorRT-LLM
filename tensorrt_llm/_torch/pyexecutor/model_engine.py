@@ -406,6 +406,23 @@ class PyTorchModelEngine(ModelEngine):
                         kv_cache_manager.num_extra_kv_tokens - 1 -
                         max_num_draft_tokens),
                 )
+
+                # This is a temporary fix for a serious issue. max_position_embeddings
+                # typically constrains the maximum sequence length for the model that we're
+                # running. If you go over it, you'll get an illegal memory access during RoPE
+                # (if you're lucky; if you're unluck you'll just get final outputs that are
+                # slightly different).
+                #
+                # The problem is that the executor config, the model engine, and the KV cache
+                # manager do not always agree on what the maximum sequence length should be.
+                # This likely needs a complete overhaul and refactor - it is impossibly confusing
+                # right now. Not only do multiple objects have their own max seq len definition,
+                # it can be mutated in multiple different places.
+                if hasattr(self.model.config, "max_position_embeddings"):
+                    token_num = min(
+                        token_num, self.model.config.max_position_embeddings -
+                        max_num_draft_tokens - 1)
+
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
                 max_seq_len_request = kv_cache_manager.add_dummy_requests(
@@ -532,8 +549,9 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.pytorch_backend_config.autotuner_enabled:
             with no_cuda_graph(), autotune():
-                num_tokens_per_request = min(self.max_num_tokens,
-                                             kv_cache_manager.max_seq_len - 1)
+                num_tokens_per_request = min(
+                    (self.max_seq_len, kv_cache_manager.max_seq_len - 1,
+                     self.max_num_tokens))
                 with release_batch(
                         get_torch_compile_warmup_request(
                             1, num_tokens_per_request)) as batch:
