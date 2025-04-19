@@ -417,7 +417,8 @@ void initConfigBindings(pybind11::module_& m)
             c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch());
+            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch(),
+            c.getPromptTableOffloading());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -430,7 +431,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 26)
+        if (cpp_states.size() != 27)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -461,7 +462,8 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[22].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
             cpp_states[23].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
             cpp_states[24].cast<bool>(),                                                   // GatherGenerationLogits
-            cpp_states[25].cast<bool>()                                                    // UseVariableBeamWidthSearch
+            cpp_states[25].cast<bool>(),                                                   // UseVariableBeamWidthSearch
+            cpp_states[26].cast<bool>()                                                    // PromptTableOffloading
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -496,7 +498,8 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
                  std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
                  bool,                                                   // GatherGenerationLogits
-                 bool                                                    // UseVariableBeamWidthSearch
+                 bool,                                                   // UseVariableBeamWidthSearch
+                 bool                                                    // PromptTableOffloading
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -516,7 +519,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
             py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
-            py::arg("use_variable_beam_width_search") = false)
+            py::arg("use_variable_beam_width_search") = false, py::arg("mm_embedding_offloading") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -562,6 +565,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setGatherGenerationLogits)
         .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
+        .def_property("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
+            &tle::ExecutorConfig::setPromptTableOffloading)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 
