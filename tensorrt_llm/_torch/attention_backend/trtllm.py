@@ -312,7 +312,7 @@ class TrtllmAttentionWrapper:
                 mask_type = AttentionMaskType.padding
             else:
                 raise ValueError("Unexpected attention mask type")
-
+        print(f"attention_chunk_size: {attention_chunk_size}")
         output = torch.ops.trtllm.attention(
             q,
             k,
