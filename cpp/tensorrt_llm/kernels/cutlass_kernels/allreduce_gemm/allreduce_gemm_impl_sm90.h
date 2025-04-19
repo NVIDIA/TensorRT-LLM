@@ -16,7 +16,7 @@
  */
 #pragma once
 
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/allreduce_gemm_runner.h"
+#include "allreduce_gemm_runner.h"
 
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass_extensions/gemm_configs.h"
