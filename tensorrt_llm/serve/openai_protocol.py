@@ -187,7 +187,8 @@ class CompletionRequest(OpenAIBaseModel):
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
+            logprobs=None,  # TODO: WIP
+            prompt_logprobs=None,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -502,7 +503,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
-            return_log_probs=self.logprobs,
+            logprobs=None,  # TODO: WIP
+            prompt_logprobs=None,
             max_tokens=self.max_completion_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,

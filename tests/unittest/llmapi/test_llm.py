@@ -1613,6 +1613,70 @@ def test_llm_return_generation_logits():
     check_llm_return_generation_logits(tp_size=1)
 
 
+@pytest.mark.parametrize(
+    "pytorch_backend, prompt_logprobs, logprobs, return_context_logits, return_generation_logits",
+    [
+        (False, 2, None, True, False),
+        (False, None, 2, False, False),
+        (False, 2, 2, False, True),
+    ])
+def test_llm_return_logprobs(pytorch_backend: bool,
+                             prompt_logprobs: Optional[int],
+                             logprobs: Optional[int],
+                             return_context_logits: bool,
+                             return_generation_logits: bool):
+    LLM_CLASS = LLM
+    if pytorch_backend:
+        from tensorrt_llm._torch import LLM as LLM_torch
+        LLM_CLASS = LLM_torch
+
+    llm = LLM_CLASS(
+        llama_model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        build_config=BuildConfig(gather_context_logits=True),
+        gather_generation_logits=True,
+        fast_build=True,
+    )
+
+    prompts = ["A B C D E F G H I J K"]
+    sampling_params = SamplingParams(
+        logprobs=logprobs,
+        prompt_logprobs=prompt_logprobs,
+        return_context_logits=return_context_logits,
+        return_generation_logits=return_generation_logits)
+
+    for output in llm.generate(prompts, sampling_params):
+        context_logits = output.context_logits
+        generation_logits = output.outputs[0].generation_logits
+        logprobs_result = output.outputs[0].logprobs
+        prompt_logprobs_result = output.outputs[0].prompt_logprobs
+        token_ids = output.outputs[0].token_ids
+
+        if prompt_logprobs and not return_context_logits:
+            assert context_logits is None
+
+        if logprobs and not return_generation_logits:
+            assert generation_logits is None
+
+        if return_context_logits:
+            assert isinstance(context_logits, torch.Tensor)
+
+        if return_generation_logits:
+            assert isinstance(generation_logits, torch.Tensor)
+
+        if prompt_logprobs:
+            assert prompt_logprobs_result and len(
+                prompt_logprobs_result[0].keys()) == prompt_logprobs
+            print("prompt_logprobs[0]: ", prompt_logprobs_result[0])
+
+        if logprobs:
+            assert logprobs_result and len(
+                logprobs_result[0].keys()) in {logprobs, logprobs + 1}
+            # Most contain log prob of the sample token, even if it's not within K
+            assert token_ids[0] in logprobs_result[0].keys()
+            print("logprobs[0]: ", logprobs_result[0])
+
+
 class DummyExecutorWorker3(ExecutorBindingsWorker):
     should_raise_error = True
 
