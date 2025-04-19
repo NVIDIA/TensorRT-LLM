@@ -2314,3 +2314,54 @@ def disaggregated_test_root(llm_root, llm_venv):
                                       "tests/integration/defs/disaggregated")
 
     return disaggregated_root
+
+
+def filter_pytest_cases(*filters: str):
+
+    def deco(func):
+        marks = []
+        indirects = []
+        for mark in func.pytestmark:
+            if mark.name == "parametrize":
+                values = mark.args[1]
+                ids = mark.kwargs.get("ids", None)
+                if ids is None:
+                    ids = [str(i) for i in values]
+                elif callable(ids):
+                    ids = [ids(i) for i in values]
+                marks.append((mark.args[0], values, ids))
+                if mark.kwargs.get("indirect", False):
+                    indirects.append(mark.args[0])
+
+        name_combined = ",".join([mark[0] for mark in marks])
+
+        all_values = []
+        all_ids = []
+        for filter in filters:
+            filter_origin = filter
+            case_values = []
+            for mark in marks:
+                values = mark[1]
+                ids = mark[2]
+                found = False
+                for i, id in enumerate(ids):
+                    if filter.startswith(f"{id}-") or filter == id:
+                        filter = filter[len(id) + 1:]
+                        case_values.append(values[i])
+                        found = True
+                        break
+                if not found:
+                    raise ValueError(
+                        f"{filter_origin} is not a valid case name for argument \"{mark[0]}\". Available ids are {ids}."
+                    )
+            all_values.append((*case_values, ))
+            all_ids.append(filter_origin)
+
+        delattr(func, "pytestmark")
+        func = pytest.mark.parametrize(name_combined,
+                                       all_values,
+                                       ids=all_ids,
+                                       indirect=indirects)(func)
+        return func
+
+    return deco
