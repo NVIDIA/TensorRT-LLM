@@ -40,7 +40,7 @@ from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (download_hf_model, download_hf_pretrained_config,
                     enable_llm_debug, get_directory_size_in_gb, print_colored,
-                    print_traceback_on_error)
+                    print_colored_debug, print_traceback_on_error)
 
 
 @dataclass
@@ -488,6 +488,7 @@ class ModelLoader:
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
+    @print_traceback_on_error
     def _load_model_from_ckpt(self):
         ''' Load a TRT-LLM model from checkpoint. '''
         self.pretrained_config = PretrainedConfig.from_json_file(
@@ -515,10 +516,14 @@ class ModelLoader:
         assert isinstance(self.llm_args.model, Module)
         self._model_info = _ModelInfo.from_module(self.model)
 
+    @print_traceback_on_error
     def _build_engine(self):
         assert isinstance(
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
+
+        print_colored_debug(f"rank{mpi_rank()} begin to build engine...\n",
+                            "green")
 
         # avoid the original build_config is modified, avoid the side effect
         copied_build_config = copy.deepcopy(self.build_config)
@@ -535,6 +540,7 @@ class ModelLoader:
 
         # delete the model explicitly to free all the build-time resources
         self.model = None
+        print_colored_debug(f"rank{mpi_rank()} build engine done\n", "green")
 
     def _save_engine_for_runtime(self):
         '''
