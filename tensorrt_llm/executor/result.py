@@ -14,7 +14,7 @@ from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
 from ..sampling_params import SamplingParams
-from .utils import ErrorResponse, has_event_loop
+from .utils import ErrorResponse, has_event_loop, is_llm_response
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -238,7 +238,7 @@ class GenerationResultBase:
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
                     handler(response.error)
-        elif isinstance(response, tllm.Response):
+        elif is_llm_response(response):
             if response.has_error():
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
