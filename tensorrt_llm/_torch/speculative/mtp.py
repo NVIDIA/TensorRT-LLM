@@ -953,8 +953,10 @@ class MTPEagleWorker(MTPWorker):
             req_types = attn_metadata.host_request_types[:batch_size].clone()
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
-            if hasattr(attn_metadata, 'flash_mla_metadata'):
-                flash_mla_tile_scheduler_metadata = attn_metadata.flash_mla_metadata.tile_scheduler_metadata
+            if hasattr(attn_metadata,
+                       'flash_mla_metadata') and attn_metadata.enable_flash_mla:
+                # tile_scheduler_metadata_eagle has been pre-allocated. Swap to use it.
+                attn_metadata.flash_mla_metadata.tile_scheduler_metadata, attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle = attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle, attn_metadata.flash_mla_metadata.tile_scheduler_metadata
 
         # Prepare inputs for the 1st MTP layer
         position_ids = position_ids.squeeze(0)
@@ -1002,13 +1004,12 @@ class MTPEagleWorker(MTPWorker):
 
                 if attn_metadata.enable_flash_mla:
                     # Since KV cache length is increasing, we need to update the MLA metadata.
+                    # TODO: Is this correct?
                     torch.ops.trtllm.get_mla_metadata(
                         attn_metadata.kv_lens_cuda[:batch_size], attn_metadata.
-                        flash_mla_metadata.tile_scheduler_metadata_eagle,
+                        flash_mla_metadata.tile_scheduler_metadata,
                         attn_metadata.flash_mla_metadata.
                         num_splits[:batch_size + 1])
-                    # Replace tile_scheduler_metadata which is passed into the AttentionOp.
-                    attn_metadata.flash_mla_metadata.tile_scheduler_metadata = attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle
 
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
@@ -1035,9 +1036,10 @@ class MTPEagleWorker(MTPWorker):
             spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens_cuda)
-            if hasattr(attn_metadata, 'flash_mla_metadata'):
-                # Restore the original tile_scheduler_metadata.
-                attn_metadata.flash_mla_metadata.tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
+            if hasattr(attn_metadata,
+                       'flash_mla_metadata') and attn_metadata.enable_flash_mla:
+                # Swap back to the original tile_scheduler_metadata.
+                attn_metadata.flash_mla_metadata.tile_scheduler_metadata, attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle = attn_metadata.flash_mla_metadata.tile_scheduler_metadata_eagle, attn_metadata.flash_mla_metadata.tile_scheduler_metadata
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -1113,6 +1115,18 @@ class MTPEagleWorker(MTPWorker):
             # the graph and force an expensive recapture.
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                 self.mtp_num_modules + 1 - num_accepted_tokens[num_contexts:])
+
+        if hasattr(attn_metadata,
+                   'flash_mla_metadata') and attn_metadata.enable_flash_mla:
+            # Eagle MTP will require different metadata from main model.
+            # Need to get_mla_metadata again.
+            torch.ops.trtllm.get_mla_metadata(
+                attn_metadata.kv_lens_cuda[
+                    attn_metadata.num_contexts:attn_metadata.num_contexts +
+                    attn_metadata.num_generations],
+                attn_metadata.flash_mla_metadata.tile_scheduler_metadata,
+                attn_metadata.flash_mla_metadata.
+                num_splits[:attn_metadata.num_generations + 1])
 
         return {
             "input_ids": input_ids,
