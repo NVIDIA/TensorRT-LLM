@@ -1224,6 +1224,19 @@ def test_trtllm_serve_example(llm_root, llm_venv):
          str(test_root / "_test_trtllm_serve_example.py")])
 
 
+def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_multimodal_example.py")
+    ])
+
+
 def test_openai_misc_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_misc.py")])
@@ -1245,6 +1258,19 @@ def test_openai_chat_example(llm_root, llm_venv):
     ])
 
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_chat.py")])
+
+
+def test_openai_chat_multimodal_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "apps"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_multimodal.py")])
 
 
 @pytest.mark.skip_less_device(2)

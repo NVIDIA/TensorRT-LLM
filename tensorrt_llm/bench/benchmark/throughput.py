@@ -10,6 +10,7 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
+from tensorrt_llm.bench.build.build import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -21,7 +22,8 @@ from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
-                                           initialize_tokenizer)
+                                           initialize_tokenizer,
+                                           update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
@@ -93,11 +95,25 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Pass in a dataset file for parsing instead of stdin.",
 )
 @optgroup.option(
+    "--modality",
+    type=click.Choice(["image", "video"]),
+    default=None,
+    help="Modality of the multimodal requests.",
+)
+@optgroup.option(
+    "--max_input_len",
+    type=int,
+    default=4096,
+    help=
+    "Maximum input sequence length to use for multimodal models. This is used only when --modality "
+    "is specified since the actual number of vision tokens is unknown before the model is run.",
+)
+@optgroup.option(
     "--num_requests",
     type=int,
     default=0,
     help=
-    "Number of requests to cap benchmark run at. If not specified or set to 0, it will be the"
+    "Number of requests to cap benchmark run at. If not specified or set to 0, it will be the "
     "length of dataset.",
 )
 @optgroup.option(
@@ -194,6 +210,9 @@ def throughput_command(
     engine_dir: Path = params.pop("engine_dir")
     concurrency: int = params.pop("concurrency")
     backend: str = params.get("backend")
+    modality: str = params.pop("modality")
+    max_input_len: int = params.pop("max_input_len")
+    model_type = get_model_config(model, checkpoint_path).model_type
 
     # Reporting options
     report_json: Path = params.pop("report_json")
@@ -209,15 +228,24 @@ def throughput_command(
     # Dataset Loading and Preparation
     with open(dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
-            tokenizer, dataset, num_requests=num_requests)
+            tokenizer,
+            dataset,
+            num_requests=num_requests,
+            model_dir=checkpoint_path,
+            model_type=model_type,
+            modality=modality,
+            max_input_seq_len_for_multimodal=max_input_len)
         metadata.dataset_path = dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
         params["target_output_len"] = params.get(
             "target_output_len") or metadata.avg_osl
 
-    # Log dataset info
-    logger.info(metadata.get_summary_for_print())
+    if modality is None:
+        # Log dataset info
+        # NOTE: This table is only accurate for non-multimodal models.
+        #       The accurate table for multimodal models will be logged after the benchmark is done.
+        logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
     if backend and backend.lower() in ["pytorch", "autodeploy"]:
@@ -294,8 +322,12 @@ def throughput_command(
             warmup_dataset = generate_warmup_dataset(requests, warmup)
             logger.info("Running warmup.")
             asyncio.run(
-                async_benchmark(llm, sampling_params, warmup_dataset, False,
-                                concurrency))
+                async_benchmark(llm,
+                                sampling_params,
+                                warmup_dataset,
+                                False,
+                                concurrency,
+                                modality=modality))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -304,10 +336,19 @@ def throughput_command(
 
         with iteration_writer.capture():
             statistics = asyncio.run(
-                async_benchmark(llm, sampling_params, requests, streaming,
-                                concurrency, iteration_writer.full_address))
+                async_benchmark(llm,
+                                sampling_params,
+                                requests,
+                                streaming,
+                                concurrency,
+                                iteration_writer.full_address,
+                                modality=modality))
 
         logger.info(f"Benchmark done. Reporting results...")
+        if modality is not None:
+            # For multimodal models, we need to update the metadata with the correct input lengths
+            metadata = update_metadata_for_multimodal(metadata, statistics)
+
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, kwargs, streaming)
         if report_json:
