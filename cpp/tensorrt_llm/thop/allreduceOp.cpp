@@ -467,13 +467,13 @@ private:
 
         allreduce_fusion_params.stream = stream;
 
-        bool const required_cale_factor_required = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+        bool const is_scale_factor_required = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
 
         allreduce_fusion_params.scale_factor
-            = required_cale_factor_required ? static_cast<float*>(scale.value().data_ptr()) : nullptr;
+            = is_scale_factor_required ? static_cast<float*>(scale.value().data_ptr()) : nullptr;
 
         tensorrt_llm::kernels::ar_fusion::allreduce_fusion_op(allreduce_fusion_params);
 

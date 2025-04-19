@@ -113,10 +113,24 @@ class AllReduce(nn.Module):
             mapping (Mapping):  The parallel mapping config.
             strategy (AllReduceStrategy):
                 Three types of all-reduce strategies are supported:
-                UB: AllReduce uses user-buffer based all-reduce kernel.
-                NCCL: AllReduce delegates all-reduce to NCCL MIN_LATENCY mode kernel.
-                MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
-                AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
+                - UB: AllReduce uses user-buffer based all-reduce kernel. Supported ops:
+                    - RESIDUAL_RMS_NORM
+                    - RESIDUAL_RMS_NORM_QUANT_FP8
+                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
+
+                - NCCL: AllReduce delegates all-reduce to NCCL MIN_LATENCY mode kernel. Supported ops:
+                    - NONE (AllReduce only)
+                    - RESIDUAL_RMS_NORM
+
+                - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel. Supported ops:
+                    - NONE (AllReduce only)
+                    - RESIDUAL_RMS_NORM
+                    - RESIDUAL_RMS_NORM_QUANT_FP8
+                    - RESIDUAL_RMS_NORM_QUANT_NVFP4
+                    - RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+                    - RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+
+                - AUTO: AUTO chooses between NCCL and MIN_LATENCY mode based on a heuristic policy.
         """
 
         self.mapping = mapping
