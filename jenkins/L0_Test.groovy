@@ -1102,9 +1102,9 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
     sh "tar -zvxf ${linuxPkgName}"
 
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && trtllm-build --model_config config.json --log_level verbose'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../run.py --max_output_len 4 --end_id -1'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core//gpt && trtllm-build --model_config config.json --log_level verbose'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../run.py --max_output_len 4 --end_id -1'")
 }
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {

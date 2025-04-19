@@ -1338,7 +1338,7 @@ def test_llm_llama_v1_1gpu_kv_cache_reuse_with_prompt_table(
     # add --run_profiling to run the request for multiple times
     print("Run inference")
     run_cmd = [
-        f"{llama_example_root}/../run.py", "--max_output_len=10",
+        f"{llama_example_root}/../../../run.py", "--max_output_len=10",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}/engines", f"--input_file={input_file}",
         f"--prompt_table_path={prompt_table_path}",
@@ -1444,7 +1444,7 @@ def test_llm_llama_1gpu_batched_beam_search(llama_example_root,
     # run.py test.
     num_beams = 4
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1532,7 +1532,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1549,7 +1549,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
 
     print("Run Summarization test with batch size = 1")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
@@ -1568,7 +1568,7 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
     if mmlu_test:
         print("Run MMLU test")
         mmlu_cmd = [
-            f"{llama_example_root}/../mmlu_llmapi.py",
+            f"{llama_example_root}/../../../mmlu_llmapi.py",
             f"--data_dir={mmlu_dataset_root}",
             f"--hf_model_dir={llama_model_root}",
             f"--engine_dir={engine_dir}",
@@ -1612,7 +1612,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1629,7 +1629,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
 
     print("Run Summarization test with batch size = 1")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
@@ -1686,7 +1686,7 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
     # run.py test.
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=32",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -1703,7 +1703,7 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
     print("Run Summarization test")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_model_root}",
@@ -1808,7 +1808,7 @@ def test_llm_llama_v2_lora_1gpu(data_type, lora_data_type, llama_example_root,
     # TODO change to chinese evaluation task in the future
 
     base_run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         f"--tokenizer_dir={llm_lora_model_root}",
@@ -1923,7 +1923,7 @@ def test_llm_llama_v3_dora_1gpu(data_type, llama_example_root, llama_model_root,
     dora_weights = f"{llm_venv.get_working_directory()}/dora_weights"
 
     normalize_cmd = [
-        f"{llama_example_root}/../dora/normalize_weights.py", "-i",
+        f"{llama_example_root}/../../../dora/normalize_weights.py", "-i",
         llm_dora_model_root, "-b", llama_model_root, "-o", dora_weights
     ]
 
@@ -1983,7 +1983,7 @@ def test_llm_llama_v3_dora_1gpu(data_type, llama_example_root, llama_model_root,
         writer.writerow(input_tokens)
 
     base_run_cmd = [
-        f"{llama_example_root}/../run.py", "--max_output_len=20",
+        f"{llama_example_root}/../../../run.py", "--max_output_len=20",
         f"--input_file={in_csv}", f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}", "--max_output_len=32"
     ]
@@ -2060,7 +2060,8 @@ def test_llm_llama_long_alpaca_8gpu_summary(llama_example_root,
     print("Run summarize...")
     max_output_len = test_case["max_output_len"]
     run_cmd = [
-        f"{llama_example_root}/../run.py", f"--max_output_len={max_output_len}",
+        f"{llama_example_root}/../../../run.py",
+        f"--max_output_len={max_output_len}",
         f"--input_file={test_case['input_file']}", f"--engine_dir={engine_dir}",
         f"--num_beams={num_beams}",
         f"--tokenizer_dir={llm_long_alpaca_model_root}",
@@ -2199,7 +2200,7 @@ def test_llm_llama_code_llama_1gpu_summary(
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=40",
         f"--tokenizer_dir={code_llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -2272,7 +2273,7 @@ def test_llm_llama_code_llama_multi_gpus_summary(llama_example_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=160",
         f"--tokenizer_dir={code_llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -2491,7 +2492,7 @@ def test_llm_llama_v2_int8sq_2gpu_tp2(data_type, llama_example_root,
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         "--hf_model_dir",
         f"{llama_v2_tokenizer_model_root}",
@@ -2674,7 +2675,7 @@ def test_llm_llama_v1_multiple_lora_1gpu(data_type, lora_data_type,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     base_run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--input_text",
         "美国的首都在哪里? \n答案:",
         "美国的首都在哪里? \n答案:",
@@ -2765,7 +2766,7 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
     print("Convert LoRA to cpp format")
     convert_cmd = [
         "python",
-        f"{llama_example_root}/../hf_lora_convert.py",
+        f"{llama_example_root}/../../../hf_lora_convert.py",
         f"-i={llm_lora_model_root}",
         "--storage-type=float16",
         f"-o={llm_venv.get_working_directory()}/lora_cpp",
@@ -2773,7 +2774,7 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
     check_call(" ".join(convert_cmd), shell=True, env=llm_venv._new_env)
 
     print("Prepare datasets")
-    benchmark_root = f"{llama_example_root}/../../benchmarks/cpp"
+    benchmark_root = f"{llama_example_root}/../../../../benchmarks/cpp"
     lora_eg = f"{llm_venv.get_working_directory()}/lora-eg"
     base_dataset_cmd = [
         f"mkdir -p {lora_eg}/data",
@@ -3775,7 +3776,7 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
     if dataset_name == "passkey":
         print("Run passkey evaluation...")
         summary_cmd = [
-            f"{llama_example_root}/../eval_long_context.py",
+            f"{llama_example_root}/../../../eval_long_context.py",
             f"--engine_dir={engine_dir}",
             f"--tokenizer_dir={llama_model_root}",
             f"--max_input_length={max_input_len}",
@@ -3823,7 +3824,7 @@ def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
 
     print("Generate evaluation dataset for passkey.")
     gen_cmd = [
-        f"{llama_example_root}/../infinitebench/construct_synthetic_dataset.py",
+        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
         "--test_case=build_passkey",
         "--test_level=7",
     ]
@@ -3852,7 +3853,7 @@ def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
 
     print("Run passkey evaluation...")
     eval_cmd = [
-        f"{llama_example_root}/../eval_long_context.py",
+        f"{llama_example_root}/../../../eval_long_context.py",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llama_model_root}",
         f"--max_input_length={max_seq_len-10}",
@@ -3920,7 +3921,7 @@ def test_llm_llama_2nodes_8gpus(test_type, llama_example_root, llama_model_root,
 
         print("Run inference...")
         run_cmd = [
-            f"{llama_example_root}/../run.py",
+            f"{llama_example_root}/../../../run.py",
             "--max_output_len=50",
             f"--tokenizer_dir={llama_model_root}",
             f"--engine_dir={engine_dir}",
@@ -3989,7 +3990,7 @@ def test_llm_llama_v2_1gpu_weight_streaming(llama_example_root,
             break
         print(f"Run inference with gpu_weights_percent={gpu_weights_percent}")
         summary_cmd = [
-            f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+            f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
             "--hf_model_dir", f"{llama_model_root}", "--data_type", "fp16",
             "--check_accuracy", f"--engine_dir={engine_dir}", "--num_beams=2",
             f"--dataset_dir={llm_datasets_root}",
@@ -4038,7 +4039,7 @@ def test_llm_llama_1gpu_streaming_llm(llama_example_root, deepseek_model_root,
 
     print("Run inference")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         f"--tokenizer_dir={deepseek_model_root}",
         f"--engine_dir={engine_dir}",
         f"--max_input_length={max_input_len}",
@@ -4096,7 +4097,7 @@ def test_llm_llama_v3_1_1node_single_gpu(llama_example_root, llama_model_root,
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         f"--hf_model_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -4141,7 +4142,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 
     print("Run summarize...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         "--test_trt_llm",
         f"--hf_model_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
@@ -4229,7 +4230,7 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
 
     print("Run eval...")
     eval_cmd = [
-        f"{llama_example_root}/../eval_long_context.py",
+        f"{llama_example_root}/../../../eval_long_context.py",
         "--task=passkey",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llama_model_root}",
@@ -4326,7 +4327,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         check_call(f"mkdir -p {context_dir}", shell=True)
 
         gen_cmd = [
-            f"{llama_example_root}/../infinitebench/construct_synthetic_dataset.py",
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
             "--test_case=build_passkey",
             "--test_level=4",
         ]
@@ -4342,7 +4343,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
 
         print("Run eval...")
         eval_cmd = [
-            f"{llama_example_root}/../eval_long_context.py",
+            f"{llama_example_root}/../../../eval_long_context.py",
             "--task=passkey",
             f"--engine_dir={engine_dir}",
             f"--tokenizer_dir={llama_model_root}",
@@ -4408,7 +4409,7 @@ def test_llm_llama_v2_1gpu_low_latency_gemm(llama_example_root,
 
     print("Run Summarization test")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py", "--test_trt_llm",
+        f"{llama_example_root}/../../../summarize.py", "--test_trt_llm",
         "--hf_model_dir", f"{llama_model_root}", "--data_type", "fp16",
         f"--engine_dir={engine_dir}", "--check_accuracy", "--max_ite=40",
         f"--dataset_dir={llm_datasets_root}"
@@ -4644,7 +4645,7 @@ def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=50",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",

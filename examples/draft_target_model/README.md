@@ -25,7 +25,7 @@ We provide two styles of running DTM now: using TensorRT-LLM-BLS in Triton Infer
 + `--max_batch_size` more than 1 is acceptable in general usage, but we use 1 in this example.
 
 ```bash
-cd examples/llama
+cd examples/models/core/llama
 export DRAFT_CKPT_PATH=/workspace/ckpt-draft
 export TARGET_CKPT_PATH=/workspace/ckpt-target
 export DRAFT_ENGINE_PATH=/workspace/engine-draft

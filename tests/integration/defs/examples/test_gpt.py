@@ -102,7 +102,7 @@ def test_streaming_beam(gpt_example_root, llm_venv, llm_gpt2_model_root,
     print("Running inference...")
 
     streaming_command = [
-        f"{gpt_example_root}/../run.py", "--no_add_special_tokens",
+        f"{gpt_example_root}/../../../run.py", "--no_add_special_tokens",
         f"--max_output_len={output_len}", f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llm_gpt2_model_root}", f"--streaming",
         f"--streaming_interval=1", f"--num_beams={num_beams}", f"--input_text",
@@ -115,7 +115,7 @@ def test_streaming_beam(gpt_example_root, llm_venv, llm_gpt2_model_root,
     joined_nonstreamed_outputs = ""
     for length_iterator in range(1, output_len + 1):
         command = [
-            f"{gpt_example_root}/../run.py", "--no_add_special_tokens",
+            f"{gpt_example_root}/../../../run.py", "--no_add_special_tokens",
             f"--max_output_len={length_iterator}", f"--engine_dir={engine_dir}",
             f"--tokenizer_dir={llm_gpt2_model_root}",
             f"--num_beams={num_beams}", f"--input_text", *input_text
@@ -216,7 +216,7 @@ def test_llm_gpt2_kv_cache_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
     print("Running inference...")
 
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../summarize.py",
+        f"{gpt_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
         "--test_hf",
         "--batch_size=1",
@@ -229,7 +229,7 @@ def test_llm_gpt2_kv_cache_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
     ])
 
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../summarize.py",
+        f"{gpt_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
         "--test_hf",
         "--batch_size=1",
@@ -287,11 +287,12 @@ def test_llm_gpt2_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
 
     print("Running inference...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../summarize.py", f"--engine_dir={engine_dir}",
-        "--test_hf", "--batch_size=1", "--test_trt_llm",
-        f"--hf_model_dir={llm_gpt2_model_root}", "--check_accuracy",
-        "--tensorrt_llm_rouge1_threshold=13.5", "--no_add_special_tokens",
-        f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
+        f"{gpt_example_root}/../../../summarize.py",
+        f"--engine_dir={engine_dir}", "--test_hf", "--batch_size=1",
+        "--test_trt_llm", f"--hf_model_dir={llm_gpt2_model_root}",
+        "--check_accuracy", "--tensorrt_llm_rouge1_threshold=13.5",
+        "--no_add_special_tokens", f"--dataset_dir={llm_datasets_root}",
+        f"--rouge_dir={llm_rouge_root}"
     ])
 
     if not use_gemm_plugin:
@@ -343,7 +344,7 @@ def test_llm_gpt2_medium_1gpu(gpt_example_root, llm_venv,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llm_gpt2_medium_model_root}",
         "--no_add_special_tokens"
@@ -423,7 +424,7 @@ def test_llm_gpt2_medium_bad_words_1gpu(gpt_example_root, llm_venv,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llm_gpt2_medium_model_root}",
         "--no_add_special_tokens"
@@ -495,7 +496,7 @@ def test_llm_gpt2_medium_stop_words_1gpu(gpt_example_root, llm_venv,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}",
         f"--tokenizer_dir={llm_gpt2_medium_model_root}",
         "--no_add_special_tokens"
@@ -545,7 +546,7 @@ def test_llm_gpt3_175b_2layers_1node_8gpus(gpt_example_root, llm_venv,
     "Build & run GPT-3 175B: 2 layer w/ plugins, regression test for issues #20"
     dtype = 'float16'
     convert_cmd = [
-        f"{gpt_example_root}/../generate_checkpoint_config.py",
+        f"{gpt_example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=2", "--num_attention_heads=96",
@@ -580,7 +581,7 @@ def test_llm_gpt3_175b_2layers_1node_8gpus(gpt_example_root, llm_venv,
     venv_mpi_check_call(
         llm_venv,
         ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "8"], [
-            f"{gpt_example_root}/../run.py", "--max_output_len=8",
+            f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
             f"--engine_dir={engine_dir}", "--no_add_special_tokens"
         ])
 
@@ -596,7 +597,7 @@ def test_llm_gpt3_175b_96layers_build_only(gpt_example_root, llm_venv,
     "Build GPT-3 175B: 96 layer w/ plugins"
     dtype = 'float16'
     convert_cmd = [
-        f"{gpt_example_root}/../generate_checkpoint_config.py",
+        f"{gpt_example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -646,7 +647,7 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
     "Build & Run GPT-3 175B: 96 layer w/ plugins"
     dtype = 'float16'
     convert_cmd = [
-        f"{gpt_example_root}/../generate_checkpoint_config.py",
+        f"{gpt_example_root}/../../../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=96", "--num_attention_heads=96",
@@ -688,7 +689,7 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
     venv_mpi_check_call(
         llm_venv,
         ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "8"], [
-            f"{gpt_example_root}/../run.py", "--max_output_len=8",
+            f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
             f"--engine_dir={engine_dir}", "--no_add_special_tokens"
         ])
 
@@ -731,7 +732,7 @@ def test_llm_gpt2_smooth_single_gpu_summary(gpt_example_root, llm_venv,
 
     print("Running inference...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}", f"--tokenizer_dir={llm_gpt2_model_root}",
         "--no_add_special_tokens"
     ])
@@ -768,7 +769,7 @@ def test_llm_gpt2_int8_kv_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
 
     print("Running inference...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}", f"--tokenizer_dir={llm_gpt2_model_root}",
         "--no_add_special_tokens"
     ])
@@ -785,7 +786,7 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
     ckpt_dir = f"{cmodel_dir}/gpt2-medium/fp8/1-gpu"
 
     quantize_cmd = [
-        f"{gpt_example_root}/../quantization/quantize.py",
+        f"{gpt_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_gpt2_medium_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
@@ -812,7 +813,8 @@ def test_llm_gpt2_medium_fp8(gpt_example_root, llm_gpt2_medium_model_root,
     print('Run engines...')
     rouge1_threshold = 17.2 if quant_lm_head else 17.4
     summary_cmd = [
-        f"{gpt_example_root}/../summarize.py", f"--engine_dir={engine_dir}",
+        f"{gpt_example_root}/../../../summarize.py",
+        f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_gpt2_medium_model_root}", "--test_trt_llm",
         "--check_accuracy",
         f"--tensorrt_llm_rouge1_threshold={rouge1_threshold}",
@@ -838,7 +840,7 @@ def test_starcoder_fp8_quantization_2gpu(gpt_example_root,
     tp_size, pp_size = 2, 1
     world_size = tp_size * pp_size
     quantize_cmd = [
-        f"{gpt_example_root}/../quantization/quantize.py",
+        f"{gpt_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_gpt2_starcoder_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
@@ -866,7 +868,8 @@ def test_starcoder_fp8_quantization_2gpu(gpt_example_root,
 
     print('Run engines...')
     summary_cmd = [
-        f"{gpt_example_root}/../summarize.py", f"--engine_dir={engine_dir}",
+        f"{gpt_example_root}/../../../summarize.py",
+        f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_gpt2_starcoder_model_root}", "--test_trt_llm",
         "--check_accuracy", "--tensorrt_llm_rouge1_threshold=17.5",
         f"--dataset_dir={llm_datasets_root}", f"--rouge_dir={llm_rouge_root}"
@@ -903,7 +906,7 @@ def test_llm_gpt2_next_1gpu(gpt_example_root, llm_venv,
 
     print("Running inference...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../run.py", "--max_output_len=8",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
         f"--engine_dir={engine_dir}",
         f"--vocab_file={ckpt_dir}/tokenizer.model", "--no_add_special_tokens"
     ])
@@ -1005,7 +1008,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
 
     # test model without p-tuning dict
     run_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--no_add_special_tokens",
         "--max_output_len=10",
         f"--engine_dir={engine_dir}",
@@ -1025,7 +1028,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
 
     # test p-tuning task separately
     run_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--no_add_special_tokens",
         "--max_output_len=10",
         f"--engine_dir={engine_dir}",
@@ -1047,7 +1050,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         for ref in inference_params["squad"]["outputs"]), "incorrect output"
 
     run_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--no_add_special_tokens",
         "--max_output_len=10",
         f"--engine_dir={engine_dir}",
@@ -1070,7 +1073,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
 
     # test batched p-tuning tasks
     run_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--no_add_special_tokens",
         "--max_output_len=10",
         f"--engine_dir={engine_dir}",
@@ -1106,7 +1109,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
 
     if not use_py_session and tensor_parallel == 1:
         run_cmd = [
-            f"{gpt_example_root}/../run.py",
+            f"{gpt_example_root}/../../../run.py",
             "--no_add_special_tokens",
             "--max_output_len=10",
             f"--engine_dir={engine_dir}",
@@ -1189,7 +1192,7 @@ def test_llm_gpt2_medium_1node_4gpus(gpt_example_root,
 
     print("Run engines...")
     summary_cmd = [
-        f"{gpt_example_root}/../summarize.py", "--test_trt_llm",
+        f"{gpt_example_root}/../../../summarize.py", "--test_trt_llm",
         f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_gpt2_medium_model_root}", "--check_accuracy",
         "--tensorrt_llm_rouge1_threshold=19",
@@ -1261,7 +1264,7 @@ def test_llm_gpt2_santacoder_1node_4gpus(gpt_example_root,
     venv_mpi_check_call(
         llm_venv,
         ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "4"], [
-            f"{gpt_example_root}/../run.py", "--max_output_len=20",
+            f"{gpt_example_root}/../../../run.py", "--max_output_len=20",
             f"--engine_dir={engine_dir}", "--tokenizer_dir",
             llm_gpt2_santacoder_model_root, "--input_text",
             "def print_hello_world():", "--no_add_special_tokens"
@@ -1330,7 +1333,7 @@ def test_llm_gpt2_starcoder_1node_4gpus(gpt_example_root,
     venv_mpi_check_call(
         llm_venv,
         ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "4"], [
-            f"{gpt_example_root}/../run.py",
+            f"{gpt_example_root}/../../../run.py",
             "--max_output_len=20",
             f"--engine_dir={engine_dir}",
             "--tokenizer_dir",
@@ -1391,7 +1394,7 @@ def test_llm_gpt2_starcoder_1gpus(gpt_example_root,
 
     print('Run gpt2-starcoder...')
     summary_cmd = [
-        f"{gpt_example_root}/../run.py", "--max_output_len=20",
+        f"{gpt_example_root}/../../../run.py", "--max_output_len=20",
         f"--engine_dir={engine_dir}", "--tokenizer_dir",
         llm_gpt2_starcoder_model_root, "--input_text",
         "def print_hello_world():", "--no_add_special_tokens"
@@ -1440,7 +1443,7 @@ def test_llm_gpt2_starcoder_weight_only(gpt_example_root,
 
     print('Run gpt2-starcoder...')
     summary_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--engine_dir={engine_dir}",
         "--tokenizer_dir",
@@ -1507,7 +1510,7 @@ def test_llm_gpt2_starcoder2(gpt_example_root, llm_gpt2_starcoder2_model_root,
             "mpirun", "--allow-run-as-root", "--oversubscribe", "-np",
             str(tensor_parallel)
         ]), [
-            f"{gpt_example_root}/../summarize.py", "--batch_size=1",
+            f"{gpt_example_root}/../../../summarize.py", "--batch_size=1",
             f"--engine_dir={engine_dir}", "--test_trt_llm", "--check_accuracy",
             "--eval_task=code_completion",
             f"--hf_model_dir={llm_gpt2_starcoder2_model_root}",
@@ -1532,7 +1535,7 @@ def test_llm_minitron(gpt_example_root, minitron_model_root, llm_datasets_root,
         ckpt_dir = f"{cmodel_dir}/minitron/fp8/1-gpu"
 
         quantize_cmd = [
-            f"{gpt_example_root}/../quantization/quantize.py",
+            f"{gpt_example_root}/../../../quantization/quantize.py",
             f"--model_dir={minitron_model_root}",
             f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
             f"--dtype={dtype}",
@@ -1572,7 +1575,7 @@ def test_llm_minitron(gpt_example_root, minitron_model_root, llm_datasets_root,
         llm_venv,
         parse_mpi_cmd(
             ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "1"]), [
-                f"{gpt_example_root}/../summarize.py", "--batch_size=1",
+                f"{gpt_example_root}/../../../summarize.py", "--batch_size=1",
                 f"--engine_dir={engine_dir}", "--test_trt_llm",
                 "--check_accuracy", "--eval_task", "code_completion",
                 "--hf_model_dir", minitron_model_root,
@@ -1621,7 +1624,7 @@ def test_llm_gpt2_parallel_embedding_2gpu(gpt_example_root, llm_venv,
     venv_mpi_check_call(llm_venv, [
         "mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "2"
     ], [
-        f"{gpt_example_root}/../summarize.py", "--batch_size=8",
+        f"{gpt_example_root}/../../../summarize.py", "--batch_size=8",
         "--test_trt_llm", "--check_accuracy",
         "--tensorrt_llm_rouge1_threshold=13.5", f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_gpt2_model_root}", "--no_add_special_tokens",
@@ -1672,7 +1675,7 @@ def test_llm_gpt2_multi_lora_1gpu(gpt_example_root, llm_venv,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
     run_cmd = [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
         "--use_py_session",
         f"--vocab_file={ckpt_dir}/tokenizer.model",
@@ -1862,7 +1865,7 @@ def test_llm_gpt_starcoder_lora_1gpu(data_type, lora_data_type,
 
     print(f"Run inference with lora id 0...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -1881,7 +1884,7 @@ def test_llm_gpt_starcoder_lora_1gpu(data_type, lora_data_type,
 
     print(f"Run inference with lora id -1...")
     venv_check_call(llm_venv, [
-        f"{gpt_example_root}/../run.py",
+        f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -1911,7 +1914,7 @@ def test_llm_starcoder2_sqootb_single_gpu(gpt_example_root, llm_venv,
     ckpt_dir = f"{cmodel_dir}/starcoder2/int8_sq/1-gpu"
 
     quantize_cmd = [
-        f"{gpt_example_root}/../quantization/quantize.py",
+        f"{gpt_example_root}/../../../quantization/quantize.py",
         f"--model_dir={llm_gpt2_starcoder_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
@@ -1937,7 +1940,7 @@ def test_llm_starcoder2_sqootb_single_gpu(gpt_example_root, llm_venv,
         llm_venv,
         parse_mpi_cmd(
             ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "1"]), [
-                f"{gpt_example_root}/../summarize.py", "--batch_size=1",
+                f"{gpt_example_root}/../../../summarize.py", "--batch_size=1",
                 f"--engine_dir={engine_dir}", "--test_trt_llm",
                 "--check_accuracy", "--eval_task", "code_completion",
                 f"--hf_model_dir={llm_gpt2_starcoder_model_root}",
@@ -1964,7 +1967,7 @@ def test_llm_minitron_fp8_with_pseudo_loras(gpt_example_root,
     ckpt_dir = f"{cmodel_dir}/minitron/fp8/1-gpu"
 
     quantize_cmd = [
-        f"{gpt_example_root}/../quantization/quantize.py",
+        f"{gpt_example_root}/../../../quantization/quantize.py",
         f"--model_dir={minitron_model_root}",
         f"--calib_dataset={llm_datasets_root}/cnn_dailymail",
         f"--dtype={dtype}",
