@@ -51,6 +51,7 @@ class PyTorchConfig:
     moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
+    moe_backend: str = 'CUTLASS'
     # If true, will iterate over sampling_params of each request and use the
     # corresponding decoding way, like top-k, top-p, etc.
     mixed_decoder: bool = False

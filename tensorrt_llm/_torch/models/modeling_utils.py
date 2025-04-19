@@ -1,5 +1,4 @@
 import contextlib
-import fnmatch
 import math
 import time
 from dataclasses import dataclass
@@ -419,13 +418,9 @@ class DecoderModelForCausalLM(nn.Module,
         quant_config = self.model_config.quant_config
         if quant_config is not None:
             if quant_config.exclude_modules is not None:
-                exclude_modules = quant_config.exclude_modules
                 for name, module in self.named_modules():
-                    is_excluded = False
-                    for exclude_module in exclude_modules:
-                        if fnmatch.fnmatchcase(name, exclude_module):
-                            is_excluded = True
-                            break
+                    is_excluded = quant_config.is_module_excluded_from_quantization(
+                        name)
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = None
