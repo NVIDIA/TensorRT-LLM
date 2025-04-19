@@ -106,6 +106,7 @@ EOF
 ```bash
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
   --extra_llm_api_options ./extra-llm-api-config.yml \
   mmlu
 ```
@@ -114,6 +115,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ```bash
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
   --extra_llm_api_options ./extra-llm-api-config.yml \
   gsm8k
 ```
@@ -124,6 +126,7 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
   --extra_llm_api_options ./extra-llm-api-config.yml \
   gpqa_diamond \
   --apply_chat_template
