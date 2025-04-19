@@ -38,11 +38,6 @@ from utils.util import getSMVersion
     [torch.float16, torch.float32, torch.bfloat16],
 )
 def test_fp8_scaled_mm(output_dtype, m, k_n):
-    pytest.skip("https://nvbugspro.nvidia.com/bug/5228279")
-    # Skip specific problematic case
-    if m == 228 and k_n == (28672, 8192):
-        pytest.skip("Skipping problematic case with m=228, k=28672, n=8192")
-
     k, n = k_n
     torch.random.manual_seed(0)
     shape_x = (m, k)
@@ -60,8 +55,10 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         out_dtype=output_dtype,
     )
     # set pytorch's cublas workspace size to 32MB to be aligned with trtllm
+    # if anywhere else calls torch's cublas op, the static workspace size will
+    # be fixed to 1MB.
     old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")
-    os.environ["CUBLASLT_WORKSPACE_SIZE"] = f"{32*1024*1024}"
+    os.environ["CUBLASLT_WORKSPACE_SIZE"] = f"{32*1024}"
     ref = torch._scaled_mm(
         x,
         w.t(),
