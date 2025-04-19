@@ -88,7 +88,7 @@ class Attention(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.o_proj = Linear(
             self.hidden_size,
@@ -98,7 +98,7 @@ class Attention(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -130,10 +130,6 @@ class Attention(nn.Module):
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
-        if not config.skip_create_weights:
-            self.create_weights()
-
-    def create_weights(self):
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -143,6 +139,14 @@ class Attention(nn.Module):
             pos_embd_params=self.pos_embd_params,
             quant_config=self.quant_config,
         )
+
+        if not config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def create_weights(self):
+        # self.attn has no weights but has states that are related to quant_config,
+        # which could be modified after __init__
+        self.attn.set_up_quant_states()
 
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
@@ -233,6 +237,7 @@ class MLA(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.dtype = dtype
 
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
@@ -287,7 +292,7 @@ class MLA(nn.Module):
 
         rms_norm_eps = config.pretrained_config.rms_norm_eps
         quant_config = config.get_quant_config()
-        quant_mode = quant_config.quant_mode
+        self.quant_config = quant_config
 
         if not self.is_lite:
             self.fused_a = Linear(
@@ -296,7 +301,7 @@ class MLA(nn.Module):
                 bias=bias,
                 dtype=dtype,
                 quant_config=quant_config,
-                skip_create_weights=config.skip_create_weights,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
@@ -311,7 +316,7 @@ class MLA(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
-                skip_create_weights=config.skip_create_weights)
+                skip_create_weights_in_init=config.skip_create_weights_in_init)
         else:
             self.fused_a = Linear(
                 hidden_size,
@@ -319,7 +324,7 @@ class MLA(nn.Module):
                 bias=bias,
                 dtype=dtype,
                 quant_config=quant_config,
-                skip_create_weights=config.skip_create_weights,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True)
 
             self.q_proj = Linear(
@@ -330,7 +335,7 @@ class MLA(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 quant_config=quant_config,
-                skip_create_weights=config.skip_create_weights,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
             )
             self.q_b_proj = self.q_proj
 
@@ -338,20 +343,16 @@ class MLA(nn.Module):
                                       dtype=dtype,
                                       eps=rms_norm_eps)
 
-        if quant_mode.has_fp8_block_scales():
-            mla_weight_dtype = torch.float8_e4m3fn
-        else:
-            mla_weight_dtype = dtype
-
-        self.kv_b_proj = Linear(self.kv_lora_rank,
-                                tp_size * self.num_heads *
-                                (self.qk_nope_head_dim + self.v_head_dim),
-                                bias=bias,
-                                dtype=dtype,
-                                mapping=mapping,
-                                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                                quant_config=quant_config,
-                                skip_create_weights=config.skip_create_weights)
+        self.kv_b_proj = Linear(
+            self.kv_lora_rank,
+            tp_size * self.num_heads *
+            (self.qk_nope_head_dim + self.v_head_dim),
+            bias=bias,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=quant_config,
+            skip_create_weights_in_init=config.skip_create_weights_in_init)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         self.v_b_proj = nn.Parameter(
@@ -362,43 +363,6 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        self.k_b_proj_trans = nn.Parameter(
-            torch.empty(
-                (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
-                dtype=mla_weight_dtype,
-            ),
-            requires_grad=False,
-        )
-
-        if quant_mode.has_fp8_block_scales():
-            self.k_b_proj_trans_scale = nn.Parameter(
-                torch.empty(
-                    (
-                        self.num_heads,
-                        self.kv_lora_rank // 128,
-                        self.qk_nope_head_dim // 128,
-                    ),
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            # This parameter will view into self.kv_b_proj.weight_scale after loading weights.
-            # For dummy weight initialization, this parameter is initialized with empty tensor.
-            self.v_b_proj_scale = nn.Parameter(
-                torch.empty(
-                    (
-                        self.num_heads,
-                        self.v_head_dim // 128,
-                        self.kv_lora_rank // 128,
-                    ),
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.k_b_proj_trans_scale = None
-            self.v_b_proj_scale = None
-
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim * tp_size,
             self.hidden_size,
@@ -407,7 +371,7 @@ class MLA(nn.Module):
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=quant_config,
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
         def yarn_get_mscale(scale=1, mscale=1):
@@ -470,6 +434,56 @@ class MLA(nn.Module):
                 head_dim=self.qk_rope_head_dim,
                 is_neox=pos_embd_params.is_neox,
             )
+
+        if not config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def create_weights(self):
+        # self.attn has no weights but has states that are related to quant_config,
+        # which could be modified after __init__
+        self.mha.set_up_quant_states()
+        self.mqa.set_up_quant_states()
+
+        has_fp8_block_scales = self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
+        )
+
+        mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
+        self.k_b_proj_trans = nn.Parameter(
+            torch.empty(
+                (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
+                dtype=mla_weight_dtype,
+            ),
+            requires_grad=False,
+        )
+
+        if has_fp8_block_scales:
+            self.k_b_proj_trans_scale = nn.Parameter(
+                torch.empty(
+                    (
+                        self.num_heads,
+                        self.kv_lora_rank // 128,
+                        self.qk_nope_head_dim // 128,
+                    ),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            # This parameter will view into self.kv_b_proj.weight_scale after loading weights.
+            # For dummy weight initialization, this parameter is initialized with empty tensor.
+            self.v_b_proj_scale = nn.Parameter(
+                torch.empty(
+                    (
+                        self.num_heads,
+                        self.v_head_dim // 128,
+                        self.kv_lora_rank // 128,
+                    ),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+        else:
+            self.k_b_proj_trans_scale = None
+            self.v_b_proj_scale = None
 
     def apply_rope(
         self,

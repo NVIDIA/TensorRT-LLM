@@ -41,7 +41,7 @@ def _create_linear_from_configs(model_config: ModelConfig[PretrainedConfig],
         tensor_parallel_mode=TensorParallelMode.COLUMN,
         gather_output=True,
         quant_config=model_config.get_quant_config(),
-        skip_create_weights=model_config.skip_create_weights,
+        skip_create_weights_in_init=model_config.skip_create_weights_in_init,
     )
 
 

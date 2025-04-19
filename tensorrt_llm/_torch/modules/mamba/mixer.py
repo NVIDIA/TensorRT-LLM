@@ -93,7 +93,7 @@ class MambaMixer(nn.Module):
             mapping=self.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             quant_config=config.get_quant_config(),
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
         # A
