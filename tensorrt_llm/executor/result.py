@@ -241,10 +241,11 @@ class GenerationResultBase:
     @nvtx_range_debug("handle_response",
                       color="red",
                       category="GenerationResultBase")
-    def _handle_response(self, response: Union["PostprocWorker.Output",
-                                               tllm.Response, ErrorResponse],
-                               additional_outputs: Optional[AdditionalOutputs] = None):
-
+    def _handle_response(
+            self,
+            response: Union["PostprocWorker.Output", tllm.Response,
+                            ErrorResponse],
+            additional_outputs: Optional[AdditionalOutputs] = None):
         if isinstance(response, PostprocWorker.Output):
             self._done = response.is_final
             if isinstance(response.res, CompletionOutput):
@@ -288,7 +289,6 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            # TODO: handle beam
             if additional_outputs is not None:
                 out = self._outputs[response_result.sequence_index]
                 out.prompt_logprobs = additional_outputs.prompt_logprobs
@@ -330,8 +330,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
     @nvtx_range_debug("handle_response",
                       color="red",
                       category="DetokenizedGenerationResultBase")
-    def _handle_response(self, response: "GenerationExecutor.Response", additional_outputs: Optional[AdditionalOutputs] = None,):
-        GenerationResultBase._handle_response(self, response, additional_outputs)
+    def _handle_response(
+        self,
+        response: "GenerationExecutor.Response",
+        additional_outputs: Optional[AdditionalOutputs] = None,
+    ):
+        GenerationResultBase._handle_response(self, response,
+                                              additional_outputs)
 
         # The postprocess has been performed, return directly
         if isinstance(response, PostprocWorker.Output):
@@ -377,11 +382,13 @@ class GenerationResult(GenerationResultBase):
     '''
 
     def __init__(
-            self,
-            generation_request: "GenerationRequest",
-            background_error_handler: Optional[Callable] = None,
-            executor: Optional["GenerationExecutor"] = None,
-            disaggregated_params: Optional[DisaggregatedParams] = None) -> None:
+        self,
+        generation_request: "GenerationRequest",
+        background_error_handler: Optional[Callable] = None,
+        executor: Optional["GenerationExecutor"] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        logprob_params: Optional[dict] = None,
+    ) -> None:
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
@@ -391,6 +398,8 @@ class GenerationResult(GenerationResultBase):
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
         self.disaggregated_params = disaggregated_params
+        # minimal sampling params needed for logprob calculation
+        self._logprob_params = logprob_params
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
@@ -423,6 +432,12 @@ class GenerationResult(GenerationResultBase):
     @property
     def finished(self) -> bool:
         return self._done
+
+    def clear_logprob_params(self):
+        # Remove temporary attribute used in executor
+        # for a cleaner external-facing output.
+        if hasattr(self, "_logprob_params"):
+            del self._logprob_params
 
     def _result_step(self, timeout: Optional[float] = None):
         response, additional_outputs = self.queue.get(timeout=timeout)

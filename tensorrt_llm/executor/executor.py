@@ -203,6 +203,23 @@ class GenerationExecutor(ABC):
         self._last_client_id = (self._last_client_id + 1) & ((1 << 64) - 1)
         return self._last_client_id
 
+    def _get_logprob_params(self, request: GenerationRequest) -> Optional[dict]:
+        """Store lobprobs-related fields from request for the later logprob calculation."""
+        logprob_params = None
+        if request.sampling_params.logprobs or request.sampling_params.prompt_logprobs:
+            logprob_params = {
+                "logprobs":
+                request.sampling_params.logprobs,
+                "prompt_logprobs":
+                request.sampling_params.prompt_logprobs,
+                "drop_context_logits":
+                not request.sampling_params._need_return_context_logits,
+                "drop_generation_logits":
+                not request.sampling_params._need_return_generation_logits
+            }
+
+        return logprob_params
+
     def _maybe_initialize_iteration_results(self):
         if self._is_llm_executor:
             if self._iter_stats_result is None:
