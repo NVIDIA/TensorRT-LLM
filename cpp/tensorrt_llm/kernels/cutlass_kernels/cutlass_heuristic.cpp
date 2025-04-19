@@ -401,6 +401,35 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
 
 } // namespace kernels
 
+std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::CandidateConfigTypeParam const config)
+{
+#ifdef FAST_BUILD
+    // Fast build disables all configs except this one for SM100
+    return {CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
+        MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+#else
+    if (config & CutlassGemmConfig::GROUPED_GEMM)
+    {
+        std::vector<CutlassGemmConfig> candidate_configs;
+        if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
+        {
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x256B,
+                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            return candidate_configs;
+        }
+        else
+        {
+            TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");
+        }
+    }
+    else
+    {
+        TLLM_THROW("Not Implemented: SM120 GEMM candidates have not been defined.");
+    }
+#endif
+
+} // namespace kernels
+
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
 {
@@ -417,6 +446,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     if (sm >= 100 && sm < 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
     {
         return get_candidate_configs_sm100(config_type_param);
+    }
+    if (sm == 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    {
+        return get_candidate_configs_sm120(config_type_param);
     }
 
     std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
