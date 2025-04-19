@@ -4250,7 +4250,7 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     mmlu_cmd = generate_mmlu_cmd(example_root=llama_example_root,
                                  data_dir=mmlu_dataset_root,
                                  engine_dir=engine_dir,
-                                 tokenizer_dir=llama_model_root,
+                                 hf_model_dir=llama_model_root,
                                  enable_chunked_prefill=True)
     venv_check_call(llm_venv, mmlu_cmd)
 
@@ -4362,7 +4362,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         mmlu_cmd = generate_mmlu_cmd(example_root=llama_example_root,
                                      data_dir=mmlu_dataset_root,
                                      engine_dir=engine_dir,
-                                     tokenizer_dir=llama_model_root,
+                                     hf_model_dir=llama_model_root,
                                      enable_chunked_prefill=True)
         venv_check_call(llm_venv, mmlu_cmd)
 
