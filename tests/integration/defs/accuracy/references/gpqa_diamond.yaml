@@ -1,0 +1,12 @@
+meta-llama/Llama-3.3-70B-Instruct:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 45.55
+  - quant_algo: FP8
+    accuracy: 48.03
+deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 70.45
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 70.06

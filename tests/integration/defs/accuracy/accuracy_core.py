@@ -261,6 +261,38 @@ class MMLU(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
+class GSM8K(AccuracyTask):
+    DATASET = "gsm8k"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
+
+    ALPHA = 0.02
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 1319  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+
+class GPQADiamond(AccuracyTask):
+    DATASET = "gpqa_diamond"
+    DATASET_DIR = f"{llm_models_root()}/datasets/gpqa"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 198  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 32768
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GPQADiamond
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"
     LEVEL = 3

@@ -20,7 +20,8 @@ import tensorrt_llm.profiler as profiler
 
 from .._torch.llm import LLM as PyTorchLLM
 from .._torch.pyexecutor.config import PyTorchConfig
-from ..evaluate import MMLU, CnnDailymail
+from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
+                        GPQAMain)
 from ..llmapi import LLM, BuildConfig, KvCacheConfig
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
@@ -142,6 +143,7 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
     profiler.stop("trtllm init")
     elapsed_time = profiler.elapsed_time_in_sec("trtllm init")
     logger.info(f"TRTLLM initialization time: {elapsed_time:.3f} seconds.")
+    profiler.reset("trtllm init")
 
     # Pass llm to subcommands
     ctx.obj = llm
@@ -149,6 +151,10 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
 
 main.add_command(CnnDailymail.command)
 main.add_command(MMLU.command)
+main.add_command(GSM8K.command)
+main.add_command(GPQADiamond.command)
+main.add_command(GPQAMain.command)
+main.add_command(GPQAExtended.command)
 
 if __name__ == "__main__":
     main()

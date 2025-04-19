@@ -88,22 +88,48 @@ python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MT
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
 
-### Run evaluation on GPQA dataset
-Download the dataset first
-1. Sign up a huggingface account and request the access to the gpqa dataset: https://huggingface.co/datasets/Idavidrein/gpqa
-2. Download the csv file from https://huggingface.co/datasets/Idavidrein/gpqa/blob/main/gpqa_diamond.csv
+## Evaluation
 
-Evaluate on GPQA dataset.
+Evaluate the model accuracy using `trtllm-eval`.
+
+1. (Optional) Prepare an advanced configuration file:
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+pytorch_backend_config:
+    use_cuda_graph: true
+    enable_overlap_scheduler: true
+enable_attention_dp: true
+EOF
 ```
-python examples/gpqa_llmapi.py \
-  --hf_model_dir <YOUR_MODEL_DIR> \
-  --data_dir <DATASET_PATH> \
+
+2. Evaluate accuracy on the [MMLU](https://people.eecs.berkeley.edu/~hendrycks/data.tar) dataset:
+```bash
+trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
-  --use_cuda_graph \
-  --enable_overlap_scheduler \
-  --concurrency 32 \
-  --batch_size 32 \
-  --max_num_tokens 4096
+  --kv_cache_free_gpu_memory_fraction 0.8 \
+  --extra_llm_api_options ./extra-llm-api-config.yml \
+  mmlu
+```
+
+3. Evaluate accuracy on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset:
+```bash
+trtllm-eval --model  <YOUR_MODEL_DIR> \
+  --tp_size 8 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
+  --extra_llm_api_options ./extra-llm-api-config.yml \
+  gsm8k
+```
+
+4. Evaluate accuracy on the [GPQA](https://huggingface.co/datasets/Idavidrein/gpqa) dataset:
+```bash
+# Ensure signing up a huggingface account with access to the GPQA dataset
+
+trtllm-eval --model  <YOUR_MODEL_DIR> \
+  --tp_size 8 \
+  --kv_cache_free_gpu_memory_fraction 0.8 \
+  --extra_llm_api_options ./extra-llm-api-config.yml \
+  gpqa_diamond \
+  --apply_chat_template
 ```
 
 ## Serving

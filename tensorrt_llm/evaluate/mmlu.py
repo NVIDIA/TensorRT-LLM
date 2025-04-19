@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-import random
 from typing import Iterable, List, Optional, Union
 
 import click
@@ -110,12 +109,13 @@ class MMLU(Evaluator):
 
     def __init__(self,
                  dataset_path: str,
-                 num_samples: int = None,
+                 num_samples: Optional[int] = None,
                  num_train: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
-        super().__init__(apply_chat_template=apply_chat_template,
+        super().__init__(random_seed=random_seed,
+                         apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
         self.dataset_path = dataset_path
         if num_samples is None:
@@ -124,8 +124,6 @@ class MMLU(Evaluator):
             self.num_samples_per_subject = math.ceil(
                 num_samples / len(self.SUBJECT_TO_SUBCATEGORIES))
         self.num_train = num_train
-        random.seed(random_seed)
-        np.random.seed(random_seed)
 
     def format_subject(self, subject):
         line = subject.split("_")
@@ -227,15 +225,16 @@ class MMLU(Evaluator):
     @click.option("--num_samples", type=int, default=None)
     @click.option("--num_train", type=int, default=5)
     @click.option("--random_seed", type=int, default=0)
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=4094)
     @click.option("--max_output_length", type=int, default=2)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=30)
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, num_train: int,
-                random_seed: int, max_input_length: int, max_output_length: int,
-                check_accuracy: bool, accuracy_threshold: float) -> None:
+                random_seed: int, apply_chat_template: bool,
+                system_prompt: Optional[str], max_input_length: int,
+                max_output_length: int) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -243,9 +242,8 @@ class MMLU(Evaluator):
         evaluator = MMLU(dataset_path,
                          num_samples=num_samples,
                          num_train=num_train,
-                         random_seed=random_seed)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+                         random_seed=random_seed,
+                         apply_chat_template=apply_chat_template,
+                         system_prompt=system_prompt)
+        evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
-
-        if check_accuracy:
-            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
