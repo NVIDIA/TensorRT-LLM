@@ -9,4 +9,4 @@ deepseek-ai/DeepSeek-R1:
     accuracy: 70.45
   - quant_algo: NVFP4
     spec_dec_algo: MTP
-    accuracy: 0
+    accuracy: 70.06
