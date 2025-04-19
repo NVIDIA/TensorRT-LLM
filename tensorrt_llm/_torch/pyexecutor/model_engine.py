@@ -217,58 +217,6 @@ KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
 
 
-class NGRAMDrafterEngine(ModelEngine):
-    def __init__(
-        self,
-        batch_size: int = 8,
-        max_num_tokens: int = 8192,
-        max_seq_len: Optional[int] = None,
-        mapping: Optional[Mapping] = None,
-        spec_config: Optional[SpecConfig] = None,
-    ):
-        self.batch_size = batch_size
-        self.max_num_tokens = max_num_tokens
-        self.max_seq_len = max_seq_len
-        self.mapping = mapping
-        self.spec_config = spec_config
-
-        self.pld_pool = PLDPool(
-            input_batch_size = self.batch_size,
-            prompt_lookup_num_tokens = spec_config.prompt_lookup_num_tokens,
-            max_matching_ngram_size = spec_config.max_matching_ngram_size,
-            end_id = spec_config.end_id,
-            max_seq_len = spec_config.max_seq_len,
-            is_keep_all = spec_config.is_keep_all,
-            is_use_oldest = spec_config.is_use_oldest
-        )
-
-    def get_max_num_sequences(self) -> int:
-        """
-        Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
-        """
-        num_batches = self.mapping.pp_size if self.mapping.has_pp() else 1
-        return num_batches * self.batch_size
-
-    @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
-    def forward(self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: ResourceManager,
-        new_tensors_device: Optional[Dict[str, torch.Tensor]] = None,
-        extra_model_inputs: Optional[Dict[str, Any]] = None,
-        is_dummy_forward: bool = False
-    ):
-        # loop over requests
-        #     find matching ngram using PLDPool
-        #     return matching ngram
-        prefix = []
-        batch_slot = []
-        for scheduled_request in scheduled_requests:
-            prefix.append(scheduled_request.prompt) # don't know if prompt is correct field
-            batch_slot.append(scheduled_request.batch_slot_id)
-        return get_draft_tokens(prefix, batch_slot)
-
-
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(

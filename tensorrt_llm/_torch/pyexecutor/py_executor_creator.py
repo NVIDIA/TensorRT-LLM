@@ -58,7 +58,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     dist = MPIDist(mapping=mapping)
 
     spec_config = executor_config.speculative_config
-    has_draft_model_engine = isinstance(spec_config, Eagle3Config) or isinstance(spec_config, NGRAMConfig)
+    has_draft_model_engine = isinstance(spec_config, Eagle3Config)
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
@@ -80,27 +80,18 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     draft_model_engine = None
     if has_draft_model_engine:
-        if isinstance(spec_config, NGRAMConfig):
-            draft_model_engine = NGRAMDrafterEngine(
-                batch_size=executor_config.max_batch_size,
-                max_num_tokens=executor_config.max_num_tokens,
-                max_seq_len=executor_config.max_seq_len,
-                mapping=mapping,
-                spec_config=copy.copy(spec_config),
-            )
-        else:
-            draft_model_engine = PyTorchModelEngine(
-                spec_config.eagle_weights_path,
-                pytorch_backend_config,
-                batch_size=executor_config.max_batch_size,
-                max_num_tokens=executor_config.max_num_tokens,
-                max_seq_len=executor_config.max_seq_len,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=copy.copy(spec_config),
-            )
-            draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+        draft_model_engine = PyTorchModelEngine(
+            spec_config.eagle_weights_path,
+            pytorch_backend_config,
+            batch_size=executor_config.max_batch_size,
+            max_num_tokens=executor_config.max_num_tokens,
+            max_seq_len=executor_config.max_seq_len,
+            mapping=mapping,
+            attn_runtime_features=attn_runtime_features,
+            dist=dist,
+            spec_config=copy.copy(spec_config),
+        )
+        draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
 
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
@@ -113,6 +104,18 @@ def create_py_executor(executor_config: ExecutorConfig,
     if spec_config is not None:
         max_seq_len += spec_config.num_extra_kv_tokens
         max_seq_len += spec_config.max_draft_tokens
+
+    pld_pool = None
+    if isinstance(spec_config, NGRAMConfig):
+        pld_pool = PLDPool(
+            input_batch_size=executor_config.max_batch_size,
+            prompt_lookup_num_tokens=spec_config.prompt_lookup_num_tokens,
+            max_matching_ngram_size=spec_config.max_matching_ngram_size,
+            end_id=???,
+            max_seq_len=max_seq_len,
+            is_keep_all=spec_config.is_keep_all,
+            is_use_oldest=spec_config.is_use_oldest,
+        )
 
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
@@ -164,7 +167,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False, lora_config)
+                                              pld_pool, False, lora_config)
 
     if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
@@ -195,7 +198,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, kv_cache_manager, draft_kv_cache_manager, mapping,
                 pytorch_backend_config, executor_config, ctx_chunk_config,
-                model_engine, draft_model_engine, True, lora_config)
+                model_engine, draft_model_engine, pld_pool, True, lora_config)
 
     py_executor.start_worker()
     return py_executor

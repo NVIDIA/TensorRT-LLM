@@ -164,6 +164,7 @@ class PyExecutor:
                  max_draft_tokens: int = 0,
                  kv_cache_transceiver: KvCacheTransceiver = None,
                  draft_model_engine: Optional[ModelEngine] = None,
+                 pld_pool: Optional[PLDPool] = None,
                  start_worker: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
@@ -186,6 +187,9 @@ class PyExecutor:
 
         # Draft model for certain spec decode algorithms, e.g. EAGLE3
         self.draft_model_engine = draft_model_engine
+
+        # ngram-based draft token generator
+        self.pld_pool = pld_pool
 
         # enqueue and _fetch_new_requests used data
         self.enqueue_lock = threading.Lock()
@@ -843,6 +847,8 @@ class PyExecutor:
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.draft_model_engine is not None:
                         self._prepare_draft_tokens(scheduled_batch)
+                    if self.pld_pool is not None:
+                        self._get_ngram_draft_tokens(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
@@ -1736,6 +1742,15 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
+
+    @nvtx_range("_get_ngram_draft_tokens")
+    def _get_ngram_draft_tokens(self, scheduled_requests: ScheduledRequests):
+        prefix, batch_slot = [], []
+        for generation_request in scheduled_requests.generation_requests:
+            prefix.append(
+
+    def get_draft_tokens(self, prefix: list[torch.Tensor],
+                         batch_slot: list[int]):
 
     @nvtx_range("_prepare_draft_tokens")
     def _prepare_draft_tokens(self, scheduled_requests: ScheduledRequests):

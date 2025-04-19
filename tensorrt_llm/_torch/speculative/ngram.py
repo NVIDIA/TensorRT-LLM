@@ -11,6 +11,13 @@ from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 @dataclass
 class NGRAMConfig(SpecConfig):
     spec_dec_name: str = "NGRAM"
+    prompt_lookup_num_tokens: int = 5
+    max_matching_ngram_size: int = 5
+    max_draft_len: int = 1024
+    prompt_lookup_num_tokens: int = 10
+    end_id: int = -1
+    is_keep_all: bool = True
+    is_use_oldest: bool = True
 
     def __post_init__(self):
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
@@ -24,6 +31,7 @@ class NGRAMConfig(SpecConfig):
 class NGRAMSpecMetadata(SpecMetadata):
     max_draft_tokens: int = 1024
     prompt_lookup_num_tokens: int = 10
+    max_matching_ngram_size: int = 5
     end_id: int = -1
     is_keep_all: bool = True
     is_use_oldest: bool = True

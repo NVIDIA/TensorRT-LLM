@@ -20,8 +20,8 @@ def get_spec_metadata(spec_config,
                                   num_layers=spec_config.num_layers)
     elif spec_config.spec_dec_mode.is_ngram():
         return NGRAMSpecMetaData(max_draft_tokens=spec_config.max_draft_tokens,
+                                 spec_dec_mode=spec_config.spec_dec_mode,
                                  prompt_lookup_num_tokens=spec_config.prompt_lookup_num_tokens,
-                                 end_id=spec_config.end_id,
                                  is_keep_all=spec_config.is_keep_all,
                                  is_use_oldest=spec_config.is_use_oldest)
     else:
