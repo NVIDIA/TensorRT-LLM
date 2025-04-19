@@ -97,6 +97,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
         "ep_size": params.get("ep"),
+        "cluster_size": params.get("cluster_size"),
     }
 
     if params.get("max_batch_size") and params.get("max_num_tokens"):

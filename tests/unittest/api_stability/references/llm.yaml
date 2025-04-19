@@ -14,6 +14,9 @@ methods:
       embedding_parallel_mode:
         annotation: str
         default: SHARDING_ALONG_VOCAB
+      moe_cluster_parallel_size:
+        annotation: Optional[int]
+        default: null
       # Engine building
       build_config:
         annotation: Optional[tensorrt_llm.builder.BuildConfig]
