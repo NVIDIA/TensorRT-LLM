@@ -1,3 +1,47 @@
+"""
+This transformation defines two main RoPE (Rotary Positional Embedding) pattern matchers used
+to identify and replace RoPE subgraphs with a custom op (`torch.ops.rope.flashinfer`).
+
+Supported RoPE variants:
+
+1. Explicit Cos/Sin Multiplication (HF-style, e.g., LLaMA, Mixtral, Qwen)
+   - Input layout: [B, N, S, D] (non-interleaved)
+   - Frequencies are provided as separate `cos` and `sin` tensors of shape [B, S, head_dim].
+   - Source code:
+       def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            cos = cos.unsqueeze(unsqueeze_dim)
+            sin = sin.unsqueeze(unsqueeze_dim)
+            q_embed = (q * cos) + (rotate_half(q) * sin)
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return q_embed, k_embed
+
+2. Complex Multiplication (GPTJ/LLaMA4-style, interleaved)
+   - Input layout: [B, S, N, D] or [B*S, N, D] (interleaved)
+   - Frequencies are combined into a single complex-valued tensor `freqs_cis` of shape [B, S, head_dim // 2].
+   - Source code:
+       def apply_rotary_emb(
+            xq: torch.Tensor,
+            xk: torch.Tensor,
+            freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2)
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+            xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+            xq_out = torch.view_as_real(xq_ * freqs_cis[:, :, None, :]).flatten(3)
+            xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
+            return xq_out.type_as(xq), xk_out.type_as(xk)
+
+TODO: Support Minor variants:
+- DeepSeekV3: reshape + transpose before applying RoPE.
+- DeepSeekV3: dynamic position-based updates to frequency cache.
+- Phi-4: rotary applied only to part of the hidden dimension (q_rot, q_pass split).
+- LLaMA4 Vision: 2D rotary frequencies constructed from image patches.
+"""
+
 import operator
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, List, Optional
@@ -10,7 +54,7 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
-def match_rope_v1(gm: GraphModule) -> GraphModule:
+def match_explicit_rope(gm: GraphModule) -> GraphModule:
     """
     Identify and replace legacy RoPE subgraphs (explicit cos/sin multiplication pattern):
 
@@ -30,7 +74,7 @@ def match_rope_v1(gm: GraphModule) -> GraphModule:
         node = start_boundary
         while node != end_boundary:
             if is_op(node, torch.ops.aten.add):
-                match_info = _match_rotary_subpattern_V1(node)
+                match_info = _match_explicit_rope_subpattern(node)
                 if match_info:
                     matches.append(match_info)
             node = node.next
@@ -47,7 +91,7 @@ def match_rope_v1(gm: GraphModule) -> GraphModule:
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_rope_v1(
+        _process_explicit_rope(
             graph,
             q_match,
             k_match,
@@ -60,7 +104,7 @@ def match_rope_v1(gm: GraphModule) -> GraphModule:
     return gm
 
 
-def match_rope_v2(gm: GraphModule) -> GraphModule:
+def match_complex_rope(gm: GraphModule) -> GraphModule:
     """
     Identify and replace RoPE subgraphs using complex multiplication pattern:
 
@@ -80,7 +124,7 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
         node = start_boundary
         while node != end_boundary:
             if is_op(node, torch.ops.aten.type_as):
-                match_info = _match_rotary_subpattern_V2(node)
+                match_info = _match_complex_rope_subpattern(node)
                 if match_info:
                     matches.append(match_info)
             node = node.next
@@ -97,7 +141,7 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_rope_v2(
+        _process_complex_rope(
             graph,
             q_match,
             k_match,
@@ -109,7 +153,7 @@ def match_rope_v2(gm: GraphModule) -> GraphModule:
     return gm
 
 
-def _match_rotary_subpattern_V1(add_node: Node) -> Optional[Dict[str, Node]]:
+def _match_explicit_rope_subpattern(add_node: Node) -> Optional[Dict[str, Node]]:
     """
     Given an aten.add.Tensor node that is expected to compute:
       output = (raw_input * unsqueeze(cos)) + (rotate_half(raw_input) * unsqueeze(sin))
@@ -195,7 +239,7 @@ def _match_rotary_subpattern_V1(add_node: Node) -> Optional[Dict[str, Node]]:
     }
 
 
-def _match_rotary_subpattern_V2(type_as_node: Node) -> Optional[Dict[str, Node]]:
+def _match_complex_rope_subpattern(type_as_node: Node) -> Optional[Dict[str, Node]]:
     """
     Given a type_as node, this function inspects the graph
     structure and returns a dictionary with:
@@ -276,7 +320,7 @@ def _match_rotary_subpattern_V2(type_as_node: Node) -> Optional[Dict[str, Node]]
     }
 
 
-def _process_rope_v1(
+def _process_explicit_rope(
     graph: GraphModule,
     q_match: Dict[str, Node],
     k_match: Dict[str, Node],
@@ -337,32 +381,40 @@ def _process_rope_v1(
         if need_transpose:
             q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
             k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_for_op_contig = graph.call_method("contiguous", (q_for_op,))
-            k_for_op_contig = graph.call_method("contiguous", (k_for_op,))
+            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
+            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
         else:
             q_for_op_contig, k_for_op_contig = q_node, k_node
 
         head_dim = cos_node.meta["val"].shape[-1]
         half_head_dim = head_dim // 2
 
-        cache = rope_flash_cache
-        cache_key = (cos_node, sin_node)
-        if cache_key in cache:
-            fused_cos_sin = cache[cache_key]
-        else:
+    cache = rope_flash_cache
+    cache_key = (cos_node, sin_node)
+    if cache_key in cache:
+        fused_cos_sin_to = cache[cache_key]
+    else:
+        with graph.inserting_after(cos_node):
             cos_prefix = graph.call_function(
                 torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
             )
+        with graph.inserting_after(sin_node):
             sin_prefix = graph.call_function(
                 torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
             )
+        with graph.inserting_after(sin_prefix):
             fused_cos_sin = graph.call_function(
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
-            fused_cos_sin = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
-            fused_cos_sin = graph.call_method("to", (fused_cos_sin, torch.float32))
-            cache[cache_key] = fused_cos_sin
+        with graph.inserting_after(fused_cos_sin):
+            fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+        with graph.inserting_after(fused_cos_sin_0):
+            fused_cos_sin_to = graph.call_function(
+                torch.ops.aten.to, args=(fused_cos_sin_0, torch.float32)
+            )
+        cache[cache_key] = fused_cos_sin_to
 
+    with graph.inserting_before(q_match["add_node"]):
         position_ids = _get_position_ids(
             graph,
             q_for_op_contig,
@@ -373,7 +425,7 @@ def _process_rope_v1(
 
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin, True),
+            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin_to, True),
         )
 
     with graph.inserting_after(flash_node):
@@ -395,7 +447,7 @@ def _process_rope_v1(
     k_match["add_node"].replace_all_uses_with(new_k)
 
 
-def _process_rope_v2(
+def _process_complex_rope(
     graph: GraphModule,
     q_match: Dict[str, Node],
     k_match: Dict[str, Node],
@@ -445,7 +497,9 @@ def _process_rope_v2(
         with graph.inserting_after(cos_sin_flash_3d):
             cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
         with graph.inserting_after(cos_sin_flash):
-            cos_sin_flash = graph.call_method("to", (cos_sin_flash, torch.float32))
+            cos_sin_flash = graph.call_function(
+                torch.ops.aten.to, args=(cos_sin_flash, torch.float32)
+            )
         cache[inv_freq_node] = cos_sin_flash
 
     with graph.inserting_before(q_match["out"]):
@@ -466,6 +520,42 @@ def _process_rope_v2(
 
     q_match["out"].replace_all_uses_with(raw_q)
     k_match["out"].replace_all_uses_with(raw_k)
+
+
+def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:
+    """
+    Validates that:
+    - The last dimension (head_dim) of both q and k is a multiple of 64.
+    - The dtype of q and k is half precision (bfloat16 or float16).
+    """
+    for name, node in [("q", q_node), ("k", k_node)]:
+        fake_val = node.meta.get("val", None)
+        if fake_val is None:
+            ad_logger.warning(
+                f"Meta['val'] for {name} not available; skipping RoPE transformation."
+            )
+            return False
+
+        # Check dtype
+        if fake_val.dtype not in (torch.float16, torch.bfloat16):
+            ad_logger.warning(
+                f"""{name} tensor is {fake_val.dtype},
+                expected half precision (float16 or bfloat16). Skipping RoPE transformation."""
+            )
+            return False
+
+        # Check head_dim
+        if len(fake_val.shape) < 1:
+            ad_logger.warning(f"{name} tensor has invalid shape {fake_val.shape}.")
+            return False
+        head_dim = fake_val.shape[-1]
+        if isinstance(head_dim, int) and head_dim % 64 != 0:
+            ad_logger.warning(
+                f"{name} head_dim = {head_dim} is not a multiple of 64. Skipping RoPE transformation."
+            )
+            return False
+
+    return True
 
 
 def _get_position_ids(
