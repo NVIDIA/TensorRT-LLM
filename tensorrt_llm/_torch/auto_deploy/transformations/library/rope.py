@@ -339,10 +339,6 @@ def _process_explicit_rope(
     cos_node = q_match["unsqueeze_cos"].args[0]
     sin_node = q_match["unsqueeze_sin"].args[0]
 
-    # Sanity check on head_dim
-    if not _validate_rope_inputs(q_node, k_node):
-        return
-
     # Sanity-check: ensure cos/sin nodes trace back to aten.cos/aten.sin.
     bfs(
         cos_node,
@@ -383,8 +379,8 @@ def _process_explicit_rope(
 
     with graph.inserting_before(q_match["add_node"]):
         if need_transpose:
-            q_for_op = graph.call_function(torch.ops.aten.transpose.int, args=(q_node, 1, 2))
-            k_for_op = graph.call_function(torch.ops.aten.transpose.int, args=(k_node, 1, 2))
+            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
             q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
             k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
         else:
@@ -393,26 +389,32 @@ def _process_explicit_rope(
         head_dim = cos_node.meta["val"].shape[-1]
         half_head_dim = head_dim // 2
 
-        cache = rope_flash_cache
-        cache_key = (cos_node, sin_node)
-        if cache_key in cache:
-            fused_cos_sin = cache[cache_key]
-        else:
+    cache = rope_flash_cache
+    cache_key = (cos_node, sin_node)
+    if cache_key in cache:
+        fused_cos_sin_to = cache[cache_key]
+    else:
+        with graph.inserting_after(cos_node):
             cos_prefix = graph.call_function(
                 torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
             )
+        with graph.inserting_after(sin_node):
             sin_prefix = graph.call_function(
                 torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
             )
+        with graph.inserting_after(sin_prefix):
             fused_cos_sin = graph.call_function(
                 torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
             )
-            fused_cos_sin = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
-            fused_cos_sin = graph.call_function(
-                torch.ops.aten.to.dtype, args=(fused_cos_sin, torch.float32)
+        with graph.inserting_after(fused_cos_sin):
+            fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+        with graph.inserting_after(fused_cos_sin_0):
+            fused_cos_sin_to = graph.call_function(
+                torch.ops.aten.to, args=(fused_cos_sin_0, torch.float32)
             )
-            cache[cache_key] = fused_cos_sin
+        cache[cache_key] = fused_cos_sin_to
 
+    with graph.inserting_before(q_match["add_node"]):
         position_ids = _get_position_ids(
             graph,
             q_for_op_contig,
@@ -423,7 +425,7 @@ def _process_explicit_rope(
 
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin, True),
+            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin_to, True),
         )
 
     with graph.inserting_after(flash_node):
@@ -463,10 +465,6 @@ def _process_complex_rope(
     k_node = k_match["input"]
     inv_freq_node = q_match["inv_freq"]
 
-    # Sanity check on head_dim
-    if not _validate_rope_inputs(q_node, k_node):
-        return
-
     if inv_freq_node != k_match["inv_freq"]:
         raise RuntimeError("Mismatch of freqs_cis (inv_freq) between branches.")
 
@@ -500,7 +498,7 @@ def _process_complex_rope(
             cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
         with graph.inserting_after(cos_sin_flash):
             cos_sin_flash = graph.call_function(
-                torch.ops.aten.to.dtype, args=(cos_sin_flash, torch.float32)
+                torch.ops.aten.to, args=(cos_sin_flash, torch.float32)
             )
         cache[inv_freq_node] = cos_sin_flash
 
