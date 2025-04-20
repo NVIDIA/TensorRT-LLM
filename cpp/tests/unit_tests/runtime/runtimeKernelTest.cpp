@@ -348,225 +348,6 @@ TEST_F(RuntimeKernelTest, CopyInputToOutput)
     }
 }
 
-TEST_F(RuntimeKernelTest, CopyPackedInputToOutput)
-{
-    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
-
-    auto const maxInputLength = static_cast<tr::SizeType32>(input.size());
-    auto const batchSize = maxInputLength;
-    tr::SizeType32 constexpr maxNewTokens{3};
-    auto const beamWidth = 5;
-    auto const maxSeqLength = maxInputLength + maxNewTokens;
-    tr::SizeType32 constexpr padId{50256};
-
-    std::vector<tr::SizeType32> inputLengthsHost(batchSize);
-    std::iota(inputLengthsHost.begin(), inputLengthsHost.end(), 1);
-    auto inputLengths = mManager->copyFrom(inputLengthsHost, tr::ITensor::makeShape({batchSize}), tr::MemoryType::kGPU);
-
-    std::vector<tr::SizeType32> inputOffsetsHost(batchSize + 1);
-    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
-    auto const totalInputSize = inputOffsetsHost.back();
-
-    std::vector<std::int32_t> inputsHost(totalInputSize);
-    for (tr::SizeType32 i = 0; i < batchSize; ++i)
-    {
-        std::copy(input.begin(), input.begin() + inputLengthsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
-    }
-    auto inputIds = mManager->copyFrom(inputsHost, tr::ITensor::makeShape({1, totalInputSize}), tr::MemoryType::kGPU);
-
-    TensorPtr const outputIds
-        = mManager->gpu(tr::ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32);
-
-    auto inputOffsets
-        = std::shared_ptr(mManager->gpu(tr::ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32));
-    mManager->setZero(*inputOffsets);
-    tr::kernels::invokeInclusiveSum(*tr::ITensor::slice(inputOffsets, 1), *inputLengths, *mManager, *mStream);
-    auto inputOffsetsHost2 = mManager->copyFrom(*inputOffsets, tr::MemoryType::kCPU);
-    auto* inputOffsetsHost2Ptr = tr::bufferCast<tr::SizeType32>(*inputOffsetsHost2);
-
-    for (std::size_t b = 0; b < inputOffsetsHost.size(); ++b)
-    {
-        EXPECT_EQ(inputOffsetsHost[b], inputOffsetsHost2Ptr[b]) << "Error at index " << b;
-    }
-
-    tr::kernels::invokeCopyPackedInputToOutput(*outputIds, *inputIds, *inputOffsets, maxInputLength, padId, *mStream);
-
-    auto outputIdsHost = mManager->copyFrom(*outputIds, tr::MemoryType::kCPU);
-    auto* outputIdsHostData = tr::bufferCast<tr::SizeType32>(*outputIdsHost);
-
-    for (tr::SizeType32 b = 0; b < batchSize; ++b)
-    {
-        for (tr::SizeType32 beam = 0; beam < beamWidth; ++beam)
-        {
-            for (tr::SizeType32 i = 0; i < inputLengthsHost[b]; ++i)
-            {
-                auto const outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
-                EXPECT_EQ(outputIdsHostData[outputIndex], input[i])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-            for (tr::SizeType32 i = inputLengthsHost[b]; i < maxInputLength; ++i)
-            {
-                auto const outputIndex = tc::flat_index3(b, beam, i, beamWidth, maxSeqLength);
-                EXPECT_EQ(outputIdsHostData[outputIndex], padId)
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
-}
-
-TEST_F(RuntimeKernelTest, CopyPackedInputToOutputTransposed)
-{
-    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
-
-    auto const maxInputLength = static_cast<tr::SizeType32>(input.size());
-    auto const batchSize = maxInputLength;
-    tr::SizeType32 constexpr maxNewTokens{3};
-    auto const beamWidth = 5;
-    auto const maxSeqLength = maxInputLength + maxNewTokens;
-    tr::SizeType32 constexpr padId{50256};
-
-    std::vector<tr::SizeType32> inputLengthsHost(batchSize);
-    std::iota(inputLengthsHost.begin(), inputLengthsHost.end(), 1);
-    auto inputLengths = mManager->copyFrom(inputLengthsHost, tr::ITensor::makeShape({batchSize}), tr::MemoryType::kGPU);
-
-    std::vector<tr::SizeType32> inputOffsetsHost(batchSize + 1);
-    tc::stl_utils::inclusiveScan(inputLengthsHost.begin(), inputLengthsHost.end(), inputOffsetsHost.begin() + 1);
-    auto const totalInputSize = inputOffsetsHost.back();
-
-    std::vector<std::int32_t> inputsHost(totalInputSize);
-    for (tr::SizeType32 i = 0; i < batchSize; ++i)
-    {
-        std::copy(input.begin(), input.begin() + inputLengthsHost[i], inputsHost.begin() + inputOffsetsHost[i]);
-    }
-    auto inputIds = mManager->copyFrom(inputsHost, tr::ITensor::makeShape({1, totalInputSize}), tr::MemoryType::kGPU);
-
-    TensorPtr const outputIds
-        = mManager->gpu(tr::ITensor::makeShape({maxSeqLength, batchSize, beamWidth}), nvinfer1::DataType::kINT32);
-
-    auto inputOffsets
-        = std::shared_ptr(mManager->gpu(tr::ITensor::makeShape({batchSize + 1}), nvinfer1::DataType::kINT32));
-    mManager->setZero(*inputOffsets);
-    tr::kernels::invokeInclusiveSum(*tr::ITensor::slice(inputOffsets, 1), *inputLengths, *mManager, *mStream);
-    auto inputOffsetsHost2 = mManager->copyFrom(*inputOffsets, tr::MemoryType::kCPU);
-    auto* inputOffsetsHost2Ptr = tr::bufferCast<tr::SizeType32>(*inputOffsetsHost2);
-
-    for (std::size_t offset = 0; offset < inputOffsetsHost.size(); ++offset)
-    {
-        EXPECT_EQ(inputOffsetsHost[offset], inputOffsetsHost2Ptr[offset]) << "Error at index " << offset;
-    }
-
-    tr::kernels::invokeCopyPackedInputToOutputTransposed(
-        *outputIds, *inputIds, *inputOffsets, maxInputLength, padId, *mStream);
-
-    auto outputIdsHost = mManager->copyFrom(*outputIds, tr::MemoryType::kCPU);
-    auto* outputIdsHostData = tr::bufferCast<tr::SizeType32>(*outputIdsHost);
-
-    for (tr::SizeType32 b = 0; b < batchSize; ++b)
-    {
-        for (tr::SizeType32 beam = 0; beam < beamWidth; ++beam)
-        {
-            for (tr::SizeType32 i = 0; i < inputLengthsHost[b]; ++i)
-            {
-                auto const outputIndex = tc::flat_index3(i, b, beam, batchSize, beamWidth);
-                EXPECT_EQ(outputIdsHostData[outputIndex], input[i])
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-            for (tr::SizeType32 i = inputLengthsHost[b]; i < maxInputLength; ++i)
-            {
-                auto const outputIndex = tc::flat_index3(i, b, beam, batchSize, beamWidth);
-                EXPECT_EQ(outputIdsHostData[outputIndex], padId)
-                    << "Error at index (" << b << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
-}
-
-TEST_F(RuntimeKernelTest, ScatterInt32)
-{
-    tr::SizeType32 const beamWidth{3};
-
-    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
-    tr::SizeType32 const batchSize{4};
-    auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
-    auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
-    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
-
-    auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
-    mManager->setZero(*outputTensor);
-
-    tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    auto outputHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
-    auto* outputPtr = tr::bufferCast<tr::SizeType32>(*outputHost);
-
-    std::cout << *outputHost;
-
-    for (tr::SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
-    {
-        for (tr::SizeType32 beam = 0; beam < beamWidth; ++beam)
-        {
-            for (tr::SizeType32 i = 0; i < inputLength; ++i)
-            {
-                auto const inputIdx = tc::flat_index2(batchIdx, i, inputLength);
-                auto const expected = beam == 0 ? input[inputIdx] : 0;
-                auto const outputIdx = tc::flat_index3(batchIdx, beam, i, beamWidth, inputLength);
-                EXPECT_EQ(outputPtr[outputIdx], expected)
-                    << "Error at index (" << batchIdx << ',' << beam << ',' << i << ')';
-            }
-        }
-    }
-}
-
-TEST_F(RuntimeKernelTest, SplitTransposed)
-{
-    tr::SizeType32 const split{2};
-    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
-    std::vector<std::int32_t> const output{28524, 5093, 23316, 11, 263, 355, 287, 12, 4881, 30022, 8776, 257};
-    std::vector<std::int32_t> const output2{28524, 287, 23316, 4881, 263, 8776, 5093, 12, 11, 30022, 355, 257};
-
-    {
-        tr::SizeType32 const batchSize{6};
-        auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
-        auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
-        auto const outputShape = tr::ITensor::makeShape({split, batchSize, inputLength / split});
-
-        auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
-        mManager->setZero(*outputTensor);
-
-        tr::kernels::splitTransposed(*outputTensor, *inputTensor, split, *mStream);
-        auto outputHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
-        auto* outputPtr = tr::bufferCast<tr::SizeType32>(*outputHost);
-        cudaError_t const cudaerr = cudaDeviceSynchronize();
-
-        for (tr::SizeType32 i = 0; i < static_cast<tr::SizeType32>(input.size()); ++i)
-        {
-            EXPECT_EQ(outputPtr[i], output[i]);
-        }
-    }
-
-    {
-        tr::SizeType32 const batchSize{3};
-        auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
-        auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
-        auto const outputShape = tr::ITensor::makeShape({split, batchSize, inputLength / split});
-
-        auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
-        mManager->setZero(*outputTensor);
-
-        tr::kernels::splitTransposed(*outputTensor, *inputTensor, split, *mStream);
-        auto outputHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
-        auto* outputPtr = tr::bufferCast<tr::SizeType32>(*outputHost);
-        cudaError_t const cudaerr = cudaDeviceSynchronize();
-
-        for (tr::SizeType32 i = 0; i < static_cast<tr::SizeType32>(input.size()); ++i)
-        {
-            EXPECT_EQ(outputPtr[i], output2[i]);
-        }
-    }
-}
-
 TEST_F(RuntimeKernelTest, ScatterHalf)
 {
     tr::SizeType32 const beamWidth{3};
@@ -670,8 +451,53 @@ TEST_F(RuntimeKernelTest, TileHalf)
     verifyTiling(input, *outputTensor, *mManager);
 }
 
+TEST_F(RuntimeKernelTest, TileInplaceInt32)
+{
+    tr::SizeType32 const beamWidth{3};
+
+    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
+    tr::SizeType32 const batchSize{4};
+    auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
+    auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
+    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
+
+    auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
+
+    tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+    tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
+
+    outputTensor->reshape(tr::ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
+}
+
+TEST_F(RuntimeKernelTest, TileInplaceHalf)
+{
+    tr::SizeType32 const beamWidth{3};
+
+    std::vector<half> const input{
+        28524.F, 287.F, 5093.F, 12.F, 23316.F, 4881.F, 11.F, 30022.F, 263.F, 8776.F, 355.F, 257.F};
+    tr::SizeType32 const batchSize{4};
+    auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
+    auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
+    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
+
+    auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kHALF);
+
+    tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+    tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
+
+    outputTensor->reshape(tr::ITensor::makeShape({batchSize, beamWidth, inputLength}));
+    verifyTiling(input, *outputTensor, *mManager);
+}
+
 TEST_F(RuntimeKernelTest, TileInt8Large)
 {
+    // Force synchronize to ensure that all memory allocations and de-allocations are completed before running the test,
+    // as it uses a significant portion of the total memory on smaller devices and tends to cause OOMs.
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+
     std::int8_t constexpr value{3};
     tr::SizeType32 constexpr batchSize{1};
     tr::SizeType32 constexpr beamWidth{2};
@@ -681,21 +507,82 @@ TEST_F(RuntimeKernelTest, TileInt8Large)
     auto const inputShape = tr::ITensor::makeShape({batchSize, d2, d3});
     auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, d2, d3});
 
-    auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
-    tr::kernels::invokeFill(*inputTensor, value, *mStream);
-    mStream->synchronize();
-
-    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
-    tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    mStream->synchronize();
-
-    auto bufferHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
-    auto* bufferPtr = tr::bufferCast<std::int8_t>(*bufferHost);
-    auto constexpr expected = value;
-    for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
+    // Ensure the test is not too memory hungry for the current device.
+    auto const totalBytesAllocated = tr::ITensor::volume(inputShape) + tr::ITensor::volume(outputShape);
+    auto const [_, totalDeviceMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+    auto constexpr memoryProportionThreshold{0.9};
+    if (static_cast<double>(totalBytesAllocated) > (static_cast<double>(totalDeviceMemory) * memoryProportionThreshold))
     {
-        EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+        GTEST_SKIP() << "Skipping test due to large memory allocation that could make test flaky.";
     }
+
+    // Scope the allocated tensors to ensure they are de-allocated before the test ends.
+    {
+        auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
+        tr::kernels::invokeFill(*inputTensor, value, *mStream);
+        mStream->synchronize();
+
+        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
+        tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+        mStream->synchronize();
+
+        auto bufferHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
+        auto* bufferPtr = tr::bufferCast<std::int8_t>(*bufferHost);
+        auto constexpr expected = value;
+        for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
+        {
+            EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+        }
+    }
+    mStream->synchronize();
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+TEST_F(RuntimeKernelTest, TileInplaceInt8Large)
+{
+    // Force synchronize to ensure that all memory allocations and de-allocations are completed before running the test,
+    // as it uses a significant portion of the total memory on smaller devices and tends to cause OOMs.
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::int8_t constexpr value{3};
+    tr::SizeType32 constexpr batchSize{1};
+    tr::SizeType32 constexpr beamWidth{2};
+
+    tr::SizeType32 const d2{2};
+    auto const d3 = std::numeric_limits<int32_t>::max();
+    auto const inputShape = tr::ITensor::makeShape({batchSize, d2, d3});
+    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, d2, d3});
+
+    // Ensure the test is not too memory hungry for the current device.
+    auto const totalBytesAllocated = tr::ITensor::volume(inputShape) + tr::ITensor::volume(outputShape);
+    auto const [_, totalDeviceMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+    auto constexpr memoryProportionThreshold{0.9};
+    if (static_cast<double>(totalBytesAllocated) > (static_cast<double>(totalDeviceMemory) * memoryProportionThreshold))
+    {
+        GTEST_SKIP() << "Skipping test due to large memory allocation that could make test flaky.";
+    }
+
+    // Scope the allocated tensors to ensure they are de-allocated before the test ends.
+    {
+        auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
+        tr::kernels::invokeFill(*inputTensor, value, *mStream);
+        mStream->synchronize();
+
+        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
+        tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
+        tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
+        mStream->synchronize();
+
+        auto bufferHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
+        auto* bufferPtr = tr::bufferCast<std::int8_t>(*bufferHost);
+        auto constexpr expected = value;
+        for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
+        {
+            EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
+        }
+    }
+    mStream->synchronize();
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 namespace
