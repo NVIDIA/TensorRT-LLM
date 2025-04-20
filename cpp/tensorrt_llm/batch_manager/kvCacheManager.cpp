@@ -1948,7 +1948,6 @@ SizeType32 KVCacheManager::getMaxCapacityBatchSize(SizeType32 inputLength, SizeT
 SizeType32 KVCacheManager::calculateMaxBlockRequirementsPerBeam(
     SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 maxAttentionWindow, SizeType32 tokensPerBlock)
 {
-    // TODO (tomer): this should probably be changed
     auto const sinkBubbleLength = BaseKVCacheManager::getSinkBubbleLength(sinkTokenLength, tokensPerBlock);
     auto const actualSeqLen = std::min(sequenceLength, maxAttentionWindow);
     auto actualMaxTokenNum = actualSeqLen + sinkBubbleLength;
