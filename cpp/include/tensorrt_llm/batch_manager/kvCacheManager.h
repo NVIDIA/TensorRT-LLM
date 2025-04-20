@@ -305,7 +305,8 @@ public:
 
     explicit GenerationRequest(LlmRequest::RequestIdType requestId, SizeType32 numTokens, SizeType32 beamWidth,
         SizeType32 maxBlocks, SizeType32 numPools = 1,
-        executor::KvCacheRetentionConfig kvCacheRetentionConfig = executor::KvCacheRetentionConfig())
+        executor::KvCacheRetentionConfig kvCacheRetentionConfig = executor::KvCacheRetentionConfig(),
+        bool const contextRequiresSlidingWindowKvCache = false)
         : mRequestId(requestId)
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
@@ -314,6 +315,7 @@ public:
               runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
               runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value)}
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
+        , mContextRequiresSlidingWindowKvCache(contextRequiresSlidingWindowKvCache)
     {
         auto cacheBlockIdsRange = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices);
         std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
@@ -405,11 +407,6 @@ public:
     [[nodiscard]] bool getContextRequiresSlidingWindowKvCache() const
     {
         return mContextRequiresSlidingWindowKvCache;
-    }
-
-    void setContextRequiresSlidingWindowKvCache(bool contextRequiresSlindigWindowKvCache)
-    {
-        mContextRequiresSlidingWindowKvCache = contextRequiresSlindigWindowKvCache;
     }
 
 private:

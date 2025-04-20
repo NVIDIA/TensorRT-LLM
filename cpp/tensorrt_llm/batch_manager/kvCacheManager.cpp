@@ -1629,17 +1629,16 @@ void KVCacheManager::addSequence(
     auto const [seqIt, emplaceDone] = [&]
     {
         auto lck = std::scoped_lock(mSequencesMtx);
+        // Enable sliding window kv cache when inputLength exceeds maxAttentionWindow.
+        // Note that currently sliding window kv cache doesn't work with shared kv cache of different beams.
+        // TODO (tomer): remove after checking if works with beam search
+        auto const contextRequiresSlidingWindowKvCache = inputLength > mMinAttentionWindow + mSinkBubbleLength;
         return mSequences.emplace(requestId,
             GenerationRequest(requestId, inputLength, beamWidth, mMaxBlocksPerSeq, mBlockManager.getNumPools(),
-                kvCacheRetentionConfig));
+                kvCacheRetentionConfig, contextRequiresSlidingWindowKvCache));
     }();
     TLLM_CHECK(emplaceDone);
     auto& sequence = seqIt->second;
-
-    // Enable sliding window kv cache when inputLength exceeds maxAttentionWindow.
-    // Note that currently sliding window kv cache doesn't work with shared kv cache of different beams.
-    sequence.setContextRequiresSlidingWindowKvCache(inputLength > mMinAttentionWindow
-            + mSinkBubbleLength); // We decide at the outset whether a request uses sliding window kv-cache or not.
 
     // Get the final token index in kv cache
     SizeType32 const finalTokenKVIdx
