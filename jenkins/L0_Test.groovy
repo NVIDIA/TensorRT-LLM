@@ -473,6 +473,32 @@ def runLLMDocBuild(pipeline, config)
     )
 }
 
+def launchTestListCheck(pipeline)
+{
+    stageName = "Test List Check"
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
+        try {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
+            libffi-dev \
+            -y""")
+            sh "nvidia-smi -q"
+            // download TRT-LLM tarfile
+            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
+            sh "tar -zxf ${tarName}"
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            throw e
+        }
+    })
+}
+
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
     String resultFiles = sh(script: "cd ${stageName} && ls -l ${resultPath} | wc -l", returnStdout: true).trim()
     echo "${resultFiles}"
@@ -1563,6 +1589,20 @@ pipeline {
                         }
                     }
                     println testFilter
+                }
+            }
+        }
+        stage("Check Test Lists")
+        {
+            when {
+                expression {
+                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                }
+            }
+            steps
+            {
+                script {
+                    launchTestListCheck(this)
                 }
             }
         }
