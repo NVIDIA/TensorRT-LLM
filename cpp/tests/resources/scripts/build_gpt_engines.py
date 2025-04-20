@@ -37,7 +37,7 @@ def convert_ckpt(model_dir: str,
                  world_size: int = 1,
                  dtype: str = 'float16'):
     convert_cmd = [
-        sys.executable, "examples/gpt/convert_checkpoint.py",
+        sys.executable, "examples/models/core/gpt/convert_checkpoint.py",
         f"--model_dir={model_dir}", f"--output_dir={output_dir}",
         f"--dtype={dtype}", f"--tp_size={world_size}"
     ] + list(args)
