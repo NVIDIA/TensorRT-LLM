@@ -430,17 +430,14 @@ bool BlockManager::verifyQueueIntegrity()
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
-    if (!sequence.getContextRequiresSlidingWindowKvCache())
-    {
-        constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
-        auto const& cacheBlockIds = sequence.getCacheBlockIds();
-        auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
+    auto const& cacheBlockIds = sequence.getCacheBlockIds();
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
-        auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
-        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
-    }
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
 }
 
 void BlockManager::createBlockScalePools(SizeType32 quantBlockSize)
