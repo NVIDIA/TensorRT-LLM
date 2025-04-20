@@ -86,6 +86,35 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
+//! \brief Get all blocks in a sequence by traversing backwards from the last block.
+//! \param lastBlock a BlockPtr to the last block in the sequence to start traversal from
+//! \return Vector of BlockPtrs in sequence order
+std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
+{
+    // First count the number of blocks to pre-allocate the vector
+    auto currentBlock = lastBlock;
+    size_t blockCount = 0;
+    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+    {
+        blockCount++;
+        currentBlock = currentBlock->getPrevBlockInSeq();
+    }
+
+    // Create and pre-allocate the vector with the correct size
+    std::vector<BlockPtr> sequenceBlocks(blockCount);
+
+    // Now traverse backwards and fill from the end
+    currentBlock = lastBlock;
+    size_t currentIndex = blockCount - 1;
+    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+    {
+        sequenceBlocks[currentIndex--] = currentBlock;
+        currentBlock = currentBlock->getPrevBlockInSeq();
+    }
+
+    return sequenceBlocks;
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -1091,7 +1120,7 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
 {
     auto const requestId = sequence.getRequestId();
     auto node = mAllocatedBlocksPerSeq.extract(requestId);
-    auto& allocatedBlocks = node.mapped();
+    auto& sequenceBlocks = node.mapped();
 
     // TODO: refactor this method in two: store blocks for reuse and just 'release blocks'. Only the caller
     // can know which blocks to store for reuse and which to just release.
@@ -1107,7 +1136,6 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
     {
         auto constexpr beamIdx = 0;
         auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-        auto cacheBlockIds = sequence.getCacheBlockIds()[beamIdx];
 
         // TODO: get the caller to mark tokens as filled / not filled, so that the kv-cache manager doesn't
         // have to guess. Only (length - 1) tokens of the sequence have their kv-state recorded in kv-cache. We assume
@@ -1117,41 +1145,21 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
         // In case of sliding window attention, the number of blocks in the entire sequence can be larger than the
-        // number of blocks in the cacheBlockIds vector (which holds only the blocks in the current attention window).
+        // number of blocks in the sequenceBlocks vector (which holds only the blocks in the current attention window).
         // In this case, get all blocks in the sequence by traversing back until nullptr.
-        if (blockKeys.size() > cacheBlockIds.size())
+        if (blockKeys.size() > sequenceBlocks.size())
         {
-            auto lastBlock = allocatedBlocks.back();
-
-            // First count the number of blocks to pre-allocate the vector
-            auto currentBlock = lastBlock;
-            size_t blockCount = 0;
-            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-            {
-                blockCount++;
-                currentBlock = currentBlock->getPrevBlockInSeq();
-            }
-
-            // Pre-allocate the vector with the correct size
-            cacheBlockIds.resize(blockCount);
-            allocatedBlocks.resize(blockCount);
-
-            // Now traverse backwards and fill from the end
-            currentBlock = lastBlock;
-            size_t currentIndex = blockCount - 1;
-            while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-            {
-                cacheBlockIds[currentIndex] = currentBlock->getBlockId();
-                allocatedBlocks[currentIndex] = currentBlock;
-                currentIndex--;
-                currentBlock = currentBlock->getPrevBlockInSeq();
-            }
+            sequenceBlocks = getAllSequenceBlocks(sequenceBlocks.back());
         }
+
+        std::vector<KVCacheBlock::IdType> cacheBlockIds(sequenceBlocks.size());
+        std::transform(sequenceBlocks.begin(), sequenceBlocks.end(), cacheBlockIds.begin(),
+            [](BlockPtr const& block) { return block->getBlockId(); });
 
         storeBlocks(std::move(blockKeys), cacheBlockIds);
     }
 
-    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
+    for (auto it = sequenceBlocks.rbegin(); it != sequenceBlocks.rend(); ++it)
     {
         auto& block = *it;
         // Decrease ref count
