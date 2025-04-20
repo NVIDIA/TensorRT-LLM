@@ -1415,11 +1415,6 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req) const
 {
-    if (req.isFinished())
-    {
-        return 0;
-    }
-
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
