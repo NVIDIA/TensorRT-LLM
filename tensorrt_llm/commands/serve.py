@@ -253,7 +253,9 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
     server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
                                 gen_servers=gen_server_urls,
                                 req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout)
+                                server_start_timeout_secs=server_start_timeout,
+                                ctx_router_type=disagg_cfg.ctx_router_type,
+                                gen_router_type=disagg_cfg.gen_router_type)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

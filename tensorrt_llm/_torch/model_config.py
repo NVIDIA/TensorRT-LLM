@@ -126,6 +126,12 @@ class ModelConfig(Generic[TConfig]):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                 quant_config.exclude_modules = ["*eh_proj"]
 
+                block_size = hf_quant_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.group_size = block_size[0]
+
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
                    quant_config_dict=layer_quant_config,
