@@ -6,8 +6,7 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 TrtllmAttention)
+from ..attention_backend import AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention
@@ -18,24 +17,6 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
-
-
-class L2Norm(torch.nn.Module):
-
-    def __init__(self, dtype: Optional[torch.dtype] = None, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.dtype = dtype
-
-    def _norm(self, x):
-        flash_infer_kernel = RMSNorm(hidden_size=x.shape[-1],
-                                     eps=self.eps,
-                                     dtype=self.dtype,
-                                     device=x.device)
-        return flash_infer_kernel(x)
-
-    def forward(self, x):
-        return self._norm(x).type_as(x)
 
 
 class Attention(nn.Module):
@@ -53,8 +34,6 @@ class Attention(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
-        use_qk_norm: bool = False,
-        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -67,9 +46,6 @@ class Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
-        self.use_qk_norm = use_qk_norm
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         if dense_bias is None:
             self.dense_bias = bias
@@ -101,11 +77,6 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        if self.use_qk_norm:
-            self.qk_norm = L2Norm(dtype=dtype)
-        else:
-            self.qk_norm = None
-
         self.qkv_proj = Linear(
             self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -132,19 +103,6 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
         self.pos_embd_params = pos_embd_params
 
-        self.enable_rope_fusion = self.attn_backend == "TRTLLM"
-        self.support_fused_qkv = self.attn_backend == "TRTLLM"
-        self.support_unfused_qkv = self.attn_backend != "TRTLLM"
-        self.rotary_emb = None
-        self.apply_rotary_emb = (not self.enable_rope_fusion
-                                 and pos_embd_params is not None)
-        if self.apply_rotary_emb:
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
-
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
         # handles them as a single fused operation.
@@ -160,8 +118,23 @@ class Attention(nn.Module):
 
         if not config.skip_create_weights:
             self.create_weights()
+        else:
+            self.create_backend()
 
-    def create_weights(self):
+        self.enable_rope_fusion = self.attn.support_fused_rope()
+        self.support_fused_qkv = self.attn.support_fused_qkv()
+
+        self.rotary_emb = None
+        self.apply_rotary_emb = (not self.enable_rope_fusion
+                                 and pos_embd_params is not None)
+        if self.apply_rotary_emb:
+            self.rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
+    def create_backend(self):
         self.attn = create_attention(
             self.attn_backend,
             self.layer_idx,
@@ -172,10 +145,14 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
         )
 
+    def create_weights(self):
+        # recreate the backend when quant_config changes
+        self.create_backend()
+
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        elif k is not None and v is not None and not self.support_unfused_qkv:
+        elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v
@@ -193,25 +170,6 @@ class Attention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-
-        if self.qk_norm is not None:
-            # TODO: make this more efficient.
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-            do_multi_stream = torch.cuda.is_current_stream_capturing(
-            ) and self.aux_stream is not None
-            if do_multi_stream:
-                self.ln_events[0].record()
-                k = self.qk_norm(k)
-                with torch.cuda.stream(self.aux_stream):
-                    self.ln_events[0].wait()
-                    q = self.qk_norm(q)
-                    self.ln_events[1].record()
-                self.ln_events[1].wait()
-            else:
-                q = self.qk_norm(q)
-                k = self.qk_norm(k)
-            qkv = torch.concat([q, k, v], dim=-1)
 
         if lora_params is not None:
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -387,6 +345,9 @@ class MLA(nn.Module):
 
         if quant_mode.has_fp8_block_scales():
             mla_weight_dtype = torch.float8_e4m3fn
+            # TODO: remove hack for fp8 Deepseek on SM100
+            if config.moe_backend == "TRTLLM":
+                mla_weight_dtype = dtype
         else:
             mla_weight_dtype = dtype
 
@@ -401,6 +362,7 @@ class MLA(nn.Module):
                                 skip_create_weights=config.skip_create_weights)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
+        # Used in forward_generation only
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.v_head_dim, self.kv_lora_rank),
@@ -409,6 +371,7 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        # Use in forward_generation only
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),
@@ -506,9 +469,8 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.enable_rope_fusion = isinstance(self.mha, TrtllmAttention)
-        self.support_fused_qkv = isinstance(self.mha, TrtllmAttention)
-        self.support_unfused_qkv = not isinstance(self.mha, TrtllmAttention)
+        self.enable_rope_fusion = self.mha.support_fused_rope()
+        self.support_fused_qkv = self.mha.support_fused_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.enable_rope_fusion
         if self.apply_rotary_emb:
@@ -622,7 +584,7 @@ class MLA(nn.Module):
         return attn_output
 
     def _maybe_concat_qkv(self, q, k, v):
-        if k is not None and v is not None and not self.support_unfused_qkv:
+        if k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
         return q, k, v

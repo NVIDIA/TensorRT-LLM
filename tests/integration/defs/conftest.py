@@ -194,7 +194,7 @@ def llm_rouge_root() -> str:
 @pytest.fixture(scope="module")
 def bert_example_root(llm_root):
     "Get bert example root"
-    example_root = os.path.join(llm_root, "examples", "bert")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "bert")
 
     return example_root
 
@@ -202,7 +202,8 @@ def bert_example_root(llm_root):
 @pytest.fixture(scope="module")
 def enc_dec_example_root(llm_root):
     "Get encoder-decoder example root"
-    example_root = os.path.join(llm_root, "examples", "enc_dec")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "enc_dec")
 
     return example_root
 
@@ -210,7 +211,8 @@ def enc_dec_example_root(llm_root):
 @pytest.fixture(scope="module")
 def whisper_example_root(llm_root, llm_venv):
     "Get whisper example root"
-    example_root = os.path.join(llm_root, "examples", "whisper")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "whisper")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -236,7 +238,7 @@ def opt_example_root(llm_root, llm_venv):
 def llama_example_root(llm_root, llm_venv):
     "Get llama example root"
 
-    example_root = os.path.join(llm_root, "examples", "llama")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
     try:
         llm_venv.run_cmd([
             "-m", "pip", "install", "-r",
@@ -270,7 +272,7 @@ def disaggregated_example_root(llm_root, llm_venv):
 def gemma_example_root(llm_root, llm_venv):
     "Get gemma example root"
 
-    example_root = os.path.join(llm_root, "examples", "gemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
     # https://nvbugs/4559583 Jax dependency broke the entire pipeline in TRT container
     # due to the dependency incompatibility with torch, which forced reinstall everything
     # and caused pipeline to fail. We manually install gemma dependency as a WAR.
@@ -361,7 +363,7 @@ def mistral_nemo_minitron_model_root(request):
 @pytest.fixture(scope="module")
 def gpt_example_root(llm_root, llm_venv):
     "Get gpt example root"
-    example_root = os.path.join(llm_root, "examples", "gpt")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -386,7 +388,8 @@ def gptj_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def glm_4_9b_example_root(llm_root, llm_venv):
     "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "glm-4-9b")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "glm-4-9b")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -398,7 +401,8 @@ def glm_4_9b_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def exaone_example_root(llm_root, llm_venv):
     "Get EXAONE example root"
-    example_root = os.path.join(llm_root, "examples", "exaone")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "exaone")
 
     return example_root
 
@@ -442,7 +446,8 @@ def plugin_gen_path(llm_root):
 @pytest.fixture(scope="module")
 def internlm2_example_root(llm_root, llm_venv):
     "Get internlm2 example root"
-    example_root = os.path.join(llm_root, "examples", "internlm2")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "internlm2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -454,7 +459,7 @@ def internlm2_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def qwen_example_root(llm_root, llm_venv):
     "Get qwen example root"
-    example_root = os.path.join(llm_root, "examples", "qwen")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "qwen")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -526,7 +531,7 @@ def eagle_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def mamba_example_root(llm_root, llm_venv):
     "Get mamba example root"
-    example_root = os.path.join(llm_root, "examples", "mamba")
+    example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -543,7 +548,8 @@ def mamba_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def recurrentgemma_example_root(llm_root, llm_venv):
     "Get recurrentgemma example root"
-    example_root = os.path.join(llm_root, "examples", "recurrentgemma")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "recurrentgemma")
 
     # install requirements
     llm_venv.run_cmd([
@@ -561,7 +567,8 @@ def recurrentgemma_example_root(llm_root, llm_venv):
 
 @pytest.fixture(scope="module")
 def nemotron_nas_example_root(llm_root, llm_venv):
-    example_root = os.path.join(llm_root, "examples", "nemotron_nas")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron_nas")
 
     yield example_root
 
@@ -569,7 +576,8 @@ def nemotron_nas_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def nemotron_example_root(llm_root, llm_venv):
     "Get nemotron example root"
-    example_root = os.path.join(llm_root, "examples", "nemotron")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "nemotron")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -580,7 +588,8 @@ def nemotron_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="module")
 def commandr_example_root(llm_root, llm_venv):
     "Get commandr example root"
-    example_root = os.path.join(llm_root, "examples", "commandr")
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "commandr")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")

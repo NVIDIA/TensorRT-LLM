@@ -414,9 +414,11 @@ void initConfigBindings(pybind11::module_& m)
             c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
-            c.getGpuWeightsPercent(), c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(),
-            c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch());
+            c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
+            c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
+            c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
+            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch(),
+            c.getPromptTableOffloading());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -429,7 +431,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 25)
+        if (cpp_states.size() != 27)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -449,17 +451,19 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[11].cast<std::optional<tle::PeftCacheConfig>>(),           // PeftCacheConfig
             cpp_states[12].cast<std::optional<tle::LogitsPostProcessorConfig>>(), // LogitsPostProcessorConfig
             cpp_states[13].cast<std::optional<tle::DecodingConfig>>(),            // DecodingConfig
-            cpp_states[14].cast<float>(),                                         // GpuWeightsPercent
-            cpp_states[15].cast<std::optional<SizeType32>>(),                     // MaxQueueSize
-            cpp_states[16].cast<tle::ExtendedRuntimePerfKnobConfig>(),            // ExtendedRuntimePerfKnobConfig
-            cpp_states[17].cast<std::optional<tle::DebugConfig>>(),               // DebugConfig
-            cpp_states[18].cast<SizeType32>(),                                    // RecvPollPeriodMs
-            cpp_states[19].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
-            cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
-            cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
-            cpp_states[22].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
-            cpp_states[23].cast<bool>(),                                                   // GatherGenerationLogits
-            cpp_states[24].cast<bool>()                                                    // UseVariableBeamWidthSearch
+            cpp_states[14].cast<bool>(),                                          // UseGpuDirectStorage
+            cpp_states[15].cast<float>(),                                         // GpuWeightsPercent
+            cpp_states[16].cast<std::optional<SizeType32>>(),                     // MaxQueueSize
+            cpp_states[17].cast<tle::ExtendedRuntimePerfKnobConfig>(),            // ExtendedRuntimePerfKnobConfig
+            cpp_states[18].cast<std::optional<tle::DebugConfig>>(),               // DebugConfig
+            cpp_states[19].cast<SizeType32>(),                                    // RecvPollPeriodMs
+            cpp_states[20].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
+            cpp_states[21].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
+            cpp_states[22].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
+            cpp_states[23].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
+            cpp_states[24].cast<bool>(),                                                   // GatherGenerationLogits
+            cpp_states[25].cast<bool>(),                                                   // UseVariableBeamWidthSearch
+            cpp_states[26].cast<bool>()                                                    // PromptTableOffloading
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -483,6 +487,7 @@ void initConfigBindings(pybind11::module_& m)
                  tle::PeftCacheConfig const&,                            // PeftCacheConfig
                  std::optional<tle::LogitsPostProcessorConfig>,          // LogitsPostProcessorConfig
                  std::optional<tle::DecodingConfig>,                     // DecodingConfig
+                 bool,                                                   // UseGpuDirectStorage
                  float,                                                  // GpuWeightsPercent
                  std::optional<SizeType32>,                              // MaxQueueSize
                  tle::ExtendedRuntimePerfKnobConfig const&,              // ExtendedRuntimePerfKnobConfig
@@ -493,7 +498,8 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
                  std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
                  bool,                                                   // GatherGenerationLogits
-                 bool                                                    // UseVariableBeamWidthSearch
+                 bool,                                                   // UseVariableBeamWidthSearch
+                 bool                                                    // PromptTableOffloading
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -505,14 +511,15 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
             py::arg("logits_post_processor_config") = py::none(), py::arg("decoding_config") = py::none(),
-            py::arg("gpu_weights_percent") = 1.0, py::arg("max_queue_size") = py::none(),
+            py::arg("use_gpu_direct_storage") = false, py::arg("gpu_weights_percent") = 1.0,
+            py::arg("max_queue_size") = py::none(),
             py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
                 "ExtendedRuntimePerfKnobConfig()"),
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
             py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
-            py::arg("use_variable_beam_width_search") = false)
+            py::arg("use_variable_beam_width_search") = false, py::arg("mm_embedding_offloading") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -537,6 +544,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setLogitsPostProcessorConfig)
         .def_property(
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
+        .def_property("use_gpu_direct_storage", &tle::ExecutorConfig::getUseGpuDirectStorage,
+            &tle::ExecutorConfig::setUseGpuDirectStorage)
         .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
         .def_property("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
@@ -556,6 +565,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setGatherGenerationLogits)
         .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
+        .def_property("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
+            &tle::ExecutorConfig::setPromptTableOffloading)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 

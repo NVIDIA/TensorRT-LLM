@@ -315,7 +315,7 @@ class CliFlowAccuracyTestHarness:
 
     @property
     def example_dir(self):
-        return f"{self.llm_root}/examples/{self.EXAMPLE_FOLDER}"
+        return f"{self.llm_root}/examples/models/core/{self.EXAMPLE_FOLDER}"
 
     def install_requirements(self):
         requirements = f"{self.example_dir}/requirements.txt"
@@ -373,7 +373,10 @@ class CliFlowAccuracyTestHarness:
 
         quant_config = QuantConfig(self.quant_algo, self.kv_cache_quant_algo)
         if not is_prequantized and quant_config._requires_modelopt_quantization:
-            script = "../quantization/quantize.py"
+            if "core" in self.example_dir:
+                script = "../../../quantization/quantize.py"
+            else:
+                script = "../quantization/quantize.py"
         else:
             script = "convert_checkpoint.py"
 

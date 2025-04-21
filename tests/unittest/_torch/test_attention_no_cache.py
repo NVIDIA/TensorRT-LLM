@@ -246,9 +246,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         max_num_tokens=8192,
         kv_cache_manager=None,
         mapping=None,
-        runtime_features=None,
-        is_dummy_attention=False,
-    )
+        runtime_features=None)
 
     # NOTE: set up metadata
     attn_metadata.seq_lens = torch.tensor(sequence_lengths, dtype=torch.int)
