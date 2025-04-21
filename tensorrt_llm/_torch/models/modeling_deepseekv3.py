@@ -300,11 +300,16 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router gemm
-        logits = torch.ops.trtllm.cublas_mm(hidden_states,
-                                            self.weight.t(),
-                                            bias=None,
-                                            out_dtype=torch.float32)
+        if hidden_states.size(0) >= 1 and hidden_states.size(0) <= 16:
+            logits = torch.ops.trtllm.router_gemm_op(hidden_states,
+                                                     self.weight.t(),
+                                                     bias=None,
+                                                     out_dtype=torch.float32)
+        else:
+            logits = torch.ops.trtllm.cublas_mm(hidden_states,
+                                                self.weight.t(),
+                                                bias=None,
+                                                out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -504,8 +509,8 @@ class Deepseekv3MoE(nn.Module):
                                                        min_latency_mode)
             return routed_output
 
-        shared_output, routed_output = maybe_execute_in_parallel(
-            _compute_shared_output, _compute_routed_output,
+        routed_output, shared_output = maybe_execute_in_parallel(
+            _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
 
