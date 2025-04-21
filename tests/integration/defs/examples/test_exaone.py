@@ -26,7 +26,8 @@ from defs.trt_test_alternative import check_call
 @pytest.mark.parametrize("llm_exaone_model_root",
                          ['exaone_3.0_7.8b_instruct', 'exaone_deep_2.4b'],
                          indirect=True)
-@pytest.mark.parametrize("use_weight_only", [True, False],
+@pytest.mark.parametrize("use_weight_only",
+                         [pytest.param(True, marks=skip_post_blackwell), False],
                          ids=["enable_weight_only", "disable_weight_only"])
 def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
