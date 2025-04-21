@@ -868,10 +868,6 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     self._update_requests(decoder_state)
 
                     if self.kv_cache_transceiver:
@@ -1023,14 +1019,10 @@ class PyExecutor:
                     decoder_state = self._decode_async(scheduled_batch,
                                                        batch_outputs)
 
-                    if num_dummy_request > 0:
-                        self._finish_dummy_request(scheduled_batch)
-
                     self._update_request_states(scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
+                    if num_dummy_request > 0:
+                        self._finish_dummy_request(scheduled_batch)
 
                     has_previous_batch = self.previous_batch is not None
                     if has_previous_batch:
