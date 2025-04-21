@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,10 @@
 
 #pragma once
 
+#include "Dtype.h"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_size.h>
-#include <cutlass/numeric_types.h>
-
-#include "Dtype.h"
 
 namespace moe::dev
 {
@@ -50,6 +47,9 @@ struct Data
     // optional: if `nullptr`, it is not filled
     // dim: [mNumTokens, mTopK]
     int32_t* mPtrExpertIdx{nullptr};
+    // optional: only used as an intermediate buffer when the number of tokens is large.
+    // dim: [2*NumThreads] = [512]
+    int32_t* mPtrExpertCounts{nullptr};
     // optional: if `nullptr`, it is not filled
     // dim: [1]
     int32_t* mPtrPermutedIdxSize{nullptr};
@@ -60,11 +60,21 @@ struct Data
     // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
     int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
     // optional: if `nullptr`, it is not filled
-    // dim: [mNumLocalExperts * (2 ^ mLocalExpertsSrideLog2), mNumTokens]
+    // dim: [mNumLocalExperts * (2 ^ mLocalExpertsStrideLog2), mNumTokens]
     void* mPtrExpertWeightsFull{nullptr};
     // optional: if `nullptr`, it is not filled
     // dim: [mNumTokens, mTopK]
     void* mPtrExpertWeights{nullptr};
+
+    //
+    // Grouped Gemm Launch Config Buffers
+    //
+    int32_t* mPtrCtaIdxXyToBatchIdx{nullptr};
+    int32_t* mPtrCtaIdxXyToMnLimit{nullptr};
+    int32_t* mPtrNumNonExitingCtas{nullptr};
+    // mPtrPermutedIdxSize is ptrTotalNumPaddedTokens
+    bool mAllToAllRouteAct{false};
+
     void const* mPtrRoutingWeights;
     void const* mPtrRoutingBias;
     void const* mPtrIn;
@@ -78,12 +88,12 @@ struct Data
     int32_t mTopK;
     int32_t mPaddingLog2;
     int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsSrideLog2;
+    int32_t mLocalExpertsStrideLog2;
     int32_t mNumLocalExperts;
     float mRouteScale;
     bool mUseRoutingSoftmax;
 
-    uint8_t* mPtrNumTokensPerExpert{nullptr};
+    int32_t* mPtrNumTokensPerExpert{nullptr};
     int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
 };
 
@@ -95,11 +105,17 @@ struct KernelParams
     static constexpr bool UsePdl = UsePdl_;
 
     int32_t* mPtrExpertIdx;
+    int32_t* mPtrExpertCounts;
     int32_t* mPtrPermutedIdxSize;
     int32_t* mPtrExpandedIdxToPermutedIdx;
     int32_t* mPtrPermutedIdxToTokenIdx;
     int32_t* mPtrPermutedIdxToExpandedIdx;
-    uint8_t* mPtrNumTokensPerExpert;
+    int32_t* mPtrNumTokensPerExpert;
+
+    int32_t* mPtrCtaIdxXyToBatchIdx;
+    int32_t* mPtrCtaIdxXyToMnLimit;
+    int32_t* mPtrNumNonExitingCtas;
+
     TypeExpW* mPtrExpertWeightsFull;
     TypeExpW* mPtrExpertWeights;
     TypeExpW const* mPtrRoutingWeights;
@@ -115,20 +131,28 @@ struct KernelParams
     int32_t mTopK;
     int32_t mPaddingLog2;
     int32_t mLocalExpertsStartIdx;
-    int32_t mLocalExpertsSrideLog2;
+    int32_t mLocalExpertsStrideLog2;
     int32_t mNumLocalExperts;
+    int32_t mNumTokens;
     float mRouteScale;
+    bool mAllToAllRouteAct;
 
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
 
         params.mPtrExpertIdx = data.mPtrExpertIdx;
+        params.mPtrExpertCounts = data.mPtrExpertCounts;
         params.mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
         params.mPtrExpandedIdxToPermutedIdx = data.mPtrExpandedIdxToPermutedIdx;
         params.mPtrPermutedIdxToTokenIdx = data.mPtrPermutedIdxToTokenIdx;
         params.mPtrPermutedIdxToExpandedIdx = data.mPtrPermutedIdxToExpandedIdx;
         params.mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
+
+        params.mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
+        params.mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
+        params.mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
+
         params.mPtrExpertWeightsFull = (TypeExpW*) data.mPtrExpertWeightsFull;
         params.mPtrExpertWeights = (TypeExpW*) data.mPtrExpertWeights;
         params.mPtrRoutingWeights = (TypeExpW*) data.mPtrRoutingWeights;
@@ -144,10 +168,11 @@ struct KernelParams
         params.mTopK = data.mTopK;
         params.mPaddingLog2 = data.mPaddingLog2;
         params.mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
-        params.mLocalExpertsSrideLog2 = data.mLocalExpertsSrideLog2;
+        params.mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
         params.mNumLocalExperts = data.mNumLocalExperts;
+        params.mNumTokens = data.mNumTokens;
         params.mRouteScale = data.mRouteScale;
-
+        params.mAllToAllRouteAct = data.mAllToAllRouteAct;
         return params;
     }
 };
