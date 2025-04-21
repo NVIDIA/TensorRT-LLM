@@ -65,6 +65,9 @@ methods:
       workspace:
         annotation: Optional[str]
         default: null
+      lora_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
+        default: null
       kwargs:
         annotation: Any
         default: inspect._empty
