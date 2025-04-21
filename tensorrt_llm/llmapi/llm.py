@@ -2,7 +2,9 @@ import atexit
 import json
 import os
 import shutil
+import socket
 import tempfile
+import time
 import weakref
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
@@ -108,6 +110,7 @@ class LLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self._llm_id = None
 
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
@@ -181,6 +184,16 @@ class LLM:
     @property
     def workspace(self) -> Path:
         return Path(self._workspace.name)
+
+    @property
+    def llm_id(self) -> str:
+        if self._llm_id is None:
+            hostname = socket.gethostname()
+            pid = os.getpid()
+            timestamp = int(time.time() * 1000)
+            self._llm_id = f"{hostname}-{pid}-{timestamp}"
+
+        return self._llm_id
 
     def generate(
         self,
