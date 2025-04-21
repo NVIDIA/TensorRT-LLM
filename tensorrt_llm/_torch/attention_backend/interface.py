@@ -537,6 +537,18 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return False
+
 
 @dataclass(kw_only=True, unsafe_hash=True)
 class MLAParams:
