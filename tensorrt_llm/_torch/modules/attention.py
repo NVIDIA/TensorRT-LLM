@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import nn
@@ -12,6 +12,7 @@ from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..utils import Fp4QuantizedTensor
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
@@ -185,7 +186,7 @@ class Attention(nn.Module):
     def forward(
         self,
         position_ids: Optional[torch.LongTensor],
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Fp4QuantizedTensor],
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
@@ -194,12 +195,12 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
+        num_tokens = hidden_states.fp4_tensor.size(0) if isinstance(
+            hidden_states, Fp4QuantizedTensor) else hidden_states.size(0)
         if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 4:
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             assert self.floor_scale == 8192.0 and self.attn_scale == 0.1, "floor_scale and attn_scale should be 8192.0 and 0.1"
-            qkv = self.qkv_proj(hidden_states,
-                                position_ids=position_ids)
+            qkv = self.qkv_proj(hidden_states, position_ids=position_ids)
         else:
             qkv = self.qkv_proj(hidden_states)
 
@@ -239,7 +240,8 @@ class Attention(nn.Module):
                 k = self.qk_norm(k).reshape(-1, self.kv_size)
             qkv = torch.concat([q, k, v], dim=-1)
 
-        if self.attn_temperature_tuning and (not self.qkv_proj.use_llama4_qkv or num_tokens > 4):
+        if self.attn_temperature_tuning and (not self.qkv_proj.use_llama4_qkv
+                                             or num_tokens > 4):
             # this must be a nope layer
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
