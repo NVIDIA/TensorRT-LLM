@@ -288,10 +288,8 @@ def run_command(command: str):
         raise e
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
