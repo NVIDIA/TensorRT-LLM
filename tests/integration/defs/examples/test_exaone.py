@@ -17,6 +17,7 @@
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
+from defs.conftest import skip_post_blackwell
 from defs.trt_test_alternative import check_call
 
 
