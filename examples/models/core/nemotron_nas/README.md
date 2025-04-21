@@ -16,6 +16,9 @@ The TensorRT-LLM Nemotron-NAS implementation can be found in [tensorrt_llm/model
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the model into tensorrt-llm checkpoint format.
 
+The recommended flow for using Nemotron-NAS models is through TRTLLM's PyTorch-based flow.
+An example of how to run `Nemotron-NAS` models through the PyTorch workflow can be found in the [PyTorch quickstart example](../../../pytorch/README.md).
+
 ## Support Matrix
 
   * FP16
