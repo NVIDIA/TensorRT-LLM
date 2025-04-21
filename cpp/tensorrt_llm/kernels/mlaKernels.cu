@@ -61,24 +61,28 @@ template <typename T>
 struct VecType
 {
     using Type = T;
+    using GPTJEltType = T;
 };
 
 template <>
 struct VecType<float>
 {
     using Type = float4;
+    using GPTJEltType = float2;
 };
 
 template <>
 struct VecType<half>
 {
     using Type = uint4;
+    using GPTJEltType = uint32_t;
 };
 
 template <>
 struct VecType<__nv_bfloat16>
 {
     using Type = mmha::bf16_8_t;
+    using GPTJEltType = __nv_bfloat162;
 };
 
 template <typename T>
@@ -123,31 +127,6 @@ struct setPagedKVKernelTraits
     static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
 };
 
-namespace mla
-{
-
-template <typename T>
-inline __device__ void apply_rotary_embedding_mla(
-    T& q, T q_pair_left, T q_pair_right, T& k, T k_pair_left, T k_pair_right, float2 const& coef)
-{
-    T cos = cuda_cast<T>(coef.x);
-    T sin = cuda_cast<T>(coef.y);
-
-    q = cuda_cast<T>(cuda_cast<float>(cos * q_pair_left)) + cuda_cast<T>(cuda_cast<float>(sin * q_pair_right));
-    k = cuda_cast<T>(cuda_cast<float>(cos * k_pair_left)) + cuda_cast<T>(cuda_cast<float>(sin * k_pair_right));
-}
-
-template <typename T>
-inline __device__ void apply_rotary_embedding_mla(T& q, T q_left, T q_right, float2 const& coef)
-{
-    T cos = cuda_cast<T>(coef.x);
-    T sin = cuda_cast<T>(coef.y);
-
-    q = cuda_cast<T>(cuda_cast<float>(cos * q_left)) + cuda_cast<T>(cuda_cast<float>(sin * q_right));
-}
-
-} // namespace mla
-
 template <typename SrcType, int NUM>
 inline __device__ void quantCopy(
     __nv_fp8_e4m3* dst_global_ptr, SrcType const* src_fragment_ptr, float const scale_val = 1.f)
@@ -186,9 +165,9 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 
     // Constants.
     using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
     constexpr auto HEAD_SIZE = ROPE_DIM;
     constexpr auto K_HEAD_SIZE = K_DIM;
-    constexpr auto HALF_ROTATARY_DIM = ROPE_DIM / 2;
     constexpr auto BYTES_PER_ELT = sizeof(T);
     constexpr auto BYTES_PER_LOAD = 16;
     constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
@@ -208,7 +187,6 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
-        bool const first_half = head_dim_idx < HALF_ROTATARY_DIM;
 
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
@@ -229,41 +207,27 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
             int const global_token_idx = local_token_idx + global_token_offset;
 
             auto const position_id = local_token_idx;
-            auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
             float2 const* rotary_coef_cache_buffer
-                = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
+                = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
             VecT q, k;
-            VecT q_ref[2], k_ref[2];
             auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
             auto const src_q_global_offset
                 = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
 
-            for (int i = 0; i < 2; ++i)
-            {
-                q_ref[i]
-                    = *reinterpret_cast<VecT const*>(&qkv_output[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
-                k_ref[i] = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
-            }
+            q = *reinterpret_cast<VecT const*>(&qkv_output[src_q_global_offset + head_dim_idx]);
+            k = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
 
-            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+            for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
             {
+                GPTJEltT& q_ = reinterpret_cast<GPTJEltT*>(&q)[elt_id];
+                GPTJEltT& k_ = reinterpret_cast<GPTJEltT*>(&k)[elt_id];
+
                 float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                auto& q_ = reinterpret_cast<T*>(&q)[elt_id];
-                auto& k_ = reinterpret_cast<T*>(&k)[elt_id];
-                auto q_left = first_half ? reinterpret_cast<T*>(&q_ref)[elt_id * 2]
-                                         : reinterpret_cast<T*>(&q_ref)[elt_id * 2 + 1];
-                auto q_right = first_half ? reinterpret_cast<T*>(&q_ref)[elt_id * 2 + 1]
-                                          : reinterpret_cast<T*>(&q_ref)[elt_id * 2];
-                auto k_left = first_half ? reinterpret_cast<T*>(&k_ref)[elt_id * 2]
-                                         : reinterpret_cast<T*>(&k_ref)[elt_id * 2 + 1];
-                auto k_right = first_half ? reinterpret_cast<T*>(&k_ref)[elt_id * 2 + 1]
-                                          : reinterpret_cast<T*>(&k_ref)[elt_id * 2];
-                // float2 rotary_coef_cache;
-                // T q_left, q_right, k_left, k_right;
-                mla::apply_rotary_embedding_mla(q_, q_left, q_right, k_, k_left, k_right, rotary_coef_cache);
+                mmha::apply_rotary_embedding_gptj(q_, k_, rotary_coef_cache);
             }
             // do sync
             __syncwarp();
@@ -383,9 +347,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
     // Constants.
     using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
     constexpr auto HEAD_SIZE = ROPE_DIM;
     constexpr auto K_HEAD_SIZE = K_DIM;
-    constexpr auto HALF_ROTATARY_DIM = ROPE_DIM / 2;
     constexpr auto BYTES_PER_ELT = sizeof(T);
     constexpr auto BYTES_PER_LOAD = 16;
     constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
@@ -435,7 +399,6 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
-        bool const first_half = head_dim_idx < HALF_ROTATARY_DIM;
 
         int const seq_len_loop_end = size_t((total_s_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float const quant_scale_q_val = quant_scale_q ? quant_scale_q[0] : 1.0f;
@@ -452,45 +415,33 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             if (valid_token)
             {
-                VecT ref[2];
 
                 auto const position_id = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
-                auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
                 float2 const* rotary_coef_cache_buffer
-                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
+                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx / 2);
 
                 if (head_idx == head_num)
                 {
                     auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
 
-                    for (int i = 0; i < 2; ++i)
-                    {
-                        ref[i] = *reinterpret_cast<VecT const*>(
-                            &fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
-                    }
+                    data = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
                 }
                 else
                 {
                     auto const src_q_global_offset
                         = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
 
-                    for (int i = 0; i < 2; ++i)
-                    {
-                        ref[i]
-                            = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
-                    }
+                    data = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + head_dim_idx]);
                 }
 
-                for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                // Pack two elements into one for gptj rotary embedding.
+#pragma unroll
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC / 2; elt_id++)
                 {
+                    GPTJEltT& data_ = reinterpret_cast<GPTJEltT*>(&data)[elt_id];
+
                     float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                    rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                    auto& data_ = reinterpret_cast<T*>(&data)[elt_id];
-                    auto data_left = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2]
-                                                : reinterpret_cast<T*>(&ref)[elt_id * 2 + 1];
-                    auto data_right = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2 + 1]
-                                                 : reinterpret_cast<T*>(&ref)[elt_id * 2];
-                    mla::apply_rotary_embedding_mla(data_, data_left, data_right, rotary_coef_cache);
+                    data_ = mmha::rotary_embedding_transform(data_, rotary_coef_cache);
                 }
             }
 
