@@ -44,24 +44,22 @@ python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --mo
 ## Supported Models
 | Architecture | Model | HuggingFace Example | Modality |
 |--------------|-------|---------------------|----------|
-| `BertForSequenceClassification` | BERT-based | `textattack/bert-base-uncased-yelp-polarity` | L |
-| `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3 `| L |
-| `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + V |
-| `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + V |
-| `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
-| `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L |
-| `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |
-| `MixtralForCausalLM` | Mixtral | `mistralai/Mixtral-8x7B-v0.1` | L |
-| `MllamaForConditionalGeneration` | Llama 3.2 | `meta-llama/Llama-3.2-11B-Vision` | L |
-| `NemotronForCausalLM` | Nemotron-3, Nemotron-4, Minitron | `nvidia/Minitron-8B-Base` | L |
-| `NemotronNASForCausalLM` | LLamaNemotron  | `nvidia/Llama-3_1-Nemotron-51B-Instruct` | L |
-| `NemotronNASForCausalLM` | LlamaNemotron Super | `nvidia/Llama-3_3-Nemotron-Super-49B-v1` | L |
-| `NemotronNASForCausalLM` | LlamaNemotron Ultra | `nvidia/Llama-3_1-Nemotron-Ultra-253B-v1` | L |
-| `Qwen2ForCausalLM` | QwQ, Qwen2 | `Qwen/Qwen2-7B-Instruct` | L |
-| `Qwen2ForProcessRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-PRM-7B` | L |
-| `Qwen2ForRewardModel` | Qwen2-based | `Qwen/Qwen2.5-Math-RM-72B` | L |
-| `Qwen2VLForConditionalGeneration` | Qwen2-VL | `Qwen/Qwen2-VL-7B-Instruct` | L + V |
-| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | `Qwen/Qwen2.5-VL-7B-Instruct` | L + V |
+| `BertForSequenceClassification` | BERT-based | ex. `textattack/bert-base-uncased-yelp-polarity` | L |
+| `DeepseekV3ForCausalLM` | DeepSeek-V3 | ex. `deepseek-ai/DeepSeek-V3 `| L |
+| `LlavaLlamaModel` | VILA | ex. `Efficient-Large-Model/NVILA-8B` | L + V |
+| `LlavaNextForConditionalGeneration` | LLaVA-NeXT | ex. `llava-hf/llava-v1.6-mistral-7b-hf` | L + V |
+| `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | ex. `meta-llama/Meta-Llama-3.1-70B` | L |
+| `Llama4ForConditionalGeneration` | Llama 4 | ex. `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L |
+| `MistralForCausalLM` | Mistral | ex. `mistralai/Mistral-7B-v0.1` | L |
+| `MixtralForCausalLM` | Mixtral | ex. `mistralai/Mixtral-8x7B-v0.1` | L |
+| `MllamaForConditionalGeneration` | Llama 3.2 | ex. `meta-llama/Llama-3.2-11B-Vision` | L |
+| `NemotronForCausalLM` | Nemotron-3, Nemotron-4, Minitron | ex. `nvidia/Minitron-8B-Base` | L |
+| `NemotronNASForCausalLM` | LLamaNemotron (Super, Ultra, ++)  | ex. `nvidia/Llama-3_1-Nemotron-51B-Instruct`, `nvidia/Llama-3_3-Nemotron-Super-49B-v1`, `nvidia/Llama-3_1-Nemotron-Ultra-253B-v1` | L |
+| `Qwen2ForCausalLM` | QwQ, Qwen2 | ex. `Qwen/Qwen2-7B-Instruct` | L |
+| `Qwen2ForProcessRewardModel` | Qwen2-based | ex. `Qwen/Qwen2.5-Math-PRM-7B` | L |
+| `Qwen2ForRewardModel` | Qwen2-based | ex. `Qwen/Qwen2.5-Math-RM-72B` | L |
+| `Qwen2VLForConditionalGeneration` | Qwen2-VL | ex. `Qwen/Qwen2-VL-7B-Instruct` | L + V |
+| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | ex. `Qwen/Qwen2.5-VL-7B-Instruct` | L + V |
 
 Note:
 - L: Language only
