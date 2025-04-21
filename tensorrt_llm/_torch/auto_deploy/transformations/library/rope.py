@@ -5,10 +5,11 @@ to identify and replace RoPE subgraphs with a custom op (`torch.ops.rope.flashin
 Supported RoPE variants:
 
 1. Explicit Cos/Sin Multiplication (HF-style, e.g., LLaMA, Mixtral, Qwen)
-   - Input layout: [B, N, S, D] (non-interleaved)
+   - Input layout: non-interleaved, [B, N, S, D] with unsqueeze_dim=1 and
+        [B, S, N, D] with unsqueeze_dim=2, default is [B, N, S, D]
    - Frequencies are provided as separate `cos` and `sin` tensors of shape [B, S, head_dim].
    - Source code:
-       def rotate_half(x):
+        def rotate_half(x):
             x1 = x[..., : x.shape[-1] // 2]
             x2 = x[..., x.shape[-1] // 2 :]
             return torch.cat((-x2, x1), dim=-1)
@@ -20,11 +21,11 @@ Supported RoPE variants:
             k_embed = (k * cos) + (rotate_half(k) * sin)
             return q_embed, k_embed
 
-2. Complex Multiplication (GPTJ/LLaMA4-style, interleaved)
-   - Input layout: [B, S, N, D] or [B*S, N, D] (interleaved)
+2. Complex Multiplication (GPTJ/Llama-stack-style, interleaved)
+   - Input layout: [B, S, N, D] (interleaved)
    - Frequencies are combined into a single complex-valued tensor `freqs_cis` of shape [B, S, head_dim // 2].
    - Source code:
-       def apply_rotary_emb(
+        def apply_rotary_emb(
             xq: torch.Tensor,
             xk: torch.Tensor,
             freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2)
