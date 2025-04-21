@@ -837,6 +837,12 @@ class PyExecutor:
                         "fail to schedule any pending request, "
                         "probably run out of resource.")
 
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
                 self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
