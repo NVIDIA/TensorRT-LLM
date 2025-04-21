@@ -41,22 +41,24 @@ from transformers import PretrainedConfig
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, allgather)
 from ..model_config import ModelConfig
-from ..models.modeling_utils import ModelConfig
+from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.moe_load_balancer import MoeLoadBalancer
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -148,6 +150,111 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
+class DeepseekV3Linear(Linear):
+    """
+    A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        dtype: torch.dtype = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,  # COLUMN parallel only
+        quant_config: Optional[QuantConfig] = None,
+        weights_loading_config: Optional[WeightsLoadingConfig] = None,
+        reduce_output: bool = True,  # ROW parallel only
+        skip_create_weights_in_init: bool = False,
+        use_custom_cublas_mm: bool = False,
+        lora: Optional[LoraLayer] = None,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias,
+            dtype,
+            mapping,
+            tensor_parallel_mode,
+            gather_output,
+            quant_config,
+            weights_loading_config,
+            reduce_output,
+            skip_create_weights_in_init,
+            use_custom_cublas_mm,
+            lora,
+        )
+
+    def apply_linear(self,
+                     input,
+                     weight,
+                     bias,
+                     lora_params: Optional[dict] | None = None,
+                     layer_idx: Optional[int] | None = None) -> torch.Tensor:
+        if self.has_any_quant:
+            qc = self.quant_config
+            if self.has_fp8_qdq:
+                cur_input_scale = self.input_scale
+                if input.dtype != torch.float8_e4m3fn:
+                    if self.input_scale is not None:
+                        # Static quantization
+                        qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                            input, self.input_scale)
+                    else:
+                        # Dynamic quantization
+                        qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                            input)
+                        cur_input_scale = cur_input_scale.to(torch.float32)
+                else:
+                    qinput = input
+                # This op does not support bias now.
+                output = torch.ops.trtllm.cublas_scaled_mm(
+                    qinput,
+                    weight.t(),
+                    scale_a=cur_input_scale,
+                    scale_b=self.weight_scale,
+                    bias=None,
+                    out_dtype=self.dtype or input.dtype,
+                )
+                if bias is not None:
+                    output = output + bias
+            elif self.has_fp8_block_scales:
+                if input.dtype == torch.float8_e4m3fn:
+                    input = input.to(torch.bfloat16) * self.input_scale
+                assert input.dtype == torch.bfloat16
+
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
+
+                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                    act_input_fp8, self.weight, act_input_sf, self.weight_scale)
+                if bias is not None:
+                    output = output + bias
+            elif self.has_nvfp4:
+                if isinstance(input, Fp4QuantizedTensor):
+                    act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+                else:
+                    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                        input, self.input_scale, self.scaling_vector_size,
+                        False)
+
+                output = torch.ops.trtllm.nvfp4_gemm(act_fp4, self.weight,
+                                                     act_sf, self.weight_scale,
+                                                     self.alpha, False,
+                                                     self.dtype)
+                if bias is not None:
+                    output = output + bias
+            else:
+                # TODO(zhenhuanc): support other quant mode
+                raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
+        else:
+            output = torch.ops.trtllm.dsv3_fused_a_gemm_op(
+                input, self.weight.t(), bias, None)
+        return output
+
+
 class DeepseekV3Attention(MLA):
 
     def __init__(
@@ -178,6 +285,16 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream)
+        self.fused_a = DeepseekV3Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim +
+            (self.q_lora_rank if not self.is_lite else 0),
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.
+            skip_create_weights_in_init,
+            use_custom_cublas_mm=True)
 
 
 class Deepseekv3RoutingImpl():
@@ -302,11 +419,10 @@ class DeepseekV3Gate(DeepSeekV3MoeRoutingMethod):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router gemm
-        logits = torch.ops.trtllm.cublas_mm(hidden_states,
-                                            self.weight.t(),
-                                            bias=None,
-                                            out_dtype=torch.float32)
+        logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
+                                                      self.weight.t(),
+                                                      bias=None,
+                                                      out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -516,8 +632,8 @@ class Deepseekv3MoE(nn.Module):
                 cutlass_min_latency_mode)
             return routed_output
 
-        shared_output, routed_output = maybe_execute_in_parallel(
-            _compute_shared_output, _compute_routed_output,
+        routed_output, shared_output = maybe_execute_in_parallel(
+            _compute_routed_output, _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared], self.aux_stream)
 
@@ -764,6 +880,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         eps=self.post_attention_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 # No fusion
@@ -780,6 +897,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
+                        trigger_completion_at_end=False,
                     ))
             else:
                 if self.next_layer_layernorm is not None:
