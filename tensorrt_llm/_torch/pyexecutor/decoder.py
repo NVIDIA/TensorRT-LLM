@@ -420,7 +420,7 @@ class TRTLLMDecoder(Decoder):
         self._instantiate_algorithms()
 
     def _initialize_store(self):
-        torch_stream = torch.cuda.Stream()
+        torch_stream = torch.cuda.current_stream()
         cuda_stream = CudaStream(torch_stream.cuda_stream)
         buffer_manager = BufferManager(stream=cuda_stream)
 
@@ -479,12 +479,10 @@ class TRTLLMDecoder(Decoder):
         self.algs.update_decoder_buffers = UpdateDecoderBuffers()
 
     def setup_decoder_step(self, requests):
-        self.store["torch_stream"].wait_stream(torch.cuda.current_stream())
-        with torch.inference_mode():
-            batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
-                self.model_config, self.world_config, self.decoding_config,
-                requests, self.store["buffer_manager"], self.logits_datatype,
-                self.store["decoder_input_buffers"])
+        batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(
+            self.model_config, self.world_config, self.decoding_config,
+            requests, self.store["buffer_manager"], self.logits_datatype,
+            self.store["decoder_input_buffers"])
 
         if len(decoder_requests):
             self.algs.create_new_decoder_requests(
@@ -512,32 +510,29 @@ class TRTLLMDecoder(Decoder):
 
         self.setup_decoder_step(scheduled_requests.context_requests)
 
-        with torch.inference_mode():
-            # Note: In runtimeBuffers.cpp, num_context_logits is set to:
-            #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
-            # Revisit this when we support chunked context.
-            num_context_logits = [1] * self.batch_size
-            logits_index = self.algs.handle_context_logits(
-                scheduled_requests.context_requests, num_context_logits, logits,
-                self.store["decoder_buffers"], self.model_config,
-                self.store["buffer_manager"], self.store["cuda_stream"])
+        # Note: In runtimeBuffers.cpp, num_context_logits is set to:
+        #       numContextLogits.at(batchIdx) = modelConfig.computeContextLogits() ? contextChunkSize : 1;
+        # Revisit this when we support chunked context.
+        num_context_logits = [1] * self.batch_size
+        logits_index = self.algs.handle_context_logits(
+            scheduled_requests.context_requests, num_context_logits, logits,
+            self.store["decoder_buffers"], self.model_config,
+            self.store["buffer_manager"], self.store["cuda_stream"])
 
-            self.algs.handle_generation_logits(
-                logits_index, scheduled_requests.generation_requests,
-                self.store["decoder_buffers"], self.model_config,
-                self.store["buffer_manager"], logits)
+        self.algs.handle_generation_logits(
+            logits_index, scheduled_requests.generation_requests,
+            self.store["decoder_buffers"], self.model_config,
+            self.store["buffer_manager"], logits)
 
-            decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
-                scheduled_requests.context_requests,
-                scheduled_requests.generation_requests,
-                self.store["decoder_buffers"],
-                self.store["decoder_input_buffers"],
-                self.algs.decoder.decoder_state, self.model_config,
-                self.max_num_sequences, self.beam_width,
-                self.store["buffer_manager"], self.store["cuda_stream"])
+        decoding_input, self.decoding_output = self.algs.make_decoding_batch_input_output(
+            scheduled_requests.context_requests,
+            scheduled_requests.generation_requests,
+            self.store["decoder_buffers"], self.store["decoder_input_buffers"],
+            self.algs.decoder.decoder_state, self.model_config,
+            self.max_num_sequences, self.beam_width,
+            self.store["buffer_manager"], self.store["cuda_stream"])
 
-            self.algs.decoder.forward_async(self.decoding_output,
-                                            decoding_input)
+        self.algs.decoder.forward_async(self.decoding_output, decoding_input)
 
         # NOTE: The following code prepares a new_tokens_device_tensor in accordance with the
         #       current implementation of model_engine.
@@ -563,8 +558,6 @@ class TRTLLMDecoder(Decoder):
         # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
         #       It's still not understood why.
         # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
-
-        torch.cuda.current_stream().wait_stream(self.store["torch_stream"])
 
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
