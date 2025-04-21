@@ -37,6 +37,9 @@ public:
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
         = 0;
 
+    /// @brief After changing the reuse tree we have to update the internal state because the block may no longer be a leaf.
+    virtual void processAddChild(BlockPtr block) = 0;
+
     /// @brief Get a free block from the specified cache level
     /// @returns The pointer to the free block, along with whether it can be offloaded
     virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel) = 0;
@@ -91,10 +94,8 @@ public:
 
     bool verifyQueueIntegrity() override;
 
+    void processAddChild(BlockPtr block) override;
 private:
-    // Check if the block should be added to mFreeQueues.
-    bool isReleasedLeafBlock(BlockPtr const& block);
-
     // Queues of available leaf blocks, split by cache level and priority level
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
     // All blocks that have been released, along with the amount of released children
