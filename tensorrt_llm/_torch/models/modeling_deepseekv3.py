@@ -1,3 +1,30 @@
+# --------------------------------------------------
+# Portions of this code were derived from DeepSeek‑V3:
+#   https://github.com/deepseek-ai/DeepSeek-V3
+#
+# MIT License
+
+# Copyright (c) 2023 DeepSeek
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# --------------------------------------------------
+
 import math
 import os
 import warnings
@@ -5,6 +32,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -31,6 +60,63 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
+
+
+@triton.jit
+def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    """
+    Dequantizes weights using the provided scaling factors and stores the result.
+
+    Args:
+        x_ptr (tl.pointer): Pointer to the quantized weights.
+        s_ptr (tl.pointer): Pointer to the scaling factors.
+        y_ptr (tl.pointer): Pointer to the output buffer for dequantized weights.
+        M (int): Number of rows in the weight matrix.
+        N (int): Number of columns in the weight matrix.
+        BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n = tl.cdiv(N, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(s_ptr + pid_m * n + pid_n)
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def weight_dequant(x: torch.Tensor,
+                   s: torch.Tensor,
+                   block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
+
+    Args:
+        x (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s (torch.Tensor): The scale tensor of shape (M, N).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
+    """
+    assert x.is_contiguous() and s.is_contiguous(
+    ), 'Input tensors must be contiguous'
+    assert x.dim() == 2 and s.dim() == 2, 'Input tensors must have 2 dimensions'
+    M, N = x.size()
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']),
+                         triton.cdiv(N, meta['BLOCK_SIZE']))
+    weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    return y
 
 
 class DeepseekV3MTPHead(nn.Module):
@@ -184,13 +270,20 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
         dtype: Optional[torch.dtype] = None,
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
+        moe_backend: str = 'CUTLASS',
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
+        self.moe_backend = moe_backend
+        if moe_backend == 'TRTLLM':
+            bias_dtype = torch.bfloat16
+        else:
+            bias_dtype = torch.float32
+
         self.e_score_correction_bias = nn.Parameter(torch.empty(
-            (num_experts), dtype=torch.float32),
+            (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
 
         assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
@@ -219,7 +312,8 @@ class DeepseekV3Gate(BaseMoeRoutingMethod):
         self.weight.copy_(weights[0]["weight"][:])
 
         self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(torch.float32))
+            weights[0]["e_score_correction_bias"][:].to(
+                self.e_score_correction_bias.dtype))
 
     def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # topk routing
@@ -260,7 +354,8 @@ class Deepseekv3MoE(nn.Module):
             routed_scaling_factor=config.routed_scaling_factor,
             dtype=dtype,
             fuse_routing_kernel=True,
-            apply_routing=False)
+            apply_routing=False,
+            moe_backend=model_config.moe_backend)
         self.experts = FusedMoE(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -408,6 +503,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
         super().__init__()
+        self.model_config = model_config
         config = model_config.pretrained_config
         self.hidden_size = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -556,7 +652,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         min_latency_mode = True if hidden_states.size(
             0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
+        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS' else False
 
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
@@ -1084,6 +1180,52 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
             return kv_b_proj, k_nope_weight_trans
 
+        def check_weight_dtype(module_name: str, dtype):
+            weight_name = "weight"
+            w_dtype = weights[f"{module_name}.{weight_name}"].dtype
+            return w_dtype == dtype
+
+        def load_kv_b_proj_and_k_b_proj_trans_dequant(
+                module_name: str) -> torch.Tensor:
+            weight_name = "weight"
+            local_qk_nope_head_dim = qk_nope_head_dim
+            local_v_head_dim = v_head_dim
+            local_kv_lora_rank = kv_lora_rank
+
+            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
+
+            weight_name = "weight_scale_inv"
+            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
+
+            kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
+            kv_b_proj = kv_b_proj.unflatten(
+                0,
+                [
+                    num_heads,
+                    local_qk_nope_head_dim + local_v_head_dim,
+                ],
+            )
+            if not self.model_config.mapping.enable_attention_dp:
+                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [local_qk_nope_head_dim, local_v_head_dim],
+                dim=1,
+            )
+            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
+            local_num_heads = num_heads // weight_divisor
+
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
+
+            kv_b_proj = torch.concat([
+                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
+                                      local_kv_lora_rank),
+                v_weight.reshape(local_num_heads * local_v_head_dim,
+                                 local_kv_lora_rank)
+            ],
+                                     dim=0)
+
+            return kv_b_proj, k_nope_weight_trans
+
         def split_kv_b_proj(kv_b_proj: torch.Tensor,
                             is_scale: bool) -> torch.Tensor:
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
@@ -1129,8 +1271,15 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
                 if names[-1] == "kv_b_proj":
-                    kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
-                        name, is_scale=False)
+                    # TODO: remove weight_dequant after enabling fp8_bmm
+                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
+                        names[-1])
+                    if dequant_kv_b_proj:
+                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
+                            name)
+                    else:
+                        kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
+                            name, is_scale=False)
                     module.weight.data.copy_(
                         kv_b_proj.reshape(module.weight.shape))
 
@@ -1144,7 +1293,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         k_b_proj_trans.reshape(
                             attn_module.k_b_proj_trans.shape))
 
-                    if getattr(module, "weight_scale", None) is not None:
+                    if getattr(module, "weight_scale",
+                               None) is not None and not dequant_kv_b_proj:
                         kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
                             name, is_scale=True)
                         module.weight_scale.copy_(

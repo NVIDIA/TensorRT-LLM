@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #pragma once
 
 #include "Dtype.h"
+#include "SfLayout.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cutlass/cutlass.h>
@@ -151,11 +152,12 @@ struct Data
     float* inDqSfsPtr = nullptr;
     float* outDqSfsPtr = nullptr;
 
-    int32_t* permutedIdxToExpandedIdx;
-
     int32_t innerDim;
-    int32_t outerDim;
-    int32_t totalNumPaddedTokens;
+    int32_t numTokens;
+    int32_t topK;
+    int32_t* expandedIdxToPermutedIdx;
+
+    int32_t const* totalNumPaddedTokens;
 };
 
 template <typename Type_, bool UsePdl_>
@@ -170,11 +172,12 @@ struct KernelParams
     float* inDqSfsPtr = nullptr;
     float* outDqSfsPtr = nullptr;
 
-    int32_t* permutedIdxToExpandedIdx;
-
     int32_t innerDim;
-    int32_t outerDim;
-    int32_t totalNumPaddedTokens;
+    int32_t numTokens;
+    int32_t topK;
+    int32_t* expandedIdxToPermutedIdx;
+
+    int32_t const* totalNumPaddedTokens;
 
     static KernelParams setKernelParams(Data const& data)
     {
@@ -185,10 +188,11 @@ struct KernelParams
         params.inDqSfsPtr = data.inDqSfsPtr;
         params.outDqSfsPtr = data.outDqSfsPtr;
 
-        params.permutedIdxToExpandedIdx = data.permutedIdxToExpandedIdx;
+        params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
 
         params.innerDim = data.innerDim;
-        params.outerDim = data.outerDim;
+        params.numTokens = data.numTokens;
+        params.topK = data.topK;
         params.totalNumPaddedTokens = data.totalNumPaddedTokens;
 
         return params;
@@ -198,6 +202,61 @@ struct KernelParams
 void run(Data const& data, void* stream);
 
 } // namespace activation
+
+namespace convertsf
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace tg = trtllm::gen;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Data
+{
+    bool mUsePdl{false};
+
+    void* inSfPtr = nullptr;
+    void* outSfPtr = nullptr;
+    int32_t hiddenDimSf;
+    int32_t numTokens;
+    tg::SfLayout sfLayoutSrc;
+    tg::SfLayout sfLayoutDst;
+};
+
+template <typename Type_, bool UsePdl_>
+struct KernelParams
+{
+    using Type = Type_;
+    static constexpr bool UsePdl = UsePdl_;
+
+    void const* inSfPtr = nullptr;
+    void* outSfPtr = nullptr;
+    int32_t hiddenDimSf;
+    int32_t numTokens;
+    tg::SfLayout sfLayoutSrc;
+    tg::SfLayout sfLayoutDst;
+
+    static KernelParams setKernelParams(Data const& data)
+    {
+        KernelParams params;
+
+        params.inSfPtr = data.inSfPtr;
+        params.outSfPtr = data.outSfPtr;
+        params.hiddenDimSf = data.hiddenDimSf;
+        params.numTokens = data.numTokens;
+        params.sfLayoutSrc = data.sfLayoutSrc;
+        params.sfLayoutDst = data.sfLayoutDst;
+
+        return params;
+    }
+};
+
+void run(Data const& data, void* stream);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace convertsf
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -224,7 +283,7 @@ struct Data
     int32_t hiddenDim;
     int32_t numTokens;
     int32_t topK;
-    int32_t totalNumPaddedTokens;
+    int32_t const* totalNumPaddedTokens;
 };
 
 template <typename Type_, bool UsePdl_>
@@ -241,7 +300,7 @@ struct KernelParams
     int32_t hiddenDim;
     int32_t numTokens;
     int32_t topK;
-    int32_t totalNumPaddedTokens;
+    int32_t const* totalNumPaddedTokens;
     bool useDeepSeekFp8;
 
     static KernelParams setKernelParams(Data const& data)
@@ -299,7 +358,7 @@ struct Data
     int32_t numExperts;
     int32_t topK;
     int32_t hiddenDim;
-    int32_t totalNumPaddedTokens;
+    int32_t const* totalNumPaddedTokens;
 };
 
 template <typename Type_, typename TypeExpW_, bool UsePdl_>
@@ -322,7 +381,7 @@ struct KernelParams
     int32_t numTokens;
     int32_t numExperts;
     int32_t topK;
-    int32_t totalNumPaddedTokens;
+    int32_t const* totalNumPaddedTokens;
 
     static KernelParams setKernelParams(Data const& data)
     {
