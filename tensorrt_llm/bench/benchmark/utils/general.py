@@ -22,6 +22,9 @@ _KV_CACHE_MAP = {
     QuantAlgo.NVFP4.value: "fp8",
 }
 
+SUPPORTED_BACKENDS = ["pytorch", "autodeploy", "cpp"]
+PYTHON_SUPPORTED_BACKENDS = ["pytorch", "autodeploy"]
+
 
 def get_settings_from_engine(
     engine_path: Path
