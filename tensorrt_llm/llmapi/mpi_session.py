@@ -1,5 +1,6 @@
 import abc
-import itertools
+import base64
+import json
 import os
 import socket
 import sys
@@ -263,16 +264,26 @@ class RemoteMpiCommSessionClient():
     RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
     '''
 
-    def __init__(self, addr: str, hmac_key: Optional[bytes] = None):
+    def __init__(
+        self,
+        *,
+        addr: Optional[tuple[str, Optional[bytes]]] = None,
+        addr_file: Optional[str] = None,
+    ):
+        '''
+        Args:
+            addr: The address of the remote MPI pool.
+            addr_file: The file to write the address of the remote MPI pool to share with other intra-node processes.
+        '''
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
-        self.addr = addr
+        self._is_shutdown = False
         print_colored_debug(
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
-        self.queue = ZeroMqQueue((addr, hmac_key),
-                                 is_server=False,
-                                 use_hmac_encryption=bool(hmac_key))
-        self._is_shutdown = False
+        self.queue = ZeroMqQueue(addr, is_server=True, use_hmac_encryption=True)
+        self.addr_file = addr_file
+        self.write_address_to_shared_file(
+        )  # for client process to get the address
 
     def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
         if self._is_shutdown:
@@ -280,10 +291,26 @@ class RemoteMpiCommSessionClient():
                 "RemoteMpiCommSessionClient is already shut down\n", "yellow")
             return []
         print_colored_debug(
-            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
+            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.queue.address}\n",
             "yellow")
         self.queue.put(RemoteTask(task, args, kwargs))
         return []
+
+    def write_address_to_shared_file(self):
+        # This file will be deleted when client is destroyed, that is sufficient for client to read it during setup
+        with open(self.addr_file, "w") as f:
+            ip_addr, hmac_key = self.queue.address
+            if hmac_key is not None:
+                hmac_key = base64.b64encode(hmac_key).decode('ascii')
+            json.dump((ip_addr, hmac_key), f)
+
+    @staticmethod
+    def read_address_from_shared_file(path: str):
+        with open(path, "r") as f:
+            ip_addr, hmac_key = json.load(f)
+            if hmac_key is not None:
+                hmac_key = base64.b64decode(hmac_key)
+            return (ip_addr, hmac_key)
 
     def submit_sync(self, task, *args, **kwargs):
         return self.submit(task, *args, **kwargs)
@@ -318,10 +345,9 @@ class RemoteMpiCommSessionServer():
                  is_comm: bool = False):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
-        self.addr = addr
         self.queue = ZeroMqQueue((addr, hmac_key),
-                                 is_server=True,
-                                 use_hmac_encryption=bool(hmac_key))
+                                 use_hmac_encryption=bool(hmac_key),
+                                 is_server=False)
         self.comm = comm
 
         if self.comm is not None:
@@ -334,7 +360,8 @@ class RemoteMpiCommSessionServer():
 
     def serve(self):
         print_colored_debug(
-            f"RemoteMpiCommSessionServer listening on {self.addr}\n", "yellow")
+            f"RemoteMpiCommSessionServer listening on {self.queue.address}\n",
+            "yellow")
         while True:
             message: Optional[RemoteTask] = self.queue.get()
             if message is None:
@@ -345,7 +372,7 @@ class RemoteMpiCommSessionServer():
                 break
             else:
                 print_colored_debug(
-                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task from {self.addr}\n",
+                    f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received task from {self.queue.address}\n",
                     "green")
                 self.session.submit(message.task, *message.args,
                                     **message.kwargs)
@@ -359,54 +386,10 @@ def find_free_port() -> int:
 
 def get_mpi_world_size() -> int:
     # avoid cyclic import
-    from ..executor.utils import get_spawn_proxy_process_env
+    from ..executor.utils import spawn_proxy_process_enabled
 
     # If the proxy process is spawned, the MPI-related env will be cleaned in the proxy process, thus we made another env for the mpi_world_size
-    if get_spawn_proxy_process_env():
+    if spawn_proxy_process_enabled():
         return int(os.getenv("tllm_mpi_size") or 1)
     else:
         return mpi_world_size()
-
-
-def split_mpi_env(mpi_env_keys: List[str] | None = None) -> Tuple[dict, dict]:
-    '''
-    Splits the environment variables into MPI-related and non-MPI-related dictionaries.
-
-    Args:
-        mpi_env_keys: Additional environment variables to be considered as MPI-related.
-
-    Returns:
-        Tuple[dict, dict]: (non_mpi_env, mpi_env)
-            - non_mpi_env: Environment dictionary without MPI-related variables
-            - mpi_env: Environment dictionary containing only MPI-related variables
-    '''
-    current_env = os.environ.copy()
-
-    # Identify MPI-related variables
-    mpi_vars = set(
-        itertools.chain([
-            var for var in current_env if var.startswith((
-                'MPI_',
-                'OMPI_',
-                'PMIX_',
-                'PMI_',
-                'OMPI_',
-                'PMIX_',
-                'PMI_',
-                'SLURM_',
-                'MPI_',
-                'UCX_',
-                'I_MPI_',
-                'HYDRA_',
-                'KMP_',
-                'MPICH_',
-                'MV2_',
-                'CRAY_',
-            ))
-        ], mpi_env_keys or []))
-
-    # Split into two dictionaries
-    non_mpi_env = {k: v for k, v in current_env.items() if k not in mpi_vars}
-    mpi_env = {k: v for k, v in current_env.items() if k in mpi_vars}
-
-    return non_mpi_env, mpi_env

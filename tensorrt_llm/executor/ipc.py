@@ -84,7 +84,9 @@ class ZeroMqQueue:
                 logger.info(f"Generating a new HMAC key for server {self.name}")
                 self.hmac_key = os.urandom(32)
 
-            self.address = (self.address_endpoint, self.hmac_key)
+    @property
+    def address(self) -> tuple[str, Optional[bytes]]:
+        return self.address_endpoint, self.hmac_key
 
     def setup_lazily(self):
         if self._setup_done:
