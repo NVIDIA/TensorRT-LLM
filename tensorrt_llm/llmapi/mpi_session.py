@@ -302,7 +302,7 @@ class RemoteMpiCommSessionClient(MpiSession):
         ''' Submit a task to the remote MPI pool and wait for task completion. '''
         self.submit(task, *args, sync=True, **kwargs)
 
-        while not (res := self.poll() or self._is_shutdown):
+        while not ((res := self.poll()) or self._is_shutdown):
             print_colored_debug(f"Waiting for task completion... {res}\n",
                                 "grey")
             time.sleep(self.SYNC_IDLE_INTERVAL)
