@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import functools
 import os
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
@@ -17,14 +18,24 @@ PERIODICAL_RESP_IN_AWAIT = os.getenv(
     "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT") == "1"
 
 
-def get_spawn_proxy_process_ipc_addr_env() -> str | None:
-    ''' Get the IPC address for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
+def get_spawn_proxy_process_ipc_address_file_env() -> str | None:
+    ''' Get the IPC address file for the spawn proxy process dynamically. '''
+    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_ADDR_FILE")
 
 
-def get_spawn_proxy_process_env() -> bool:
+def spawn_proxy_process_enabled() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
+    return get_spawn_proxy_process_ipc_address_file_env() is not None
+
+
+@functools.lru_cache(maxsize=1)
+def get_spawn_proxy_process_ipc_addr() -> tuple[str, Optional[bytes]] | None:
+    ''' Get the IPC address for the spawn proxy process dynamically. '''
+    address_file = get_spawn_proxy_process_ipc_address_file_env()
+    if not address_file:
+        raise ValueError("TLLM_SPAWN_PROXY_PROCESS_ADDR_FILE is not set.")
+    return RemoteMpiCommSessionClient.read_address_from_shared_file(
+        address_file)
 
 
 if PERIODICAL_RESP_IN_AWAIT:
@@ -35,18 +46,9 @@ def create_mpi_comm_session(
         n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
     assert mpi_rank(
     ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
-    if get_spawn_proxy_process_env():
-        assert get_spawn_proxy_process_ipc_addr_env(
-        ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
-        print_colored_debug(
-            f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
-            "yellow")
-        hmac_key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
-        # Convert the hex string to bytes
-        if hmac_key is not None:
-            hmac_key = bytes.fromhex(hmac_key)
+    if spawn_proxy_process_enabled():
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
+            addr_file=get_spawn_proxy_process_ipc_address_file_env(), )
     else:
         print_colored_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
