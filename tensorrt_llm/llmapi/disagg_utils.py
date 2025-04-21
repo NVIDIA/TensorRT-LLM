@@ -45,6 +45,13 @@ class DisaggServerConfig():
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
 
 
+@dataclass
+class MetadataServerConfig():
+    server_type: Literal['etcd']
+    hostname: str = "localhost"
+    port: int = 2379
+
+
 def parse_disagg_config_file(yaml_config_file: str):
 
     with open(yaml_config_file, 'r') as file:
@@ -220,3 +227,14 @@ def split_world_comm(
     )
 
     return is_leader, instance_idx, sub_comm
+
+
+def parse_metadata_server_config_file(
+    metadata_server_config_file: Optional[str]
+) -> Optional[MetadataServerConfig]:
+    if metadata_server_config_file is None:
+        return None
+
+    with open(metadata_server_config_file, 'r') as file:
+        config = yaml.safe_load(file)
+        return MetadataServerConfig(**config)
