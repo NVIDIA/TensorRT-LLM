@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@
 
 //// FIX
 #include "DtypeDecl.h" // #include <trtllm/gen/DtypeDecl.h>
-#define TLLM_ENABLE_CUDA
 
+#include <cassert>
 #include <iostream>
 
+#define TLLM_ENABLE_CUDA
 #ifdef TLLM_ENABLE_CUDA
 #include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/half.h>
 #endif
 
 namespace gemm
@@ -40,7 +39,7 @@ namespace tg = trtllm::gen;
 #ifdef TLLM_ENABLE_CUDA
 
 inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
-    std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr)
+    std::vector<uint64_t> const& strides, int32_t tileSizeMn, int32_t tileSizeK, void* gmemAddr, bool doSwizzle = true)
 {
     CUtensorMap desc{};
     // The data type.
@@ -72,24 +71,27 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
     }
 
     // The swizzle type.
-    CUtensorMapSwizzle swizzleType;
+    CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
     int32_t tileKSizeInBytes = (tileSizeK * tg::dtypeGetNumBits(dtype)) / /* bits */ 8;
-    if ((tileKSizeInBytes % 128) == 0)
+    if (doSwizzle)
     {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
-    }
-    else if ((tileKSizeInBytes % 64) == 0)
-    {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
-    }
-    else if ((tileKSizeInBytes % 32) == 0)
-    {
-        swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-    }
-    else
-    {
-        std::cerr << "Unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
-        assert(false);
+        if ((tileKSizeInBytes % 128) == 0)
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
+        }
+        else if ((tileKSizeInBytes % 64) == 0)
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
+        }
+        else if ((tileKSizeInBytes % 32) == 0)
+        {
+            swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
+        }
+        else
+        {
+            std::cerr << "Unexpected tileKSizeInBytes " << tileKSizeInBytes << std::endl;
+            assert(false);
+        }
     }
 
     // Check gmem address must be 16B-aligned

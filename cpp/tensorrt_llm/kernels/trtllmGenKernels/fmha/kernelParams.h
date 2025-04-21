@@ -24,7 +24,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"

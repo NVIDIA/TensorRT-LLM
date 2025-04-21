@@ -553,6 +553,14 @@ public:
         return mTokens.at(beam);
     }
 
+    /// @brief Get mutable reference to tokens for a specific beam
+    /// @param beam The beam index
+    /// @return Mutable reference to the tokens vector
+    [[nodiscard]] VecTokens& getTokensMutable(SizeType32 beam)
+    {
+        return mTokens.at(beam);
+    }
+
     /// @brief Get all tokens (input+output) for all beams
     /// @return A vector of vector of tokens.
     [[nodiscard]] BeamTokens const& getTokens() const
@@ -1771,6 +1779,9 @@ public:
     SizeType32 mMaskPosition{0};
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
+
+    // current position of the prompt tuning table (only used in chunked prefill mode)
+    SizeType32 mPtableCurrentPosition{0};
 
 protected:
     bool mIsStreaming;

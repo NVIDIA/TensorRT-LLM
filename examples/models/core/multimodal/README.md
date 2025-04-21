@@ -24,6 +24,7 @@ We first describe three runtime modes for running multimodal models and how to r
 - [Video NeVA](#video-neva)
 - [Dataset Evaluation](#dataset-evaluation)
 - [Enabling Tensor Parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
+- [Enabling Embedding Table Offloading](#enabling-embedding-table-offloading)
 
 ## Runtime Modes
 TensorRT-LLM supports three runtime modes for running multimodal models.
@@ -1176,3 +1177,16 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/2-gpu \
     ```
+## Enabling Embedding Table Offloading
+
+Embedding Table Offloading is a memory optimization technique that helps manage large embedding tables more efficiently. It offloads the embedding table to CPU memory and uses a chunked prefetching mechanism during processing. This approach is only available when operating in context chunk mode.
+
+To enable this feature, use the `--mm_embedding_offloading` argument:
+```bash
+python run.py \
+    --enable_chunked_context \
+    --mm_embedding_offloading true \
+    --hf_model_dir ${HF_MODEL_PATH} \
+    --engine_dir ${ENGINE_PATH}
+```
+When not explicitly specified, this feature automatically enables if you're using a multimodal model along with context chunking enabled.

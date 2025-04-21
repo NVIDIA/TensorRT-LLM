@@ -81,6 +81,13 @@ def add_common_args(parser):
         help='Enables chunked context (only available with cpp session).',
     )
     parser.add_argument(
+        '--mm_embedding_offloading',
+        type=lambda s: s.lower() == "true",
+        default=None,
+        help=
+        'Enable position table offloading. When not specified, defaults to True if using a multimodal model with chunked context.'
+    )
+    parser.add_argument(
         '--session',
         default='cpp_llm_only',
         type=str,
