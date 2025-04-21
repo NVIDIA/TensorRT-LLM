@@ -313,7 +313,9 @@ class Linear(nn.Module):
                      input,
                      weight,
                      bias,
-                     inv_input_scale: Optional[torch.Tensor] = None):
+                     inv_input_scale: Optional[torch.Tensor] = None,
+                     position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
         if self.has_any_quant:
             qc = self.quant_config
             if self.has_fp8_qdq:
@@ -328,6 +330,7 @@ class Linear(nn.Module):
                         qinput,
                         weight.t(),
                         self.combined_scale,
+                        position_ids,
                     )
                 elif self.use_llama4_fc_swiglu and inv_input_scale is not None:
                     output = torch.ops.trtllm.llama4_fc_swiglu_fp8(
@@ -402,6 +405,7 @@ class Linear(nn.Module):
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         inv_input_scale: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         from ..distributed import allgather
 
@@ -432,11 +436,15 @@ class Linear(nn.Module):
                 # Caller (gated_mlp.py) guards the feeding of inv_input_scale with
                 # "if self.is_llama4 and self.down_proj.has_fp8_qdq and x.shape[0] <= 4".
                 # If the statement is not satisfied, inv_input_scale is None.
-
                 output = self.apply_linear(input,
                                            self.weight,
                                            self.bias,
                                            inv_input_scale=inv_input_scale)
+            elif self.use_llama4_qkv and position_ids is not None:
+                output = self.apply_linear(input,
+                                           self.weight,
+                                           self.bias,
+                                           position_ids=position_ids)
             else:
                 output = self.apply_linear(input, self.weight, self.bias)
             if self.parallel_config.gather_output:

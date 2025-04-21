@@ -194,7 +194,15 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        num_tokens = hidden_states.size(0)
+        if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 4:
+            assert position_ids is not None, "attn_temperature_tuning requires position_ids"
+            assert self.floor_scale == 8192.0 and self.attn_scale == 0.1, "floor_scale and attn_scale should be 8192.0 and 0.1"
+            qkv = self.qkv_proj(hidden_states,
+                                position_ids=position_ids)
+        else:
+            qkv = self.qkv_proj(hidden_states)
+
         is_fused_qkv = False
         if isinstance(self.attn, TrtllmAttention):
             is_fused_qkv = True
@@ -231,7 +239,7 @@ class Attention(nn.Module):
                 k = self.qk_norm(k).reshape(-1, self.kv_size)
             qkv = torch.concat([q, k, v], dim=-1)
 
-        if self.attn_temperature_tuning:
+        if self.attn_temperature_tuning and (not self.qkv_proj.use_llama4_qkv or num_tokens > 4):
             # this must be a nope layer
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
