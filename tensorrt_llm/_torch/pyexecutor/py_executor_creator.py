@@ -143,7 +143,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         if executor_config.kv_cache_config.enable_block_reuse and not (
                 is_sm90() or is_sm100()):
             logger.warning(
-                f"KV cache reuse for MLA only can be enabled on Hopper/Blackwell, change enable_block_reuse to False"
+                f"KV cache reuse for MLA only can be enabled on SM90/SM100, change enable_block_reuse to False"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
         executor_config.enable_chunked_context = False
