@@ -2,9 +2,6 @@ import pytest
 from test_llm import (global_kvcache_config,
                       tinyllama_guided_decoding_test_harness)
 
-# isort: off
-# isort: on
-
 
 @pytest.mark.gpu4
 def test_tinyllama_guided_decoding_tp2pp2_pytorch():
