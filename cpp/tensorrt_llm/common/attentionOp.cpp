@@ -915,7 +915,8 @@ int AttentionOp::mlaGeneration(
     params.quant_scale_kv = generation_params.kv_scale_orig_quant;
     params.dequant_scale_q = generation_params.kv_scale_quant_orig;
     params.dequant_scale_kv = generation_params.kv_scale_quant_orig;
-    params.host_bmm1_scale = 1 / (sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
+    params.host_bmm1_scale
+        = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
 
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
     sync_check_cuda_error(stream);
@@ -1001,9 +1002,13 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.mSfStartTokenIdx = generation_params.start_token_idx_sf;
 
         // Scales for quantization
-        static constexpr int bmm1_scale_offset = 1;
-        tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
+        if (mFP8GenerationMLA)
+        {
+            static constexpr int bmm1_scale_offset = 1;
+            tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(params.bmm2_scale);
+            tllmRunnerParams.scaleSoftmaxLog2Ptr
+                = reinterpret_cast<float const*>(params.bmm1_scale) + bmm1_scale_offset;
+        }
 
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         mTllmGenFMHARunner->run(tllmRunnerParams);
