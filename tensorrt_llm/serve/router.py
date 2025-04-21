@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
@@ -61,6 +62,13 @@ class ServerState:
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
+
+    async def is_healthy(self) -> bool:
+        try:
+            async with self._session.get(self._server + "/health") as response:
+                return response.status == 200
+        except Exception:
+            return False
 
 
 class KvCacheAwareServerState(ServerState):
@@ -135,8 +143,11 @@ class KvCacheAwareServerState(ServerState):
 
 class Router(ABC):
 
-    def __init__(self, servers: list[str] = None):
+    def __init__(self,
+                 servers: List[str] = None,
+                 metadata_server: JsonDictionary = None):
         self._servers = servers
+        self._metadata_server = metadata_server
 
     @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -146,11 +157,44 @@ class Router(ABC):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
+    async def start_server_monitoring(self, poll_interval: int = 10):
+        """Start monitoring servers update from metadata service"""
+        self._monitor_task = asyncio.create_task(
+            self._monitor_servers(poll_interval))
+
+    async def stop_server_monitoring(self):
+        """Stop monitoring servers update from metadata service"""
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._monitor_task = None
+
+    async def _monitor_servers(self, poll_interval: int = 10):
+        """Monitor servers update from metadata service"""
+        while True:
+            new_servers = await self.fetch_live_servers()
+
+            async with self._lock:
+                if new_servers != self._servers:
+                    self._servers = new_servers
+
+            await asyncio.sleep(poll_interval)
+
+    async def fetch_live_servers(self) -> List[str]:
+        """Fetch current list of healthy servers from metadata service
+           If use etcd, we can use the watch method to get the update."""
+
 
 class RoundRobinRouter(Router):
 
-    def __init__(self, servers: list[str] = None, **kwargs):
-        super().__init__(servers)
+    def __init__(self,
+                 servers: List[str] = None,
+                 metadata_server: JsonDictionary = None,
+                 **kwargs):
+        super().__init__(servers, metadata_server)
         self._server_idx = 0
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
@@ -165,10 +209,11 @@ class RoundRobinRouter(Router):
 class LoadBalancingRouter(Router):
 
     def __init__(self,
-                 servers: list[str] = None,
+                 servers: List[str] = None,
+                 metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
                  **kwargs):
-        super().__init__(servers)
+        super().__init__(servers, metadata_server)
         self._lock = asyncio.Lock()
         # Load map between servers and their number of tokens processed
         self._server_state = {}
@@ -313,7 +358,8 @@ class KvCacheAwareRouter(Router):
 
 
 def create_router(router_config: Optional[RouterConfig],
-                  servers: list[str]) -> Router:
+                  servers: List[str],
+                  metadata_server: JsonDictionary = None) -> Router:
     """
     Factory function to create different types of router instances.
 
@@ -345,4 +391,4 @@ def create_router(router_config: Optional[RouterConfig],
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
 
-    return router_class(servers, **router_config.args)
+    return router_class(servers, metadata_server, **router_config.args)

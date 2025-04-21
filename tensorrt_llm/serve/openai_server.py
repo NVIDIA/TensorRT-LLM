@@ -3,6 +3,7 @@ import asyncio
 import signal
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
@@ -18,12 +19,14 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (ConversationMessage,
                                            apply_chat_template,
                                            check_multiple_response,
                                            parse_chat_messages_coroutines)
+from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -48,9 +51,11 @@ class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
-                 model: str):
+                 model: str,
+                 metadata_server_cfg: MetadataServerConfig):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        self.metadata_server = create_metadata_server(metadata_server_cfg)
         try:
             hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
             self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
@@ -68,8 +73,22 @@ class OpenAIServer:
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            if self.metadata_server is not None:
+                metadata = {
+                    "model": self.model,
+                    "version": VERSION,
+                    "timestamp": datetime.now().isoformat()
+                }
+                # TODO: add more metadata
+                self.metadata_server.put(f"trtllm/{self.llm.llm_id}/metadata", metadata)
+                logger.info(f"trtllm/{self.llm.llm_id} is registered")
+
             # terminate rank0 worker
             yield
+
+            if self.metadata_server is not None:
+                self.metadata_server.remove(f"trtllm/{self.llm.llm_id}/metadata")
+                logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)

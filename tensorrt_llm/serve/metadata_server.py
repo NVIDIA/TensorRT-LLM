@@ -1,7 +1,10 @@
 import json
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import etcd3
+
+from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 
 
 class RemoteDictionary(ABC):
@@ -67,3 +70,21 @@ class JsonDictionary:
 
     def keys(self) -> list[str]:
         return self._dict.keys()
+
+
+def create_metadata_server(
+    metadata_server_cfg: Optional[MetadataServerConfig]
+) -> Optional[JsonDictionary]:
+
+    if metadata_server_cfg is None:
+        return None
+
+    if metadata_server_cfg.server_type == 'etcd':
+        dict = EtcdDictionary(host=metadata_server_cfg.hostname,
+                              port=metadata_server_cfg.port)
+    else:
+        raise ValueError(
+            f"Unsupported metadata server type: {metadata_server_cfg.server_type}"
+        )
+
+    return JsonDictionary(dict)
