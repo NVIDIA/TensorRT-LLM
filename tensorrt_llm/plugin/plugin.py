@@ -704,7 +704,8 @@ class CustomAllReduceHelper:
         )
 
     @staticmethod
-    def max_workspace_size_auto(tp_size: int, support_deterministic) -> int:
+    def max_workspace_size_auto(tp_size: int,
+                                support_deterministic=True) -> int:
         if force_all_reduce_deterministic() and support_deterministic:
             workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
                                        "1000000000")
