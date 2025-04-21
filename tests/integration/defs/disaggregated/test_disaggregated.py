@@ -18,6 +18,8 @@ import os
 import pytest
 from defs.trt_test_alternative import check_call
 
+from tensorrt_llm._utils import get_sm_version
+
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -145,6 +147,10 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
                                             disaggregated_example_root,
                                             llm_venv, deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -166,6 +172,10 @@ def test_disaggregated_deepseek_v3_lite_fp8(disaggregated_test_root,
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -187,6 +197,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu(
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -209,6 +223,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                                                 disaggregated_example_root,
                                                 llm_venv,
                                                 deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -229,6 +247,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -249,6 +271,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -271,6 +297,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -292,6 +322,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -314,6 +348,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
 def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -336,6 +374,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -358,6 +400,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
@@ -380,6 +426,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
 def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
+    if (get_sm_version() != 90):
+        pytest.skip(
+            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
+        )
     src_dst_dict = {
         deepseek_v3_model_root:
         f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
