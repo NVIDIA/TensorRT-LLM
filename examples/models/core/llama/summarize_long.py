@@ -16,8 +16,9 @@ import argparse
 import json
 import os
 
+import evaluate
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
@@ -71,7 +72,7 @@ def parse_args():
         default=None,
         type=str,
         help=
-        "datasets.load_metrics('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
+        "evaluate.load('rouge') will attempt to pull rouge package from HF. Use cached rouge can avoid network outage of host or HF."
     )
     parser.add_argument(
         '--multi_block_mode',
@@ -379,7 +380,7 @@ def main(args):
         rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
             args.rouge_dir) else "rouge"
         metric_tensorrt_llm = [
-            load_metric(rouge_dir) for _ in range(args.num_beams)
+            evaluate.load(rouge_dir) for _ in range(args.num_beams)
         ]
 
         for i in range(args.num_beams):
