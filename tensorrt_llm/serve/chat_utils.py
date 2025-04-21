@@ -1,6 +1,7 @@
+import asyncio
 from functools import partial
-from typing import (Any, Callable, Dict, Iterable, List, Literal, Optional,
-                    Tuple, TypeAlias, TypedDict, Union, cast)
+from typing import (Any, Callable, Coroutine, Dict, Iterable, List, Literal,
+                    Optional, Tuple, TypeAlias, TypedDict, Union, cast)
 
 from openai.types.chat import ChatCompletionContentPartImageParam
 from openai.types.chat import \
@@ -10,7 +11,7 @@ from openai.types.chat import (ChatCompletionContentPartTextParam,
 from transformers import AutoConfig, ProcessorMixin
 from typing_extensions import Required
 
-from tensorrt_llm.inputs import load_image, load_video
+from tensorrt_llm.inputs import async_load_image, async_load_video
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.logger import logger
 
@@ -57,60 +58,66 @@ def retrieve_multimodal_placeholder(
     model_config: AutoConfig,
     current_count: int,
 ) -> Optional[str]:
+    """Retrieve the appropriate placeholder for a given modality and model type."""
     model_type = model_config.model_type
 
     if modality == "image":
-        if model_type in ("mllama", "llama4"):
-            return "<|image|>"
         if model_type in ("qwen2_vl", "qwen2_5_vl"):
             return "<|vision_start|><|image_pad|><|vision_end|>"
         raise TypeError(f"Unknown {modality} model type: {model_type}")
-
     elif modality == "video":
         if model_type in ("qwen2_vl", "qwen2_5_vl"):
             return "<|vision_start|><|video_pad|><|vision_end|>"
         raise TypeError(f"Unknown {modality} model type: {model_type}")
-
     raise TypeError(f"Unknown modality: {modality}")
 
 
 def add_multimodal_placeholders(
     text_prompt: str,
-    mm_content_dict: dict[str, list[Any]],
+    mm_dicts: dict[str, Coroutine[Any, Any, Optional[Dict[str, List[Any]]]]],
     model_config: AutoConfig,
 ) -> str:
     placeholders = []
     counts = {}
-    for media_type, _ in mm_content_dict.items():
-        if media_type not in counts:
-            counts[media_type] = 0
-        counts[media_type] += 1
-        placeholder = retrieve_multimodal_placeholder(media_type, model_config,
-                                                      counts[media_type])
-        if placeholder is not None:
-            placeholders.append(placeholder)
+
+    for media_type, media_list in mm_dicts.items():
+        count = counts.get(media_type, 0)
+        for _ in media_list:
+            placeholder = retrieve_multimodal_placeholder(
+                media_type, model_config, count)
+            if placeholder is not None:
+                placeholders.append(placeholder)
+                count += 1
+        counts[media_type] = count
+
+    if not placeholders:
+        return text_prompt
+
     return "\n".join(placeholders + [text_prompt])
 
 
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
 ) -> tuple[str, Union[str, dict[str, str]]]:
-    assert isinstance(
-        part, dict)  # This is needed to avoid mypy errors: part.get() from str
+    """Parse a single multimodal part of a chat message."""
+    assert isinstance(part, dict)
     part_type = part.get("type", None)
 
     if isinstance(part_type, str) and part_type in MM_PARSER_MAP:
-        content = MM_PARSER_MAP[part_type](part)
-        return part_type, content
+        return part_type, MM_PARSER_MAP[part_type](part)
 
     if not isinstance(part_type, str):
         raise ValueError("Invalid 'type' field in multimodal part.")
     return part_type, "unknown part_type content"
 
 
-def parse_chat_message_content_part(part: ChatCompletionMessageParam, ):
-    if isinstance(part, str):  # Handle plain text parts
-        return part
+def parse_chat_message_content_part(
+    part: ChatCompletionMessageParam,
+) -> Tuple[Optional[str], Optional[str], Optional[Coroutine[
+        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+    """Parse a single part of a chat message."""
+    if isinstance(part, str):
+        return part, None, None
 
     # Handle structured dictionary parts
     part_type, content = _parse_chat_message_content_mm_part(part)
@@ -118,62 +125,85 @@ def parse_chat_message_content_part(part: ChatCompletionMessageParam, ):
     # if part_type is text/image_url/video_url but content is None, log a warning and skip
     if part_type in VALID_MESSAGE_CONTENT_MM_PART_TYPES and content is None:
         logger.warning(
-            "Skipping multimodal part '%s' (type: '%s') "
-            "with empty / unparsable content.", part, part_type)
-        return None
+            "Skipping multimodal part '%s' (type: '%s') with empty / unparsable content.",
+            part, part_type)
+        return None, None, None
 
-    mm_content = None
     if part_type == "text":
-        str_content = cast(str, content)
-        return str_content, mm_content
+        return cast(str, content), None, None
 
-    # TODO: make them async on multimodal data as loading video/image is time consuming
-
-    # Handle all non-text multimodal types
     if part_type == "image_url":
         str_content = cast(str, content)
-        mm_content = {"image": load_image(str_content)}
+
+        async def load_image_async():
+            try:
+                return await async_load_image(str_content)
+            except Exception as e:
+                logger.error(f"Failed to load image: {str(e)}")
+                return None
+
+        return None, "image", load_image_async()
+
     elif part_type == "video_url":
         str_content = cast(str, content)
-        mm_content = {"video": load_video(str_content, num_frames=8)}
-    else:
-        raise NotImplementedError(f"Unknown part type: {part_type}")
 
-    return None, mm_content
+        async def load_video_async():
+            try:
+                return await async_load_video(str_content, num_frames=8)
+            except Exception as e:
+                logger.error(f"Failed to load video: {str(e)}")
+                return None
+
+        return None, "video", load_video_async()
+
+    raise NotImplementedError(f"Unknown part type: {part_type}")
 
 
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionMessageParam],
     model_config: AutoConfig,
-) -> List[ConversationMessage]:
-    content = []
-    mm_content_dict = {}
+) -> Tuple[List[ConversationMessage], Optional[Coroutine[
+        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+    """Parse multiple parts of a chat message."""
+    content_parts = []
+    mm_dicts = {}
 
     for part in parts:
-        parse_res, mm_content = parse_chat_message_content_part(part, )
+        parse_res, media_type, media_loader_coroutine = parse_chat_message_content_part(
+            part)
         if parse_res:
-            content.append(parse_res)
+            content_parts.append(parse_res)
+        if media_type is not None and media_loader_coroutine is not None:
+            mm_dicts.setdefault(media_type, []).append(media_loader_coroutine)
 
-        # Collect multimodal content
-        if mm_content:
-            for media_type, media_value in mm_content.items():
-                if media_type not in mm_content_dict:
-                    mm_content_dict[media_type] = []
-                mm_content_dict[media_type].append(media_value)
+    text_prompt = "\n".join(content_parts)
 
-    text_prompt = "\n".join(content)
-    if mm_content_dict:
-        text_prompt = add_multimodal_placeholders(text_prompt, mm_content_dict,
-                                                  model_config)
+    text_prompt = add_multimodal_placeholders(text_prompt, mm_dicts,
+                                              model_config)
+
+    async def combined_media_loader():
+        combined_data = {}
+        for media_type, coroutines in mm_dicts.items():
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
+            valid_results = [
+                r for r in results
+                if r is not None and not isinstance(r, Exception)
+            ]
+            if valid_results:
+                combined_data[media_type] = valid_results
+        return combined_data if combined_data else None
+
     return [ConversationMessage(role=role,
-                                content=text_prompt)], mm_content_dict
+                                content=text_prompt)], combined_media_loader()
 
 
 def parse_chat_message_content(
     message: ChatCompletionMessageParam,
     model_config: AutoConfig,
-) -> Tuple[List[ConversationMessage], Optional[Dict[str, List[Any]]]]:
+) -> Tuple[List[ConversationMessage], Optional[Coroutine[
+        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+    """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
 
@@ -184,12 +214,44 @@ def parse_chat_message_content(
             ChatCompletionContentPartTextParam(type="text", text=content)
         ]
 
-    result, mm_data = parse_chat_message_content_parts(
+    result, mm_data_coroutine = parse_chat_message_content_parts(
         role,
         content,
         model_config,
     )
-    return result, mm_data
+    return result, mm_data_coroutine
+
+
+def parse_chat_messages_coroutines(
+    messages: List[ChatCompletionMessageParam],
+    model_config: AutoConfig,
+) -> Tuple[List[ConversationMessage], Optional[Coroutine[
+        Any, Any, Optional[Dict[str, List[Any]]]]]]:
+    conversation = []
+    mm_coroutines = []
+
+    for msg in messages:
+        sub_messages, mm_coroutine = parse_chat_message_content(
+            msg, model_config)
+        conversation.extend(sub_messages)
+        if mm_coroutine is not None:
+            mm_coroutines.append(mm_coroutine)
+
+    async def combined_media_loader():
+        results = await asyncio.gather(*mm_coroutines, return_exceptions=True)
+        combined_data = {}
+
+        for result in results:
+            if isinstance(result, Exception) or result is None:
+                continue
+
+            for media_type, data_list in result.items():
+                if data_list:
+                    combined_data.setdefault(media_type, []).extend(data_list)
+
+        return combined_data if combined_data else None
+
+    return conversation, combined_media_loader()
 
 
 def resolve_hf_chat_template(

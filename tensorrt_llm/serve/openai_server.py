@@ -22,7 +22,7 @@ from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (ConversationMessage,
                                            apply_chat_template,
-                                           parse_chat_message_content)
+                                           parse_chat_messages_coroutines)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
@@ -102,6 +102,7 @@ class OpenAIServer:
         return JSONResponse(content=error_response.model_dump(),
                             status_code=error_response.code)
 
+
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -180,10 +181,9 @@ class OpenAIServer:
             ]
             sampling_params = request.to_sampling_params()
             postproc_args = ChatPostprocArgs.from_request(request)
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            for msg in request.messages:
-                conv_messages, mm_data = parse_chat_message_content(msg, self.model_config)
-                conversation.extend(conv_messages)
+            conversation, mm_coroutines = parse_chat_messages_coroutines(request.messages, self.model_config)
 
             prompt: str = apply_chat_template(
                 tokenizer=self.tokenizer,
@@ -196,18 +196,11 @@ class OpenAIServer:
                 chat_template=request.chat_template,
                 **(request.chat_template_kwargs or {}),
             )
-            sampling_params = request.to_sampling_params()
-            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
-            postproc_args = ChatPostprocArgs.from_request(request)
             prompt = prompt_inputs(prompt)
 
-            if mm_data:
-                if "multi_modal_data" not in prompt:
-                    prompt["multi_modal_data"] = {}
-                for media_type, media_values in mm_data.items():
-                    if media_type not in prompt["multi_modal_data"]:
-                        prompt["multi_modal_data"][media_type] = []
-                    prompt["multi_modal_data"][media_type].extend(media_values)
+            mm_data = await mm_coroutines
+            if mm_data is not None:
+                prompt["multi_modal_data"] = mm_data
 
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             if conversation and conversation[-1].get(
