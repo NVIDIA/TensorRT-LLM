@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import copy
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -23,42 +24,90 @@ import transformers.models.mllama.configuration_mllama as config_mllama
 from torch import nn
 from tqdm import tqdm
 
+from ...logger import logger
 from ..attention_backend.interface import AttentionMetadata
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import TensorParallelMode
 from ..modules.logits_procesor import LogitsProcessor
-from .modeling_llama import LlamaDecoderLayer
+from ..modules.rms_norm import RMSNorm
+from .modeling_llama import LlamaAttention
 from .modeling_utils import duplicate_kv_weight, register_auto_model
 
 
-# TODO: For performance consideration, should use from ..modules.rms_norm import RMSNorm
-# to utilize fused add rms norm after flashinfer rmsnorm accuracy issue is resolved.
-class RMSNorm(nn.Module):
+class MllamaDecoderLayer(DecoderLayer):
 
-    def __init__(self, hidden_size, eps=1e-6, dtype=None):
+    def __init__(
+        self,
+        config: ModelConfig[config_mllama.MllamaConfig],
+        layer_idx: int,
+    ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        self.variance_epsilon = eps
+        pretrained_config = config.pretrained_config
+        # llama_config for reusing the LlamaAttention
+        llama_config = ModelConfig(
+            pretrained_config=pretrained_config.text_config,
+            mapping=config.mapping,
+            quant_config=config.quant_config,
+            quant_config_dict=config.quant_config_dict,
+            attn_backend=config.attn_backend)
+        llama_config.pretrained_config.attention_bias = False
+        llama_config.pretrained_config.mlp_bias = False
 
-    def forward(self, hidden_states, residual: Optional[torch.Tensor] = None):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        if residual is not None:
-            hidden_states = hidden_states + residual.to(torch.float32)
-            residual = hidden_states.to(input_dtype)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance +
-                                                    self.variance_epsilon)
+        self.layer_idx = layer_idx
 
-        hidden_states = self.weight * hidden_states.to(input_dtype)
+        self.self_attn = LlamaAttention(
+            llama_config,
+            layer_idx=layer_idx,
+        )
 
-        if residual is not None:
-            return hidden_states, residual
-        return hidden_states
+        self.mlp = GatedMLP(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            intermediate_size=llama_config.pretrained_config.intermediate_size,
+            bias=llama_config.pretrained_config.mlp_bias,
+            dtype=llama_config.pretrained_config.torch_dtype,
+            config=llama_config,
+        )
+        self.input_layernorm = RMSNorm(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            eps=llama_config.pretrained_config.rms_norm_eps,
+            dtype=llama_config.pretrained_config.torch_dtype)
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=llama_config.pretrained_config.hidden_size,
+            eps=llama_config.pretrained_config.rms_norm_eps,
+            dtype=llama_config.pretrained_config.torch_dtype)
+
+    def forward(
+        self,
+        position_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 class MllamaTextModel(nn.Module):
@@ -71,16 +120,6 @@ class MllamaTextModel(nn.Module):
         super().__init__()
         pretrained_config = config.pretrained_config
         text_config = pretrained_config.text_config
-        # llama_config for reusing the LlamaDecoderLayer
-        llama_config = ModelConfig(
-            pretrained_config=pretrained_config.text_config,
-            mapping=config.mapping,
-            quant_config=config.quant_config,
-            quant_config_dict=config.quant_config_dict,
-            attn_backend=config.attn_backend)
-        llama_config.pretrained_config.attention_bias = False
-        llama_config.pretrained_config.mlp_bias = False
-
         self.padding_id = text_config.pad_token_id
         self.vocab_size = text_config.vocab_size
         self.embed_tokens = Embedding(
@@ -97,8 +136,7 @@ class MllamaTextModel(nn.Module):
                 # TODO: Cross-attention decoder layer impl.
                 layers.append(None)
             else:
-                layers.append(
-                    LlamaDecoderLayer(llama_config, layer_idx=layer_id))
+                layers.append(MllamaDecoderLayer(config, layer_idx=layer_id))
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(hidden_size=text_config.hidden_size,
@@ -123,7 +161,7 @@ class MllamaTextModel(nn.Module):
         for _, decoder_layer in enumerate(self.layers):
             if decoder_layer == None:
                 assert skip_cross_attention == True, 'Cross-attention is not supported yet'
-            elif isinstance(decoder_layer, LlamaDecoderLayer):
+            elif isinstance(decoder_layer, MllamaDecoderLayer):
                 hidden_states, residual = decoder_layer(
                     position_ids=positions,
                     hidden_states=hidden_states,
@@ -145,6 +183,7 @@ class MllamaForCausalLM(nn.Module):
         cache_config=None,
     ):
         super().__init__()
+        self.config = config
         pretrain_config = config.pretrained_config
         text_config = pretrain_config.text_config
 
@@ -157,13 +196,9 @@ class MllamaForCausalLM(nn.Module):
             text_config.vocab_size,
             text_config.hidden_size,
             dtype=text_config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=config.mapping.tp_rank,
-                tensor_parallel_size=config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-                gpus_per_node=config.mapping.gpus_per_node,
-            ),
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         # use embedding weights in lm_head if tie word embedding is enabled
         if text_config.tie_word_embeddings:
@@ -194,6 +229,32 @@ class MllamaForCausalLM(nn.Module):
             skip_cross_attention=skip_cross_attention,
         )
         return hidden_states
+
+    def infer_max_seq_len(self) -> int:
+        # NOTE: Copied from DecoderModelForCausalLM.infer_max_seq_len
+        # Modified from tensorrt_llm/builder.py _init_max_seq_len
+        rope_scaling = getattr(self.config, 'rope_scaling', None)
+        rope_factor = 1
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                rope_factor = rope_scaling.get('factor', 1.0)
+
+        # Step 1: Find the upper bound of max_seq_len
+        inferred_max_seq_len = 2048
+        if getattr(self.config, 'max_position_embeddings', None) is not None:
+            inferred_max_seq_len = self.config.max_position_embeddings
+
+        # Step 2: Scale max_seq_len with rotary scaling
+        if rope_factor != 1:
+            inferred_max_seq_len = int(
+                math.ceil(inferred_max_seq_len * rope_factor))
+            logger.warning(
+                f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+            )
+
+        # Step 3: Return the new max_seq_len
+        return inferred_max_seq_len
 
 
 @register_auto_model("MllamaForConditionalGeneration")
@@ -233,6 +294,9 @@ class MllamaForConditionalGeneration(nn.Module):
             bias=True,
             dtype=config.pretrained_config.vision_config.torch_dtype)
         self.logits_processor = LogitsProcessor()
+
+    def infer_max_seq_len(self) -> int:
+        return self.language_model.infer_max_seq_len()
 
     @torch.inference_mode()
     def forward(

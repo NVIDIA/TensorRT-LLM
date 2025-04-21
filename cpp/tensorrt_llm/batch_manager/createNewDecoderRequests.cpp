@@ -54,6 +54,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     CudaStream const& runtimeStream, SizeType32 maxSequenceLength) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TLLM_CHECK(batchSlot >= 0);
 
     auto const& decoderStream = decoder.getDecoderStream();

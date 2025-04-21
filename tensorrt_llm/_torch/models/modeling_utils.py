@@ -3,7 +3,8 @@ import fnmatch
 import math
 import time
 from dataclasses import dataclass
-from typing import ClassVar, Dict, Generic, List, Optional, Tuple, Type, TypeVar
+from typing import (ClassVar, Dict, Generic, List, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -11,14 +12,16 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm.mapping import Mapping
+
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
-from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import FusedMoE
-from ..modules.linear import Linear, WeightMode
+from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_procesor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..pipeline_interface import PipelineInterface
@@ -114,6 +117,13 @@ def duplicate_kv_weight(weight: torch.Tensor, head_dim: int,
     return weight.reshape(num_kv_heads * reps * head_dim, -1).clone().detach()
 
 
+def unpack_hidden_states(hidden_states):
+    if isinstance(hidden_states, (tuple, list)):
+        return hidden_states
+    else:
+        return hidden_states, None
+
+
 def create_pipeline_interface_factory(keys: List[str], hidden_size: int,
                                       dtype: torch.dtype):
 
@@ -138,10 +148,27 @@ class MissingLayer(torch.nn.Identity):
         super().__init__()
 
 
+class MissingDecoderLayer(MissingLayer, DecoderLayer):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = ...,
+        **kwargs,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual
+
+    def is_missing(self) -> bool:
+        return True
+
+
 def build_pipeline_layers(layer_list,
                           num_hidden_layers,
                           layer_fn,
-                          missing_layer_fn=MissingLayer):
+                          missing_layer_fn=MissingDecoderLayer):
     layer_offset = layer_list[0]
     layers = [
         layer_fn(layer_idx - layer_offset)  # local layer idx to attn_backend
@@ -252,7 +279,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
 
         # rebuild layers with pipeline parallel support
         num_hidden_layers = len(self.layers)
-        self.pp_layer_list = self.model_config.mapping.pp_layers_torch(
+        self.pp_layer_list = self.model_config.mapping.pp_layers(
             num_hidden_layers)
         decoder_layer_cls = self.layers[0].__class__
         if hasattr(self, 'aux_stream_dict'):  # DeepseekV3
@@ -263,59 +290,21 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 self.model_config, layer_idx)
         self.layers = build_pipeline_layers(self.pp_layer_list,
                                             num_hidden_layers, layer_fn)
+        self._local_layers = [
+            layer for layer in self.layers[:config.num_hidden_layers]
+            if not layer.is_missing()
+        ]
+        print(f"{self._local_layers=}, {self.pp_layer_list=}")
 
         # add create_pipeline_interface method
         pp_interface_keys = ["hidden_states", "residual"]
         self.create_pipeline_interface = create_pipeline_interface_factory(
             pp_interface_keys, config.hidden_size, config.torch_dtype)
 
-        # override forward method
-        self.forward = self._pp_forward
-
-    def _pp_forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pipeline_interface: Optional[PipelineInterface] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        # unpack pp_interface or embedding lookup for the input
-        if self.pp_rank != 0:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface  # unpack pp_interface
-        else:
-            if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError(
-                    "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
-            hidden_states = inputs_embeds
-            residual = None
-
-        # local forward pass
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
-
-        for decoder_layer in local_decoder_layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
-
-        # pack pp_interface or return hidden_states for last pp rank
-        if not self.pp_rank == self.pp_size - 1:
-            return PipelineInterface(hidden_states,
-                                     residual)  # pack pp_interface
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+    def local_layers(self) -> List[DecoderLayer]:
+        return (
+            self._local_layers if hasattr(self, "_local_layers") else
+            self.layers[:self.model_config.pretrained_config.num_hidden_layers])
 
 
 class PostInitCaller(type):
@@ -356,14 +345,13 @@ class DecoderModelForCausalLM(nn.Module,
                     vocab_size,
                     hidden_size,
                     dtype=config.pretrained_config.torch_dtype,
-                    parallel_config=ParallelConfig(
-                        tensor_parallel_rank=0,
-                        tensor_parallel_size=1,
-                        tensor_parallel_mode=None,
-                        gather_output=False,
-                        pipeline_parallel_size=config.mapping.pp_size,
-                        parallel_rank=config.mapping.rank,
+                    mapping=Mapping(
+                        world_size=1,
+                        tp_size=1,
+                        rank=0,
                     ),
+                    tensor_parallel_mode=None,
+                    gather_output=False,
                 )
             else:
                 # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
@@ -372,15 +360,9 @@ class DecoderModelForCausalLM(nn.Module,
                     vocab_size,
                     hidden_size,
                     dtype=config.pretrained_config.torch_dtype,
-                    parallel_config=ParallelConfig(
-                        tensor_parallel_size=config.mapping.tp_size,
-                        tensor_parallel_rank=config.mapping.tp_rank,
-                        tensor_parallel_mode=TensorParallelMode.COLUMN,
-                        gather_output=True,
-                        gpus_per_node=config.mapping.gpus_per_node,
-                        pipeline_parallel_size=config.mapping.pp_size,
-                        parallel_rank=config.mapping.rank,
-                    ),
+                    mapping=config.mapping,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
                 )
 
             # use embedding weights in lm_head if tie word embedding is enabled
@@ -520,6 +502,7 @@ class DecoderModelForCausalLM(nn.Module,
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
         }
+
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
@@ -533,6 +516,9 @@ class DecoderModelForCausalLM(nn.Module,
                     continue
 
                 names = name.split('.')
+                # WAR: better solution is that llama has its own load_weights function.
+                if names[-1] == 'next_layer_layernorm':
+                    continue
                 if names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -548,6 +534,7 @@ class DecoderModelForCausalLM(nn.Module,
                                 if k in ["weight", "bias"] else v
                                 for k, v in fw.items()
                             }
+
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
                 else:

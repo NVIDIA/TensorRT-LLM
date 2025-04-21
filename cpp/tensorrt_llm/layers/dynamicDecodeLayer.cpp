@@ -205,8 +205,9 @@ void DynamicDecodeLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
     }
 
     mCyclicStep = mCyclicStep % mRuntimeMaxSeqLen;
-    workspace->setDeviceBatchSlots(
-        params->batchSlots); // Copy the input batch slots to device for faster access in devie usage (kernels).
+    //! Copy the input batch slots to device for faster access in devie usage (kernels).
+    workspace->setDeviceBatchSlots(params->batchSlots);
+
     prepareIdsPtrs(baseOutputs, params->batchSlots, localDecoderDomain.getBatchSize(),
         localDecoderDomain.getBeamWidth(), maxSeqLen);
 
@@ -246,6 +247,7 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
     BufferConstPtr batchSlots, SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
     TensorPtr outputIdsPtrHostSlice = ITensor::at(mOutputIdsPtrHost, {mCyclicStep});
     TensorPtr parentIdsPtrHostSlice = ITensor::at(mParentIdsPtrHost, {mCyclicStep});
     auto outputIdsPtrHost = runtime::bufferCast<TokenIdType*>(*outputIdsPtrHostSlice);
@@ -255,10 +257,7 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
     {
         auto const batchSlot = batchSlotsPtr[bi];
         outputIdsPtrHost[batchSlot] = bufferCast<TokenIdType>(*outputs->outputIds) + batchSlot * beamWidth * maxSeqLen;
-    }
-    for (SizeType32 bi = 0; bi < batchSize; bi++)
-    {
-        auto const batchSlot = batchSlotsPtr[bi];
+
         if (beamWidth > 1)
         {
             parentIdsPtrHost[batchSlot]

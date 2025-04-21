@@ -152,7 +152,7 @@ bool ipcNvlsSupported()
     return true;
 }
 
-IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> group)
+IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_CHECK(size > 0);
@@ -324,26 +324,33 @@ IpcNvlsHandle ipcNvlsAllocate(size_t size, std::set<int> group)
 
     printf("Rank %d imported IPC handles successfully\n", rank);
 
-    return handle;
+    return new IpcNvlsHandle(std::move(handle));
 #else
     TLLM_THROW("ipcNvlsAllocate needs to be compiled with ENABLE_MULTI_DEVICE");
 #endif
 }
 
-void ipcNvlsFree(IpcNvlsHandle handle)
+void ipcNvlsFree(IpcNvlsHandle* handle)
 {
 #if ENABLE_MULTI_DEVICE
-    // Unmap and release MC VA
-    CUCHECK(cuMemUnmap(handle.mc_va, handle.size));
-    CUCHECK(cuMemRelease(handle.mc_handle));
-    CUCHECK(cuMemAddressFree(handle.mc_va, handle.size));
-    // Unmap and release UC VA
-    for (size_t i = 0; i < handle.ipc_uc_vas.size(); ++i)
+    if (handle == nullptr)
     {
-        CUCHECK(cuMemUnmap(handle.ipc_uc_vas[i], handle.size));
-        CUCHECK(cuMemRelease(handle.ipc_uc_handles[i]));
-        CUCHECK(cuMemAddressFree(handle.ipc_uc_vas[i], handle.size));
+        return;
     }
+
+    // Unmap and release MC VA
+    CUCHECK(cuMemUnmap(handle->mc_va, handle->size));
+    CUCHECK(cuMemRelease(handle->mc_handle));
+    CUCHECK(cuMemAddressFree(handle->mc_va, handle->size));
+    // Unmap and release UC VA
+    for (size_t i = 0; i < handle->ipc_uc_vas.size(); ++i)
+    {
+        CUCHECK(cuMemUnmap(handle->ipc_uc_vas[i], handle->size));
+        CUCHECK(cuMemRelease(handle->ipc_uc_handles[i]));
+        CUCHECK(cuMemAddressFree(handle->ipc_uc_vas[i], handle->size));
+    }
+
+    delete handle;
 #else
     TLLM_THROW("ipcNvlsFree needs to be compiled with ENABLE_MULTI_DEVICE");
 #endif

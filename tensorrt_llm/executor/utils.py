@@ -5,13 +5,10 @@ from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
-import torch
-
+from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.llmapi.utils import print_colored_debug
 from tensorrt_llm.logger import logger
 
-from ..bindings import executor as tllm
-from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.utils import print_colored_debug
@@ -36,6 +33,8 @@ if PERIODICAL_RESP_IN_AWAIT:
 
 def create_mpi_comm_session(
         n_workers: int) -> RemoteMpiCommSessionClient | MpiPoolSession:
+    assert mpi_rank(
+    ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
         ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
@@ -90,39 +89,10 @@ class ProcessPoolExecutorSession(MpiSession):
         self.mpi_pool.shutdown(wait=True)
 
 
-class ExecutorResponseTensors(NamedTuple):
-    output_token_ids: List[List[int]]
-    # context_logits is a tensor or a string denoting the path to the shared memory.
-    context_logits: Optional[torch.Tensor | str]
-    # generation_logits is a tensor or a string denoting the path to the shared memory.
-    generation_logits: Optional[torch.Tensor | str]
-    log_probs: Optional[list]
-    cum_log_probs: Optional[list]
-
-
 class ErrorResponse(NamedTuple):
     client_id: int
     error_msg: str
     request_id: int
-
-
-class ExecutorResponse(NamedTuple):
-    """ The response from the cpp-executor to the Python main thread. """
-    client_id: int
-    tensors: Optional[ExecutorResponseTensors]
-    finish_reasons: Optional[List[tllm.FinishReason]]
-    is_final: Optional[bool]
-    sequence_index: Optional[int]
-    # There are two types of errors:
-    # 1. str for the errors from the cpp-executor.await_responses, this will be dispatched to the user's
-    #    generate_async as a per-request error, and won't stop the whole service.
-    # 2. Exception for the errors from the background threads/processes, this will be processed in the main thread,
-    #    and stop the whole service.
-    error: Optional[str | Exception]
-    # The timestamp of the creation of the response. We use this to track the IPC overhead.
-    timestamp: Optional[float] = None
-    # Optional disaggregated serving params needed by the generation instances
-    disaggregated_params: Optional[DisaggregatedParams] = None
 
 
 class IntraProcessQueue:
@@ -153,9 +123,9 @@ class IntraProcessQueue:
 
 
 class WorkerCommIpcAddrs(NamedTuple):
-    ''' IPC addresses for communication with the worker processes. '''
-    request_queue_addr: str
-    request_error_queue_addr: str
-    result_queue_addr: str
-    stats_queue_addr: str
-    kv_cache_events_queue_addr: str
+    ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
+    request_queue_addr: tuple[str, Optional[bytes]]
+    request_error_queue_addr: tuple[str, Optional[bytes]]
+    result_queue_addr: tuple[str, Optional[bytes]]
+    stats_queue_addr: tuple[str, Optional[bytes]]
+    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]

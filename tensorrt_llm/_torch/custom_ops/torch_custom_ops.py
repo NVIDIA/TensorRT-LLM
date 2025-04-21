@@ -5,7 +5,8 @@ import torch
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
-from ..utils import get_power_of_2_num_tokens_buckets, next_positive_power_of_2
+from ..utils import (get_last_power_of_2_num_tokens_buckets,
+                     last_positive_power_of_2, next_positive_power_of_2)
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -216,10 +217,12 @@ class NVFP4GemmRunner(TunableRunner):
     def __init__(
         self,
         sf_use_ue8m0: bool,
+        to_userbuffers: bool,
         output_dtype: torch.dtype,
     ):
         self.sf_use_ue8m0 = sf_use_ue8m0
         self.output_dtype = output_dtype
+        self.to_userbuffers = to_userbuffers
         if output_dtype not in NVFP4GemmRunner._runner_dict:
             NVFP4GemmRunner._runner_dict[
                 output_dtype] = torch.classes.trtllm.FP4GemmRunner(output_dtype)
@@ -245,6 +248,7 @@ class NVFP4GemmRunner(TunableRunner):
             mat2_scale,
             global_scale,
             self.sf_use_ue8m0,
+            self.to_userbuffers,
             tactic,
         )
 
@@ -268,18 +272,20 @@ def nvfp4_gemm(
     alpha: torch.Tensor,
     sf_use_ue8m0: bool,
     output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     tuning_config = TuningConfig(
-        dynamic_tensors=((0, 0, (get_power_of_2_num_tokens_buckets,
-                                 next_positive_power_of_2)), ),
+        dynamic_tensors=((0, 0, (get_last_power_of_2_num_tokens_buckets,
+                                 last_positive_power_of_2)), ),
         constraints=((2, 0, fp4_scale_dims), ),
     )
 
     # allocate workspace for profiling
-    nvfp4_gemm_runner = NVFP4GemmRunner(sf_use_ue8m0, output_dtype)
+    nvfp4_gemm_runner = NVFP4GemmRunner(sf_use_ue8m0, to_userbuffers,
+                                        output_dtype)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::nvfp4_gemm::gemm",
@@ -302,6 +308,7 @@ def _(
     alpha: torch.Tensor,
     sf_use_ue8m0: bool,
     output_dtype: torch.dtype,
+    to_userbuffers: bool = False,
 ) -> torch.Tensor:
-    return input.new_empty((act_fp4.size(0), weight.size(0)),
-                           dtype=output_dtype)
+    return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
+                             dtype=output_dtype)

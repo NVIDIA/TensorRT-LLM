@@ -166,9 +166,8 @@ function(process_target target_name enable_hopper enable_blackwell)
       ${target_name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
   endif()
 
-  target_compile_options(${target_name}
-                         PRIVATE "-DENABLE_MULTI_DEVICE=${ENABLE_MULTI_DEVICE}")
   if(ENABLE_MULTI_DEVICE)
+    target_compile_options(${target_name} PRIVATE "-DENABLE_MULTI_DEVICE=1")
     target_link_libraries(${target_name} PRIVATE ${MPI_C_LIBRARIES})
   endif()
 

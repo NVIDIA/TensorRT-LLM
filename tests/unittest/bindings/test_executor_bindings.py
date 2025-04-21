@@ -1523,6 +1523,9 @@ def test_executor_config():
     assert config.max_seq_idle_microseconds == 180000000
     assert config.spec_dec_config is None
     assert config.guided_decoding_config is None
+    assert config.additional_model_outputs is None
+    assert config.gather_generation_logits is False
+    assert config.use_variable_beam_width_search is False
 
     kwargs = {
         "max_beam_width":
@@ -1567,27 +1570,35 @@ def test_executor_config():
         trtllm.GuidedDecodingConfig(
             trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
             encoded_vocab=["eos", "a", "b", "c", "d"]),
-        "additional_output_names": ["topKLogits"]
+        "additional_model_outputs":
+        [trtllm.AdditionalModelOutput("topKLogits")],
+        "gather_generation_logits":
+        True,
+        "use_variable_beam_width_search":
+        True
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
-        if "config" not in k:
+        if "config" not in k and k != "additional_model_outputs":
             assert getattr(config, k) == v
     assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
     assert config.scheduler_config.capacity_scheduler_policy == trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
     assert isinstance(config.parallel_config, trtllm.ParallelConfig)
     assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
-    assert config.extended_runtime_perf_knob_config.multi_block_mode == True
+    assert config.extended_runtime_perf_knob_config.multi_block_mode is True
     assert isinstance(config.debug_config, trtllm.DebugConfig)
     assert isinstance(config.logits_post_processor_config,
                       trtllm.LogitsPostProcessorConfig)
     assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
     assert isinstance(config.guided_decoding_config,
                       trtllm.GuidedDecodingConfig)
-    assert isinstance(config.additional_output_names, list)
-    assert len(config.additional_output_names) == 1
-    assert config.additional_output_names[0] == "topKLogits"
+    assert isinstance(config.additional_model_outputs, list)
+    assert len(config.additional_model_outputs) == 1
+    assert config.additional_model_outputs[0].name == "topKLogits"
+    assert config.additional_model_outputs[0].gather_context is False
+    assert config.gather_generation_logits is True
+    assert config.use_variable_beam_width_search is True
 
 
 def test_parallel_config():
@@ -1595,12 +1606,17 @@ def test_parallel_config():
     comm_mode = trtllm.CommunicationMode.LEADER
     device_ids = [0, 1, 2, 3]
     participant_ids = [4, 5, 6, 7]
-    parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
-                                            participant_ids)
+    num_nodes = 2
+    parallel_config = trtllm.ParallelConfig(comm_type,
+                                            comm_mode,
+                                            device_ids,
+                                            participant_ids,
+                                            num_nodes=num_nodes)
     assert parallel_config.communication_type == comm_type
     assert parallel_config.communication_mode == comm_mode
     assert parallel_config.device_ids == device_ids
     assert parallel_config.participant_ids == participant_ids
+    assert parallel_config.num_nodes == num_nodes
 
     comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
     #Dummy path to worker executable
@@ -1615,6 +1631,25 @@ def test_parallel_config():
     assert parallel_config.orchestrator_config.worker_executable_path == str(
         worker_path)
     assert parallel_config.orchestrator_config.spawn_processes == True
+
+
+def test_parallel_config_pickle():
+    comm_type = trtllm.CommunicationType.MPI
+    comm_mode = trtllm.CommunicationMode.LEADER
+    device_ids = [0, 1, 2, 3]
+    participant_ids = [4, 5, 6, 7]
+    num_nodes = 2
+    parallel_config = trtllm.ParallelConfig(comm_type,
+                                            comm_mode,
+                                            device_ids,
+                                            participant_ids,
+                                            num_nodes=num_nodes)
+    parallel_config_copy = pickle.loads(pickle.dumps(parallel_config))
+    assert parallel_config_copy.communication_type == comm_type
+    assert parallel_config_copy.communication_mode == comm_mode
+    assert parallel_config_copy.device_ids == device_ids
+    assert parallel_config_copy.participant_ids == participant_ids
+    assert parallel_config_copy.num_nodes == num_nodes
 
 
 def test_peft_cache_config():

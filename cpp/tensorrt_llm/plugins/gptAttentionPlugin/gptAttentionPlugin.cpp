@@ -868,8 +868,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         std::int32_t const* host_pool_mapping
             = static_cast<std::int32_t const*>(inputs[getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)]);
 
-        const int32_t layerToPool = host_pool_mapping[mLayerIdx * 2];
-        const int32_t layerIdxInCachePool = host_pool_mapping[mLayerIdx * 2 + 1];
+        int32_t const layerToPool = host_pool_mapping[mLayerIdx * 2];
+        int32_t const layerIdxInCachePool = host_pool_mapping[mLayerIdx * 2 + 1];
         TLLM_LOG_TRACE("Layer%d: LayerCachePoolLocator{.indexOfPool=%d, .layerIdxInCachePool=%d}", mLayerIdx,
             layerToPool, layerIdxInCachePool);
         auto const seqStride = getStride(kvCacheBlockOffsetsShape, 1);

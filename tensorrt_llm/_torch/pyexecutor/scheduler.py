@@ -200,7 +200,9 @@ class SimpleScheduler(RequestScheduler):
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
-        return SchedulerOutput(context_requests, generation_requests,
-                               paused_requests,
-                               fitting_disagg_gen_init_requests,
+        # Convert from binding type RequestVector to list[LlmRequest],
+        # so Python fields on LlmRequest won't be stripped away
+        return SchedulerOutput(list(context_requests),
+                               list(generation_requests), list(paused_requests),
+                               list(fitting_disagg_gen_init_requests),
                                len(fitting_requests))

@@ -63,12 +63,25 @@ class Gemma2ConfigGroup:
         return {f.name for f in dataclasses.fields(cls)}
 
 
+@dataclasses.dataclass(kw_only=True, frozen=True)
+class Gemma3ConfigGroup:
+    query_pre_attn_scalar: float
+    final_logit_softcapping: Optional[float]
+    sliding_window_pattern: int
+    rope_local_base_freq: int
+    sliding_window: int
+
+    @classmethod
+    def keys(cls):
+        return {f.name for f in dataclasses.fields(cls)}
+
+
 if TYPE_CHECKING:
     from typing import Type, TypeVar
 
     from typing_extensions import Self
 
-    ConfigGroups = Union[Gemma2ConfigGroup]
+    ConfigGroups = Union[Gemma2ConfigGroup, Gemma3ConfigGroup]
     """Groupings of config where, if one of said properties exists, we assume all of the properties exist (even if they are `None`)"""
     CG = TypeVar("CG", bound=ConfigGroups)
 
@@ -1027,6 +1040,9 @@ class DecoderModelForCausalLM(PretrainedModel):
             else:
                 assert False, "Context parallelism with non-remove-padding is not supported yet."
 
+        is_gemma_2_cg = self.config.has_config_group(Gemma2ConfigGroup)
+        is_gemma_3_cg = self.config.has_config_group(Gemma3ConfigGroup)
+
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -1080,9 +1096,10 @@ class DecoderModelForCausalLM(PretrainedModel):
                 lm_logits *= getattr(self.config, 'output_multiplier_scale', 1)
             if self.mup_width_multiplier is not None:
                 lm_logits = lm_logits / self.mup_width_multiplier
-            if self.config.has_config_group(Gemma2ConfigGroup):
+            if is_gemma_2_cg or is_gemma_3_cg:
                 softcap = self.config.get_config_group(
-                    Gemma2ConfigGroup).final_logit_softcapping
+                    Gemma2ConfigGroup if not is_gemma_3_cg else
+                    Gemma3ConfigGroup).final_logit_softcapping
                 if softcap:
                     lm_logits = lm_logits * float(1 / softcap)
                     lm_logits = tanh(lm_logits) * float(softcap)

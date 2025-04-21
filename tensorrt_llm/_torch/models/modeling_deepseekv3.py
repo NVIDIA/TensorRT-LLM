@@ -15,7 +15,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           DeepseekAllReduce, ParallelConfig, allgather)
+                           DeepseekAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -23,10 +23,9 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..pipeline_interface import PipelineInterface
-from ..pyexecutor.cuda_graph_runner import is_graph_capturing
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      disable_fp4_allgather)
@@ -60,20 +59,6 @@ class DeepseekV3MTPHead(nn.Module):
         return logits
 
 
-class DeepseekV3RotaryEmbedding(RotaryEmbedding):
-
-    def __init__(self,
-                 config: PretrainedConfig,
-                 device: Optional[torch.device] = None):
-        head_dim = config.hidden_size // config.num_attention_heads
-        super().__init__(config,
-                         head_dim=head_dim,
-                         num_attention_heads=config.num_attention_heads,
-                         max_position_embeddings=config.max_position_embeddings,
-                         device=device,
-                         rope_type="default")
-
-
 class DeepseekV3Attention(MLA):
 
     def __init__(
@@ -83,14 +68,6 @@ class DeepseekV3Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        if model_config.fuse_pos_embd:
-            pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-            )
-        else:
-            pos_embd_params = None
-
         predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -103,8 +80,11 @@ class DeepseekV3Attention(MLA):
                          predicted_tokens_per_seq=predicted_tokens_per_seq,
                          max_position_embeddings=config.max_position_embeddings,
                          bias=False,
-                         rotary_emb=DeepseekV3RotaryEmbedding(config),
-                         pos_embd_params=pos_embd_params,
+                         pos_embd_params=PositionalEmbeddingParams(
+                             type=PositionEmbeddingType.yarn,
+                             rope=RopeParams.from_config(config),
+                             is_neox=False,
+                         ),
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
@@ -287,14 +267,19 @@ class Deepseekv3MoE(nn.Module):
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
 
         self.shared_output_scale = None
+        # The block scale size is 128, which requires shared_expert_intermediate_size to be divisible by 128.
+        assert shared_expert_intermediate_size % 128 == 0
         if self.use_dp:
+            # If using attention DP, the shared experts also use DP instead of TP.
             shared_tp_size = 1
         else:
-            assert shared_expert_intermediate_size % 128 == 0
+            # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+            # The math.gcd operation ensures that shared_tp_size falls in the supported TP sizes.
             shared_tp_size = math.gcd(
                 shared_expert_intermediate_size // 128,
                 model_config.mapping.tp_size,
             )
+            # If shared_tp_size has been overridden, the output of shared experts needs to be scaled down accordingly before all-reduce.
             if shared_tp_size != model_config.mapping.tp_size:
                 self.shared_output_scale = shared_tp_size / model_config.mapping.tp_size
         self.shared_experts = GatedMLP(
@@ -304,15 +289,10 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            is_expert=True)
+            reduce_output=False)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -321,14 +301,14 @@ class Deepseekv3MoE(nn.Module):
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, min_latency_mode):
-        if self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+        if self.use_dp and self.mapping.tp_size > 1:
             max_num_token = max(all_rank_num_tokens)
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max_num_token - hidden_states.shape[0]))
             if disable_fp4_allgather():
                 hidden_states = allgather(hidden_states,
-                                          self.parallel_config,
+                                          self.mapping,
                                           gather_dim=0)
         router_logits = self.gate(hidden_states)
 
@@ -356,34 +336,32 @@ class Deepseekv3MoE(nn.Module):
     ) -> torch.Tensor:
         if min_latency_mode:
             assert not self.use_dp
-        # Only enable multi-stream for cuda graph since switch stream has extra host overhead
-        # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        do_multi_stream = is_graph_capturing()
-        if do_multi_stream:
-            self.event_dict[EventType.Main].record()
-        shared_output = self.shared_experts(hidden_states)
-        if self.shared_output_scale is not None:
-            shared_output *= self.shared_output_scale
-        if do_multi_stream:
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.Main].wait()
-                routed_output = self.compute_routed_output(
-                    hidden_states, hidden_states_fp4, all_rank_num_tokens,
-                    min_latency_mode)
-                self.event_dict[EventType.MoeShared].record()
-            self.event_dict[EventType.MoeShared].wait()
-        else:
+
+        def _compute_shared_output():
+            shared_output = self.shared_experts(hidden_states)
+            if self.shared_output_scale is not None:
+                shared_output *= self.shared_output_scale
+            return shared_output
+
+        def _compute_routed_output():
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
                                                        min_latency_mode)
+            return routed_output
+
+        shared_output, routed_output = maybe_execute_in_parallel(
+            _compute_shared_output, _compute_routed_output,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared], self.aux_stream)
+
         if min_latency_mode:
             return [shared_output, *routed_output]
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if not self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -414,7 +392,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
 
-        pp_layer_offset = model_config.mapping.pp_layers_torch(
+        pp_layer_offset = model_config.mapping.pp_layers(
             config.num_hidden_layers)[0]
         global_layer_idx = pp_layer_offset + layer_idx
 
@@ -439,10 +417,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 model_config=model_config,
                 aux_stream_dict=aux_stream_dict)
         else:
+            # The block scale size is 128, which requires intermediate_size to be divisible by 128.
+            assert config.intermediate_size % 128 == 0
             if self.enable_attention_dp:
+                # If using attention DP, the MLP also uses DP instead of TP.
                 self.mlp_tp_size = 1
             else:
-                assert config.intermediate_size % 128 == 0
+                # Due to the restriction of block scale size (i.e., 128), the supported TP sizes only include 1, 2, 4, 8, and 16.
+                # To avoid the costly inter-node all-reduce, we further restrict TP size to be divisible by gpus_per_node.
+                # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
                 self.mlp_tp_size = math.gcd(
                     math.gcd(
                         config.intermediate_size // 128,
@@ -461,7 +444,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 dtype=config.torch_dtype,
                                 config=model_config,
                                 overridden_tp_size=self.mlp_tp_size,
-                                is_expert=False)
+                                reduce_output=True)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -470,14 +453,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
+        self.mapping = model_config.mapping
         self.layer_idx = layer_idx
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
 
         self.deepseek_allreduce_disabled = os.environ.get(
@@ -486,7 +464,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.deepseek_allreduce_disabled = True
 
         if not self.deepseek_allreduce_disabled:
-            self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
+            self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
 
     def forward(
         self,
@@ -505,15 +483,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             0
         ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 else False
 
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.fusion_config.
-                PRE_MLP_FUSION or self.parallel_config.tensor_parallel_size == 1
-                or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION
+                or self.fusion_config.PRE_MLP_FUSION
+                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -586,9 +568,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                    POST_MLP_FUSION or self.parallel_config.tensor_parallel_size
-                    == 1 or self.enable_attention_dp)),
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
                 min_latency_mode=min_latency_mode,
             )
         else:
@@ -596,9 +578,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION or self.fusion_config.
-                    POST_MLP_FUSION or self.parallel_config.tensor_parallel_size
-                    == 1 or self.enable_attention_dp)),
+                    self.fusion_config.POST_MOE_FUSION
+                    or self.fusion_config.POST_MLP_FUSION
+                    or self.mapping.tp_size == 1 or self.enable_attention_dp)),
                 min_latency_mode=min_latency_mode,
             )
 
@@ -729,8 +711,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
             **kwargs,
         )
 
@@ -762,8 +744,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states,
             all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION or self.parallel_config.
-                tensor_parallel_size == 1 or self.enable_attention_dp)),
+                self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
+                or self.enable_attention_dp)),
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -827,41 +809,9 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-    ) -> torch.Tensor:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = inputs_embeds
-        residual = hidden_states
-
-        hidden_states = self.layers[0].input_layernorm(hidden_states)
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
-
-        return hidden_states
-
-    def _pp_forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
     ) -> torch.Tensor:
-        if self.pp_rank != 0:
-            if pipeline_interface is None:
-                raise ValueError(
-                    "pipeline_interface is required for non-first pp rank.")
-            hidden_states, residual = pipeline_interface
-        else:
+        if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError(
                     "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -871,29 +821,27 @@ class DeepseekV3Model(DecoderModel):
                 inputs_embeds = self.embed_tokens(input_ids)
 
             hidden_states = inputs_embeds
-            residual = hidden_states
-
-        local_decoder_layers = ([
-            self.layers[layer_id] for layer_id in self.pp_layer_list
-        ] if self.pp_size > 1 else self.layers)
-
-        if self.pp_rank == 0:
-            hidden_states = local_decoder_layers[0].input_layernorm(
-                hidden_states)
+            residual = None
         else:
-            hidden_states, residual = local_decoder_layers[0].input_layernorm(
+            if pipeline_interface is None:
+                raise ValueError(
+                    "pipeline_interface is required for non-first pp rank.")
+            hidden_states, residual = pipeline_interface
+            hidden_states, residual = self.local_layers()[0].input_layernorm(
                 hidden_states, residual)
 
-        for decoder_layer in local_decoder_layers:
-            hidden_states, residual = decoder_layer(position_ids=position_ids,
-                                                    hidden_states=hidden_states,
-                                                    attn_metadata=attn_metadata,
-                                                    residual=residual)
+        for decoder_layer in self.local_layers():
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+            )
 
-        if not self.pp_rank == self.pp_size - 1:
-            return PipelineInterface(hidden_states, residual)
-        else:
+        if self.model_config.mapping.is_last_pp_rank():
             return hidden_states
+        else:
+            return PipelineInterface(hidden_states, residual)
 
 
 @register_auto_model("DeepseekV3ForCausalLM")

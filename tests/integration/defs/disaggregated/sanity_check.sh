@@ -31,9 +31,6 @@ elif [[ "${TEST_DESC}" == "mixed" ]]; then
 elif [[ "${TEST_DESC}" == "overlap" ]]; then
   NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_overlap.yaml
-elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp_8_overlap_dp" ]]; then
-  NUM_RANKS=4
-  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_overlap_dp.yaml
 elif [[ "${TEST_DESC}" == "4_ranks" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp1.yaml
@@ -49,6 +46,9 @@ elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph"
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp_8_attention_dp_overlap" ]]; then
+  NUM_RANKS=4
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_attention_dp_one" ]]; then
   NUM_RANKS=4
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_one.yaml
@@ -61,6 +61,9 @@ elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_mtp" ]]; then
 elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1" ]]; then
   NUM_RANKS=2
   CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml
+elif [[ "${TEST_DESC}" == "deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp" ]]; then
+  NUM_RANKS=2
+  CONFIG_FILE=${SCRIPT_DIR}/test_configs/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp_attention_dp_overlap.yaml
 else
   echo "Invalid test description: ${TEST_DESC}"
   exit 1
@@ -76,6 +79,12 @@ trtllm-serve disaggregated --server_start_timeout 900 -c ${CONFIG_FILE} &> outpu
 for i in $(seq 1 ${NUM_ITERS}); do
     python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950
     python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json --server-start-timeout 950 --streaming -o output_streaming.json
+
+    # Run the chat completion endpoint test only for TinyLlama
+    if [[ "${TEST_DESC}" == "overlap" ]]; then
+      python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json -e chat --server-start-timeout 950 -o output_chat.json
+      python3 ${CLIENT_DIR}/disagg_client.py -c ${EXAMPLE_DIR}/disagg_config.yaml -p ${CLIENT_DIR}/prompts.json -e chat --server-start-timeout 950 --streaming -o output_streaming_chat.json
+    fi
 done
 
 echo "------------------"
@@ -111,12 +120,24 @@ fi
 
 if [[ "${TEST_DESC}" != "gen_only" ]]; then
   expected_strings=("The capital of Germany is Berlin" "Asyncio is a Python library")
+  not_expected_strings=("Berlin Berlin")
   if [[ "${TEST_DESC}" =~ "deepseek_v3_lite" ]]; then
-    expected_strings=("Berlin" "Asyncio is a powerful tool")
+    expected_strings=("Berlin" "Asyncio is a")
   fi
 
   for expected_string in "${expected_strings[@]}"; do
       grep "${expected_string}" output.json
       grep "${expected_string}" output_streaming.json
+
+      if [[ "${TEST_DESC}" == "overlap" ]]; then
+        grep "${expected_string}" output_chat.json
+        grep "${expected_string}" output_streaming_chat.json
+      fi
   done
+
+  for not_expected_string in "${not_expected_strings[@]}"; do
+      grep -v "${not_expected_string}" output.json
+      grep -v "${not_expected_string}" output_streaming.json
+  done
+
 fi

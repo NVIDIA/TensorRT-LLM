@@ -3,7 +3,7 @@ import itertools
 import os
 import socket
 import sys
-import time
+import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
@@ -11,6 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.logger import logger
 
 from .._utils import global_mpi_rank
 from .utils import print_colored_debug
@@ -90,8 +91,37 @@ class MpiSession(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def shutdown(self):
+    def shutdown(self, wait=True):
         raise NotImplementedError()
+
+    @abc.abstractmethod
+    def abort(self):
+        raise NotImplementedError()
+
+    def _abort_on_timeout(self, fut: Future, timeout: float, reason=None):
+        try:
+            fut.result(timeout=timeout)
+        except TimeoutError:
+            logger.critical("MpiSession shutdown timeout, aborting...")
+            if reason is not None:
+                logger.info(f"Reason to shutdown: {repr(reason)}")
+            self.abort()
+
+    def shutdown_abort(self, grace: float = 60, reason=None):
+        if sys.is_finalizing():
+            # cannot start thread at interpreter shutdown
+            # simply don't wait to avoid hang
+            return self.shutdown(wait=False)
+
+        fut = Future()
+        killer = threading.Thread(group=None,
+                                  target=self._abort_on_timeout,
+                                  name="MpiSessionTimeoutKiller",
+                                  args=(fut, grace, reason))
+        killer.start()
+        self.shutdown()
+        fut.set_result(None)
+        killer.join()
 
 
 class MpiPoolSession(MpiSession):
@@ -120,10 +150,13 @@ class MpiPoolSession(MpiSession):
         ]
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=True)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -132,7 +165,7 @@ class MpiPoolSession(MpiSession):
                                         path=sys.path)
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
@@ -187,10 +220,6 @@ class MpiCommSession(MpiSession):
             for i in range(self.n_workers - 1)
         ]
 
-        # A trick to wait for rank0 to be ready, or the collective tasks will hang
-        # TODO[chunweiy]: Remove this trick
-        time.sleep(10)
-
         rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
 
@@ -198,13 +227,16 @@ class MpiCommSession(MpiSession):
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         if self.mpi_pool is not None:
-            self.mpi_pool.shutdown(wait=True)
+            self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
         if self.thread_pool is not None:
-            self.thread_pool.shutdown(wait=True)
+            self.thread_pool.shutdown(wait=wait)
             self.thread_pool = None
+
+    def abort(self):
+        self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
@@ -214,7 +246,7 @@ class MpiCommSession(MpiSession):
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):
-        self.shutdown()
+        self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
@@ -232,12 +264,12 @@ class RemoteMpiCommSessionClient():
     '''
 
     def __init__(self, addr: str):
+        # FIXME: this is a hack to avoid circular import, resolve later
+        from tensorrt_llm.executor.ipc import ZeroMqQueue
+        self.addr = addr
         print_colored_debug(
             f"RemoteMpiCommSessionClient connecting to {addr}\n", "yellow")
-        self.addr = addr
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PAIR)
-        self.socket.connect(addr)
+        self.queue = ZeroMqQueue(addr, is_server=False)
         self._is_shutdown = False
 
     def submit(self, task: Callable[..., T], *args, **kwargs) -> list:
@@ -246,12 +278,15 @@ class RemoteMpiCommSessionClient():
                 "RemoteMpiCommSessionClient is already shut down\n", "yellow")
             return []
         print_colored_debug(
-            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] Sending task {task} to {self.addr}\n",
+            f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
-        self.socket.send_pyobj(RemoteTask(task, args, kwargs))
+        self.queue.put(RemoteTask(task, args, kwargs))
         return []
 
-    def shutdown(self):
+    def submit_sync(self, task, *args, **kwargs):
+        return self.submit(task, *args, **kwargs)
+
+    def shutdown(self, wait=True):
         if self._is_shutdown:
             return
 
@@ -259,10 +294,7 @@ class RemoteMpiCommSessionClient():
             print_colored_debug(
                 f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server\n",
                 "green")
-            self.socket.send_pyobj(
-                None)  # ask RemoteMpiCommSessionServer to shutdown
-            self.socket.close()
-            self.context.term()
+            self.queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
         except zmq.error.ZMQError as e:
             print_colored_debug(
                 f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
@@ -281,10 +313,10 @@ class RemoteMpiCommSessionServer():
                  addr: str = f'tcp://127.0.0.1:*',
                  comm=None,
                  is_comm: bool = False):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PAIR)
-        self.socket.bind(addr)
-        self.addr = self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+        # FIXME: this is a hack to avoid circular import, resolve later
+        from tensorrt_llm.executor.ipc import ZeroMqQueue
+        self.addr = addr
+        self.queue = ZeroMqQueue(addr, is_server=True)
         self.comm = comm
 
         if self.comm is not None:
@@ -299,7 +331,7 @@ class RemoteMpiCommSessionServer():
         print_colored_debug(
             f"RemoteMpiCommSessionServer listening on {self.addr}\n", "yellow")
         while True:
-            message: Optional[RemoteTask] = self.socket.recv_pyobj()
+            message: Optional[RemoteTask] = self.queue.get()
             if message is None:
                 print_colored_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",

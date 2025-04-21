@@ -897,7 +897,7 @@ class TritonWithFlattenedInputs(AttentionDescriptor):
 
     @classmethod
     def get_attention_op(cls):
-        return torch.ops.attention.fused_flattened_mha_with_cache
+        return torch.ops.attention.fused_flattened_mha_with_cache, 3
 
     @classmethod
     def get_prepare_metadata_op(cls):

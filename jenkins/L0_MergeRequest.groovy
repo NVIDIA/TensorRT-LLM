@@ -21,10 +21,10 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 // Container configuration
 // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
 // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-x86_64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.01-py3-aarch64-ubuntu24.04-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py310-trt10.8.0.43-skip-devel-202503131720-8877"
-LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.0-devel-rocky8-x86_64-rocky8-py312-trt10.8.0.43-skip-devel-202503131720-8877"
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-x86_64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.03-py3-aarch64-ubuntu24.04-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py310-trt10.9.0.34-skip-devel-202504101610-3421"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.8.1-devel-rocky8-x86_64-rocky8-py312-trt10.9.0.34-skip-devel-202504101610-3421"
 
 LLM_ROCKYLINUX8_DOCKER_IMAGE = LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE
 
@@ -326,13 +326,7 @@ def launchReleaseCheck(pipeline)
         // Step 1: cloning tekit source code
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep pre-commit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install `grep bandit requirements-dev.txt`")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit install")
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run -a --show-diff-on-failure || (git restore . && false)")
-        sh "cd ${LLM_ROOT} && bandit --configfile scripts/bandit.yaml -r tensorrt_llm | tee /tmp/bandit.log"
-        sh "cat /tmp/bandit.log | grep -q 'Total lines skipped (#nosec): 0' && exit 0 || exit 1"
-        sh "cat /tmp/bandit.log | grep -q 'Issue:' && exit 1 || exit 0"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
         // Step 2: build tools
         withEnv(['GONOSUMDB=*.nvidia.com']) {
@@ -524,7 +518,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py",
+        "tensorrt_llm/_torch/models/modeling_llama.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "jenkins/L0_Test.groovy",
@@ -565,7 +562,13 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
         return false
     }
-    def pytorchOnlyPattern = ~/^tensorrt_llm\/_torch\/.*/
+    def pytorchOnlyList = [
+        "tensorrt_llm/_torch/",
+        "tests/unittest/_torch/",
+        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+        "tests/integration/defs/disaggregated/",
+        "examples/pytorch/",
+    ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
 
@@ -573,12 +576,20 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
         return false
     }
 
-    def result = changedFileList.every { file ->
-        def isPytorchFile = file =~ pytorchOnlyPattern
+    def result = true
+    for (file in changedFileList) {
+        def isPytorchFile = false
+        for (prefix in pytorchOnlyList) {
+            if (file.startsWith(prefix)) {
+                isPytorchFile = true
+                break
+            }
+        }
         if (!isPytorchFile) {
             pipeline.echo("Found non-PyTorch file: ${file}")
+            result = false
+            break
         }
-        return isPytorchFile
     }
 
     pipeline.echo("Only PyTorch files changed: ${result}")

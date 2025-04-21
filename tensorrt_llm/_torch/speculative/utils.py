@@ -16,7 +16,8 @@ def get_spec_metadata(spec_config,
         return Eagle3SpecMetadata(max_draft_tokens=spec_config.max_draft_tokens,
                                   spec_dec_mode=spec_config.spec_dec_mode,
                                   max_num_requests=max_num_requests,
-                                  num_layers=spec_config.num_layers)
+                                  num_layers=spec_config.num_layers,
+                                  hidden_size=spec_config.hidden_size)
     else:
         return None
 

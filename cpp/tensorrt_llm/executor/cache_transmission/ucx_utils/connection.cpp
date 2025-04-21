@@ -38,29 +38,40 @@ UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx
         if (mFromRequester)
         {
 
-            std::shared_ptr<ucxx::Request> request = mEndpoint->streamRecv(
-                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-            while (!request->isCompleted())
+            // since the tag don't contain the information of the connection id or mConnectionIdInPeer, we need to
+            // lock the mutex ,to ensure only one tagRecv is called in the same time.
+            std::shared_ptr<ucxx::Request> recvRequest
+                = mEndpoint->tagRecv(reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer),
+                    ucxx::Tag(ResponserTag), ucxx::TagMaskFull);
+            while (!recvRequest->isCompleted())
                 ;
-            request->checkError();
-            request = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-            while (!request->isCompleted())
+
+            recvRequest->checkError();
+
+            auto sendTag = ucxx::Tag(mConnectionIdInPeer << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> sendRequest
+                = mEndpoint->tagSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), sendTag);
+            while (!sendRequest->isCompleted())
                 ;
-            request->checkError();
+            sendRequest->checkError();
         }
         else
         {
-            std::shared_ptr<ucxx::Request> request
-                = mEndpoint->streamSend(reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), false);
-            while (!request->isCompleted())
-                ;
-            request->checkError();
 
-            request = mEndpoint->streamRecv(
-                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), false);
-            while (!request->isCompleted())
+            // Since Responder may recv from multiple Requesters, we need to send the mConnectionId to the Reqester
+            // first and use ConnectionId as the tag to recv the mConnectionIdInPeer from the Requester
+            std::shared_ptr<ucxx::Request> sendRequest = mEndpoint->tagSend(
+                reinterpret_cast<void*>(&mConnectionId), sizeof(mConnectionId), ucxx::Tag(ResponserTag));
+            while (!sendRequest->isCompleted())
                 ;
-            request->checkError();
+            sendRequest->checkError();
+
+            auto recvTag = ucxx::Tag(mConnectionId << 32 | (RequesterTag & 0xFFFFFFFF));
+            std::shared_ptr<ucxx::Request> recvRequest = mEndpoint->tagRecv(
+                reinterpret_cast<void*>(&mConnectionIdInPeer), sizeof(mConnectionIdInPeer), recvTag, ucxx::TagMaskFull);
+            while (!recvRequest->isCompleted())
+                ;
+            recvRequest->checkError();
         }
     }
     catch (std::exception const& e)

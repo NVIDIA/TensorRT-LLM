@@ -86,41 +86,43 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.lora_manager = lora_manager
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 *,
-                 lora_dir: Optional[str] = None,
-                 rank: int = 0,
-                 max_batch_size: Optional[int] = None,
-                 max_input_len: Optional[int] = None,
-                 max_output_len: Optional[int] = None,
-                 max_beam_width: Optional[int] = None,
-                 max_attention_window_size: Optional[list[int]] = None,
-                 sink_token_length: Optional[int] = None,
-                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-                 cross_kv_cache_fraction: Optional[float] = None,
-                 medusa_choices: list[list[int]] | None = None,
-                 eagle_choices: list[list[int]] | None = None,
-                 eagle_posterior_threshold: float | None = None,
-                 eagle_use_dynamic_tree: bool = False,
-                 eagle_dynamic_tree_max_top_k: Optional[int] = None,
-                 lookahead_config: list[int] | None = None,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1,
-                 max_tokens_in_paged_kv_cache: int | None = None,
-                 kv_cache_enable_block_reuse: bool = False,
-                 enable_chunked_context: bool = False,
-                 is_enc_dec: bool = False,
-                 multi_block_mode: bool = True,
-                 enable_context_fmha_fp32_acc: Optional[bool] = None,
-                 cuda_graph_mode: Optional[bool] = None,
-                 logits_processor_map: Optional[Dict[str,
-                                                     LogitsProcessor]] = None,
-                 device_ids: List[int] | None = None,
-                 is_orchestrator_mode: bool = False,
-                 use_runtime_defaults: bool = True,
-                 gather_generation_logits: bool = False) -> 'ModelRunnerCpp':
+    def from_dir(
+        cls,
+        engine_dir: str,
+        *,
+        lora_dir: Optional[str] = None,
+        rank: int = 0,
+        max_batch_size: Optional[int] = None,
+        max_input_len: Optional[int] = None,
+        max_output_len: Optional[int] = None,
+        max_beam_width: Optional[int] = None,
+        max_attention_window_size: Optional[list[int]] = None,
+        sink_token_length: Optional[int] = None,
+        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+        cross_kv_cache_fraction: Optional[float] = None,
+        medusa_choices: list[list[int]] | None = None,
+        eagle_choices: list[list[int]] | None = None,
+        eagle_posterior_threshold: float | None = None,
+        eagle_use_dynamic_tree: bool = False,
+        eagle_dynamic_tree_max_top_k: Optional[int] = None,
+        lookahead_config: list[int] | None = None,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        gpu_weights_percent: float = 1,
+        max_tokens_in_paged_kv_cache: int | None = None,
+        kv_cache_enable_block_reuse: bool = False,
+        enable_chunked_context: bool = False,
+        is_enc_dec: bool = False,
+        multi_block_mode: bool = True,
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
+        cuda_graph_mode: Optional[bool] = None,
+        logits_processor_map: Optional[Dict[str, LogitsProcessor]] = None,
+        device_ids: List[int] | None = None,
+        is_orchestrator_mode: bool = False,
+        use_runtime_defaults: bool = True,
+        gather_generation_logits: bool = False,
+        use_variable_beam_width_search: bool = False,
+    ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -384,7 +386,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             peft_cache_config=peft_cache_config,
             debug_config=debug_config,
             gpu_weights_percent=gpu_weights_percent,
-            gather_generation_logits=gather_generation_logits)
+            gather_generation_logits=gather_generation_logits,
+            use_variable_beam_width_search=use_variable_beam_width_search,
+        )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
 
@@ -615,12 +619,25 @@ class ModelRunnerCpp(ModelRunnerMixin):
             # Convert from old API of SamplingConfig
             # Note: Due to a Python3.10 bug one cannot use inspect on it currently
             accepted_parameters = [
-                "num_beams", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-                "top_p_decay", "temperature", "min_tokens",
-                "beam_search_diversity_rate", "repetition_penalty",
-                "presence_penalty", "frequency_penalty", "length_penalty",
-                "early_stopping", "no_repeat_ngram_size", "random_seed",
-                "num_return_sequences", "min_p"
+                "num_beams",
+                "top_k",
+                "top_p",
+                "top_p_min",
+                "top_p_reset_ids",
+                "top_p_decay",
+                "temperature",
+                "min_tokens",
+                "beam_search_diversity_rate",
+                "repetition_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                "length_penalty",
+                "early_stopping",
+                "no_repeat_ngram_size",
+                "random_seed",
+                "num_return_sequences",
+                "min_p",
+                "beam_width_array",
             ]
             rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
@@ -633,6 +650,28 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if "top_p" in sampling_params and sampling_params["top_p"] == 0.0:
                 sampling_params["top_p"] = None
 
+            # TODO: improve usage of SamplingConfig. For example,
+            # construct SamplingConfig for each request, rather than one for the whole batch.
+            # Here we use beam width array for each request for Variable-Beam-Width-Search.
+            batch_size = len(batch_input_ids)
+            use_sampling_config_for_each_request = False
+            # Just placeholder for non-Variable-Beam-Width-Search
+            sampling_config_list = [None] * batch_size
+            if "beam_width_array" in sampling_params and sampling_params[
+                    "beam_width_array"] is not None and len(
+                        sampling_params["beam_width_array"]) == batch_size:
+                use_sampling_config_for_each_request = True
+                sp_copy = copy.deepcopy(sampling_params)
+                for i in range(batch_size):
+                    bwa = sampling_params["beam_width_array"][i]
+                    sp_copy["beam_width_array"] = bwa
+                    sp_copy["beam_width"] = max(bwa)
+                    sampling_config_list[i] = trtllm.SamplingConfig(**sp_copy)
+                # Just placeholder for Variable-Beam-Width-Search and for `self._check_inputs`
+                max_beam_width = max(sc.beam_width
+                                     for sc in sampling_config_list)
+                sampling_params["beam_width"] = max_beam_width
+                sampling_params["beam_width_array"] = [max_beam_width] * 8
             sampling_config = trtllm.SamplingConfig(**sampling_params)
         else:
             sampling_config = copy.deepcopy(sampling_config)
@@ -713,7 +752,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 stop_words=stop_words,
                 bad_words=bad_words,
-                sampling_config=sampling_config,
+                sampling_config=(sampling_config_each_request
+                                 if use_sampling_config_for_each_request else
+                                 sampling_config),
                 lookahead_config=request_lookahead_config,
                 streaming=streaming,
                 output_config=output_config,
@@ -728,11 +769,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
              mrope_config, lora_config, logits_post_processor_name,
-             external_draft_tokens_config, language_adapter_uid) in enumerate(
+             external_draft_tokens_config, language_adapter_uid,
+             sampling_config_each_request) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
                      prompt_tuning_configs, mrope_configs, lora_configs,
                      logits_processor_names, external_draft_tokens_configs,
-                     language_adapter_uids))
+                     language_adapter_uids, sampling_config_list))
         ]
 
         request_ids = self.session.enqueue_requests(requests)

@@ -10,7 +10,6 @@ import time
 import traceback
 import warnings
 import weakref
-from contextlib import contextmanager
 from functools import cache, wraps
 from pathlib import Path
 from queue import Queue
@@ -26,37 +25,6 @@ from pydantic import BaseModel
 from tqdm.auto import tqdm
 
 from tensorrt_llm.logger import Singleton, logger
-
-_nvtx_available = False
-
-try:
-    import nvtx
-
-    _nvtx_available = True
-
-except ImportError:
-    _nvtx_available = False
-
-_nvtx_available = _nvtx_available and os.getenv("TLLM_LLMAPI_ENABLE_NVTX",
-                                                "0") == "1"
-
-
-@contextmanager
-def _nvtx_range_faked(*args, **kwargs):
-    yield
-
-
-def nvtx_range(msg, color="grey", domain="TensorRT-LLM", category=None):
-    if _nvtx_available:
-        return nvtx.annotate(msg, color=color, category=category, domain=domain)
-    else:
-
-        return _nvtx_range_faked()
-
-
-def nvtx_mark(msg, color="grey", domain="TensorRT-LLM", category=None):
-    if _nvtx_available:
-        nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def print_traceback_on_error(func):

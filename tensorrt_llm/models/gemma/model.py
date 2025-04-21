@@ -23,8 +23,8 @@ from tensorrt_llm.quantization.mode import (MODELOPT_FLOW_QUANTIZATIONS,
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor, cast,
-                           recv, send)
+from ...functional import (AllReduceFusionOp, AllReduceParams, LayerNormType,
+                           Tensor, cast, recv, send)
 from ...layers import (Attention, AttentionMaskType, AttentionParams,
                        ColumnLinear, Embedding, GatedMLP, KeyValueCacheParams,
                        LoraParams, PositionEmbeddingType, RmsNorm)
@@ -56,13 +56,26 @@ class GemmaDecoderLayer(Module):
 
         q_scaling = 1.0
         max_attn_value = 0.0
+        qk_layernorm = False
+        is_sliding = False
+        rotary_base = config.rotary_base
+        rotary_base_local = None
 
         gemma2_config = config.gemma2_config()
+        gemma3_config = config.gemma3_config()
         if gemma2_config:
             q_scaling = math.sqrt(
                 gemma2_config.query_pre_attn_scalar) / math.sqrt(
                     config.head_size)
             max_attn_value = config.attn_logit_softcapping or 0.0
+        elif gemma3_config:
+            qk_layernorm = True
+            q_scaling = math.sqrt(
+                gemma3_config.query_pre_attn_scalar) / math.sqrt(
+                    config.head_size)
+            is_sliding = bool(
+                (layer_idx + 1) % gemma3_config.sliding_window_pattern)
+            rotary_base_local = config.rope_local_base_freq
 
         self.attention = Attention(
             local_layer_idx=self.local_layer_idx,
@@ -70,18 +83,22 @@ class GemmaDecoderLayer(Module):
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             attention_head_size=config.head_size,
+            qk_layernorm=qk_layernorm,
+            layernorm_type=LayerNormType.RmsNorm,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
             attention_mask_type=AttentionMaskType.causal,
             bias=config.attn_bias,
             position_embedding_type=PositionEmbeddingType.rope_gpt_neox,
-            rotary_embedding_base=config.rotary_base,
+            rotary_embedding_base=rotary_base,
+            rotary_embedding_base_local=rotary_base_local,
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             quant_mode=config.quant_mode,
             q_scaling=q_scaling,
             max_attn_value=max_attn_value,
+            is_local=is_sliding,
         )
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size

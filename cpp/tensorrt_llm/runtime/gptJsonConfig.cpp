@@ -80,9 +80,9 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     return value;
 }
 
-static nvinfer1::DataType strToDType(std::string type)
+nvinfer1::DataType strToDType(std::string type)
 {
-    static const std::map<std::string, nvinfer1::DataType> typeMap = {{"int64", nvinfer1::DataType::kINT64},
+    static std::map<std::string, nvinfer1::DataType> const typeMap = {{"int64", nvinfer1::DataType::kINT64},
         {"int32", nvinfer1::DataType::kINT32}, {"int", nvinfer1::DataType::kINT32},
         {"float32", nvinfer1::DataType::kFLOAT}, {"bfloat16", nvinfer1::DataType::kBF16},
         {"float16", nvinfer1::DataType::kHALF}, {"bool", nvinfer1::DataType::kBOOL},

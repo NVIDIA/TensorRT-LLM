@@ -72,15 +72,16 @@ Additionally, we have officially verified and fully optimized support for the fo
 <details>
 <summary>Click to expand supported models list</summary>
 
-| Model Series | HF Model Card | Precision | World Size | Runtime | Compile Backend || Attention Backend ||
-|--------------|----------------------|-----------|------------|---------|-----------------|--------------------|--------|--------------------|
-|              |               |           |            |         | torch-simple    | torch-opt          | TritonWithFlattenedInputs | FlashInfer |
-| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
-| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
-| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
-| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
-| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
-| BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ |
+| Model Series | HF Model Card | Precision | World Size | Runtime | Compile Backend || Attention Backend |||
+|--------------|----------------------|-----------|------------|---------|-----------------|--------------------|--------|----------|----------|
+|              |               |           |            |         | torch-simple    | torch-opt          | TritonWithFlattenedInputs | FlashInfer | MultiHeadLatentAttention |
+| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| BigCode      | bigcode/starcoder2-15b | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | n/a |
+| Deepseek-V3      | deepseek-ai/DeepSeek-V3 | BF16 | 1,2,4 | demollm | ✅ | ❌ | n/a | n/a | ✅ |
 
 </details>
 
@@ -129,6 +130,7 @@ In the below example:
 - `runtime` specify which type of Engine to use during runtime, default is `demollm` .
 - `compile_backend` specify how to compile the graph from `torch.export`, default is `torch-opt` .
 - `attn_backend` specify kernel implementation for attention, default is `TritonWithFlattenedInputs`.
+- `mla_backend` specify implementation for multi-head latent attention, default is `MultiHeadLatentAttention`.
 - `benchmark` indicates whether to run the built-in benchmark for token generation, default is `False`.
 
 ```bash

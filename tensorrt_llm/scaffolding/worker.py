@@ -1,4 +1,4 @@
-from abc import ABC, abstractmethod
+from abc import ABC
 from copy import deepcopy
 from typing import Callable, List, Optional, Union
 
@@ -30,9 +30,8 @@ class Worker(ABC):
 
     task_handlers = {}
 
-    @abstractmethod
     def shutdown(self):
-        raise NotImplementedError
+        pass
 
     def __enter__(self):
         return self
