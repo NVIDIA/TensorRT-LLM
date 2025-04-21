@@ -449,17 +449,16 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @skip_pre_blackwell
-    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False), (True, False, False),
-                           (False, True, False), (False, False, True),
-                           (True, True, True)])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("mtp_nextn", [None, 2])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
                                                          (8, 1, 8)],
                              ids=["tp8", "tp8ep4", "tp8ep8"])
     def test_nvfp4_8gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
                          attention_dp, cuda_graph, overlap_scheduler):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
         pytorch_config = PyTorchConfig(
             enable_overlap_scheduler=overlap_scheduler,
             use_cuda_graph=cuda_graph)
