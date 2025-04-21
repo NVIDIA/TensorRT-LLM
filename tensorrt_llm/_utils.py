@@ -538,6 +538,12 @@ def mpi_recv(buf, source, tag):
     return None
 
 
+def mpi_allreduce(obj, op: MPI.Op):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().allreduce(obj, op)
+    return None
+
+
 def pad_vocab_size(vocab_size, tp_size):
     return int(math.ceil(vocab_size / tp_size) * tp_size)
 

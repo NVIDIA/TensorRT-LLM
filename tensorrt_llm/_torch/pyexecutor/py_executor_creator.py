@@ -1,6 +1,9 @@
 import copy
 
+from mpi4py import MPI
+
 import tensorrt_llm
+from tensorrt_llm._utils import mpi_allreduce
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
@@ -169,6 +172,10 @@ def create_py_executor(executor_config: ExecutorConfig,
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
+
+        if mapping.world_size > 1:
+            kv_cache_max_tokens = mpi_allreduce(kv_cache_max_tokens, MPI.MAX)
+
         # This may be None if no max number tokens set and enable cp.
         if kv_cache_max_tokens is not None:
             executor_config.kv_cache_config.max_tokens = kv_cache_max_tokens
