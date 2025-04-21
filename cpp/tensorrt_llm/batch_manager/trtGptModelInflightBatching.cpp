@@ -832,7 +832,7 @@ void TrtGptModelInflightBatching::forwardSync()
     }
     if (mCacheTransceiver)
     {
-        mCacheTransceiver->checkContextTransferStatus();
+        mCacheTransceiver->checkContextTransferStatus(0);
     }
     ++mIterCounter;
 
@@ -892,13 +892,11 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         TLLM_LOG_DEBUG("Running DECODER request scheduler");
         auto [fittingRequests, fittingDisaggGenInitRequests, requestsToPause]
             = (*mCapacityScheduler)(activeRequests, mKvCacheManager, mPeftCacheManager, mCrossKvCacheManager);
-
         // Remove from fitting requests the requests that cannot be scheduled due to disagg KV cache transfer
         if (mModelConfig.isTransformerBased() && getKVCacheManager() && mCacheTransceiver)
         {
             prepareDisaggGenInitRequests(activeRequests, fittingDisaggGenInitRequests);
         }
-
         if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
@@ -906,13 +904,12 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                 ",will try wait for kvCache transfer to complete");
             if (mCacheTransceiver)
             {
-                mCacheTransceiver->checkContextTransferStatus(true);
+                mCacheTransceiver->checkContextTransferStatus(1);
                 // will free kvCache in next iteration.
             }
         }
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
-
         TLLM_CHECK(currRequests.size() <= static_cast<size_t>(getMaxBatchSize()));
 
         (*mPauseRequests)(requestsToPause, mInflightReqIds, mReqIdsToPause, false, *mSeqSlotManager, mKvCacheManager,
@@ -965,7 +962,6 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
             }
 
             executeBatch(currRequests);
-
             if (mWorldConfig.isLastPipelineParallelRank() && mGuidedDecoder)
             {
                 // XGrammar: build maskcache for context requests and perform maskgen for all requests
