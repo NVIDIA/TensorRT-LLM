@@ -213,10 +213,6 @@ template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool Quant
 __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAllReduceFusionParams params)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
-#endif
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
     cg::grid_group grid = cg::this_grid();
@@ -242,6 +238,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
     float4 clear_vec = get_neg_zero();
 
     cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess;
 
@@ -373,11 +370,6 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
     comm.update(params.size * NRanks);
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
