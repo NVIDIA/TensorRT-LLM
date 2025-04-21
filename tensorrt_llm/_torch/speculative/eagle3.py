@@ -66,6 +66,9 @@ class Eagle3SpecMetadata(SpecMetadata):
         if not self.is_cuda_graph:
             self.hidden_states = []
 
+    def is_layer_capture(self, layer_id: int):
+        return layer_id in self.layers_to_capture
+
     def maybe_capture_hidden_states(
             self,
             layer_id: int,

@@ -382,6 +382,16 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states, residual = unpack_hidden_states(
                 self.post_attention_layernorm(hidden_states, residual))
 
+        # In eagle3 mode, we capture the value in the boundary of decoder layer.
+        # If fusing rms in the next layer, the value is not correct. Thus, if
+        # this layer will be captured, we should not fuse the rms in the next
+        # layer.
+        if spec_metadata is not None:
+            if spec_metadata.is_layer_capture(self.layer_idx):
+                self.fusion_config.POST_MOE_FUSION = False
+                self.fusion_config.POST_MLP_FUSION = False
+                min_latency_mode = False
+
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
