@@ -318,12 +318,15 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         mm_processor_kwargs['do_rescale'] = False
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs).to(self.device)
-
-        mm_features = self._process(
-            processed_inputs.get('pixel_values', None),
-            processed_inputs.get('pixel_values_videos', None),
-            processed_inputs.get('image_grid_thw', None),
-            processed_inputs.get('video_grid_thw', None))
+        if mm_data:
+            mm_features = self._process(
+                processed_inputs.get('pixel_values', None),
+                processed_inputs.get('pixel_values_videos', None),
+                processed_inputs.get('image_grid_thw', None),
+                processed_inputs.get('video_grid_thw', None))
+            prompt_tuning_config = [mm_features, None, None]
+        else:
+            prompt_tuning_config = None
 
         input_ids = processed_inputs['input_ids']
 
@@ -336,7 +339,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         fused_input_ids = self._postprocess(input_ids[0])
 
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features,
+            "prompt_tuning_config": prompt_tuning_config,
             "mrope_config": mrope_config
         }
 

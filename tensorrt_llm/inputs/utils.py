@@ -1,5 +1,13 @@
+import base64
+import os
+import tempfile
+from io import BytesIO
+from pathlib import Path
 from typing import List, Union
+from urllib.parse import urlparse
 
+import aiohttp
+import cv2
 import numpy as np
 import requests
 import torch
@@ -29,7 +37,6 @@ def load_video(
         num_frames: int = 10,
         format: str = "pt",
         device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
-    import cv2
 
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
@@ -226,3 +233,101 @@ INPUT_FORMATTER_MAP = {
     "qwen2_5_vl": format_qwen2_vl_input,
     "llama4": format_generic_input,
 }
+
+
+async def async_load_image(
+        image: str,
+        format: str = "pt",
+        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+    # print('[INFO] async_load_image is called')
+    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    parsed_url = urlparse(image)
+
+    def load_and_conver_image(image):
+        image = Image.open(image)
+        image.load()
+        return image.convert("RGB")
+
+    if parsed_url.scheme in ["http", "https"]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image) as response:
+                content = await response.read()
+                image = load_and_conver_image(BytesIO(content))
+    elif parsed_url.scheme == "data":
+        data_spec, data = parsed_url.path.split(",", 1)
+        media_type, data_type = data_spec.split(";", 1)
+
+        if data_type != "base64":
+            msg = "Only base64 data URLs are supported for now."
+            raise NotImplementedError(msg)
+
+        content = base64.b64decode(data)
+        image = load_and_conver_image(BytesIO(content))
+    else:
+        filepath = Path(parsed_url.path)
+        image = load_and_conver_image(filepath)
+
+    # print('[INFO] async_load_image is finished')
+    if format == "pt":
+        return ToTensor()(image).to(device=device)
+    else:
+        return image
+
+
+async def async_load_video(
+        video: str,
+        num_frames: int = 10,
+        format: str = "pt",
+        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    # Load video frames from a video file
+    if video.startswith("http://") or video.startswith("https://"):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video) as response:
+                with tempfile.NamedTemporaryFile(delete=False,
+                                                 suffix='.mp4') as tmp:
+                    tmp.write(await response.content.read())
+                    video_path = tmp.name
+    else:
+        video_path = video
+
+    vidcap = cv2.VideoCapture(video_path)
+
+    if not vidcap.isOpened():
+        raise ValueError(
+            f"Video '{video}' could not be opened. Make sure opencv is installed with video support."
+        )
+
+    # Find the last frame as frame count might not be accurate
+    frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    while frame_count > 0:
+        vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+        if vidcap.grab():
+            break
+        frame_count -= 1
+    else:
+        raise ValueError(f"Video '{video}' has no frames.")
+
+    # Extract frames uniformly
+    indices = np.round(np.linspace(0, frame_count - 1, num_frames)).astype(int)
+    frames = {}
+    for index in indices:
+        if index in frames:
+            continue
+        vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        success, frame = vidcap.read()
+        if not success:
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames[index] = Image.fromarray(frame)
+
+    if video.startswith("http://") or video.startswith("https://"):
+        os.unlink(video_path)
+
+    return [
+        ToTensor()(frames[index]).to(
+            device=device) if format == "pt" else frames[index]
+        for index in indices if index in frames
+    ]

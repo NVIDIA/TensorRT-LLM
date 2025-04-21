@@ -4,12 +4,13 @@ from .registry import (ExtraProcessedInputs, InputProcessor,
 from .utils import (INPUT_FORMATTER_MAP, default_image_loader,
                     default_video_loader, format_generic_input,
                     format_qwen2_vl_input, format_vila_input, load_image,
-                    load_video)
+                    load_video, async_load_image, async_load_video)
 
 __all__ = [
     "PromptInputs", "prompt_inputs", "TextPrompt", "TokensPrompt",
     "InputProcessor", "create_input_processor", "register_input_processor",
-    "ExtraProcessedInputs", "load_image", "load_video", "INPUT_FORMATTER_MAP",
-    "default_image_loader", "default_video_loader", "format_vila_input",
-    "format_generic_input", "format_qwen2_vl_input"
+    "ExtraProcessedInputs", "load_image", "load_video", "async_load_image",
+    "async_load_video", "INPUT_FORMATTER_MAP", "default_image_loader",
+    "default_video_loader", "format_vila_input", "format_generic_input",
+    "format_qwen2_vl_input"
 ]
