@@ -59,7 +59,7 @@ def test_llm_granite(llama_example_root, llm_granite_model_root,
 
     print("Run engines...")
     summary_cmd = [
-        f"{llama_example_root}/../summarize.py",
+        f"{llama_example_root}/../../../summarize.py",
         f"--engine_dir={engine_dir}",
         f"--hf_model_dir={llm_granite_model_root}",
         f"--dataset_dir={llm_datasets_root}",

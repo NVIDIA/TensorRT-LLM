@@ -30,7 +30,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-
+#include "tensorrt_llm/common/logger.h"
 #include <cuda.h>
 
 #include <cstdio>
@@ -175,9 +175,56 @@ CUresult CUDADriverWrapper::cuLaunchKernel(CUfunction f, unsigned int gridDimX, 
         f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
 }
 
+namespace
+{
+std::string stringify_launch_config(CUlaunchConfig const& config)
+{
+    std::stringstream ss;
+
+    // Grid dimensions (Driver API uses separate fields)
+    ss << "Grid Dimensions: (" << config.gridDimX << ", " << config.gridDimY << ", " << config.gridDimZ << ")\n";
+
+    // Block dimensions
+    ss << "Block Dimensions: (" << config.blockDimX << ", " << config.blockDimY << ", " << config.blockDimZ << ")\n";
+
+    // Shared memory and stream (Driver API uses hStream)
+    ss << "Shared Memory: " << config.sharedMemBytes << " bytes\n";
+    ss << "Stream: " << (config.hStream ? "Custom" : "Default") << " (0x" << std::hex
+       << reinterpret_cast<uintptr_t>(config.hStream) << ")\n";
+
+    // Attributes (Driver API uses value instead of val)
+    ss << "Attributes (" << config.numAttrs << "):\n";
+    for (uint i = 0; i < config.numAttrs; ++i)
+    {
+        CUlaunchAttribute const& attr = config.attrs[i];
+        ss << "  [" << i << "] ";
+
+        switch (attr.id)
+        {
+        case CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION:
+            ss << "Cluster Dimension: (" << attr.value.clusterDim.x << ", " << attr.value.clusterDim.y << ", "
+               << attr.value.clusterDim.z << ")";
+            break;
+
+        case CU_LAUNCH_ATTRIBUTE_PRIORITY: ss << "Priority: " << attr.value.priority; break;
+
+        // Handle other Driver API attributes here
+        default: ss << "Unknown Attribute (ID=" << attr.id << ")"; break;
+        }
+        ss << "\n";
+    }
+
+    return ss.str();
+}
+} // namespace
+
 CUresult CUDADriverWrapper::cuLaunchKernelEx(
     CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra) const
 {
+
+    TLLM_LOG_DEBUG("Launch config: %s", stringify_launch_config(*config).c_str());
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        (extra != nullptr) != (kernelParams != nullptr), "Exactly one of 'extra' and 'kernelParams' should be set.");
     return (*_cuLaunchKernelEx)(config, f, kernelParams, extra);
 }
 

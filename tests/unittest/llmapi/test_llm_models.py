@@ -97,8 +97,8 @@ def test_llm_starcoder2_fp8():
 
 
 def test_llm_phi_3_mini_4k():
-    phi_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
-                                        "examples/phi/requirements.txt")
+    phi_requirement_path = os.path.join(
+        os.getenv("LLM_ROOT"), "examples/models/core/phi/requirements.txt")
     command = f"pip install -r {phi_requirement_path}"
     subprocess.run(command, shell=True, check=True, env=os.environ)
     phi3_mini_4k_sampling_params = SamplingParams(max_tokens=13)
@@ -112,8 +112,8 @@ def test_llm_phi_3_mini_4k():
 
 @force_ampere
 def test_llm_phi_3_small_8k():
-    phi_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
-                                        "examples/phi/requirements.txt")
+    phi_requirement_path = os.path.join(
+        os.getenv("LLM_ROOT"), "examples/models/core/phi/requirements.txt")
     command = f"pip install -r {phi_requirement_path}"
     subprocess.run(command, shell=True, check=True, env=os.environ)
     build_config = BuildConfig()

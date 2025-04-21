@@ -136,7 +136,7 @@ class LlavaNextInputProcessor(InputProcessor):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
-            "multi_modal_data")
+            "multi_modal_data", {})
         assert 'image' in mm_data
 
         input_ids = self.tokenizer(

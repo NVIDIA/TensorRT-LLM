@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import aiohttp
 import pytest
 import yaml
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -17,13 +18,13 @@ MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 def get_ctx_gen_server_urls_from_cfg(config_file: str):
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
-        ctx_servers = []
-        gen_servers = []
-        for server in config["context_servers"]["urls"]:
-            ctx_servers.append("http://" + server)
-        for server in config["generation_servers"]["urls"]:
-            gen_servers.append("http://" + server)
-        return ctx_servers, gen_servers
+    ctx_servers = []
+    gen_servers = []
+    for server in config["context_servers"]["urls"]:
+        ctx_servers.append("http://" + server)
+    for server in config["generation_servers"]["urls"]:
+        gen_servers.append("http://" + server)
+    return ctx_servers, gen_servers
 
 
 def run_disaggregated_workers(
@@ -45,6 +46,7 @@ def run_disaggregated_workers(
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
     ]
+    logging.info(f"Running workers with command: {' '.join(workers_cmd)}")
     workers_proc = subprocess.Popen(workers_cmd,
                                     stdout=stdout,
                                     stderr=subprocess.STDOUT,
@@ -104,6 +106,29 @@ class BasicWorkerTester:
         gen_request["disaggregated_params"]["request_type"] = "generation_only"
         gen_response = await self.send_request(session, gen_url, gen_request)
         return gen_response
+
+    async def query_kv_cache_events(self, session: aiohttp.ClientSession,
+                                    url: str):
+        async with session.post(url + "/kv_cache_events") as response:
+            events_raw = await response.json()
+
+        events = []
+        for event_raw in events_raw:
+            event = {"id": event_raw["event_id"]} | event_raw["data"]
+            if event["type"] == "stored":
+                for block in event["blocks"]:
+                    block["token_id"] = [
+                        token["token_id"] for token in block["tokens"]
+                    ]
+                    block["token_extra_id"] = [
+                        token["token_extra_id"] for token in block["tokens"]
+                    ]
+                    # TODO: check by BlockKey::usesExtraIds
+                    if not any(block["token_extra_id"]):
+                        del block["token_extra_id"]
+                    del block["tokens"]
+            events.append(event)
+        return events
 
     async def check_server_ready(self, session: aiohttp.ClientSession,
                                  server_url: str) -> bool:
@@ -195,6 +220,161 @@ class ConditionalWorkerTester(BasicWorkerTester):
             await asyncio.gather(*chat_threads)
 
 
+class CacheBlockMeta:
+
+    def __init__(self, hash: int, parent_hash: Optional[int] = None):
+        self.hash = hash
+        self.parent_hash = parent_hash
+        # TODO: maintain next_hashes for partial matching
+
+    def __str__(self):
+        if self.parent_hash is None:
+            return f"CacheBlockMeta({self.hash:016x})"
+        else:
+            return f"CacheBlockMeta({self.hash:016x}, {self.parent_hash:016x})"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+# TODO: use pybind-ed BlockKeyHasher
+def block_key_hasher(token_ids: List[int],
+                     parent_hash: Optional[int] = None) -> int:
+    mask32 = 0xffff_ffff
+    mask64 = 0xffff_ffff_ffff_ffff
+    seed = len(token_ids)
+    if parent_hash is not None:
+        seed ^= (parent_hash * 0xbf58476d1ce4e5b9) & mask64
+    for token_id in token_ids:
+        a = token_id & mask32
+        a = (((a >> 16) ^ a) * 0x45d9f3b) & mask32
+        a = (((a >> 16) ^ a) * 0x45d9f3b) & mask32
+        a = (a >> 16) ^ a
+        seed ^= (((a + 0x9e3779b9) & mask32) + ((seed << 6) & mask64) +
+                 (seed >> 2)) & mask64
+        # TODO: handle token_extra_id and lora_task_id
+    return seed & mask64
+
+
+class KvCacheBlockMap:
+
+    def __init__(self):
+        self.kv_blocks: dict[int, CacheBlockMeta] = {}
+
+    def update_with_events(self, events: List[dict]):
+        for event in events:
+            if event["type"] == "stored":
+                parent_hash = event["parent_hash"]
+                for block in event["blocks"]:
+                    block_hash = block["block_hash"]
+                    self.kv_blocks[block_hash] = CacheBlockMeta(
+                        block_hash, parent_hash)
+            elif event["type"] == "removed":
+                block_hashes = event["block_hashes"]
+                for block_hash in block_hashes:
+                    self.kv_blocks.pop(block_hash, None)
+
+    def get_block_match_count(self, block_hashes: List[int]) -> int:
+        count = 0
+        for block_hash in block_hashes:
+            if block_hash in self.kv_blocks:
+                count += 1
+            else:
+                break
+        return count
+
+    def __str__(self):
+        return f"ServerState(active_requests={self.active_requests}, kv_blocks={', '.join(str(block) for block in self.kv_blocks.values())})"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class KvCacheEventWorkerTester(BasicWorkerTester):
+
+    def __init__(self,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
+                 req_timeout_secs: int = 180,
+                 server_start_timeout_secs: int = 180):
+        super().__init__(ctx_servers, gen_servers, req_timeout_secs,
+                         server_start_timeout_secs)
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        self.kv_cache_block_maps = {}
+        for ctx_server in ctx_servers:
+            self.kv_cache_block_maps[ctx_server] = KvCacheBlockMap()
+        for gen_server in gen_servers:
+            if gen_server not in self.kv_cache_block_maps:
+                self.kv_cache_block_maps[gen_server] = KvCacheBlockMap()
+
+    async def send_request(self, session: aiohttp.ClientSession, url: str,
+                           request: dict) -> dict:
+        response = await super().send_request(session, url, request)
+
+        events = await self.query_kv_cache_events(session, url)
+        self.kv_cache_block_maps[url].update_with_events(events)
+        return response
+
+    async def multi_round_request(self,
+                                  session: aiohttp.ClientSession,
+                                  init_prompt: str,
+                                  max_rounds: int,
+                                  check_match_count: bool = True):
+        request = {
+            "model": MODEL_NAME,
+            "prompt": init_prompt,
+            "max_tokens": 64,
+            "temperature": 0.0,
+        }
+        tokens_per_block = 32  # TODO: read from config
+        prev_ctx_match_count = 0
+        prev_gen_match_count = 0
+        for i in range(max_rounds):
+            # split tokens into blocks and check block match count by hash
+            tokens = self.tokenizer(request["prompt"])["input_ids"]
+            block_hashes = []
+            for t in range(0, len(tokens), tokens_per_block):
+                block_hashes.append(
+                    block_key_hasher(tokens[t:t + tokens_per_block],
+                                     None if t == 0 else block_hashes[-1]))
+            ctx_match_count = self.kv_cache_block_maps[
+                self.ctx_servers[0]].get_block_match_count(block_hashes)
+            gen_match_count = self.kv_cache_block_maps[
+                self.gen_servers[0]].get_block_match_count(block_hashes)
+            assert ctx_match_count >= prev_ctx_match_count
+            assert gen_match_count >= prev_gen_match_count
+
+            response = await self.send_disagg_request(session,
+                                                      self.ctx_servers[0],
+                                                      self.gen_servers[0],
+                                                      request)
+            logging.info(
+                f"Received response {i}: {repr(response['choices'][0]['text'])}"
+            )
+            prev_ctx_match_count = ctx_match_count
+            prev_gen_match_count = gen_match_count
+            request["prompt"] += response["choices"][0]["text"]
+
+        if check_match_count:
+            assert ctx_match_count > 0
+            assert gen_match_count >= ctx_match_count
+        return request["prompt"]
+
+    async def test_multi_round_request(self,
+                                       init_prompts: List[str],
+                                       max_rounds: int = 8):
+        async with await self.new_session() as session:
+            chat_threads = [
+                self.multi_round_request(session, prompt, max_rounds, False)
+                for prompt in init_prompts
+            ]
+            prompts = await asyncio.gather(*chat_threads)
+            await asyncio.gather(*[
+                self.multi_round_request(session, prompt, 1, True)
+                for prompt in prompts
+            ])
+
+
 def prepare_model(llama_model_root: str, llm_venv):
     src_dst_dict = {
         llama_model_root:
@@ -214,15 +394,14 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
     config_file = os.path.join(disaggregated_test_root,
                                'test_configs/disagg_config_cache_reuse.yaml')
     prepare_model(llama_model_root, llm_venv)
+    cwd = llm_venv.get_working_directory()
 
-    with open(
-            os.path.join(llm_venv.get_working_directory(),
-                         'output_workers.log'), 'w') as log_file:
+    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
         workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
             config_file=config_file,
             stdout=log_file,
             env=llm_venv._new_env,
-            cwd=llm_venv.get_working_directory(),
+            cwd=cwd,
             num_ranks=2)
         try:
             tester = ConditionalWorkerTester(ctx_servers, gen_servers)
@@ -231,6 +410,37 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
             with open(prompts_file, 'r') as f:
                 prompts = json.load(f)
             asyncio.run(tester.test_multi_round_request(prompts))
+        except Exception as e:
+            raise e
+        finally:
+            workers_proc.terminate()
+            workers_proc.wait()
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_workers_kv_cache_events(disaggregated_test_root,
+                                 disaggregated_example_root, llm_venv,
+                                 llama_model_root):
+    config_file = os.path.join(disaggregated_test_root,
+                               'test_configs/disagg_config_cache_reuse.yaml')
+    prepare_model(llama_model_root, llm_venv)
+    cwd = llm_venv.get_working_directory()
+
+    with open(os.path.join(cwd, 'output_workers.log'), 'w') as log_file:
+        workers_proc, ctx_servers, gen_servers = run_disaggregated_workers(
+            config_file=config_file,
+            stdout=log_file,
+            env=llm_venv._new_env,
+            cwd=cwd,
+            num_ranks=2)
+        try:
+            tester = KvCacheEventWorkerTester(ctx_servers, gen_servers)
+            prompts_file = os.path.join(disaggregated_example_root,
+                                        'clients/prompts.json')
+            with open(prompts_file, 'r') as f:
+                prompts = json.load(f)
+            asyncio.run(tester.test_multi_round_request(prompts, 6))
         except Exception as e:
             raise e
         finally:

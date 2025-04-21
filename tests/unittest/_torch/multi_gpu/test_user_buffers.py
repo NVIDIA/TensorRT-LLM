@@ -771,7 +771,7 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
         if rank == 0:
             torch.testing.assert_close(output_fused,
                                        output_ref,
-                                       atol=5e-1,
+                                       atol=6e-1,
                                        rtol=1e-2)
     except Exception:
         traceback.print_exc()

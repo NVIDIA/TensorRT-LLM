@@ -102,7 +102,7 @@ def test_llm_mixtral_4gpus_fp8_mmlu_llmapi(
 
     print("Run MMLU test")
     mmlu_cmd = [
-        f"{llmapi_example_root}/../mmlu_llmapi.py",
+        f"{llmapi_example_root}/../../../mmlu_llmapi.py",
         f"--data_dir={mmlu_dataset_root}",
         f"--hf_model_dir={model_dir}",
         "--backend=tensorrt",
@@ -605,7 +605,7 @@ def test_llm_mixtral_moe_plugin_lora_4gpus(
     input_text = "我爱吃蛋糕"
     print("Run inference with lora id 0...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -626,7 +626,7 @@ def test_llm_mixtral_moe_plugin_lora_4gpus(
     print("Run inference with lora id -1...")
     input_text = "I love french quiche"
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -700,7 +700,7 @@ def test_llm_mixtral_moe_plugin_fp8_lora_4gpus(
     input_text = "我爱吃蛋糕"
     print("Run inference with lora id 0...")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=0",
@@ -726,7 +726,7 @@ def test_llm_mixtral_moe_plugin_fp8_lora_4gpus(
     print("Run inference with lora id -1...")
     input_text = "I love french quiche. I"
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=5",
         f"--input_text={input_text}",
         "--lora_task_uids=-1",
@@ -853,7 +853,7 @@ def test_llm_mixtral_1gpu_fp4(
     print("Run MMLU test")
     acc_thres = 68.0
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
+        f"{llama_example_root}/../../../mmlu_llmapi.py",
         f"--data_dir={mmlu_dataset_root}",
         f"--hf_model_dir={llm_mixtral_model_root}",
         f"--engine_dir={engine_dir}",

@@ -259,6 +259,7 @@ class PyTorchModelEngine(ModelEngine):
             model_path,
             mapping=self.mapping,
             attn_backend=attn_backend,
+            moe_backend=pytorch_backend_config.moe_backend,
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
@@ -750,7 +751,7 @@ class PyTorchModelEngine(ModelEngine):
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
-        if self.ub_buffers:
+        if getattr(self, 'ub_buffers', None):
             for u in self.ub_buffers:
                 ub.ub_deallocate(u.addr)
         # Release model weights.
@@ -770,6 +771,10 @@ class PyTorchModelEngine(ModelEngine):
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         if num_layers > 0:
             config.pretrained_config.num_hidden_layers = num_layers
+            for sub_config in ["text_config", "vision_config"]:
+                if hasattr(config.pretrained_config, sub_config):
+                    getattr(config.pretrained_config,
+                            sub_config).num_hidden_layers = num_layers
 
         with timing("Model init total"):
             try:

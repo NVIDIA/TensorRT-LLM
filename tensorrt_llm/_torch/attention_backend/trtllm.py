@@ -710,3 +710,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   or k is not None,
                                   attention_mask=attention_mask)
         return output
+
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return True
+
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True

@@ -28,6 +28,7 @@ class ModelConfig(Generic[TConfig]):
     moe_max_num_tokens: Optional[int] = None
 
     attn_backend: str = 'TRTLLM'
+    moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
 
     def __post_init__(self):
         if self.pretrained_config and hasattr(self.pretrained_config,
@@ -116,6 +117,14 @@ class ModelConfig(Generic[TConfig]):
                         config.quant_algo = mixed_quant_config[k]['quant_algo']
                         mixed_quant_config[k] = config
                 layer_quant_config = mixed_quant_config
+
+            if kwargs.get(
+                    'moe_backend'
+            ) == 'TRTLLM' and quant_config.quant_algo == "FP8_BLOCK_SCALES" and quant_config.exclude_modules is None:
+                quant_config.exclude_modules = [
+                    "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                ]
+
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
@@ -124,7 +133,19 @@ class ModelConfig(Generic[TConfig]):
                     "quant_method") == "fp8" and hf_quant_config.get(
                         "weight_block_size", []):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                quant_config.exclude_modules = ["*eh_proj"]
+                if kwargs.get('moe_backend') == 'TRTLLM':
+                    # TODO: This is a hack. Remove after fp8 bmm is integrated.
+                    quant_config.exclude_modules = [
+                        "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
+                    ]
+                else:
+                    quant_config.exclude_modules = ["*eh_proj"]
+
+                block_size = hf_quant_config.get("weight_block_size", [])
+                assert tuple(block_size) == (
+                    128,
+                    128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
+                quant_config.group_size = block_size[0]
 
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
