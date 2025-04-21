@@ -266,6 +266,8 @@ private:
     CtaInfo computeNumCtas(
         RunnerParams const& params, KernelMeta const& kernelMeta, SelectKernelParams& selectKernelParams) const
     {
+        bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 && params.mMaxSeqLenQ <= 16
+            && params.mHeadDimQk == 576 && params.mHeadDimV == 512;
         // Do we need to select a new kernel ?
         selectKernelParams.mSelectNewKernel = false;
 
@@ -338,7 +340,7 @@ private:
 
             // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension is 16.
             // Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-            if (numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
+            if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16
                 && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
                 && isGmemReduction(selectKernelParams.mMultiCtasKvMode) && !selectKernelParams.mForceGmemReduction)
             {
@@ -378,12 +380,25 @@ private:
             // Split the headDimV into multiple CTAs if the utilization is not full.
             // It doesn't work with reuseSmemKForV currently.
             // TODO: find better heuristic of splitting headDimV across multiple CTAs.
-            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * 2 <= params.mMultiProcessorCount)
+            if (isDsv3MinLatencyMode)
             {
-                // Use smaller headDimPerCtaV to fully utilize the SMs.
-                selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 4 <= params.mMultiProcessorCount ? 128 : 256;
-                // Need to select a different kernel.
-                selectKernelParams.mSelectNewKernel = true;
+                if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas <= params.mMultiProcessorCount)
+                {
+                    // Use smaller headDimPerCtaV to fully utilize the SMs.
+                    selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 2 <= params.mMultiProcessorCount ? 128 : 256;
+                    // Need to select a different kernel.
+                    selectKernelParams.mSelectNewKernel = true;
+                }
+            }
+            else
+            {
+                if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * 2 <= params.mMultiProcessorCount)
+                {
+                    // Use smaller headDimPerCtaV to fully utilize the SMs.
+                    selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 4 <= params.mMultiProcessorCount ? 128 : 256;
+                    // Need to select a different kernel.
+                    selectKernelParams.mSelectNewKernel = true;
+                }
             }
         }
 
