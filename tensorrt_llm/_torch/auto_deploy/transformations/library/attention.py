@@ -16,7 +16,7 @@ def match_repeat_kv(gm: GraphModule) -> GraphModule:
     Match and replace the repeat_kv pattern in fx graphs.
 
     The pattern is:
-    unsqueeze -> expand -> reshape
+    unsqueeze -> expand -> reshape -> [optional] contiguous
 
     This is replaced with torch.ops.attention.repeat_kv.
     """
@@ -186,7 +186,7 @@ def _match_repeat_kv_pattern(reshape_node: Node) -> Optional[Dict[str, Node]]:
     Match the repeat_kv pattern starting from a reshape node.
 
     The pattern is:
-    unsqueeze -> expand -> reshape
+    unsqueeze -> expand -> reshape -> [optional] contiguous
 
     Returns a dictionary with information about the match or None if no match.
     """
@@ -268,13 +268,26 @@ def _match_repeat_kv_pattern(reshape_node: Node) -> Optional[Dict[str, Node]]:
     if out_batch != batch_size or out_seq != seq_len or out_dim != head_dim:
         return None
 
-    return {
+    # Check if reshape is followed by a contiguous node
+    contiguous_node = None
+    users = list(reshape_node.users)
+
+    # Only consider contiguous if reshape has exactly one user
+    if len(users) == 1 and is_op(users[0], torch.ops.aten.contiguous):
+        contiguous_node = users[0]
+
+    result = {
         "input_tensor": input_tensor,
         "unsqueeze_node": unsqueeze_node,
         "expand_node": expand_node,
         "reshape_node": reshape_node,
         "n_rep": n_rep,
     }
+
+    if contiguous_node:
+        result["contiguous_node"] = contiguous_node
+
+    return result
 
 
 def _match_eager_attention_pattern(final_matmul_node: Node) -> Optional[Dict[str, Node]]:
@@ -473,16 +486,19 @@ def _replace_with_repeat_kv(graph, match_info: Dict[str, Node]) -> None:
     reshape_node = match_info["reshape_node"]
     n_rep = match_info["n_rep"]
 
-    with graph.inserting_before(reshape_node):
+    # Determine the node to replace (either reshape or contiguous if present)
+    node_to_replace = match_info.get("contiguous_node", reshape_node)
+
+    with graph.inserting_before(node_to_replace):
         repeat_kv_node = graph.call_function(
             torch.ops.attention.repeat_kv, args=(input_tensor, n_rep)
         )
 
     # Preserve metadata from the original node
-    repeat_kv_node.meta = reshape_node.meta.copy()
+    repeat_kv_node.meta = node_to_replace.meta.copy()
 
-    # Replace all uses of the reshape node with the repeat_kv node
-    reshape_node.replace_all_uses_with(repeat_kv_node)
+    # Replace all uses of the node with the repeat_kv node
+    node_to_replace.replace_all_uses_with(repeat_kv_node)
 
 
 def _replace_with_sdpa(graph, match_info: Dict[str, Node]) -> None:

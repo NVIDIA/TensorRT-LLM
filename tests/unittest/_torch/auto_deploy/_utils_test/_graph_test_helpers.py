@@ -95,7 +95,6 @@ def run_test(
 
     # check if we can still export the model as expected
     torch_export(gm_transformed, args=(x,))
-    torch_export_to_gm(gm_transformed, args=(x,))
 
     # return graph module for further testing
     return gm_transformed

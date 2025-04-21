@@ -1,7 +1,10 @@
+from typing import Callable
+
 import pytest
 import torch
 from _graph_test_helpers import run_test
 from torch.export import Dim
+from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
 from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
     match_attention_layout,
@@ -13,6 +16,34 @@ from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 torch.manual_seed(0)
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _repeat_kv2(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch_size, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states.unsqueeze(2).expand(
+        batch_size, num_kv_heads, n_rep, seq_len, head_dim
+    )
+    return hidden_states.reshape(batch_size, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+def _repeat_kv3(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    return _repeat_kv2(hidden_states, n_rep).contiguous()
 
 
 class RepeatKVModel(torch.nn.Module):
@@ -33,6 +64,9 @@ class RepeatKVModel(torch.nn.Module):
         self.k_proj = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
         self.v_proj = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
 
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        return _repeat_kv(x, n_rep)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
 
@@ -47,12 +81,8 @@ class RepeatKVModel(torch.nn.Module):
         v = v.transpose(1, 2)
 
         # Apply repeat_kv pattern manually (this is what we want to detect and optimize)
-        if self.num_kv_heads != self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            k = k.unsqueeze(2).expand(batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim)
-            k = k.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-            v = v.unsqueeze(2).expand(batch_size, self.num_kv_heads, n_rep, seq_len, self.head_dim)
-            v = v.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+        k = self._repeat_kv(k, self.num_heads // self.num_kv_heads)
+        v = self._repeat_kv(v, self.num_heads // self.num_kv_heads)
 
         # Simple concatenation to return a result
         output = torch.cat([q, k, v], dim=1)
@@ -60,6 +90,21 @@ class RepeatKVModel(torch.nn.Module):
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+
+
+class RepeatKVModel2(RepeatKVModel):
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        return _repeat_kv2(x, n_rep)
+
+
+class HFRepeatKVModel(RepeatKVModel):
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        return hf_repeat_kv(x, n_rep)
+
+
+class RepeatKVModel3(RepeatKVModel):
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        return _repeat_kv3(x, n_rep)
 
 
 class EagerAttentionModel(torch.nn.Module):
@@ -283,12 +328,15 @@ class GroupedAttentionModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
+@pytest.mark.parametrize(
+    "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
+)
 @torch.inference_mode()
-def test_match_repeat_kv(num_heads, num_kv_heads):
+def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     batch_size, seq_len = 4, 12
     hidden_size = 512
 
-    model = RepeatKVModel(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=torch.float16)
+    model = model_cls(hidden_size, num_heads, num_kv_heads).to("cuda", dtype=torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
     dynamic_shapes = model.get_dynamic_shapes()
 
@@ -979,12 +1027,16 @@ def test_match_llama3_causal_attention(use_grouped_sdpa):
 class MockAttentionDescriptor:
     """A mock class that mimics the AttentionDescriptor interface for testing."""
 
-    def __init__(self, layout: str = "bnsd"):
-        self.layout = layout
+    layout: str = "bnsd"
+    source_attention_op: Callable = torch.ops.attention.scaled_dot_product_attention
 
     @classmethod
     def get_attention_layout(cls) -> str:
         return cls.layout
+
+    @classmethod
+    def get_source_attention_op(cls) -> Callable:
+        return cls.source_attention_op
 
 
 class AttentionLayoutModel(torch.nn.Module):
@@ -1097,6 +1149,14 @@ def test_match_attention_layout(layout, model_config):
 
     # Set up the mock attention descriptor class with the specified layout
     MockAttentionDescriptor.layout = layout
+    if layout == "bnsd":
+        if model_config.get("use_grouped_sdpa"):
+            source_op = torch.ops.attention.grouped_sdpa
+        else:
+            source_op = torch.ops.attention.scaled_dot_product_attention
+    else:
+        source_op = torch.ops.attention.bsnd_grouped_sdpa
+    MockAttentionDescriptor.source_attention_op = source_op
 
     # Create appropriate model based on model_config
     if model_config["type"] == "standard":

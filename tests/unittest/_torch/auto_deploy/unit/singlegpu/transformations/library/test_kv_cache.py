@@ -11,9 +11,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonWi
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import check_in_out_nodes
-from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import (
-    insert_sdpa_with_kv_cache,
-)
+from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
 
 # Class that uses SDPA directly instead of the regular attention mechanism
@@ -54,15 +52,8 @@ class GQAWithSdpa(GQA):
         k = k.view(b, s, self.num_kv_heads, self.head_dim)
         v = v.view(b, s, self.num_kv_heads, self.head_dim)
 
-        # Transpose to [b, n, s, h_d] for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Use the custom SDPA op
-        attn_output = torch.ops.hf.sdpa_attention(
-            q, k, v, None, 0.0, None, True, self.num_key_value_groups
-        )
+        # Use grouped SDPA in bsnd layout
+        attn_output = torch.ops.attention.bsnd_grouped_sdpa(q, k, v, None, 0.0, True, None)
 
         # SDPA output is already in [b, s, n, h_d] format
         # Reshape to [b, s, n*h_d]
@@ -78,7 +69,7 @@ class GQAWithSdpa(GQA):
     ids=["float16", "float32"],
 )
 @pytest.mark.parametrize(
-    "attention_op",
+    "attn_descriptor",
     [TritonWithFlattenedInputs, FlashInferAttention],
     ids=["triton", "flashinfer"],
 )
@@ -92,10 +83,10 @@ class GQAWithSdpa(GQA):
     ids=["regular", "gqa", "mqa"],
 )
 @torch.inference_mode()
-def test_sdpa_with_kv_cache(dtype, attention_op, gqa_config):
+def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     """Test the SDPA transformation with KV cache."""
     # FlashInfer doesn't support float32 data type
-    if attention_op == FlashInferAttention and dtype == torch.float32:
+    if attn_descriptor == FlashInferAttention and dtype == torch.float32:
         pytest.skip("FlashInfer doesn't support float32 data type")
 
     # Unpack the GQA configuration
@@ -147,8 +138,8 @@ def test_sdpa_with_kv_cache(dtype, attention_op, gqa_config):
     input_nodes = check_in_out_nodes(gm)
 
     # Apply the transformation
-    gm_transformed = insert_sdpa_with_kv_cache(
-        gm, cm, attention_op=attention_op, cache_config=cache_config, input_nodes=input_nodes
+    gm_transformed = insert_cached_attention(
+        gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config, input_nodes=input_nodes
     )
     gm_transformed.to("cuda")
     cm.initialize_caches()
