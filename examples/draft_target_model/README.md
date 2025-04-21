@@ -97,7 +97,8 @@ python3 examples/run.py \
 
 + This example is based on TensorRT-LLM-0.18.0 and TRTLLM-backend-0.18.0 with docker image `nvcr.io/nvidia/tritonserver:25.03-trtllm-python-py3`.
 + DTM model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
-+ Get related repository inside the container
+
+#### Get related repository inside the container
 
 ```bash
 git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
@@ -175,7 +176,7 @@ Ubuntu is a free and open source operating system that runs from the desktop, to
 Ubuntu is a community developed operating system that is perfect for laptops, desktops, servers, and cloud. It is used by millions of people around the world who want to explore new ideas and discover new opportunities.
 ```
 
-+ Test DTM with a script
++ Test DTM with a script.
   + Prepare a JSON file `input_data.json` containing input data as below (more requests are acceptable).
 
 ```json
@@ -189,8 +190,6 @@ Ubuntu is a community developed operating system that is perfect for laptops, de
 ```
 
 + Use command below to launch test.
-  + `inflight_batcher_llm/client/end_to_end_grpc_client.py` is used in BLS speculative decoding.
-  + `inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py` is used i client-side speculative decoding.
 
 ```bash
 ### Use BLS speculative decoding
