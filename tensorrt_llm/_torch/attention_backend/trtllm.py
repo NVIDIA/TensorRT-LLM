@@ -838,6 +838,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
+                and metadata.enable_paged_context_mla
                 and metadata.num_ctx_cached_tokens > 0)
 
     def load_paged_kv_cache_for_mla(

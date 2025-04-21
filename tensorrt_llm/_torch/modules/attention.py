@@ -723,7 +723,8 @@ class MLA(nn.Module):
 
         # apply rope to current q_pe and k_pe
         assert position_ids is not None
-        assert position_ids.dim() == 1 or (position_ids.dim() == 2 and position_ids.shape[0] == 1)
+        assert position_ids.dim() == 1 or (position_ids.dim() == 2
+                                           and position_ids.shape[0] == 1)
         assert self.rotary_emb is not None
         assert self.rotary_emb.head_dim == self.qk_rope_head_dim
         assert q_pe.shape[0] == k_pe.shape[0]
@@ -731,6 +732,8 @@ class MLA(nn.Module):
                                       self.num_heads * self.qk_rope_head_dim)
         q_pe, k_pe = self.rotary_emb(
             position_ids[..., :attn_metadata.num_ctx_tokens], [q_pe, k_pe])
+
+        k_pe = k_pe.contiguous()
 
         # build q for attention op
         q_view = q.view(-1, self.num_heads,
