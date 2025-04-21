@@ -111,10 +111,9 @@ public:
 
             for (auto kernel : kernels)
             {
-                char const* kernelName;
-                CHECK_CUDA(cuKernelGetName(&kernelName, kernel));
-                std::string kernelNameStr(kernelName);
-                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos)
+                int numRegisters;
+                CHECK_CUDA(cuKernelGetAttribute(&numRegisters, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel, 0));
+                if (numRegisters > 4) // is not dummy kernel
                 {
                     kernel_ = kernel;
                     break;
