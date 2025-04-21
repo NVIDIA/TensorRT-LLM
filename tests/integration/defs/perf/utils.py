@@ -463,6 +463,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 print_info(
                     f"skip writing perf result when calling generating dataset in trtllm-bench"
                 )
+                outputs.pop(cmd_idx)
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
