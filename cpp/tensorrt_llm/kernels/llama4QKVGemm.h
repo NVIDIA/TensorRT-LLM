@@ -15,20 +15,15 @@
  */
 
 #pragma once
-#include <NvInferRuntime.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/ipcUtils.h"
-
 namespace tensorrt_llm::kernels::llama4_qkv_gemm
 {
 
-void llama4_qkv_gemm_op(
-    int num_tokens, void const* A, void const* B, void* C, void const* scaling_factor, cudaStream_t stream);
+void llama4_qkv_gemm_op(void const* A, void const* B, void* C, void const* scaling_factor,
+                        void const* pos_ids, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::llama4_qkv_gemm

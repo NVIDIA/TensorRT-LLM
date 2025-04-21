@@ -43,14 +43,17 @@ public:
 
     ~Llama4QKVGemmOp() = default;
 
-    torch::Tensor run(torch::Tensor inputA, torch::Tensor inputB, torch::Tensor scaling_factor) noexcept
+    torch::Tensor run(torch::Tensor inputA, torch::Tensor inputB, torch::Tensor scaling_factor,
+                      torch::optional<torch::Tensor> position_ids) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(inputA.get_device());
         auto output = torch::empty(
             {inputA.size(0), inputB.size(1)}, torch::TensorOptions().dtype(torch::kBFloat16).device(inputA.device()));
 
+        void const* position_ids_ptr = position_ids.has_value() ? position_ids.value().const_data_ptr() : nullptr;
         llama4_qkv_gemm_op(
-            inputA.size(0), inputA.data_ptr(), inputB.data_ptr(), output.data_ptr(), scaling_factor.data_ptr(), stream);
+            inputA.data_ptr(), inputB.data_ptr(), output.data_ptr(), scaling_factor.data_ptr(),
+            position_ids_ptr, inputA.size(0), inputB.size(0), inputB.size(1), stream);
 
         return output;
     }
@@ -62,17 +65,20 @@ public:
 };
 } // namespace
 
-torch::Tensor llama4_qkv_gemm(torch::Tensor inputA, torch::Tensor inputB, torch::Tensor scaling_factor)
+torch::Tensor llama4_qkv_gemm(torch::Tensor const& inputA, torch::Tensor const& inputB,
+                              torch::Tensor const& scaling_factor,
+                              torch::optional<torch::Tensor> position_ids)
 {
     Llama4QKVGemmOp op;
-    return op.run(inputA, inputB, scaling_factor);
+    return op.run(inputA, inputB, scaling_factor, position_ids);
 }
 
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("llama4_qkv_gemm(Tensor inputA, Tensor inputB, Tensor scaling_factor) -> Tensor");
+    m.def("llama4_qkv_gemm(Tensor inputA, Tensor inputB, "
+          "Tensor scaling_factor, Tensor? position_ids=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -15,12 +15,16 @@
  */
 
 #include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerBlockTemplate.cuh"
+#include "tensorrt_llm/kernels/llama4Fp8Bf16GemmAttnScalingPerBlockTemplate.cuh"
 #include "tensorrt_llm/kernels/llama4Fp8Bf16GemmPerWarpTemplate.cuh"
 #include "tensorrt_llm/kernels/llama4QKVGemm.h"
 #include <stdexcept>
 
 #define GEMM_HIDDEN_IN 5120
 #define GEMM_HIDDEN_OUT 896 // This is QKV_GEMM. Replaced with 4096 for MLP_FC1.
+#define Q_HIDDEN_OUT 640
+#define FLOOR_SCALE 8192.0
+#define ATTN_SCALE 0.1
 
 #define BLOCK_SIZE 128
 #define WARP_SIZE 32
@@ -29,6 +33,7 @@ namespace tensorrt_llm::kernels::llama4_qkv_gemm
 {
 
 DEFINE_GET_PER_BLOCK_FUNC_PTR(5120, true);
+DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(5120, true);
 
 // Function to launch kernel using FDL(Flexible Dispatch Layer)
 void launch_kernel_fdl(
@@ -62,30 +67,71 @@ void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
     if (num_tokens == 1)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 1.
-        const dim3 grid_size = dim3(div_up(GEMM_HIDDEN_OUT, 1), div_up(num_tokens, 1), 1);
+        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 1);
-        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 5);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 2)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 1.
-        const dim3 grid_size = dim3(div_up(GEMM_HIDDEN_OUT, 1), div_up(num_tokens, 2), 1);
+        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 1);
-        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 5);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 3)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 4.
-        const dim3 grid_size = dim3(div_up(GEMM_HIDDEN_OUT, 4), div_up(num_tokens, 1), 1);
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
-        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 5);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 4)
     {
         // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
-        const dim3 grid_size = dim3(div_up(GEMM_HIDDEN_OUT, 2), div_up(num_tokens, 2), 1);
+        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 2);
-        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 5);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
+    }
+    else
+    {
+        throw std::runtime_error("llama4QKVGemm: num_tokens larger than 4 is unsupported.");
+    }
+}
+
+void llama4_qkv_gemv_attn_scaling_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* C,
+    float const* scaling_factor, int64_t const* pos_ids, float floor_scale, float attn_scale,
+    int num_tokens, int hidden_in, int hidden_out, int q_hidden_out, cudaStream_t stream)
+{
+    void* args[] = {(void*) &A, (void*) &B, (void*) &C, (void*) &scaling_factor,
+                    (void*) &pos_ids, (void*) &floor_scale, (void*) &attn_scale,
+                    (void*) &num_tokens, (void*) &hidden_in, (void*) &hidden_out, (void*) &q_hidden_out};
+    if (num_tokens == 1)
+    {
+        // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 1.
+        const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 1);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 2)
+    {
+        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
+        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 3)
+    {
+        // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 4)
+    {
+        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
+        const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else
     {
@@ -94,14 +140,27 @@ void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
 }
 
 void llama4_qkv_gemm_op(
-    int num_tokens, void const* A, void const* B, void* C, void const* scaling_factor, cudaStream_t stream)
+    void const* A, void const* B, void* C, void const* scaling_factor,
+    void const* pos_ids, int num_tokens, int hidden_in, int hidden_out, cudaStream_t stream)
 {
     __nv_fp8_e4m3 const* A_fp8 = static_cast<__nv_fp8_e4m3 const*>(A);
     __nv_fp8_e4m3 const* B_fp8 = static_cast<__nv_fp8_e4m3 const*>(B);
     __nv_bfloat16* C_bf16 = static_cast<__nv_bfloat16*>(C);
+
     float const* __restrict__ scaling_factor_float = static_cast<float const*>(scaling_factor);
-    llama4_qkv_gemv_kernel_launcher(
-        A_fp8, B_fp8, C_bf16, scaling_factor_float, num_tokens, GEMM_HIDDEN_IN, GEMM_HIDDEN_OUT, stream);
+    if (pos_ids != nullptr)
+    {
+        int64_t const* pos_ids_int64 = reinterpret_cast<int64_t const*>(pos_ids);
+        llama4_qkv_gemv_attn_scaling_kernel_launcher(
+            A_fp8, B_fp8, C_bf16, scaling_factor_float,
+            pos_ids_int64, FLOOR_SCALE, ATTN_SCALE,
+            num_tokens, hidden_in, hidden_out, Q_HIDDEN_OUT, stream);
+    }
+    else
+    {
+        llama4_qkv_gemv_kernel_launcher(
+            A_fp8, B_fp8, C_bf16, scaling_factor_float, num_tokens, hidden_in, hidden_out, stream);
+    }
 }
 
 } // namespace tensorrt_llm::kernels::llama4_qkv_gemm

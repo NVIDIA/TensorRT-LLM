@@ -15,14 +15,9 @@
  */
 
 #pragma once
-#include <NvInferRuntime.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/runtime/ipcUtils.h"
 
 namespace tensorrt_llm::kernels::llama4_router_gemm
 {
