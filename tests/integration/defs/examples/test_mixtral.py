@@ -182,7 +182,7 @@ def test_llm_mixtral_fp8_4gpus_summary(llama_example_root,
 
     print("Run mmlu...")
     mmlu_cmd = generate_mmlu_cmd(llama_example_root,
-                                 tokenizer_dir=llm_mixtral_model_root,
+                                 hf_model_dir=llm_mixtral_model_root,
                                  engine_dir=engine_dir,
                                  accuracy_threshold=70,
                                  data_dir=f"{llm_datasets_root}/mmlu")
@@ -247,7 +247,7 @@ def test_llm_mixtral_fp8_managed_weights_4gpus_summary(llama_example_root,
 
     print("Run mmlu...")
     mmlu_cmd = generate_mmlu_cmd(llama_example_root,
-                                 tokenizer_dir=llm_mixtral_model_root,
+                                 hf_model_dir=llm_mixtral_model_root,
                                  engine_dir=engine_dir,
                                  accuracy_threshold=70,
                                  data_dir=f"{llm_datasets_root}/mmlu")
