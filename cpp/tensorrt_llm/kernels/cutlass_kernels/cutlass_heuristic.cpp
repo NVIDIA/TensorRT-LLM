@@ -398,8 +398,22 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
         TLLM_THROW("Not Implemented: SM100 GEMM candidates have not been defined.");
     }
 #endif
+}
 
-} // namespace kernels
+// std::vector<CutlassGemmConfig> get_candidate_configs_sm120_fp4(CutlassGemmConfig::CandidateConfigTypeParam const
+// config)
+// {
+//     std::vector<CutlassGemmConfig> candidate_configs;
+//     if (config & CutlassGemmConfig::FP4_ONLY)
+//     {
+//         candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+//         MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+//     }
+//     else
+//     {
+//         TLLM_THROW("Not Implemented: SM120 GEMM candidates have not been defined for this configuration.");
+//     }
+// }
 
 std::vector<CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k, CutlassGemmConfig::CandidateConfigTypeParam const config_type_param)
@@ -422,6 +436,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     std::vector<CutlassTileConfig> tiles = get_candidate_tiles(sm, config_type_param);
 
     std::vector<CutlassGemmConfig> candidate_configs;
+    if (sm >= 120)
+    {
+        candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
+            MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+    }
     bool const int8_configs_only = config_type_param & CutlassGemmConfig::INT8_ONLY;
     int const min_stages = int8_configs_only ? 3 : 2;
     int const max_stages = int8_configs_only ? 6 : (sm >= 80 ? 4 : 2);

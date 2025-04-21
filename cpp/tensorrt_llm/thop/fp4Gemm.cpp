@@ -44,7 +44,7 @@ namespace
 
 tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k)
 {
-    return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x128B, tkc::MainloopScheduleType::AUTO,
+    return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x128B, tkc::MainloopScheduleType::AUTO,
         tkc::EpilogueScheduleType::AUTO, tkc::ClusterShape::ClusterShape_1x1x1);
 }
 
