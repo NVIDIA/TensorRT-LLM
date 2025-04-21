@@ -771,6 +771,10 @@ class PyTorchModelEngine(ModelEngine):
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         if num_layers > 0:
             config.pretrained_config.num_hidden_layers = num_layers
+            for sub_config in ["text_config", "vision_config"]:
+                if hasattr(config.pretrained_config, sub_config):
+                    getattr(config.pretrained_config,
+                            sub_config).num_hidden_layers = num_layers
 
         with timing("Model init total"):
             try:
