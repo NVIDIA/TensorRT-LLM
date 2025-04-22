@@ -624,6 +624,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
         return mlp_tp_size
 
+    def _enable_latency_mode(self, num_tokens: int):
+        return num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS'
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -650,9 +653,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
             0) > 128
 
-        min_latency_mode = True if hidden_states.size(
-            0
-        ) <= 128 and self.fusion_config.POST_MOE_FUSION and self.is_nvfp4 and self.model_config.moe_backend == 'CUTLASS' else False
+        min_latency_mode = self._enable_latency_mode(hidden_states.size(0))
 
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
