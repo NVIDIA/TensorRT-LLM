@@ -177,7 +177,7 @@ NeMo/Mistral_NeMo_Minitron_8B_Instruct:
 mistralai/Mixtral-8x7B-v0.1:
   - accuracy: 28.810
   - extra_acc_spec: plugin;beam_width=4
-    accuracy: 21.0
+    accuracy: 29.812
   - extra_acc_spec: ootb_except_mha;beam_width=4
     accuracy: 29.981
   - quant_algo: NVFP4
@@ -203,9 +203,10 @@ mistralai/Mixtral-8x7B-Instruct-v0.1:
     accuracy: 28.810
 mistralai/Mixtral-8x22B-v0.1:
   - quant_algo: FP8
-    accuracy: 21.5
-  - extra_acc_spec: plugin
-    accuracy: 21.0
+    accuracy: 25.519
+  - quant_algo: W8A16
+    extra_acc_spec: plugin
+    accuracy: 27.427
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16
