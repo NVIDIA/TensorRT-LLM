@@ -16,7 +16,6 @@ from utils.util import force_ampere
 
 @force_ampere
 def test_tinyllama_guided_decoding():
-    llm_kwargs = {'backend': 'pytorch'}
     tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
