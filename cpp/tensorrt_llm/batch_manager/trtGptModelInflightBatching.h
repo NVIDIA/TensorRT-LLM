@@ -61,6 +61,7 @@ class SequenceSlotManager;
 class DecoderStepAsyncSend;
 class DecoderSlotAsyncSend;
 class DecoderInputBuffers;
+class DecoderOutputBuffers;
 class DecoderBuffers;
 class SlotDecoderBuffers;
 class LlmRequest;
@@ -473,14 +474,14 @@ private:
     std::unique_ptr<tensorrt_llm::batch_manager::GuidedDecoder> mGuidedDecoder;
 
     /******************** Pipeline parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommPipelinePara;
     std::vector<std::unique_ptr<DecoderStepAsyncSend>> mDecStepAsyncSndHdls;
     std::vector<std::unique_ptr<DecoderSlotAsyncSend>> mDecSlotAsyncSndHdls;
     std::unique_ptr<tensorrt_llm::mpi::MpiWaitThread> mAsyncSendWaitThread;
 
     /******************** Tensor parallelism ********************/
-    std::shared_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
-    std::shared_ptr<runtime::AllReduceBuffers> mAllReduceBuffers;
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiCommTensorPara;
+    std::unique_ptr<runtime::AllReduceBuffers> mAllReduceBuffers;
 
     /******************** Runtime parameters ********************/
     // Flag to select fused or unfused context+generation execution
@@ -513,13 +514,15 @@ private:
 
     /******************** Buffers ********************/
     // Buffers for each micro batch. Unfused path (mCtxGenFusion==false) uses two times the buffers.
-    std::vector<std::shared_ptr<RuntimeBuffers>> mBuffers;
-    // Decoder buffers for each micro batch.
+    std::vector<std::unique_ptr<RuntimeBuffers>> mBuffers;
+    // Decoder input buffers for each micro batch.
     std::vector<DecoderInputBuffers> mDecoderInputBuffers;
+    // Decoder output buffers for each micro batch.
+    std::vector<DecoderOutputBuffers> mDecoderOutputBuffers;
     // Global buffer to interface with decoder. Slots in this buffer are selected by mSeqSlotManager.
-    std::shared_ptr<DecoderBuffers> mDecoderBuffers;
+    std::unique_ptr<DecoderBuffers> mDecoderBuffers;
     // Buffers for each slot in the decoder
-    std::vector<std::shared_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
+    std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
     // Decoder input for each micro batch.
