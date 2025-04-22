@@ -20,20 +20,11 @@
 #include "tensorrt_llm/kernels/llama4QKVGemm.h"
 #include <stdexcept>
 
-#define GEMM_HIDDEN_IN 5120
-#define GEMM_HIDDEN_OUT 896 // This is QKV_GEMM. Replaced with 4096 for MLP_FC1.
-#define Q_HIDDEN_OUT 640
-#define FLOOR_SCALE 8192.0
-#define ATTN_SCALE 0.1
-
-#define BLOCK_SIZE 128
-#define WARP_SIZE 32
-
 namespace tensorrt_llm::kernels::llama4_qkv_gemm
 {
 
-DEFINE_GET_PER_BLOCK_FUNC_PTR(5120, true);
-DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(5120, true);
+DEFINE_GET_PER_BLOCK_FUNC_PTR(/*HIDDEN_IN=*/5120, /*ALIGNED=*/true);
+DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(/*HIDDEN_IN=*/5120, /*ALIGNED=*/true);
 
 // Function to launch kernel using FDL(Flexible Dispatch Layer)
 void launch_kernel_fdl(

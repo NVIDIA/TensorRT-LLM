@@ -15,20 +15,10 @@
  */
 
 #include "llama4GemmSwiGLU.h"
-
-#define HIDDEN_IN 5120
-#define BLOCK_SIZE 128
-#define WARP_SIZE 32
-
-#define ENABLE_ACQBULK 1
-#define ENABLE_PREFETCH 1
-#define ENABLE_PREEXIT 1
+#include "llama4Utils.cuh"
 
 namespace tensorrt_llm::kernels::llama4_fc_swiglu
 {
-
-// Use 8 for now, which results in LDG.64.
-#define VEC_SIZE 8
 
 struct __align__(8) aligned_fp8x8
 {

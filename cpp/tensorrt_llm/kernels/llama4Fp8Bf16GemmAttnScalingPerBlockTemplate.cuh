@@ -1,5 +1,4 @@
-#ifndef LLAMA4_FP8_BF16_GEMM_ATTN_SCALING_PER_BLOCK_TEMPLATE_CUH
-#define LLAMA4_FP8_BF16_GEMM_ATTN_SCALING_PER_BLOCK_TEMPLATE_CUH
+#pragma once
 
 #include "tensorrt_llm/kernels/llama4Utils.cuh"
 
@@ -7,33 +6,22 @@
 #include <cuda_fp8.h>
 #include <stdexcept>
 
-namespace
+namespace tensorrt_llm::kernels::llama4_qkv_gemm
 {
 
-#define BLOCK_SIZE 128
-#define WARP_SIZE 32
-
-// Use 8 for now, which results in LDG.64.
-#define VEC_SIZE 8
+using tensorrt_llm::kernels::aligned_fp8x8;
 
 // Grid size is num_tokens / TILE_TOKEN * hidden_out / TILE_OUT.
 // Each block processes TILE_TOKEN tokens and TILE_OUT rows.
 // Withing each block, it steps through hidden_in in steps of BLOCK_SIZE * VEC_SIZE.
 template <int HIDDEN_IN, int TILE_TOKEN, int TILE_OUT, bool ALIGNED = true>
-__launch_bounds__(BLOCK_SIZE)
-__global__ void llama4_gemv_attn_scaling_per_block_kernel(
-    const __nv_fp8_e4m3* __restrict__ A,  // Input tensor [num_tokens][hidden_in]
-    const __nv_fp8_e4m3* __restrict__ B,  // Input tensor [hidden_out][hidden_in]
-    __nv_bfloat16* __restrict__ C,        // Output tensor [num_tokens][hidden_out]
-    float* __restrict__ scaling_factor,
-    const int64_t* __restrict__ pos_ids,
-    const float floor_scale,
-    const float attn_scale,
-    int num_tokens,
-    int hidden_in,
-    int hidden_out,
-    int q_hidden_out
-) {
+__launch_bounds__(BLOCK_SIZE) __global__ void llama4_gemv_attn_scaling_per_block_kernel(
+    __nv_fp8_e4m3 const* __restrict__ A, // Input tensor [num_tokens][hidden_in]
+    __nv_fp8_e4m3 const* __restrict__ B, // Input tensor [hidden_out][hidden_in]
+    __nv_bfloat16* __restrict__ C,       // Output tensor [num_tokens][hidden_out]
+    float* __restrict__ scaling_factor, int64_t const* __restrict__ pos_ids, float const floor_scale,
+    float const attn_scale, int num_tokens, int hidden_in, int hidden_out, int q_hidden_out)
+{
     // Shared memory for block reduction
     __shared__ float reduce_buffer[TILE_TOKEN][TILE_OUT][BLOCK_SIZE];
 
@@ -48,16 +36,16 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
         }
     }
 
-    const int token_idx = blockIdx.y;
-    const int row_idx = blockIdx.x;
-    const int tid = threadIdx.x;
+    int const token_idx = blockIdx.y;
+    int const row_idx = blockIdx.x;
+    int const tid = threadIdx.x;
 
     // Calculate attn scaling factor.
     float attn_scaling_factors[TILE_TOKEN];
 #pragma unroll
     for (int tile_token_idx = 0; tile_token_idx < TILE_TOKEN; tile_token_idx++) {
         int current_token = token_idx * TILE_TOKEN + tile_token_idx;
-        const float floor = floorf((static_cast<float>(pos_ids[current_token]) + 1.0f) / floor_scale);
+        float const floor = floorf((static_cast<float>(pos_ids[current_token]) + 1.0f) / floor_scale);
         attn_scaling_factors[tile_token_idx] = (__logf(floor + 1.0f) * attn_scale) + 1.0f;
     }
 
@@ -98,7 +86,8 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
 #pragma unroll
         for (int tile_out_idx = 0; tile_out_idx < TILE_OUT; tile_out_idx++) {
             int current_row = row_idx * TILE_OUT + tile_out_idx;
-            b_vec[tile_out_idx] = reinterpret_cast<const aligned_fp8x8*>(B)[current_row * hidden_in / VEC_SIZE + base_idx];
+            b_vec[tile_out_idx]
+                = reinterpret_cast<aligned_fp8x8 const*>(B)[current_row * hidden_in / VEC_SIZE + base_idx];
         }
 
         // Load values from tensor A
@@ -106,7 +95,8 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
 #pragma unroll
         for (int tile_token_idx = 0; tile_token_idx < TILE_TOKEN; tile_token_idx++) {
             int current_token = token_idx * TILE_TOKEN + tile_token_idx;
-            a_vec[tile_token_idx] = reinterpret_cast<const aligned_fp8x8*>(A)[current_token * hidden_in / VEC_SIZE + base_idx];
+            a_vec[tile_token_idx]
+                = reinterpret_cast<aligned_fp8x8 const*>(A)[current_token * hidden_in / VEC_SIZE + base_idx];
         }
 
         // Compute partial sum
@@ -137,7 +127,8 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
 #pragma unroll
             for (int tile_out_idx = 0; tile_out_idx < TILE_OUT; tile_out_idx++) {
                 int current_row = row_idx * TILE_OUT + tile_out_idx;
-                b_vec[tile_out_idx] = reinterpret_cast<const aligned_fp8x8*>(B)[current_row * hidden_in / VEC_SIZE + base_idx];
+                b_vec[tile_out_idx]
+                    = reinterpret_cast<aligned_fp8x8 const*>(B)[current_row * hidden_in / VEC_SIZE + base_idx];
             }
 
             // Load values from tensor A
@@ -145,7 +136,8 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
 #pragma unroll
             for (int tile_token_idx = 0; tile_token_idx < TILE_TOKEN; tile_token_idx++) {
                 int current_token = token_idx * TILE_TOKEN + tile_token_idx;
-                a_vec[tile_token_idx] = reinterpret_cast<const aligned_fp8x8*>(A)[current_token * hidden_in / VEC_SIZE + base_idx];
+                a_vec[tile_token_idx]
+                    = reinterpret_cast<aligned_fp8x8 const*>(A)[current_token * hidden_in / VEC_SIZE + base_idx];
             }
 
             // Compute partial sum
@@ -210,8 +202,6 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
 #endif
 }
 
-} // namespace
-
 #define DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED) \
     do { \
         if (TILE_TOKEN == 1) { \
@@ -246,9 +236,10 @@ __global__ void llama4_gemv_attn_scaling_per_block_kernel(
         throw std::invalid_argument("Invalid tile token"); \
     } while (0)
 
-#define DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(HIDDEN_IN, ALIGNED) \
-    void* get_per_block_attn_scaling_func_ptr_aligned_##ALIGNED##_##HIDDEN_IN##_(int tile_token, int tile_out) { \
-        DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED); \
+#define DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(HIDDEN_IN, ALIGNED)                                                 \
+    void* get_per_block_attn_scaling_func_ptr_aligned_##ALIGNED##_##HIDDEN_IN##_(int tile_token, int tile_out)         \
+    {                                                                                                                  \
+        DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                \
     }
 
-#endif // LLAMA4_FP8_BF16_GEMM_ATTN_SCALING_PER_BLOCK_TEMPLATE_CUH
+} // namespace tensorrt_llm::kernels::llama4_qkv_gemm

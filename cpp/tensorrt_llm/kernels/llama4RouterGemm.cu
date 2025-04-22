@@ -15,15 +15,10 @@
  */
 
 #include "tensorrt_llm/kernels/llama4RouterGemm.h"
-
-#define GEMM_K 5120
-#define BLOCK_SIZE 256
-#define NUM_EXPERTS 128
+#include "tensorrt_llm/kernels/llama4Utils.cuh"
 
 namespace tensorrt_llm::kernels::llama4_router_gemm
 {
-
-#define VEC_SIZE 4
 
 struct __align__(8) aligned_bf16x4
 {
