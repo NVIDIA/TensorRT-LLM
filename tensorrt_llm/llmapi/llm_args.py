@@ -879,7 +879,8 @@ class LlmArgs(BaseModel):
                                    exclude=True)
 
     # TODO smor- this is an experimental feature and is probably subject to change before 1.0 release
-    lora_config: Optional[LoraConfig] = None
+    lora_config: Optional[LoraConfig] = Field(
+        default=None, description="LoRA configuration for the model.")
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
