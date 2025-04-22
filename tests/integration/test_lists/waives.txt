@@ -346,7 +346,6 @@ examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_vl_7b_instruct-ena
 examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2_vl_7b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] SKIP (https://nvbugs/5141290)
 examples/test_qwen.py::test_llm_qwen_awq_single_gpu_summary[qwen2_vl_7b_instruct-nb:4] SKIP (https://nvbugs/5141290)
 examples/test_qwen.py::test_llm_hf_qwen_quantization_1gpu[qwen2_vl_7b_instruct-fp8-bfloat16] SKIP (https://nvbugs/5141290)
-examples/test_qwen.py::test_llm_qwen_smooth_quant_single_gpu_summary[qwen2_vl_7b_instruct-enable_ptpc-nb:4] SKIP (https://nvbugs/5141291)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoder] SKIP (https://nvbugs/5141400)
 examples/test_gpt.py::test_starcoder_fp8_quantization_2gpu[starcoderplus] SKIP (https://nvbugs/5141400)
 unittest/_torch/auto_deploy/integration/test_lm_eval.py SKIP (https://nvbugs/5144854)
