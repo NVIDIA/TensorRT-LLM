@@ -3,14 +3,13 @@ import pytest
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
+# isort: off
 from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_guided_decoding_test_harness)
-
-# isort: off
 from utils.util import force_ampere
 # isort: on
 

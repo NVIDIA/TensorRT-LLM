@@ -1,7 +1,9 @@
 import pytest
 
+# isort: off
 from .test_llm import (global_kvcache_config,
                        tinyllama_guided_decoding_test_harness)
+# isort: on
 
 
 @pytest.mark.gpu4
