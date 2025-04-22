@@ -842,110 +842,110 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        try {
-            echoNodeAndGpuInfo(pipeline, stageName)
-            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
+        //try {
+        echoNodeAndGpuInfo(pipeline, stageName)
+        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
 
-            def extraInternalEnv = ""
-            // Move back to 3600 once TRTLLM-4000 gets resolved
-            def pytestTestTimeout = "7200"
+        def extraInternalEnv = ""
+        // Move back to 3600 once TRTLLM-4000 gets resolved
+        def pytestTestTimeout = "7200"
 
-            // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
-            extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
-            // CPP test execution is timing out easily, so we always override the timeout to 7200
-            extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
+        // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
+        extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+        // CPP test execution is timing out easily, so we always override the timeout to 7200
+        extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
 
-            def testDBList = renderTestDB(testList, llmSrc, stageName)
-            testList = "${testList}_${splitId}"
-            def testCmdLine = [
-                "LLM_ROOT=${llmSrc}",
-                "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
-                extraInternalEnv,
-                "pytest",
-                "-v",
-                "--apply-test-list-correction",
-                "--splitting-algorithm least_duration",
-                "--timeout=${pytestTestTimeout}",
-                "--rootdir ${llmSrc}/tests/integration/defs",
-                "--test-prefix=${stageName}",
-                "--splits ${splits}",
-                "--group ${splitId}",
-                "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
-                "--test-list=${testDBList}",
-                "--output-dir=${WORKSPACE}/${stageName}/",
-                "--csv=${WORKSPACE}/${stageName}/report.csv",
-                "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
-                "-o junit_logging=out-err"
-            ]
-            if (perfMode) {
-                testCmdLine += [
-                    "--perf",
-                    "--perf-log-formats csv",
-                    "--perf-log-formats yaml"
-                ]
-            }
-            // Test Coverage
-            def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
-            sh "echo ${TRTLLM_WHL_PATH}"
-            def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
-            sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
-            sh """
-                echo '[run]' > ${coverageConfigFile}
-                echo 'branch = True' >> ${coverageConfigFile}
-                echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
-                echo '[paths]' >> ${coverageConfigFile}
-                echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
-                cat ${coverageConfigFile}
-            """
+        def testDBList = renderTestDB(testList, llmSrc, stageName)
+        testList = "${testList}_${splitId}"
+        def testCmdLine = [
+            "LLM_ROOT=${llmSrc}",
+            "LLM_MODELS_ROOT=${MODEL_CACHE_DIR}",
+            extraInternalEnv,
+            "pytest",
+            "-v",
+            "--apply-test-list-correction",
+            "--splitting-algorithm least_duration",
+            "--timeout=${pytestTestTimeout}",
+            "--rootdir ${llmSrc}/tests/integration/defs",
+            "--test-prefix=${stageName}",
+            "--splits ${splits}",
+            "--group ${splitId}",
+            "--waives-file=${llmSrc}/tests/integration/test_lists/waives.txt",
+            "--test-list=${testDBList}",
+            "--output-dir=${WORKSPACE}/${stageName}/",
+            "--csv=${WORKSPACE}/${stageName}/report.csv",
+            "--junit-xml ${WORKSPACE}/${stageName}/results.xml",
+            "-o junit_logging=out-err"
+        ]
+        if (perfMode) {
             testCmdLine += [
-                "--cov=${llmSrc}/examples/",
-                "--cov=${llmSrc}/tensorrt_llm/",
-                "--cov=${TRTLLM_WHL_PATH}/tensorrt_llm/",
-                "--cov-report=",
-                "--cov-config=${coverageConfigFile}"
+                "--perf",
+                "--perf-log-formats csv",
+                "--perf-log-formats yaml"
             ]
+        }
+        // Test Coverage
+        def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
+        sh "echo ${TRTLLM_WHL_PATH}"
+        def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
+        sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
+        sh """
+            echo '[run]' > ${coverageConfigFile}
+            echo 'branch = True' >> ${coverageConfigFile}
+            echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
+            echo '[paths]' >> ${coverageConfigFile}
+            echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
+            cat ${coverageConfigFile}
+        """
+        testCmdLine += [
+            "--cov=${llmSrc}/examples/",
+            "--cov=${llmSrc}/tensorrt_llm/",
+            "--cov=${TRTLLM_WHL_PATH}/tensorrt_llm/",
+            "--cov-report=",
+            "--cov-config=${coverageConfigFile}"
+        ]
 
-            def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
-            def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
-            if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
-                echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
-                containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
-            }
-            containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
-            withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                        usernameVariable: 'GITLAB_API_USER',
-                        passwordVariable: 'GITLAB_API_TOKEN'
-                    ),
-                    string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
-                ]) {
-                    sh "env | sort"
-                    trtllm_utils.llmExecStepWithRetry(
-                        pipeline,
-                        numRetries: 1,
-                        script: """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${testCmdLine.join(" ")}
-                        """,
-                        retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
-                    )
-                }
-            }
-
-            if (perfMode) {
-                stage("Check perf result") {
-                    sh """
-                        python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                        ${stageName}/perf_script_test_results.csv \
-                        ${llmSrc}/tests/integration/defs/perf/base_perf.csv
-                    """
-                }
+        def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
+        def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
+        if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
+            echo "Prepend ${containerPIP_LLM_LIB_PATH} into \${LD_LIBRARY_PATH}"
+            containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
+        }
+        containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
+        withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+            withCredentials([
+                usernamePassword(
+                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                    usernameVariable: 'GITLAB_API_USER',
+                    passwordVariable: 'GITLAB_API_TOKEN'
+                ),
+                string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
+            ]) {
+                sh "env | sort"
+                trtllm_utils.llmExecStepWithRetry(
+                    pipeline,
+                    numRetries: 1,
+                    script: """
+                        rm -rf ${stageName}/ && \
+                        cd ${llmSrc}/tests/integration/defs && \
+                        ${testCmdLine.join(" ")}
+                    """,
+                    retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
+                )
             }
         }
-        catch (err) {
+
+        if (perfMode) {
+            stage("Check perf result") {
+                sh """
+                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
+                    ${stageName}/perf_script_test_results.csv \
+                    ${llmSrc}/tests/integration/defs/perf/base_perf.csv
+                """
+            }
+        }
+        //}
+        /*catch (err) {
             try {
                 def exitCode = sh(
                     script: "kubectl get pod ${env.HOSTNAME} -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}'",
@@ -960,7 +960,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 echo "Failed to retrieve exit code: ${innerErr.message}"
                 error("Test failed with unknown exit code")
             }
-        }
+        }*/
     }
 }
 
