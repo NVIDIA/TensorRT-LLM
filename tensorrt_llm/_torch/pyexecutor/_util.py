@@ -174,8 +174,11 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.enable_iter_perf_stats = False
     req_ids = []
     if py_executor.dist.mapping.rank == 0:
-        req = create_dummy_context_requests(max_num_tokens, origin_seq_len - 1,
-                                            vocab_size)
+        # NOTE: TRTLLMDecoder requires origin_seq_len - 1 for requests.
+        #       Spec decoders with overlap require origin_seq_len.
+        seq_len = origin_seq_len - 1 if type(
+            py_executor.decoder) == TRTLLMDecoder else origin_seq_len
+        req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = mpi_broadcast(req_ids, root=0)
     py_executor.start_worker()
