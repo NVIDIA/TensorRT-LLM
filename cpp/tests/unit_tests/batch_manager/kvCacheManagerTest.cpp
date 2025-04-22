@@ -2805,7 +2805,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     bool constexpr isStreaming{false};
 
     ///////////////////////////////////////////////////////////////////////////
-    // add a long request and then remove it
+    // add a request just at the attention window and then remove it
     SizeType32 requestId = 0;
     int inputLength = 16;
     auto inputTokens = std::make_shared<VecTokens>(inputLength);
@@ -2936,8 +2936,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock);
 
     auto constexpr blocksInPrimaryPool = 16;
-    auto constexpr blocksInSecondaryPool
-        = 0; // Test without secondary pool. Blocks stored for reuse will be kept in primary pool.
+    auto constexpr blocksInSecondaryPool = 16;
 
     auto constexpr enableBlockReuse = true;
     auto constexpr onboardBlocks = true;
@@ -2955,7 +2954,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     ASSERT_EQ(blockManager.isVariableWindow(), true);
     ASSERT_EQ(blockManager.isVariableGQA(), false);
 
-    SizeType32 constexpr maxNewTokens = 4;
+    SizeType32 constexpr maxNewTokens = 40;
 
     // prepare tokens with token[i] = 1000 + i
     TokenIdType constexpr firstToken = 1000;
@@ -2963,20 +2962,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
     auto constexpr beamWidth = maxBeamWidth;
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
-
-    SizeType32 requestId = 0;
-    int inputLength = 7;
-    auto inputTokens = std::make_shared<VecTokens>(inputLength);
-    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
-    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     auto constexpr beamIdx = 0;
-
-    ///////////////////////////////////////////////////////////////////////////
-    // add a request that will exceed the min attention window *after context*, and then remove it.
-    // blocks are stored for reuse since the initial sequence length is smaller than the min attention window.
-    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
-    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
 
     auto const assertBlocks
         = [minAttentionWindow, maxAttentionWindow, beamIdx](GenerationRequest seq,
@@ -2989,66 +2975,75 @@ TEST_F(KVCacheManagerTest, KVCacheManagerVariableWindowAttentionWithReuseTest)
         return blocksMin.size() + blocksMax.size();
     };
 
+    ///////////////////////////////////////////////////////////////////////////
+    // add a request just at the minimum attention window and then remove it
+    SizeType32 requestId = 0;
+    int inputLength = 8;
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
+    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
+    GenerationRequest const& seq0 = kvCacheManager.getSequence(requestId);
+    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     assertBlocks(seq0, {0, 1}, {0, 1});
 
-    // add tokens to enable cyclic kv cache for minimum but not maximum
-    llmRequest->addNewToken(1016, beamIdx);
+    // add tokens, making the minimum attention window slide (not reaching the max attention window)
+    llmRequest->addNewToken(1008, beamIdx);
     kvCacheManager.addToken(requestId);
-    llmRequest->addNewToken(1017, beamIdx);
+    llmRequest->addNewToken(1009, beamIdx);
     kvCacheManager.addToken(requestId);
-    auto const numBlocks = assertBlocks(seq0, {0, 1}, {0, 1, 2});
+    llmRequest->addNewToken(1010, beamIdx);
+    kvCacheManager.addToken(requestId);
+    llmRequest->addNewToken(1011, beamIdx);
+    kvCacheManager.addToken(requestId);
+    auto const numBlocks = assertBlocks(seq0, {1, 2}, {0, 1, 2});
+    auto numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
+    EXPECT_EQ(numAllocatedPrimaryBlocks, numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), allBlocksInPrimaryPools - numBlocks);
+
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
-    // no blocks stored because sliding window KV cache was enabled
-    EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), allBlocksInPrimaryPools);
+    numAllocatedPrimaryBlocks = blockManager.getNumAllocatedBlocks() - blocksInSecondaryPool;
+    EXPECT_EQ(numAllocatedPrimaryBlocks, 0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(kPrimaryLevel), blocksInPrimaryPool);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(kSecondaryLevel), blocksInSecondaryPool);
+    // For both windows, store blocks 0, 1, 2  for reuse ([1000,1001,1002,1003], [1004,1005,1006,1007],
+    // [1008,1009,1010,1011])
 
     ///////////////////////////////////////////////////////////////////////////
-    // add a short request that is between the min and max attention window
+    // add a short request within both attention windows and try to reuse
+    // reuse blocks {0, 1(p)} for both windows, copying block 1 to a new block 4 since it's not a leaf block and is
+    // partially used. upon reached attention window, get new block 5
     requestId = 1;
-    inputLength = 9;
+    inputLength = 7;
     inputTokens->resize(inputLength);
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
     GenerationRequest const& seq1 = kvCacheManager.getSequence(requestId);
-    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
-    assertBlocks(seq1, {2, 3}, {3, 4, 5});
-    llmRequest->addNewToken(1007, beamIdx);
-    kvCacheManager.addToken(requestId);
+    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 6);
+    assertBlocks(seq1, {0, 4},
+        {0, 3}); // Can't use 3 for min window since it's used to onboard block, so 4 is the next free block.
+
+    // add new tokens to allocate another block, but not enough to detach block
     llmRequest->addNewToken(1008, beamIdx);
     kvCacheManager.addToken(requestId);
-    assertBlocks(seq1, {2, 3}, {3, 4, 5});
+    llmRequest->addNewToken(1009, beamIdx);
+    kvCacheManager.addToken(requestId);
+    assertBlocks(seq1, {0, 4, 5}, {0, 3, 4});
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
 
     ///////////////////////////////////////////////////////////////////////////
-    // add a request that won't reach the min attention window, so reuse can be triggered.
+    // add a request that exceeds minimum attention window, no reuse
     requestId = 2;
-    inputLength = 4;
+    inputLength = 10;
     inputTokens->resize(inputLength);
     std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
     llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
     kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
+    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 0);
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
-    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 3);
-    assertBlocks(
-        seq2, {4}, {6}); // copying block 0 to a new blocks (4,6) since it's not a leaf block and is partially used.
-
-    auto const numTokens = llmRequest->getNumTokens(beamIdx);
-    EXPECT_EQ(tc::ceilDiv(numTokens, tokensPerBlock), 1);
-    EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId, llmRequest));
-
-    ///////////////////////////////////////////////////////////////////////////
-    // add a request that won't reach the min attention window, so a block 6 from previous request will be reused.
-    requestId = 3;
-    inputLength = 4;
-    inputTokens->resize(inputLength);
-    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
-    llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
-    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest);
-    GenerationRequest const& seq3 = kvCacheManager.getSequence(requestId);
-    EXPECT_EQ(llmRequest->getContextCurrentPosition(), 3);
-    assertBlocks(seq3, {4}, {6}); // Now blocks (4,6) are leaf blocks and reused.
+    assertBlocks(seq2, {6, 7}, {5, 6, 7});
 }
 
 namespace
