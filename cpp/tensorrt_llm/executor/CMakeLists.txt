@@ -63,7 +63,7 @@ message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
 # keep this list sorted alphabetically
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
-    cache_transmission/nixl_utils/connection.cpp
+    cache_transmission/nixl_utils/nixl_example.cpp
     cache_transmission/cacheConcatenate.cu
     contextPhaseParams.cpp
     debugConfig.cpp
