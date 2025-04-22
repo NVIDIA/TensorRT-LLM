@@ -15,7 +15,6 @@
  */
 
 #pragma once
-
 #include <cassert>
 #include <iostream>
 #include <sstream>
@@ -148,7 +147,10 @@ enum class CutlassTileConfigSM120
     // Signals that we should run heuristics do choose a config
     ChooseWithHeuristic,
 
-    CtaShape128x128x256B,
+    CtaShape128x128x128B,
+    CtaShape128x128x64B,
+    CtaShape256x128x64B,
+    CtaShape128x256x64B,
 };
 
 enum class MainloopScheduleType
@@ -468,7 +470,7 @@ struct CutlassGemmConfig
     {
         std::stringstream tactic;
         tactic << "Cutlass GEMM Tactic";
-        if (is_tma_warp_specialized && getTileConfigAsInt() != (int) CutlassTileConfigSM90::ChooseWithHeuristic)
+        if (is_tma_warp_specialized)
         {
             assert(sm_version >= 90 && "Invalid cutlass GEMM config");
             tactic << "\n\tstyle=TMA Warp Specialized"
