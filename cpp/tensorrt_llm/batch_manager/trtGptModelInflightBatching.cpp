@@ -1946,8 +1946,9 @@ runtime::CudaEvent TrtGptModelInflightBatching::decoderStepAsync(ScheduledReques
     auto decoderFinishEvent = mDecoder->forwardAsync(*mDecodingOutput, *decodingInput);
 
     auto const returnLogProbs = batchReturnLogProbs(scheduledRequests);
-    auto updateDecoderBuffersEvent = (*mUpdateDecoderBuffers)(
-        mModelConfig, *mDecoderBuffers, mDecoderOutputBuffers.at(fusedBufferId), mRuntime->getBufferManager(), *mDecoder, returnLogProbs, decoderFinishEvent);
+    auto updateDecoderBuffersEvent
+        = (*mUpdateDecoderBuffers)(mModelConfig, *mDecoderBuffers, mDecoderOutputBuffers.at(fusedBufferId),
+            mRuntime->getBufferManager(), *mDecoder, returnLogProbs, decoderFinishEvent);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return updateDecoderBuffersEvent;

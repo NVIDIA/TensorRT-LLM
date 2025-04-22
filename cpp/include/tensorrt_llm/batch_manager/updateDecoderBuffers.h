@@ -30,6 +30,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 class DecoderBuffers;
+class DecoderOutputBuffers;
 
 class UpdateDecoderBuffers : Algorithm
 {
@@ -38,8 +39,9 @@ public:
 
     UpdateDecoderBuffers() = default;
 
-    runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderBuffers& decoderBuffers, DecoderOutputBuffers& decoderOutputBuffers,
-        runtime::BufferManager const& copyBufferManager, runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
+    runtime::CudaEvent operator()(runtime::ModelConfig const& modelConfig, DecoderBuffers& decoderBuffers,
+        DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
+        runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
         runtime::CudaEvent const& decoderFinishEvent) const;
 };
 

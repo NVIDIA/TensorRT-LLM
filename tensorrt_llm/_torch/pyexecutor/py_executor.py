@@ -1016,7 +1016,7 @@ class PyExecutor:
                                                        batch_outputs)
 
                     self._update_request_states(scheduled_batch)
-                    
+
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
                     ) if self.kv_cache_transceiver else []

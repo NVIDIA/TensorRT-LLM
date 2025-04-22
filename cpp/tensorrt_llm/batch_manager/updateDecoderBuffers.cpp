@@ -29,8 +29,9 @@ using ITensor = runtime::ITensor;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 runtime::CudaEvent UpdateDecoderBuffers::operator()(runtime::ModelConfig const& modelConfig,
-    DecoderBuffers& decoderBuffers, DecoderOutputBuffers& decoderOutputBuffers, runtime::BufferManager const& copyBufferManager,
-    runtime::GptDecoderBatched const& decoder, bool returnLogProbs, runtime::CudaEvent const& decoderFinishEvent) const
+    DecoderBuffers& decoderBuffers, DecoderOutputBuffers& decoderOutputBuffers,
+    runtime::BufferManager const& copyBufferManager, runtime::GptDecoderBatched const& decoder, bool returnLogProbs,
+    runtime::CudaEvent const& decoderFinishEvent) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(updateDecoderBuffers);

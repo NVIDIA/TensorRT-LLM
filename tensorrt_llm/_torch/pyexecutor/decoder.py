@@ -434,10 +434,9 @@ class TRTLLMDecoder(Decoder):
             "decoder_buffers":
             DecoderBuffers(self.max_num_sequences,
                            self.executor_config.max_beam_width,
-                           self.max_attention_window,
-                           self.executor_config.max_seq_len,
-                           self.max_decoding_tokens, buffer_manager,
-                           self.model_config, self.world_config),
+                           self.max_attention_window, self.max_decoding_tokens,
+                           buffer_manager, self.model_config,
+                           self.world_config),
             "decoder_input_buffers":
             DecoderInputBuffers(self.executor_config.max_batch_size,
                                 self.max_decoding_tokens, buffer_manager),
@@ -447,7 +446,13 @@ class TRTLLMDecoder(Decoder):
                 self.executor_config.max_beam_width,
             ),
                         dtype=torch.int,
-                        device='cuda')
+                        device='cuda'),
+            "sequence_lengths_host":
+            torch.empty((
+                self.executor_config.max_batch_size,
+                self.executor_config.max_beam_width,
+            ),
+                        dtype=torch.int)
         }
 
     def _instantiate_algorithms(self):
@@ -552,7 +557,7 @@ class TRTLLMDecoder(Decoder):
 
         # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
         #       This could be a race condition.
-        self.store["decoder_buffers"].sequence_lengths_host.copy_(
+        self.store["sequence_lengths_host"].copy_(
             self.algs.decoder.decoder_state.sequence_lengths, non_blocking=True)
 
         # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
@@ -576,7 +581,7 @@ class TRTLLMDecoder(Decoder):
             "finish_reasons_host":
             finish_reasons,
             "sequence_lengths_host":
-            self.store["decoder_buffers"].sequence_lengths_host
+            self.store["sequence_lengths_host"]
         })
 
         decoder_event = torch.cuda.Event()
