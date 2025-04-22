@@ -14,20 +14,23 @@ from ..utils.logger import ad_logger
 from ._graph import move_to_device
 from .export import torch_export_to_gm
 from .library import (
+    bmm_shard,
     check_in_out_nodes,
     column_row_shard,
+    eliminate_redundant_transposes,
     ep_shard,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
     fuse_gemms,
     fuse_moe,
-    identify_and_fuse_mha,
-    insert_mha_with_kv_cache,
-    insert_mla_with_kv_cache,
     match_moe_pattern,
+    match_rope_v1,
+    match_rope_v2,
     quantize,
     resize_kv_cache,
 )
+from .library.kvcache import insert_mla_with_kv_cache
+from .library.sdpa import insert_unfused_mha_with_kv_cache
 
 
 class InferenceOptimizer:
@@ -79,7 +82,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         cm.info._set_example_sequence()
-        egm = torch_export_to_gm(model, args=cm.args[:1], dynamic_shapes=cm.dynamic_shapes[:1])
+        egm = torch_export_to_gm(model, args=cm.args[:2], dynamic_shapes=cm.dynamic_shapes[:2])
         del model
         ad_logger.debug("original graph: " + str(egm))
         local_rank, world_size = dist_ad.get_rank_world_size()
@@ -94,30 +97,42 @@ class InferenceOptimizer:
         # Match MoE pattern
         egm = match_moe_pattern(egm)
 
-        # identify MHA patterns
-        egm = identify_and_fuse_mha(egm, self.factory.get_positional_embedding_config())
+        # Match Rope pattern
+        egm = match_rope_v1(egm)
+        egm = match_rope_v2(egm)
 
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
 
-        input_node = check_in_out_nodes(egm)
+        input_nodes = check_in_out_nodes(egm)
+
+        # insert SDPA with KV cache
+        egm = insert_unfused_mha_with_kv_cache(
+            egm, cm, self.attention_op, self.factory.get_cache_config(), input_nodes
+        )
 
         # insert MHA with KV cache
-        egm = insert_mha_with_kv_cache(
-            egm, cm, self.attention_op, self.factory.get_cache_config(), input_node
-        )
+        # egm = insert_mha_with_kv_cache(
+        #     egm, cm, self.attention_op, self.factory.get_cache_config(), input_node
+        # )
 
         # insert MLA with KV cache
         egm = insert_mla_with_kv_cache(
-            egm, cm, self.mla_op, self.factory.get_cache_config(), input_node
+            egm, cm, self.mla_op, self.factory.get_cache_config(), input_nodes
         )
+
+        # eliminate redundant transpose operations
+        egm = eliminate_redundant_transposes(egm)
 
         # run TP sharding across ranks
         egm = column_row_shard(egm, local_rank, world_size)
 
         # run EP sharding across ranks
         egm = ep_shard(egm, local_rank, world_size)
+
+        # run BMM sharding across ranks
+        egm = bmm_shard(egm, local_rank, world_size)
 
         ############################################################################################
         # SETUP CACHES AND LOAD WEIGHTS
@@ -170,7 +185,10 @@ class InferenceOptimizer:
         ############################################################################################
 
         cm.info._set_generate_only_batch()
-        compiler_kwargs = {"cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes}
+        compiler_kwargs = {
+            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
+            "num_batched_inputs": 2,  # TODO (lliebenwein): improve once we have a config system...
+        }
         egm_compiled = compile_and_capture(
             egm,
             self.compile_backend,
