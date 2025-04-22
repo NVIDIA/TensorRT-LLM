@@ -279,7 +279,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type in ["b100-ts2", "dgx-h100", "dgx-h200", "gh200", "rtx-5080", "rtx-5090"]) {
+        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
