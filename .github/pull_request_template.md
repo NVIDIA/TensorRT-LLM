@@ -1,4 +1,3 @@
-<!--
 
 # MR title
 
@@ -9,8 +8,6 @@ Please write the MR title by following template:
 For example, assume I have a MR hope to support a new feature about cache manager of Jira TRTLLM-1000 ticket, it would be like
 
 [TRTLLM-1000][feat] Support a new feature about cache manager
-
--->
 
 ## Description
 
