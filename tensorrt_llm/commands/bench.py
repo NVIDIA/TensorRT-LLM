@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import click
+from transformers import AutoModelForCausalLM
 
 from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
@@ -52,6 +53,11 @@ def main(
 
     # Create the workspace where we plan to store intermediate files.
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)
+
+    # If we're dealing with a model name, perform a snapshot download to make
+    # sure we have a local copy of the model.
+    if ctx.obj.checkpoint_path is None:
+        AutoModelForCausalLM.from_pretrained(model)
 
 
 main.add_command(build_command)
