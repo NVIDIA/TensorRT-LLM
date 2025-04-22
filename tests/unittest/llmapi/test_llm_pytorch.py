@@ -15,12 +15,12 @@ from utils.util import force_ampere
 
 
 @force_ampere
-def test_tinyllama_guided_decoding_pytorch():
+def test_tinyllama_guided_decoding():
     llm_kwargs = {'backend': 'pytorch'}
-    tinyllama_guided_decoding_test_harness(llm_kwargs)
+    tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
-@pytest.mark.parametrize("return_context_logits, use_overlap", [
+@pytest.mark.parametrize("return_context_logits", "use_overlap", [
     (False, False),
     (False, True),
 ])
@@ -49,14 +49,14 @@ def test_llm_get_stats_async(return_context_logits, use_overlap):
     [
         SamplingParams()  # pytorch only supports n=1
     ])
-def test_llm_abort_request_pytorch(sampling_params):
+def test_llm_abort_request(sampling_params):
     from tensorrt_llm._torch import LLM as LLM_torch
     llm = LLM_torch(model=llama_model_path,
                     kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
-def test_llm_reward_model_pytorch():
+def test_llm_reward_model():
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
     tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
