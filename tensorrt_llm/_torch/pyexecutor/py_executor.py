@@ -536,11 +536,13 @@ class PyExecutor:
         model_stats.num_scheduled_requests = len(
             scheduled_batch.context_requests) + len(
                 scheduled_batch.generation_requests)
-        model_stats.num_context_requests = len(scheduled_batch.context_requests)
+        model_stats.num_context_requests = self.model_engine.iter_states[
+            'num_ctx_requests']
         model_stats.num_gen_requests = len(scheduled_batch.generation_requests)
         model_stats.num_paused_requests = len(scheduled_batch.paused_requests)
         model_stats.avg_num_decoded_tokens_per_iter = 0
-        model_stats.num_ctx_tokens = 0
+        model_stats.num_ctx_tokens = self.model_engine.iter_states[
+            'num_ctx_tokens']
         model_stats.micro_batch_id = 0
         stats.inflight_batching_stats = model_stats
         return stats
@@ -831,7 +833,7 @@ class PyExecutor:
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
@@ -957,7 +959,7 @@ class PyExecutor:
                             "num_fitting_reqs =0 and fitting_disagg_gen_init_requests is empty , may not have enough kvCache"
                         )
                         self.kv_cache_transceiver.check_context_transfer_status(
-                            True)
+                            1)
                 else:
                     assert scheduled_batch.batch_size > 0, (
                         "fail to schedule any pending request, "
@@ -1541,7 +1543,7 @@ class PyExecutor:
             if req.is_context_only_request and req.is_context_finished:
                 self.kv_cache_transceiver.respond_and_send_async(req)
 
-        self.kv_cache_transceiver.check_context_transfer_status(False)
+        self.kv_cache_transceiver.check_context_transfer_status(0)
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [

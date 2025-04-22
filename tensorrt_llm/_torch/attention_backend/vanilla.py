@@ -11,7 +11,7 @@ except ImportError:
     AttentionMaskConverter = None
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask, dummy_forward)
+                        PredefinedAttentionMask)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -230,12 +230,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 *,
                 attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
                 **kwargs) -> torch.Tensor:
-
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        if metadata.is_dummy_attention:
-            return dummy_forward(q, k, v)
-        elif metadata.kv_cache_manager is None:
+        if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.
             num_heads = self.num_heads
@@ -248,11 +243,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 num_kv_heads=num_kv_heads,
                 metadata=metadata,
                 attention_mask=attention_mask)
-
-        # This is only for memory estimation for now.
-        # NOTE: this method is not accurate while it works for most scenario.
-        if metadata is None or metadata.kv_cache_manager is None:
-            return dummy_forward(q, k, v)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [

@@ -53,6 +53,7 @@ set(SRCS
     statefulGptDecoderBatched.cpp
     tllmBuffers.cpp
     tllmRuntime.cpp
+    tllmStreamReaders.cpp
     tllmLogger.cpp
     transformerBuffers.cpp
     workerPool.cpp

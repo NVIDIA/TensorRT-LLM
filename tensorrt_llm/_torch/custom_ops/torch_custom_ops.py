@@ -126,7 +126,9 @@ def fused_moe(
         (2, 0, ((0, ), lambda x: x)),
     ))
 
-    min_latency_tensor = torch.empty(1) if min_latency_mode else torch.empty(0)
+    # TODO: set min_latency_mode always to False due to the error in the moe_kernels
+    min_latency_tensor = torch.empty(0)
+
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,

@@ -108,6 +108,8 @@ def load_weight_scales_nvfp4(weights: List[Dict],
     weight_scale_2 = None
     weight_scale = []
 
+    device = torch.device("cuda")
+
     for w in weights:
         if "input_scale" in w:
             if input_scale is None:
@@ -116,8 +118,11 @@ def load_weight_scales_nvfp4(weights: List[Dict],
                 assert input_scale == w["input_scale"][
                     ...], "The input_scale should be same for all the weights"
         if "weight_scale" in w:
-            ws = load_weight_shard(w["weight_scale"], tp_size, tp_rank,
-                                   tp_mode).contiguous()
+            ws = load_weight_shard(w["weight_scale"],
+                                   tp_size,
+                                   tp_rank,
+                                   tp_mode,
+                                   device=device).contiguous()
             assert ws.dtype == torch.float8_e4m3fn  # TODO: or e8m0 for mxfp4 recipe?
             weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
         if "weight_scale_2" in w:
