@@ -698,6 +698,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 #else
 __global__ void routingIndicesClusterKernel(KernelParams params)
 {
+    assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -886,6 +887,8 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesCoopKernel(KernelPar
             params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
         }
     }
+#else
+    assert(false && "routingIndicesCoopKernel is only supported on SM90+ architectures");
 #endif
 }
 
@@ -973,6 +976,8 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesHistogramKernel(Kern
     // Reduce histograms with atomics.
     int32_t const localExpertCount = smemExpertCount[threadIdx.x];
     atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
+#else
+    assert(false && "routingIndicesHistogramKernel is only supported on SM90+ architectures");
 #endif
 }
 
@@ -1204,6 +1209,8 @@ __global__ void __launch_bounds__(NumThreads) routingIndicesOffsetsKernel(Kernel
     {
         cudaTriggerProgrammaticLaunchCompletion();
     }
+#else
+    assert(false && "routingIndicesOffsetsKernel is only supported on SM90+ architectures");
 #endif
 }
 

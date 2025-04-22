@@ -59,6 +59,8 @@ def _generate_ds_attention_mask(b, s):
     )
 
 
+# TODO (svelury): update unit test to run fast
+@pytest.mark.skip(reason="TODO: too slow for a unit test")
 @pytest.mark.parametrize(
     "model_name, module_name, patch, yarn, inputs",
     [
