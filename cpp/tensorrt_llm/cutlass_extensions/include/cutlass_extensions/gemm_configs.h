@@ -149,6 +149,9 @@ enum class CutlassTileConfigSM120
     ChooseWithHeuristic,
 
     CtaShape128x128x128B,
+    CtaShape128x128x64B,
+    CtaShape256x128x64B,
+    CtaShape128x256x64B,
     CtaShape128x128x256B,
     CtaShape256x128x128B,
 };
