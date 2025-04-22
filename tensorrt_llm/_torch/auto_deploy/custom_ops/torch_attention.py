@@ -294,14 +294,11 @@ def apply_rope_ds(
     k: torch.Tensor,
     cos: torch.Tensor,  # [B, seq_len, head_dim]
     sin: torch.Tensor,  # [B, seq_len, head_dim]
-    unsqueeze_dim: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DS-style RoPE: interleaves Q/K channels, indexes cos/sin by position_ids
     and returns rotated (q_embed, k_embed).
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
     b, h, s, d = q.shape
     q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
     b, h, s, d = k.shape
@@ -313,7 +310,7 @@ def apply_rope_ds(
 
 @apply_rope_ds.register_fake
 def apply_rope_ds_fake(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return q, k
 

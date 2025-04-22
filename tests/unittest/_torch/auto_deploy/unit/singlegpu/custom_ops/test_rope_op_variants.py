@@ -259,8 +259,15 @@ def inverse_interleave_permute_for_rotary(x: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_ds_impl_and_hf_impl(dtype, head_dim):
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.bfloat16, 1e-4, 1e-4),
+        (torch.float16, 5e-4, 5e-4),
+    ],
+    ids=["bfloat16", "float16"],
+)
+def test_ds_impl_and_hf_impl(dtype, head_dim, atol, rtol):
     """
     Ensure Deepseek's interleaved-Q/K RoPE matches HF apply_rotary_pos_emb:
     - DS Q/K: [B, N, S, D] channel-interleaved in last dim.
@@ -302,12 +309,19 @@ def test_ds_impl_and_hf_impl(dtype, head_dim):
     q_for_hf2 = inverse_interleave_permute_for_rotary(q_for_hf.clone())
     k_for_hf2 = inverse_interleave_permute_for_rotary(k_for_hf.clone())
 
+    # adapted from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L134
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos_ds = emb.cos()
+    sin_ds = emb.sin()
+
+    torch.testing.assert_close(cos_ds, cos_new, rtol=rtol, atol=atol)
+    torch.testing.assert_close(sin_ds, sin_new, rtol=rtol, atol=atol)
+
     q_rotated_hf2, k_rotated_hf2 = apply_rotary_pos_emb_ds(
         q_for_hf2, k_for_hf2, cos_new, sin_new, position_ids, unsqueeze_dim=1
     )
-
-    atol = 1e-3 if dtype == torch.float16 else 1e-2
-    rtol = 1e-3 if dtype == torch.float16 else 1e-2
 
     torch.testing.assert_close(q_rotated_hf2.transpose(1, 2), q_rotated_hf, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_rotated_hf2.transpose(1, 2), k_rotated_hf, rtol=rtol, atol=atol)

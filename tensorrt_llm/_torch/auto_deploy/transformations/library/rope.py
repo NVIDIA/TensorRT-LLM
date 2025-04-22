@@ -45,7 +45,7 @@ TODO: Support Minor variants:
 
 import operator
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule, Node
@@ -92,6 +92,10 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
     rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
     rope_position_ids_cache: Dict[str, Node] = {}
 
+    rope_ds_cache: DefaultDict[Tuple[Node, Node, int], Tuple[Optional[Node], Optional[Node]]] = (
+        defaultdict(lambda: (None, None))
+    )
+
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []  # list of (match_info, is_ds)
         node = start_boundary
@@ -131,6 +135,7 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
                 graph,
                 q_match,
                 k_match,
+                rope_ds_cache,
             )
         else:
             _process_explicit_rope(
@@ -576,9 +581,11 @@ def _process_ds_rope(
     graph: GraphModule,
     q_match: Dict[str, Node],
     k_match: Dict[str, Node],
+    rope_ds_cache: DefaultDict[Tuple[Node, Node, int], Tuple[Optional[Node], Optional[Node]]],
 ) -> None:
     """
     Replace a matched DS-style RoPE subgraph with a call to rope::apply_rope_ds.
+    Cache the one-time unsqueeze of cos/sin.
     """
     q_node = q_match["raw_input"]
     k_node = k_match["raw_input"]
@@ -599,10 +606,19 @@ def _process_ds_rope(
         else:
             unsq_dim = 1
 
+    # look up—or first insert—the unsqueezed cos/sin
+    cache_key = (cos_node, sin_node, unsq_dim)
+    cos_u, sin_u = rope_ds_cache[cache_key]
+    if cos_u is None:
+        with graph.inserting_before(q_match["add_node"]):
+            cos_u = graph.call_function(torch.ops.aten.unsqueeze, args=(cos_node, unsq_dim))
+            sin_u = graph.call_function(torch.ops.aten.unsqueeze, args=(sin_node, unsq_dim))
+        rope_ds_cache[cache_key] = (cos_u, sin_u)
+
     with graph.inserting_before(q_match["add_node"]):
         ds_node = graph.call_function(
             torch.ops.rope.apply_rope_ds,
-            args=(q_node, k_node, cos_node, sin_node, unsq_dim),
+            args=(q_node, k_node, cos_u, sin_u),
         )
 
     with graph.inserting_after(ds_node):
