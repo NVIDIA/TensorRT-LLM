@@ -1099,12 +1099,8 @@ def tinyllama_guided_decoding_test_harness(**llm_kwargs):
 
 @force_ampere
 @pytest.mark.part0
-@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
-def test_tinyllama_guided_decoding(backend: str):
-    llm_kwargs = {}
-    if backend == 'pytorch':
-        llm_kwargs['backend'] = 'pytorch'
-    tinyllama_guided_decoding_test_harness(**llm_kwargs)
+def test_tinyllama_guided_decoding():
+    tinyllama_guided_decoding_test_harness()
 
 
 @pytest.mark.part0
@@ -1766,18 +1762,13 @@ def llm_get_stats_test_harness(tp_size: int = 1,
     assert llm.get_stats(2)
 
 
-@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
-                         [
-                             (True, False, False),
-                             (False, False, False),
-                             (False, True, False),
-                             (False, True, True),
-                         ])
-def test_llm_get_stats(return_context_logits, pytorch_backend, use_overlap):
+@pytest.mark.parametrize("return_context_logits", [
+    (True, ),
+    (False, ),
+])
+def test_llm_get_stats(return_context_logits):
     llm_get_stats_test_harness(tp_size=1,
-                               return_context_logits=return_context_logits,
-                               pytorch_backend=pytorch_backend,
-                               use_overlap=use_overlap)
+                               return_context_logits=return_context_logits)
 
 
 def llm_get_stats_async_test_harness(tp_size: int = 1,
@@ -1833,20 +1824,15 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("return_context_logits, pytorch_backend, use_overlap",
-                         [
-                             (True, False, False),
-                             (False, False, False),
-                             (False, True, False),
-                             (False, True, True),
-                         ])
-def test_llm_get_stats_async(return_context_logits, pytorch_backend,
-                             use_overlap):
+@pytest.mark.parametrize("return_context_logits", [
+    (True, ),
+    (False, ),
+])
+def test_llm_get_stats_async(return_context_logits):
     llm_get_stats_async_test_harness(
         tp_size=1,
         return_context_logits=return_context_logits,
-        pytorch_backend=pytorch_backend,
-        use_overlap=use_overlap)
+    )
 
 
 def test_llm_chunked_prefill():
@@ -1986,10 +1972,9 @@ def run_llm_with_postprocess_parallel_and_result_handler(
 
 
 @pytest.mark.parametrize("streaming", [True, False])
-@pytest.mark.parametrize("backend", [None, "pytorch"])
-def test_llm_with_postprocess_parallel_and_result_handler(streaming, backend):
+def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
-                                                         backend,
+                                                         backend=None,
                                                          tp_size=1)
 
 
@@ -2041,41 +2026,6 @@ def test_llm_abort_request(llm_for_sampling_params,
                           sampling_params=sampling_params)
 
 
-@force_ampere
-@pytest.mark.parametrize(
-    "sampling_params",
-    [
-        SamplingParams()  # pytorch only supports n=1
-    ])
-def test_llm_abort_request_pytorch(sampling_params):
-    from tensorrt_llm._torch import LLM as LLM_torch
-    llm = LLM_torch(model=llama_model_path,
-                    kv_cache_config=global_kvcache_config)
-    run_llm_abort_request(llm=llm, sampling_params=sampling_params)
-
-
-def test_llm_reward_model_pytorch():
-    rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
-    tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
-    tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
-
-    from tensorrt_llm._torch import LLM as LLM_torch
-    from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-    llm = LLM_torch(
-        model=rm_model_path,
-        pytorch_backend_config=PyTorchConfig(attn_backend="VANILLA"))
-
-    sampling_params = SamplingParams(return_context_logits=True)
-
-    outputs = llm.generate(prompts, sampling_params)
-    scores = outputs[0].context_logits
-
-    print(scores)
-
-    assert scores.shape == (tokenized_input.shape[1], 2)
-    assert not outputs[0].outputs[0].text
-
-
 def test_llm_sampling_params_n_lt_max_batch_size():
     sampling_params = SamplingParams(n=2, best_of=1)
     build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
@@ -2117,7 +2067,3 @@ def test_llm_api_draft_target():
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-
-
-if __name__ == '__main__':
-    test_llm_with_postprocess_parallel_and_result_handler(True, "pytorch")

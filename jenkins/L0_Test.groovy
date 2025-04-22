@@ -1199,6 +1199,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A30-TensorRT-2": ["a30", "l0_a30", 2, 4],
         "A30-TensorRT-3": ["a30", "l0_a30", 3, 4],
         "A30-TensorRT-4": ["a30", "l0_a30", 4, 4],
+        "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "A100X-TensorRT-1": ["a100x", "l0_a100", 1, 4],
         "A100X-TensorRT-2": ["a100x", "l0_a100", 2, 4],
         "A100X-TensorRT-3": ["a100x", "l0_a100", 3, 4],
