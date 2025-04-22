@@ -52,23 +52,6 @@ else()
 endif()
 
 if(EXISTS
-   "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/CMakeLists.txt"
-)
-  set(BUILD_NVRTC_WRAPPER_DEFAULT ON)
-else()
-  set(BUILD_NVRTC_WRAPPER_DEFAULT OFF)
-endif()
-
-option(BUILD_NVRTC_WRAPPER "Build nvrtc wrapper from source"
-       ${BUILD_NVRTC_WRAPPER_DEFAULT})
-
-if(BUILD_NVRTC_WRAPPER)
-  message(STATUS "Building nvrtc wrapper")
-else()
-  message(STATUS "Importing nvrtc wrapper")
-endif()
-
-if(EXISTS
    "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/internal_cutlass_kernels/CMakeLists.txt"
 )
   set(BUILD_INTERNAL_CUTLASS_KERNELS_DEFAULT ON)
@@ -154,6 +137,8 @@ set(CURAND_LIB CUDA::curand)
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
+set(NVRTC_LIB CUDA::nvrtc_static)
+set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
