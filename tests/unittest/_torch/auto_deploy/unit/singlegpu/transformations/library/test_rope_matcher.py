@@ -185,7 +185,7 @@ def test_match_rope(layout, num_heads, num_kv_heads):
 
 @pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4)])
 @torch.inference_mode()
-def test_match_rope_v2(num_heads, num_kv_heads):
+def test_match_rope_complex(num_heads, num_kv_heads):
     batch_size, seq_len = 8, 16
     hidden_size = 512
     max_position_embeddings = seq_len
@@ -203,6 +203,92 @@ def test_match_rope_v2(num_heads, num_kv_heads):
         match_complex_rope,
         lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=True,
+        strict_loading=True,
+        dynamic_shapes=dynamic_shapes,
+    )
+
+
+# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
+def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """
+    Apply rotary positional embeddings by interleaving Q/K ,
+    indexing cos/sin tables with position_ids, and returning rotated q, k.
+    cos:  [seq_len, head_dim]
+    sin:  [seq_len, head_dim]
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+class DSRotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        t = torch.arange(max_position_embeddings, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # returns [seq_len, head_dim] cos & sin
+        return self.cos_cached[:seq_len].to(x.dtype), self.sin_cached[:seq_len].to(x.dtype)
+
+
+class DSModel(torch.nn.Module):
+    def __init__(self, hidden_size, max_seq, n_head, n_kv, layout="BNSD"):
+        super().__init__()
+        self.hdim = hidden_size // n_head
+        self.layout = layout
+        self.q_lin = torch.nn.Linear(hidden_size, n_head * self.hdim)
+        self.k_lin = torch.nn.Linear(hidden_size, n_kv * self.hdim)
+        self.rotary = DSRotaryEmbedding(self.hdim, max_seq, base=10000, device="cuda")
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        q = self.q_lin(x).view(b, s, -1, self.hdim)
+        k = self.k_lin(x).view(b, s, -1, self.hdim)
+        # to [B, N, S, D]
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        cos, sin = self.rotary(x, seq_len=s)
+        # build position_ids [B, S]
+        pos_ids = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
+        q_out, k_out = apply_rotary_pos_emb_ds(q, k, cos, sin, pos_ids, unsqueeze_dim=1)
+        # back to [B, S, N*D]
+        q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+        k_out = k_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+        return torch.cat([q_out, k_out], dim=-1)
+
+    def get_dynamic_shapes(self):
+        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
+
+
+@pytest.mark.parametrize("layout,num_heads,num_kv_heads", [("BNSD", 8, 8), ("BSND", 8, 4)])
+@torch.inference_mode()
+def test_match_rope_deepseek(layout, num_heads, num_kv_heads):
+    batch, seq, hid = 4, 12, 512
+    model = DSModel(hid, 16, num_heads, num_kv_heads, layout=layout).to("cuda", torch.float16)
+    x = torch.randn(batch, seq, hid, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
+
+    _ = run_test(
+        model,
+        x,
+        match_explicit_rope,
+        lambda gm: any(is_op(n, torch.ops.rope.apply_rope_ds) for n in gm.graph.nodes),
+        lambda num_p: num_p,
         atol=1e-3,
         rtol=1e-3,
         test_load_hook=True,

@@ -36,6 +36,12 @@ def apply_rotary_pos_emb(
     ids=["bfloat16", "float16"],  # q/k must be in half precision
 )
 def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
+    """
+    Verify FlashInfer's Neox RoPE kernel against HF's apply_rotary_pos_emb:
+    - Q/K: [B, S, N, D] non-interleaved half-precision.
+    - cos_sin_cache: [S, D] = [cos||sin] concatenated.
+    - HF path: Q/K → [B, N, S, D], cos_new/sin_new: [S, D] duplicated, then broadcast to [B, S, D].
+    """
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -114,6 +120,12 @@ def apply_rotary_emb(
     ids=["bfloat16", "float16"],  # q/k must be in half precision
 )
 def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
+    """
+    Check FlashInfer's RoPE matches the complex-multiplication approach:
+    - Q/K: [B, S, N, D] non-interleaved half-precision.
+    - freqs_cis: [B, S, D/2] complex polar values.
+    - flashinfer uses cos_sin_cache: [S, D] interleaved from real/imag of freqs_cis.
+    """
     device = "cuda"
     batch = 2
     seq_len = 4
@@ -176,6 +188,12 @@ def precompute_freqs_cis_interleaved(
     ids=["bfloat16", "float16"],
 )
 def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
+    """
+    Validate custom Triton apply_rope_with_input_pos against HF's apply_rotary_pos_emb:
+    - Q/K: layout 'bsnd'→[B,S,N,D] or 'bnsd'→[B,N,S,D], non-interleaved half-precision.
+    - cosin_cache: [S, D/2, 2] interleaved [cos,sin].
+    - HF path: cos_full/sin_full: [S, D] then expanded to [B, S, D].
+    """
     device = "cuda"
     batch, seq_len, n_head = 2, 4, 3
 
@@ -243,6 +261,12 @@ def inverse_interleave_permute_for_rotary(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("head_dim", [64, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_ds_impl_and_hf_impl(dtype, head_dim):
+    """
+    Ensure Deepseek's interleaved-Q/K RoPE matches HF apply_rotary_pos_emb:
+    - DS Q/K: [B, N, S, D] channel-interleaved in last dim.
+    - cos_new/sin_new: [S, D] duplicated real values.
+    - HF path: Q/K → [B,N,S,D], cos_expand/sin_expand: [B,S,D], unsqueezed at dim=1.
+    """
     device = "cuda"
     batch = 2
     seq_len = 4
