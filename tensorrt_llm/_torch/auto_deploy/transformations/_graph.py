@@ -118,8 +118,18 @@ def canonicalize_graph(
 ) -> GraphModule:
     """Canonicalize the graph of the given GraphModule.
 
-    This function can be used to clean up the graph representation after a transformation with
-    optional shape propagation.
+    Args:
+        gm: The GraphModule to canonicalize.
+        shape_prop: Whether to run shape propagation. Shape propagation tends to be finicky and
+            slow, so we only run it optionally.
+        args_static: A tuple of static arguments to use for shape propagation. Shape propagation
+            requires all inputs to the graph ("placeholder" nodes) to have metadata with an
+            appropriate FakeTensor argument (``node.meta["val"]``). ``args_static`` can be used to
+            infer static FakeTensor information if some placeholder nodes do not have metadata.
+            When ``meta["val"]`` is available, it will take precedence over ``args_static``.
+
+    Returns:
+        The canonicalized (cleaned-up) GraphModule.
     """
     ad_logger.debug(f"Before canonicalizing: {gm}")
 

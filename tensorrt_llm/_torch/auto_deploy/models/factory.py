@@ -30,7 +30,34 @@ class ModelFactory(ABC):
 
     @abstractmethod
     def build_model(self, device: str) -> nn.Module:
-        """Build the model on the desired device."""
+        """Build the model on the desired device.
+
+        Args:
+            device: The device to build the model on.
+
+        Returns:
+            The built model.
+
+
+        Note that we assume that the model's forward function has the following signature:
+
+        .. code-block:: python
+
+            def forward(
+                self, input_ids: torch.Tensor, position_ids: torch.Tensor
+            ) -> Sequence[torch.Tensor]: ...
+
+        ``logits`` are assumeg to be the first output of the model, i.e.,
+        ``model(input_ids, position_ids)[0]`` should return a ``logits`` tensor.
+
+        Moreover, we assume the following tensor shapes:
+
+        .. code-block:: python
+
+            input_ids.shape = (batch_size, seq_len)
+            position_ids.shape = (batch_size, seq_len)
+            logits.shape = (batch_size, seq_len, vocab_size)
+        """
 
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""

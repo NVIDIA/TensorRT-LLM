@@ -94,7 +94,10 @@ class HFFactory(ModelFactory):
 
     @staticmethod
     def _simple_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor):
-        """A simple forward pass for the model to functionalize the args."""
+        """A simple forward pass for the model to functionalize the args.
+
+        This follows the standard function signature as expected by factory.py.
+        """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
     def build_model(self, device: DeviceLikeType) -> nn.Module:

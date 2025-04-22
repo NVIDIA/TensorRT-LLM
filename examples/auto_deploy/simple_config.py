@@ -45,7 +45,7 @@ class SimpleConfig:
     # Extra kwargs for the tokenizer class to customize the tokenizer. Same as model_kwargs.
     # For example, the default HF Llama tokenizer can be initialized with the arguments specified
     # [here](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/tokenization_llama_fast.py#L127).
-    # NOTE: This is only used if customize_tokenizer is True an
+    # NOTE: This is only used if customize_tokenizer is True
     tokenizer_kwargs: Dict = field(default_factory=dict)
 
     ### CONFIGURE BACKEND, RUNTIME, AND WORLD SIZE ##################################
