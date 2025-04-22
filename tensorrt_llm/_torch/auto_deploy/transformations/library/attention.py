@@ -139,10 +139,7 @@ def match_causal_attn_mask(gm: GraphModule) -> GraphModule:
 
         # Check if this mask is a causal mask
         if not _is_causal_mask(attn_mask):
-            ad_logger.warning(
-                f"Found non-causal attention mask at {node}! This can lead to wrong inference "
-                "results in prefill or mixed batches with batch_size > 1"
-            )
+            ad_logger.debug(f"Found non-causal attention mask at {node=}!")
             continue
 
         ad_logger.debug(f"Found causal attention mask at {node}")

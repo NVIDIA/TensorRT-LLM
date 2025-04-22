@@ -106,15 +106,19 @@ def grouped_sdpa_fake(
 
 @torch.library.custom_op("attention::bsnd_grouped_sdpa", mutates_args=())
 def bsnd_grouped_sdpa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
+    query: torch.Tensor,  # layout: [b, n, s_q, d]
+    key: torch.Tensor,  # layout: [b, n, s_k, d]
+    value: torch.Tensor,  # layout: [b, n, s_k, d]
+    attn_mask: Optional[torch.Tensor] = None,  # layout: [b, n, s_q, s_k]
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Attention that assumes the input layout is bsnd."""
+    """Attention that assumes the input layout is bsnd.
+
+    Note that attn_mask layout is still assumed to be [b, n, s_q, s_k] and is consistent with the
+    original sdpa op!
+    """
     # let's transpose to bnsd so we can use the grouped sdpa
     query = query.transpose(1, 2).contiguous()
     key = key.transpose(1, 2).contiguous()

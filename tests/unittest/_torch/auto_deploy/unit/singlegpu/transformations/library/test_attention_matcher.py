@@ -1042,18 +1042,43 @@ class MockAttentionDescriptor:
 class AttentionLayoutModel(torch.nn.Module):
     """Model that uses SDPA for testing the layout transformation."""
 
-    def __init__(self, hidden_size: int, num_heads: int, use_grouped_sdpa: bool = False):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        use_grouped_sdpa: bool = False,
+        has_mask: bool = False,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.use_grouped_sdpa = use_grouped_sdpa
+        self.has_mask = has_mask
 
         # Define linear layers
         self.q_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
         self.k_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
         self.v_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
         self.out_proj = torch.nn.Linear(num_heads * self.head_dim, hidden_size)
+
+    def _get_attn_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """Create a deterministic pseudo-random attention mask in the shape [b, n, s, s]."""
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+
+        # Create a deterministic pseudo-random attention mask
+        row_indices = (
+            torch.arange(seq_len, device=device)
+            .view(1, 1, -1, 1)
+            .expand(batch_size, self.num_heads, -1, seq_len)
+        )
+        col_indices = (
+            torch.arange(seq_len, device=device)
+            .view(1, 1, 1, -1)
+            .expand(batch_size, self.num_heads, seq_len, -1)
+        )
+        return ((row_indices + col_indices) % 3 == 0).to(dtype=x.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
@@ -1068,13 +1093,16 @@ class AttentionLayoutModel(torch.nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Create attention mask if needed
+        attn_mask = self._get_attn_mask(x) if self.has_mask else None
+
         # Apply scaled dot product attention
         if self.use_grouped_sdpa:
             attn_output = torch.ops.attention.grouped_sdpa(
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=True,
                 scale=1.0 / (self.head_dim**0.5),
@@ -1084,7 +1112,7 @@ class AttentionLayoutModel(torch.nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=True,
                 scale=1.0 / (self.head_dim**0.5),
@@ -1113,12 +1141,15 @@ class BsndAttentionModel(AttentionLayoutModel):
 
         # Important: No transpose here because bsnd_grouped_sdpa expects [batch, seq, heads, dim]
 
+        # Create attention mask if needed
+        attn_mask = self._get_attn_mask(x) if self.has_mask else None
+
         # Apply bsnd_grouped_sdpa directly
         attn_output = torch.ops.attention.bsnd_grouped_sdpa.default(
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=True,
             scale=1.0 / (self.head_dim**0.5),
@@ -1140,8 +1171,9 @@ class BsndAttentionModel(AttentionLayoutModel):
         {"type": "already_bsnd", "name": "DirectBSND"},
     ],
 )
+@pytest.mark.parametrize("has_mask", [False, True])
 @torch.inference_mode()
-def test_match_attention_layout(layout, model_config):
+def test_match_attention_layout(layout, model_config, has_mask):
     """Test the match_attention_layout transformation with various models and layouts."""
     batch_size, seq_len = 4, 12
     hidden_size = 512
@@ -1164,11 +1196,13 @@ def test_match_attention_layout(layout, model_config):
             hidden_size,
             num_heads,
             use_grouped_sdpa=model_config["use_grouped_sdpa"],
+            has_mask=has_mask,
         ).to("cuda", dtype=torch.float16)
     else:  # already_bsnd
         model = BsndAttentionModel(
             hidden_size,
             num_heads,
+            has_mask=has_mask,
         ).to("cuda", dtype=torch.float16)
 
     # Create input tensor
@@ -1176,7 +1210,7 @@ def test_match_attention_layout(layout, model_config):
     dynamic_shapes = model.get_dynamic_shapes()
 
     # Print test case info
-    print(f"\nRunning test: {model_config['name']} model with {layout} layout")
+    print(f"\nRunning test: {model_config['name']} model with {layout} layout, has_mask={has_mask}")
 
     # Define appropriate verification function
     def verify_matcher(gm):
@@ -1210,6 +1244,17 @@ def test_match_attention_layout(layout, model_config):
                 print(f"❌ Expected no transpose nodes, found {len(transpose_nodes)}")
                 return False
 
+            # Check that the mask is correctly passed to the attention function
+            if has_mask:
+                node = bsnd_nodes[0]
+                has_mask_arg = "attn_mask" in node.kwargs
+                if not has_mask_arg and len(node.args) >= 4:
+                    has_mask_arg = node.args[3] is not None
+
+                if not has_mask_arg:
+                    print("❌ Expected attention mask in args or kwargs but not found")
+                    return False
+
             print(f"✅ Already bsnd model correctly handled for {layout} layout")
         elif layout == "bsnd":
             # For layout=bsnd, original SDPA should be replaced with bsnd_grouped_sdpa
@@ -1222,6 +1267,17 @@ def test_match_attention_layout(layout, model_config):
             if len(bsnd_nodes) != 1:
                 print(f"❌ Expected 1 bsnd_grouped_sdpa node, found {len(bsnd_nodes)}")
                 return False
+
+            # Check that the mask is correctly passed to the attention function
+            if has_mask:
+                node = bsnd_nodes[0]
+                has_mask_arg = "attn_mask" in node.kwargs
+                if not has_mask_arg and len(node.args) >= 4:
+                    has_mask_arg = node.args[3] is not None
+
+                if not has_mask_arg:
+                    print("❌ Expected attention mask in args or kwargs but not found")
+                    return False
 
             # We expect at least 7 transpose nodes:
             # - 3 from original model (q,k,v)
@@ -1242,6 +1298,17 @@ def test_match_attention_layout(layout, model_config):
             if len(bsnd_nodes) > 0:
                 print(f"❌ Expected no bsnd_grouped_sdpa nodes, found {len(bsnd_nodes)}")
                 return False
+
+            # Check that the mask is correctly passed to the attention function
+            if has_mask:
+                node = original_nodes[0]
+                has_mask_arg = "attn_mask" in node.kwargs
+                if not has_mask_arg and len(node.args) >= 4:
+                    has_mask_arg = node.args[3] is not None
+
+                if not has_mask_arg:
+                    print("❌ Expected attention mask in args or kwargs but not found")
+                    return False
 
             # The model has 4 transposes: 3 for q,k,v inputs and 1 for output
             if len(transpose_nodes) != 4:

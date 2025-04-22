@@ -55,7 +55,7 @@ def insert_cached_attention(
     if cm.info.is_paged:
         assert attn_descriptor.is_paged(), "Paged sequence info requires paged attention op."
 
-    ad_logger.info(f"Replacing {source_op=} with {attn_descriptor=}")
+    ad_logger.info(f"Replacing attn op {source_op} with backend {attn_descriptor.__name__}")
     ad_logger.debug(f"Before inserting {attn_descriptor=} with cache: {egm}")
 
     # insert metadata computation and extract each argument as a node
