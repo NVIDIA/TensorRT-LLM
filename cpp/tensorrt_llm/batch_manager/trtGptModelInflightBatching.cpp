@@ -1069,16 +1069,18 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
                                 llmReq->freeEncoderOutputBuffers();
                             }
                             storeContextBlocks(llmReq);
+
+                            if (isTrtOverlap() && llmReq->willCompleteNextIteration())
+                            {
+                                // This prohibits the request from being scheduled for another iteration if only one
+                                // iteration is expected.
+                                llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
+                            }
                         }
                     }
                     else if (llmReq->isGenerationInProgressState())
                     {
                         TLLM_LOG_DEBUG("request with ID %lu forwards a step in decoder gen phase", llmReq->mRequestId);
-                    }
-
-                    if (isTrtOverlap() && llmReq->willCompleteNextIteration())
-                    {
-                        llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
                     }
                 }
             }
@@ -2288,6 +2290,13 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             if (llmReq->isContextInitState())
             {
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+            }
+
+            if (isTrtOverlap() && llmReq->willCompleteNextIteration())
+            {
+                // This state prohibits the request from being scheduled for another iteration. It assumes that the next
+                // iteration has already been scheduled and the request can finish in the next call to updateRequests().
+                llmReq->setState(LlmRequestState::kGENERATION_TO_COMPLETE);
             }
         }
 

@@ -666,7 +666,7 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
-    /// @brief Returns true if request reaches max number of tokens in the current iteration.
+    /// @brief Returns true if request reaches max number of tokens in the next iteration.
     [[nodiscard]] bool willCompleteNextIteration() const
     {
         return getMaxNumGeneratedTokens() + mNumTokensPerIteration >= mMaxNewTokens;
