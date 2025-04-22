@@ -76,7 +76,7 @@ public:
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-        torch::optional<int32_t> attention_chunk_size) const
+        std::optional<int32_t> attention_chunk_size) const
         = 0;
 };
 
@@ -125,7 +125,7 @@ public:
         torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
-        torch::optional<int32_t> attention_chunk_size) const override
+        std::optional<int32_t> attention_chunk_size) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
         T* attention_input = static_cast<T*>(qkv.slice(0, token_offset).data_ptr());
@@ -570,7 +570,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             host_past_key_value_lengths, context_lengths, host_context_lengths, kv_cache_block_offsets,
             host_kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, cache_indirection,
             kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe,
-            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, attention_chunk_size);
+            block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, std::nullopt);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
