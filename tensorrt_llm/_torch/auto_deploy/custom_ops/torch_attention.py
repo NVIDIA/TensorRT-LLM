@@ -292,8 +292,8 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 def apply_rope_ds(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,  # [B, seq_len, head_dim]
-    sin: torch.Tensor,  # [B, seq_len, head_dim]
+    cos: torch.Tensor,  # [B, 1, seq_len, head_dim]
+    sin: torch.Tensor,  # [B, 1, seq_len, head_dim]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DS-style RoPE: interleaves Q/K channels, indexes cos/sin by position_ids
