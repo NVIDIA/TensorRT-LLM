@@ -57,7 +57,7 @@ def main(
     # If we're dealing with a model name, perform a snapshot download to make
     # sure we have a local copy of the model.
     if ctx.obj.checkpoint_path is None:
-        AutoModelForCausalLM.from_pretrained(model)
+        AutoModelForCausalLM.from_pretrained(model, trust_remote_code=True)
 
 
 main.add_command(build_command)
