@@ -295,7 +295,7 @@ class LayerQuantConfig(QuantConfig):
     def layer_quant_mode(self, layer_name) -> QuantMode:
 
         for name, quant_mode in self.auto_quant_mode.items():
-            if fnmatch(layer_name, name):
+            if fnmatch.fnmatch(layer_name, name):
                 return quant_mode
 
         return QuantMode(0)
@@ -324,7 +324,7 @@ class LayerQuantConfig(QuantConfig):
         quant_res = QuantConfig()
 
         for name, quant_cfg in self.quantized_layers.items():
-            if fnmatch(module_name, name):
+            if fnmatch.fnmatch(module_name, name):
                 quant_res = quant_cfg
                 break
         return quant_res
