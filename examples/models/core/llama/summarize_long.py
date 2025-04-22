@@ -17,7 +17,8 @@ import json
 import os
 
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
+from evaluate import load
 from transformers import AutoModelForCausalLM, LlamaTokenizer
 
 import tensorrt_llm
@@ -378,9 +379,7 @@ def main(args):
 
         rouge_dir = args.rouge_dir if args.rouge_dir and os.path.exists(
             args.rouge_dir) else "rouge"
-        metric_tensorrt_llm = [
-            load_metric(rouge_dir) for _ in range(args.num_beams)
-        ]
+        metric_tensorrt_llm = [load(rouge_dir) for _ in range(args.num_beams)]
 
         for i in range(args.num_beams):
             metric_tensorrt_llm[i].seed = 0

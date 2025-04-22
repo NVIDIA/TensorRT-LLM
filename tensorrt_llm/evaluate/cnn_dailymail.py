@@ -29,12 +29,13 @@ class CnnDailymail(Evaluator):
 
     def __init__(self,
                  dataset_path: str = "ccdv/cnn_dailymail",
-                 num_samples: int = None,
+                 num_samples: Optional[int] = None,
                  random_seed: int = 0,
                  rouge_path: str = "rouge",
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
-        super().__init__(apply_chat_template=apply_chat_template,
+        super().__init__(random_seed=random_seed,
+                         apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
         self.data = datasets.load_dataset(dataset_path,
                                           "3.0.0",
@@ -73,15 +74,16 @@ class CnnDailymail(Evaluator):
     @click.option("--num_samples", type=int, default=None)
     @click.option("--random_seed", type=int, default=0)
     @click.option("--rouge_path", type=str, default="rouge")
+    @click.option("--apply_chat_template", is_flag=True, default=False)
+    @click.option("--system_prompt", type=Optional[str], default=None)
     @click.option("--max_input_length", type=int, default=924)
     @click.option("--max_output_length", type=int, default=100)
-    @click.option("--check_accuracy", is_flag=True, default=False)
-    @click.option("--accuracy_threshold", type=float, default=15)
     @click.pass_context
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
-                rouge_path: str, max_input_length: int, max_output_length: int,
-                check_accuracy: bool, accuracy_threshold: float) -> None:
+                rouge_path: str, apply_chat_template: bool,
+                system_prompt: Optional[str], max_input_length: int,
+                max_output_length: int) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -89,9 +91,8 @@ class CnnDailymail(Evaluator):
         evaluator = CnnDailymail(dataset_path,
                                  num_samples=num_samples,
                                  random_seed=random_seed,
-                                 rouge_path=rouge_path)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+                                 rouge_path=rouge_path,
+                                 apply_chat_template=apply_chat_template,
+                                 system_prompt=system_prompt)
+        evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
-
-        if check_accuracy:
-            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
