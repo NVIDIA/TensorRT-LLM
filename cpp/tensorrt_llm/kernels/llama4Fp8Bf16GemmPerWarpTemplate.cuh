@@ -1,5 +1,4 @@
-#ifndef LLAMA4_FP8_BF16_GEMM_PER_WARP_TEMPLATE_CUH
-#define LLAMA4_FP8_BF16_GEMM_PER_WARP_TEMPLATE_CUH
+#pragma once
 
 #include "tensorrt_llm/kernels/llama4Utils.cuh"
 
@@ -7,15 +6,10 @@
 #include <cuda_fp8.h>
 #include <stdexcept>
 
-namespace
+namespace tensorrt_llm::kernels::llama4_qkv_gemm
 {
 
-#define BLOCK_SIZE 128
-#define WARP_SIZE 32
-#define WARP_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
-
-// Use 8 for now, which results in LDG.64.
-#define VEC_SIZE 8
+using tensorrt_llm::kernels::aligned_fp8x8;
 
 // Grid size is num_tokens / TILE_TOKEN * hidden_out / TILE_OUT / WARP_PER_BLOCK.
 // Each warp processes TILE_TOKEN tokens and TILE_OUT rows.
@@ -255,8 +249,6 @@ __launch_bounds__(BLOCK_SIZE) __global__
 #endif
 }
 
-} // namespace
-
 #define DISPATCH_PER_WARP_FC_FP8_BF16_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED)                             \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -307,4 +299,4 @@ __launch_bounds__(BLOCK_SIZE) __global__
         DISPATCH_PER_WARP_FC_FP8_BF16_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                              \
     }
 
-#endif // LLAMA4_FP8_BF16_GEMM_PER_WARP_TEMPLATE_CUH
+} // namespace tensorrt_llm::kernels::llama4_qkv_gemm
