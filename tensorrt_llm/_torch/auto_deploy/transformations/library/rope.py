@@ -55,11 +55,33 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
+def _match_ds_rope_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
+    """
+    Detect DeepSeek-style interleave on Q/K:
+      reshape(transpose(view(raw, [b,h,s,d//2,2]), 4, 3), [b,h,s,d])
+    Returns:
+      {"interleaved": reshape_node} if matched, else None.
+    """
+    if not is_op(node, torch.ops.aten.reshape):
+        return None
+    transpose_node = node.args[0]
+    if not is_op(transpose_node, torch.ops.aten.transpose):
+        return None
+    view_node = transpose_node.args[0]
+    if not is_op(view_node, torch.ops.aten.view):
+        return None
+    raw_node = view_node.args[0]
+    if not isinstance(raw_node, Node):
+        return None
+    return {"interleaved": raw_node}
+
+
 def match_explicit_rope(gm: GraphModule) -> GraphModule:
     """
     Identify and replace legacy RoPE subgraphs (explicit cos/sin multiplication pattern):
 
-      output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
+      - HF style: output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
+      - DS-style: requires interleaving Q/K before the cos/sin mul → apply_rope_ds
 
     If exactly two such branches (query and key) are detected within each region, they're replaced
     by a call to `torch.ops.rope.flashinfer`.
@@ -71,13 +93,25 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
     rope_position_ids_cache: Dict[str, Node] = {}
 
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
-        matches = []
+        matches = []  # list of (match_info, is_ds)
         node = start_boundary
         while node != end_boundary:
             if is_op(node, torch.ops.aten.add):
-                match_info = _match_explicit_rope_subpattern(node)
-                if match_info:
-                    matches.append(match_info)
+                explicit = _match_explicit_rope_subpattern(node)
+                if explicit is not None:
+                    raw = explicit["raw_input"]
+                    # check if this raw is result of DS interleave
+                    inter = _match_ds_rope_interleave_pattern(raw)
+                    if inter is not None:
+                        ds_match = {
+                            "raw_input": inter["interleaved"],
+                            "unsqueeze_cos": explicit["unsqueeze_cos"],
+                            "unsqueeze_sin": explicit["unsqueeze_sin"],
+                            "add_node": explicit["add_node"],
+                        }
+                        matches.append((ds_match, True))
+                    else:
+                        matches.append((explicit, False))
             node = node.next
 
         if not matches:
@@ -88,18 +122,25 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
                 f"found {len(matches)}."
             )
 
-        # Assume the first matched branch is query (q), second is key (k).
-        # This assumption is based on the default ordering in the exported graph,
-        # since node naming conventions don't reliably indicate q/k branches.
-        q_match, k_match = matches
-        _process_explicit_rope(
-            graph,
-            q_match,
-            k_match,
-            start_boundary,
-            rope_flash_cache,
-            rope_position_ids_cache,
-        )
+        (q_match, q_is_ds), (k_match, k_is_ds) = matches
+        if q_is_ds != k_is_ds:
+            raise RuntimeError("Mismatched RoPE types between q and k branches")
+
+        if q_is_ds:
+            _process_ds_rope(
+                graph,
+                q_match,
+                k_match,
+            )
+        else:
+            _process_explicit_rope(
+                graph,
+                q_match,
+                k_match,
+                start_boundary,
+                rope_flash_cache,
+                rope_position_ids_cache,
+            )
 
     gm = canonicalize_graph(gm)
     return gm
@@ -340,6 +381,10 @@ def _process_explicit_rope(
     cos_node = q_match["unsqueeze_cos"].args[0]
     sin_node = q_match["unsqueeze_sin"].args[0]
 
+    # Sanity check on head_dim
+    if not _validate_rope_inputs(q_node, k_node):
+        return
+
     # Sanity-check: ensure cos/sin nodes trace back to aten.cos/aten.sin.
     bfs(
         cos_node,
@@ -466,6 +511,10 @@ def _process_complex_rope(
     k_node = k_match["input"]
     inv_freq_node = q_match["inv_freq"]
 
+    # Sanity check on head_dim
+    if not _validate_rope_inputs(q_node, k_node):
+        return
+
     if inv_freq_node != k_match["inv_freq"]:
         raise RuntimeError("Mismatch of freqs_cis (inv_freq) between branches.")
 
@@ -521,6 +570,50 @@ def _process_complex_rope(
 
     q_match["out"].replace_all_uses_with(raw_q)
     k_match["out"].replace_all_uses_with(raw_k)
+
+
+def _process_ds_rope(
+    graph: GraphModule,
+    q_match: Dict[str, Node],
+    k_match: Dict[str, Node],
+) -> None:
+    """
+    Replace a matched DS-style RoPE subgraph with a call to rope::apply_rope_ds.
+    """
+    q_node = q_match["raw_input"]
+    k_node = k_match["raw_input"]
+    cos_node = q_match["unsqueeze_cos"].args[0]
+    sin_node = q_match["unsqueeze_sin"].args[0]
+
+    # Sanity check on head_dim
+    if not _validate_rope_inputs(q_node, k_node):
+        return
+
+    # Infer unsqueeze_dim from layout
+    unsq_dim = 1
+    fake = q_node.meta.get("val", None)
+    if fake is not None and len(fake.shape) == 4:
+        # if shape[1] symbolic, it's [B, S, N, D] => BSND -> head dim is 2
+        if isinstance(fake.shape[1], torch.SymInt):
+            unsq_dim = 2
+        else:
+            unsq_dim = 1
+
+    with graph.inserting_before(q_match["add_node"]):
+        ds_node = graph.call_function(
+            torch.ops.rope.apply_rope_ds,
+            args=(q_node, k_node, cos_node, sin_node, unsq_dim),
+        )
+
+    with graph.inserting_after(ds_node):
+        q_out = graph.call_function(operator.getitem, args=(ds_node, 0))
+        k_out = graph.call_function(operator.getitem, args=(ds_node, 1))
+
+    q_out.meta["val"] = q_match["add_node"].meta.get("val", None)
+    k_out.meta["val"] = k_match["add_node"].meta.get("val", None)
+
+    q_match["add_node"].replace_all_uses_with(q_out)
+    k_match["add_node"].replace_all_uses_with(k_out)
 
 
 def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:

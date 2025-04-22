@@ -1,7 +1,7 @@
 """Torch reference implementations for attention."""
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -286,6 +286,36 @@ def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+@torch.library.custom_op("rope::apply_rope_ds", mutates_args=())
+def apply_rope_ds(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,  # [B, seq_len, head_dim]
+    sin: torch.Tensor,  # [B, seq_len, head_dim]
+    unsqueeze_dim: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DS-style RoPE: interleaves Q/K channels, indexes cos/sin by position_ids
+    and returns rotated (q_embed, k_embed).
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+@apply_rope_ds.register_fake
+def apply_rope_ds_fake(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return q, k
 
 
 @torch.library.custom_op("attention::fused_mla_ref", mutates_args=())
