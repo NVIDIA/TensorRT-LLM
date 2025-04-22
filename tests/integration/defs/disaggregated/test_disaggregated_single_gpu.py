@@ -5,13 +5,14 @@ import sys
 
 import cloudpickle
 import pytest
+from defs.conftest import skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch import LLM
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._utils import get_sm_version, set_mpi_comm
+from tensorrt_llm._utils import set_mpi_comm
 from tensorrt_llm.llmapi import KvCacheConfig, MpiCommSession
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -199,15 +200,12 @@ def test_disaggregated_simple_llama(model, generation_overlap,
         ])
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
 def test_disaggregated_simple_deepseek(model, generation_overlap,
                                        enable_cuda_graph):
-    if (get_sm_version() != 90):
-        pytest.skip(
-            f"DeepSeek FP8 is not supported in this SM version {get_sm_version()}"
-        )
     verify_disaggregated(
         model, generation_overlap, enable_cuda_graph,
         "What is the capital of Germany?",
