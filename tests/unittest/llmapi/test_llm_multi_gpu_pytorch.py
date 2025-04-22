@@ -1,6 +1,7 @@
 import pytest
-from test_llm import (global_kvcache_config,
-                      tinyllama_guided_decoding_test_harness)
+
+from .test_llm import (global_kvcache_config,
+                       tinyllama_guided_decoding_test_harness)
 
 
 @pytest.mark.gpu4
