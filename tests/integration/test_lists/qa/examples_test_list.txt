@@ -296,10 +296,6 @@ examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-
 examples/test_whisper.py::test_llm_whisper_general[large-v3-enable_gemm_plugin-enable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime]
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-int8-float16-nb:1-use_cpp_runtime]
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-enable_attention_plugin-int4-float16-nb:1-use_cpp_runtime]
-examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep4-pp1-tp8-fp4-deepseek_r1]
-examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep4-pp1-tp8-fp4-deepseek_r1]
-examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn0-ep8-pp1-tp8-fp4-deepseek_r1]
-examples/test_deepseek.py::test_deepseek_gpqa_llmapi[enable_overlap_scheduler-enable_cuda_graph-disable_dp-nextn2-ep8-pp1-tp8-fp4-deepseek_r1]
 
 # Accuracy test list
 accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype
@@ -434,6 +430,12 @@ accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinitron4BBaseInstruct::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestNemotronNas::test_auto_dtype_tp8
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8-mtp_nextn=2-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep4-mtp_nextn=2-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8-cuda_graph-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_8gpus[tp8ep8-mtp_nextn=2-cuda_graph-overlap_scheduler]
 
 test_e2e.py::test_benchmark_sanity[bert_base] # 127.18s
 test_e2e.py::test_benchmark_sanity[gpt_350m] # 64.06s

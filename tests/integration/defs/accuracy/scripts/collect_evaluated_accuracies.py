@@ -19,8 +19,11 @@ import pandas as pd
 
 metric_regex = {
     "rouge1": r"(?<=rouge1: )\d+\.\d+",
-    "perplexity": r"(?<=Per-token perplexity: )\d+\.\d+",
     "mmlu": r"(?<=MMLU weighted average accuracy: )\d+\.\d+",
+    "gsm8k": r"(?<=gsm8k average accuracy: )\d+\.\d+",
+    "gpqa_diamond":
+    r"(?<=gpqa_diamond_cot_zeroshot_aa average accuracy: )\d+\.\d+",
+    "perplexity": r"(?<=Per-token perplexity: )\d+\.\d+",
     "passkey": r"(?<=passkey accuracy: )\d+\.\d+"
 }
 
