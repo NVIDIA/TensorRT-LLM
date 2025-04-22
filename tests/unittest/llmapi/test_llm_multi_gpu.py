@@ -288,7 +288,6 @@ def run_command(command: str):
         raise e
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     # TODO[chunweiy]: reactivate this later
@@ -500,10 +499,3 @@ def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
                                sampling_params: SamplingParams):
     run_llm_abort_request(llm=llm_for_sampling_params_tp2,
                           sampling_params=sampling_params)
-
-
-if __name__ == '__main__':
-
-    #test_llm_capture_request_error()
-
-    test_llm_generate_tp2()

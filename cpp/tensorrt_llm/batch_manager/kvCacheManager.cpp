@@ -91,6 +91,39 @@ std::vector<BlockKey> buildBlockKeys(
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
+{
+    size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
+
+    for (auto const& uniqueToken : blockKey.uniqueTokens)
+    {
+        uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
+        a = ((a >> 16) ^ a) * 0x45d9f3b;
+        a = ((a >> 16) ^ a) * 0x45d9f3b;
+        a = (a >> 16) ^ a;
+        seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        if (blockKey.usesExtraIds)
+        {
+            uint64_t b = uniqueToken.tokenExtraId;
+            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
+            b = b ^ (b >> 31);
+            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+    }
+
+    if (blockKey.loraTaskId)
+    {
+        uint64_t c = blockKey.loraTaskId.value();
+        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+        c = c ^ (c >> 31);
+        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+
+    return seed;
+}
+
 KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     : mBlockId(blockId)
     , mMemoryPoolBlockIndex{blockIdx}
