@@ -280,7 +280,11 @@ def set_cuda_device():
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
-def disaggregated_mpi_worker(config_file: Optional[str]):
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
     set_cuda_device()
@@ -296,6 +300,7 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
     is_leader, instance_idx, sub_comm = split_world_comm(
         disagg_cfg.server_configs)
 
+    logger.set_level(log_level)
     os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
     set_mpi_comm(sub_comm)
     logger.info(

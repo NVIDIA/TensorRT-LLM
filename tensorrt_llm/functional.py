@@ -15,7 +15,7 @@
 import math
 import weakref
 from collections import OrderedDict
-from enum import IntEnum, IntFlag, auto
+from enum import IntEnum
 from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -3873,46 +3873,30 @@ def unbind(input: Tensor, dim: int = 0):
 
 
 class AllReduceStrategy(IntEnum):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
     NCCL = 0
-    ONESHOT = 1
-    TWOSHOT = 2
-    UB = 3
-    AUTO = 4
+    MIN_LATENCY = 1
+    UB = 2
+    AUTO = 3
+    ONESHOT = 4
+    TWOSHOT = 5
 
 
-class AllReduceConfig(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
-    USE_MEMCPY = auto()
-    PUSH_MODE = auto()
-
-
-class AllReduceFusionOp(IntFlag):
-    """
-    Warning: actual definition is in cpp/tensorrt_llm/kernels/customAllReduceKernels.h
-             they must be kept in sync
-    """
+class AllReduceFusionOp(IntEnum):
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
     RESIDUAL_RMS_PREPOST_NORM = 3
     RESIDUAL_RMS_NORM_QUANT_FP8 = 4
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 6
-    RESIDUAL_RMS_NORM_AND_QUANT_NVFP4 = 7
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
+    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
 
     def __init__(self,
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
-                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
@@ -3922,7 +3906,6 @@ class AllReduceParams():
                  eps: float = 1e-06,
                  enable_allreduce: bool = True):
         self.strategy = strategy
-        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
@@ -3932,7 +3915,8 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
-        assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
+        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+                                                             is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -3969,10 +3953,6 @@ def create_allreduce_plugin(
         "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField(
-        "config", np.array([int(all_reduce_params.config)], np.int8),
-        trt.PluginFieldType.INT8)
-    pfc.append(p_config)
     p_fusion_op = trt.PluginField(
         "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
@@ -3981,7 +3961,6 @@ def create_allreduce_plugin(
         "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
-
     p_affine = trt.PluginField(
         "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)

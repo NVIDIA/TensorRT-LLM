@@ -439,6 +439,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots);
 
+    py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
+        .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
+        .def_readwrite("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
+        .def_property_readonly("new_output_tokens_host",
+            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
+        .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
+        .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
+        .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
+
     py::class_<tb::DecoderBuffers::DraftBuffers>(m, "DraftBuffers")
         .def(py::init())
         .def_readwrite("next_draft_tokens_device", &tb::DecoderBuffers::DraftBuffers::nextDraftTokensDevice)
@@ -458,21 +467,12 @@ void initBindings(pybind11::module_& m)
 
     py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::SizeType32, runtime::BufferManager const&, runtime::ModelConfig const&,
-                 runtime::WorldConfig const&>(),
+                 runtime::BufferManager const&, runtime::ModelConfig const&, runtime::WorldConfig const&>(),
             py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
-            py::arg("world_config"))
+            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_property_readonly("new_output_tokens_host",
-            [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
