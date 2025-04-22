@@ -675,7 +675,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                             self.mlp.experts.fc31_input_scale
                         ],
                         self.post_attention_layernorm.variance_epsilon,
-                        AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4,
+                        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
                     )
                     hidden_states_fp4 = Fp4QuantizedTensor(
                         hidden_states_act, hidden_states_sf)

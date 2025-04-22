@@ -123,12 +123,12 @@ def row_linear_residual_norm_fusion_forward(
                     AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
                 )
                 output = (act_fp4, act_sf, residual)
-            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
                 hidden_states, act_fp4, act_sf, residual = deepseek_allreduce(
                     inter_x,
                     [residual, norm_weight, scale],
                     eps,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
                 )
                 output = (hidden_states, act_fp4, act_sf, residual)
         else:
@@ -141,7 +141,7 @@ def row_linear_residual_norm_fusion_forward(
                     hidden_states, scale, 16, False)
 
                 output = (act_fp4, act_sf, residual)
-            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+            elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
                 act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                     hidden_states, scale, 16, False)
 
@@ -173,7 +173,7 @@ def row_linear_residual_norm_fusion_forward(
             rtol=0.05,
             atol=0.15,
         )
-    elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+    elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
         hidden_states, act_fp4, act_sf, residual = output
         f_hidden_states, f_act_fp4, f_act_sf, f_residual = fuse_output
         torch.testing.assert_close(
@@ -188,7 +188,7 @@ def row_linear_residual_norm_fusion_forward(
     torch_final_output = rms_norm(torch_inter_output, norm_weight,
                                   eps).to(dtype)
 
-    if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4:
+    if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM or fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
         torch.testing.assert_close(
             output[0],
             torch_final_output,
@@ -205,12 +205,12 @@ def row_linear_residual_norm_fusion_forward(
 @pytest.mark.parametrize("fusion_op", [
     AllReduceFusionOp.RESIDUAL_RMS_NORM,
     AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-    AllReduceFusionOp.RESIDUAL_RMS_NORM_AND_QUANT_NVFP4,
+    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
 ],
                          ids=[
                              "residual_rms_norm",
                              "residual_rms_norm_quant_nvfp4",
-                             "residual_rms_norm_and_quant_nvfp4"
+                             "residual_rms_norm_out_quant_nvfp4"
                          ])
 def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fusion_op):
     torch.manual_seed(42)
