@@ -136,6 +136,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         cache_reuse=executor_config.kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_draft_model_engine,
     )
+    print("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     model_engine = PyTorchModelEngine(
         checkpoint_dir,

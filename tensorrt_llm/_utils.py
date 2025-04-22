@@ -18,11 +18,12 @@ import inspect
 import json
 import math
 import struct
+import trace
 import weakref
 from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -642,6 +643,17 @@ def release_gc():
 def get_sm_version():
     prop = torch.cuda.get_device_properties(0)
     return prop.major * 10 + prop.minor
+
+
+def trace_func(func):
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        tracer = trace.Trace(trace=1, count=0)
+        result = tracer.runfunc(func, *args, **kwargs)
+        return result
+
+    return wrapper
 
 
 class DictConversion:
