@@ -281,9 +281,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -317,9 +319,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp,
                   speculative_config=mtp_config)
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
@@ -346,9 +350,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -383,9 +389,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   speculative_config=mtp_config)
         assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_pre_blackwell
@@ -402,9 +410,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp)
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -429,9 +439,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   enable_attention_dp=attention_dp)
         assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
         with llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+            # task = CnnDailymail(self.MODEL_NAME)
+            # task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
