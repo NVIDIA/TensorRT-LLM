@@ -298,7 +298,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
 
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_medusa(self, cuda_graph, mocker):
-        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
+        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "../../medusa")
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [
@@ -321,7 +321,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                            (True, True, False), (True, False, True)])
     def test_eagle(self, cuda_graph, chunked_context, typical_acceptance,
                    mocker):
-        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")
+        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "../../eagle")
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [

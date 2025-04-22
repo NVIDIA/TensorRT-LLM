@@ -815,7 +815,7 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism,
             mContextCacheState->getParallelConfig().mPipelineParallelism, mContextCacheState->getDataType(),
             mContextCacheState->getAttentionConfig().mAttentionType, mContextCacheState->getAttentionConfig().mKvFactor,
-            mContextCacheState->getParallelConfig().mEnableAttenionDP, contextDpRank,
+            mContextCacheState->getParallelConfig().mEnableAttentionDP, contextDpRank,
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
@@ -884,7 +884,7 @@ protected:
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;
@@ -948,7 +948,7 @@ protected:
         int startLayerId = layerSizePerRank * mPpRank;
         int headSizePerRank = mCacheState->getModelConfig().mNbKvHeadsPerLayer.at(0);
         int startHeadId = headSizePerRank * mTpRank;
-        bool enableDP = mCacheState->getParallelConfig().mEnableAttenionDP;
+        bool enableDP = mCacheState->getParallelConfig().mEnableAttentionDP;
         if (mIsMLA || enableDP)
         {
             startHeadId = 0;

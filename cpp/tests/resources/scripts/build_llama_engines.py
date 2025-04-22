@@ -32,11 +32,12 @@ def build_engine(weight_dir: _pl.Path, engine_dir: _pl.Path, convert_extra_args,
 
     ckpt_dir = engine_dir / 'ckpt'
 
-    convert_cmd = [_sys.executable, "examples/llama/convert_checkpoint.py"
-                   ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
-                       f'--output_dir={ckpt_dir}',
-                       '--dtype=float16',
-                   ] + convert_extra_args
+    convert_cmd = [
+        _sys.executable, "examples/models/core/llama/convert_checkpoint.py"
+    ] + ([f'--model_dir={weight_dir}'] if weight_dir else []) + [
+        f'--output_dir={ckpt_dir}',
+        '--dtype=float16',
+    ] + convert_extra_args
 
     run_command(convert_cmd)
 

@@ -15,12 +15,15 @@
  * limitations under the License.
  */
 
-#include "promptTuningBuffers.h"
+#include "tensorrt_llm/batch_manager/promptTuningBuffers.h"
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using TensorPtr = runtime::ITensor::SharedPtr;
 
 PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
@@ -31,6 +34,31 @@ PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::Buffe
     // vocabSize and mMaxPromptVocabSize
     mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
     mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
+
+    auto promptVocabSizeHost
+        = runtime::BufferManager::pinned(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    auto promptVocabSizeHostData = runtime::bufferCast<SizeType32>(*promptVocabSizeHost);
+    promptVocabSizeHostData[0] = mMaxPromptVocabSize;
+    manager.copy(*promptVocabSizeHost, *mPromptTuningParams.vocabSize);
+
+    // embeddingTable
+    mPromptTuningParams.embeddingTable = manager.gpu(
+        runtime::ITensor::makeShape({maxPromptEmbeddingTableSize, hiddenSize}), modelConfig.getDataType());
+
+    // tasks
+    mPromptTuningParams.tasks = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+}
+
+PromptTuningBuffers::PromptTuningBuffers(SizeType32 maxBatchSize, runtime::BufferManager const& manager,
+    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig, bool promptTableOffloading)
+{
+    auto maxPromptEmbeddingTableSize = modelConfig.getMaxPromptEmbeddingTableSize();
+    auto const hiddenSize = modelConfig.getHiddenSize() * worldConfig.getTensorParallelism();
+
+    // vocabSize and mMaxPromptVocabSize
+    mPromptTuningParams.vocabSize = manager.gpu(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    mMaxPromptVocabSize = maxPromptEmbeddingTableSize / maxBatchSize;
+    mPromptTableOffloading = promptTableOffloading;
 
     auto promptVocabSizeHost
         = runtime::BufferManager::pinned(runtime::ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
@@ -88,6 +116,7 @@ void PromptTuningBuffers::validate(
 void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVector const& genRequests,
     runtime::BufferManager const& manager, bool packed)
 {
+    NVTX3_SCOPED_RANGE_WITH_NAME(range, "PromptTuningBuffers::fill");
     manager.setZero(*mPromptTuningParams.embeddingTable);
 
     auto const numContextRequests = static_cast<SizeType32>(contextRequests.size());
@@ -110,8 +139,21 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
                 numContextTokens += contextChunkSize + draftLength;
                 reqPromptLengths.push_back(numContextTokens);
             }
-            auto optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
-            auto const optReqPromptVocabSize = llmReq->getPromptVocabSize();
+
+            std::optional<TensorPtr> optReqPromptEmbeddingTable = std::nullopt;
+            std::optional<SizeType32> optReqPromptVocabSize = std::nullopt;
+
+            if (mPromptTableOffloading)
+            {
+                optReqPromptEmbeddingTable = getChunkPtableBuffer(getChunkPtableCurrentIndex());
+                optReqPromptVocabSize = getChunkPtableBufferSliceSize(getChunkPtableCurrentIndex(), batchIdx);
+            }
+            else
+            {
+                optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
+                optReqPromptVocabSize = llmReq->getPromptVocabSize();
+            }
+
             mPromptTuningParams.promptTuningEnabled.push_back(optReqPromptEmbeddingTable.has_value());
 
             // If context request & has embedding table, validate it
@@ -120,9 +162,21 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
                 // If a context request, validate prompt tensors and move to GPU
                 if (batchIdx < numContextRequests)
                 {
-                    // Move to GPU
-                    llmReq->movePromptEmbeddingTableToGpu(manager);
-                    optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
+                    if (mPromptTableOffloading)
+                    {
+                        // Need to slice the ptable since we don't need the entire buffer
+                        // The size depends on optReqPromptVocabSize which stores how many fake prompts are in the chunk
+                        auto slicedPtable = runtime::ITensor::slice(
+                            optReqPromptEmbeddingTable.value(), 0, optReqPromptVocabSize.value());
+                        slicedPtable->unsqueeze(0);
+                        optReqPromptEmbeddingTable = std::move(slicedPtable);
+                    }
+                    else
+                    {
+                        // Move to GPU
+                        llmReq->movePromptEmbeddingTableToGpu(manager);
+                        optReqPromptEmbeddingTable = llmReq->getPromptEmbeddingTable();
+                    }
 
                     // Validate the table, prompt_vocab_size
                     validate(optReqPromptEmbeddingTable, optReqPromptVocabSize);
@@ -148,11 +202,123 @@ void PromptTuningBuffers::fill(RequestVector const& contextRequests, RequestVect
     }
 
     auto const batchSize = batchIdx;
-    TensorPtr tasksHost = runtime::BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
-    auto* tasksHostPtr = runtime::bufferCast<SizeType32>(*tasksHost);
-    std::iota(tasksHostPtr, tasksHostPtr + batchSize, 0);
+    std::vector<SizeType32> tasksHostVec(batchSize);
+    std::iota(tasksHostVec.begin(), tasksHostVec.end(), 0);
+
+    // Create a tensor that wraps the vector and convert unique_ptr to shared_ptr
+    auto tasksHost = std::shared_ptr<runtime::ITensor>(
+        runtime::ITensor::wrap(tasksHostVec, runtime::ITensor::makeShape({batchSize})).release());
+
     mPromptTuningParams.fillTasksTensor(
         tasksHost, batchSize, numContextRequests, reqBeamWidths, reqPromptLengths, manager, packed);
+}
+
+void PromptTuningBuffers::initializeChunkPtableBuffers(runtime::BufferManager const& manager,
+    runtime::ModelConfig const& modelConfig, SizeType32 contextChunkSize, std::shared_ptr<LlmRequest> const& llmReq)
+{
+    if (mChunkPtableInitialized)
+    {
+        return;
+    }
+
+    std::array<TensorPtr, 2> buffers;
+    std::vector<std::vector<SizeType32>> startPositions(2);
+    for (int i = 0; i < 2; i++)
+    {
+        startPositions[i].emplace_back(0);
+        auto memType = llmReq->getPromptEmbeddingTable().value()->getDataType();
+        buffers[i] = manager.gpu(runtime::ITensor::makeShape({contextChunkSize, modelConfig.getHiddenSize()}), memType);
+    }
+
+    mChunkPtableBuffers = std::move(buffers);
+    mChunkPtableBufferStartPositions = std::move(startPositions);
+
+    mChunkPtableCurrentIndex = 0;
+    mChunkPtableInitialized = true;
+}
+
+void PromptTuningBuffers::switchChunkPtableBuffer()
+{
+    mChunkPtableCurrentIndex = 1 - mChunkPtableCurrentIndex;
+    clearBufferStartPositions(mChunkPtableCurrentIndex);
+}
+
+size_t PromptTuningBuffers::getChunkPtableCurrentIndex()
+{
+    return mChunkPtableCurrentIndex;
+}
+
+TensorPtr& PromptTuningBuffers::getChunkPtableBuffer(size_t index)
+{
+    if (!mChunkPtableBuffers.has_value())
+    {
+        TLLM_THROW("Chunk ptable buffers not initialized");
+    }
+    if (!mChunkPtableBuffers.value()[index])
+    {
+        TLLM_THROW("Chunk ptable buffer at index %zu is null", index);
+    }
+    return mChunkPtableBuffers.value()[index];
+}
+
+SizeType32 PromptTuningBuffers::getChunkPtableBufferSliceSize(size_t index, size_t batchIdx)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return 0;
+    }
+
+    if (batchIdx + 1 >= mChunkPtableBufferStartPositions.value()[index].size())
+    {
+        TLLM_THROW("Batch index %zu + 1 out of bounds for buffer %zu (size: %zu)", batchIdx, index,
+            mChunkPtableBufferStartPositions.value()[index].size());
+    }
+
+    return mChunkPtableBufferStartPositions.value()[index][batchIdx + 1]
+        - mChunkPtableBufferStartPositions.value()[index][batchIdx];
+}
+
+SizeType32 PromptTuningBuffers::getChunkPtableBufferStartPosition(size_t index, size_t batchIdx)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return 0;
+    }
+
+    if (batchIdx >= mChunkPtableBufferStartPositions.value()[index].size())
+    {
+        TLLM_THROW("Batch index %zu out of bounds for buffer %zu (size: %zu)", batchIdx, index,
+            mChunkPtableBufferStartPositions.value()[index].size());
+    }
+
+    // For first batch, return the value directly
+    if (batchIdx == 0)
+    {
+        return mChunkPtableBufferStartPositions.value()[index][0];
+    }
+
+    // For other batches, return difference from previous position
+    return mChunkPtableBufferStartPositions.value()[index][batchIdx]
+        - mChunkPtableBufferStartPositions.value()[index][batchIdx - 1];
+}
+
+void PromptTuningBuffers::updateBufferStartPosition(size_t index, SizeType32 numRows)
+{
+    if (!mChunkPtableBufferStartPositions.has_value())
+    {
+        return;
+    }
+    auto& positions = mChunkPtableBufferStartPositions.value()[index];
+    positions.push_back(positions.back() + numRows);
+}
+
+void PromptTuningBuffers::clearBufferStartPositions(size_t index)
+{
+    if (mChunkPtableBufferStartPositions.has_value())
+    {
+        mChunkPtableBufferStartPositions.value()[index].clear();
+        mChunkPtableBufferStartPositions.value()[index].emplace_back(0);
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager

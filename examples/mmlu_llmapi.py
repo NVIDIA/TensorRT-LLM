@@ -241,6 +241,10 @@ def parse_args():
         default='TRTLLM',
         choices=['TRTLLM', 'FLASHINFER'],
         help='Attention kernel for PyTorch. Ignored for TRT backend.')
+    parser.add_argument('--moe_backend',
+                        type=str,
+                        default='CUTLASS',
+                        choices=['CUTLASS', 'TRTLLM'])
     parser.add_argument("--enable_chunked_prefill",
                         action="store_true",
                         help="Exercises the chunked prefill inference feature.")
@@ -307,6 +311,7 @@ def main():
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
         config = PyTorchConfig(
             attn_backend=args.attn_backend,
+            moe_backend=args.moe_backend,
             enable_overlap_scheduler=args.enable_overlap_scheduler,
             torch_compile_enabled=args.torch_compile)
         llm = tensorrt_llm._torch.LLM(

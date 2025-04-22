@@ -279,7 +279,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type == "b100-ts2" || type.contains("dgx-h100") || type.contains("dgx-h200") || type == "gh200" ) {
+        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -471,6 +471,32 @@ def runLLMDocBuild(pipeline, config)
         "doc-html-preview.tar.gz",
         "${UPLOAD_PATH}/test-results/"
     )
+}
+
+def launchTestListCheck(pipeline)
+{
+    stageName = "Test List Check"
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
+        try {
+            echoNodeAndGpuInfo(pipeline, stageName)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
+            libffi-dev \
+            -y""")
+            sh "nvidia-smi -q"
+            // download TRT-LLM tarfile
+            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
+            sh "tar -zxf ${tarName}"
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/TensorRT-LLM/src"
+            sh "python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            throw e
+        }
+    })
 }
 
 def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
@@ -1102,9 +1128,9 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
     sh "tar -zvxf ${linuxPkgName}"
 
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && trtllm-build --model_config config.json --log_level verbose'")
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/gpt && python3 ../run.py --max_output_len 4 --end_id -1'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../generate_checkpoint_config.py --architecture GPTForCausalLM --dtype float16'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core//gpt && trtllm-build --model_config config.json --log_level verbose'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'cd tensorrt_llm/examples/models/core/gpt && python3 ../../../run.py --max_output_len 4 --end_id -1'")
 }
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {
@@ -1193,6 +1219,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
         "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
+        "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
+        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
@@ -1563,6 +1592,20 @@ pipeline {
                         }
                     }
                     println testFilter
+                }
+            }
+        }
+        stage("Check Test Lists")
+        {
+            when {
+                expression {
+                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                }
+            }
+            steps
+            {
+                script {
+                    launchTestListCheck(this)
                 }
             }
         }

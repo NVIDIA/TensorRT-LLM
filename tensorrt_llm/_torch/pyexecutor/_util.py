@@ -1,3 +1,4 @@
+import math
 import random
 from collections.abc import Iterable
 
@@ -6,8 +7,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings as tllm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._utils import (mpi_allgather, mpi_broadcast,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
@@ -132,9 +133,17 @@ def get_token_num_for_estimation(executor_config, model_config):
         fraction = get_fraction_from_executor_config(executor_config)
         kv_size_per_token = get_cache_size_per_token(model_config, mapping)
         max_tokens_limit = int(end * fraction // kv_size_per_token)
+        # When reusing KV cache blocks, we need to add extra tokens to account for partially filled blocks
+        # that cannot be reused. For each sequence of max_num_tokens length, we may need up to one extra
+        # block (tokens_per_block tokens) if the sequence length is not perfectly divisible by tokens_per_block.
+        # So we add math.ceil(max_num_tokens/max_seq_len) * tokens_per_block extra tokens.
         return min(
-            max(executor_config.max_batch_size, executor_config.max_num_tokens,
-                executor_config.max_seq_len), max_tokens_limit)
+            max(
+                executor_config.max_batch_size, executor_config.max_num_tokens +
+                math.ceil(executor_config.max_num_tokens /
+                          executor_config.max_seq_len) *
+                executor_config.tokens_per_block, executor_config.max_seq_len),
+            max_tokens_limit)
     else:
         return None
 
@@ -172,8 +181,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     req_ids = mpi_broadcast(req_ids, root=0)
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
-    # sync all ranks after processing dummy requests
-    mpi_allgather(0)
+    # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
 
     torch_peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
 
@@ -210,9 +218,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     py_executor.resource_manager.resource_managers.get(
         "kv_cache_manager").shutdown()
 
-    py_executor.shutdown()
-    # sync all ranks after creating new pyExecutor
-    mpi_allgather(0)
+    if py_executor.dist.mapping.rank == 0:
+        py_executor.shutdown()
 
     return kv_cache_max_tokens
 

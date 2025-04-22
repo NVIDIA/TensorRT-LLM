@@ -253,7 +253,9 @@ def disaggregated(config_file: Optional[str], server_start_timeout: int,
     server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
                                 gen_servers=gen_server_urls,
                                 req_timeout_secs=request_timeout,
-                                server_start_timeout_secs=server_start_timeout)
+                                server_start_timeout_secs=server_start_timeout,
+                                ctx_router_type=disagg_cfg.ctx_router_type,
+                                gen_router_type=disagg_cfg.gen_router_type)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 
@@ -278,7 +280,11 @@ def set_cuda_device():
               type=str,
               default=None,
               help="Specific option for disaggregated mode.")
-def disaggregated_mpi_worker(config_file: Optional[str]):
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
     set_cuda_device()
@@ -294,6 +300,7 @@ def disaggregated_mpi_worker(config_file: Optional[str]):
     is_leader, instance_idx, sub_comm = split_world_comm(
         disagg_cfg.server_configs)
 
+    logger.set_level(log_level)
     os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
     set_mpi_comm(sub_comm)
     logger.info(
