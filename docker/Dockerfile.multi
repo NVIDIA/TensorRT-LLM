@@ -30,6 +30,10 @@ RUN bash ./install_cmake.sh && rm install_cmake.sh
 COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install_ccache.sh && rm install_ccache.sh
 
+ARG BUILD_TRITON=0
+COPY docker/common/install_triton.sh install_triton.sh
+RUN bash ./install_triton.sh && rm install_triton.sh
+
 # Only take effect when the base image is Rocky Linux 8 with old CUDA version.
 COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
 RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
