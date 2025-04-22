@@ -19,7 +19,7 @@ def test_tinyllama_guided_decoding():
     tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
-@pytest.mark.parametrize("return_context_logits", "use_overlap", [
+@pytest.mark.parametrize("return_context_logits, use_overlap", [
     (False, False),
     (False, True),
 ])
