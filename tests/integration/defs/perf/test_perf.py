@@ -283,8 +283,8 @@ class PerfTestConfig:
         backend: str = "",
         mode: str = "plugin",
         data_type: str = "float16",
-        max_batch_size: int = 2048,
-        max_num_tokens: int = 8192,
+        max_batch_size: int = 512,
+        max_num_tokens: int = 2048,
         gpu_weights_percent: float = -1,
         batch_sizes: List[int] = [0],
         input_lens: List[int] = [8],
@@ -601,7 +601,7 @@ class PerfTestConfig:
         if self.model_name in MODEL_PATH_DICT.keys():
             VALID_QUANTS = [
                 "", "nvfp4", "fp8", "int8_sq", "int4_awq", "w4a8_awq",
-                "int8_wo", "int4_wo", "full_prec"
+                "w4a16_awq", "int8_wo", "int4_wo", "full_prec"
             ]
         else:
             VALID_QUANTS = [
