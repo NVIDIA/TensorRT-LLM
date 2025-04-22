@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm::kernels
@@ -41,13 +43,6 @@ constexpr int RECV_FIFO_ENTRY_BYTES = 256 * 1024;
 constexpr int RECV_FIFO_ENTRY_U64 = RECV_FIFO_ENTRY_BYTES / sizeof(uint64_t);
 constexpr int RECV_FIFO_TOTAL_BYTES = RECV_FIFO_DEPTH * RECV_FIFO_ENTRY_BYTES;
 constexpr int RECV_FIFO_TOTAL_U64 = RECV_FIFO_TOTAL_BYTES / sizeof(uint64_t);
-
-constexpr int CHANNEL_COUNT = 8;
-
-inline size_t getMoeCommWorkspaceSize(int epSize)
-{
-    return RECV_FIFO_TOTAL_BYTES * epSize * CHANNEL_COUNT + sizeof(MoeCommFifoConnInfo) * epSize * CHANNEL_COUNT;
-}
 
 class AllToAllChannelCommunicatorBase
 {
@@ -76,6 +71,56 @@ public:
         int groupEndIndice;
     };
 
+    static void setMaxUsableSmCount(int maxUsableSmCount)
+    {
+        TLLM_CHECK_WITH_INFO(AllToAllChannelCommunicatorBase::maxSmCountUsed == false,
+            "setMaxUsableSmCount can be called only before it is used");
+        int smCount = tensorrt_llm::common::getMultiProcessorCount();
+        if (maxUsableSmCount > smCount)
+        {
+            TLLM_LOG_WARNING("setMaxUsableSmCount, maxUsableSmCount=%d, larger than smCount=%d, using smCount instead",
+                maxUsableSmCount, smCount);
+            maxUsableSmCount = smCount;
+        }
+        AllToAllChannelCommunicatorBase::maxSmCount = maxUsableSmCount;
+    }
+
+    static int getMaxUsableSmCount()
+    {
+        AllToAllChannelCommunicatorBase::maxSmCountUsed = true;
+        if (AllToAllChannelCommunicatorBase::maxSmCount == -1)
+        {
+            int smCount = tensorrt_llm::common::getMultiProcessorCount();
+            AllToAllChannelCommunicatorBase::maxSmCount = smCount;
+        }
+        return AllToAllChannelCommunicatorBase::maxSmCount;
+    }
+
+    static int computeMoeCommChannelCount(int epSize)
+    {
+        int smCount = getMaxUsableSmCount();
+        int blockCountPerChannel = (epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK;
+        blockCountPerChannel *= 2; // for send and recv
+        TLLM_CHECK_WITH_INFO(
+            blockCountPerChannel <= smCount, "GPU should support at lease one channel, usableSmCount=%d", smCount);
+        int perferredChannel = smCount / 2 / blockCountPerChannel; // use half SMs for communication
+        int channelCount = std::max(perferredChannel, 1);          // at lease one channel
+        return channelCount;
+    }
+
+    static int getMoeCommChannelCount(int epSize)
+    {
+        static std::map<int, int> channelCountMap{};
+        auto iter = channelCountMap.find(epSize);
+        if (iter == channelCountMap.end())
+        {
+            auto channelCount = AllToAllChannelCommunicatorBase::computeMoeCommChannelCount(epSize);
+            channelCountMap[epSize] = channelCount;
+            return channelCount;
+        }
+        return iter->second;
+    }
+
     static dim3 getLaunchBlockDim()
     {
         return dim3(WARP_SIZE * WARP_PER_GROUP, GROUP_COUNT_PER_BLOCK);
@@ -83,9 +128,20 @@ public:
 
     static dim3 getLaunchGridDim(int epSize)
     {
-        return dim3((epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK, CHANNEL_COUNT, 2);
+        int channelCount = AllToAllChannelCommunicatorBase::getMoeCommChannelCount(epSize);
+        return dim3((epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK, channelCount, 2);
     }
+
+protected:
+    static int maxSmCount;
+    static bool maxSmCountUsed;
 };
+
+inline size_t getMoeCommWorkspaceSize(int epSize)
+{
+    int channelCount = AllToAllChannelCommunicatorBase::getMoeCommChannelCount(epSize);
+    return RECV_FIFO_TOTAL_BYTES * epSize * channelCount + sizeof(MoeCommFifoConnInfo) * epSize * channelCount;
+}
 
 struct MoeEpWorldInfo
 {
@@ -164,32 +220,35 @@ struct MoeCommWorkspace
     uint64_t* workspacePtr;
     size_t rankStrideInU64;
 #ifdef __CUDACC__
-    __inline__ __device__ uint64_t* getFifoBasePtr(bool isSender, int epRank, int peerRank, int channel) const
+    __inline__ __device__ uint64_t* getFifoBasePtr(
+        bool isSender, int epRank, int peerRank, int channel, int channelCount) const
     {
         // fifo itself is in receiver's side.
         if (isSender)
         {
-            return workspacePtr + peerRank * rankStrideInU64 + (epRank * CHANNEL_COUNT + channel) * RECV_FIFO_TOTAL_U64;
+            return workspacePtr + peerRank * rankStrideInU64 + (epRank * channelCount + channel) * RECV_FIFO_TOTAL_U64;
         }
         else
         {
-            return workspacePtr + epRank * rankStrideInU64 + (peerRank * CHANNEL_COUNT + channel) * RECV_FIFO_TOTAL_U64;
+            return workspacePtr + epRank * rankStrideInU64 + (peerRank * channelCount + channel) * RECV_FIFO_TOTAL_U64;
         }
     }
 
     __inline__ __device__ MoeCommFifoConnInfo* getFifoConnInfo(
-        bool isSender, int epRank, int peerRank, int channel, int epSize) const
+        bool isSender, int epRank, int peerRank, int channel, int epSize, int channelCount) const
     {
         // fifoInfo is in sender's side.
-        uint64_t* fifoInfoPtrU64 = workspacePtr + RECV_FIFO_TOTAL_U64 * CHANNEL_COUNT * epSize;
+        uint64_t* fifoInfoPtrU64 = workspacePtr + RECV_FIFO_TOTAL_U64 * channelCount * epSize;
         int strideIndice = isSender ? epRank : peerRank;
         int fifoInfoIndice = isSender ? peerRank : epRank;
         fifoInfoPtrU64 += strideIndice * rankStrideInU64;
         MoeCommFifoConnInfo* fifoInfoPtr = (MoeCommFifoConnInfo*) fifoInfoPtrU64;
-        return fifoInfoPtr + fifoInfoIndice * CHANNEL_COUNT + channel;
+        return fifoInfoPtr + fifoInfoIndice * channelCount + channel;
     }
 #endif
 };
+
+void setMaxUsableSmCount(int smCount);
 
 void moeAllToAll(MoeEpWorldInfo worldInfo, SendRecvDataInfo sendRecvDataInfo, SendRecvDispls sendDispls,
     SendRecvDispls recvDispls, MoeCommWorkspace workspace, cudaStream_t stream);

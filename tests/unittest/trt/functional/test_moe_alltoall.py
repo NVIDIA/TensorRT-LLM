@@ -22,6 +22,8 @@ from parameterized import parameterized
 
 import tensorrt_llm as tllm
 
+has_setup_max_sm_count = False
+
 
 class TestMoeAlltoAllSingleGPU(unittest.TestCase):
 
@@ -138,6 +140,16 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                                 input_entry_per_rank,
                                                 vector_dim, dtype):
         torch.cuda.set_device(0)
+        max_world_size = 8
+        assert world_size <= max_world_size, f"should run with world_size at most {max_world_size}"
+
+        global has_setup_max_sm_count
+        if not has_setup_max_sm_count:
+            sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+            max_sm_count = sm_count // max_world_size  # we use single gpu to test multiple gpu communication
+            torch.ops.trtllm.set_moe_max_usable_sm_count(max_sm_count)
+            has_setup_max_sm_count = True
+
         # Create a random input tensor
         input_tensor = torch.randn(input_entry_per_rank * world_size,
                                    vector_dim,

@@ -53,10 +53,11 @@ private:
     const MoeCommWorkspace workspace;
     const SendRecvDataInfo sendRecvDataInfo;
     const SendRecvDispls dataDispls;
-    int peerRank;      // peer rank index
+    int peerRank;           // peer rank index
     bool const flagThread;
-    int const group;   // primitives group index
-    int const channel; // channel index
+    int const group;        // primitives group index
+    int const channel;      // channel index
+    int const channelCount; // count of channels
 
     MoeCommFifoConnInfo* fifoConnInfoPtr;
     uint64_t* fifoBasePtr; // pointer to fifo base address
@@ -80,7 +81,8 @@ public:
     }
 
     __inline__ __device__ AllToAllChannelCommunicator(MoeEpWorldInfo const& worldInfo, MoeCommWorkspace workspace,
-        SendRecvDataInfo sendRecvDataInfo, SendRecvDispls dataDispls, GroupSharedBuffer* groupSharedBuffer)
+        SendRecvDataInfo sendRecvDataInfo, SendRecvDispls dataDispls, GroupSharedBuffer* groupSharedBuffer,
+        int channelCount)
         : worldInfo(worldInfo)
         , nthreads(blockDim.x)
         , tid(threadIdx.x)
@@ -98,13 +100,15 @@ public:
         , step(0)
         , tailStepCache(0)
         , groupSharedBuffer(groupSharedBuffer)
+        , channelCount(channelCount)
     {
     }
 
     __inline__ __device__ void init()
     {
-        fifoBasePtr = workspace.getFifoBasePtr(isSender, worldInfo.epRank, peerRank, channel);
-        fifoConnInfoPtr = workspace.getFifoConnInfo(isSender, worldInfo.epRank, peerRank, channel, worldInfo.epSize);
+        fifoBasePtr = workspace.getFifoBasePtr(isSender, worldInfo.epRank, peerRank, channel, channelCount);
+        fifoConnInfoPtr
+            = workspace.getFifoConnInfo(isSender, worldInfo.epRank, peerRank, channel, worldInfo.epSize, channelCount);
         step = isSender ? fifoConnInfoPtr->head : fifoConnInfoPtr->tail;
         tailStepCache = isSender ? fifoConnInfoPtr->tail : 0;
     }
@@ -115,7 +119,7 @@ public:
         {
             int rankCount = dataDispls.getCount(peerRank);
             int rankStart = dataDispls.getRankStart(peerRank);
-            int countPerChannel = (rankCount + CHANNEL_COUNT - 1) / CHANNEL_COUNT;
+            int countPerChannel = (rankCount + channelCount - 1) / channelCount;
             int groupEnd = min(rankStart + (channel + 1) * countPerChannel, rankStart + rankCount);
             int groupStart = min(rankStart + channel * countPerChannel, rankStart + rankCount);
             groupSharedBuffer->groupStartIndice = groupStart;
@@ -318,17 +322,20 @@ __global__ void moeAllToAllKernel(MoeEpWorldInfo worldInfo, MoeCommWorkspace wor
     __shared__ AllToAllChannelCommunicatorBase::GroupSharedBuffer
         allGroupSharedBuffer[AllToAllChannelCommunicatorBase::GROUP_COUNT_PER_BLOCK];
     bool isSender = blockIdx.z == 0;
+    int channelCount = gridDim.y;
     int group = threadIdx.y;
     SendRecvDispls dataDispls = isSender ? sendDispls : recvDispls;
     AllToAllChannelCommunicatorBase::GroupSharedBuffer* groupSharedBuffer = &allGroupSharedBuffer[group];
     if (isSender)
     {
-        AllToAllChannelCommunicator<true> comm(worldInfo, workspace, sendRecvDataInfo, dataDispls, groupSharedBuffer);
+        AllToAllChannelCommunicator<true> comm(
+            worldInfo, workspace, sendRecvDataInfo, dataDispls, groupSharedBuffer, channelCount);
         comm.run();
     }
     else
     {
-        AllToAllChannelCommunicator<false> comm(worldInfo, workspace, sendRecvDataInfo, dataDispls, groupSharedBuffer);
+        AllToAllChannelCommunicator<false> comm(
+            worldInfo, workspace, sendRecvDataInfo, dataDispls, groupSharedBuffer, channelCount);
         comm.run();
     }
 }
@@ -749,6 +756,14 @@ void moeLocalGather(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParall
     kernelPtr<<<blockCount, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
         localMaxTokenCount, recvRankCountCumSum, localGatherIndices, gatheredExpertIds, gatheredScales, localExpertIds,
         localScales);
+}
+
+int AllToAllChannelCommunicatorBase::maxSmCount = -1;
+bool AllToAllChannelCommunicatorBase::maxSmCountUsed = false;
+
+void setMaxUsableSmCount(int smCount)
+{
+    AllToAllChannelCommunicatorBase::setMaxUsableSmCount(smCount);
 }
 
 } // namespace tensorrt_llm::kernels

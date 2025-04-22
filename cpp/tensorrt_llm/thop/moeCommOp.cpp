@@ -191,6 +191,11 @@ int64_t getWorkspaceSizePerRank(int64_t epSize)
     return tensorrt_llm::kernels::getMoeCommWorkspaceSize(epSize32);
 }
 
+void setMaxUsableSmCount(int64_t maxSmCount)
+{
+    tensorrt_llm::kernels::setMaxUsableSmCount(maxSmCount);
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -239,4 +244,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("get_moe_commworkspace_size_per_rank", &torch_ext::getWorkspaceSizePerRank);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("set_moe_max_usable_sm_count(int maxSmCount) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
+{
+    m.impl("set_moe_max_usable_sm_count", &torch_ext::setMaxUsableSmCount);
 }
