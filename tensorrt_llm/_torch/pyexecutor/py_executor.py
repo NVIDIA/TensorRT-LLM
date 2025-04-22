@@ -859,14 +859,14 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(scheduled_batch)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     decoder_state = self._decode_async(scheduled_batch,
                                                        batch_outputs)
 
                     self._update_request_states(scheduled_batch)
+
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
 
                     self._update_requests(decoder_state)
 
@@ -1012,14 +1012,14 @@ class PyExecutor:
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_new_tensors_device)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     decoder_state = self._decode_async(scheduled_batch,
                                                        batch_outputs)
 
                     self._update_request_states(scheduled_batch)
+                    
+                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests
+                    ) if self.kv_cache_transceiver else []
 
                     if num_dummy_request > 0:
                         self._finish_dummy_request(scheduled_batch)
@@ -1092,8 +1092,8 @@ class PyExecutor:
             self.send_handles[microbatch_id].Wait()
         decoder_state.decoder_event.synchronize()
 
-        self.send_handles[microbatch_id] = self.dist.isend_tensor(
-            decoder_state.new_tensors_host,
+        self.send_handles[microbatch_id] = self.dist.isend_tensor_list(
+            decoder_state.new_tensors_host.values(),
             dest=self.dist.next_pp_rank,
             tag=microbatch_id)
 
