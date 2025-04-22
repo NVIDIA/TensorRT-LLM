@@ -123,6 +123,22 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Number of requests warm up benchmark.",
 )
 @optgroup.option(
+    "--target_input_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) input length for tuning heuristics.",
+)
+@optgroup.option(
+    "--target_output_len",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Target (average) sequence length for tuning heuristics.",
+)
+@optgroup.group(
+    "World Configuration",
+    help="Options for configuring the backend multi-GPU world.",
+)
+@optgroup.option(
     "--tp",
     type=int,
     default=1,
@@ -145,18 +161,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=int,
     default=None,
     help="expert cluster parallelism size",
-)
-@optgroup.option(
-    "--target_input_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) input length for tuning heuristics.",
-)
-@optgroup.option(
-    "--target_output_len",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Target (average) sequence length for tuning heuristics.",
 )
 @optgroup.group("Request Load Control Options",
                 cls=MutuallyExclusiveOptionGroup,
