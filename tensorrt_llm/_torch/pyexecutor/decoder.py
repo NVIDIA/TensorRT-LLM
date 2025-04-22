@@ -1,6 +1,5 @@
 import itertools
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -328,13 +327,12 @@ class TorchDecoder(Decoder):
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return DecoderState(scheduled_requests=scheduled_requests,
-                            logits=logits,
-                            new_tensors_device=OrderedDict(
-                                {"new_tokens_device": new_tokens_device}),
-                            new_tensors_host=OrderedDict(
-                                {"new_tokens_host": new_tokens_host}),
-                            decoder_event=decoder_event)
+        return DecoderState(
+            scheduled_requests=scheduled_requests,
+            logits=logits,
+            new_tensors_device={"new_tokens_device": new_tokens_device},
+            new_tensors_host={"new_tokens_host": new_tokens_host},
+            decoder_event=decoder_event)
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> DecoderState:
@@ -573,16 +571,12 @@ class TRTLLMDecoder(Decoder):
 
         new_tensors_device = {"new_tokens_device": new_tokens_device_tensor}
 
-        new_tensors_host = OrderedDict({
-            "new_tokens_host":
-            new_output_tokens,
-            "finished_sum_host":
-            finished_sum,
-            "finish_reasons_host":
-            finish_reasons,
-            "sequence_lengths_host":
-            self.store["sequence_lengths_host"]
-        })
+        new_tensors_host = {
+            "new_tokens_host": new_output_tokens,
+            "finished_sum_host": finished_sum,
+            "finish_reasons_host": finish_reasons,
+            "sequence_lengths_host": self.store["sequence_lengths_host"]
+        }
 
         decoder_event = torch.cuda.Event()
         decoder_event.record()

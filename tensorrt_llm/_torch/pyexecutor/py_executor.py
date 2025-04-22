@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import weakref
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from contextlib import contextmanager
 from itertools import chain
 from typing import Dict, List, Optional, Tuple, Union
@@ -1077,9 +1077,9 @@ class PyExecutor:
                                       dtype=torch.int64,
                                       device='cpu',
                                       pin_memory=True)
-        return DecoderState(scheduled_requests=scheduled_batch,
-                            new_tensors_host=OrderedDict(
-                                {"new_tokens_host": new_tokens_host}))
+        return DecoderState(
+            scheduled_requests=scheduled_batch,
+            new_tensors_host={"new_tokens_host": new_tokens_host})
 
     @nvtx_range("_forward_step_last_pp")
     def _forward_step_last_pp(self, scheduled_batch,
