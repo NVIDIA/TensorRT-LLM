@@ -199,7 +199,7 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
         # cannot directly import whisper due to name collision
-        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        sys.path.append(f"{os.path.dirname(__file__)}/models/core/whisper")
         from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')

@@ -1,3 +1,4 @@
+import math
 import random
 from collections.abc import Iterable
 
@@ -132,9 +133,17 @@ def get_token_num_for_estimation(executor_config, model_config):
         fraction = get_fraction_from_executor_config(executor_config)
         kv_size_per_token = get_cache_size_per_token(model_config, mapping)
         max_tokens_limit = int(end * fraction // kv_size_per_token)
+        # When reusing KV cache blocks, we need to add extra tokens to account for partially filled blocks
+        # that cannot be reused. For each sequence of max_num_tokens length, we may need up to one extra
+        # block (tokens_per_block tokens) if the sequence length is not perfectly divisible by tokens_per_block.
+        # So we add math.ceil(max_num_tokens/max_seq_len) * tokens_per_block extra tokens.
         return min(
-            max(executor_config.max_batch_size, executor_config.max_num_tokens,
-                executor_config.max_seq_len), max_tokens_limit)
+            max(
+                executor_config.max_batch_size, executor_config.max_num_tokens +
+                math.ceil(executor_config.max_num_tokens /
+                          executor_config.max_seq_len) *
+                executor_config.tokens_per_block, executor_config.max_seq_len),
+            max_tokens_limit)
     else:
         return None
 
@@ -172,6 +181,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     req_ids = mpi_broadcast(req_ids, root=0)
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
+
     # sync all ranks after processing dummy requests
     mpi_allgather(0)
 

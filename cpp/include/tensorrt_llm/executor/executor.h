@@ -1408,7 +1408,8 @@ public:
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false);
+        bool gatherGenerationLogits = false, bool useVariableBeamWidthSearch = false,
+        bool promptTableOffloading = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1441,6 +1442,7 @@ public:
     [[nodiscard]] std::optional<std::vector<AdditionalModelOutput>> getAdditionalModelOutputs() const;
     [[nodiscard]] bool getGatherGenerationLogits() const;
     [[nodiscard]] bool getUseVariableBeamWidthSearch() const;
+    [[nodiscard]] bool getPromptTableOffloading() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1468,6 +1470,7 @@ public:
     void setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs);
     void setGatherGenerationLogits(bool gatherGenerationLogits);
     void setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch);
+    void setPromptTableOffloading(bool promptTableOffloading);
 
 private:
     friend class Serialization;
@@ -1548,6 +1551,9 @@ private:
 
     /// @brief Controls if Variable-Beam-Width-Search is enabled.
     bool mUseVariableBeamWidthSearch{false};
+
+    /// @brief Controls if prompt table offloading is enabled.
+    bool mPromptTableOffloading{false};
 };
 
 struct KVCacheCreatedData
