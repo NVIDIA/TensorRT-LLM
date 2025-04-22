@@ -331,3 +331,14 @@ async def async_load_video(
             device=device) if format == "pt" else frames[index]
         for index in indices if index in frames
     ]
+
+
+# Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
+def encode_base64_content_from_url(content_url: str) -> str:
+    """Encode a content retrieved from a remote url to base64 format."""
+
+    with requests.get(content_url) as response:
+        response.raise_for_status()
+        result = base64.b64encode(response.content).decode('utf-8')
+
+    return result
