@@ -380,6 +380,9 @@ full:L40S/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int4] SKI
 full:L40S/accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8 SKIP (https://nvbugs/5176867)
 full:L40S/accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2 SKIP (https://nvbugs/5176867)
 full:L40S/accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights SKIP (https://nvbugs/5176867)
+full:L20/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype SKIP (https://nvbugs/5176851)
+full:L20/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int8] SKIP (https://nvbugs/5176851)
+full:L20/accuracy/test_cli_flow.py::TestGemma2_9BIt::test_weight_only[int4] SKIP (https://nvbugs/5176851)
 
 full:B200/perf/test_perf.py::test_perf[quant:w4a8_awq] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugspro.nvidia.com/bug/5161074)
