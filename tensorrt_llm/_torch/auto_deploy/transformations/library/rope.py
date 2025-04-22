@@ -36,9 +36,11 @@ Supported RoPE variants:
             xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
             return xq_out.type_as(xq), xk_out.type_as(xk)
 
-TODO: Support Minor variants:
-- DeepSeekV3: reshape + transpose before applying RoPE.
-- DeepSeekV3: dynamic position-based updates to frequency cache.
+Supported Minor variants:
+- DeepSeekV3:   reshape + transpose before applying RoPE.
+                dynamic position-based updates to frequency cache.
+
+TODO: Support other variants:
 - Phi-4: rotary applied only to part of the hidden dimension (q_rot, q_pass split).
 - LLaMA4 Vision: 2D rotary frequencies constructed from image patches.
 """
@@ -60,7 +62,7 @@ def _match_ds_rope_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
     Detect DeepSeek-style interleave on Q/K:
       reshape(transpose(view(raw, [b,h,s,d//2,2]), 4, 3), [b,h,s,d])
     Returns:
-      {"interleaved": reshape_node} if matched, else None.
+      {"interleaved": raw_node} if matched, else None.
     """
     if not is_op(node, torch.ops.aten.reshape):
         return None
