@@ -147,7 +147,10 @@ class KVCacheManager(BaseResourceManager):
         if kv_cache_config.max_attention_window is None:
             max_attention_window = max_seq_len
         else:
-            max_attention_window = max(kv_cache_config.max_attention_window)
+            assert len(
+                kv_cache_config.max_attention_window
+            ) == 1, "Python KvCacheManager doesn't currently support variable window attention"
+            max_attention_window = kv_cache_config.max_attention_window[0]
 
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
@@ -176,8 +179,7 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window = max_atten_window_upper_bound
             self.max_seq_len = max_atten_window_upper_bound
 
-        max_kv_cache_len = (max_attention_window if kv_cache_type
-                            == CacheTypeCpp.SELF else self.max_seq_len)
+        self.max_attention_window = max_attention_window if kv_cache_type == CacheTypeCpp.SELF else self.max_seq_len
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
@@ -190,8 +192,9 @@ class KVCacheManager(BaseResourceManager):
             'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
-            'max_attention_window_vec': [max_kv_cache_len],
-            'temporary_attention_window': 0,
+            'max_attention_window_vec': [self.max_attention_window],
+            'temp_attention_window_inputs': None,
+            'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
             'max_sequence_length': max_seq_len,
@@ -207,7 +210,7 @@ class KVCacheManager(BaseResourceManager):
 
         self.impl = KVCacheManagerCpp(**kwargs)
 
-        self.impl.allocate_pools(dtype, False)
+        self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
@@ -407,7 +410,8 @@ class KVCacheManager(BaseResourceManager):
         return max_atten_window_upper_bound
 
     def get_cache_indices(self, request: LlmRequest) -> List[int]:
-        result = self.impl.get_cache_block_ids(request.py_request_id)
+        result = self.impl.get_cache_block_ids(request.py_request_id,
+                                               self.max_attention_window)
         assert len(result) == 1
         return result[0]
 
@@ -415,7 +419,8 @@ class KVCacheManager(BaseResourceManager):
         self,
         request_ids: List[int],
     ) -> Dict[int, List[int]]:
-        result = self.impl.get_batch_cache_block_ids(request_ids)
+        result = self.impl.get_batch_cache_block_ids(request_ids,
+                                                     self.max_attention_window)
         for i in range(len(result)):
             assert (len(result[i])) == 1
             result[i] = result[i][0]
