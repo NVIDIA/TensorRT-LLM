@@ -226,13 +226,37 @@ class GSM8K(LmEvalEvaluator):
         super().__init__("gsm8k", **kwargs)
 
     @click.command("gsm8k")
-    @click.option("--dataset_path", type=str, default=None)
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4096)
-    @click.option("--max_output_length", type=int, default=256)
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GSM8K dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=256,
+                  help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -245,13 +269,37 @@ class GPQADiamond(LmEvalEvaluator):
         super().__init__("gpqa_diamond_cot_zeroshot_aa", **kwargs)
 
     @click.command("gpqa_diamond")
-    @click.option("--dataset_path", type=str, default=None)
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4096)
-    @click.option("--max_output_length", type=int, default=32768)
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GPQA dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=32768,
+                  help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -264,13 +312,37 @@ class GPQAMain(LmEvalEvaluator):
         super().__init__("gpqa_main_cot_zeroshot_aa", **kwargs)
 
     @click.command("gpqa_main")
-    @click.option("--dataset_path", type=str, default=None)
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4096)
-    @click.option("--max_output_length", type=int, default=32768)
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GPQA dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=32768,
+                  help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -283,13 +355,37 @@ class GPQAExtended(LmEvalEvaluator):
         super().__init__("gpqa_extended_cot_zeroshot_aa", **kwargs)
 
     @click.command("gpqa_extended")
-    @click.option("--dataset_path", type=str, default=None)
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4096)
-    @click.option("--max_output_length", type=int, default=32768)
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GPQA dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=32768,
+                  help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
