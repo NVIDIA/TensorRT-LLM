@@ -120,7 +120,7 @@ def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
-
+@Field
 def testFilter = [
     (REUSE_STAGE_LIST): null,
     (ENABLE_SKIP_TEST): false,
