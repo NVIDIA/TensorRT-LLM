@@ -31,7 +31,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/gptneox)
 - [Granite-3.0](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/granite)
 - [Grok-1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/grok)
-- [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples//models/contribinternlm)
+- [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples//models/contrib/internlm)
 - [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/internlm2)
 - [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama)
 - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/mamba)
