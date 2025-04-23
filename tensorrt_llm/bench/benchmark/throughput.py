@@ -141,6 +141,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="expert parallelism size",
 )
 @optgroup.option(
+    "--cluster_size",
+    type=int,
+    default=None,
+    help="expert cluster parallelism size",
+)
+@optgroup.option(
     "--target_input_len",
     default=None,
     type=click.IntRange(min=1),

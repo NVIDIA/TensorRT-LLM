@@ -59,6 +59,7 @@ def add_llm_args(parser):
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
+    parser.add_argument('--moe_cluster_size', type=int, default=-1)
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
@@ -142,6 +143,7 @@ def setup_llm(args):
               enable_attention_dp=args.enable_attention_dp,
               moe_expert_parallel_size=args.moe_ep_size,
               moe_tensor_parallel_size=args.moe_tp_size,
+              moe_cluster_parallel_size=args.moe_cluster_size,
               enable_chunked_prefill=args.enable_chunked_prefill,
               speculative_config=spec_config)
 
