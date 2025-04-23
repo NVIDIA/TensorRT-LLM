@@ -930,6 +930,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     """,
                     retryLog: "stageName = ${stageName}, HOST_NODE_NAME = ${env.HOST_NODE_NAME}"
                 )
+                sh """
+                    if ! grep -q \"<testcase\" ${WORKSPACE}/${stageName}/results.xml; then
+                        rm results.xml
+                    fi
+                """
             }
         }
 
