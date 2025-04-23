@@ -118,7 +118,9 @@ class Eagle3Decoder(TorchDecoder):
 
     def _batch_decode(self, scheduled_requests, model_outputs):
         logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
+        new_tokens_device, logits = self._get_new_tokens_from_logits(
+            scheduled_requests, logits)
+
         if "d2t" in model_outputs:
             d2t = model_outputs["d2t"]
             new_tokens_device = d2t[new_tokens_device] + new_tokens_device

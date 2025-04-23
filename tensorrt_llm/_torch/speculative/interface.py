@@ -63,9 +63,35 @@ class SpecConfig:
     # The max number of draft tokens
     max_draft_tokens: int = 1024
 
+    greedy_sampling: bool = True
+    # These fields are ignored unless greedy_sampling == False.
+    # These are tunable knobs related to relaxed decoding.
+    # When relaxed decoding is enabled, we give up trying
+    # to replicate the distribution of the target model to boost the
+    # draft model's acceptance rate. It works like this:
+    # 1. During verification, sample relaxed_sampling_max_topk tokens from the target model's
+    # logits. This gives us a candidate set. A draft token at position i can be accepted if
+    # it matches any token at the candidate set for position i.
+    # 2. Filter the candidate set. We discard any tokens that have probability less than
+    # (top 1 probability - relaxed_sampling_probability_delta).
+    # 3. Accept the draft tokens with the new candidate sets. Note that this is NOT
+    # guaranteed to match the target model's distribution - model quality will be
+    # degraded! However, it should boost acceptance rate.
+    #
+    # TODO: these fields currently do not apply to MTP. We can fix that once MTP
+    # is unified with the "two model engine" spec decode framework.
+    relaxed_sampling_max_topk: int = 3
+    relaxed_sampling_probability_delta: float = 0.1
+
     def __post_init__(self) -> None:
         self.spec_dec_mode = SpeculativeDecodingMode.from_string(
             self.spec_dec_name)
+
+        if self.greedy_sampling:
+            if self.relaxed_sampling_max_topk < 1:
+                raise ValueError(
+                    f"relaxed_sampling_max_topk must be >= 1. Got {self.relaxed_sampling_max_topk}"
+                )
 
     def update_from_model_config(self, model_config: TConfig):
         pass

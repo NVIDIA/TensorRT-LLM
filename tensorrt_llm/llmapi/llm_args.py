@@ -227,6 +227,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     pytorch_eagle_weights_path: Optional[str] = None
+    # See SpecConfig for details on relaxed sampling fields.
+    pytorch_relaxed_sampling_probability_delta: float = 0.1
+    pytorch_relaxed_sampling_max_topk: int = 3
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1192,7 +1195,13 @@ class LlmArgs(BaseModel):
                     self.speculative_config = Eagle3Config(
                         max_draft_tokens=self.speculative_config.max_draft_len,
                         eagle_weights_path=self.speculative_config.
-                        pytorch_eagle_weights_path)
+                        pytorch_eagle_weights_path,
+                        greedy_sampling=self.speculative_config.greedy_sampling,
+                        relaxed_sampling_probability_delta=self.
+                        speculative_config.
+                        pytorch_relaxed_sampling_probability_delta,
+                        relaxed_sampling_max_topk=self.speculative_config.
+                        pytorch_relaxed_sampling_max_topk)
 
             elif isinstance(self.speculative_config, MTPDecodingConfig):
                 from tensorrt_llm._torch.speculative import MTPConfig

@@ -37,7 +37,7 @@ def get_spec_decoder(max_seq_len, spec_config):
     if spec_config.spec_dec_mode.is_mtp():
         return MTPDecoder(max_seq_len, spec_config)
     if spec_config.spec_dec_mode.is_eagle3():
-        return Eagle3Decoder(max_seq_len)
+        return Eagle3Decoder(max_seq_len, spec_config=spec_config)
     else:
         return None
 

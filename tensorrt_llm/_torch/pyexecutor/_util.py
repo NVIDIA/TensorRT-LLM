@@ -462,7 +462,7 @@ def create_py_executor_instance(dist,
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
     decoder = instantiate_decoder(model_engine, executor_config, spec_decoder,
-                                  pytorch_backend_config, mapping)
+                                  pytorch_backend_config, mapping, spec_config)
 
     return PyExecutor(resource_manager,
                       scheduler,
@@ -480,7 +480,7 @@ def create_py_executor_instance(dist,
 
 
 def instantiate_decoder(model_engine, executor_config, spec_decoder,
-                        pytorch_backend_config, mapping):
+                        pytorch_backend_config, mapping, spec_config):
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
@@ -498,5 +498,6 @@ def instantiate_decoder(model_engine, executor_config, spec_decoder,
     else:
         decoder = TorchDecoder(
             max_seq_len=model_engine.max_seq_len,
-            mixed_decoder=pytorch_backend_config.mixed_decoder)
+            mixed_decoder=pytorch_backend_config.mixed_decoder,
+            spec_config=spec_config)
     return decoder

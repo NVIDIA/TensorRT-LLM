@@ -1,6 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import List
 
 import torch
 
@@ -170,9 +171,15 @@ def decode_single_request(request: LlmRequest, logits):
 
 class TorchDecoder(Decoder):
 
-    def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
+    def __init__(
+        self,
+        max_seq_len: int,
+        mixed_decoder: bool = False,
+        # Use string for annotation to avoid circular import
+        spec_config: "Optional[SpecConfig]" = None):
         self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
+        self.spec_config = spec_config
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
@@ -218,6 +225,127 @@ class TorchDecoder(Decoder):
             return True
 
         return False
+
+    def _relaxed_sampling_spec_decode(self, new_tokens_list: List[int],
+                                      logits: torch.Tensor,
+                                      extend_requests: List[LlmRequest]) -> int:
+        num_processed_logits = 0
+        if not extend_requests:
+            return num_processed_logits
+
+        probs = torch.softmax(logits, dim=-1).tolist()
+        beam_idx = 0
+        assert self.spec_config is not None
+        topk = self.spec_config.relaxed_sampling_max_topk
+
+        for request in extend_requests:
+            num_accepted = 0
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                # We use sorted=True when we do the topk to get the candidate, so the best token
+                # is the first.
+                new_token = new_tokens_list[num_processed_logits]
+                num_tokens = request.add_new_token(new_token, beam_idx)
+                if self._handle_stop_criteria(request, new_token, num_tokens,
+                                              beam_idx):
+                    continue
+                request.py_decoding_iter += 1
+
+                # The candidate set for a token at idx is the set of possible
+                # tokens at position idx + 1. We accept a draft token if it's
+                # in the candidate set.
+                # The candidate set is constructed as follows:
+                # 1. Take the topk most probable tokens following position idx.
+                # 2. Filter this set: any tokens with probability below (max_probability - delta)
+                # are discarded. max_probability is the highest probability in the candidate set here.
+                # The probabilities are derived from the logits.
+                def _get_candidate_set(idx: int):
+                    start_idx = num_processed_logits + topk * idx
+                    end_idx = num_processed_logits + topk * (idx + 1)
+
+                    candidate_set = new_tokens_list[start_idx:end_idx]
+                    candidate_set_probs = probs[start_idx:end_idx]
+
+                    prob_cutoff = candidate_set_probs[
+                        0] - self.spec_config.relaxed_sampling_probability_delta
+
+                    candidate_set = [
+                        candidate_set[i] for i in range(len(candidate_set))
+                        if candidate_set_probs[i] >= prob_cutoff
+                    ]
+                    return candidate_set
+
+                for i in range(len(request.py_draft_tokens)):
+                    draft_token = request.py_draft_tokens[i]
+                    candidate_set = _get_candidate_set(i)
+                    if draft_token not in candidate_set:
+                        break
+                    # Note that we don't add any tokens yet.
+                    # The next token is going to be selected from the
+                    # next candidate set. It will either be equal to
+                    # the next draft token (when the draft token is accepted)
+                    # or equal to the highest probability token from the candidate set
+                    # (when the draft token is rejected).
+                    num_accepted += 1
+
+                if num_accepted > 0:
+                    for i in range(num_accepted - 1):
+                        draft_token = request.py_draft_tokens[i + 1]
+                        request.add_new_token(draft_token, beam_idx)
+                        if self._handle_stop_criteria(request, draft_token,
+                                                      num_tokens, beam_idx):
+                            break
+                        request.py_decoding_iter += 1
+
+                    last_candidate_set = _get_candidate_set(num_accepted)
+                    new_token = last_candidate_set[0]
+                    request.add_new_token(new_token, beam_idx)
+                    if self._handle_stop_criteria(request, new_token,
+                                                  num_tokens, beam_idx):
+                        break
+                    request.py_decoding_iter += 1
+
+            request.py_num_accepted_draft_tokens = num_accepted
+            request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
+            num_processed_logits += topk * (len(request.py_draft_tokens) + 1)
+
+        return num_processed_logits
+
+    def _greedy_sampling_spec_decode(self, new_tokens_list: List[int],
+                                     extend_requests: List[LlmRequest]) -> int:
+        idx = 0
+        beam_idx = 0
+        for request in extend_requests:
+            num_accepted = 0
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
+                new_token = new_tokens_list[idx]
+                num_tokens = request.add_new_token(new_token, beam_idx)
+                if self._handle_stop_criteria(request, new_token, num_tokens,
+                                              beam_idx):
+                    continue
+
+                request.py_decoding_iter += 1
+
+                # Accept draft tokens (if we have any) if and only if they match the new
+                # token exactly.
+                for i in range(len(request.py_draft_tokens)):
+                    draft_token = request.py_draft_tokens[i]
+                    if draft_token != new_token:
+                        # Reject.
+                        break
+
+                    num_accepted += 1
+                    new_token = new_tokens_list[idx + i + 1]
+                    num_tokens = request.add_new_token(new_token, beam_idx)
+
+                    if self._handle_stop_criteria(request, new_token,
+                                                  num_tokens, beam_idx):
+                        break
+                    request.py_decoding_iter += 1
+
+            request.py_num_accepted_draft_tokens = num_accepted
+            request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
+            idx += len(request.py_draft_tokens) + 1
+        return idx
 
     def update_requests(self, decoder_state: DecoderState) -> None:
         if decoder_state.decoder_event:
@@ -280,32 +408,14 @@ class TorchDecoder(Decoder):
             else:
                 generation_requests.append(request)
 
-        for request in extend_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                new_token = new_tokens_list[token_idx]
-                num_tokens = request.add_new_token(new_token, beam_idx)
-                self._handle_stop_criteria(request, new_token, num_tokens,
-                                           beam_idx)
-
-                # Accept draft tokens (if we have any) if and only if they match the new
-                # token exactly.
-                num_accepted = 0
-                for draft_token in request.py_draft_tokens:
-                    if draft_token != new_token:
-                        # Reject.
-                        break
-                    num_accepted += 1
-                    new_token = new_tokens_list[token_idx + num_accepted]
-                    num_tokens = request.add_new_token(new_token, beam_idx)
-
-                    if self._handle_stop_criteria(request, new_token,
-                                                  num_tokens, beam_idx):
-                        break
-                handle_logits(request, num_accepted)
-                request.py_decoding_iter += 1
-                request.py_num_accepted_draft_tokens = num_accepted
-                request.py_rewind_len = request.py_draft_pages_allocated - num_accepted
-            advance_idx(len(request.py_draft_tokens) + 1)
+        if self.spec_config is not None and not self.spec_config.greedy_sampling:
+            token_idx += self._relaxed_sampling_spec_decode(
+                new_tokens_list[token_idx:], decoder_state.logits[token_idx:],
+                extend_requests)
+        else:
+            token_idx += self._greedy_sampling_spec_decode(
+                new_tokens_list[token_idx:], extend_requests)
+        request_idx += len(extend_requests)
 
         for request in generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
@@ -365,7 +475,8 @@ class TorchDecoder(Decoder):
     def _batch_decode(self, scheduled_requests: ScheduledRequests,
                       model_outputs) -> DecoderState:
         logits = model_outputs["logits"]
-        new_tokens_device = torch.argmax(logits, dim=-1)
+        new_tokens_device, logits = self._get_new_tokens_from_logits(
+            scheduled_requests, logits)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
         decoder_event = torch.cuda.Event()
         decoder_event.record()
@@ -382,6 +493,22 @@ class TorchDecoder(Decoder):
             return self._mixed_decode(scheduled_requests, model_outputs)
         else:
             return self._batch_decode(scheduled_requests, model_outputs)
+
+    def _get_new_tokens_from_logits(self, scheduled_requests: ScheduledRequests,
+                                    logits: torch.Tensor) -> torch.Tensor:
+        has_extend_requests = any(
+            req.py_draft_tokens
+            for req in scheduled_requests.generation_requests)
+        if has_extend_requests and self.spec_config is not None and not self.spec_config.greedy_sampling:
+            topk_values = torch.topk(
+                logits,
+                k=self.spec_config.relaxed_sampling_max_topk,
+                dim=-1,
+                sorted=True)
+            topk_logits = topk_values.values.flatten()
+            return topk_values.indices.flatten(), topk_logits
+        else:
+            return torch.argmax(logits, dim=-1), logits
 
 
 class TorchStarAttentionDecoder(TorchDecoder):

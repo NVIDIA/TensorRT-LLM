@@ -95,6 +95,15 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_algo', type=str, default=None)
     parser.add_argument('--spec_decode_nextn', type=int, default=1)
     parser.add_argument('--eagle_model_dir', type=str, default=None)
+    parser.add_argument("--spec_decode_use_relaxed_sampling",
+                        action='store_true',
+                        default=False)
+    parser.add_argument("--spec_decode_relaxed_sampling_delta",
+                        type=float,
+                        default=0.1)
+    parser.add_argument("--spec_decode_relaxed_sampling_max_topk",
+                        type=float,
+                        default=3)
 
     return parser
 
@@ -132,7 +141,12 @@ def setup_llm(args):
     elif spec_decode_algo == "EAGLE3":
         spec_config = EagleDecodingConfig(
             max_draft_len=args.spec_decode_nextn,
-            pytorch_eagle_weights_path=args.eagle_model_dir)
+            pytorch_eagle_weights_path=args.eagle_model_dir,
+            greedy_sampling=not args.spec_decode_use_relaxed_sampling,
+            pytorch_relaxed_sampling_probability_delta=args.
+            spec_decode_relaxed_sampling_delta,
+            pytorch_relaxed_sampling_max_topk=args.
+            spec_decode_relaxed_sampling_max_topk)
     else:
         spec_config = None
 
