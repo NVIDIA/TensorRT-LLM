@@ -36,15 +36,10 @@ import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
-# Disable flake8 on the line below because mpi_barrier is not used in tensorrt_llm project
-# but may be called in dependencies (such as examples)
-from ._mnnvl_utils import MnnvlMemory  # NOQA
-from ._mnnvl_utils import MnnvlMoe  # NOQA
-from ._utils import mpi_barrier  # NOQA
-from ._utils import mpi_comm  # NOQA
-from ._utils import str_dtype_to_torch  # NOQA
+from ._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                     mpi_rank, mpi_world_size, set_mpi_comm, str_dtype_to_trt,
+                     mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
+                     set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
                      torch_dtype_to_trt)
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
@@ -84,6 +79,7 @@ __all__ = [
     'Network',
     'Mapping',
     'MnnvlMemory',
+    'MnnvlMoe',
     'PluginBase',
     'Builder',
     'BuilderConfig',

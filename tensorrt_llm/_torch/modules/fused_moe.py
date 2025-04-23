@@ -1,15 +1,16 @@
 import math
 import os
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
 
+from tensorrt_llm._mnnvl_utils import MnnvlMoe
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
-from ..._mnnvl_utils import MnnvlMoe
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
@@ -218,6 +219,19 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
 
 
+@dataclass
+class MoEAlltoallInfo:
+    local_gather_indices: torch.Tensor
+    send_rank_count_cumsum: torch.Tensor
+    send_rank_local_indices: torch.Tensor
+    recv_rank_count_cumsum: torch.Tensor
+    recv_rank_local_indices: torch.Tensor
+    backward_recv_rank_local_indices: torch.Tensor
+    local_expert_ids: torch.Tensor
+    local_scales: torch.Tensor
+    local_token_allocation_count: int
+
+
 class FusedMoE(nn.Module):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
@@ -318,8 +332,8 @@ class FusedMoE(nn.Module):
                 "alltoall should only enabled with attention dp and parallel_size > 1"
             qm = self.quant_config.quant_mode
             self.use_postquant_alltoall = (os.environ.get(
-                "TRTLLM_MOE_POST_QUANT_ALLTOALLV",
-                "1") == "1") and qm.has_any_quant() and qm.has_nvfp4()
+                "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
+                                           == "1") and qm.has_nvfp4()
         self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
             model_config.mapping) if enable_alltoall else None
 
@@ -664,8 +678,7 @@ class FusedMoE(nn.Module):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
             elif self.has_nvfp4:
-                if not disable_fp4_allgather() or (self.enable_alltoall and
-                                                   self.use_postquant_alltoall):
+                if not disable_fp4_allgather() or self.use_postquant_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = x.fp4_tensor, x.scaling_factor
                         x_row = x.shape[0]
@@ -720,7 +733,7 @@ class FusedMoE(nn.Module):
             cluster_rank = self.cluster_rank
             quant_scales = self.quant_scales
 
-        if self.enable_alltoall and self.use_postquant_alltoall:
+        if self.use_postquant_alltoall:
             x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
                                                        alltoall_info)
 
@@ -1000,13 +1013,14 @@ class FusedMoE(nn.Module):
             gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
         gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
             gathered_token_selected_experts, self.num_experts, self.ep_size)
-        alltoall_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+        alltoall_info_tuple = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_experts,
             gathered_token_final_scales, max_num_token, expert_count, top_k,
             self.ep_rank, self.ep_size, use_real_size)
         local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
             recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
-            local_expert_ids, local_scales, local_token_allocation_count = alltoall_info
+            local_expert_ids, local_scales, local_token_allocation_count = alltoall_info_tuple
+        alltoall_info = MoEAlltoallInfo(*alltoall_info_tuple)
 
         token_selected_experts, token_final_scales = local_expert_ids, local_scales
 
@@ -1024,15 +1038,14 @@ class FusedMoE(nn.Module):
 
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     x_row: int, x_col: int,
-                                    alltoall_info: tuple):
-        local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
-            recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
-            local_expert_ids, local_scales, local_token_allocation_count = alltoall_info
+                                    alltoall_info: MoEAlltoallInfo):
         x = MnnvlMoe.mnnvl_moe_alltoallv(
-            x, send_rank_count_cumsum, send_rank_local_indices,
-            recv_rank_count_cumsum, recv_rank_local_indices,
-            self.alltoall_workspace, self.ep_rank, self.ep_size,
-            local_token_allocation_count)
+            x, alltoall_info.send_rank_count_cumsum,
+            alltoall_info.send_rank_local_indices,
+            alltoall_info.recv_rank_count_cumsum,
+            alltoall_info.recv_rank_local_indices, self.alltoall_workspace,
+            self.ep_rank, self.ep_size,
+            alltoall_info.local_token_allocation_count)
 
         if x_sf is not None:
             if self.has_nvfp4:
@@ -1040,10 +1053,12 @@ class FusedMoE(nn.Module):
                                     self.scaling_vector_size)
 
             x_sf = MnnvlMoe.mnnvl_moe_alltoallv(
-                x_sf, send_rank_count_cumsum, send_rank_local_indices,
-                recv_rank_count_cumsum, recv_rank_local_indices,
-                self.alltoall_workspace, self.ep_rank, self.ep_size,
-                local_token_allocation_count)
+                x_sf, alltoall_info.send_rank_count_cumsum,
+                alltoall_info.send_rank_local_indices,
+                alltoall_info.recv_rank_count_cumsum,
+                alltoall_info.recv_rank_local_indices, self.alltoall_workspace,
+                self.ep_rank, self.ep_size,
+                alltoall_info.local_token_allocation_count)
 
             if self.has_nvfp4:
                 x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
@@ -1052,19 +1067,16 @@ class FusedMoE(nn.Module):
         return x, x_sf
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
-                         alltoall_info: tuple, token_count: int):
+                         alltoall_info: MoEAlltoallInfo, token_count: int):
         top_k = self.routing_method.experts_per_token
-        local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
-            recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
-            local_expert_ids, local_scales, local_token_allocation_count = alltoall_info
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
-            recv_rank_count_cumsum,
-            recv_rank_local_indices,
-            send_rank_count_cumsum,
-            backward_recv_rank_local_indices,
+            alltoall_info.recv_rank_count_cumsum,
+            alltoall_info.recv_rank_local_indices,
+            alltoall_info.send_rank_count_cumsum,
+            alltoall_info.backward_recv_rank_local_indices,
             self.alltoall_workspace,
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,

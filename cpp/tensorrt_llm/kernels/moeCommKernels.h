@@ -184,6 +184,7 @@ struct SendRecvDataInfo
     }
 };
 
+// struct holding Send/Recv data pointer and its displacement information.
 struct SendRecvDispls
 {
     uint64_t* dataPtr;

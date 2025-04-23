@@ -201,8 +201,9 @@ void setMaxUsableSmCount(int64_t maxSmCount)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_comm_prepare_indices(Tensor gatheredTargetRankIds, Tensor? realRankTokenCountCumSum, int "
-        "maxTokenCountPerRank, int expertCount, int topK, int epRank, int epSize) -> (Tensor, Tensor, Tensor, Tensor, "
+        "moe_comm_prepare_indices(Tensor gathered_target_rank_ids, Tensor? real_rank_token_count_cum_sum, int "
+        "max_token_count_per_rank, int expert_count, int top_k, int ep_rank, int ep_size) -> (Tensor, Tensor, Tensor, "
+        "Tensor, "
         "Tensor, Tensor)");
 }
 
@@ -214,9 +215,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_local_gather(Tensor recvRankCumSum, Tensor localGatherIndices, Tensor gatheredExpertIds, Tensor "
-        "gatheredScales, Tensor localExpertIds, Tensor localScales, int maxTokenCountPerRank, int expertCount, int "
-        "topK, int epRank, int epSize) -> ()");
+        "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor gathered_expert_ids, Tensor "
+        "gathered_scales, Tensor local_expert_ids, Tensor local_scales, int max_token_count_per_rank, int "
+        "expert_count, int "
+        "top_k, int ep_rank, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -227,8 +229,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_comm(Tensor input, Tensor sendRankCumSum, Tensor sendIndices, Tensor output, Tensor recvRankCumSum, "
-        "Tensor recvIndices, Tensor allWorkspaces, int epRank, int epSize) -> ()");
+        "moe_comm(Tensor input, Tensor send_rank_cum_sum, Tensor send_indices, Tensor output, Tensor "
+        "recv_rank_cum_sum, "
+        "Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -238,7 +241,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("get_moe_commworkspace_size_per_rank(int epSize) -> int");
+    m.def("get_moe_commworkspace_size_per_rank(int ep_size) -> int");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
@@ -248,7 +251,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("set_moe_max_usable_sm_count(int maxSmCount) -> ()");
+    m.def("set_moe_max_usable_sm_count(int max_sm_count) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)

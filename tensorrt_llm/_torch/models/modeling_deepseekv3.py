@@ -38,11 +38,10 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
-from ..._mnnvl_utils import MnnvlMemory
-from ...llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -447,7 +446,7 @@ class Deepseekv3MoE(nn.Module):
         if not MnnvlMemory.supports_mnnvl():
             return False
 
-        if os.environ.get("TRTLLM_DEEPSEEK_DISABLE_MOE_ALLTOALLV", "0") == "1":
+        if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False
 
         if model_config.mapping.moe_ep_size <= top_k:
