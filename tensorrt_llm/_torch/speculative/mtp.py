@@ -338,8 +338,7 @@ class MTPWorker(nn.Module):
             attn_metadata = draft_inputs["attn_metadata"]
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
         if attn_metadata.is_cuda_graph and attn_metadata is not None:
-            self.restore_attn_metadata(num_accepted_tokens=num_accepted_tokens,
-                                       attn_metadata=attn_metadata)
+            self.restore_attn_metadata(attn_metadata=attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -700,23 +699,12 @@ class MTPWorker(nn.Module):
                 attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
                     i] -= mtp_num_modules + 1 - num_accepted_tokens[i].item()
 
-    def restore_attn_metadata(self, num_accepted_tokens: torch.Tensor,
-                              attn_metadata: AttentionMetadata):
+    def restore_attn_metadata(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-
         num_contexts = attn_metadata.num_contexts
         attn_metadata._seq_lens[num_contexts:batch_size] += 1
         attn_metadata._seq_lens_cuda[num_contexts:batch_size] += 1
         attn_metadata.on_update()
-
-        if hasattr(attn_metadata, 'kv_lens_cuda'):
-            # Note that it's important to not free the seq_lens_cuda
-            # buffer once the graph has been captured also - this will invalidate
-            # the graph and force an expensive recapture.
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] += (
-                mtp_num_modules + 1 -
-                num_accepted_tokens[num_contexts:batch_size])
 
     def prepare_drafter_inputs(
         self,
@@ -938,7 +926,6 @@ class MTPEagleWorker(MTPWorker):
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
 
         # Sample and verify draft tokens
         raw_logits = logits
@@ -949,10 +936,6 @@ class MTPEagleWorker(MTPWorker):
         if attn_metadata.is_cuda_graph:
             seq_len = attn_metadata._seq_lens[:batch_size].clone()
             seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
-            spec_all_rank_num_tokens = spec_metadata.all_rank_num_tokens
-            req_types = attn_metadata.host_request_types[:batch_size].clone()
-            if hasattr(attn_metadata, 'kv_lens_cuda'):
-                kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
 
         # Prepare inputs for the 1st MTP layer
         position_ids = position_ids.squeeze(0)
@@ -1013,15 +996,9 @@ class MTPEagleWorker(MTPWorker):
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
-            attn_metadata.num_contexts = num_contexts
-            attn_metadata.num_generations = num_generations
             attn_metadata._seq_lens[:batch_size].copy_(seq_len)
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
-            attn_metadata.host_request_types[:batch_size].copy_(req_types)
-            spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-            if hasattr(attn_metadata, 'kv_lens_cuda'):
-                attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens_cuda)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[

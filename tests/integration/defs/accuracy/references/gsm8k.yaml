@@ -11,6 +11,17 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 75.61
   - quant_algo: FP8
     accuracy: 83.30
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 64.74
+  - quant_algo: NVFP4
+    accuracy: 63.71
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 64.74
+  - spec_dec_algo: MTP
+    accuracy: 64.44
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 64.14
 deepseek-ai/DeepSeek-R1:
   - quant_algo: NVFP4
     accuracy: 95.42
