@@ -620,7 +620,7 @@ def renderTestDB(testContext, llmSrc, stageName) {
     if (stageName.contains("-DeepSeek-")) {
         makoArgs += ["auto_trigger=deepseek"]
     } else {
-        makoArgs += ["auto_trigger=false"]
+        makoArgs += ["auto_trigger=others"]
     }
 
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
@@ -1188,7 +1188,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1469,6 +1469,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         parallelJobsFiltered += multiGpuJobs
     }
 
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+        echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
+        def autoTriggerTagStages = [:]
+        for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
+            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
+        }
+        parallelJobsFiltered += autoTriggerTagStages
+        if (autoTriggerTagStages.size() > 0) {
+            echo "Auto trigger will force run stages: ${autoTriggerTagStages.keySet().join(', ')}."
+        }
+        println parallelJobsFiltered.keySet()
+    }
+
     // Check --post-merge, post-merge or TRT dependency testing pipelines.
     // If true, add post-merge only test stages and multi-GPU test stages.
     if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
@@ -1507,19 +1520,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
         echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
         parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
-        println parallelJobsFiltered.keySet()
-    }
-
-    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
-        echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
-        def autoTriggerTagStages = [:]
-        for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
-            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
-        }
-        parallelJobsFiltered += autoTriggerTagStages
-        if (autoTriggerTagStages.size() > 0) {
-            echo "Auto trigger will force run stages: ${autoTriggerTagStages.keySet().join(', ')}."
-        }
         println parallelJobsFiltered.keySet()
     }
 
