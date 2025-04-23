@@ -865,6 +865,15 @@ class PyTorchModelEngine(ModelEngine):
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
 
+                if inputs['attn_metadata'].enable_flash_mla:
+                    # Since kv_lens_cuda is modified, we also need to get_mla_metadata.
+                    torch.ops.trtllm.get_mla_metadata(
+                        inputs['attn_metadata'].
+                        kv_lens_cuda[num_ctx_requests:num_seqs],
+                        inputs['attn_metadata'].flash_mla_metadata.
+                        tile_scheduler_metadata, inputs['attn_metadata'].
+                        flash_mla_metadata.num_splits[:num_gen_requests + 1])
+
         return inputs
 
     def _prepare_tp_inputs(
