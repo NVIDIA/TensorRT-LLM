@@ -16,6 +16,7 @@ from utils.util import force_ampere
 
 @force_ampere
 def test_tinyllama_guided_decoding():
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5240350")
     tinyllama_guided_decoding_test_harness(backend="pytorch")
 
 
@@ -56,6 +57,7 @@ def test_llm_abort_request(sampling_params):
 
 
 def test_llm_reward_model():
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5240358")
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
     tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
