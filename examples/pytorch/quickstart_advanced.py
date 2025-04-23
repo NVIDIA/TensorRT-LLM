@@ -66,9 +66,9 @@ def add_llm_args(parser):
 
     # KV cache
     parser.add_argument('--kv_cache_dtype', type=str, default='auto')
-    parser.add_argument('--kv_cache_enable_block_reuse',
-                        default=True,
-                        action='store_false')
+    parser.add_argument('--disable_kv_cache_reuse',
+                        default=False,
+                        action='store_true')
     parser.add_argument("--kv_cache_fraction", type=float, default=None)
 
     # Runtime
@@ -119,7 +119,7 @@ def setup_llm(args):
         enable_trtllm_decoder=args.enable_trtllm_decoder)
 
     kv_cache_config = KvCacheConfig(
-        enable_block_reuse=args.kv_cache_enable_block_reuse,
+        enable_block_reuse=not args.disable_kv_cache_reuse,
         free_gpu_memory_fraction=args.kv_cache_fraction,
     )
 
