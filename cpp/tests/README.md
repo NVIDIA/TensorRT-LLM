@@ -60,9 +60,7 @@ To build the engines from the top-level directory:
 
 ```bash
 PYTHONPATH=examples/models/core/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
-PYTHONPATH=examples/models/contrib/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gptj_engines.py
 PYTHONPATH=examples/models/core/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
-PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
 PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
 PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/build_redrafter_engines.py
@@ -86,9 +84,7 @@ End-to-end tests read inputs and expected outputs from Numpy files located at [c
 
 ```bash
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gpt_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_gptj_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_llama_output.py
-PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_chatglm_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_medusa_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_eagle_output.py
 PYTHONPATH=examples:$PYTHONPATH python3 cpp/tests/resources/scripts/generate_expected_redrafter_output.py

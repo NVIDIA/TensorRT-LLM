@@ -57,7 +57,7 @@ step further by performing FP8 computation on Hopper GPUs instead of the
 standard FP16.
 
 Similar examples running Falcon-180B with quantization in TensorRT-LLM are
-available in [examples/falcon](/examples/falcon).
+available in [examples/models/contrib/falcon](/examples/models/contrib/falcon).
 
 ## Llama-70B on H200 up to 6.7x A100
 
