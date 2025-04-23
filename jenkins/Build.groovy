@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@emma_move_funcs']) _
 
 import groovy.transform.Field
 
@@ -88,169 +88,7 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
-BUILD_JOBS = "8"
-
-TESTER_CORES = "12"
-TESTER_MEMORY = "96Gi"
-
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
-
-String getShortenedJobName(String path)
-{
-    static final nameMapping = [
-        "L0_MergeRequest": "l0-mr",
-        "L0_Custom": "l0-cus",
-        "L0_PostMerge": "l0-pm",
-        "L0_PostMergeDocker": "l0-pmd",
-        "L1_Custom": "l1-cus",
-        "L1_Nightly": "l1-nt",
-        "L1_Stable": "l1-stb",
-    ]
-    def parts = path.split('/')
-    // Apply nameMapping to the last part (jobName)
-    def jobName = parts[-1]
-    boolean replaced = false
-    nameMapping.each { key, value ->
-        if (jobName.contains(key)) {
-            jobName = jobName.replace(key, value)
-            replaced = true
-        }
-    }
-    if (!replaced) {
-        jobName = jobName.length() > 7 ? jobName.substring(0, 7) : jobName
-    }
-    // Replace the last part with the transformed jobName
-    parts[-1] = jobName
-    // Rejoin the parts with '-', convert to lowercase
-    return parts.join('-').toLowerCase()
-}
-
-def createKubernetesPodConfig(image, type, arch = "amd64")
-{
-    def targetCould = "kubernetes-cpu"
-    def selectors = """
-                  nvidia.com/node_type: builder
-                  kubernetes.io/os: linux
-                  kubernetes.io/arch: ${arch}"""
-    def containerConfig = ""
-    def nodeLabelPrefix = ""
-    def jobName = getShortenedJobName(env.JOB_NAME)
-    def buildID = env.BUILD_ID
-
-    def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
-
-    switch(type)
-    {
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "package":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['cat']
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    }
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
-    def pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  persistentVolumeClaim:
-                    claimName: sw-tensorrt-pvc
-    """
-    if (arch == "arm64") {
-        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
-        pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  nfs:
-                    server: 10.117.145.13
-                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
-        """
-    }
-    def podConfig = [
-        cloud: targetCould,
-        namespace: "sw-tensorrt",
-        label: nodeLabel,
-        yaml: """
-            apiVersion: v1
-            kind: Pod
-            spec:
-                qosClass: Guaranteed
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                            - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: DoesNotExist
-                              - key: "tensorrt/affinity"
-                                operator: NotIn
-                                values:
-                                - "core"
-                nodeSelector: ${selectors}
-                containers:
-                  ${containerConfig}
-                    env:
-                    - name: HOST_NODE_NAME
-                      valueFrom:
-                        fieldRef:
-                          fieldPath: spec.nodeName
-                  - name: jnlp
-                    image: ${jnlpImage}
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                qosClass: Guaranteed
-                volumes:
-                ${pvcVolume}
-        """.stripIndent(),
-    ]
-
-    return podConfig
-}
 
 def echoNodeAndGpuInfo(pipeline, stageName)
 {
@@ -337,7 +175,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
         return
     }
 
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build", k8s_cpu), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(image, "build", k8s_cpu), "trt-llm", {
         stage(key) {
             stage("[${key}] Run") {
                 echoNodeAndGpuInfo(pipeline, key)
@@ -689,7 +527,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         parallelJobs += [
         (key): {
             script {
-                trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
+                trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
@@ -716,7 +554,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig(AGENT_IMAGE, "package", "amd64")
+        kubernetes trtllm_utils.createKubernetesPodConfig(AGENT_IMAGE, "package", "amd64")
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/

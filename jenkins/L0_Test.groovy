@@ -1,11 +1,8 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@emma_move_funcs']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
 import groovy.json.JsonSlurper
-import groovy.json.JsonOutput
-import com.nvidia.bloom.KubernetesManager
-import com.nvidia.bloom.Constants
 import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.SlurmConfig
@@ -15,6 +12,8 @@ import com.nvidia.bloom.Utils
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
+
+BUILD_JOBS = "8"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -45,8 +44,6 @@ DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.04-py3"
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
-
 // Literals for easier access.
 @Field
 def TARNAME = "tarName"
@@ -72,20 +69,12 @@ def BUILD_CONFIGS = [
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
 ]
 
-// TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "64Gi"
 BUILD_JOBS = "8"
 
 SLURM_CORES_REQUEST = "1"
 SLURM_CORES_LIMIT = "1"
 SLURM_MEMORY_REQUEST = "8Gi"
 SLURM_MEMORY_LIMIT = "12Gi"
-
-TESTER_CORES = "12"
-TESTER_MEMORY = "96Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
@@ -281,36 +270,6 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
-String getShortenedJobName(String path)
-{
-    static final nameMapping = [
-        "L0_MergeRequest": "l0-mr",
-        "L0_Custom": "l0-cus",
-        "L0_PostMerge": "l0-pm",
-        "L0_PostMergeDocker": "l0-pmd",
-        "L1_Custom": "l1-cus",
-        "L1_Nightly": "l1-nt",
-        "L1_Stable": "l1-stb",
-    ]
-    def parts = path.split('/')
-    // Apply nameMapping to the last part (jobName)
-    def jobName = parts[-1]
-    boolean replaced = false
-    nameMapping.each { key, value ->
-        if (jobName.contains(key)) {
-            jobName = jobName.replace(key, value)
-            replaced = true
-        }
-    }
-    if (!replaced) {
-        jobName = jobName.length() > 7 ? jobName.substring(0, 7) : jobName
-    }
-    // Replace the last part with the transformed jobName
-    parts[-1] = jobName
-    // Rejoin the parts with '-', convert to lowercase
-    return parts.join('-').toLowerCase()
-}
-
 def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false)
 {
     checkStageName([stageName])
@@ -350,230 +309,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             junit(testResults: "${stageName}/results*.xml")
         }
     }
-}
-
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false)
-{
-    def targetCould = "kubernetes-cpu"
-    def selectors = """
-                  nvidia.com/node_type: builder
-                  kubernetes.io/arch: ${arch}
-                  kubernetes.io/os: linux"""
-    def containerConfig = ""
-    def nodeLabelPrefix = ""
-    def jobName = getShortenedJobName(env.JOB_NAME)
-    def buildID = env.BUILD_ID
-
-    def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
-
-    switch(type)
-    {
-    case "agent":
-        containerConfig = """
-                  - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
-                    command: ['cat']
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "slurm":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${SLURM_CORES_REQUEST}
-                        memory: ${SLURM_MEMORY_REQUEST}
-                        ephemeral-storage: 100Gi
-                      limits:
-                        cpu: ${SLURM_CORES_LIMIT}
-                        memory: ${SLURM_MEMORY_LIMIT}
-                        ephemeral-storage: 100Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    case "build":
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
-                    volumeMounts:
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
-                        ephemeral-storage: 200Gi
-                      limits:
-                        cpu: ${BUILD_CORES_LIMIT}
-                        memory: ${BUILD_MEMORY_LIMIT}
-                        ephemeral-storage: 200Gi
-                    imagePullPolicy: Always"""
-        nodeLabelPrefix = "cpu"
-        break
-    default:
-        def hasMultipleGPUs = (gpuCount > 1)
-        def memorySize = "${TESTER_MEMORY}"
-        def storageSize = "300Gi"
-        def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
-        def cpuCount = "${TESTER_CORES}"
-
-        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
-        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
-        {
-            // Not a hard requirement, but based on empirical values.
-            memorySize = "${gpuCount * 150}" + "Gi"
-            storageSize = "${gpuCount * 150}" + "Gi"
-            cpuCount = "${gpuCount * 12}"
-        }
-
-        def gpuType = KubernetesManager.selectGPU(type)
-        nodeLabelPrefix = type
-
-        targetCould = "kubernetes"
-
-        // The following GPU types doesn't support dynamic driver flashing.
-        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}"""
-        } else if (perfMode && !hasMultipleGPUs) {
-        // Not using the "perf" node currently due to hardware resource constraint.
-        // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
-        // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'"""
-        }
-        else
-        {
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'"""
-        }
-
-        containerConfig = """
-                  - name: trt-llm
-                    image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
-                    tty: true
-                    resources:
-                      requests:
-                        cpu: ${cpuCount}
-                        memory: ${memorySize}
-                        nvidia.com/gpu: ${gpuCount}
-                        ephemeral-storage: ${storageSize}
-                      limits:
-                        cpu: ${cpuCount}
-                        memory: ${memorySize}
-                        nvidia.com/gpu: ${gpuCount}
-                        ephemeral-storage: ${storageSize}
-                    imagePullPolicy: Always
-                    volumeMounts:
-                    - name: dshm
-                      mountPath: /dev/shm
-                    - name: scratch-trt-llm-data
-                      mountPath: /scratch.trt_llm_data
-                      readOnly: true
-                    - name: sw-tensorrt-pvc
-                      mountPath: "/mnt/sw-tensorrt-pvc"
-                      readOnly: false
-                    securityContext:
-                      capabilities:
-                        add:
-                        - SYS_ADMIN"""
-        break
-    }
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
-    def pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  persistentVolumeClaim:
-                    claimName: sw-tensorrt-pvc
-    """
-    if (arch == "arm64") {
-        // PVC mount isn't supported on aarch64 platform. Use NFS as a WAR.
-        pvcVolume = """
-                - name: sw-tensorrt-pvc
-                  nfs:
-                    server: 10.117.145.13
-                    path: /vol/scratch1/scratch.svc_tensorrt_blossom
-        """
-    }
-    def podConfig = [
-        cloud: targetCould,
-        namespace: "sw-tensorrt",
-        label: nodeLabel,
-        yaml: """
-            apiVersion: v1
-            kind: Pod
-            spec:
-                qosClass: Guaranteed
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                            - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: DoesNotExist
-                              - key: "tensorrt/affinity"
-                                operator: NotIn
-                                values:
-                                - "core"
-                nodeSelector: ${selectors}
-                containers:
-                  ${containerConfig}
-                    env:
-                    - name: HOST_NODE_NAME
-                      valueFrom:
-                        fieldRef:
-                          fieldPath: spec.nodeName
-                  - name: jnlp
-                    image: ${jnlpImage}
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-                    resources:
-                      requests:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                      limits:
-                        cpu: '2'
-                        memory: 10Gi
-                        ephemeral-storage: 25Gi
-                qosClass: Guaranteed
-                volumes:
-                - name: dshm
-                  emptyDir:
-                    medium: Memory
-                - name: scratch-trt-llm-data
-                  nfs:
-                    server: 10.117.145.14
-                    path: /vol/scratch1/scratch.michaeln_blossom
-                ${pvcVolume}
-        """.stripIndent(),
-    ]
-
-    return podConfig
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -646,7 +381,7 @@ def runLLMDocBuild(pipeline, config)
 def launchTestListCheck(pipeline)
 {
     stageName = "Test List Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
         try {
             echoNodeAndGpuInfo(pipeline, stageName)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
@@ -680,142 +415,6 @@ def generateStageFailTestResultXml(stageName, subName, failureLog, resultPath) {
         <testcase name="${subName}" classname="${stageName}" time="1.0">
         <failure message="${failureLog}"> ${failureLog}
         </failure></testcase></testsuite></testsuites>"""
-}
-
-def getMakoOpts(getMakoScript, makoArgs=[]) {
-    // We want to save a map for the Mako opts
-    def makoOpts = [:]
-    def turtleOutput = ""
-
-    // Echo the command
-    // NOTE: We redirect stderr to stdout so that we can capture
-    //  both stderr and stdout streams with the 'returnStdout' flag
-    //  in sh command.
-    def listMakoCmd = [
-        "python3",
-        getMakoScript,
-        "--device 0"].join(" ")
-
-    if (makoArgs) {
-        def makoOptArgs = makoArgs.collect { "--mako-opt " + it }
-        listMakoCmd += " " + makoOptArgs.join(" ")
-    }
-    // Add the withCredentials step to access gpu-chip-mapping file
-    withCredentials([file(credentialsId: 'gpu-chip-mapping', variable: 'GPU_CHIP_MAPPING')]) {
-        listMakoCmd = [listMakoCmd, "--chip-mapping-file ${GPU_CHIP_MAPPING}"].join(" ")
-        listMakoCmd = [listMakoCmd, "2>&1"].join(" ")
-
-        echo "Scripts to get Mako list, cmd: ${listMakoCmd}"
-
-        // Capture the mako output, add timeout in case any hang
-        timeout(time: 30, unit: 'MINUTES'){
-            turtleOutput = sh(label: "Capture Mako Parameters", script: listMakoCmd, returnStdout: true)
-        }
-    }
-
-    // Validate output
-    assert turtleOutput: "Mako opts not found - could not construct test db test list."
-
-    // Split each line of turtle output into a list
-    def turtleOutList = turtleOutput.split("\n")
-
-    // Extract the mako opts
-    def startedMakoOpts = false
-    def param = null
-    def value = null
-    turtleOutList.each { val ->
-        if (startedMakoOpts) {
-            // Handle case where value is missing
-            param = null
-            value = null
-            try {
-                (param, value) = val.split("=")
-            } catch (ArrayIndexOutOfBoundsException ex) {
-                param = val.split("=")[0]
-                value = null
-            }
-
-            // Try to convert nulls, booleans, and floats into the correct type
-            if (value != null) {
-                if (value.toLowerCase() == "none") {
-                    echo "Converted mako param '${param}' value '${value}' to 'null'"
-                    value = null
-                } else if (value.toLowerCase() in ["true", "false"]) {
-                    echo "Converted mako param '${param}' value '${value}' to Boolean '${value.toBoolean()}'"
-                    value = value.toBoolean()
-                }
-            }
-            makoOpts[(param)] = value
-        }
-        if (val.equals("Mako options:")) {
-            startedMakoOpts = true
-        }
-    }
-
-    // Finally, convert the query to a json string
-    def makoOptsJson = JsonOutput.toJson(makoOpts)
-
-    // Print and return the Test DB Query as a JSON string
-    echo "Test DB Mako opts: ${makoOptsJson}"
-
-    return makoOptsJson
-}
-
-def renderTestDB(testContext, llmSrc, stageName) {
-    def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
-    def makoArgs = []
-    def isPostMerge = stageName.contains("Post-Merge")
-    makoArgs += [isPostMerge ? "stage=post_merge" : "stage=pre_merge"]
-    // Determine the backend type based on keywords in stageName
-    if (stageName.contains("-PyTorch-")) {
-        // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
-        // At this point, only tests with backend=pytorch or unspecified backend will be run
-        makoArgs += ["backend=pytorch"]
-    } else if (stageName.contains("-TensorRT-")) {
-        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
-        // At this point, only tests with backend=tensorrt or unspecified backend will be run
-        makoArgs += ["backend=tensorrt"]
-    } else if (stageName.contains("-CPP-")) {
-        // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
-        // At this point, only tests with backend=cpp or unspecified backend will be run
-        makoArgs += ["backend=cpp"]
-    } else if (stageName.contains("-Triton-")) {
-        // If stageName contains "-Triton-", add "backend=triton" to makoArgs
-        // At this point, only tests with backend=triton or unspecified backend will be run
-        makoArgs += ["backend=triton"]
-    } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", or "-Triton-", do not add any backend
-        // At this point, all tests will be run
-        // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
-    }
-    if (stageName.contains("-DeepSeek-")) {
-        makoArgs += ["auto_trigger=deepseek"]
-    } else {
-        makoArgs += ["auto_trigger=others"]
-    }
-
-    def makoOpts = getMakoOpts(scriptPath, makoArgs)
-
-    sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-    def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
-    def testList = "${llmSrc}/${testContext}.txt"
-    def testDBQueryCmd = [
-        "trt-test-db",
-        "-d",
-        testDBPath,
-        "--context",
-        testContext,
-        "--test-names",
-        "--output",
-        testList,
-        "--match",
-        "'${makoOpts}'"
-    ].join(" ")
-
-    sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    sh(script: "cat ${testList}")
-
-    return testList
 }
 
 def getSSHConnectionPorts(portConfigFile, stageName)
@@ -1144,7 +743,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // CPP test execution is timing out easily, so we always override the timeout to 7200
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=7200"
 
-        def testDBList = renderTestDB(testList, llmSrc, stageName)
+        def testDBList = trtllm_utils.renderTestDB(testList, llmSrc, stageName)
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
@@ -1592,7 +1191,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1638,7 +1237,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
         }]]}
 
@@ -1656,7 +1255,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         parallelJobs += parallelSlurmJobs
     }
 
-    docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
+    docBuildSpec = trtllm_utils.createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
     docBuildConfigs = [
         "A10-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
@@ -1749,14 +1348,14 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 k8s_arch = "arm64"
             }
 
-            def buildSpec = createKubernetesPodConfig(values[0], "build", k8s_arch)
+            def buildSpec = trtllm_utils.createKubernetesPodConfig(values[0], "build", k8s_arch)
             def buildRunner = runInKubernetes(pipeline, buildSpec, "trt-llm")
             def sanityRunner = null
 
             if (dockerNode) {
                 sanityRunner = runInDockerOnNode(values[0], dockerNode, dockerArgs)
             } else {
-                def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
+                def sanitySpec = trtllm_utils.createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
                 sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
             }
 
@@ -1795,7 +1394,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
             if (checkPipStage) {
                 stage("Run LLMAPI tests") {
-                    pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
+                    pipInstallSanitySpec = trtllm_utils.createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -1993,7 +1592,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig("", "agent")
+        kubernetes trtllm_utils.createKubernetesPodConfig("", "agent")
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
