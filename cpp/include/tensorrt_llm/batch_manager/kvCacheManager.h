@@ -538,7 +538,7 @@ public:
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
+    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, bool shareLastContextBlock);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
@@ -867,7 +867,7 @@ public:
         LlmRequest& llmRequest, SizeType32 windowSize);
 
     void addSequence(
-        GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
+        GenerationRequest& sequence, SizeType32 numBlocks, bool shareLastContextBlock, SizeType32 windowSize);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 

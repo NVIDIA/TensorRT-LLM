@@ -131,7 +131,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     auto constexpr requestId = 42;
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(seq0, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow);
+    blockManager.addSequence(seq0, numBlocksPerBeam, false, maxAttentionWindow);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
     auto const& ids = seq0.getCacheBlockIds(maxAttentionWindow);
@@ -146,7 +146,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
-    blockManager.addSequence(seq0, numBlocksPerBeam, -1, maxAttentionWindow);
+    blockManager.addSequence(seq0, numBlocksPerBeam, true, maxAttentionWindow);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocksPerBeam);
     EXPECT_EQ(ids.size(), beamWidth);
     for (std::size_t i = 0u; i < ids.front().size(); ++i)
@@ -160,17 +160,15 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     // occupy 22/24 blocks
-    EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow));
+    EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, false, maxAttentionWindow));
     GenerationRequest seq1{requestId + 1, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow));
+    EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, false, maxAttentionWindow));
     // same requestId not allowed
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_THROW(
-        blockManager.addSequence(seq2, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow), std::runtime_error);
+    EXPECT_THROW(blockManager.addSequence(seq2, numBlocksPerBeam, false, maxAttentionWindow), std::runtime_error);
     // no more blocks
     GenerationRequest seq3{requestId + 2, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_THROW(
-        blockManager.addSequence(seq3, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow), std::runtime_error);
+    EXPECT_THROW(blockManager.addSequence(seq3, numBlocksPerBeam, false, maxAttentionWindow), std::runtime_error);
 }
 
 template <typename T, nvinfer1::DataType type, int mask>

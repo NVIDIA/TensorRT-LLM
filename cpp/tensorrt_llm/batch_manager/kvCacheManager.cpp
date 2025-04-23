@@ -1178,23 +1178,24 @@ void WindowBlockManager::addSequence(
 }
 
 void BlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize)
+    GenerationRequest& sequence, SizeType32 numContextBlocks, bool shareLastContextBlock, SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, numBlocks, unsharedBlockIdx);
+    mWindowBlockManagers.at(windowSize).addSequence(sequence, numContextBlocks, shareLastContextBlock);
 }
 
-void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx)
+void WindowBlockManager::addSequence(
+    GenerationRequest& sequence, SizeType32 numContextBlocks, bool shareLastContextBlock)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
     TLLM_CHECK(emplaceDone);
 
     // Allocate blocks
-    for (SizeType32 bi = 0; bi < numBlocks; ++bi)
+    for (SizeType32 bi = 0; bi < numContextBlocks - 1; ++bi)
     {
-        bool shareAmongBeams = bi != unsharedBlockIdx;
-        allocateBlock(sequence, shareAmongBeams);
+        allocateBlock(sequence, true);
     }
+    allocateBlock(sequence, shareLastContextBlock);
 }
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
@@ -1906,7 +1907,7 @@ void KVCacheManager::addSequence(
     {
         auto lck = std::scoped_lock(mSequencesMtx);
         // Note that currently sliding window kv cache doesn't work with shared kv cache of different beams.
-        // TODO (tomer): remove second comment line after checking if works with beam search
+        // TODO (tomer): remove comment after checking if works with beam search
         return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
             mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
     }();
@@ -1923,22 +1924,6 @@ void KVCacheManager::addSequence(
     {
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
-
-        // Get the final token index in kv cache
-        SizeType32 const finalTokenKVIdx
-            = mSinkBlockTokenLength + ((inputLength - 1 - mSinkBlockTokenLength) % metadata.numNonSinkTokensInWindow);
-
-        // Get block index that with shareAmongBeams=False.
-        // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
-        SizeType32 unsharedBlockIdx = -1;
-        if ((!sequence.getContextRequiresSlidingWindowKvCache() || beamWidth > 1
-                || finalTokenKVIdx % getTokensPerBlock() > 0)
-            && !isCrossKv())
-        {
-            unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
-                ? finalTokenKVIdx / getTokensPerBlock() + 1
-                : finalTokenKVIdx / getTokensPerBlock();
-        }
 
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
@@ -1958,7 +1943,8 @@ void KVCacheManager::addSequence(
                     "have no effect.",
                     llmRequest->mRequestId);
             }
-            mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
+            auto const shareLastContextBlock = isCrossKv() || effectiveInputLength % getTokensPerBlock() == 0;
+            mBlockManager.addSequence(sequence, numContextBlocks, shareLastContextBlock, windowSize);
             if (mEnableHashKey && llmRequest.has_value() && beamWidth == 1)
             {
                 constexpr SizeType32 beamIdx = 0;
