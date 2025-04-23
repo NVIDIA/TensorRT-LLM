@@ -256,7 +256,7 @@ Currently, CogVLM only support bfloat16 precision.
 ## Deplot
 
 1. Download Huggingface weights and convert original checkpoint to TRT-LLM checkpoint format
-   following example in `examples/enc_dec/README.md`.
+   following example in `examples/models/core/enc_dec/README.md`.
 
     ```bash
     export MODEL_NAME="deplot"
@@ -320,7 +320,7 @@ Currently, CogVLM only support bfloat16 precision.
     git clone https://huggingface.co/adept/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/gpt`.
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/gpt`.
     The LLM portion of Fuyu uses a Persimmon model
     ```bash
     python ../gpt/convert_checkpoint.py \
@@ -489,7 +489,7 @@ Firstly, please install transformers with 4.37.2
     git clone https://huggingface.co/microsoft/kosmos-2-patch14-224 tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/gpt`.
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/gpt`.
     ```bash
     python ../gpt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -560,7 +560,7 @@ Firstly, please install transformers with 4.37.2
         git clone https://huggingface.co/Efficient-Large-Model/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md` and `examples/qwen/README.md`
+2. Generate TRT-LLM engine for LLaMA following example in `examples/models/core/llama/README.md` and `examples/models/core/qwen/README.md`
 
     ```bash
     python ../llama/convert_checkpoint.py \
@@ -725,7 +725,7 @@ Firstly, please install transformers with 4.37.2
 
 This section shows how to build and run a LLaMA-3.2 Vision model in TensorRT-LLM. We use [Llama-3.2-11B-Vision/](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision) as an example.
 
-For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llama/README.md) because it shares the model architecture of llama.
+For LLaMA-3.2 text model, please refer to the [examples/models/core/llama/README.md](../llama/README.md) because it shares the model architecture of llama.
 
 ### Support data types <!-- omit from toc -->
   * BF16
@@ -831,7 +831,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
 
 [NeVA](https://docs.nvidia.com/nemo-framework/user-guide/latest/multimodalmodels/neva/index.html) is a groundbreaking addition to the NeMo Multimodal ecosystem. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
 
-1. Generate TRT-LLM engine for NVGPT following example in `examples/gpt/README.md`. To adhere to the NVGPT conventions of the conversion script, some layer keys have to be remapped using `--nemo_rename_key`.
+1. Generate TRT-LLM engine for NVGPT following example in `examples/models/core/gpt/README.md`. To adhere to the NVGPT conventions of the conversion script, some layer keys have to be remapped using `--nemo_rename_key`.
 
     ```bash
     export MODEL_NAME="neva"
@@ -886,11 +886,11 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
     git clone https://huggingface.co/facebook/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/enc_dec`
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/enc_dec`
 
    Nougat uses mBART architecture but replaces the LLM encoder with a Swin Transformer encoder.
    To achieve this, we add an extra `--nougat` flag (over mBART example) to
-   `convert_checkpoint.py` in `examples/enc_dec` and `trtllm-build`.
+   `convert_checkpoint.py` in `examples/models/core/enc_dec` and `trtllm-build`.
 
     ```bash
     python ../enc_dec/convert_checkpoint.py --model_type bart \
@@ -938,7 +938,7 @@ Note that for instruct Vision model, please set the `max_encoder_input_len` as `
     git clone https://huggingface.co/microsoft/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/phi`.
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/models/core/phi`.
     ```bash
     python ../phi/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -1045,7 +1045,7 @@ pip install -r requirements-qwen2vl.txt
 
 [Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
 
-1. Generate TRT-LLM engine for Nemotron model following example in `examples/nemotron/README.md`. To adhere to the NVGPT conventions of the conversion script. This will be used as our base LM for inference.
+1. Generate TRT-LLM engine for Nemotron model following example in `examples/models/core/nemotron/README.md`. To adhere to the NVGPT conventions of the conversion script. This will be used as our base LM for inference.
 
     ```bash
     pip install decord # used for loading video
@@ -1094,7 +1094,7 @@ This section explains how to evaluate datasets using our provided script, includ
 To run an evaluation, use the following command:
 
 ```bash
-python ./examples/multimodal/eval.py \
+python ./examples/models/core/multimodal/eval.py \
     --model_type <model_type> \
     --engine_dir <engine_dir> \
     --hf_model_dir <hf_model_dir> \

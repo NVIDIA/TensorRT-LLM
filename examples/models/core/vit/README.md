@@ -30,7 +30,7 @@ LLaVA-NeXT is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](htt
     # copy the image newlines tensor to engine directory
     cp tmp/trt_models/${MODEL_NAME}/fp16/1-gpu/vision/image_newlines.safetensors tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/vision
     ```
-3. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md`
+3. Generate TRT-LLM engine for LLaMA following example in `examples/models/core/llama/README.md`
 
     ```bash
     python ../llama/convert_checkpoint.py \
