@@ -170,12 +170,10 @@ class CanaryTokenizer:
         else:
             dpl='en'
         if self.prompt_format == 'canary2':
-                self.default_prompt = f"<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|{dpl}|> <|{dpl}|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
+            self.default_prompt = f"<|startofcontext|> <|startoftranscript|> <|emo:undefined|> <|{dpl}|> <|{dpl}|> <|nopnc|> <|noitn|> <|notimestamp|> <|nodiarize|>" 
         else:
-            if self.has_country_code:
-                self.default_prompt = f"<|startoftranscript|><|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
-            else:
-                self.default_prompt = f"<|startoftranscript|><|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
+            self.default_prompt = f"<|startoftranscript|> <|{dpl}|> <|transcribe|> <|{dpl}|> <|pnc|>"
+
                 
 
         self.id_to_token = {}
