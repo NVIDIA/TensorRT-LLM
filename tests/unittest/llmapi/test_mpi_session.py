@@ -49,6 +49,7 @@ def run_client(server_addr, values_to_process):
         return f"Error in client: {str(e)}"
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
 def test_remote_mpi_session():
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
     command = [
