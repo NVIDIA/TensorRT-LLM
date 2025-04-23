@@ -131,7 +131,7 @@ class MMLU(Evaluator):
     def __init__(self,
                  dataset_path: str,
                  num_samples: Optional[int] = None,
-                 num_train: int = 5,
+                 num_fewshot: int = 5,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
                  system_prompt: Optional[str] = None):
@@ -144,7 +144,7 @@ class MMLU(Evaluator):
         else:
             self.num_samples_per_subject = math.ceil(
                 num_samples / len(self.SUBJECT_TO_SUBCATEGORIES))
-        self.num_train = num_train
+        self.num_fewshot = num_fewshot
 
     def format_subject(self, subject):
         line = subject.split("_")
@@ -176,7 +176,7 @@ class MMLU(Evaluator):
         for subject in self.SUBJECT_TO_SUBCATEGORIES.keys():
             dev_df = pd.read_csv(f"{self.dataset_path}/dev/{subject}_dev.csv",
                                  header=None)
-            train_prompt = self.gen_prompt(dev_df, subject, self.num_train)
+            train_prompt = self.gen_prompt(dev_df, subject, self.num_fewshot)
 
             test_df = pd.read_csv(
                 f"{self.dataset_path}/test/{subject}_test.csv", header=None)
@@ -249,18 +249,41 @@ class MMLU(Evaluator):
         help="The path to MMLU dataset. The commands to prepare the dataset: "
         "wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar"
     )
-    @click.option("--num_samples", type=int, default=None)
-    @click.option("--num_train", type=int, default=5)
-    @click.option("--random_seed", type=int, default=0)
-    @click.option("--apply_chat_template", is_flag=True, default=False)
-    @click.option("--system_prompt", type=Optional[str], default=None)
-    @click.option("--max_input_length", type=int, default=4094)
-    @click.option("--max_output_length", type=int, default=2)
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--num_fewshot",
+                  type=int,
+                  default=5,
+                  help="Number of fewshot.")
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  is_flag=True,
+                  default=False,
+                  help="Whether to apply chat template.")
+    @click.option("--system_prompt",
+                  type=Optional[str],
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4094,
+                  help="Maximum prompt length.")
+    @click.option("--max_output_length",
+                  type=int,
+                  default=2,
+                  help="Maximum generation length.")
     @click.option("--check_accuracy", is_flag=True, default=False)
     @click.option("--accuracy_threshold", type=float, default=30)
     @click.pass_context
     @staticmethod
-    def command(ctx, dataset_path: str, num_samples: int, num_train: int,
+    def command(ctx, dataset_path: str, num_samples: int, num_fewshot: int,
                 random_seed: int, apply_chat_template: bool,
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
@@ -271,7 +294,7 @@ class MMLU(Evaluator):
             truncate_prompt_tokens=max_input_length)
         evaluator = MMLU(dataset_path,
                          num_samples=num_samples,
-                         num_train=num_train,
+                         num_fewshot=num_fewshot,
                          random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
                          system_prompt=system_prompt)
