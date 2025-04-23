@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_broadcast,
-                                 mpi_comm, mpi_isend, mpi_recv)
+                                 mpi_comm, mpi_isend, mpi_recv, torch_dtype_to_np)
 from tensorrt_llm.mapping import Mapping
 
 
@@ -143,16 +143,18 @@ class MPIDist(Distributed):
             return None
         elif len(tensor_list) == 1:
             return self.recv_tensor(next(iter(tensor_list)), src, tag)
-
+        
+        # Use the first tensor's dtype to infer the buffer dtype
+        numpy_dtype = torch_dtype_to_np(next(iter(tensor_list)).dtype)
         # Prepare buffer to receive tensor_list
         recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
-                               dtype=np.uint8)
+                               dtype=numpy_dtype)
         # Receive tensors
         self.recv(recv_buffer, src, tag)
         # Assign to tensor_list
         offset = 0
         for t in tensor_list:
-            t.copy_(torch.from_numpy(recv_buffer[offset:offset + t.numel()]))
+            t.copy_(torch.from_numpy(recv_buffer[offset:offset + t.numel()]).reshape(t.shape))
             offset += t.numel()
         return None
 
