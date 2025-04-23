@@ -27,8 +27,9 @@ from ..executor.utils import (create_mpi_comm_session,
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_args import LLMARGS_EXPLICIT_DOCSTRING, PybindMirror
-from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
+from .llm_args import (LLMARGS_EXPLICIT_DOCSTRING, PybindMirror, TorchLlmArgs,
+                       TrtLlmArgs)
+from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
@@ -112,7 +113,11 @@ class LLM:
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
                                                      None)
-            self.args = LlmArgs.from_kwargs(
+
+            llm_args_cls = TorchLlmArgs if kwargs.get(
+                'backend', None) == 'torch' else TrtLlmArgs
+
+            self.args = llm_args_cls.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
                 tokenizer_mode=tokenizer_mode,
