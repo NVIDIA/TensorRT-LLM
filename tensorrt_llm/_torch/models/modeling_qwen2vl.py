@@ -417,7 +417,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         assert mm_embed == [] or len(
             mm_embed) == num_context_requests, error_msg
 
-        input_ids, input_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
+                                                    input_ids, mm_embed)
 
         mrope_config = kwargs.get("mrope_config", {})
         if mrope_config:

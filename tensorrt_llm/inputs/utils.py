@@ -104,7 +104,7 @@ def format_vila_input(model_dir, inputs):
     return inputs
 
 
-def format_llava_next_input(model_dir, inputs):
+def format_generic_input(model_dir, inputs):
     """
     This function formats the input for the Llava Next VL model.
 
@@ -122,15 +122,16 @@ def format_llava_next_input(model_dir, inputs):
     def apply_template(prompt, multimodal_data):
         conversation = [
             {
-                "role": "user",
+                "role":
+                "user",
                 "content": [
                     {
                         "type": "text",
                         "text": prompt
                     },
-                    {
+                    *[{
                         "type": "image"
-                    },
+                    } for _ in multimodal_data["image"]],
                 ],
             },
         ]
@@ -220,7 +221,8 @@ def default_video_loader(prompts, videos, image_data_format="pt", num_frames=8):
 
 INPUT_FORMATTER_MAP = {
     "llava_llama": format_vila_input,
-    "llava_next": format_llava_next_input,
+    "llava_next": format_generic_input,
     "qwen2_vl": format_qwen2_vl_input,
     "qwen2_5_vl": format_qwen2_vl_input,
+    "llama4": format_generic_input,
 }
