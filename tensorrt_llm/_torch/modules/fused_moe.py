@@ -653,6 +653,7 @@ class FusedMoE(nn.Module):
             ep_rank=self.ep_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
             min_latency_mode=min_latency_mode,
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
         if min_latency_mode:

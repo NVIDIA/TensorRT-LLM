@@ -6,6 +6,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..utils import (get_last_power_of_2_num_tokens_buckets,
+                     get_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2, next_positive_power_of_2)
 
 
@@ -113,6 +114,7 @@ def fused_moe(
     ep_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
+    tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -120,8 +122,8 @@ def fused_moe(
     # TODO: only profile for min_latency_mode = False due to the error in the moe_kernels
     tuning_config = TuningConfig(dynamic_tensors=(
         # input, dim 0, all valid buckets, map a seq_len to power of 2 bucket index
-        (0, 0, ((16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4,
-                 2, 1), next_positive_power_of_2)),
+        (0, 0, (get_power_of_2_num_tokens_buckets(tune_max_num_tokens),
+                next_positive_power_of_2)),
         # min_latency_tensor, dim 0, (0 for False, 1 for True), map to it self
         (2, 0, ((0, ), lambda x: x)),
     ))
@@ -194,6 +196,7 @@ def _(
     ep_rank: int = 0,
     use_fp8_block_scaling: bool = False,
     min_latency_mode: bool = False,
+    tune_max_num_tokens: int = 8192,
 ):
     seq_len = input.shape[0]
     hidden_size = fc2_expert_weights.shape[1]
