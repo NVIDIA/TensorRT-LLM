@@ -5,6 +5,7 @@ import sys
 
 import cloudpickle
 import pytest
+from defs.conftest import skip_no_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -199,6 +200,7 @@ def test_disaggregated_simple_llama(model, generation_overlap,
         ])
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])

@@ -22,6 +22,7 @@ from defs.conftest import skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=['eagle1', 'eagle2'])
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
