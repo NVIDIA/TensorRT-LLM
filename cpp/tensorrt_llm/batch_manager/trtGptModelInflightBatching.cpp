@@ -255,14 +255,16 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     }
     if (mModelConfig.isTransformerBased() && modelConfig.isKVCacheEnabled())
     {
-        auto cacheTransceiverConfig = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
-         auto const cacheSizePerToken
-        = kv_cache_manager::BaseKVCacheManager::calculateCacheSizePerToken(modelConfig, worldConfig, false);
+        auto cacheTransceiverConfig
+            = optionalParams.cacheTransceiverConfig.value_or(executor::CacheTransceiverConfig());
+        auto const cacheSizePerToken
+            = kv_cache_manager::BaseKVCacheManager::calculateCacheSizePerToken(modelConfig, worldConfig, false);
         //  TODO: cacheType
-        auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(cacheTransceiverConfig.getMaxNumTokens(), cacheSizePerToken);
+        auto cacheTransPreAllocaSize = kv_cache_manager::CacheTransBufferManager::preAllocBufferSize(
+            cacheTransceiverConfig.getMaxNumTokens(), cacheSizePerToken);
         auto const [blocksInPrimaryPool, blocksInSecondaryPool]
             = BaseKVCacheManager::calculateMaxNumBlocks(optionalParams.kvCacheConfig, mModelConfig.getKvDataType(),
-                mModelConfig, mWorldConfig, mRuntime->getBufferManager(),2,cacheTransPreAllocaSize);
+                mModelConfig, mWorldConfig, mRuntime->getBufferManager(), 2, cacheTransPreAllocaSize);
         TLLM_LOG_INFO("before Create KVCacheManager cacheTransPreAllocaSize:%ld", cacheTransPreAllocaSize);
         if (mModelConfig.useCrossAttention())
         {

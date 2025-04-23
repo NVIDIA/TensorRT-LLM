@@ -2061,8 +2061,11 @@ std::tuple<SizeType32, SizeType32> BaseKVCacheManager::calculateMaxNumBlocks(KvC
     TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
     auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.useUvm);
     auto maxTokens = static_cast<SizeType32>(freeMemFraction
-        * static_cast<double>(freeMem - extraCostMemory + bufferManager.memoryPoolFree()) / static_cast<double>(cacheSizeBytesPerToken));
-    TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB, extraCostMemory: %0.2f GiB",
+        * static_cast<double>(freeMem - extraCostMemory + bufferManager.memoryPoolFree())
+        / static_cast<double>(cacheSizeBytesPerToken));
+    TLLM_LOG_INFO(
+        "Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB, "
+        "extraCostMemory: %0.2f GiB",
         (totalMem / static_cast<double>(1 << 30)),
         ((freeMem + bufferManager.memoryPoolFree()) / static_cast<double>(1 << 30)),
         extraCostMemory / static_cast<double>(1 << 30));

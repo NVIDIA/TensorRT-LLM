@@ -221,7 +221,9 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
     kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
         executor_config, model_engine.model.model_config, mapping)
-    logger.info(f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}")
+    logger.info(
+        f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}"
+    )
     peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
