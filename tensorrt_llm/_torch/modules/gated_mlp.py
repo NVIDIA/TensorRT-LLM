@@ -74,7 +74,7 @@ class GatedMLP(nn.Module):
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
             reduce_output=False,
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
         self.down_proj = Linear(
             self.intermediate_size,
@@ -85,7 +85,7 @@ class GatedMLP(nn.Module):
             tensor_parallel_mode=TensorParallelMode.ROW,
             quant_config=config.get_quant_config(),
             reduce_output=reduce_output,
-            skip_create_weights=config.skip_create_weights,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,

@@ -406,14 +406,20 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
+        skip_create_weights_in_init: bool = False,
         **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
+        if not skip_create_weights_in_init:
+            self.update_quant_config(self.quant_config)
 
+    def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
+        self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
-        if quant_config and quant_config.layer_quant_mode.has_any_quant():
-            quant_mode = quant_config.layer_quant_mode
+        if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
+        ):
+            quant_mode = self.quant_config.layer_quant_mode
             if quant_mode.has_fp8_kv_cache():
                 self.has_fp8_kv_cache = True
 
