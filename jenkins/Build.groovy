@@ -88,6 +88,7 @@ def globalVars = [
     (ACTION_INFO): null,
 ]
 
+BUILD_JOBS = "8"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
 def echoNodeAndGpuInfo(pipeline, stageName)
