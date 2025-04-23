@@ -1672,7 +1672,6 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
 {
-
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
@@ -1684,7 +1683,6 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     }
 
     auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
-    auto const numNonSinkTokensInWindow = mBlockManager.getWindowSizeMetadata(windowSize).numNonSinkTokensInWindow;
 
     SizeType32 const numContextBlocks
         = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
@@ -1707,18 +1705,14 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     }
 
     // In case of sliding window attention, a new block is allocated when the window slides (and then the out-of-window
-    // block is detached) So we need an extra block for generation if the diff between the max sequence length and the
-    // current sequence length crosses a block boundary
-    auto const isSlidingWindow
-        = req.mPromptLen + req.mMaxNewTokens > numNonSinkTokensInWindow + temporaryAttentionWindow;
-    // req.getNumTokens() does NOT include sink tokens, so don't consider them in maxSeqlenInBlocks as well
-    SizeType32 const currentSeqlenInBlocks = tc::ceilDiv(req.getNumTokens(0), getTokensPerBlock());
-    SizeType32 const maxSeqlenInBlocks = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
+    // block is detached). So we need an extra block for generation if the diff between the max sequence length and the
+    // current sequence length crosses both a block boundary and a window boundary
+    auto const isSlidingWindow = req.mPromptLen + req.mMaxNewTokens > windowSize + temporaryAttentionWindow;
+    SizeType32 const currentSeqlenInBlocks = tc::ceilDiv(req.getNumTokens(0) + mSinkBubbleLength, getTokensPerBlock());
+    SizeType32 const maxSeqlenInBlocks
+        = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens + mSinkBubbleLength, getTokensPerBlock());
     auto const willCrossBlockBoundary = maxSeqlenInBlocks > currentSeqlenInBlocks;
-    // We also need to check if the last block in the window will become full (window size does not have to be a
-    // multiple of block size)
-    auto const numSinkBlocks = mSinkBlockTokenLength / getTokensPerBlock();
-    auto const willCrossWindowBlockBoundary = maxSeqlenInBlocks + numSinkBlocks > numTotalBlocksPerBeam;
+    auto const willCrossWindowBlockBoundary = maxSeqlenInBlocks > numTotalBlocksPerBeam;
     SizeType32 numExtraBlocksPerBeam
         = isSlidingWindow && willCrossBlockBoundary && willCrossWindowBlockBoundary ? 1 : 0;
 
