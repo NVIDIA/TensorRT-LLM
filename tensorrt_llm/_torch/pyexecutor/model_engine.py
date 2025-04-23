@@ -248,6 +248,7 @@ class PyTorchModelEngine(ModelEngine):
         # accommodate certain target/draft model use cases. See
         # py_executor.py for how this is used.
         self.last_spec_metadata = None
+        self.is_draft_model = False
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -1142,7 +1143,7 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
 
-        if not attn_metadata.is_cuda_graph or is_spec_decode:
+        if not attn_metadata.is_cuda_graph or self.is_draft_model:
             # Usually, we don't need to update seq_lens when using CUDA graphs.
             # This is because CUDA graphs are only used for pure decoding batches.
             # If we're doing spec decode, however, we can have variable seqlens (up
