@@ -1,11 +1,11 @@
 
-# MR title
+# PR title
 
-Please write the MR title by following template:
+Please write the PR title by following template:
 
-[JIRA ticket link/nvbug link/github issue link][fix/feat/doc/infra/...] \<summary of this MR\>
+[JIRA ticket link/nvbug link/github issue link][fix/feat/doc/infra/...] \<summary of this PR\>
 
-For example, assume I have a MR hope to support a new feature about cache manager of Jira TRTLLM-1000 ticket, it would be like
+For example, assume I have a PR hope to support a new feature about cache manager of Jira TRTLLM-1000 ticket, it would be like
 
 [TRTLLM-1000][feat] Support a new feature about cache manager
 
@@ -16,7 +16,7 @@ Please explain the issue and the solution in short.
 ## Test Coverage
 
 <!--
-Please list clearly what are the relevant test(s) that can safeguard the changes in the MR. This helps us to ensure we have sufficient test coverage for the MR.
+Please list clearly what are the relevant test(s) that can safeguard the changes in the PR. This helps us to ensure we have sufficient test coverage for the PR.
 -->
 
 ## GitHub Bot Help
