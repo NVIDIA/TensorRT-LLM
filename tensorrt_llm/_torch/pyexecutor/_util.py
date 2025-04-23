@@ -5,9 +5,9 @@ from collections.abc import Iterable
 import torch
 
 import tensorrt_llm
-import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
                                  torch_dtype_to_str)
+from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
