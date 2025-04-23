@@ -1,6 +1,5 @@
 from typing import List, Union
 
-import cv2
 import numpy as np
 import requests
 import torch
@@ -30,6 +29,8 @@ def load_video(
         num_frames: int = 10,
         format: str = "pt",
         device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+    import cv2
+
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     # Load video frames from a video file
