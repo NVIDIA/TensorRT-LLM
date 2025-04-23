@@ -48,7 +48,7 @@ class LLaMAForCausalLM (DecoderModelForCausalLM):
 
 
 Then, in the convert_checkpoint.py script in the
-[`examples/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama/) directory of the GitHub repo,
+[`examples/models/core/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/) directory of the GitHub repo,
 the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
 
 

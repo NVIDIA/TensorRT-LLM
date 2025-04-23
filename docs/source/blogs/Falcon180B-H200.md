@@ -117,7 +117,7 @@ These improvements will be published in the `main` branch soon, and will be
 included in the v0.7 & v0.8 releases.
 
 Similar examples running Llama-70B in TensorRT-LLM are published in
-[examples/llama](/examples/llama).
+[examples/models/core/llama](/examples/models/core/llama).
 
 For more information about H200, please see the [H200 announcement blog](./H200launch.md).
 

@@ -59,9 +59,9 @@ The weights and built engines are stored under [cpp/tests/resources/models](reso
 To build the engines from the top-level directory:
 
 ```bash
-PYTHONPATH=examples/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
-PYTHONPATH=examples/gptj:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gptj_engines.py
-PYTHONPATH=examples/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
+PYTHONPATH=examples/models/core/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gpt_engines.py
+PYTHONPATH=examples/models/contrib/gpt:$PYTHONPATH python3 cpp/tests/resources/scripts/build_gptj_engines.py
+PYTHONPATH=examples/models/core/llama:$PYTHONPATH python3 cpp/tests/resources/scripts/build_llama_engines.py
 PYTHONPATH=examples/chatglm:$PYTHONPATH python3 cpp/tests/resources/scripts/build_chatglm_engines.py
 PYTHONPATH=examples/medusa:$PYTHONPATH python3 cpp/tests/resources/scripts/build_medusa_engines.py
 PYTHONPATH=examples/eagle:$PYTHONPATH python3 cpp/tests/resources/scripts/build_eagle_engines.py
@@ -71,7 +71,7 @@ PYTHONPATH=examples/redrafter:$PYTHONPATH python3 cpp/tests/resources/scripts/bu
 It is possible to build engines with tensor and pipeline parallelism for LLaMA using 4 GPUs.
 
 ```bash
-PYTHONPATH=examples/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
+PYTHONPATH=examples/models/core/llama python3 cpp/tests/resources/scripts/build_llama_engines.py --only_multi_gpu
 ```
 
 If there is an issue finding model_spec.so in engine building, manually build model_spec.so by

@@ -112,7 +112,7 @@ cd cpp/build
     Take GPT-350M as an example for 2-GPU inflight batching
     ```
     mpirun -n 2 ./benchmarks/gptManagerBenchmark \
-        --engine_dir ../../examples/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
+        --engine_dir ../../examples/models/core/gpt/trt_engine/gpt2-ib/fp16/2-gpu/ \
         --request_rate 10 \
         --dataset ../../benchmarks/cpp/preprocessed_dataset.json \
         --max_num_samples 500
@@ -173,7 +173,7 @@ Datasets with fixed input/output lengths for benchmarking can be generated with 
 Take GPT-350M as an example for single GPU with static batching
 ```
 ./benchmarks/gptManagerBenchmark \
-    --engine_dir ../../examples/gpt/trt_engine/gpt2/fp16/1-gpu/ \
+    --engine_dir ../../examples/models/core/gpt/trt_engine/gpt2/fp16/1-gpu/ \
     --request_rate -1 \
     --static_emulated_batch_size 32 \
     --static_emulated_timeout 100 \
@@ -213,7 +213,7 @@ CPP_LORA=chinese-llama-2-lora-13b-cpp
 EG_DIR=/tmp/lora-eg
 
 # Build lora enabled engine
-python examples/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
+python examples/models/core/llama/convert_checkpoint.py --model_dir ${MODEL_CHECKPOINT} \
                               --output_dir ${CONVERTED_CHECKPOINT} \
                               --dtype ${DTYPE} \
                               --tp_size ${TP} \
