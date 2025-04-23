@@ -990,29 +990,28 @@ class MTPEagleWorker(MTPWorker):
             attn_metadata.on_update()
             # cannot run generation if their is no kv cache
             if inputs["attn_metadata"].kv_cache_manager is not None:
+                # Turn context request to generation request
                 attn_metadata.host_request_types[:attn_metadata.
                                                  num_contexts].fill_(1)
                 attn_metadata.num_contexts = 0
-                if i == 0 and num_contexts > 0 and attn_metadata.enable_flash_mla:
-                    reorder_block_ids_per_seq = torch.cat([
-                        attn_metadata.
-                        kv_block_ids_per_seq[num_contexts:batch_size],
-                        attn_metadata.kv_block_ids_per_seq[:num_contexts]
-                    ])
-                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-                        reorder_block_ids_per_seq, non_blocking=True)
 
                 if attn_metadata.enable_flash_mla:
-                    # Since KV cache length is increasing, we need to update the MLA metadata.
-                    # TODO: Is this correct?
-                    torch.ops.trtllm.get_mla_metadata(
-                        attn_metadata.kv_lens_cuda[:batch_size], attn_metadata.
-                        flash_mla_metadata.tile_scheduler_metadata,
-                        attn_metadata.flash_mla_metadata.
-                        num_splits[:batch_size + 1])
+                    # block_ids_per_seq is used by FlashMLA and needs to be updated.
+                    attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                        attn_metadata.kv_block_ids_per_seq[:batch_size, :],
+                        non_blocking=True)
 
             if hasattr(attn_metadata, 'kv_lens_cuda'):
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
+
+            if attn_metadata.enable_flash_mla:
+                # Since KV cache length is increasing, we need to update the MLA metadata.
+                torch.ops.trtllm.get_mla_metadata(
+                    attn_metadata.kv_lens_cuda[:batch_size],
+                    attn_metadata.flash_mla_metadata.tile_scheduler_metadata,
+                    attn_metadata.flash_mla_metadata.num_splits[:batch_size +
+                                                                1])
+
             # support attention dp
             if spec_metadata.all_rank_num_tokens is not None:
                 spec_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
