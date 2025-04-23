@@ -41,7 +41,7 @@ GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
-BUILD_TRITON       ?= 0
+INSTALL_TRITON     ?= 0
 
 define add_local_user
 	docker build \
@@ -80,7 +80,7 @@ endef
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
-		$(if $(BUILD_TRITON), --build-arg BUILD_TRITON="$(BUILD_TRITON)") \
+		$(if $(INSTALL_TRITON), --build-arg INSTALL_TRITON="$(INSTALL_TRITON)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
