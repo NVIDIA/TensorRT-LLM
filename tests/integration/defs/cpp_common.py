@@ -737,7 +737,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
 
-        gpt_tests = {"gpt", "gpt_session", "gpt_tests", "gpt_executor"}
+        gpt_tests = {"gpt", "gpt_session", "gpt_tests"}
 
         # gpt* tests are not parallelized as it would cause OOM because kv cache memory allocations
         # exist in multiple running tests
