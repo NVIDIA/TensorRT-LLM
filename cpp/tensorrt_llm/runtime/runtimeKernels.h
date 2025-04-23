@@ -61,8 +61,6 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, 
 
 void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, CudaStream const& stream);
 
-void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& stream);
-
 void gatherLastTokenLogits(
     ITensor& output, ITensor const& input, ITensor const& lastTokenIds, CudaStream const& stream);
 

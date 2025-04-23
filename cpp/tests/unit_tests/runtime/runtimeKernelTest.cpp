@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -451,47 +450,6 @@ TEST_F(RuntimeKernelTest, TileHalf)
     verifyTiling(input, *outputTensor, *mManager);
 }
 
-TEST_F(RuntimeKernelTest, TileInplaceInt32)
-{
-    tr::SizeType32 const beamWidth{3};
-
-    std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
-    tr::SizeType32 const batchSize{4};
-    auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
-    auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
-    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
-
-    auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
-
-    tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
-
-    outputTensor->reshape(tr::ITensor::makeShape({batchSize, beamWidth, inputLength}));
-    verifyTiling(input, *outputTensor, *mManager);
-}
-
-TEST_F(RuntimeKernelTest, TileInplaceHalf)
-{
-    tr::SizeType32 const beamWidth{3};
-
-    std::vector<half> const input{
-        28524.F, 287.F, 5093.F, 12.F, 23316.F, 4881.F, 11.F, 30022.F, 263.F, 8776.F, 355.F, 257.F};
-    tr::SizeType32 const batchSize{4};
-    auto const inputLength = static_cast<tr::SizeType32>(input.size() / batchSize);
-    auto const inputShape = tr::ITensor::makeShape({batchSize, inputLength});
-    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
-
-    auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kHALF);
-
-    tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-    tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
-
-    outputTensor->reshape(tr::ITensor::makeShape({batchSize, beamWidth, inputLength}));
-    verifyTiling(input, *outputTensor, *mManager);
-}
-
 TEST_F(RuntimeKernelTest, TileInt8Large)
 {
     // Force synchronize to ensure that all memory allocations and de-allocations are completed before running the test,
@@ -524,53 +482,6 @@ TEST_F(RuntimeKernelTest, TileInt8Large)
 
         auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
         tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-        mStream->synchronize();
-
-        auto bufferHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);
-        auto* bufferPtr = tr::bufferCast<std::int8_t>(*bufferHost);
-        auto constexpr expected = value;
-        for (std::size_t i = 0; i < bufferHost->getSize(); ++i)
-        {
-            EXPECT_EQ(bufferPtr[i], expected) << "Error at index " << i;
-        }
-    }
-    mStream->synchronize();
-    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-TEST_F(RuntimeKernelTest, TileInplaceInt8Large)
-{
-    // Force synchronize to ensure that all memory allocations and de-allocations are completed before running the test,
-    // as it uses a significant portion of the total memory on smaller devices and tends to cause OOMs.
-    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-
-    std::int8_t constexpr value{3};
-    tr::SizeType32 constexpr batchSize{1};
-    tr::SizeType32 constexpr beamWidth{2};
-
-    tr::SizeType32 const d2{2};
-    auto const d3 = std::numeric_limits<int32_t>::max();
-    auto const inputShape = tr::ITensor::makeShape({batchSize, d2, d3});
-    auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, d2, d3});
-
-    // Ensure the test is not too memory hungry for the current device.
-    auto const totalBytesAllocated = tr::ITensor::volume(inputShape) + tr::ITensor::volume(outputShape);
-    auto const [_, totalDeviceMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
-    auto constexpr memoryProportionThreshold{0.9};
-    if (static_cast<double>(totalBytesAllocated) > (static_cast<double>(totalDeviceMemory) * memoryProportionThreshold))
-    {
-        GTEST_SKIP() << "Skipping test due to large memory allocation that could make test flaky.";
-    }
-
-    // Scope the allocated tensors to ensure they are de-allocated before the test ends.
-    {
-        auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
-        tr::kernels::invokeFill(*inputTensor, value, *mStream);
-        mStream->synchronize();
-
-        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
-        tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
-        tr::kernels::tileTensorInplace(*outputTensor, beamWidth, *mStream);
         mStream->synchronize();
 
         auto bufferHost = mManager->copyFrom(*outputTensor, tr::MemoryType::kCPU);

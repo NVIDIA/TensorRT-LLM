@@ -205,31 +205,6 @@ __global__ void extendAttentionMask(
     }
 }
 
-__global__ void copyPackedInputToOutputTransposed(TokenIdType* outputIds, TokenIdType const* inputIds,
-    SizeType32 const* inputOffsets, TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth,
-    SizeType32 const maxInputLength)
-{
-    SizeType32 const tidx = (blockIdx.x * blockDim.x) + threadIdx.x;
-    SizeType32 const tidy = (blockIdx.y * blockDim.y) + threadIdx.y;
-
-    for (SizeType32 batchIdx = tidy; batchIdx < batchSize; batchIdx += blockDim.y * gridDim.y)
-    {
-        auto const tokenBegin = inputOffsets[batchIdx];
-        auto const tokenEnd = inputOffsets[batchIdx + 1];
-        auto const inputLength = tokenEnd - tokenBegin;
-
-        for (SizeType32 tokenIdx = tidx; tokenIdx < maxInputLength; tokenIdx += blockDim.x * gridDim.x)
-        {
-            auto const value = (tokenIdx < inputLength) ? inputIds[tokenBegin + tokenIdx] : padId;
-            for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-            {
-                auto const outputIdx = tc::flat_index3(tokenIdx, batchIdx, beamIdx, batchSize, beamWidth);
-                outputIds[outputIdx] = value;
-            }
-        }
-    }
-}
-
 __global__ void copyInputToOutput(TokenIdType* outputIds, TokenIdType const* inputIds, SizeType32 const* inputLengths,
     TokenIdType const padId, SizeType32 const batchSize, SizeType32 const beamWidth, SizeType32 const maxInputLength,
     SizeType32 const maxSeqLength)
@@ -295,7 +270,6 @@ void invokeGatherLastTokenLogits(
     auto const vocabSizePadded = static_cast<std::uint32_t>(outputShape.d[2]);
 
     auto const& inputShape = input.getShape();
-    auto const maxInputLength = static_cast<std::uint32_t>(inputShape.d[1]);
 
     TLLM_CHECK_WITH_INFO(inputShape.d[0] == batchSize, "Invalid input shape: dim[0]");
     TLLM_CHECK_WITH_INFO(inputShape.d[2] == vocabSizePadded, "Invalid input shape: dim[2]");
@@ -494,46 +468,6 @@ void invokeMergeLogitsFragments(BufferManager const& bufferManager, ITensor& out
         bufferCast<T*>(cachePointerDevice), outputLen, firstBatchSlotIdx, beamWidth, vocabSizePadded, stepOffset);
 }
 
-template <typename T>
-__global__ void tileTensorInPlace(
-    T* inputOutput, std::uint32_t const batchSize, std::size_t const inputOutputRowSize, std::uint32_t const beamWidth)
-{
-    auto const tidx = (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
-    auto const tidy = (static_cast<std::size_t>(blockIdx.y) * blockDim.y) + threadIdx.y;
-    auto const stridex = static_cast<std::size_t>(blockDim.x) * gridDim.x;
-    auto const stridey = static_cast<std::size_t>(blockDim.y) * gridDim.y;
-
-    for (auto batchIdx = tidy; batchIdx < batchSize; batchIdx += stridey)
-    {
-        for (auto columnIdx = tidx; columnIdx < inputOutputRowSize; columnIdx += stridex)
-        {
-            auto const inputIdx = ((batchIdx * beamWidth + 0) * inputOutputRowSize) + columnIdx;
-            auto const value = inputOutput[inputIdx];
-            for (std::size_t beamIdx = 1; beamIdx < beamWidth; ++beamIdx)
-            {
-                auto const outputIdx = ((batchIdx * beamWidth + beamIdx) * inputOutputRowSize) + columnIdx;
-                inputOutput[outputIdx] = value;
-            }
-        }
-    }
-}
-
-template <typename T>
-void invokeTileTensorInPlace(ITensor& inputOutput, SizeType32 const beamWidth, CudaStream const& stream)
-{
-    auto const& inputOutputShape = inputOutput.getShape();
-    auto const nbOutputRows = static_cast<std::uint32_t>(inputOutputShape.d[0]);
-    auto const nbInputRows = nbOutputRows / static_cast<std::uint32_t>(beamWidth);
-    auto const inputOutputRowSize = inputOutput.getSize() / static_cast<std::size_t>(nbOutputRows);
-
-    dim3 const blockSize{256, 1};
-    std::size_t const gridx{tc::ceilDiv(inputOutputRowSize, blockSize.x)};
-    std::size_t const gridMax{std::numeric_limits<std::uint32_t>::max()};
-    dim3 const gridSize{static_cast<std::uint32_t>(std::min(gridx, gridMax)), nbInputRows};
-    tileTensorInPlace<<<gridSize, blockSize, 0, stream.get()>>>(
-        bufferCast<T>(inputOutput), nbInputRows, inputOutputRowSize, static_cast<std::uint32_t>(beamWidth));
-}
-
 void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, ITensor const& inputOffsets,
     SizeType32 const maxInputLength, TokenIdType const padId, CudaStream const& stream)
 {
@@ -564,21 +498,6 @@ void invokeCopyPackedInputToOutput(ITensor& outputIds, ITensor const& inputIds, 
 }
 
 } // namespace
-
-void tileTensorInplace(ITensor& tensor, SizeType32 beamWidth, CudaStream const& stream)
-{
-    switch (tensor.getDataType())
-    {
-    case nvinfer1::DataType::kINT32: invokeTileTensorInPlace<SizeType32>(tensor, beamWidth, stream); break;
-    case nvinfer1::DataType::kFLOAT: invokeTileTensorInPlace<float>(tensor, beamWidth, stream); break;
-    case nvinfer1::DataType::kHALF: invokeTileTensorInPlace<half>(tensor, beamWidth, stream); break;
-    case nvinfer1::DataType::kINT8: invokeTileTensorInPlace<int8_t>(tensor, beamWidth, stream); break;
-#ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8: invokeTileTensorInPlace<__nv_fp8_e4m3>(tensor, beamWidth, stream); break;
-#endif // ENABLE_FP8
-    default: TLLM_THROW("data type not supported");
-    }
-}
 
 template <typename T>
 void invokeFill(IBuffer& buffer, T const value, CudaStream const& stream)
