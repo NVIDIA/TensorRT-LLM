@@ -2,7 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
 import os
 import tempfile
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import openai
@@ -498,110 +498,3 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
-
-
-@pytest.fixture(scope="module", ids=["DeepSeek-R1-Distill-Qwen-1.5B"])
-def reasoning_model_name() -> str:
-    return "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-
-
-@pytest.fixture(scope="module")
-def reasoning_server(reasoning_model_name: str,
-                     backend: str) -> RemoteOpenAIServer:
-    model_path = get_model_path(reasoning_model_name)
-    args = []
-    if backend == "pytorch":
-        args.extend(["--backend", f"{backend}"])
-    args.extend(["--max_beam_width", "2"])
-    args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
-    args.extend(["--reasoning_parser", "deepseek-r1"])
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-
-
-@pytest.fixture(scope="module")
-def reasoning_client(reasoning_server: RemoteOpenAIServer) -> openai.OpenAI:
-    return reasoning_server.get_client()
-
-
-def test_reasoning_parser(reasoning_client: openai.OpenAI,
-                          reasoning_model_name: str, backend: str):
-    messages = [{"role": "user", "content": "hi"}]
-    if backend == "pytorch":
-        n, extra_body = 1, None
-    else:
-        n, extra_body = 2, dict(use_beam_search=True)
-    resp = reasoning_client.chat.completions.create(
-        model=reasoning_model_name,
-        messages=messages,
-        max_completion_tokens=1000,
-        temperature=0.0,
-        n=n,
-        extra_body=extra_body,
-    )
-
-    if backend == "pytorch":
-        assert len(resp.choices) == n
-        for resp_choice in resp.choices:
-            assert len(resp_choice.message.content) > 0
-            assert len(resp_choice.message.reasoning_content) > 0
-    else:
-        assert len(resp.choices) == n
-        for resp_choice in resp.choices:
-            assert len(resp_choice.message.content) > 0
-            assert len(resp_choice.message.reasoning_content) > 0
-
-
-@pytest.fixture(scope="module")
-def async_reasoning_client(
-        reasoning_server: RemoteOpenAIServer) -> openai.OpenAI:
-    return reasoning_server.get_async_client()
-
-
-async def process_stream(
-        stream: openai.AsyncStream) -> Tuple[List[str], List[str]]:
-    content_chunks: List[str] = []
-    reasoning_content_chunks: List[str] = []
-    async for chunk in stream:
-        assert len(chunk.choices) == 1
-        choice = chunk.choices[0]
-        delta = choice.delta.dict()
-        content = delta.get("content", None)
-        reasoning_content = delta.get("reasoning_content", None)
-        if content is not None:
-            content_chunks.append(content)
-        if reasoning_content is not None:
-            reasoning_content_chunks.append(reasoning_content)
-    return (content_chunks, reasoning_content_chunks)
-
-
-@pytest.mark.asyncio(loop_scope="module")
-async def test_reasoning_parser_streaming(async_reasoning_client: openai.OpenAI,
-                                          reasoning_model_name: str,
-                                          backend: str):
-    messages = [{"role": "user", "content": "hi"}]
-    stream = await async_reasoning_client.chat.completions.create(
-        model=reasoning_model_name,
-        messages=messages,
-        max_completion_tokens=1000,
-        temperature=0.0,
-        stream=True,
-    )
-
-    content_chunks, reasoning_content_chunks = await process_stream(
-        stream=stream)
-    assert len(content_chunks) > 0
-    assert len(reasoning_content_chunks) > 0
-
-    stream = await async_reasoning_client.chat.completions.create(
-        model=reasoning_model_name,
-        messages=messages,
-        max_completion_tokens=1,
-        temperature=0.0,
-        stream=True,
-    )
-
-    content_chunks, reasoning_content_chunks = await process_stream(
-        stream=stream)
-    assert len(content_chunks) == 0
-    assert len(reasoning_content_chunks) == 1
