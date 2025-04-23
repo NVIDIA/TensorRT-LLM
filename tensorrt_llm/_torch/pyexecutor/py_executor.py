@@ -1072,6 +1072,7 @@ class PyExecutor:
     @nvtx_range("_forward_step_inter_pp")
     def _forward_step_inter_pp(self, scheduled_batch) -> DecoderState:
         batch_outputs = self._forward_step(scheduled_batch)
+        self._update_request_states(scheduled_batch)
         tokens_shape = batch_outputs["hidden_states"].shape[:-1]
         new_tokens_host = torch.empty(tokens_shape,
                                       dtype=torch.int64,
