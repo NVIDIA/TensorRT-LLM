@@ -1810,7 +1810,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
              ],
              [
                  "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus in the right lane, a police car in the middle lane, and a few other vehicles scattered across the lanes. The traffic seems to be",
-                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident."
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane, possibly indicating a traffic check or an incident.",
+                 "The image shows a multi-lane highway with traffic flowing in both directions. The road appears to be relatively clear, with a few vehicles visible on the road. There is a bus on the right side of the road, and a police car is seen in the middle lane. The traffic seems to be moving smoothly, with"
              ]],
             "video":
             [[
