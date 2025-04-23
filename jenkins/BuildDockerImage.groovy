@@ -393,7 +393,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
 
 pipeline {
     agent {
-        kubernetes createKubernetesPodConfig("agent")
+        kubernetes trtllm_utils.createKubernetesPodConfig("", "agent")
     }
 
     parameters {
