@@ -77,13 +77,19 @@ class KvCacheAwareServerState(ServerState):
         for hash in block_hashes:
             self._kv_cache_block_table.remove(hash)
 
-    def update_with_events(self, events_raw: Iterable[dict]):
-        for event_raw in events_raw:
-            event = event_raw["data"]
+    def update_with_events(self, events: Iterable[dict]):
+        # event_raw: {"id": <id>, "data": <event body>}
+        for event_raw in events:
+            if "data" in event_raw:
+                event = event_raw["data"]
+            else:
+                event = event_raw
+
             if event["type"] == "stored":
                 self.add_blocks(block["block_hash"]
                                 for block in event["blocks"])
             elif event["type"] == "removed":
+                logger.info(f"removed blocks: {event['block_hashes']}")
                 self.remove_blocks(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
@@ -95,7 +101,6 @@ class KvCacheAwareServerState(ServerState):
         match_count = 0
         async with self._lock:
             for hash_list in block_hashes:
-                # TODO: check parent hash
                 for hash in hash_list:
                     if hash in self._kv_cache_block_table:
                         match_count += 1
@@ -276,7 +281,6 @@ class KvCacheAwareRouter(Router):
             ) / total_blocks - workloads[i] / self._max_batch_size
             scores.append(score)
 
-        logger.info(f"workloads: {workloads}  scores: {scores}")
         server = servers[scores.index(max(scores))]
         await self._server_state[server].increment_load(request)
         async with self._lock:
@@ -305,6 +309,7 @@ def create_router(router_type: str, servers: list[str]) -> Router:
             - "round_robin": Creates a RoundRobinRouter
             - "requests_load_balancing": Creates a LoadBalancingRouter, which balances requests across instances
             - "tokens_load_balancing": Creates a LoadBalancingRouter, which balances tokens across instances
+            - "kv_cache_aware": Creates a KvCacheAwareRouter, which balances requests across instances additionally based on KV cache hits
         servers: List of server URLs
 
     Returns:
@@ -317,7 +322,8 @@ def create_router(router_type: str, servers: list[str]) -> Router:
     router_map = {
         "round_robin": RoundRobinRouter,
         "requests_load_balancing": LoadBalancingRouter,
-        "tokens_load_balancing": LoadBalancingRouter
+        "tokens_load_balancing": LoadBalancingRouter,
+        "kv_cache_aware": KvCacheAwareRouter,
     }
 
     router_class = router_map.get(router_type.lower())

@@ -250,7 +250,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
     async def send_request(self, session: aiohttp.ClientSession, url: str,
                            request: dict) -> dict:
         response = await super().send_request(session, url, request)
-        await self.kv_cache_block_maps[url].update_with_post_events(session)
+        events = await self.query_kv_cache_events(session, url)
+        async with self.kv_cache_block_maps[url]._lock:
+            self.kv_cache_block_maps[url].update_with_events(events)
         return response
 
     async def multi_round_request(self,
@@ -357,7 +359,6 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                 assert gen_server == gen_server_prev
             ctx_server_prev = ctx_server
             gen_server_prev = gen_server
-            # TODO: update in router.py
             response = await self.send_disagg_request(session, ctx_server,
                                                       gen_server, request)
             await asyncio.gather(
@@ -470,4 +471,4 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
                             4) as (ctx_servers, gen_servers):
         tester = KvCacheAwareRouterTester(ctx_servers, gen_servers)
         prompts = load_default_prompts(disaggregated_example_root)
-        asyncio.run(tester.test_multi_round_request(prompts, 4, 2))
+        asyncio.run(tester.test_multi_round_request(prompts, 6, 4))
