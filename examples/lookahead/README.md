@@ -43,14 +43,14 @@ Each request can specify a Lookahead configuration, noted as `(w, n, g)`. If non
 ### Convert Checkpoint
 
 This example is based on the Vicuna-7b v1.3 model, a fine-tuned Llama model.
-Checkpoint conversion is similar to any standard autoregressive model, such as the models located in the [examples/llama](../../examples/llama) directory.
+Checkpoint conversion is similar to any standard autoregressive model, such as the models located in the [examples/models/core/llama](../../examples/models/core/llama) directory.
 
 ```bash
 MODEL_DIR=/path/to/vicuna-7b-v1.3
 ENGINE_DIR=tmp/engine
 CKPT_DIR=tmp/engine/ckpt
 
-python3 examples/llama/convert_checkpoint.py    \
+python3 examples/models/core/llama/convert_checkpoint.py    \
     --model_dir=$MODEL_DIR                      \
     --output_dir=$CKPT_DIR                      \
     --dtype=float16                             \

@@ -550,24 +550,6 @@ def generate_summary_cmd(example_root, *args, **kwargs):
     return summary_cmd
 
 
-def generate_mmlu_cmd(example_root, *args, **kwargs):
-    "generate mmlu command"
-    mmlu_script = f"{example_root}/../../../mmlu_llmapi.py" if "core" in example_root else f"{example_root}/../mmlu_llmapi.py"
-    mmlu_cmd = [mmlu_script, "--check_accuracy"]
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                mmlu_cmd.append(f"--{key}")
-        else:
-            mmlu_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        mmlu_cmd.append(f"--{arg}")
-
-    return mmlu_cmd
-
-
 def generate_deterministic_cmd(example_root, *args, **kwargs):
     "generate deterministic command"
     deterministic_cmd = [

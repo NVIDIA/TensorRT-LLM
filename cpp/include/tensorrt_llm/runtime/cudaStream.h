@@ -58,7 +58,6 @@ public:
     explicit CudaStream(cudaStream_t stream, int device, bool ownsStream = true)
         : mDevice{device}
     {
-        TLLM_CHECK_WITH_INFO(stream != nullptr, "stream is nullptr");
         mStream = StreamPtr{stream, Deleter{ownsStream}};
     }
 

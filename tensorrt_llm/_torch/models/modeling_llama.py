@@ -757,7 +757,9 @@ class LlamaModel(DecoderModel):
 
         if hasattr(model_config,
                    'lora_config') and model_config.lora_config is not None:
-            self.embed_tokens.weight.value = weight.to(self.embed_tokens.dtype)
+            with torch.no_grad():
+                x = weight.to(self.embed_tokens.dtype)
+                self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
@@ -843,6 +845,15 @@ class Llama4ForConditionalGeneration(DecoderModelForCausalLM[Llama4Model,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    def infer_max_seq_len(self):
+        # TODO: increase to support 10M context length. There are two blockers
+        # right now:
+        # 1. We need to implement chunked attention.
+        # 2. CUDA graph warmup will crash when the cached context is that long.
+        # This only affects the TRTLLM backend; flashinfer is fine. It is
+        # most likely an issue with the kernel.
+        return 8192
 
     def load_weights(self, weights: Dict):
         new_weights = {}

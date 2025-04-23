@@ -1837,13 +1837,11 @@ class PyTorchModelEngine(ModelEngine):
             # We can insert other CPU computation between them in the future.
             if self.mapping.is_last_pp_rank(
             ) and self.guided_decoder is not None:
-                guided_decoder_resource_manager = resource_manager.get_resource_manager(
-                    "guided_decoder_resource_manager")
-                self.guided_decoder.build(scheduled_requests,
-                                          guided_decoder_resource_manager)
+                seq_slot_manager = resource_manager.get_resource_manager(
+                    "seq_slot_manager")
+                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
-                                            outputs['logits'],
-                                            guided_decoder_resource_manager)
+                                            outputs['logits'], seq_slot_manager)
 
             return outputs
 

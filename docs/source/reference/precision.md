@@ -85,8 +85,8 @@ The activations are encoded using floating-point values (FP16 or BF16).
 To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.
 
-This release includes examples for [GPT](source:examples/gpt) and
-[LLaMA](source:examples/llama).
+This release includes examples for [GPT](source:examples/models/core/gpt) and
+[LLaMA](source:examples/models/core/llama).
 
 ## GPTQ and AWQ (W4A16)
 
@@ -101,9 +101,9 @@ plugin and the corresponding
 [`weight_only_groupwise_quant_matmul`](source:tensorrt_llm/quantization/functional.py)
 Python function, for details.
 
-This release includes examples of applying GPTQ to [GPT-NeoX](source:examples/gpt)
-and [LLaMA-v2](source:examples/llama), as well as an example of using AWQ with
-[GPT-J](source:examples/gptj). Those examples are experimental implementations and
+This release includes examples of applying GPTQ to [GPT-NeoX](source:examples/models/core/gpt)
+and [LLaMA-v2](source:examples/models/core/llama), as well as an example of using AWQ with
+[GPT-J](source:examples/models/contrib/gpt). Those examples are experimental implementations and
 are likely to evolve in a future release.
 
 ## FP8 (Hopper)

@@ -601,7 +601,7 @@ UNIFIED_CKPT_PATH=/tmp/checkpoints/tmp_$variant_it_tensorrt_llm/bf16/tp1/
 ENGINE_PATH=/tmp/gemma2/$variant/bf16/1-gpu/
 VOCAB_FILE_PATH=gemma-2-$variant-it/tokenizer.model
 
-python3 ./examples/gemma/convert_checkpoint.py \
+python3 ./examples/models/core/gemma/convert_checkpoint.py \
     --ckpt-type hf \
     --model-dir ${CKPT_PATH} \
     --dtype bfloat16 \

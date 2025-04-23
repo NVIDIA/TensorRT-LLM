@@ -73,8 +73,6 @@ void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input, int32_t 
 
 void setRawPointers(ITensor& pointers, ITensor::SharedPtr const& input);
 
-void scatterBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager);
-
 void tileBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth, BufferManager& manager);
 
 void tileCpuBufferReplace(ITensor::SharedPtr& tensor, SizeType32 beamWidth);

@@ -24,11 +24,11 @@ from copy import deepcopy
 
 import defs.ci_profiler
 import pytest
-from defs.common import (convert_weights, generate_mmlu_cmd,
-                         generate_summary_cmd, get_cpp_benchmark,
-                         get_trt_llm_lib_dir, parse_output, quantize_data,
-                         similar, test_multi_lora_support, venv_check_call,
-                         venv_check_output, venv_mpi_check_call)
+from defs.common import (convert_weights, generate_summary_cmd,
+                         get_cpp_benchmark, get_trt_llm_lib_dir, parse_output,
+                         quantize_data, similar, test_multi_lora_support,
+                         venv_check_call, venv_check_output,
+                         venv_mpi_check_call)
 # yapf: disable
 from defs.conftest import (evaltool_humaneval_post_process,
                            evaltool_mmlu_post_process,
@@ -364,15 +364,12 @@ def test_llm_llama_1gpu_fp4(
     }
     acc_thres = accuracy_map[model_name]
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llama_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--accuracy_threshold={acc_thres}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={acc_thres}"
     ]
-
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @skip_pre_blackwell
@@ -468,14 +465,12 @@ def test_llm_llama_2gpu_fp4(mmlu_dataset_root, fp4_type, llama_example_root,
     print("Run MMLU test")
     acc_thres = 75
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llama_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--accuracy_threshold={acc_thres}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={acc_thres}"
     ]
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device(8)
@@ -512,14 +507,12 @@ def test_llm_llama_8gpu_fp4(mmlu_dataset_root, fp4_type, llama_example_root,
     print("Run MMLU test")
     acc_thres = 75
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llama_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        f"--accuracy_threshold={acc_thres}",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={acc_thres}"
     ]
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.parametrize("num_beams", [1, 2, 4],
@@ -1030,14 +1023,12 @@ def test_llm_llama_v3_1_autoq_1gpu_mmlu(llama_example_root, llama_model_root,
 
     print("Run MMLU test")
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llama_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        "--accuracy_threshold=63.8",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={63.8}"
     ]
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -1075,14 +1066,12 @@ def test_llm_llama_v3_1_autoq_2gpu_mmlu(llama_example_root, llama_model_root,
 
     print("Run MMLU test")
     mmlu_cmd = [
-        f"{llama_example_root}/../mmlu_llmapi.py",
-        f"--data_dir={mmlu_dataset_root}",
-        f"--hf_model_dir={llama_model_root}",
-        f"--engine_dir={engine_dir}",
-        "--check_accuracy",
-        "--accuracy_threshold=77.58",
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+        f"--accuracy_threshold={77.58}"
     ]
-    venv_check_call(llm_venv, mmlu_cmd)
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device(2)
@@ -1568,15 +1557,12 @@ def test_llm_llama_v2_1gpu_fp8_summary_and_mmlu(
     if mmlu_test:
         print("Run MMLU test")
         mmlu_cmd = [
-            f"{llama_example_root}/../../../mmlu_llmapi.py",
-            f"--data_dir={mmlu_dataset_root}",
-            f"--hf_model_dir={llama_model_root}",
-            f"--engine_dir={engine_dir}",
-            "--check_accuracy",
-            "--accuracy_threshold=45.0",
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={mmlu_dataset_root}", "--check_accuracy",
+            f"--accuracy_threshold={45.0}"
         ]
-
-        venv_check_call(llm_venv, mmlu_cmd)
+        check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device_memory(50000)
@@ -4247,12 +4233,12 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
         eval_cmd)
 
     print("Run mmlu...")
-    mmlu_cmd = generate_mmlu_cmd(example_root=llama_example_root,
-                                 data_dir=mmlu_dataset_root,
-                                 engine_dir=engine_dir,
-                                 hf_model_dir=llama_model_root,
-                                 enable_chunked_prefill=True)
-    venv_check_call(llm_venv, mmlu_cmd)
+    mmlu_cmd = [
+        "trtllm-eval", f"--model={engine_dir}",
+        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
+    ]
+    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -4359,12 +4345,12 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         venv_check_call(llm_venv, eval_cmd)
 
         print("Run mmlu...")
-        mmlu_cmd = generate_mmlu_cmd(example_root=llama_example_root,
-                                     data_dir=mmlu_dataset_root,
-                                     engine_dir=engine_dir,
-                                     hf_model_dir=llama_model_root,
-                                     enable_chunked_prefill=True)
-        venv_check_call(llm_venv, mmlu_cmd)
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
+        ]
+        check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
 @pytest.mark.skip_less_device_memory(50000)
