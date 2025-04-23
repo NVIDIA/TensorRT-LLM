@@ -35,6 +35,11 @@ CacheTransBufferManager::CacheTransBufferManager(
     TLLM_LOG_INFO("mRecvBufferCount:%d", mRecvBufferCount);
     TLLM_LOG_INFO("mSendBufferCount:%d", mSendBufferCount);
     TLLM_LOG_INFO("mPreAllocBufferSize:%d", mPreAllocBufferSize);
+    TLLM_LOG_INFO(
+        "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
+        "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld",
+        maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
+        mPreAllocBufferSize);
     allocateBuffer();
 }
 
@@ -188,13 +193,11 @@ void CacheTransBufferManager::allocateBuffer()
         {
             mConcurrenceSendResource.mBuffers[i] = mBufferManager.gpuSync(
                 runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
-            TLLM_LOG_INFO("mConcurrenceSendResource.mBuffers[%d]: %p", i, mConcurrenceSendResource.mBuffers[i].get());
         }
         for (size_t i = 0; i < mRecvBufferCount; i++)
         {
             mConcurrenceRecvResource.mBuffers[i] = mBufferManager.gpuSync(
                 runtime::ITensor::makeShape({static_cast<int64_t>(mBufferEleSize)}), mDataType);
-            TLLM_LOG_INFO("mConcurrenceRecvResource.mBuffers[%d]: %p", i, mConcurrenceRecvResource.mBuffers[i].get());
         }
     }
 }

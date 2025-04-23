@@ -154,7 +154,7 @@ def get_cache_transceiver_prealloc_size(executor_config: ExecutorConfig,
                                         mapping: Mapping):
     if (os.getenv("TRTLLM_USE_MPI_KVCACHE")
             or os.getenv("TRTLLM_USE_UCX_KVCACHE")):
-        kv_size_per_token = get_cache_size_per_token(model_config, mapping)
+        kv_size_per_token = int(get_cache_size_per_token(model_config, mapping))
         logger.info(
             f"get_cache_transceiver_prealloc_size kv_size_per_token: {kv_size_per_token} , executor_config.cache_transceiver_config: {executor_config.cache_transceiver_config}"
         )
@@ -220,7 +220,8 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
     activation_bytes = torch_peak_memory - model_bytes
     extra_cost = max(total_used_bytes - torch_used_bytes, 0)
     kv_cache_transceiver_prealloc_size = get_cache_transceiver_prealloc_size(
-        executor_config, model_engine, mapping)
+        executor_config, model_engine.model.model_config, mapping)
+    logger.info(f"kv_cache_transceiver_prealloc_size: {kv_cache_transceiver_prealloc_size}")
     peak_memory = torch_peak_memory + extra_cost + kv_cache_transceiver_prealloc_size
     logger.info(
         f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"

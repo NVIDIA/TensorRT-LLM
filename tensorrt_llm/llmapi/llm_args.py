@@ -860,6 +860,9 @@ class LlmArgs(BaseModel):
 
     scheduler_config: Optional[SchedulerConfig] = Field(
         default=None, description="Scheduler config.")
+    
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
+        default=None, description="Cache transceiver config.")
 
     # Speculative decoding parameters
     speculative_config: Optional[Union[
