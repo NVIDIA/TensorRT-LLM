@@ -1008,7 +1008,6 @@ int AttentionOp::mlaGeneration(
         int const ngroups = num_q_heads / num_kv_heads;
 
         int const s_q = params.acc_q_len / batch_beam;
-        assert(s_q == mMLAParams.predicted_tokens_per_seq);
         int const head_size_v = mMLAParams.kv_lora_rank;
         int const num_sm_parts = mFlashMlaNumSmParts;
         size_t const softmax_lse_size = sizeof(float) * (batch_beam * s_q * num_q_heads * num_kv_heads); // softmax_lse
