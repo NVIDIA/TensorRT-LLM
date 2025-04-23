@@ -359,7 +359,7 @@ Firstly, please install transformers with 4.45.2
     pip install -r requirements-internlm-xcomposer2.txt
 ```
 
-1. Convert Huggingface weights to TRT-LLM checkpoint format using `examples/internlm/README.md`.
+1. Convert Huggingface weights to TRT-LLM checkpoint format using `examples/models/contrib/internlm/README.md`.
 
 2. Use `trtllm-build` command to build TRT-LLM engine for OPT.
 
