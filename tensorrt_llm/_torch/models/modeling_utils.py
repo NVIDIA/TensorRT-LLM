@@ -377,9 +377,9 @@ class DecoderModelForCausalLM(nn.Module,
 
                 if hasattr(config,
                            'lora_config') and config.lora_config is not None:
-                    # TODO smor- figure out if it sticks
-                    self.lm_head.weight.value = weight.to(
-                        self.lm_head.dtype).cuda()
+                    with torch.no_grad():
+                        x = weight.to(self.lm_head.dtype).cuda()
+                        self.lm_head.weight.data.copy_(x)
 
             # use embedding weights in lm_head if tie word embedding is enabled
             if config.pretrained_config.tie_word_embeddings and not isinstance(

@@ -773,8 +773,6 @@ class PeftCacheManager(BaseResourceManager):
                                         buffer_manager=buffer_manager)
 
     def add_request_peft(self, request: LlmRequest):
-        # TODO smor- a helper function to add a request to the peft cache manager.
-        # Cosnider replacing in favor of prepare_resources
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,

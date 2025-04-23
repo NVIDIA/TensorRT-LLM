@@ -201,11 +201,11 @@ class Attention(nn.Module):
                                         out_scale=out_scale,
                                         attention_mask=attention_mask,
                                         mrope_config=mrope_config)
-
+        hidden_states = attn_output
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
         if bool(lora_params):
-            attn_lora_output = self.o_lora(attn_output, lora_params,
+            attn_lora_output = self.o_lora(hidden_states, lora_params,
                                            self.layer_idx)
             if attn_lora_output is not None:
                 attn_output = attn_output + attn_lora_output
