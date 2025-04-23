@@ -1540,7 +1540,7 @@ public:
     }
 
     /// Determines whether the current position is only one chunk away from the end of the context.
-    [[nodiscard]] bool isLastContextChunk() const noexcept
+    [[nodiscard]] bool isLastContextChunk() const
     {
         return isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete()
             || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
