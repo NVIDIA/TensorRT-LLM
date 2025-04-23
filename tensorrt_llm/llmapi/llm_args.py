@@ -54,6 +54,7 @@ class _ParallelConfig:
     pp_size: int = 1
     cp_size: int = 1
     gpus_per_node: int = 8
+    moe_cluster_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
     cp_config: dict = field(default_factory=dict)
@@ -121,6 +122,7 @@ class _ParallelConfig:
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
+                       moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
                        auto_parallel=self.auto_parallel)
@@ -731,6 +733,11 @@ class LlmArgs(BaseModel):
     gpus_per_node: Optional[int] = Field(
         default=None, description="The number of GPUs per node.")
 
+    moe_cluster_parallel_size: Optional[int] = Field(
+        default=None,
+        description="The cluster parallel size for MoE models's expert weights."
+    )
+
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
         description="The tensor parallel size for MoE models's expert weights.")
@@ -931,6 +938,9 @@ class LlmArgs(BaseModel):
             self.gpus_per_node = torch.cuda.device_count()
         assert self.gpus_per_node is not None
 
+        if self.moe_cluster_parallel_size is None:
+            self.moe_cluster_parallel_size = -1
+
         if self.moe_tensor_parallel_size is None:
             self.moe_tensor_parallel_size = -1
 
@@ -942,6 +952,7 @@ class LlmArgs(BaseModel):
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
             gpus_per_node=self.gpus_per_node,
+            moe_cluster_size=self.moe_cluster_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
@@ -1214,6 +1225,7 @@ class LlmArgs(BaseModel):
             pp_size=mapping.pp_size,
             cp_size=mapping.cp_size,
             gpus_per_node=mapping.gpus_per_node,
+            moe_cluster_size=mapping.moe_cluster_size,
             moe_tp_size=mapping.moe_tp_size,
             moe_ep_size=mapping.moe_ep_size)
 
@@ -1223,6 +1235,7 @@ class LlmArgs(BaseModel):
         tp_size = pretrained_config.mapping.tp_size
         pp_size = pretrained_config.mapping.pp_size
         cp_size = pretrained_config.mapping.cp_size
+        moe_cluster_size = pretrained_config.mapping.moe_cluster_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
         world_size = pretrained_config.mapping.world_size
@@ -1246,12 +1259,14 @@ class LlmArgs(BaseModel):
                 f"auto parallel with world_size {self.parallel_config.world_size} does not support checkpoint with "
                 "world_size {world_size} > 1")
         if not self.parallel_config.auto_parallel:
-            self.parallel_config = _ParallelConfig(tp_size=tp_size,
-                                                   pp_size=pp_size,
-                                                   cp_size=cp_size,
-                                                   gpus_per_node=gpus_per_node,
-                                                   moe_tp_size=moe_tp_size,
-                                                   moe_ep_size=moe_ep_size)
+            self.parallel_config = _ParallelConfig(
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                gpus_per_node=gpus_per_node,
+                moe_cluster_size=moe_cluster_size,
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size)
 
     def _setup_embedding_parallel_mode(self):
         if self.embedding_parallel_mode == 'NONE':

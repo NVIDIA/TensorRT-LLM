@@ -265,6 +265,10 @@ class FusedMoE(nn.Module):
         # could be modified later
         self.quant_config = model_config.quant_config
 
+        self.cluster_rank = model_config.mapping.moe_cluster_rank
+        self.cluster_size = model_config.mapping.moe_cluster_size
+        self.smart_router = True if self.cluster_size > 1 else False
+
         self.tp_rank = model_config.mapping.moe_tp_rank
         self.tp_size = model_config.mapping.moe_tp_size
 
@@ -340,6 +344,32 @@ class FusedMoE(nn.Module):
 
     def is_cutlass(self):
         return not self.is_trtllm()
+
+    def get_quant_scales(self, expert_start, expert_end):
+        assert self.smart_router
+
+        if self.has_fp8_block_scales:
+            return FusedMoEQuantScalesFP8BlockScales(
+                fc_weight_scales=self.w3_w1_weight_scaling_factor.narrow(
+                    0, expert_start, expert_end - expert_start),
+                proj_weight_scales=self.w2_weight_scaling_factor.narrow(
+                    0, expert_start, expert_end - expert_start),
+            )
+        elif self.has_nvfp4:
+            return FusedMoEQuantScalesNVFP4(
+                fc1_act_global=self.fc31_input_scale,
+                fc1_weight_block=self.w3_w1_weight_scale.narrow(
+                    0, expert_start, expert_end - expert_start),
+                fc1_global=self.fc31_alpha.narrow(0, expert_start,
+                                                  expert_end - expert_start),
+                fc2_act_global=self.fc2_input_scale,
+                fc2_weight_block=self.w2_weight_scale.narrow(
+                    0, expert_start, expert_end - expert_start),
+                fc2_global=self.fc2_alpha.narrow(0, expert_start,
+                                                 expert_end - expert_start),
+            )
+        else:
+            return self.quant_scales
 
     def create_weights(self):
         if self._weights_created:
@@ -638,19 +668,43 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
+        if self.smart_router and not min_latency_mode:
+            ep_size = self.cluster_size
+            ep_rank = self.cluster_rank
+            expert_start = ep_rank * self.num_experts // ep_size
+            expert_end = min(self.num_experts,
+                             (ep_rank + 1) * self.num_experts // ep_size)
+            w3_w1_weight = self.w3_w1_weight.narrow(0, expert_start,
+                                                    expert_end - expert_start)
+            w2_weight = self.w2_weight.narrow(0, expert_start,
+                                              expert_end - expert_start)
+            cluster_size = self.ep_size
+            cluster_rank = self.ep_rank
+            quant_scales = self.get_quant_scales(expert_start, expert_end)
+        else:
+            ep_size = self.ep_size
+            ep_rank = self.ep_rank
+            w3_w1_weight = self.w3_w1_weight
+            w2_weight = self.w2_weight
+            cluster_size = self.cluster_size
+            cluster_rank = self.cluster_rank
+            quant_scales = self.quant_scales
+
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
-            self.w3_w1_weight,
-            self.w2_weight,
+            w3_w1_weight,
+            w2_weight,
             output_dtype,
-            quant_scales=self.quant_scales,
+            quant_scales=quant_scales,
             input_sf=x_sf,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
             min_latency_mode=min_latency_mode,
         )

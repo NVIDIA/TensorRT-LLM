@@ -159,7 +159,8 @@ public:
         torch::optional<torch::Tensor> token_final_scales, torch::Tensor const& fc1_expert_weights,
         torch::Tensor const& fc2_expert_weights, torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales,
         torch::optional<torch::Tensor> input_sf, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
-        int64_t const ep_rank, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         // Free the profile workspace to save memory
         if (mProfileWorkspace != nullptr)
@@ -172,6 +173,7 @@ public:
 
         std::lock_guard<std::mutex> lock(mMutex);
 
+        TORCH_CHECK(cluster_size == 1 && cluster_rank == 0, "smart_router is supported in min_latency mode");
         CHECK_INPUT(input, mActivationDtype)
         CHECK_INPUT(token_selected_experts, at::ScalarType::Int)
         if (token_final_scales)
@@ -244,7 +246,8 @@ public:
         torch::Tensor const& fc1_expert_weights, torch::Tensor const& fc2_expert_weights,
         torch::optional<c10::ArrayRef<torch::Tensor>> quant_scales, torch::optional<torch::Tensor> input_sf,
         int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+        int64_t const cluster_size, int64_t const cluster_rank, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -283,7 +286,8 @@ public:
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
-        auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
+        auto parallelism_config
+            = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
         auto activation_type = tensorrt_llm::ActivationType::Swiglu;
 
         setRunnerProfiles(profile_ids);
@@ -332,7 +336,8 @@ public:
 
     void runGemmProfile(torch::Tensor const& input, torch::Tensor const& fc2_expert_weights, int64_t const top_k,
         int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        bool const min_latency_mode, int64_t const gemm_idx, int64_t const profile_id, bool const do_preparation)
+        int64_t const cluster_size, int64_t const cluster_rank, bool const min_latency_mode, int64_t const gemm_idx,
+        int64_t const profile_id, bool const do_preparation)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -363,7 +368,8 @@ public:
 
             // mProfiler init
             auto parallelism_config = kernels::MOEParallelismConfig(static_cast<int>(tp_size),
-                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank));
+                static_cast<int>(tp_rank), static_cast<int>(ep_size), static_cast<int>(ep_rank),
+                static_cast<int>(cluster_size), static_cast<int>(cluster_rank));
 
             int const GROUP_SIZE = -1;
             bool const USE_BIAS = false;
