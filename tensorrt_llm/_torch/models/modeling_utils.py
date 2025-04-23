@@ -240,6 +240,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional = None,  # TODO smor add type hint
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -257,6 +258,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
+                lora_params=lora_params,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -355,6 +357,15 @@ class DecoderModelForCausalLM(nn.Module,
             else:
                 # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
                 # will considering per layer QuantConfig in the future.
+
+                # TODO smor- hack
+                if hasattr(config,
+                           'lora_config') and config.lora_config is not None:
+                    from tensorrt_llm.lora_manager import HfLoraLoader
+                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                    weight = lora_loader.lm_head
+                    vocab_size = lora_loader.vocab_size
+
                 self.lm_head = LMHead(
                     vocab_size,
                     hidden_size,
@@ -363,6 +374,12 @@ class DecoderModelForCausalLM(nn.Module,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
                     gather_output=True,
                 )
+
+                if hasattr(config,
+                           'lora_config') and config.lora_config is not None:
+                    # TODO smor- figure out if it sticks
+                    self.lm_head.weight.value = weight.to(
+                        self.lm_head.dtype).cuda()
 
             # use embedding weights in lm_head if tie word embedding is enabled
             if config.pretrained_config.tie_word_embeddings and not isinstance(
@@ -450,6 +467,7 @@ class DecoderModelForCausalLM(nn.Module,
         pipeline_interface: Optional[PipelineInterface] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional = None,  # TODO smor add type hint
         **kwargs,
     ) -> torch.Tensor:
         if self._supports_pp and self.pp_size > 1:
@@ -466,12 +484,14 @@ class DecoderModelForCausalLM(nn.Module,
             if self.pp_rank < self.pp_size - 1:
                 return output
         else:
+
             output = self.model(
                 input_ids=input_ids,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
                 inputs_embeds=inputs_embeds,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
             )
 
         return self.logits_processor.forward(
@@ -504,6 +524,13 @@ class DecoderModelForCausalLM(nn.Module,
                 # skip load weights if tie word embeddings is enabled and layer is lm_head
                 if self.config.tie_word_embeddings and name.startswith(
                         "lm_head"):
+                    continue
+
+                # Skip loading weights for embedding and lm_head if LoRA is enabled
+                if hasattr(self.model_config, 'lora_config'
+                           ) and self.model_config.lora_config is not None and (
+                               name == "model.embed_tokens"
+                               or name == "lm_head"):
                     continue
 
                 # Skip if parameter belongs to a missing layer

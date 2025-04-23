@@ -171,7 +171,7 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
 
-        if lora_params is not None:
+        if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
                                               self.layer_idx)
             if qkv_lora is not None:
@@ -204,7 +204,7 @@ class Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
-        if lora_params is not None:
+        if bool(lora_params):
             attn_lora_output = self.o_lora(attn_output, lora_params,
                                            self.layer_idx)
             if attn_lora_output is not None:

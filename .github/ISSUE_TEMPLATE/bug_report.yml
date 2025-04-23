@@ -46,8 +46,6 @@ body:
 
         Performance: @kaiyux
 
-        Others: @byshiue
-
       placeholder: "@Username ..."
 
   - type: checkboxes

@@ -285,6 +285,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
@@ -321,6 +324,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @pytest.mark.skip_device_not_contain(["H100"])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
@@ -350,6 +356,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100"])
@@ -387,6 +396,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @skip_pre_blackwell
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
@@ -406,6 +418,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
@@ -433,6 +448,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            if attention_dp and cuda_graph and overlap_scheduler:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
 
 
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
