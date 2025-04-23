@@ -893,16 +893,25 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(40000)
-    @pytest.mark.parametrize("manage_weights", [True, False],
-                             ids=["manage_weights", ""])
-    def test_fp8_tp2pp2(self, manage_weights):
+    def test_fp8_tp2pp2(self):
+        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
+                        MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.FP8,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 tp_size=2,
+                 pp_size=2)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(40000)
+    def test_fp8_tp2pp2_manage_weights(self):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  pp_size=2,
-                 extra_build_args=["--fast_build"] if manage_weights else [])
+                 extra_build_args=["--fast_build"])
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
