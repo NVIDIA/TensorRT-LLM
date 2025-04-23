@@ -53,7 +53,7 @@ public:
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false,
         std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
-        bool gatherGenerationLogits = false)
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -75,6 +75,7 @@ public:
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalModelOutputs{std::move(additionalModelOutputs)}
         , gatherGenerationLogits{gatherGenerationLogits}
+        , promptTableOffloading{promptTableOffloading}
     {
         if (guidedDecodingConfig)
         {
@@ -125,6 +126,8 @@ public:
     bool isLeaderInOrchMode;
     std::optional<std::vector<executor::AdditionalModelOutput>> additionalModelOutputs;
     bool gatherGenerationLogits;
+    // Whether to offload the prompt table to CPU and prefetching to GPU
+    bool promptTableOffloading;
 };
 
 } // namespace tensorrt_llm::batch_manager

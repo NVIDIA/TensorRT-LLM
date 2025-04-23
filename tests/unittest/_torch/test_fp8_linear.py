@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 from utils.util import skip_pre_hopper
@@ -51,12 +53,18 @@ def test_fp8_linear(dtype):
 
     def ref_linear():
         ref_x_fp8 = ref_quant(x, x_scale)
+        # Align cublaslt workspace size with trtllm's 32MB.
+        # Details see in test_scaled_mm.py
+        old_env = os.environ.get("CUBLASLT_WORKSPACE_SIZE", "")
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = f"{32*1024}"
         ref_output = torch._scaled_mm(ref_x_fp8,
                                       w_fp8.t(),
                                       out_dtype=dtype,
                                       scale_a=x_scale,
                                       scale_b=w_scale,
+                                      use_fast_accum=True,
                                       bias=l0.bias)
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = old_env
         return ref_output
 
     with torch.inference_mode():

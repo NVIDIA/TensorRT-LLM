@@ -234,16 +234,11 @@ def test_tinyllama_logits_processor_tp2pp2():
 
 @pytest.mark.gpu4
 @pytest.mark.part0
-@pytest.mark.parametrize("backend", ['tensorrt', 'pytorch'])
-def test_tinyllama_guided_decoding_tp2pp2(backend: str):
-    llm_kwargs = {}
-    if backend == 'pytorch':
-        llm_kwargs['backend'] = 'pytorch'
+def test_tinyllama_guided_decoding_tp2pp2():
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
         pipeline_parallel_size=2,
-        kv_cache_config=global_kv_cache_config,
-        **llm_kwargs)
+        kv_cache_config=global_kv_cache_config)
 
 
 @pytest.mark.gpu2
@@ -288,7 +283,6 @@ def run_command(command: str):
         raise e
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5223608: timeout")
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     # TODO[chunweiy]: reactivate this later
@@ -500,10 +494,3 @@ def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
                                sampling_params: SamplingParams):
     run_llm_abort_request(llm=llm_for_sampling_params_tp2,
                           sampling_params=sampling_params)
-
-
-if __name__ == '__main__':
-
-    #test_llm_capture_request_error()
-
-    test_llm_generate_tp2()

@@ -171,7 +171,7 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
 
-        if lora_params is not None:
+        if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
                                               self.layer_idx)
             if qkv_lora is not None:
@@ -204,7 +204,7 @@ class Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
-        if lora_params is not None:
+        if bool(lora_params):
             attn_lora_output = self.o_lora(attn_output, lora_params,
                                            self.layer_idx)
             if attn_lora_output is not None:
@@ -345,6 +345,9 @@ class MLA(nn.Module):
 
         if quant_mode.has_fp8_block_scales():
             mla_weight_dtype = torch.float8_e4m3fn
+            # TODO: remove hack for fp8 Deepseek on SM100
+            if config.moe_backend == "TRTLLM":
+                mla_weight_dtype = dtype
         else:
             mla_weight_dtype = dtype
 
@@ -359,6 +362,7 @@ class MLA(nn.Module):
                                 skip_create_weights=config.skip_create_weights)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
+        # Used in forward_generation only
         self.v_b_proj = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.v_head_dim, self.kv_lora_rank),
@@ -367,6 +371,7 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        # Use in forward_generation only
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads, self.kv_lora_rank, self.qk_nope_head_dim),

@@ -37,7 +37,7 @@ WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParall
     , mContextParallelism{contextParallelism}
     , mRank{rank}
     , mGpusPerNode{gpusPerNode}
-    , mEnableAttenionDP{enableAttentionDP}
+    , mEnableAttentionDP{enableAttentionDP}
     , mDeviceIds{deviceIds.value_or(std::vector<SizeType32>(mGpusPerNode))}
 {
 #if ENABLE_MULTI_DEVICE
