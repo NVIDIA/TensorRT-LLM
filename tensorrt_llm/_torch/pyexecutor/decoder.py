@@ -11,7 +11,7 @@ from tensorrt_llm.bindings.executor import (DecodingConfig, DecodingMode,
                                             ExecutorConfig, FinishReason)
 from tensorrt_llm.bindings.internal.algorithms import (
     CreateNewDecoderRequests, GenerateRequestOptions, HandleContextLogits,
-    HandleGenerationLogits, MakeDecodingBatchInputOutput, UpdateDecoderBuffers)
+    HandleGenerationLogits, MakeDecodingBatchInputOutput)
 from tensorrt_llm.bindings.internal.batch_manager import (DecoderBuffers,
                                                           DecoderInputBuffers)
 from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
@@ -479,7 +479,6 @@ class TRTLLMDecoder(Decoder):
         self.algs.handle_generation_logits = HandleGenerationLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
-        self.algs.update_decoder_buffers = UpdateDecoderBuffers()
 
     def setup_decoder_step(self, requests):
         batch_slots, decoder_requests, sampling_configs = self.algs.generate_request_options(

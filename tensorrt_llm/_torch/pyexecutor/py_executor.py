@@ -1117,7 +1117,7 @@ class PyExecutor:
             if self.send_handles[prev_microbatch_id] is not None:
                 self.send_handles[prev_microbatch_id].Wait()
             self.send_handles[prev_microbatch_id] = self.dist.isend_tensor_list(
-                tensor=new_tokens_host.values(),
+                new_tokens_host.values(),
                 dest=self.dist.next_pp_rank,
                 tag=prev_microbatch_id)
 

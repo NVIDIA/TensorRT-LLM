@@ -130,7 +130,7 @@ class MPIDist(Distributed):
         if len(tensor_list) == 0:
             return None
         elif len(tensor_list) == 1:
-            return self.isend_tensor(tensor_list[0], dest, tag)
+            return self.isend_tensor(next(iter(tensor_list)), dest, tag)
 
         return self.isend(
             np.concatenate([t.numpy().ravel() for t in tensor_list]), dest, tag)
@@ -142,7 +142,7 @@ class MPIDist(Distributed):
         if len(tensor_list) == 0:
             return None
         elif len(tensor_list) == 1:
-            return self.recv_tensor(tensor_list[0], src, tag)
+            return self.recv_tensor(next(iter(tensor_list)), src, tag)
 
         # Prepare buffer to receive tensor_list
         recv_buffer = np.empty(sum([t.numel() for t in tensor_list]),
