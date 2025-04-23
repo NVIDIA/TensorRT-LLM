@@ -32,20 +32,25 @@ CacheTransBufferManager::CacheTransBufferManager(
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvParallelCacheSend() ? common::getEnvKVCacheSendMaxConcurrenceNum() : 1;
     mPreAllocBufferSize = mTransferBufferSize * (mRecvBufferCount + mSendBufferCount);
-    TLLM_LOG_INFO("mRecvBufferCount:%d", mRecvBufferCount);
-    TLLM_LOG_INFO("mSendBufferCount:%d", mSendBufferCount);
-    TLLM_LOG_INFO("mPreAllocBufferSize:%d", mPreAllocBufferSize);
     TLLM_LOG_INFO(
         "CacheTransBufferManager: mMaxNumTokens:%ld, mRecvBufferCount:%ld, "
         "mSendBufferCount:%ld,mTransferBufferSize:%ld, mPreAllocBufferSize:%ld",
         maxNumTokens.has_value() ? maxNumTokens.value() : 0, mRecvBufferCount, mSendBufferCount, mTransferBufferSize,
         mPreAllocBufferSize);
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseMPIKvCache();
+
+    TLLM_CHECK_WITH_INFO(to_allocate, "CacheTransBufferManager: to_allocate is false");
     allocateBuffer();
 }
 
 size_t CacheTransBufferManager::preAllocBufferSize(
     std::optional<size_t> maxNumTokens, std::optional<size_t> kvCacheSizePerToken)
 {
+    bool to_allocate = common::getEnvUseMPIKvCache() || common::getEnvUseMPIKvCache();
+    if (!to_allocate)
+    {
+        return 0;
+    }
     if (maxNumTokens.has_value())
     {
         TLLM_CHECK(kvCacheSizePerToken.has_value());
