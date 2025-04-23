@@ -39,12 +39,12 @@ sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
     "Build GPT-3 175B: 96 layer w/ plugins"
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
+    example_root = os.path.join(llm_root, "examples", "gpt")
     engine_dir = os.path.join(engine_dir, "gpt-175-96layers-build-only")
 
     dtype = 'float16'
     convert_cmd = [
-        f"{example_root}/../../../generate_checkpoint_config.py",
+        f"{example_root}/../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=1", "--num_attention_heads=96",
@@ -72,12 +72,12 @@ def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
                          ids=["use_cpp_session", "use_py_session"])
 def test_gpt_fp32(llm_root, llm_venv, additional_build_option, use_py_session,
                   engine_dir):
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
+    example_root = os.path.join(llm_root, "examples", "gpt")
     engine_dir = os.path.join(engine_dir, "gpt2")
 
     dtype = 'float32'
     convert_cmd = [
-        f"{example_root}/../../../generate_checkpoint_config.py",
+        f"{example_root}/../generate_checkpoint_config.py",
         f"--output_path={engine_dir}/ckpt_config.json",
         "--architecture=GPTForCausalLM", f"--dtype={dtype}",
         "--num_hidden_layers=2", "--num_attention_heads=16",
@@ -102,7 +102,7 @@ def test_gpt_fp32(llm_root, llm_venv, additional_build_option, use_py_session,
 
     print("Running inference...")
     run_cmd = [
-        f"{example_root}/../../../run.py", "--max_output_len=1",
+        f"{example_root}/../run.py", "--max_output_len=1",
         f"--engine_dir={engine_dir}"
     ]
     if use_py_session:
@@ -164,7 +164,7 @@ def test_llama_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 
     print("Run inference...")
     run_cmd = [
-        f"{llama_example_root}/../../../run.py",
+        f"{llama_example_root}/../run.py",
         "--max_output_len=1",
         f"--tokenizer_dir={llama_tokenizer_model_root}",
         "--log_level=verbose",
@@ -248,7 +248,7 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 
     print("Run inference...")
     run_cmd = [
-        f"{llama_example_root}/../../../run.py",
+        f"{llama_example_root}/../run.py",
         "--max_output_len=1",
         f"--tokenizer_dir={llama_tokenizer_model_root}",
         "--log_level=verbose",
@@ -1005,12 +1005,13 @@ run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models/llama-7b-hf"),
+    ("gptj", "gpt-j-6b"),
+    ("falcon", "falcon-7b-instruct"),
     ("llama", "codellama/CodeLlama-7b-Instruct-hf"),
 ])
 def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
-                                      model_name)
+    llama_example_root = os.path.join(llm_root, "examples", model_name)
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
@@ -1048,8 +1049,7 @@ def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,
 ])
 def test_llmapi_load_engine_from_build_command_with_lora(
         llm_root, llm_venv, engine_dir, model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
-                                      model_name)
+    llama_example_root = os.path.join(llm_root, "examples", model_name)
     dtype = 'bfloat16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
@@ -1150,8 +1150,7 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
 
 
 def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
-    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
-                                      "llama")
+    llama_example_root = os.path.join(llm_root, "examples", "llama")
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, "llama-7b-cmodel")
 
@@ -1225,19 +1224,6 @@ def test_trtllm_serve_example(llm_root, llm_venv):
          str(test_root / "_test_trtllm_serve_example.py")])
 
 
-def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "serve"))
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-    llm_venv.run_cmd([
-        "-m", "pytest",
-        str(test_root / "_test_trtllm_serve_multimodal_example.py")
-    ])
-
-
 def test_openai_misc_example(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_misc.py")])
@@ -1259,19 +1245,6 @@ def test_openai_chat_example(llm_root, llm_venv):
     ])
 
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_chat.py")])
-
-
-def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
-    test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    llm_venv.run_cmd(
-        ["-m", "pytest",
-         str(test_root / "_test_openai_chat_multimodal.py")])
 
 
 @pytest.mark.skip_less_device(2)
@@ -1504,7 +1477,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
-    ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
@@ -1542,6 +1514,31 @@ def test_ptq_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-V3', 'DeepSeek-V3', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_2nodes_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    # "RCCA https://nvbugs/5163844"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_overlap_scheduler",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_ep_size=8",
+        "--tp_size=16",
+        "--use_cuda_graph",
+        "--kv_cache_fraction=0.5",
+        "--max_batch_size=32",
+        "--max_num_tokens=2048",
+        "--kv_cache_enable_block_reuse",
     ])
 
 
