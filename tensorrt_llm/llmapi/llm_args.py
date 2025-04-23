@@ -19,6 +19,8 @@ from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
 from ..bindings.executor import BatchingType as _BatchingType
 from ..bindings.executor import \
+    CacheTransceiverConfig as _CacheTransceiverConfig
+from ..bindings.executor import \
     CapacitySchedulerPolicy as _CapacitySchedulerPolicy
 from ..bindings.executor import ContextChunkingPolicy as _ContextChunkingPolicy
 from ..bindings.executor import DecodingConfig, DecodingMode
@@ -638,6 +640,19 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
         res.cuda_graph_mode = self.cuda_graph_mode
         res.cuda_graph_cache_size = self.cuda_graph_cache_size
         return res
+
+
+@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
+class CacheTransceiverConfig(BaseModel, PybindMirror):
+    """
+    Configuration for the cache transceiver.
+    """
+    max_num_tokens: Optional[int] = Field(
+        default=None,
+        description="The max number of tokens the transfer buffer can fit.")
+
+    def _to_pybind(self):
+        return _CacheTransceiverConfig(max_num_tokens=self.max_num_tokens)
 
 
 @dataclass
@@ -1327,6 +1342,7 @@ def update_llm_args_with_extra_dict(
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "pytorch_backend_config": PyTorchConfig,
+        "cache_transceiver_config": CacheTransceiverConfig,
     }
     for field, field_type in field_mapping.items():
         if field in llm_args_dict:
