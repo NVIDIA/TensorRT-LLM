@@ -581,7 +581,8 @@ class LLM:
                 num_postprocess_workers=self.args.num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
-            is_llm_executor=True)
+            is_llm_executor=True,
+            lora_config=self.args.lora_config)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -594,8 +595,17 @@ class LLM:
         if self.runtime_context is not None:
             return self.runtime_context.tokenizer
 
+        # TODO smor- need to look more on this
+        # what should be chose as the tokenizer? the adapter or the base model?
+        # what happens if we have multiple adapters?
+        if hasattr(
+                self.args, "backend"
+        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+            tokenizer_path = self.args.lora_config.lora_dir[0]
+        else:
+            tokenizer_path = self.args.model
         return ModelLoader.load_hf_tokenizer(
-            self.args.model,
+            tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 
