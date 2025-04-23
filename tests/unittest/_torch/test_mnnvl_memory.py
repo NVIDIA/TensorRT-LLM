@@ -12,14 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import socket
 import unittest
 
 import pytest
-
-# isort: off
 import torch
-# isort: on
-import socket
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping

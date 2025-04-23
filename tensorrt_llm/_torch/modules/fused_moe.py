@@ -1,13 +1,12 @@
 import math
 import os
-from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import MnnvlMoe
+from tensorrt_llm._mnnvl_utils import MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
@@ -217,19 +216,6 @@ class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
 class MoEWeightLoadingMode(Enum):
     VANILLA = 0
     FUSED_GATE_UP_PROJ = 1
-
-
-@dataclass
-class MoEAlltoallInfo:
-    local_gather_indices: torch.Tensor
-    send_rank_count_cumsum: torch.Tensor
-    send_rank_local_indices: torch.Tensor
-    recv_rank_count_cumsum: torch.Tensor
-    recv_rank_local_indices: torch.Tensor
-    backward_recv_rank_local_indices: torch.Tensor
-    local_expert_ids: torch.Tensor
-    local_scales: torch.Tensor
-    local_token_allocation_count: int
 
 
 class FusedMoE(nn.Module):
@@ -1013,52 +999,36 @@ class FusedMoE(nn.Module):
             gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
         gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
             gathered_token_selected_experts, self.num_experts, self.ep_size)
-        alltoall_info_tuple = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
+        alltoall_info, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_experts,
             gathered_token_final_scales, max_num_token, expert_count, top_k,
             self.ep_rank, self.ep_size, use_real_size)
-        local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
-            recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
-            local_expert_ids, local_scales, local_token_allocation_count = alltoall_info_tuple
-        alltoall_info = MoEAlltoallInfo(*alltoall_info_tuple)
-
-        token_selected_experts, token_final_scales = local_expert_ids, local_scales
 
         if not self.use_postquant_alltoall:
             assert not isinstance(
                 x, Fp4QuantizedTensor
             ), "pre-quant alltoall doesn't support fp4 tensor"
-            x = MnnvlMoe.mnnvl_moe_alltoallv(
-                x, send_rank_count_cumsum, send_rank_local_indices,
-                recv_rank_count_cumsum, recv_rank_local_indices,
-                self.alltoall_workspace, self.ep_rank, self.ep_size,
-                local_token_allocation_count)
+            x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                             self.alltoall_workspace,
+                                             self.ep_rank, self.ep_size)
 
         return x, token_selected_experts, token_final_scales, alltoall_info
 
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     x_row: int, x_col: int,
                                     alltoall_info: MoEAlltoallInfo):
-        x = MnnvlMoe.mnnvl_moe_alltoallv(
-            x, alltoall_info.send_rank_count_cumsum,
-            alltoall_info.send_rank_local_indices,
-            alltoall_info.recv_rank_count_cumsum,
-            alltoall_info.recv_rank_local_indices, self.alltoall_workspace,
-            self.ep_rank, self.ep_size,
-            alltoall_info.local_token_allocation_count)
+        x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
+                                         self.alltoall_workspace, self.ep_rank,
+                                         self.ep_size)
 
         if x_sf is not None:
             if self.has_nvfp4:
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
-            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(
-                x_sf, alltoall_info.send_rank_count_cumsum,
-                alltoall_info.send_rank_local_indices,
-                alltoall_info.recv_rank_count_cumsum,
-                alltoall_info.recv_rank_local_indices, self.alltoall_workspace,
-                self.ep_rank, self.ep_size,
-                alltoall_info.local_token_allocation_count)
+            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                self.alltoall_workspace,
+                                                self.ep_rank, self.ep_size)
 
             if self.has_nvfp4:
                 x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
@@ -1073,10 +1043,7 @@ class FusedMoE(nn.Module):
             final_hidden_states = final_hidden_states[0]
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
-            alltoall_info.recv_rank_count_cumsum,
-            alltoall_info.recv_rank_local_indices,
-            alltoall_info.send_rank_count_cumsum,
-            alltoall_info.backward_recv_rank_local_indices,
+            alltoall_info,
             self.alltoall_workspace,
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,

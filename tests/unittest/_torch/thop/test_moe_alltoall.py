@@ -14,10 +14,7 @@
 # limitations under the License.
 import unittest
 
-# isort: off
 import torch
-# isort: on
-
 from parameterized import parameterized
 
 import tensorrt_llm as tllm

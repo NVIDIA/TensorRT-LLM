@@ -14,6 +14,7 @@
 # limitations under the License.
 import platform
 import sys
+from dataclasses import dataclass
 
 import pynvml
 import torch
@@ -273,6 +274,17 @@ class MnnvlMemory:
         return is_on_aarch64 and support_nvlink_and_all_up
 
 
+@dataclass
+class MoEAlltoallInfo:
+    local_gather_indices: torch.Tensor
+    send_rank_count_cumsum: torch.Tensor
+    send_rank_local_indices: torch.Tensor
+    recv_rank_count_cumsum: torch.Tensor
+    recv_rank_local_indices: torch.Tensor
+    backward_recv_rank_local_indices: torch.Tensor
+    local_token_allocation_count: int
+
+
 class MnnvlMoe:
     moe_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
@@ -341,48 +353,46 @@ class MnnvlMoe:
                                           max_token_count_per_rank,
                                           expert_count, top_k, ep_rank, ep_size)
 
-        return local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
-            recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices, \
-            local_expert_ids, local_scales, local_token_allocation_count
+        alltoall_info = MoEAlltoallInfo(
+            local_gather_indices, send_rank_count_cumsum,
+            send_rank_local_indices, recv_rank_count_cumsum,
+            recv_rank_local_indices, backward_recv_rank_local_indices,
+            local_token_allocation_count)
+        return alltoall_info, local_expert_ids, local_scales
 
     @staticmethod
-    def mnnvl_moe_alltoallv(x: torch.Tensor,
-                            send_rank_count_cumsum: torch.Tensor,
-                            send_rank_local_indices: torch.Tensor,
-                            recv_rank_count_cumsum: torch.Tensor,
-                            recv_rank_local_indices: torch.Tensor,
-                            workspace: torch.Tensor, ep_rank: int, ep_size: int,
-                            local_token_allocation_count: int):
+    def mnnvl_moe_alltoallv(x: torch.Tensor, alltoall_info: MoEAlltoallInfo,
+                            workspace: torch.Tensor, ep_rank: int,
+                            ep_size: int):
         assert x.dim() == 2, "only 2D tensor supported, please reshape."
-        output_tensor = torch.empty(local_token_allocation_count,
+        output_tensor = torch.empty(alltoall_info.local_token_allocation_count,
                                     x.shape[1],
                                     dtype=x.dtype,
                                     device=torch.device('cuda'))
-        torch.ops.trtllm.moe_comm(x, send_rank_count_cumsum,
-                                  send_rank_local_indices, output_tensor,
-                                  recv_rank_count_cumsum,
-                                  recv_rank_local_indices, workspace, ep_rank,
-                                  ep_size)
+        torch.ops.trtllm.moe_comm(x, alltoall_info.send_rank_count_cumsum,
+                                  alltoall_info.send_rank_local_indices,
+                                  output_tensor,
+                                  alltoall_info.recv_rank_count_cumsum,
+                                  alltoall_info.recv_rank_local_indices,
+                                  workspace, ep_rank, ep_size)
         return output_tensor
 
     @staticmethod
-    def mnnvl_moe_alltoallv_combine(
-            x: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
-            recv_rank_local_indices: torch.Tensor,
-            send_rank_count_cumsum: torch.Tensor,
-            backward_recv_rank_local_indices: torch.Tensor,
-            workspace: torch.Tensor, ep_rank: int, ep_size: int, top_k: int,
-            token_count: int):
+    def mnnvl_moe_alltoallv_combine(x: torch.Tensor,
+                                    alltoall_info: MoEAlltoallInfo,
+                                    workspace: torch.Tensor, ep_rank: int,
+                                    ep_size: int, top_k: int, token_count: int):
         assert x.dim() == 2, "2D tensor supported, please reshape."
         output_tensor = torch.zeros(token_count * top_k,
                                     x.shape[1],
                                     dtype=x.dtype,
                                     device=torch.device('cuda'))
-        torch.ops.trtllm.moe_comm(x, recv_rank_count_cumsum,
-                                  recv_rank_local_indices, output_tensor,
-                                  send_rank_count_cumsum,
-                                  backward_recv_rank_local_indices, workspace,
-                                  ep_rank, ep_size)
+        torch.ops.trtllm.moe_comm(
+            x, alltoall_info.recv_rank_count_cumsum,
+            alltoall_info.recv_rank_local_indices, output_tensor,
+            alltoall_info.send_rank_count_cumsum,
+            alltoall_info.backward_recv_rank_local_indices, workspace, ep_rank,
+            ep_size)
         return torch.sum(output_tensor.reshape(token_count, top_k, x.shape[1]),
                          dim=1,
                          keepdim=False)

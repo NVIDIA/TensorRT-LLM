@@ -36,7 +36,7 @@ import tensorrt_llm.runtime as runtime
 import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
-from ._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
@@ -80,6 +80,7 @@ __all__ = [
     'Mapping',
     'MnnvlMemory',
     'MnnvlMoe',
+    'MoEAlltoallInfo',
     'PluginBase',
     'Builder',
     'BuilderConfig',
