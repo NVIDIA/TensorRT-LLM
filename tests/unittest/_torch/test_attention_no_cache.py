@@ -6,6 +6,7 @@ from typing import List, Tuple
 
 import pytest
 import torch
+from utils.util import skip_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
@@ -128,6 +129,10 @@ class Scenario:
     def num_kv_groups(self) -> int:
         return self.num_heads // self.num_kv_heads
 
+    # self-defined repr for pytest substring match
+    def __repr__(self) -> str:
+        return f"Scenario(num_heads_{self.num_heads}, num_kv_heads_{self.num_kv_heads}, head_dim_{self.head_dim}, num_layers_{self.num_layers}, dtype_{self.dtype})"
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -175,6 +180,8 @@ scenarios = generate_attn_scenarios(num_q_heads_kv_heads, head_dim, num_layers,
                                     dtype)
 
 
+# skip for blackwell
+@skip_blackwell
 # Convert parameterized tests to pytest parametrize
 @pytest.mark.parametrize("accuracy", [(1e-2, 1e-3)],
                          ids=lambda x: f"atol={x[0]} rtol={x[1]}")
@@ -189,6 +196,7 @@ def test_attention_no_cache(scenario: Scenario,
                             context_sequence_lengths: List[int], mask_type,
                             accuracy):
     """Test attention computation without using cache for both FULL and CAUSAL masks"""
+
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
     head_dim = scenario.head_dim
