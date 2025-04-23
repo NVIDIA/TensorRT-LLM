@@ -125,7 +125,7 @@ cd cpp/build
 
     Currently encoder-decoder engines only support `--api executor`, `--type IFB`, `--enable_kv_cache_reuse false`, which are all default values so no specific settings required.
 
-    Prepare t5-small engine from [examples/enc_dec](/examples/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
+    Prepare t5-small engine from [examples/models/core/enc_dec](/examples/models/core/enc_dec/README.md#convert-and-split-weights) for the encoder-decoder 4-GPU inflight batching example.
 
     Prepare the dataset suitable for engine input lengths.
     ```
@@ -147,8 +147,8 @@ cd cpp/build
     Run the benchmark
     ```
     mpirun --allow-run-as-root -np 4 ./benchmarks/gptManagerBenchmark \
-        --encoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
-        --decoder_engine_dir ../../examples/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
+        --encoder_engine_dir ../../examples/models/core/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/encoder \
+        --decoder_engine_dir ../../examples/models/core/enc_dec/tmp/trt_engines/t5-small-4gpu/bfloat16/decoder \
         --dataset cnn_dailymail.json
     ```
 

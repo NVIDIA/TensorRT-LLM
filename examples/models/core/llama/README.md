@@ -231,7 +231,7 @@ commands still work.
 Note that the `rope_theta` and `vocab_size` are larger in LLaMA v3 models and these values are now inferred
 or pickup up from the `params.json` when using the `meta_ckpt_dir`.
 
-LLaMA 3.2 models are also supported now. For text only model like [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B), the steps are same to v3.0. For vision model like [Llama-3.2-11B-Vision](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision), please refer to the [examples/mllama/README.md](../mllama/README.md)
+LLaMA 3.2 models are also supported now. For text only model like [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B), the steps are same to v3.0. For vision model like [Llama-3.2-11B-Vision](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision), please refer to the [examples/models/core/mllama/README.md](../mllama/README.md)
 
 ```bash
 # Build LLaMA v3 8B TP=1 using HF checkpoints directly.

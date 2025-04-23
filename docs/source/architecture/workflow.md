@@ -68,7 +68,7 @@ In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its varia
 
 
 In future releases, there might be `from_jax`, `from_nemo`, `from_keras` or other factory methods for different training checkpoints added.
-For example, the Gemma 2B model and the convert_checkpoint.py file in the [`examples/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gemma/)
+For example, the Gemma 2B model and the convert_checkpoint.py file in the [`examples/models/core/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gemma/)
 directory support JAX and Keras formats in addition to Hugging Face. The model developers can choose to implement **any subset** of these factory methods for the models they contributed to TensorRT-LLM.
 
 
