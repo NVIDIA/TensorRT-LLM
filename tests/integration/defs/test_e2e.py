@@ -1616,7 +1616,7 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
         f"{llm_models_root()}/{model_path}",
         "--eagle_model_dir",
         f"{llm_models_root()}/{eagle_model_path}",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 
@@ -1643,7 +1643,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
         "--kv_cache_fraction=0.95",
         "--max_batch_size=1",
         "--max_seq_len=3000",
-        "--kv_cache_enable_block_reuse",
+        "--disable_kv_cache_reuse",
     ])
 
 

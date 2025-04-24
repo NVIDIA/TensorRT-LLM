@@ -484,3 +484,5 @@ accuracy/test_cli_flow.py::TestLlama3_2_1B::test_cyclic_kv_cache SKIP (https://n
 accuracy/test_llm_api_pytorch.py::TestMixtral8x7B::test_fp8_tp2 SKIP (https://nvbugs/5220763)
 test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1] SKIP (https://nvbugs/5233422)
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-8B-FP16-vila/NVILA-8B-image] SKIP (https://nvbugs/5233423)
+accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized SKIP (https://nvbugs/5238599)
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4 SKIP (https://nvbugs/5238602)

@@ -307,7 +307,7 @@ class FusedMoE(nn.Module):
         self.has_been_profiled_min_latency = False
 
         self._weights_created = False
-        if not model_config.skip_create_weights:
+        if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
