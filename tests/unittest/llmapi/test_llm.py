@@ -35,8 +35,6 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
 
-from .run_llm_with_postproc import perform_faked_oai_postprocess
-
 # isort: off
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
@@ -2105,9 +2103,13 @@ def test_llm_with_postprocess_parallel():
 
 def run_llm_with_postprocess_parallel_and_result_handler(
         streaming, backend, tp_size: int = 1):
-    sampling_params = SamplingParams(max_tokens=6)
+    # avoid import error when running in CI
     from tensorrt_llm.executor.postproc_worker import (PostprocArgs,
                                                        PostprocParams)
+
+    from .run_llm_with_postproc import perform_faked_oai_postprocess
+
+    sampling_params = SamplingParams(max_tokens=6)
     post_proc_args = PostprocArgs(tokenizer=llama_model_path)
     post_proc_params = PostprocParams(
         post_processor=perform_faked_oai_postprocess,
