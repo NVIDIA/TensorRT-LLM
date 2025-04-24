@@ -1905,8 +1905,6 @@ void KVCacheManager::addSequence(
     auto const [seqIt, emplaceDone] = [&]
     {
         auto lck = std::scoped_lock(mSequencesMtx);
-        // Note that currently sliding window kv cache doesn't work with shared kv cache of different beams.
-        // TODO (tomer): remove comment after checking if works with beam search
         return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
             mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
     }();

@@ -568,19 +568,6 @@ std::shared_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    bool enableSlidingWindowKvCache = false;
-    for (SizeType32 maxAttenWin : getMaxAttentionWindowVec())
-    {
-        if (maxAttenWin != getMaxSequenceLen())
-        {
-            enableSlidingWindowKvCache = true;
-            break;
-        }
-    }
-    // TODO (tasida): Should this be removed? Beam search + sliding window kv cache should be supported.
-    TLLM_CHECK_WITH_INFO(getMaxBeamWidth() == 1 || !enableSlidingWindowKvCache,
-        "Can't support sliding window kv cache with beam search.");
-
     // init KV cache block manager
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
