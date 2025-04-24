@@ -243,6 +243,13 @@ private:
 
         // The number of Ctas per Q sequence.
         int numCtasPerSeqQ = (params.mMaxSeqLenQ + kernelMeta.mStepQ - 1) / kernelMeta.mStepQ;
+        // Each CTA handles one tokenQ by default for spec-decoding generation kernel, which is used to emulate causal
+        // masking (like MTP or Eagle3). Note this will be changed later when the high-throughput spec-decoding
+        // generation kernels are integrated.
+        if (params.mMaxSeqLenQ > 1 && !isContextKernel(params.mKernelType))
+        {
+            numCtasPerSeqQ = params.mMaxSeqLenQ;
+        }
 
         // Compute the grid dimension Y.
         int numHeadsPerCta
@@ -260,12 +267,6 @@ private:
         int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
         // Compute the grid dimension Z.
         int numCtasZ = params.mBatchSize;
-        // MTP kernels use different blockY to process MTP tokens.
-        if (isMlaGenKernel(params) && params.mMaxSeqLenQ > 1)
-        {
-            numCtasZ *= params.mMaxSeqLenQ;
-            numCtasPerSeqQ = 1;
-        }
         // The 2CtaMma kernels will use 2 Ctas in the x dimension (only used by MLA generation kernels) for heads,
         // so numCtasPerHeadDim and numCtasForAllHeadsQ will be handled by the 2Ctas in the x dimension.
         if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma)
@@ -285,8 +286,8 @@ private:
             // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
             int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
-            numCtasPerSeqKv = std::min(
-                maxNumCtasPerSeqKv, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ)));
+            numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
+                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ))));
             // The current total number of CTAs.
             int totalNumCtas = numCtasPerSeqQ * numCtasPerSeqKv * numCtasZ * numCtasY;
             // Reset multiCtasKvMode to false.
@@ -330,10 +331,10 @@ private:
             // Split the headDimV into multiple CTAs if the utilization is not full.
             // It doesn't work with reuseSmemKForV currently.
             // TODO: find better heuristic of splitting headDimV across multiple CTAs.
-            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas < params.mMultiProcessorCount)
+            if (selectKernelParams.mHeadDimPerCtaV == 512 && totalNumCtas * 2 <= params.mMultiProcessorCount)
             {
                 // Use smaller headDimPerCtaV to fully utilize the SMs.
-                selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 2 < params.mMultiProcessorCount ? 128 : 256;
+                selectKernelParams.mHeadDimPerCtaV = totalNumCtas * 4 <= params.mMultiProcessorCount ? 128 : 256;
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
