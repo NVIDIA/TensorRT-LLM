@@ -552,15 +552,8 @@ class TRTLLMDecoder(Decoder):
             non_blocking=True)
         new_tokens_device_tensor = new_tokens_device_tensor.view(-1)
 
-        # NOTE: If we overwrite seq lens on every iteration then overlap scheduling seemingly works.
-        #       This could be a race condition.
         self.store["sequence_lengths_host"].copy_(
             self.algs.decoder.decoder_state.sequence_lengths, non_blocking=True)
-
-        # TODO: We should instead copy on every iteration, however this doesn't work for overlap scheduling atm.
-        #       It's still not understood why.
-        # sequence_lengths = self.store["decoder_buffers"].sequence_lengths.to('cpu', non_blocking=True)
-
         new_output_tokens = self.algs.decoder.decoder_state.all_new_tokens.to(
             'cpu', non_blocking=True)
         finished_sum = self.algs.decoder.decoder_state.finished_sum.to(
