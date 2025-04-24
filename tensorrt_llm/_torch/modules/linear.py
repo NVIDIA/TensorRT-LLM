@@ -183,13 +183,12 @@ class Linear(nn.Module):
 
         self.in_features = local_in_features
         self.out_features = local_out_features
+        self.global_out_features = out_features
 
         self.all_reduce = AllReduce(
             self.parallel_config) if not is_expert else None
         self._weights_created = False
         self.is_expert = is_expert
-        if self.is_expert:
-            self.num_expert = out_features
         self.use_custom_cublas_mm = use_custom_cublas_mm
         # Llama4 QKV gemm kernel has hard requirement of hidden_size = 5120
         # and soft requirement of out_features = 896.
@@ -396,7 +395,7 @@ class Linear(nn.Module):
     def llama4_router_forward(self, input: torch.Tensor):
         # This magic number 4 is empircal choice, and can be changed later.
         # The router gemm is currently only available for 128 experts (and not 16).
-        if input.shape[0] <= 8 and self.is_expert and self.num_expert == 128:
+        if input.shape[0] <= 8 and self.global_out_features == 128:
             return torch.ops.trtllm.llama4_router_gemm(
                 input, torch.transpose(self.weight, 0, 1))
         else:

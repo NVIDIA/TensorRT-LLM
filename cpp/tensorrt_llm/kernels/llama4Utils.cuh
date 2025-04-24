@@ -7,49 +7,49 @@ namespace tensorrt_llm::kernels
 
 namespace llama4_router_gemm
 {
-constexpr size_t GEMM_K = 5120;
-constexpr size_t BLOCK_SIZE = 256;
-constexpr size_t NUM_EXPERTS = 128;
-constexpr size_t VEC_SIZE = 4;
+constexpr int GEMM_K = 5120;
+constexpr int BLOCK_SIZE = 256;
+constexpr int NUM_EXPERTS = 128;
+constexpr int VEC_SIZE = 4;
 
 } // namespace llama4_router_gemm
 
 namespace llama4_qkv_gemm
 {
 
-constexpr size_t HIDDEN_IN = 5120;
-constexpr size_t HIDDEN_OUT = 896;
+constexpr int HIDDEN_IN = 5120;
+constexpr int HIDDEN_OUT = 896;
+constexpr int Q_HIDDEN_OUT = 640;
 
-constexpr size_t Q_HIDDEN_OUT = 640;
-constexpr size_t FLOOR_SCALE = 8192.0;
-constexpr size_t ATTN_SCALE = 0.1;
+constexpr float FLOOR_SCALE = 8192.0;
+constexpr float ATTN_SCALE = 0.1;
 
-constexpr size_t BLOCK_SIZE = 128;
-constexpr size_t WARP_SIZE = 32;
-constexpr size_t WARP_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+constexpr int BLOCK_SIZE = 128;
+constexpr int WARP_SIZE = 32;
+constexpr int WARP_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
 // Use 8 for now, which results in LDG.64.
-constexpr size_t VEC_SIZE = 8;
+constexpr int VEC_SIZE = 8;
 
-constexpr size_t ENABLE_ACQBULK = 1;
-constexpr size_t ENABLE_PREFETCH = 1;
-constexpr size_t ENABLE_PREEXIT = 0;
+constexpr bool ENABLE_ACQBULK = 1;
+constexpr bool ENABLE_PREFETCH = 1;
+constexpr bool ENABLE_PREEXIT = 0;
 
 } // namespace llama4_qkv_gemm
 
 namespace llama4_fc_swiglu
 {
 
-constexpr size_t HIDDEN_IN = 5120;
+constexpr int HIDDEN_IN = 5120;
 
-constexpr size_t BLOCK_SIZE = 128;
-constexpr size_t WARP_SIZE = 32;
+constexpr int BLOCK_SIZE = 128;
+constexpr int WARP_SIZE = 32;
 
-constexpr size_t ENABLE_ACQBULK = 1;
-constexpr size_t ENABLE_PREFETCH = 1;
-constexpr size_t ENABLE_PREEXIT = 1;
+constexpr bool ENABLE_ACQBULK = 1;
+constexpr bool ENABLE_PREFETCH = 1;
+constexpr bool ENABLE_PREEXIT = 1;
 
 // Use 8 for now, which results in LDG.64.
-constexpr size_t VEC_SIZE = 8;
+constexpr int VEC_SIZE = 8;
 
 } // namespace llama4_fc_swiglu
 
