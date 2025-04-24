@@ -137,7 +137,8 @@ class QwenRewardController(NativeRewardController):
         yield [merged_task]
 
         assert merged_task.context_logits is not None
-        # TODO: consider running on cpu to not interrupt worker
+        # TODO: consider running on cpu to not interrupt worker or move
+        # tokenizer to a worker
         input_ids = self.tokenizer.encode(
             combined_prompt,
             return_tensors="pt",
