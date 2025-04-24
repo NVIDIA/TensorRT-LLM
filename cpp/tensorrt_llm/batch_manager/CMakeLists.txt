@@ -31,16 +31,16 @@ find_library(
   SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
                               /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
 find_library(
-  UCX_BACKEND_LIBRARY ucx_backend
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+  UCX_BACKEND_LIBRARY plugin_UCX
+  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu/plugins
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/plugins)
 find_library(
   UCX_UTILS_LIBRARY ucx_utils HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
                                     /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
 find_library(
-  GDS_BACKEND_LIBRARY gds_backend
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+  GDS_BACKEND_LIBRARY plugin_GDS
+  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu/plugins
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/plugins)
 
 # Check if all required libraries were found
 if(NOT NIXL_LIBRARY

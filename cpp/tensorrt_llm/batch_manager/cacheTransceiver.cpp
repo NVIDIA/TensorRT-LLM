@@ -187,7 +187,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
-    if (mCommType == CommType::MPI || mCommType == CommType::UCX)
+    if (mCommType == CommType::MPI || mCommType == CommType::UCX || mCommType == CommType::NIXL)
     {
         if (mCommType == CommType::UCX)
         {

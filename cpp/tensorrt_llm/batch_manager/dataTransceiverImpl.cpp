@@ -16,8 +16,6 @@
  */
 
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
-#include "nixl.h"
-#include "nixl_descriptors.h" // For nixlBasicDesc
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
