@@ -452,7 +452,10 @@ include_directories(${COMMON_HEADER_DIRS})
 include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
 # Define the ENABLE_NIXL flag with a default value
-set_ifndef(ENABLE_NIXL 1)
+if(NOT DEFINED ENABLE_NIXL)
+  set(ENABLE_NIXL 1)
+endif()
+message(STATUS "ENABLE_NIXL is set to ${ENABLE_NIXL}")
 
 if(ENABLE_NIXL)
   # Check for necessary dependencies for NIXL

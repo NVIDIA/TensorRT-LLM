@@ -31,16 +31,24 @@ find_library(
   SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
                               /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
 find_library(
-  UCX_BACKEND_LIBRARY ucx_backend
+  UCX_BACKEND_LIBRARY plugin_UCX
   HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/plugins)
 find_library(
   UCX_UTILS_LIBRARY ucx_utils HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
                                     /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
 find_library(
-  GDS_BACKEND_LIBRARY gds_backend
+  GDS_BACKEND_LIBRARY plugin_GDS
   HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/plugins)
+
+message(STATUS "Found NIXL libraries:")
+message(STATUS "  NIXL: ${NIXL_LIBRARY}")
+message(STATUS "  NIXL Build: ${NIXL_BUILD_LIBRARY}")
+message(STATUS "  SERDES: ${SERDES_LIBRARY}")
+message(STATUS "  UCX Backend: ${UCX_BACKEND_LIBRARY}")
+message(STATUS "  UCX Utils: ${UCX_UTILS_LIBRARY}")
+message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
 
 # Check if all required libraries were found
 if(NOT NIXL_LIBRARY
@@ -51,14 +59,6 @@ if(NOT NIXL_LIBRARY
    OR NOT GDS_BACKEND_LIBRARY)
   message(FATAL_ERROR "One or more NIXL libraries not found")
 endif()
-
-message(STATUS "Found NIXL libraries:")
-message(STATUS "  NIXL: ${NIXL_LIBRARY}")
-message(STATUS "  NIXL Build: ${NIXL_BUILD_LIBRARY}")
-message(STATUS "  SERDES: ${SERDES_LIBRARY}")
-message(STATUS "  UCX Backend: ${UCX_BACKEND_LIBRARY}")
-message(STATUS "  UCX Utils: ${UCX_UTILS_LIBRARY}")
-message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
 
 # keep this list sorted alphabetically
 set(SRCS
