@@ -1,29 +1,15 @@
-from typing import Tuple
-
 import flashinfer
 import pytest
 import torch
+from _model_test_utils import (
+    apply_rotary_pos_emb_complex,
+    apply_rotary_pos_emb_explicit,
+    rotate_half,
+)
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
 torch.manual_seed(0)
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # head_dim must be a multiple of 64
@@ -82,7 +68,9 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
     k_for_hf = key.transpose(1, 2).clone()
     cos_expand = cos_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
     sin_expand = sin_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
-    q_hf, k_hf = apply_rotary_pos_emb(q_for_hf, k_for_hf, cos_expand, sin_expand, unsqueeze_dim=1)
+    q_hf, k_hf = apply_rotary_pos_emb_explicit(
+        q_for_hf, k_for_hf, cos_expand, sin_expand, unsqueeze_dim=1
+    )
 
     # Convert outputs to [batch, seq_len, n_head, head_dim]
     q_hf = q_hf.transpose(1, 2).to(dtype)
@@ -95,19 +83,6 @@ def test_flashinfer_custom_op_and_hf_impl(dtype, atol, rtol, head_dim):
     torch.testing.assert_close(k_hf, k_flash, rtol=rtol, atol=atol)
     torch.testing.assert_close(q_hf, custom_q, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_hf, custom_k, rtol=rtol, atol=atol)
-
-
-# Version 2: complex multiplication approach
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2)
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis[:, :, None, :]).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 @pytest.mark.parametrize("head_dim", [64, 256])  # Must be a multiple of 64
@@ -143,7 +118,7 @@ def test_flashinfer_custom_op_and_complex_impl(dtype, atol, rtol, head_dim):
     query = torch.randn(batch, seq_len, n_head, head_dim, dtype=dtype, device=device)
     key = torch.randn(batch, seq_len, n_head, head_dim, dtype=dtype, device=device)
 
-    out_q_v2, out_k_v2 = apply_rotary_emb(query, key, freqs_cis)
+    out_q_v2, out_k_v2 = apply_rotary_pos_emb_complex(query, key, freqs_cis)
 
     cos_from_freqs = torch.real(freqs_cis)  # (B, seq, head_dim//2)
     sin_from_freqs = torch.imag(freqs_cis)  # (B, seq, head_dim//2)
@@ -219,7 +194,7 @@ def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
     sin_exp = sin_full.unsqueeze(0).expand(batch, -1, -1)  # [B, S, H]
 
     # HF reference in float32, then cast back
-    q_f32, k_f32 = apply_rotary_pos_emb(
+    q_f32, k_f32 = apply_rotary_pos_emb_explicit(
         q.to(torch.float32), k.to(torch.float32), cos_exp, sin_exp, unsqueeze_dim=unsq
     )
     q_hf = q_f32.to(dtype)
@@ -300,7 +275,7 @@ def test_ds_impl_and_hf_impl(dtype, head_dim, atol, rtol):
     k_for_hf = key.transpose(1, 2).clone()
     cos_expand = cos_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
     sin_expand = sin_new.unsqueeze(0).expand(batch, -1, -1)  # [batch, seq_len, head_dim]
-    q_rotated_hf, k_rotated_hf = apply_rotary_pos_emb(
+    q_rotated_hf, k_rotated_hf = apply_rotary_pos_emb_explicit(
         q_for_hf, k_for_hf, cos_expand, sin_expand, unsqueeze_dim=1
     )
     q_rotated_hf = q_rotated_hf.transpose(1, 2).to(torch.float32)
