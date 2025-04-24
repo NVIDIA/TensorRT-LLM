@@ -9,7 +9,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (mpi_broadcast, str_dtype_to_binding,
                                  torch_dtype_to_str)
-from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
+from tensorrt_llm.bindings.executor import (DecodingMode, ExecutorConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig, load_torch_hf_lora
 from tensorrt_llm.mapping import Mapping
@@ -415,7 +415,7 @@ def create_py_executor_instance(dist,
         # TODO smor- need to figure out how to set these values
         max_loras = 2
         max_cpu_loras = 2
-        executor_config.peft_cache_config = trtllm.PeftCacheConfig(
+        executor_config.peft_cache_config = PeftCacheConfig(
             num_device_module_layer=max_lora_rank * num_lora_modules *
             max_loras,
             num_host_module_layer=max_lora_rank * num_lora_modules *
