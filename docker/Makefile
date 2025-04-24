@@ -41,7 +41,7 @@ GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
 PYTHON_VERSION     ?=
-INSTALL_TRITON     ?= 0
+INSTALL_TRITON     ?= 1
 
 define add_local_user
 	docker build \

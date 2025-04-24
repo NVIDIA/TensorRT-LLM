@@ -18,13 +18,8 @@ install_triton_deps() {
     libnuma-dev \
     python3-build \
     libb64-dev \
-    libarchive-dev
-
-  ARCH=$(uname -m)
-  if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
-  if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
-
-  curl -o /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${ARCH}/cuda-keyring_1.0-1_all.deb && apt install /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && apt-get update && apt-get install -y datacenter-gpu-manager=1:3.2.6
+    libarchive-dev \
+    datacenter-gpu-manager=1:3.3.6
 
   install_boost
 }
@@ -39,5 +34,6 @@ if [ "$INSTALL_TRITON" == "1" ]; then
     echo "Skip Triton installation for non-Ubuntu base image"
   fi
 else
+  echo "Skip Triton installation when INSTALL_TRITON is set to 0"
   rm -rf /opt/tritonserver
 fi
