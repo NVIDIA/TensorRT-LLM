@@ -246,3 +246,9 @@ with torch.inference_mode():
         inference_pipeline_parallel=pp_size,  # The pipeline parallelism size for inference.
     )
 ```
+
+## Quantizing from the HuggingFace format to the HuggingFace format
+It is useful to be able to quantize models from HuggingFace, without changing their format, for example if you plan to use them in TensorRT-LLM's Pytorch-based workflow. The `quantize_hf_to_hf.py` script serves that purpose. It is a reduced version of ModelOpt's [example post-training quantization script](https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/examples/llm_ptq/hf_ptq.py). Please refer to the original for a more up-to-date version. For example, it can be used to quantize a model to `fp8` for tensor-parallelism 4:
+```
+python3 quantize_hf_to_hf.py --qformat=fp8 --pyt_ckpt_path=/path/to/huggingface/model --inference_tensor_parallel=4 --inference_pipeline_parallel=1 --export_path=/path/to/store/quantized/model
+```
