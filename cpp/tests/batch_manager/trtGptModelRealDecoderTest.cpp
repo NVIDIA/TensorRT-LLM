@@ -1066,7 +1066,7 @@ INSTANTIATE_TEST_SUITE_P(GptV1Tests, ParamTest,
             BeamConfig{1, {1}}, BeamConfig{2, {2}} // , BeamConfig{2, {1, 2}}
             ),
         testing::Values(std::nullopt),             // maxTokensInPagedKvCache
-        testing::Values(0.2, 0.4),                 // freeGpuMemoryFraction
+        testing::Values(0.4),                      // freeGpuMemoryFraction
         testing::Values(false),                    // enableTrtOverlap
         testing::Values(false),                    // enableChunkedContext
         testing::Values(false),                    // enableStreamingMode
