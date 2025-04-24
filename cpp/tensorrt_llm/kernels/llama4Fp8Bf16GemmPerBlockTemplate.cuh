@@ -242,6 +242,10 @@ __launch_bounds__(BLOCK_SIZE) __global__
         {                                                                                                              \
             return reinterpret_cast<void*>(llama4_gemv_per_block_kernel<HIDDEN_IN, 4, TILE_OUT, ALIGNED>);             \
         }                                                                                                              \
+        if (TILE_TOKEN == 8)                                                                                           \
+        {                                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_per_block_kernel<HIDDEN_IN, 8, TILE_OUT, ALIGNED>);             \
+        }                                                                                                              \
         throw std::invalid_argument("Invalid tile token");                                                             \
     } while (0)
 
@@ -263,6 +267,10 @@ __launch_bounds__(BLOCK_SIZE) __global__
         if (TILE_OUT == 4)                                                                                             \
         {                                                                                                              \
             DISPATCH_PER_BLOCK_FC_FP8_BF16_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 4, ALIGNED);                              \
+        }                                                                                                              \
+        if (TILE_OUT == 8)                                                                                             \
+        {                                                                                                              \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 8, ALIGNED);                              \
         }                                                                                                              \
         throw std::invalid_argument("Invalid tile token");                                                             \
     } while (0)

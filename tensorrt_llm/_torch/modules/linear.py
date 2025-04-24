@@ -326,8 +326,8 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                if self.use_llama4_qkv and qinput.shape[0] <= 4:
-                    # Kernel is only supported when M <= 4
+                if self.use_llama4_qkv and (qinput.shape[0] <= 8):
+                    # Kernel is only supported when M <= 8
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput,
                         weight.t(),
@@ -396,7 +396,7 @@ class Linear(nn.Module):
     def llama4_router_forward(self, input: torch.Tensor):
         # This magic number 4 is empircal choice, and can be changed later.
         # The router gemm is currently only available for 128 experts (and not 16).
-        if input.shape[0] <= 4 and self.is_expert and self.num_expert == 128:
+        if input.shape[0] <= 8 and self.is_expert and self.num_expert == 128:
             return torch.ops.trtllm.llama4_router_gemm(
                 input, torch.transpose(self.weight, 0, 1))
         else:

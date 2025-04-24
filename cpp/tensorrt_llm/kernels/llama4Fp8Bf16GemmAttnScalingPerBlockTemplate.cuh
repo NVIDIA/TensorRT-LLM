@@ -202,44 +202,50 @@ __launch_bounds__(BLOCK_SIZE) __global__ void llama4_gemv_attn_scaling_per_block
 #endif
 }
 
-#define DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED) \
-    do { \
-        if (TILE_TOKEN == 1) { \
-            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 1, TILE_OUT, ALIGNED>); \
-        } \
-        if (TILE_TOKEN == 2) { \
-            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 2, TILE_OUT, ALIGNED>); \
-        } \
-        if (TILE_TOKEN == 3) { \
-            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 3, TILE_OUT, ALIGNED>); \
-        } \
-        if (TILE_TOKEN == 4) { \
-            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 4, TILE_OUT, ALIGNED>); \
-        } \
-        throw std::invalid_argument("Invalid tile token"); \
+#define DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED)                    \
+    do {                                                                                                                    \
+        if (TILE_TOKEN == 1) {                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 1, TILE_OUT, ALIGNED>);     \
+        }                                                                                                                   \
+        if (TILE_TOKEN == 2) {                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 2, TILE_OUT, ALIGNED>);     \
+        }                                                                                                                   \
+        if (TILE_TOKEN == 3) {                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 3, TILE_OUT, ALIGNED>);     \ 
+        }                                                                                                                   \
+        if (TILE_TOKEN == 4) {                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 4, TILE_OUT, ALIGNED>);     \
+        }                                                                                                                   \
+        if (TILE_TOKEN == 8) {                                                                                              \
+            return reinterpret_cast<void*>(llama4_gemv_attn_scaling_per_block_kernel<HIDDEN_IN, 8, TILE_OUT, ALIGNED>);     \
+        }                                                                                                                   \
+        throw std::invalid_argument("Invalid tile token");                                                                  \
     } while (0)
 
-#define DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED) \
-    do { \
-        if (TILE_OUT == 1) { \
-            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 1, ALIGNED); \
-        } \
-        if (TILE_OUT == 2) { \
-            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 2, ALIGNED); \
-        } \
-        if (TILE_OUT == 3) { \
-            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 3, ALIGNED); \
-        } \
-        if (TILE_OUT == 4) { \
-            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 4, ALIGNED); \
-        } \
-        throw std::invalid_argument("Invalid tile token"); \
+#define DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, TILE_TOKEN, TILE_OUT, ALIGNED)                      \
+    do {                                                                                                                    \
+        if (TILE_OUT == 1) {                                                                                                \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 1, ALIGNED);                      \
+        }                                                                                                                   \
+        if (TILE_OUT == 2) {                                                                                                \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 2, ALIGNED);                      \
+        }                                                                                                                   \
+        if (TILE_OUT == 3) {                                                                                                \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 3, ALIGNED);                      \
+        }                                                                                                                   \
+        if (TILE_OUT == 4) {                                                                                                \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 4, ALIGNED);                      \
+        }                                                                                                                   \
+        if (TILE_OUT == 8) {                                                                                                \
+            DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_TOKEN(HIDDEN_IN, TILE_TOKEN, 8, ALIGNED);                      \
+        }                                                                                                                   \
+        throw std::invalid_argument("Invalid tile token");                                                                  \
     } while (0)
 
-#define DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(HIDDEN_IN, ALIGNED)                                                 \
-    void* get_per_block_attn_scaling_func_ptr_aligned_##ALIGNED##_##HIDDEN_IN##_(int tile_token, int tile_out)         \
-    {                                                                                                                  \
-        DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                \
+#define DEFINE_GET_PER_BLOCK_ATTN_SCALING_FUNC_PTR(HIDDEN_IN, ALIGNED)                                                      \
+    void* get_per_block_attn_scaling_func_ptr_aligned_##ALIGNED##_##HIDDEN_IN##_(int tile_token, int tile_out)              \
+    {                                                                                                                       \
+        DISPATCH_PER_BLOCK_FC_FP8_BF16_ATTN_SCALING_TILE_OUT(HIDDEN_IN, tile_token, tile_out, ALIGNED);                     \
     }
 
 } // namespace tensorrt_llm::kernels::llama4_qkv_gemm

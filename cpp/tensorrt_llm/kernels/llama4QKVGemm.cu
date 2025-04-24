@@ -64,28 +64,56 @@ void llama4_qkv_gemv_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
     }
     else if (num_tokens == 2)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 1.
+        // When num_tokens == 2, the best tiling size is tile_token == 2 and tile_out == 1.
         const dim3 grid_size = dim3(div_up(hidden_out, 1), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 1);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 3)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 4.
+        // When num_tokens == 3, the best tiling size is tile_token == 1 and tile_out == 4.
         const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
     else if (num_tokens == 4)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
+        // When num_tokens == 4, the best tiling size is tile_token == 2 and tile_out == 2.
         const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
     }
+    else if (num_tokens == 5)
+    {
+        // When num_tokens == 5, the best tiling size is tile_token == 1 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
+    }
+    else if (num_tokens == 6)
+    {
+        // When num_tokens == 6, the best tiling size is tile_token == 3 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 3), 1);
+        void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(3, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
+    }
+    else if (num_tokens == 7)
+    {
+        // When num_tokens == 7, the best tiling size is tile_token == 1 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(1, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
+    }
+    else if (num_tokens == 8)
+    {
+        // When num_tokens == 8, the best tiling size is tile_token == 2 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        void* kernel_func = get_per_block_func_ptr_aligned_true_5120_(2, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 7);
+    }
     else
     {
-        throw std::runtime_error("llama4QKVGemm: num_tokens larger than 4 is unsupported.");
+        throw std::runtime_error("llama4QKVGemm: num_tokens > 8 are not supported.");
     }
 }
 
@@ -105,28 +133,56 @@ void llama4_qkv_gemv_attn_scaling_kernel_launcher(__nv_fp8_e4m3 const* A, __nv_f
     }
     else if (num_tokens == 2)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
+        // When num_tokens == 2, the best tiling size is tile_token == 2 and tile_out == 2.
         const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 3)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 1 and tile_out == 4.
+        // When num_tokens == 3, the best tiling size is tile_token == 1 and tile_out == 4.
         const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
     else if (num_tokens == 4)
     {
-        // When num_tokens == 1, the best tiling size is tile_token == 2 and tile_out == 2.
+        // When num_tokens == 4, the best tiling size is tile_token == 2 and tile_out == 2.
         const dim3 grid_size = dim3(div_up(hidden_out, 2), div_up(num_tokens, 2), 1);
         void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 2);
         launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
     }
+    else if (num_tokens == 5)
+    {
+        // When num_tokens == 5, the best tiling size is tile_token == 1 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 6)
+    {
+        // When num_tokens == 6, the best tiling size is tile_token == 2 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 7)
+    {
+        // When num_tokens == 7, the best tiling size is tile_token == 1 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 1), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(1, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
+    else if (num_tokens == 8)
+    {
+        // When num_tokens == 8, the best tiling size is tile_token == 2 and tile_out == 4.
+        const dim3 grid_size = dim3(div_up(hidden_out, 4), div_up(num_tokens, 2), 1);
+        void* kernel_func = get_per_block_attn_scaling_func_ptr_aligned_true_5120_(2, 4);
+        launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, kernel_func, args, 11);
+    }
     else
     {
-        throw std::runtime_error("llama4QKVGemm: num_tokens larger than 4 is unsupported.");
+        throw std::runtime_error("llama4QKVGemm: num_tokens > 8 are not supported.");
     }
 }
 

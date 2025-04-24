@@ -197,7 +197,7 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.fp4_tensor.size(0) if isinstance(
             hidden_states, Fp4QuantizedTensor) else hidden_states.size(0)
-        if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 4:
+        if self.attn_temperature_tuning and self.qkv_proj.use_llama4_qkv and num_tokens <= 8:
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             assert self.floor_scale == 8192.0 and self.attn_scale == 0.1, "floor_scale and attn_scale should be 8192.0 and 0.1"
             qkv = self.qkv_proj(hidden_states, position_ids=position_ids)
@@ -241,7 +241,7 @@ class Attention(nn.Module):
             qkv = torch.concat([q, k, v], dim=-1)
 
         if self.attn_temperature_tuning and (not self.qkv_proj.use_llama4_qkv
-                                             or num_tokens > 4):
+                                             or num_tokens > 8):
             # this must be a nope layer
             assert position_ids is not None, "attn_temperature_tuning requires position_ids"
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
