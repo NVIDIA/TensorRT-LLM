@@ -3756,7 +3756,6 @@ TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
     auto constexpr hiddenSize = numHeads * sizePerHead;
     auto constexpr tokensPerBlock = 64;
     auto constexpr blockLengthPerSeq = 10;
-    auto constexpr maxBlocksPerSeq = 11;
     auto constexpr maxNumSequences = 8;
     auto constexpr maxBeamWidth = 4;
     auto constexpr sinkTokenLength = 4;
@@ -3769,11 +3768,13 @@ TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
     auto constexpr requestId = static_cast<RequestIdType>(7);
     auto constexpr inputLength = tokensPerBlock * blockLengthPerSeq - bubbleLength - 1;
     auto constexpr maxAttentionWindow = inputLength - tokensPerBlock;
+    auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock) + kExtraBlockBuffer;
 
     auto constexpr numSharedBlocks = (sinkTokenLength + bubbleLength) / tokensPerBlock;
     auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
     auto constexpr totalNumBlocks = maxNumSequences * numBlocksPerSeq;
-    auto constexpr numSharedBlocksCtx = (inputLength + bubbleLength) / tokensPerBlock;
+    auto constexpr numSharedBlocksCtx
+        = std::min(inputLength, maxAttentionWindow + temporaryAttentionWindow) / tokensPerBlock;
 
     auto constexpr blocksInSecondaryPool = 0;
 
