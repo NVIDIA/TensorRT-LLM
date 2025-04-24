@@ -5,6 +5,10 @@ from typing import Dict, List, Tuple
 import torch
 # isort: on
 
+import os
+from pathlib import Path
+from typing import Optional
+
 import datasets
 from datasets import load_dataset
 
@@ -12,12 +16,36 @@ from transformers import BertConfig, BertPreTrainedModel, BertForQuestionAnsweri
 from transformers import RobertaConfig, RobertaPreTrainedModel, RobertaForQuestionAnswering, RobertaForSequenceClassification, RobertaModel  # isort:skip
 
 
+# NOTE: This routine is copied from from tests/unittests/utils/llm_data.py
+def llm_models_root(check=False) -> Optional[Path]:
+    root = Path("/home/scratch.trt_llm_data/llm-models/")
+
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    if check:
+        assert root.exists(), \
+        "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+
+    return root if root.exists() else None
+
+
+def llm_datasets_root() -> Path:
+    return llm_models_root(check=True) / "datasets"
+
+
 def prepare_text_inputs(model_name, batch_size=8):
     print(
         f"HF_DATASETS_OFFLINE inside function: {datasets.config.HF_DATASETS_OFFLINE}"
     )
     if model_name == "BertForQuestionAnswering" or model_name == "RobertaForQuestionAnswering":
-        squad_dataset = load_dataset("squad_v2", trust_remote_code=True)
+        squad_dataset_root = str(llm_datasets_root(
+        )) + "/" if datasets.config.HF_DATASETS_OFFLINE else ""
+        squad_dataset_path = squad_dataset_root + "squad_v2"
+        squad_dataset = load_dataset(squad_dataset_path, trust_remote_code=True)
         val_dataset = squad_dataset["validation"]
         samples = val_dataset.select(range(batch_size))
 
@@ -27,8 +55,10 @@ def prepare_text_inputs(model_name, batch_size=8):
         }
         return qa_real_test_inputs
     elif model_name == "BertForSequenceClassification" or model_name == "RobertaForSequenceClassification":
-        yelp_dataset = load_dataset("fancyzhx/yelp_polarity",
-                                    trust_remote_code=True)
+        yelp_dataset_root = str(llm_datasets_root(
+        )) + "/" if datasets.config.HF_DATASETS_OFFLINE else "fancyzhx/"
+        yelp_dataset_path = yelp_dataset_root + "yelp_polarity"
+        yelp_dataset = load_dataset(yelp_dataset_path, trust_remote_code=True)
         val_dataset = yelp_dataset["test"]
         samples = val_dataset.select(range(batch_size))
 
