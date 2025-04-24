@@ -6,6 +6,7 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
     match_complex_rope,
     match_explicit_rope,
+    optimize_rope,
 )
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
@@ -68,146 +69,150 @@ def _precompute_freqs_cis_v2(seq_len: int, head_dim: int, rope_theta: float):
     return freqs_cis
 
 
-class RotaryModel(torch.nn.Module):
+class RoPEModel(torch.nn.Module):
     def __init__(
         self,
         hidden_size: int,
         max_seq_len: int,
         num_heads: int,
         num_kv_heads: int,
-        layout: str = "BNSD",
+        variant: str = "explicit",  # "explicit" or "complex"
+        mode: str = "match",  # "match" or "optimize"
+        layout: str = "BNSD",  # only for explicit variants
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_seq_len = max_seq_len
-        self.layout = layout
+        self.variant = variant
+        self.mode = mode
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = hidden_size // num_heads
+        self.layout = layout if variant == "explicit" else None
+
         self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
         self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, _ = x.shape
         q = self.linear_q(x)
         k = self.linear_k(x)
 
-        batch, seq, _ = q.shape
-        q = q.view(batch, seq, self.num_heads, self.head_dim)
-        k = k.view(batch, seq, self.num_kv_heads, self.head_dim)
+        if self.variant == "explicit":
+            # reshape and permute if BNSD layout
+            q = q.view(b, s, self.num_heads, self.head_dim)
+            k = k.view(b, s, self.num_kv_heads, self.head_dim)
+            if self.layout == "BNSD":
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                unsq_dim = 1
+            else:
+                unsq_dim = 2
 
-        if self.layout == "BNSD":
-            q = q.permute(0, 2, 1, 3).contiguous()  # [B, N, S, D]
-            k = k.permute(0, 2, 1, 3).contiguous()
-            unsqueeze_dim = 1
-        else:  # BSND
-            unsqueeze_dim = 2
+            cos, sin = _precompute_freqs_cis(s, self.head_dim, rope_theta=10000)
+            cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
+            sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
-        cos, sin = _precompute_freqs_cis(seq, self.head_dim, rope_theta=10000)
-        cos = cos.to(q.device).unsqueeze(0).expand(batch, -1, -1)
-        sin = sin.to(q.device).unsqueeze(0).expand(batch, -1, -1)
+            if self.mode == "match":
+                q_out, k_out = apply_rotary_pos_emb(q, k, cos, sin, unsq_dim)
+            else:  # optimize
+                q_out, k_out = torch.ops.rope.torch_apply_explicit_rope(q, k, cos, sin, unsq_dim)
 
-        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-        if self.layout == "BNSD":
-            # [B, N, S, D] -> [B, S, N*D]
-            q_embed = q_embed.permute(0, 2, 1, 3).reshape(batch, seq, -1)
-            k_embed = k_embed.permute(0, 2, 1, 3).reshape(batch, seq, -1)
-        else:  # BSND
-            q_embed = q_embed.reshape(batch, seq, -1)
-            k_embed = k_embed.reshape(batch, seq, -1)
+            # revert layout and flatten
+            if self.layout == "BNSD":
+                q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+                k_out = k_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+            else:
+                q_out = q_out.reshape(b, s, -1)
+                k_out = k_out.reshape(b, s, -1)
 
-        output = torch.cat([q_embed, k_embed], dim=-1)
-        return output.to(torch.float16)
+        else:  # complex variant
+            q = q.view(b, s, self.num_heads, self.head_dim)
+            k = k.view(b, s, self.num_kv_heads, self.head_dim)
+            freqs = _precompute_freqs_cis_v2(s, self.head_dim, rope_theta=10000)
+            freqs = freqs.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
-    def get_dynamic_shapes(self):
-        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
+            if self.mode == "match":
+                q_out, k_out = apply_rotary_emb(q, k, freqs)
+            else:
+                q_out, k_out = torch.ops.rope.torch_apply_complex_rope(q, k, freqs)
 
+            q_out = q_out.reshape(b, s, -1)
+            k_out = k_out.reshape(b, s, -1)
 
-class RotaryModelV2(torch.nn.Module):
-    def __init__(self, hidden_size: int, max_seq_len: int, num_heads: int, num_kv_heads: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.max_seq_len = max_seq_len
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = hidden_size // num_heads
-
-        self.linear_q = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
-        self.linear_k = torch.nn.Linear(hidden_size, num_kv_heads * self.head_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq, _ = x.shape
-
-        q = self.linear_q(x).view(batch, seq, self.num_heads, self.head_dim)
-        k = self.linear_k(x).view(batch, seq, self.num_kv_heads, self.head_dim)
-
-        freqs_cis = _precompute_freqs_cis_v2(seq, self.head_dim, rope_theta=10000)
-        freqs_cis = freqs_cis.to(x.device).unsqueeze(0).expand(batch, -1, -1)
-
-        q_embed, k_embed = apply_rotary_emb(q, k, freqs_cis)
-
-        q_embed = q_embed.reshape(batch, seq, -1)
-        k_embed = k_embed.reshape(batch, seq, -1)
-
-        output = torch.cat([q_embed, k_embed], dim=-1)
-        return output.to(torch.float16)
+        out = torch.cat([q_out, k_out], dim=-1)
+        return out.to(torch.float16) if self.mode == "match" else out
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", max=16)}
 
 
-@pytest.mark.parametrize("layout", ["BNSD", "BSND"])
-@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4)])
+@pytest.mark.parametrize(
+    "transformation,variant,layout,batch_size,seq_len,num_heads,num_kv_heads,atol,rtol",
+    [
+        ("match", "explicit", "BNSD", 8, 16, 8, 8, 1e-3, 1e-3),
+        ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2),
+        ("match", "complex", None, 8, 16, 8, 8, 1e-3, 1e-3),
+        ("match", "complex", None, 8, 16, 8, 4, 1e-3, 1e-3),
+        ("optimize", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
+        ("optimize", "explicit", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
+        ("optimize", "complex", None, 4, 12, 8, 8, 1e-3, 1e-3),
+        ("optimize", "complex", None, 4, 12, 8, 4, 1e-3, 1e-3),
+    ],
+)
 @torch.inference_mode()
-def test_match_rope(layout, num_heads, num_kv_heads):
-    batch_size, seq_len = 8, 16
+def test_rope_variants(
+    transformation,
+    variant,
+    layout,
+    batch_size,
+    seq_len,
+    num_heads,
+    num_kv_heads,
+    atol,
+    rtol,
+):
     hidden_size = 512
-    max_position_embeddings = seq_len
-
-    model = RotaryModel(
-        hidden_size, max_position_embeddings, num_heads, num_kv_heads, layout=layout
-    ).to("cuda", dtype=torch.float16)
+    model = RoPEModel(
+        hidden_size,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        variant=variant,
+        mode=transformation,
+        layout=layout or "BNSD",
+    ).to("cuda", torch.float16)
     x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    dynamic_shapes = model.get_dynamic_shapes()
+    dyn = model.get_dynamic_shapes()
+
+    if transformation == "match":
+        fn = match_explicit_rope if variant == "explicit" else match_complex_rope
+        check_op = (
+            torch.ops.rope.torch_apply_explicit_rope
+            if variant == "explicit"
+            else torch.ops.rope.torch_apply_complex_rope
+        )
+
+        def checker(gm):
+            return any(is_op(n, check_op) for n in gm.graph.nodes)
+
+    else:
+        fn = optimize_rope
+
+        def checker(gm):
+            return any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes)
 
     _ = run_test(
         model,
         x,
-        match_explicit_rope,
-        lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
+        fn,
+        checker,
+        lambda n: n,
+        atol=atol,
+        rtol=rtol,
         test_load_hook=True,
         strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
-    )
-
-
-@pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4)])
-@torch.inference_mode()
-def test_match_rope_complex(num_heads, num_kv_heads):
-    batch_size, seq_len = 8, 16
-    hidden_size = 512
-    max_position_embeddings = seq_len
-
-    model = RotaryModelV2(hidden_size, max_position_embeddings, num_heads, num_kv_heads).to(
-        "cuda", dtype=torch.float16
-    )
-
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    _ = run_test(
-        model,
-        x,
-        match_complex_rope,
-        lambda gm: any(is_op(n, torch.ops.rope.flashinfer) for n in gm.graph.nodes),
-        lambda num_p_og: num_p_og,
-        atol=1e-3,
-        rtol=1e-3,
-        test_load_hook=True,
-        strict_loading=True,
-        dynamic_shapes=dynamic_shapes,
+        dynamic_shapes=dyn,
     )
 
 
@@ -287,7 +292,9 @@ def test_match_rope_deepseek(layout, num_heads, num_kv_heads):
         model,
         x,
         match_explicit_rope,
-        lambda gm: any(is_op(n, torch.ops.rope.apply_rope_ds) for n in gm.graph.nodes),
+        lambda gm: any(
+            is_op(n, torch.ops.rope.torch_apply_rope_with_qk_interleaving) for n in gm.graph.nodes
+        ),
         lambda num_p: num_p,
         atol=1e-3,
         rtol=1e-3,

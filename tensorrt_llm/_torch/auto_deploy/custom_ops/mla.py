@@ -17,7 +17,7 @@ from .attention_interface import (
     PrepareMetadataCallable,
     SequenceInfo,
 )
-from .torch_attention import apply_rotary_pos_emb_ds
+from .torch_rope import apply_rotary_pos_emb_ds
 from .triton_attention import _flattened_context_mha, _generate_mha
 
 Constant = Union[int, float, str, None]
