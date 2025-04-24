@@ -2,7 +2,7 @@ import json
 import math
 import os
 import random
-from typing import Generator, List, Union
+from typing import List, Union
 
 import numpy as np
 from pydantic import BaseModel
@@ -38,36 +38,61 @@ class Workload(BaseModel):
         workload_name = "__".join(f"{key}:{value}"
                                   for key, value in self.metadata.items()
                                   if key not in ignore_keys)
-        self.metadata.setdefault('workload_name', workload_name)
+        self.metadata.setdefault("workload_name", workload_name)
 
 
-def text_dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
-                      output_file):
+def text_dataset_dump(
+    input_lens: list[int],
+    input_ids: list[list[int]],
+    output_lens: list[int],
+    task_ids: list[int],
+    metadata: dict,
+    output_file: str,
+    output_format: str,
+):
     samples = []
     for i in range(len(input_ids)):
         samples.append(
-            TextSample(input_len=input_lens[i],
-                       input_ids=input_ids[i],
-                       output_len=output_lens[i],
-                       task_id=task_ids[i]))
+            TextSample(
+                input_len=input_lens[i],
+                input_ids=input_ids[i],
+                output_len=output_lens[i],
+                task_id=task_ids[i],
+            ))
     workload = Workload(metadata=metadata, samples=samples)
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, 'w') as f:
-        json.dump(workload.model_dump(), f)
+    if os.path.dirname(output_file) != "":
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w") as f:
+        match output_format:
+            case "trtllm-bench":
+                for line in workload.samples:
+                    f.write(line + "\n")
+            case "gptManagerBenchmark":
+                json.dump(workload.model_dump(), f)
+            case _:
+                raise ValueError(f"Unsupported output format: {output_format}")
 
 
-def multimodal_dataset_dump(multimodal_texts, multimodal_image_paths,
-                            output_lens, task_ids, metadata, output_file):
+def multimodal_dataset_dump(
+    multimodal_texts,
+    multimodal_image_paths,
+    output_lens,
+    task_ids,
+    metadata,
+    output_file,
+):
     samples = []
     for i in range(len(multimodal_texts)):
         samples.append(
-            MultimodalSample(task_id=task_ids[i],
-                             prompt=multimodal_texts[i],
-                             media_paths=multimodal_image_paths[i],
-                             output_len=output_lens[i]))
+            MultimodalSample(
+                task_id=task_ids[i],
+                prompt=multimodal_texts[i],
+                media_paths=multimodal_image_paths[i],
+                output_len=output_lens[i],
+            ))
     workload = Workload(metadata=metadata, samples=samples)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, 'w') as f:
+    with open(output_file, "w") as f:
         json.dump(workload.model_dump(), f)
 
 
@@ -81,11 +106,6 @@ def print_text_dataset(input_ids, output_lens):
         yield json.dumps(d, separators=(",", ":"), ensure_ascii=False)
 
 
-def print_dataset(input_ids: list[list[int]], output_lens: list[int]):
-    for line in generate_dataset_as_json_lines(input_ids, output_lens):
-        print(line)
-
-
 def print_multimodal_dataset(multimodal_texts, multimodal_image_paths,
                              output_lens):
     for i, (text, image_paths) in enumerate(
@@ -94,9 +114,9 @@ def print_multimodal_dataset(multimodal_texts, multimodal_image_paths,
             "task_id": i,
             "prompt": text,
             "media_paths": image_paths,
-            "output_tokens": output_lens[i]
+            "output_tokens": output_lens[i],
         }
-        print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))
+        print(json.dumps(d, separators=(",", ":"), ensure_ascii=False))
 
 
 def get_list_of_delays(delay_dist, mean_time_bet_reqs, num_reqs, random_seed):
