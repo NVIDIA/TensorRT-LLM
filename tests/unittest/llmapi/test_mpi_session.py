@@ -4,9 +4,8 @@ import subprocess  # nosec B404
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
-                                             RemoteMpiCommSessionClient,
-                                             split_mpi_env)
+from tensorrt_llm.llmapi.mpi_session import (MPINodeState,
+                                             RemoteMpiCommSessionClient)
 
 
 def task0():
@@ -53,12 +52,8 @@ def run_client(server_addr, values_to_process):
 @pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5179666")
 def test_remote_mpi_session():
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
-    os.environ['TLLM_SPAWN_PROXY_PROCESS'] = "1"
-    os.environ['TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR'] = "ipc://" + str(
-        os.getpid())
-
     command = [
-        "mpirun", "--allow-run-as-root", "-np", "2", "trtllm-llmapi-launch",
+        "mpirun", "--allow-run-as-root", "-np", "4", "trtllm-llmapi-launch",
         "python3", "_run_mpi_comm_task.py"
     ]
     subprocess.run(command,
@@ -66,14 +61,3 @@ def test_remote_mpi_session():
                    stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE,
                    env=os.environ)  # nosec B603
-
-
-def task1():
-    non_mpi_env, mpi_env = split_mpi_env()
-    assert non_mpi_env
-    assert mpi_env
-
-
-def test_split_mpi_env():
-    session = MpiPoolSession(n_workers=4)
-    session.submit_sync(task1)

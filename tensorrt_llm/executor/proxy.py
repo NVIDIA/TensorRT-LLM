@@ -23,7 +23,7 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env)
+                    create_mpi_comm_session, spawn_proxy_process_enabled)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -58,7 +58,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.doing_pre_shutdown = False
         self.worker_cls = worker_cls
 
-        mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+        mpi_process_pre_spawned: bool = spawn_proxy_process_enabled()
 
         if mpi_session is None:
             if mpi_process_pre_spawned:

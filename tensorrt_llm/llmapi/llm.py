@@ -20,7 +20,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
 from ..executor.utils import (create_mpi_comm_session,
-                              get_spawn_proxy_process_env)
+                              spawn_proxy_process_enabled)
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -141,7 +141,7 @@ class LLM:
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
             if not self.mpi_session:
-                mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+                mpi_process_pre_spawned: bool = spawn_proxy_process_enabled()
                 if not mpi_process_pre_spawned:
                     print_colored_debug(f"LLM create MpiPoolSession\n",
                                         "yellow")
