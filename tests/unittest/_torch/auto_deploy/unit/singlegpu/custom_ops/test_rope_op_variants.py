@@ -3,8 +3,8 @@ import pytest
 import torch
 from _model_test_utils import (
     apply_rotary_pos_emb_complex,
+    apply_rotary_pos_emb_ds,
     apply_rotary_pos_emb_explicit,
-    rotate_half,
 )
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
@@ -205,25 +205,6 @@ def test_triton_custom_op_and_hf_impl(layout, head_dim, dtype, atol, rtol):
 
     torch.testing.assert_close(q_hf, q_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(k_hf, k_out, atol=atol, rtol=rtol)
-
-
-# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
-def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """
-    Apply rotary positional embeddings by interleaving Q/K ,
-    indexing cos/sin tables with position_ids, and returning rotated q, k.
-    cos:  [seq_len, head_dim]
-    sin:  [seq_len, head_dim]
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 def inverse_interleave_permute_for_rotary(x: torch.Tensor) -> torch.Tensor:

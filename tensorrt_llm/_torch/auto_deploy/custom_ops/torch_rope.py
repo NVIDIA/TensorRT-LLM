@@ -177,16 +177,22 @@ def torch_apply_complex_rope_fake(
 def torch_apply_rope_with_qk_interleaving(
     q: torch.Tensor,
     k: torch.Tensor,
-    cos: torch.Tensor,  # [B, 1, seq_len, head_dim]
-    sin: torch.Tensor,  # [B, 1, seq_len, head_dim]
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     DeepSeek-style RoPE: interleaves Q/K channels and returns rotated (q_embed, k_embed).
+    - Input layout: [B, S, N, D] or [B*S, N, D] or [B, N, S, D]
+    - Frequencies are provided as separate `cos` and `sin` tensors of shape
+        [B, S, 1, D] or [B*S, 1, D] or [B, 1, S, D] matching input shape.
     """
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    # Rewrite below code to accept 3D input:
+    # b, h, s, d = q.shape
+    # q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    # b, h, s, d = k.shape
+    # k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q = q.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(q)
+    k = k.unflatten(-1, (-1, 2)).transpose(-1, -2).reshape_as(k)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed

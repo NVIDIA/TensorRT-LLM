@@ -3,8 +3,8 @@ import torch
 from _graph_test_helpers import run_test
 from _model_test_utils import (
     apply_rotary_pos_emb_complex,
+    apply_rotary_pos_emb_ds,
     apply_rotary_pos_emb_explicit,
-    rotate_half,
 )
 from torch.export import Dim
 
@@ -191,25 +191,6 @@ def test_rope_variants(
     )
 
 
-# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
-def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """
-    Apply rotary positional embeddings by interleaving Q/K ,
-    indexing cos/sin tables with position_ids, and returning rotated q, k.
-    cos:  [seq_len, head_dim]
-    sin:  [seq_len, head_dim]
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 class DSRotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
@@ -239,16 +220,24 @@ class DSModel(torch.nn.Module):
         b, s, _ = x.shape
         q = self.q_lin(x).view(b, s, -1, self.hdim)
         k = self.k_lin(x).view(b, s, -1, self.hdim)
-        # to [B, N, S, D]
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
+        if self.layout == "BNSD":
+            # to [B, N, S, D]
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            unsq_dim = 1
+        else:
+            unsq_dim = 2
         cos, sin = self.rotary(x, seq_len=s)
         # build position_ids [B, S]
         pos_ids = torch.arange(s, device=x.device).unsqueeze(0).expand(b, s)
-        q_out, k_out = apply_rotary_pos_emb_ds(q, k, cos, sin, pos_ids, unsqueeze_dim=1)
-        # back to [B, S, N*D]
-        q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
-        k_out = k_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+        q_out, k_out = apply_rotary_pos_emb_ds(q, k, cos, sin, pos_ids, unsqueeze_dim=unsq_dim)
+        if self.layout == "BNSD":
+            # back to [B, S, N*D]
+            q_out = q_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+            k_out = k_out.permute(0, 2, 1, 3).reshape(b, s, -1)
+        else:
+            q_out = q_out.reshape(b, s, -1)
+            k_out = k_out.reshape(b, s, -1)
         return torch.cat([q_out, k_out], dim=-1)
 
     def get_dynamic_shapes(self):
