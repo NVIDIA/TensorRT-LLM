@@ -23,7 +23,7 @@ function mpi_world_size {
     fi
 }
 
-function export_free_tcp_addr {
+function export_free_tcp_addr_for_spawn_proxy_process {
     # find free port starting from 10012
     local free_port=$(python -c 'import socket; s=socket.socket();
 port = 10012
