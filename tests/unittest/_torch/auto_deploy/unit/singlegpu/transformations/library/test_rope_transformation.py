@@ -11,9 +11,10 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
     match_complex_rope,
     match_explicit_rope,
+    match_rope_layout,
     optimize_rope,
 )
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tuple, is_op
 
 torch.manual_seed(0)
 
@@ -129,7 +130,21 @@ class RoPEModel(torch.nn.Module):
         ("match", "explicit", "BSND", 8, 16, 8, 4, 1e-2, 1e-2),
         ("match", "complex", None, 8, 16, 8, 8, 1e-3, 1e-3),
         ("match", "complex", None, 8, 16, 8, 4, 1e-3, 1e-3),
-        ("optimize", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
+        ("match_layout", "explicit", "BNSD", 4, 12, 8, 8, 1e-3, 1e-3),
+        pytest.param(
+            "optimize",
+            "explicit",
+            "BNSD",
+            4,
+            12,
+            8,
+            8,
+            1e-3,
+            1e-3,
+            marks=pytest.mark.xfail(
+                reason="flashinfer op does not support BNSD layout", strict=True
+            ),
+        ),
         ("optimize", "explicit", "BSND", 4, 12, 8, 4, 1e-3, 1e-3),
         ("optimize", "complex", None, 4, 12, 8, 8, 1e-3, 1e-3),
         ("optimize", "complex", None, 4, 12, 8, 4, 1e-3, 1e-3),
@@ -170,6 +185,29 @@ def test_rope_variants(
 
         def checker(gm):
             return any(is_op(n, check_op) for n in gm.graph.nodes)
+
+    elif transformation == "match_layout":
+        fn = match_rope_layout
+
+        def checker(gm):
+            for n in gm.graph.nodes:
+                if is_op(n, torch.ops.rope.torch_apply_explicit_rope):
+                    q_arg, k_arg, *rest = n.args
+                    if not (
+                        is_op(q_arg, torch.ops.aten.contiguous)
+                        and is_op(k_arg, torch.ops.aten.contiguous)
+                    ):
+                        return False
+                    # extract outputs and ensure each is transposed afterwards
+                    old_q, old_k = extract_output_tuple(n, 2)
+                    if old_q is None or old_k is None:
+                        return False
+                    if not any(is_op(u, torch.ops.aten.transpose) for u in old_q.users):
+                        return False
+                    if not any(is_op(u, torch.ops.aten.transpose) for u in old_k.users):
+                        return False
+                    return True
+            return False
 
     else:
         fn = optimize_rope

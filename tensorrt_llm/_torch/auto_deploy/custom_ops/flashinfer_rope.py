@@ -24,7 +24,7 @@ def apply_rope_with_input_pos_flashinfer(
         Precomputed tensor of positional indices; it is shared across calls in the graph.
     - cos_sin_cache (torch.Tensor):
         Precomputed fused tensor created by concatenating the first half of the cosine and sine
-        components derived from the inv_freq.
+        components derived from the inv_freq. Shape [seq_len, head_dim]. Must be float32.
     - is_neox (bool):
         Flag to indicate whether to invoke the FlashInfer kernel in Neox mode.
 
