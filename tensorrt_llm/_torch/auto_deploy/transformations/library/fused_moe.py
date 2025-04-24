@@ -1,12 +1,12 @@
 from collections import defaultdict
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
 from .._graph import canonicalize_graph
 
 
@@ -160,7 +160,7 @@ def _find_gate_linear_node(topk_node: Node, boundary: Optional[Node] = None) -> 
     returning the first node that qualifies as a linear op. The search stops if it
     reaches the boundary node.
     """
-    return _bfs(
+    return bfs(
         topk_node, lambda node: is_linear_op(node), attr_next="all_input_nodes", boundary=boundary
     )
 
@@ -171,26 +171,6 @@ def _is_routing_weight(node: Node) -> bool:
         torch.ops.aten.select,
     }
     return is_op(node, routing_ops)
-
-
-def _bfs(
-    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
-) -> Node:
-    queue = [node]
-    visited = set()
-    while queue:
-        cur_node = queue.pop(0)
-        if boundary is not None and cur_node == boundary:
-            continue  # Skip the boundary node.
-        if target(cur_node):
-            return cur_node
-        for next_node in getattr(cur_node, attr_next):
-            if boundary is not None and next_node == boundary:
-                continue  # Do not expand past the boundary.
-            if next_node not in visited:
-                visited.add(next_node)
-                queue.append(next_node)
-    raise RuntimeError(f"Could not find node with target condition {target}.")
 
 
 def _find_normalized_routing_weights(
@@ -205,7 +185,7 @@ def _find_normalized_routing_weights(
         The node producing the normalized routing weights, or None if not found.
     """
     try:
-        norm_node = _bfs(
+        norm_node = bfs(
             routing_weights_node,
             lambda n: is_op(n, torch.ops.aten.to)
             and len(n.args) > 0
@@ -222,7 +202,7 @@ def _get_linear_weight_from_branch(branch_node: Node):
     def target_fn(n: Node):
         return n.op == "call_function" and n.target == torch.ops.linear.simple.default
 
-    linear_node = _bfs(branch_node, target_fn, attr_next="all_input_nodes")
+    linear_node = bfs(branch_node, target_fn, attr_next="all_input_nodes")
     return linear_node.args[1] if linear_node is not None else None
 
 
@@ -332,7 +312,7 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = _bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         ad_logger.debug(f"Removing In-place Dead Node: {node_to_remove}")
         graph.erase_node(node_to_remove)
         return True
