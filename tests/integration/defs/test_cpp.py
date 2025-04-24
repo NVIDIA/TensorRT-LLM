@@ -138,7 +138,7 @@ def install_additional_requirements(python_exe, root_dir):
                     "pip",
                     "install",
                     "-r",
-                    "examples/recurrentgemma/requirements.txt",
+                    "examples/models/core/recurrentgemma/requirements.txt",
                 ],
                 cwd=root_dir,
                 env=_os.environ,

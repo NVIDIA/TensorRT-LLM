@@ -22,7 +22,9 @@ class ModelConfig(Generic[TConfig]):
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
-    skip_create_weights: bool = False
+    # Delay weights creation to DecoderModelForCausalLM.__post_init__
+    # to support mixed quantization.
+    skip_create_weights_in_init: bool = False
     is_generation: bool = True
     max_num_tokens: int = 8192
     moe_max_num_tokens: Optional[int] = None
@@ -95,28 +97,31 @@ class ModelConfig(Generic[TConfig]):
 
             json_quant_configs = quant_config_dict['quantization']
 
-            def _load_json_quant_config(key: str):
-                if key in json_quant_configs:
-                    return json_quant_configs[key]
-                return None
-
-            quant_config.quant_algo = _load_json_quant_config('quant_algo')
-            quant_config.kv_cache_quant_algo = _load_json_quant_config(
-                'kv_cache_quant_algo')
-            quant_config.group_size = _load_json_quant_config('group_size')
-            quant_config.exclude_modules = _load_json_quant_config(
-                'exclude_modules')
+            quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            quant_config.kv_cache_quant_algo = json_quant_configs.get(
+                'kv_cache_quant_algo', None)
+            quant_config.group_size = json_quant_configs.get('group_size', None)
+            quant_config.exclude_modules = json_quant_configs.get(
+                'exclude_modules', None)
 
             if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
                 mixed_quant_config_file = model_dir / 'quant_cfg.json'
                 with open(mixed_quant_config_file) as fm:
-                    mixed_quant_config = json.load(fm)
-                    mixed_quant_config = mixed_quant_config['quantized_layers']
-                    for k in mixed_quant_config:
+                    mixed_quant_configs = json.load(fm)
+                    kv_cache_quant_algo = mixed_quant_configs[
+                        'kv_cache_quant_algo']
+                    mixed_quant_configs = mixed_quant_configs[
+                        'quantized_layers']
+
+                    for layer in mixed_quant_configs:
                         config = QuantConfig()
-                        config.quant_algo = mixed_quant_config[k]['quant_algo']
-                        mixed_quant_config[k] = config
-                layer_quant_config = mixed_quant_config
+                        config.kv_cache_quant_algo = kv_cache_quant_algo
+                        config.quant_algo = mixed_quant_configs[layer][
+                            'quant_algo']
+                        config.group_size = mixed_quant_configs[layer].get(
+                            'group_size', None)
+                        mixed_quant_configs[layer] = config
+                layer_quant_config = mixed_quant_configs
 
             if kwargs.get(
                     'moe_backend'

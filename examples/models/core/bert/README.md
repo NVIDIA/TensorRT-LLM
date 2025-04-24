@@ -5,7 +5,7 @@ This document explains how to build the BERT family, specifically [BERT](https:/
 ## Overview
 
 The TensorRT-LLM BERT family implementation can be found in [`tensorrt_llm/models/bert/model.py`](../../../../tensorrt_llm/models/bert/model.py).
-The TensorRT-LLM BERT family example code is located in [`examples/bert`](./). There are two main files in that folder:
+The TensorRT-LLM BERT family example code is located in [`examples/models/core/bert`](./). There are two main files in that folder:
 
  * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the BERT model into tensorrt-llm checkpoint format.
  * [`run.py`](./run.py) to run the inference on an input text,
