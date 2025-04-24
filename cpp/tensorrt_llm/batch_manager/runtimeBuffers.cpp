@@ -455,7 +455,7 @@ void RuntimeBuffers::setFromInputs(RequestVector const& contextRequests, Request
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManagerPtr,
     rnn_state_manager::RnnStateManager* rnnStateManagerPtr, PeftTable const& peftTable,
     runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, bool trtOverlap, TensorPtr const& newOutputTokens)
+    runtime::WorldConfig const& worldConfig, bool trtOverlap, OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(runtimeBuffersSetFromInputs);
@@ -926,7 +926,8 @@ std::tuple<SizeType32, RuntimeBuffers::TensorMap const&, RuntimeBuffers::TensorM
     SizeType32 maxAttentionWindow, DecoderBuffers& decoderBuffers, kv_cache_manager::BaseKVCacheManager* kvCacheManager,
     kv_cache_manager::BaseKVCacheManager* crossKvCacheManager, rnn_state_manager::RnnStateManager* rnnStateManager,
     PeftTable const& peftTable, TllmRuntime const& runtime, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap, TensorPtr const& newOutputTokens)
+    WorldConfig const& worldConfig, bool gatherGenerationLogits, bool trtOverlap,
+    OptionalRef<runtime::ITensor const> newOutputTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(runtimeBuffersPrepareStep);
