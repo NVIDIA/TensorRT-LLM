@@ -385,7 +385,7 @@ def create_py_executor_instance(dist,
         # TODO smor- need to figure out how to set these values
         max_loras = 2
         max_cpu_loras = 2
-        executor_config.peft_cache_config = tllm.executor.PeftCacheConfig(
+        executor_config.peft_cache_config = trtllm.PeftCacheConfig(
             num_device_module_layer=max_lora_rank * num_lora_modules *
             max_loras,
             num_host_module_layer=max_lora_rank * num_lora_modules *
