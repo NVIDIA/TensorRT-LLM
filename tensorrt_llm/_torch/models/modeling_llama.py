@@ -6,8 +6,8 @@ from torch import nn
 from transformers import Llama4Config, LlamaConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, DeepseekAllReduce,
-                                             ParallelConfig, TensorParallelMode)
+                                             AllReduceParams, DeepseekAllReduce)
+
 from tensorrt_llm._torch.pipeline_interface import PipelineInterface
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -20,7 +20,8 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (FusedMoE, Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, WeightMode, WeightsLoadingConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
+                              WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..speculative import Eagle3SpecMetadata, SpecMetadata
@@ -167,11 +168,8 @@ class Llama4MoE(nn.Module):
                              dtype=config.torch_dtype,
                              quant_config=None)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.moe_event = [torch.cuda.Event(), torch.cuda.Event()]
         self.aux_stream = aux_stream
 
@@ -215,7 +213,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if self.parallel_config.tensor_parallel_size > 1:
+        if self.mapping.tp_size > 1:
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -292,17 +290,14 @@ class Llama4DecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node)
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.mapping = model_config.mapping
+        self.all_reduce = AllReduce(self.mapping)
         self.next_layer_layernorm: RMSNorm = None
         self.next_attn: LlamaAttention = None
 
-        self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
-        self.pre_mlp_quant_allreduce = DeepseekAllReduce(self.parallel_config)
-        self.post_quant_allreduce = DeepseekAllReduce(self.parallel_config)
+        self.deepseek_allreduce = DeepseekAllReduce(self.mapping)
+        self.pre_mlp_quant_allreduce = DeepseekAllReduce(self.mapping)
+        self.post_quant_allreduce = DeepseekAllReduce(self.mapping)
 
     def forward(
         self,
@@ -343,7 +338,7 @@ class Llama4DecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(enable_allreduce=not (
                 self.fusion_config.PRE_MOE_FUSION
                 or self.fusion_config.PRE_MLP_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
+                or self.mapping.tp_size == 1)),
             **kwargs,
         )
 
@@ -396,9 +391,8 @@ class Llama4DecoderLayer(DecoderLayer):
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.parallel_config.tensor_parallel_size == 1)),
+                self.fusion_config.POST_MOE_FUSION or self.fusion_config.
+                POST_MLP_FUSION or self.mapping.tp_size == 1)),
             min_latency_mode=min_latency_mode,
             llama4_tp8ep1_min_latency_mode=llama4_tp8ep1_min_latency_mode,
         )
@@ -540,8 +534,6 @@ class Eagle3LlamaAttention(LlamaAttention):
         config = model_config.pretrained_config
 
         tp_size = model_config.mapping.tp_size
-        tp_rank = model_config.mapping.tp_rank
-        gpus_per_node = model_config.mapping.gpus_per_node
 
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
@@ -550,13 +542,8 @@ class Eagle3LlamaAttention(LlamaAttention):
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
             bias=config.attention_bias,
             dtype=config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_size=tp_size,
-                tensor_parallel_rank=tp_rank,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=model_config.get_quant_config(),
@@ -643,16 +630,9 @@ class Llama4Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
-            parallel_config=None
-            if model_config.mapping.enable_attention_dp else ParallelConfig(
-                tensor_parallel_rank=model_config.mapping.tp_rank,
-                tensor_parallel_size=model_config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                pipeline_parallel_size=model_config.mapping.pp_size,
-                parallel_rank=model_config.mapping.rank,
-                gather_output=True,
-                gpus_per_node=model_config.mapping.gpus_per_node,
-            ),
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
         )
         self.layers = nn.ModuleList([
             Llama4DecoderLayer(
@@ -885,15 +865,9 @@ class Eagle3LlamaDraftModel(DecoderModel):
                 config.vocab_size,
                 config.hidden_size,
                 dtype=config.torch_dtype,
-                parallel_config=ParallelConfig(
-                    tensor_parallel_rank=model_config.mapping.tp_rank,
-                    tensor_parallel_size=model_config.mapping.tp_size,
-                    tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    pipeline_parallel_size=model_config.mapping.pp_size,
-                    parallel_rank=model_config.mapping.rank,
-                    gather_output=True,
-                    gpus_per_node=model_config.mapping.gpus_per_node,
-                ),
+                mapping=model_config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
             )
         else:
             # Shared with target model.
