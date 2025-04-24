@@ -24,7 +24,6 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
-from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
@@ -35,6 +34,8 @@ from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
+
+from .run_llm_with_postproc import perform_faked_oai_postprocess
 
 # isort: off
 from utils.llm_data import llm_models_root

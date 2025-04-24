@@ -88,7 +88,6 @@ l0_a10:
   - unittest/api_stability
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
-  - unittest/llmapi/test_llm_perf_evaluator.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
