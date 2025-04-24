@@ -14,7 +14,7 @@ Supported RoPE variants:
             x2 = x[..., x.shape[-1] // 2 :]
             return torch.cat((-x2, x1), dim=-1)
 
-        def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             cos = cos.unsqueeze(unsqueeze_dim)
             sin = sin.unsqueeze(unsqueeze_dim)
             q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -57,42 +57,18 @@ from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
-def _match_ds_rope_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
-    """
-    Detect DeepSeek-style interleave on Q/K:
-      reshape(transpose(view(raw, [b,h,s,d//2,2]), 4, 3), [b,h,s,d])
-    Returns:
-      {"interleaved": raw_node} if matched, else None.
-    """
-    if not is_op(node, torch.ops.aten.reshape):
-        return None
-    transpose_node = node.args[0]
-    if not is_op(transpose_node, torch.ops.aten.transpose):
-        return None
-    view_node = transpose_node.args[0]
-    if not is_op(view_node, torch.ops.aten.view):
-        return None
-    raw_node = view_node.args[0]
-    if not isinstance(raw_node, Node):
-        return None
-    return {"interleaved": raw_node}
-
-
 def match_explicit_rope(gm: GraphModule) -> GraphModule:
     """
     Identify and replace legacy RoPE subgraphs (explicit cos/sin multiplication pattern):
 
       - HF style: output = (raw * unsqueeze(cos)) + (rotate_half(raw) * unsqueeze(sin))
-      - DS-style: requires interleaving Q/K before the cos/sin mul → apply_rope_ds
+      - DS-style: requires interleaving Q/K before the cos/sin mul
 
     If exactly two such branches (query and key) are detected within each region, they're replaced
     by a call to `torch.ops.rope.flashinfer`.
     """
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
-
-    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
-    rope_position_ids_cache: Dict[str, Node] = {}
 
     rope_ds_cache: DefaultDict[Tuple[Node, Node, int], Tuple[Optional[Node], Optional[Node]]] = (
         defaultdict(lambda: (None, None))
@@ -123,31 +99,21 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
         if not matches:
             continue
         if len(matches) != 2:
-            raise RuntimeError(
+            ad_logger.warning(
                 f"Expected exactly 2 legacy RoPE branches between {start_boundary} and {end_boundary}, "
                 f"found {len(matches)}."
             )
+            continue
 
         (q_match, q_is_ds), (k_match, k_is_ds) = matches
         if q_is_ds != k_is_ds:
-            raise RuntimeError("Mismatched RoPE types between q and k branches")
+            ad_logger.warning("Mismatched RoPE types between q and k branches")
+            continue
 
         if q_is_ds:
-            _process_ds_rope(
-                graph,
-                q_match,
-                k_match,
-                rope_ds_cache,
-            )
+            _process_ds_rope(graph, q_match, k_match, rope_ds_cache)
         else:
-            _process_explicit_rope(
-                graph,
-                q_match,
-                k_match,
-                start_boundary,
-                rope_flash_cache,
-                rope_position_ids_cache,
-            )
+            _process_explicit_rope(graph, q_match, k_match, start_boundary)
 
     gm = canonicalize_graph(gm)
     return gm
@@ -165,9 +131,6 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
-    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
-    rope_position_ids_cache: Dict[str, Node] = {}
-
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         matches = []
         node = start_boundary
@@ -181,25 +144,231 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
         if not matches:
             continue
         if len(matches) != 2:
-            raise RuntimeError(
+            ad_logger.warning(
                 f"Expected exactly 2 complex RoPE branches between {start_boundary} and {end_boundary}, "
                 f"found {len(matches)}."
             )
+            continue
 
         # Assume the first matched branch is query (q), second is key (k).
         # This assumption is based on the default ordering in the exported graph,
         # since node naming conventions don't reliably indicate q/k branches.
         q_match, k_match = matches
-        _process_complex_rope(
-            graph,
-            q_match,
-            k_match,
-            rope_flash_cache,
-            rope_position_ids_cache,
-        )
+        _process_complex_rope(graph, q_match, k_match)
 
     gm = canonicalize_graph(gm)
     return gm
+
+
+def optimize_rope(gm: GraphModule) -> GraphModule:
+    """
+    Scan the FX graph and replace calls to the torch-reference RoPE ops with
+    the optimized `rope::flashinfer` kernel.
+    Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
+    and reuses those nodes when possible.
+    """
+    ad_logger.info("RoPE fusion")
+    graph = gm.graph
+    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
+    rope_position_ids_cache: Dict[str, Node] = {}
+
+    for node in list(graph.nodes):
+        if is_op(node, torch.ops.rope.torch_apply_explicit_rope):
+            _fuse_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
+        elif is_op(node, torch.ops.rope.torch_apply_complex_rope):
+            _fuse_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
+
+    gm = canonicalize_graph(gm)
+    return gm
+
+
+def _fuse_explicit(
+    graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
+) -> None:
+    # node.args may be (q, k, cos, sin) or (q, k, cos, sin, unsq)
+    q_node, k_node, cos_node, sin_node, *rest = node.args
+    # retrieve q and k output node from node
+    old_q = next(
+        (
+            u
+            for u in node.users
+            if u.op == "call_function" and u.target == operator.getitem and u.args[1] == 0
+        ),
+        None,
+    )
+    old_k = next(
+        (
+            u
+            for u in node.users
+            if u.op == "call_function" and u.target == operator.getitem and u.args[1] == 1
+        ),
+        None,
+    )
+    if old_q is None or old_k is None:
+        ad_logger.warning(
+            f"Failed to extract all two outputs from the explicit op, \
+                          get {old_q}, {old_k}, fail to replace {node} with flashinfer rope"
+        )
+        return
+
+    unsq = rest[0] if rest else 1
+
+    # Sanity check on head_dim
+    if not _validate_rope_inputs(q_node, k_node):
+        return
+
+    need_transpose = False if unsq == 2 else True
+    ad_logger.debug(
+        f"Inferred RoPE input layout: [{'[b, n, s, d]' if need_transpose else '[b, s, n, d]'}]"
+    )
+    if need_transpose and unsq != 1:
+        ad_logger.warning(
+            "Unsqueeze_dim is not one of [1, 2]. "
+            "Unable to infer layout of q node. Defaulting to [b, n, s, d]."
+        )
+
+    with graph.inserting_before(node):
+        if need_transpose:
+            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
+            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
+            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
+        else:
+            q_for_op_contig, k_for_op_contig = q_node, k_node
+
+        head_dim = cos_node.meta["val"].shape[-1]
+        half_head_dim = head_dim // 2
+
+    cache_key = (cos_node, sin_node)
+    if cache_key in cache:
+        fused_cos_sin_0 = cache[cache_key]
+    else:
+        with graph.inserting_after(cos_node):
+            cos_prefix = graph.call_function(
+                torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
+            )
+        with graph.inserting_after(sin_node):
+            sin_prefix = graph.call_function(
+                torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
+            )
+        with graph.inserting_after(sin_prefix):
+            fused_cos_sin = graph.call_function(
+                torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
+            )
+        with graph.inserting_after(fused_cos_sin):
+            fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+        cache[cache_key] = fused_cos_sin_0
+
+    with graph.inserting_before(node):
+        position_ids = _get_position_ids(
+            graph,
+            q_for_op_contig,
+            batch_dim=0,
+            seq_dim=1,
+            rope_position_ids_cache=pos_cache,
+        )
+        flash_node = graph.call_function(
+            torch.ops.rope.flashinfer,
+            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin_0, True),
+        )
+
+    with graph.inserting_after(flash_node):
+        raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
+        raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
+
+    if need_transpose:
+        with graph.inserting_after(raw_q):
+            new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
+        with graph.inserting_after(raw_k):
+            new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
+    else:
+        new_q, new_k = raw_q, raw_k
+
+    new_q.meta["val"] = old_q.meta.get("val", None)
+    new_k.meta["val"] = old_k.meta.get("val", None)
+
+    old_q.replace_all_uses_with(new_q)
+    old_k.replace_all_uses_with(new_k)
+
+    graph.erase_node(old_q)
+    graph.erase_node(old_k)
+
+
+def _fuse_complex(
+    graph: GraphModule, node: Node, cache: Dict[Any, Node], pos_cache: Dict[str, Node]
+) -> None:
+    q_node, k_node, inv_freq_node = node.args
+
+    # Sanity check on head_dim
+    if not _validate_rope_inputs(q_node, k_node):
+        return
+
+    # Sanity check that input layout is BSND (no transpose needed).
+    q_fake = q_node.meta.get("val", None)
+    if q_fake is not None and len(q_fake.shape) > 2:
+        if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
+            ad_logger.warning(
+                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
+                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
+            )
+    else:
+        ad_logger.warning(
+            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
+        )
+
+    # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
+    if inv_freq_node in cache:
+        cos_sin_flash = cache[inv_freq_node]
+    else:
+        # Compute the fused cosine/sine cache.
+        with graph.inserting_after(inv_freq_node):
+            real_part = graph.call_function(torch.ops.aten.real, args=(inv_freq_node,))
+            imag_part = graph.call_function(torch.ops.aten.imag, args=(inv_freq_node,))
+        with graph.inserting_after(real_part):
+            cos_sin_flash_3d = graph.call_function(
+                torch.ops.aten.cat, args=((real_part, imag_part), -1)
+            )
+        with graph.inserting_after(cos_sin_flash_3d):
+            cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
+        with graph.inserting_after(cos_sin_flash):
+            cos_sin_flash = graph.call_function(
+                torch.ops.aten.to, args=(cos_sin_flash, torch.float32)
+            )
+        cache[inv_freq_node] = cos_sin_flash
+
+    with graph.inserting_before(node):
+        position_ids = _get_position_ids(
+            graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=pos_cache
+        )
+        flash_node = graph.call_function(
+            torch.ops.rope.flashinfer,
+            args=(q_node, k_node, position_ids, cos_sin_flash, False),
+        )
+
+    flash_node.meta["val"] = node.meta.get("val", None)
+    node.replace_all_uses_with(flash_node)
+    graph.erase_node(node)
+
+
+def _match_ds_rope_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
+    """
+    Detect DeepSeek-style interleave on Q/K:
+      reshape(transpose(view(raw, [b,h,s,d//2,2]), 4, 3), [b,h,s,d])
+    Returns:
+      {"interleaved": raw_node} if matched, else None.
+    """
+    if not is_op(node, torch.ops.aten.reshape):
+        return None
+    transpose_node = node.args[0]
+    if not is_op(transpose_node, torch.ops.aten.transpose):
+        return None
+    view_node = transpose_node.args[0]
+    if not is_op(view_node, torch.ops.aten.view):
+        return None
+    raw_node = view_node.args[0]
+    if not isinstance(raw_node, Node):
+        return None
+    return {"interleaved": raw_node}
 
 
 def _match_explicit_rope_subpattern(add_node: Node) -> Optional[Dict[str, Node]]:
@@ -370,27 +539,22 @@ def _match_complex_rope_subpattern(type_as_node: Node) -> Optional[Dict[str, Nod
 
 
 def _process_explicit_rope(
-    graph: GraphModule,
+    graph: GraphModule.graph,
     q_match: Dict[str, Node],
     k_match: Dict[str, Node],
     start_boundary: Node,
-    rope_flash_cache: DefaultDict[Any, Optional[Node]],
-    rope_position_ids_cache: Dict[str, Node],
 ) -> None:
     """
-    Process a region that matched the legacy RoPE pattern (v1).
-    Inserts the custom op (flashinfer) and replaces the original add nodes.
-    Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
-    and reuses those nodes when possible.
+    Replace matched Explicit RoPE subgraph with `rope::torch_apply_explicit_rope`.
     """
     q_node = q_match["raw_input"]
     k_node = k_match["raw_input"]
-    cos_node = q_match["unsqueeze_cos"].args[0]
-    sin_node = q_match["unsqueeze_sin"].args[0]
-
-    # Sanity check on head_dim
-    if not _validate_rope_inputs(q_node, k_node):
-        return
+    cos_unsq = q_match["unsqueeze_cos"]
+    sin_unsq = q_match["unsqueeze_sin"]
+    cos_node = cos_unsq.args[0]
+    sin_node = sin_unsq.args[0]
+    unsq_dim = cos_unsq.args[1]
+    add_node = q_match["add_node"]
 
     # Sanity-check: ensure cos/sin nodes trace back to aten.cos/aten.sin.
     bfs(
@@ -406,177 +570,57 @@ def _process_explicit_rope(
         boundary=start_boundary,
     )
 
-    # Infer input layout; default to [b, n, s, d] if inference fails.
-    q_fake = q_node.meta.get("val", None)
-    if q_fake is not None and len(q_fake.shape) > 2:
-        need_transpose = isinstance(q_fake.shape[1], int)
-        ad_logger.debug(
-            f"Inferred RoPE input layout: [{'[b, n, s, d]' if need_transpose else '[b, s, n, d]'}]"
-        )
-        # Additional sanity check for the third dimension
-        if need_transpose:
-            if not isinstance(q_fake.shape[2], torch.SymInt):
-                ad_logger.warning(
-                    "Sanity check failed: q_fake.shape[2] should be symbolic. Defaulting to [b, n, s, d]"
-                )
-                need_transpose = True
-        else:
-            if not isinstance(q_fake.shape[1], torch.SymInt):
-                ad_logger.warning(
-                    "Sanity check failed: q_fake.shape[2] should be symbolic. Defaulting to [b, n, s, d]"
-                )
-                need_transpose = True
-    else:
-        ad_logger.warning("Unable to infer layout of q node. Defaulting to [b, n, s, d].")
-        need_transpose = True
-
-    with graph.inserting_before(q_match["add_node"]):
-        if need_transpose:
-            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
-            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
-            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
-        else:
-            q_for_op_contig, k_for_op_contig = q_node, k_node
-
-        head_dim = cos_node.meta["val"].shape[-1]
-        half_head_dim = head_dim // 2
-
-    cache = rope_flash_cache
-    cache_key = (cos_node, sin_node)
-    if cache_key in cache:
-        fused_cos_sin_to = cache[cache_key]
-    else:
-        with graph.inserting_after(cos_node):
-            cos_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(cos_node, -1, 0, half_head_dim)
-            )
-        with graph.inserting_after(sin_node):
-            sin_prefix = graph.call_function(
-                torch.ops.aten.slice, args=(sin_node, -1, 0, half_head_dim)
-            )
-        with graph.inserting_after(sin_prefix):
-            fused_cos_sin = graph.call_function(
-                torch.ops.aten.cat, args=((cos_prefix, sin_prefix), -1)
-            )
-        with graph.inserting_after(fused_cos_sin):
-            fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
-        with graph.inserting_after(fused_cos_sin_0):
-            fused_cos_sin_to = graph.call_function(
-                torch.ops.aten.to, args=(fused_cos_sin_0, torch.float32)
-            )
-        cache[cache_key] = fused_cos_sin_to
-
-    with graph.inserting_before(q_match["add_node"]):
-        position_ids = _get_position_ids(
-            graph,
-            q_for_op_contig,
-            batch_dim=0,
-            seq_dim=1,
-            rope_position_ids_cache=rope_position_ids_cache,
+    with graph.inserting_before(add_node):
+        rope_node = graph.call_function(
+            torch.ops.rope.torch_apply_explicit_rope,
+            args=(q_node, k_node, cos_node, sin_node, unsq_dim),
         )
 
-        flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin_to, True),
-        )
+    with graph.inserting_after(rope_node):
+        out_q = graph.call_function(operator.getitem, args=(rope_node, 0))
+        out_k = graph.call_function(operator.getitem, args=(rope_node, 1))
 
-    with graph.inserting_after(flash_node):
-        raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
-        raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
+    out_q.meta["val"] = add_node.meta.get("val", None)
+    out_k.meta["val"] = k_match["add_node"].meta.get("val", None)
 
-    if need_transpose:
-        with graph.inserting_after(raw_q):
-            new_q = graph.call_function(torch.ops.aten.transpose.int, args=(raw_q, 1, 2))
-        with graph.inserting_after(raw_k):
-            new_k = graph.call_function(torch.ops.aten.transpose.int, args=(raw_k, 1, 2))
-    else:
-        new_q, new_k = raw_q, raw_k
-
-    new_q.meta["val"] = q_match["add_node"].meta.get("val", None)
-    new_k.meta["val"] = k_match["add_node"].meta.get("val", None)
-
-    q_match["add_node"].replace_all_uses_with(new_q)
-    k_match["add_node"].replace_all_uses_with(new_k)
+    q_match["add_node"].replace_all_uses_with(out_q)
+    k_match["add_node"].replace_all_uses_with(out_k)
 
 
 def _process_complex_rope(
-    graph: GraphModule,
+    graph: GraphModule.graph,
     q_match: Dict[str, Node],
     k_match: Dict[str, Node],
-    rope_flash_cache: DefaultDict[Any, Optional[Node]],
-    rope_position_ids_cache: Dict[str, Node],
 ) -> None:
     """
-    Process a region that matched the complex-multiplication RoPE pattern (v2).
-    Inserts the custom op (flashinfer) after extracting frequency information,
-    and replaces the original type_as nodes.
-    Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
-    and reuses those nodes when possible.
+    Replace matched Complex RoPE subgraph with `rope::torch_apply_complex_rope`.
     """
-    q_node = q_match["input"]
-    k_node = k_match["input"]
-    inv_freq_node = q_match["inv_freq"]
+    xq = q_match["input"]
+    xk = k_match["input"]
+    inv = q_match["inv_freq"]
+    out_node = q_match.get("out")
 
-    # Sanity check on head_dim
-    if not _validate_rope_inputs(q_node, k_node):
+    if inv != k_match["inv_freq"]:
+        ad_logger.warning(
+            "Mismatch of freqs_cis (inv_freq) between branches. Fail to match complex rope pattern"
+        )
         return
 
-    if inv_freq_node != k_match["inv_freq"]:
-        raise RuntimeError("Mismatch of freqs_cis (inv_freq) between branches.")
-
-    # Sanity check that input layout is BSND (no transpose needed).
-    q_fake = q_node.meta.get("val", None)
-    if q_fake is not None and len(q_fake.shape) > 2:
-        if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
-            ad_logger.warning(
-                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
-                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
-            )
-    else:
-        ad_logger.warning(
-            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
+    with graph.inserting_before(out_node):
+        rope_node = graph.call_function(
+            torch.ops.rope.torch_apply_complex_rope,
+            args=(xq, xk, inv),
         )
 
-    # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
-    cache = rope_flash_cache
-    if inv_freq_node in cache:
-        cos_sin_flash = cache[inv_freq_node]
-    else:
-        # Compute the fused cosine/sine cache.
-        with graph.inserting_after(inv_freq_node):
-            real_part = graph.call_function(torch.ops.aten.real, args=(inv_freq_node,))
-            imag_part = graph.call_function(torch.ops.aten.imag, args=(inv_freq_node,))
-        with graph.inserting_after(real_part):
-            cos_sin_flash_3d = graph.call_function(
-                torch.ops.aten.cat, args=((real_part, imag_part), -1)
-            )
-        with graph.inserting_after(cos_sin_flash_3d):
-            cos_sin_flash = graph.call_function(operator.getitem, args=(cos_sin_flash_3d, 0))
-        with graph.inserting_after(cos_sin_flash):
-            cos_sin_flash = graph.call_function(
-                torch.ops.aten.to, args=(cos_sin_flash, torch.float32)
-            )
-        cache[inv_freq_node] = cos_sin_flash
+    with graph.inserting_after(rope_node):
+        out_q = graph.call_function(operator.getitem, args=(rope_node, 0))
+        out_k = graph.call_function(operator.getitem, args=(rope_node, 1))
 
-    with graph.inserting_before(q_match["out"]):
-        position_ids = _get_position_ids(
-            graph, q_node, batch_dim=0, seq_dim=1, rope_position_ids_cache=rope_position_ids_cache
-        )
-        flash_node = graph.call_function(
-            torch.ops.rope.flashinfer,
-            args=(q_node, k_node, position_ids, cos_sin_flash, False),
-        )
+    out_q.meta["val"] = out_node.meta.get("val", None)
+    out_k.meta["val"] = k_match["out"].meta.get("val", None)
 
-    with graph.inserting_after(flash_node):
-        raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
-        raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
-
-    raw_q.meta["val"] = q_match["out"].meta.get("val", None)
-    raw_k.meta["val"] = k_match["out"].meta.get("val", None)
-
-    q_match["out"].replace_all_uses_with(raw_q)
-    k_match["out"].replace_all_uses_with(raw_k)
+    out_node.replace_all_uses_with(out_q)
+    k_match["out"].replace_all_uses_with(out_k)
 
 
 def _process_ds_rope(
@@ -586,7 +630,7 @@ def _process_ds_rope(
     rope_ds_cache: DefaultDict[Tuple[Node, Node, int], Tuple[Optional[Node], Optional[Node]]],
 ) -> None:
     """
-    Replace a matched DS-style RoPE subgraph with a call to rope::apply_rope_ds.
+    Replace a matched DS-style RoPE subgraph with a call to rope::apply_rope_with_qk_interleaving.
     Cache the one-time unsqueeze of cos/sin.
     """
     q_node = q_match["raw_input"]
@@ -619,7 +663,7 @@ def _process_ds_rope(
 
     with graph.inserting_before(q_match["add_node"]):
         ds_node = graph.call_function(
-            torch.ops.rope.apply_rope_ds,
+            torch.ops.rope.torch_apply_rope_with_qk_interleaving,
             args=(q_node, k_node, cos_u, sin_u),
         )
 
