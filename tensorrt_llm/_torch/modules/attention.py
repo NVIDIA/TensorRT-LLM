@@ -780,7 +780,9 @@ class MLA(nn.Module):
             attn_metadata,
         )
 
-        out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        # out_scale = getattr(self.o_proj, "inv_input_scale", None)
+        out_scale = None  # Currently we use BF16 MHA for context phase
+
         attn_output = self.mha.forward(
             q,
             None,
