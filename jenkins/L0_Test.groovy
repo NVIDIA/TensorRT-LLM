@@ -5,6 +5,7 @@ import groovy.transform.Field
 import groovy.json.JsonSlurper
 import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.KubernetesManager
+import com.nvidia.bloom.Constants
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
