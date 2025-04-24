@@ -53,7 +53,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.logger import ad_logger
-from ...utils.node_utils import bfs, identify_regions_between_residuals, is_op
+from ...utils.node_utils import bfs, extract_output_tuple, identify_regions_between_residuals, is_op
 from .._graph import canonicalize_graph
 
 
@@ -67,6 +67,7 @@ def match_explicit_rope(gm: GraphModule) -> GraphModule:
     If exactly two such branches (query and key) are detected within each region, they're replaced
     by a call to `torch.ops.rope.flashinfer`.
     """
+    ad_logger.info("Match explicit(HF) style RoPE")
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
@@ -128,6 +129,7 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     If exactly two such branches (query and key) are detected within each region, they're replaced
     by a call to `torch.ops.rope.flashinfer`.
     """
+    ad_logger.info("Match Complex style RoPE")
     graph = gm.graph
     boundary_nodes: List[torch.fx.Node] = identify_regions_between_residuals(gm)
 
@@ -160,6 +162,87 @@ def match_complex_rope(gm: GraphModule) -> GraphModule:
     return gm
 
 
+def match_rope_layout(gm: GraphModule, layout: str = "bsnd") -> GraphModule:
+    """
+    Match and transform input and output of rope ops to the layout specified.
+    Supported layout is 'bsnd' (batch, seq, head, dim).
+    """
+    supported = "bsnd"
+    if layout.lower() != supported:
+        ad_logger.warning(
+            f"Unsupported RoPE layout '{layout}'; expected '{supported}'. Skipping RoPE layout matching."
+        )
+        return gm
+
+    ad_logger.info(f"Match RoPE layout to {layout}")
+
+    graph = gm.graph
+    rope_ops = {
+        torch.ops.rope.torch_apply_explicit_rope,
+    }
+
+    for node in list(graph.nodes):
+        if is_op(node, rope_ops):
+            q_node, k_node, cos_node, sin_node, *rest = node.args
+            unsq = rest[0] if rest else 1
+
+            need_transpose = False if unsq == 2 else True
+            ad_logger.debug(
+                f"Inferred RoPE input layout: [{'[b, n, s, d]' if need_transpose else '[b, s, n, d]'}]"
+            )
+            if need_transpose and unsq != 1:
+                ad_logger.warning(
+                    "Unsqueeze_dim is not one of [1, 2]. "
+                    "Unable to infer layout of q node. Defaulting to [b, n, s, d]."
+                )
+            if need_transpose:
+                with graph.inserting_before(node):
+                    q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+                    k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
+                    q_for_op_contig = graph.call_function(
+                        torch.ops.aten.contiguous, args=(q_for_op,)
+                    )
+                    k_for_op_contig = graph.call_function(
+                        torch.ops.aten.contiguous, args=(k_for_op,)
+                    )
+
+                q_for_op_contig.meta["val"] = q_node.meta.get("val", None)
+                k_for_op_contig.meta["val"] = k_node.meta.get("val", None)
+
+                new_args = (
+                    q_for_op_contig,
+                    k_for_op_contig,
+                    cos_node,
+                    sin_node,
+                    2,
+                )  # unsqueeze_dim updated to 2
+                node.args = new_args
+
+                # retrieve q and k output node from node
+                old_q, old_k = extract_output_tuple(node, 2)
+                if old_q is None or old_k is None:
+                    ad_logger.warning(
+                        f"Failed to extract all two outputs from the explicit op, \
+                            get {old_q}, {old_k}, fail to replace {node} with flashinfer rope"
+                    )
+                    return
+                with graph.inserting_after(old_q):
+                    new_q = graph.call_function(torch.ops.aten.transpose, args=(old_q, 1, 2))
+                with graph.inserting_after(old_k):
+                    new_k = graph.call_function(torch.ops.aten.transpose, args=(old_k, 1, 2))
+
+                new_q.meta["val"] = old_q.meta.get("val", None)
+                new_k.meta["val"] = old_k.meta.get("val", None)
+
+                old_q.replace_all_uses_with(new_q)
+                old_k.replace_all_uses_with(new_k)
+                new_q.args = (old_q, 1, 2)
+                new_k.args = (old_k, 1, 2)
+
+    gm = canonicalize_graph(gm)
+    return gm
+
+
 def optimize_rope(gm: GraphModule) -> GraphModule:
     """
     Scan the FX graph and replace calls to the torch-reference RoPE ops with
@@ -167,7 +250,7 @@ def optimize_rope(gm: GraphModule) -> GraphModule:
     Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
     and reuses those nodes when possible.
     """
-    ad_logger.info("RoPE fusion")
+    ad_logger.info("RoPE optimization")
     graph = gm.graph
     rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
     rope_position_ids_cache: Dict[str, Node] = {}
@@ -188,56 +271,33 @@ def _fuse_explicit(
     # node.args may be (q, k, cos, sin) or (q, k, cos, sin, unsq)
     q_node, k_node, cos_node, sin_node, *rest = node.args
     # retrieve q and k output node from node
-    old_q = next(
-        (
-            u
-            for u in node.users
-            if u.op == "call_function" and u.target == operator.getitem and u.args[1] == 0
-        ),
-        None,
-    )
-    old_k = next(
-        (
-            u
-            for u in node.users
-            if u.op == "call_function" and u.target == operator.getitem and u.args[1] == 1
-        ),
-        None,
-    )
+    old_q, old_k = extract_output_tuple(node, 2)
     if old_q is None or old_k is None:
         ad_logger.warning(
             f"Failed to extract all two outputs from the explicit op, \
-                          get {old_q}, {old_k}, fail to replace {node} with flashinfer rope"
+                get {old_q}, {old_k}, fail to replace {node} with flashinfer rope"
         )
         return
-
-    unsq = rest[0] if rest else 1
 
     # Sanity check on head_dim
     if not _validate_rope_inputs(q_node, k_node):
         return
 
-    need_transpose = False if unsq == 2 else True
-    ad_logger.debug(
-        f"Inferred RoPE input layout: [{'[b, n, s, d]' if need_transpose else '[b, s, n, d]'}]"
-    )
-    if need_transpose and unsq != 1:
+    # Sanity check that input layout is BSND (no transpose needed).
+    q_fake = q_node.meta.get("val", None)
+    if q_fake is not None and len(q_fake.shape) > 2:
+        if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
+            ad_logger.warning(
+                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
+                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
+            )
+    elif q_fake is not None:
         ad_logger.warning(
-            "Unsqueeze_dim is not one of [1, 2]. "
-            "Unable to infer layout of q node. Defaulting to [b, n, s, d]."
+            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
         )
 
-    with graph.inserting_before(node):
-        if need_transpose:
-            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
-            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
-            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
-        else:
-            q_for_op_contig, k_for_op_contig = q_node, k_node
-
-        head_dim = cos_node.meta["val"].shape[-1]
-        half_head_dim = head_dim // 2
+    head_dim = cos_node.meta["val"].shape[-1]
+    half_head_dim = head_dim // 2
 
     cache_key = (cos_node, sin_node)
     if cache_key in cache:
@@ -257,32 +317,28 @@ def _fuse_explicit(
             )
         with graph.inserting_after(fused_cos_sin):
             fused_cos_sin_0 = graph.call_function(operator.getitem, args=(fused_cos_sin, 0))
+        with graph.inserting_after(fused_cos_sin_0):
+            fused_cos_sin_0 = graph.call_function(
+                torch.ops.aten.to, args=(fused_cos_sin_0, torch.float32)
+            )
         cache[cache_key] = fused_cos_sin_0
 
     with graph.inserting_before(node):
         position_ids = _get_position_ids(
             graph,
-            q_for_op_contig,
+            q_node,
             batch_dim=0,
             seq_dim=1,
             rope_position_ids_cache=pos_cache,
         )
         flash_node = graph.call_function(
             torch.ops.rope.flashinfer,
-            args=(q_for_op_contig, k_for_op_contig, position_ids, fused_cos_sin_0, True),
+            args=(q_node, k_node, position_ids, fused_cos_sin_0, True),
         )
 
     with graph.inserting_after(flash_node):
-        raw_q = graph.call_function(operator.getitem, args=(flash_node, 0))
-        raw_k = graph.call_function(operator.getitem, args=(flash_node, 1))
-
-    if need_transpose:
-        with graph.inserting_after(raw_q):
-            new_q = graph.call_function(torch.ops.aten.transpose, args=(raw_q, 1, 2))
-        with graph.inserting_after(raw_k):
-            new_k = graph.call_function(torch.ops.aten.transpose, args=(raw_k, 1, 2))
-    else:
-        new_q, new_k = raw_q, raw_k
+        new_q = graph.call_function(operator.getitem, args=(flash_node, 0))
+        new_k = graph.call_function(operator.getitem, args=(flash_node, 1))
 
     new_q.meta["val"] = old_q.meta.get("val", None)
     new_k.meta["val"] = old_k.meta.get("val", None)
@@ -311,7 +367,7 @@ def _fuse_complex(
                 f"""Sanity check failed: q_fake should have shape [b, s, n, d],
                 s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
             )
-    else:
+    elif q_fake is not None:
         ad_logger.warning(
             f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
         )
