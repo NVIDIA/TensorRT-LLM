@@ -17,30 +17,18 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
 
 # Find NIXL
-find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include
-                                        /opt/nvidia/nvda_nixl/include)
+find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include)
 
 # Find all required NIXL libraries
-find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-                                     /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-find_library(
-  NIXL_BUILD_LIBRARY nixl_build
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-find_library(
-  SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-                              /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-find_library(
-  UCX_BACKEND_LIBRARY ucx_backend
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-find_library(
-  UCX_UTILS_LIBRARY ucx_utils HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-                                    /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
-find_library(
-  GDS_BACKEND_LIBRARY gds_backend
-  HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu
-        /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu)
+find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
+find_library(NIXL_BUILD_LIBRARY nixl_build
+             HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
+find_library(SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
+find_library(UCX_BACKEND_LIBRARY plugin_UCX
+             HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH}/plugins)
+find_library(UCX_UTILS_LIBRARY ucx_utils HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
+find_library(GDS_BACKEND_LIBRARY plugin_GDS
+             HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH}/plugins)
 
 # Check if all required libraries were found
 if(NOT NIXL_LIBRARY
