@@ -970,7 +970,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         sh """
             ls -all ${stageName}/
             if ! grep -q '<testcase' ${stageName}/results.xml; then
-                rm results.xml
+                rm ${stageName}/results.xml
             fi
         """
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
