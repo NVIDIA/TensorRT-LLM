@@ -266,6 +266,7 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
+            self.model.extra_attrs['model_config'] = self.model.model_config
         if self.pytorch_backend_config.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
             module_prefix = 'Model'

@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import ceil_div, get_sm_count
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -452,7 +453,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # get_model_extra_attrs()
+        extra_attrs = get_model_extra_attrs()
+        model_config = extra_attrs['model_config']
 
         self.prompt_lens_cuda = torch.empty(
             (self.max_num_requests, ),
@@ -500,12 +502,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 tile_scheduler_metadata_size = 8  # Note: must be aligned with TileSchedulerMetaDataSize in flash_mla.h
                 block_size_m = 64
                 sm_count = get_sm_count()
-                # TODO begin: get from extra_attrs
-                # extra_attrs.
+                # Note begin: Be careful to make these configs aligned with tensorrt_llm._torch.modules.attention.MLA
                 num_heads_k = 1
-                num_heads_q = 128
-                predicted_tokens_per_seq = 1
-                # TODO end
+
+                tp_size = model_config.mapping.tp_size if not model_config.mapping.enable_attention_dp else 1
+                num_heads_q = model_config.pretrained_config.num_attention_heads
+                assert num_heads_q % tp_size == 0
+                num_heads_q = num_heads_q // tp_size
+
+                predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
+                # Note end
                 num_heads_per_head_k = predicted_tokens_per_seq * num_heads_q // num_heads_k
                 num_sm_parts = sm_count // num_heads_k // ceil_div(
                     num_heads_per_head_k, block_size_m)
