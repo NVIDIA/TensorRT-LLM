@@ -461,3 +461,5 @@ perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,
 full:B40/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP #https://nvbugspro.nvidia.com/bug/5150255
 full:B200/perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-float16-input_output_len:128,128-quant:fp8] SKIP #https://nvbugspro.nvidia.com/bug/5150255
 accuracy/test_cli_flow.py::TestGpt2Medium::test_fp8_lm_head SKIP (https://nvbugs/5231769)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler] SKIP (https://nvbugs/5236456)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp-cuda_graph-overlap_scheduler] SKIP (https://nvbugs/5236456)
