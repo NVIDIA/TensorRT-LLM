@@ -1258,7 +1258,7 @@ def test_llm_llama_v1_4gpu_paged_kv_cache(llama_example_root, llama_model_root,
 
     print("Run inference")
     run_cmd = [
-        f"{llama_example_root}/../run.py",
+        f"{llama_example_root}/../../../run.py",
         "--max_output_len=10",
         f"--tokenizer_dir={llama_model_root}",
         f"--engine_dir={engine_dir}",
