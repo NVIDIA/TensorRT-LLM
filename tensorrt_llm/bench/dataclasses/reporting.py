@@ -368,6 +368,14 @@ class ReportUtility:
                         k: self.convert_to_ms(v)
                         for k, v in
                         self.statistics.ttft_percentiles.model_dump().items()
+                    },
+                # Per request generation token throughput percentiles (Genphase TPS)
+                "generation_tp_percentiles":
+                self.statistics.generation_tp_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_to_ms(v)
+                        for k, v in self.statistics.generation_tp_percentiles.
+                        model_dump().items()
                     }
             }
 

@@ -165,7 +165,7 @@ class BenchmarkStatistics(BaseModel):
 
     @computed_field
     def per_user_generation_token_throughput_ns(self) -> float:
-        return 1.0 / self.tpot_percentiles.average
+        return self.generation_tp_percentiles.average
 
     @computed_field
     def request_throughput_ns(self) -> float:
