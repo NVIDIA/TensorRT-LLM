@@ -6,6 +6,7 @@ import os
 import traceback
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from enum import IntEnum
 from typing import Any, Dict, Optional, Tuple
 
 import safetensors
@@ -217,6 +218,12 @@ KV_CACHE_MANAGER_KEY = 'kv_cache_manager'
 DRAFT_KV_CACHE_MANAGER_KEY = 'draft_kv_cache_manager'
 
 
+class WarmupField(IntEnum):
+    TORCH_COMPILE = 1
+    AUTO_TUNE = TORCH_COMPILE << 1
+    CUDA_GRAPH = AUTO_TUNE << 1
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -372,7 +379,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.warmed_up = False
+        self.warmed_up = 0
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
@@ -515,8 +522,10 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == 'star_attention':
             return
 
-        if self._torch_compile_enabled and self.warmed_up == False:
+        if self._torch_compile_enabled and not (self.warmed_up
+                                                & WarmupField.TORCH_COMPILE):
             # Disable cuda graph capture here so that we can properly capture it later
+            self.warmed_up += WarmupField.TORCH_COMPILE
             with no_cuda_graph():
                 warmup_batch_size = [1, self.batch_size // 2]
                 if self.batch_size < 2:
@@ -544,7 +553,9 @@ class PyTorchModelEngine(ModelEngine):
                                     bs, num_tokens_per_request))
                             torch.cuda.synchronize()
 
-        if self.pytorch_backend_config.autotuner_enabled and self.warmed_up == False:
+        if self.pytorch_backend_config.autotuner_enabled and not (
+                self.warmed_up & WarmupField.AUTO_TUNE):
+            self.warmed_up += WarmupField.AUTO_TUNE
             with no_cuda_graph(), autotune():
                 num_tokens_per_request = min(self.max_num_tokens,
                                              kv_cache_manager.max_seq_len - 1)
@@ -566,7 +577,7 @@ class PyTorchModelEngine(ModelEngine):
                 logger.info(f"Autotuner Cache size after warmup " +
                             str(len(AutoTuner.get().profiling_cache)))
 
-        if not self._run_cuda_graphs:
+        if self._run_cuda_graphs:
             return
 
         logger.info(
@@ -589,7 +600,7 @@ class PyTorchModelEngine(ModelEngine):
                              resource_manager=resource_manager,
                              extra_model_inputs=_create_extra_inputs(bs, 1))
                 torch.cuda.synchronize()
-        self.warmed_up = True
+        self.warmed_up += WarmupField.CUDA_GRAPH
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         if kv_cache_manager is None:
