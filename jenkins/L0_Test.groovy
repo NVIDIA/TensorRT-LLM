@@ -2,6 +2,8 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
+import com.nvidia.bloom.KubernetesManager
+import com.nvidia.bloom.Constants
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
