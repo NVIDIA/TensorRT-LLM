@@ -320,7 +320,7 @@ class Llama4DecoderLayer(DecoderLayer):
         is_blackwell = (major * 10 + minor) >= 100
         num_tokens = hidden_states.fp4_tensor.size(0) if isinstance(
             hidden_states, Fp4QuantizedTensor) else hidden_states.size(0)
-        llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 4 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
+        llama4_tp8ep1_min_latency_mode = True if is_blackwell and self.is_fp8_quant and self.tp_size == 8 and self.ep_size == 1 and self.num_experts == 128 and self.topk == 1 and num_tokens <= 8 and self.hidden_size == 5120 and self.intermediate_size == 8192 else False
         # min_latency_mode = not llama4_tp8ep1_min_latency_mode and num_tokens <= 128 and self.fusion_config.POST_MOE_FUSION and is_blackwell and self.is_quanted
         # Temporarily disable min-latency mode for Llama4
         min_latency_mode = False
