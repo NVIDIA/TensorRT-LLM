@@ -159,6 +159,7 @@ examples/test_mistral.py::test_llm_mistral_lora_1gpu[komt-mistral-7b-v1-lora-kom
 examples/test_mistral.py::test_llm_mistral_v1_1gpu[mistral-7b-v0.1-float16-max_attention_window_size_4096-summarization_long]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_fp8_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
 examples/test_mixtral.py::test_llm_mixtral_moe_plugin_lora_4gpus[Mixtral-8x7B-v0.1-chinese-mixtral-lora]
+examples/test_mixtral.py::test_llm_mixtral_int4_awq_1gpu_summary[mixtral-8x7b-v0.1-AWQ]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3-vision-128k-instruct-pp:1-tp:1-float16-bs:8-cpp_e2e:False-nb:1]
 examples/test_multimodal.py::test_llm_multimodal_general[Phi-3.5-vision-instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1]
@@ -375,8 +376,7 @@ accuracy/test_cli_flow.py::TestMistral7B::test_fp8_tp4pp2
 accuracy/test_cli_flow.py::TestMistral7B::test_smooth_quant_tp4pp1
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp8_tp2pp2_manage_weights
-accuracy/test_cli_flow.py::TestMixtral8x7B::test_nvfp4_prequantized
-accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp4[enable_fp4]
+accuracy/test_cli_flow.py::TestMixtral8x7B::test_fp4_plugin
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_weight_only_int4_tp2
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_weight_only_int8_tp2
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_pp_reduce_scatter_tp2pp2
@@ -387,6 +387,8 @@ accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[no_renormalize-tenso
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-expert_parallel]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-mixed_parallel]
 accuracy/test_cli_flow.py::TestMixtral8x7B::test_plugin_tp8[renormalize-tensor_parallel]
+accuracy/test_cli_flow.py::TestMixtral8x7BInstruct::test_nvfp4_prequantized
+accuracy/test_cli_flow.py::TestMixtral8x7BInstruct::test_awq
 accuracy/test_cli_flow.py::TestMixtral8x22B::test_fp8_tp2pp2
 accuracy/test_cli_flow.py::TestMixtral8x22B::test_plugin_tp8[renormalize-tensor_parallel]
 accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
@@ -418,7 +420,6 @@ accuracy/test_llm_api.py::TestMixtral8x7B::test_tp2
 accuracy/test_llm_api.py::TestMixtral8x7B::test_smooth_quant_tp2pp2
 accuracy/test_llm_api.py::TestMixtral8x7B_Instruct::test_awq_tp2
 accuracy/test_llm_api.py::TestMixtral8x7B_Instruct::test_fp4
-accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4

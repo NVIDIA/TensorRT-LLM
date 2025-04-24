@@ -116,7 +116,8 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8_lm_head(self):
-        self.run(quant_algo=QuantAlgo.FP8, t=["--quantize_lm_head"])
+        self.run(quant_algo=QuantAlgo.FP8,
+                 extra_convert_args=["--quantize_lm_head"])
 
 
 class TestSantacoder(CliFlowAccuracyTestHarness):
@@ -808,6 +809,7 @@ class TestMistral7B(CliFlowAccuracyTestHarness):
         for num_beams in [1, 2]:
             gc.collect()
             torch.cuda.empty_cache()
+            self.extra_acc_spec = f"beam_width={num_beams}"
             self.extra_summarize_args = [f"--num_beams={num_beams}"]
             self.evaluate()
 
@@ -818,18 +820,14 @@ class TestMistral7B(CliFlowAccuracyTestHarness):
                  tp_size=4,
                  pp_size=2,
                  extra_convert_args=["--calib_size=4"],
-                 extra_acc_spec="beam_width=4",
-                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4"])
+                 extra_build_args=["--gemm_plugin=auto"])
 
     @pytest.mark.skip_less_device(4)
     def test_smooth_quant_tp4pp1(self):
         self.run(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
                  tp_size=4,
                  pp_size=1,
-                 extra_acc_spec="beam_width=4",
-                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4"])
+                 extra_build_args=["--gemm_plugin=auto"])
 
 
 class TestMixtral8x7B(CliFlowAccuracyTestHarness):
@@ -849,17 +847,15 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     def test_ootb_except_mha_tp8(self, moe_tp_size):
         self.run(tp_size=8,
-                 extra_acc_spec="ootb_except_mha;beam_width=4",
                  extra_convert_args=[
                      f"--moe_tp_size={moe_tp_size}",
                      f"--moe_ep_size={8 // moe_tp_size}",
                      f"--moe_renorm_mode={0}"
                  ],
                  extra_build_args=[
-                     "--max_beam_width=4", "--gemm_plugin=disable",
-                     "--moe_plugin=disable", f"--max_seq_len={8192}"
-                 ],
-                 extra_summarize_args=["--num_beams=4"])
+                     "--gemm_plugin=disable", "--moe_plugin=disable",
+                     f"--max_seq_len={8192}"
+                 ])
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(45000)
@@ -870,17 +866,15 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                              ids=['no_renormalize', 'renormalize'])
     def test_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
         self.run(tp_size=8,
-                 extra_acc_spec="plugin;beam_width=4",
                  extra_convert_args=[
                      f"--moe_tp_size={moe_tp_size}",
                      f"--moe_ep_size={8 // moe_tp_size}",
                      f"--moe_renorm_mode={moe_renorm_mode}"
                  ],
                  extra_build_args=[
-                     "--max_beam_width=4", "--gemm_plugin=auto",
-                     "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ],
-                 extra_summarize_args=["--num_beams=4"])
+                     "--gemm_plugin=auto", "--moe_plugin=auto",
+                     f"--max_seq_len={8192}"
+                 ])
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
@@ -925,9 +919,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     def test_weight_only_int8_tp2(self):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,
-                 extra_acc_spec="beam_width=4",
-                 extra_build_args=["--max_beam_width=4", "--gemm_plugin=auto"],
-                 extra_summarize_args=["--num_beams=4"])
+                 extra_build_args=["--gemm_plugin=auto"])
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(45000)
@@ -935,48 +927,38 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,
                  pp_size=2,
-                 extra_acc_spec="pp_reduce_scatter;beam_width=4",
                  extra_build_args=[
-                     "--max_beam_width=4", "--gemm_plugin=auto",
-                     "--pp_reduce_scatter=enable"
-                 ],
-                 extra_summarize_args=["--num_beams=4"])
+                     "--gemm_plugin=auto", "--pp_reduce_scatter=enable"
+                 ])
 
     @skip_pre_blackwell
-    def test_nvfp4_prequantized(self, mocker):
-        mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
+    @pytest.mark.skip_less_device_memory(180000)
+    def test_fp4_plugin(self):
+        build_args = [
+            "--max_input_len=2048", "--gemm_plugin=nvfp4",
+            "--use_paged_context_fmha=enable", "--use_fp8_context_fmha=enable"
+        ]
+        self.run(tasks=[MMLU(self.MODEL_NAME)],
+                 quant_algo=QuantAlgo.NVFP4,
+                 kv_cache_quant_algo=QuantAlgo.FP8,
+                 extra_build_args=build_args)
+
+
+class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1"
+    EXAMPLE_FOLDER = "llama"
+
+    @skip_pre_blackwell
+    def test_nvfp4_prequantized(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("fp4_type", ["plugin", "ootb", "disable"],
-                             ids=["fp4_plugin", "fp4_ootb", "disable_fp4"])
-    def test_fp4(self, fp4_type):
-        build_args = ["--max_input_len=2048"]
-        if fp4_type != "disable":
-            build_args.extend([
-                "--gemm_plugin=disable"
-                if fp4_type == "ootb" else "--gemm_plugin=nvfp4"
-            ])
-        if fp4_type == "plugin":
-            build_args.extend([
-                "--use_paged_context_fmha=enable",
-                "--use_fp8_context_fmha=enable"
-            ])
-        if fp4_type != "disable":
-            self.run(tasks=[MMLU(self.MODEL_NAME)],
-                     quant_algo=QuantAlgo.NVFP4,
-                     kv_cache_quant_algo=QuantAlgo.FP8,
-                     extra_acc_spec="fp4",
-                     extra_build_args=build_args)
-        else:
-            self.run(tasks=[MMLU(self.MODEL_NAME)],
-                     extra_acc_spec="fp4",
-                     extra_build_args=build_args)
+    def test_awq(self, mocker):
+        mocker.patch.object(self.__class__, "MODEL_PATH",
+                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
+        self.run()
 
 
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):
@@ -1014,9 +996,7 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ],
-                 extra_summarize_args=["--num_beams=4"],
-                 extra_acc_spec="plugin")
+                 ])
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

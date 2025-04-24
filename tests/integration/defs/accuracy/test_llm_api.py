@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import LLM, BuildConfig
+from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -40,7 +40,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
 
 
 class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-7B-v0.3"
+    MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
     MODEL_PATH = f"{llm_models_root()}/Mistral-7B-Instruct-v0.3"
 
     @skip_post_blackwell
@@ -56,14 +56,8 @@ class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
         elif quant == 'int8_awq':
             quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
 
-        build_config = BuildConfig()
-        build_config.max_batch_size = 1
-        build_config.max_input_len = 1900
-        build_config.plugin_config.paged_kv_cache = True
-
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
-                 build_config=build_config,
                  quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -72,37 +66,27 @@ class TestMistral7B_0_3(LlmapiAccuracyTestHarness):
 
 
 class TestMistral_Nemo_12B_Base(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "NeMo/Mistral_Nemo_12B_Base"
+    MODEL_NAME = "mistralai/Mistral-Nemo-Base-2407"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Nemo-Base-2407"
 
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
 
-        build_config = BuildConfig()
-        build_config.plugin_config._gemm_plugin = "auto"
-
-        with LLM(self.MODEL_PATH,
-                 build_config=build_config,
-                 quant_config=quant_config) as llm:
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
 
 class TestMistral_NeMo_Minitron_8B_Instruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "NeMo/Mistral_NeMo_Minitron_8B_Instruct"
+    MODEL_NAME = "nvidia/Mistral-NeMo-Minitron-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Mistral-NeMo-Minitron-8B-Instruct"
 
     @skip_pre_ada
     def test_fp8(self):
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
 
-        build_config = BuildConfig()
-        build_config.plugin_config._gemm_plugin = "auto"
-
-        with LLM(self.MODEL_PATH,
-                 build_config=build_config,
-                 quant_config=quant_config) as llm:
+        with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
