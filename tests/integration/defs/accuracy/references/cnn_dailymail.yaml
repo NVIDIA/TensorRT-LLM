@@ -148,6 +148,7 @@ meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     accuracy: 34.927
 mistralai/Mistral-7B-v0.1:
+  - accuracy: 25.736
   - extra_acc_spec: beam_width=4
     accuracy: 28.368
   - extra_acc_spec: beam_width=2
@@ -155,9 +156,11 @@ mistralai/Mistral-7B-v0.1:
   - extra_acc_spec: beam_width=1
     accuracy: 25.604
   - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 27.745
+    accuracy: 24.806
   - quant_algo: FP8
-    accuracy: 28.321
+    accuracy: 25.180
+  - quant_algo: W4A16_AWQ
+    accuracy: 24.806
 mistralai/Mistral-7B-Instruct-v0.3:
   - quant_algo: W4A16
     accuracy: 31.372

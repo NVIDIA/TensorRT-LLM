@@ -943,6 +943,11 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_build_args=build_args)
 
+    def test_int4_awq_prequantized(self, mocker):
+        mocker.patch.object(self.__class__, "MODEL_PATH",
+                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
+        self.run(quant_algo=QuantAlgo.W4A16_AWQ)
+
 
 class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -954,11 +959,6 @@ class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
         self.run(tasks=[MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.NVFP4,
                  kv_cache_quant_algo=QuantAlgo.FP8)
-
-    def test_awq(self, mocker):
-        mocker.patch.object(self.__class__, "MODEL_PATH",
-                            f"{llm_models_root()}/mixtral-8x7b-v0.1-AWQ")
-        self.run()
 
 
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):
