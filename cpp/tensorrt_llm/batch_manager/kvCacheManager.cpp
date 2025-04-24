@@ -505,11 +505,10 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             mAbsolutePoolToWindowSize.push_back(windowSize);
             mAbsolutePoolToRelativePoolIndex.push_back(i);
         }
-        auto const useOneMoreBlock = isUseOneMoreBlock(windowSize, maxSequenceLength, maxBeamWidth);
-        auto const maxTokenNum = windowSize + sinkBubbleLength + (useOneMoreBlock ? tokensPerBlock : 0);
+        auto const maxTokenNum = windowSize + sinkBubbleLength;
         auto const temporaryAttentionWindow = manager.calculateTemporaryAttentionWindow(tempAttentionWindowInputs);
 
-        auto const numNonSinkTokensInWindow = windowSize - sinkTokenLength + (useOneMoreBlock ? tokensPerBlock : 0);
+        auto const numNonSinkTokensInWindow = windowSize - sinkTokenLength;
 
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const maxBlocksPerSeq

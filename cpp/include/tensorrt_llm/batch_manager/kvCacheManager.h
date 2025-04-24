@@ -1093,12 +1093,10 @@ public:
     //! \brief Store context blocks
     void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
-    [[nodiscard]] static bool isUseOneMoreBlock(
-        SizeType32 windowSize, std::optional<SizeType32> maxSequenceLength, SizeType32 maxBeamWidth)
+    [[nodiscard]] static bool isUseOneMoreBlock()
     {
-        bool const isCyclicWindowSize = maxSequenceLength.has_value() && maxSequenceLength.value() > windowSize;
-        bool const isBeamSearch = maxBeamWidth > 1;
-        return isCyclicWindowSize && isBeamSearch;
+        // With sliding window kv cache, we don't need to use one more block even for beam search
+        return false;
     }
 
     //! \brief Perform per-request bookkeeping
