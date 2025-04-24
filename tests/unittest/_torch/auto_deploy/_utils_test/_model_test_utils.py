@@ -253,3 +253,22 @@ def apply_rotary_pos_emb_complex(
     xq_out = torch.view_as_real(xq_complex * freqs_cis[:, :, None, :]).flatten(3)
     xk_out = torch.view_as_real(xk_complex * freqs_cis[:, :, None, :]).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
+def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """
+    Apply rotary positional embeddings by interleaving Q/K ,
+    indexing cos/sin tables with position_ids, and returning rotated q, k.
+    cos:  [seq_len, head_dim]
+    sin:  [seq_len, head_dim]
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
