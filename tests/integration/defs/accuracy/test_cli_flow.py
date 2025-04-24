@@ -797,7 +797,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 class TestMistral7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
-    EXAMPLE_FOLDER = "llama"
+    EXAMPLE_FOLDER = "models/core/llama"
 
     def test_beam_search(self):
         self.run(extra_acc_spec="beam_width=4",
@@ -947,7 +947,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
 class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     MODEL_PATH = f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1"
-    EXAMPLE_FOLDER = "llama"
+    EXAMPLE_FOLDER = "models/core/llama"
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self):
@@ -964,7 +964,7 @@ class TestMixtral8x7BInstruct(CliFlowAccuracyTestHarness):
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mixtral-8x22B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Mixtral-8x22B-v0.1"
-    EXAMPLE_FOLDER = "llama"
+    EXAMPLE_FOLDER = "models/core/llama"
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
