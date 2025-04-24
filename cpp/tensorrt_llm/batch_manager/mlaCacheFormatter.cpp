@@ -61,11 +61,11 @@ bool MLACacheFormatter::needSendCache(
 {
     int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
 
-    if (selfConfig.getParallelConfig().mEnableAttenionDP)
+    if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
         int selfTPNumInDPGroup
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttenionDP
+        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
             ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
             : destConfig.getParallelConfig().mTensorParallelism;
         int selfTPrankINDPGroup = selfTpRank % selfTPNumInDPGroup;
@@ -76,7 +76,7 @@ bool MLACacheFormatter::needSendCache(
         return selfTPrankINDPGroup % (selfTPNumInDPGroup / destTPNumInDPGroup) == 0;
     }
 
-    int destTPNum = destConfig.getParallelConfig().mEnableAttenionDP
+    int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
         ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
         : destConfig.getParallelConfig().mTensorParallelism;
     int selfTPNum = selfConfig.getParallelConfig().mTensorParallelism;
@@ -107,7 +107,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     constexpr SizeType32 beam{0};
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = BlockRange(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
@@ -121,7 +121,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         }
     }
     TLLM_CHECK(blockNum > 0);
-    int deviceId = mCacheManager->getBlockManager().getBufferManager().getStream().getDevice();
+    int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
     if (common::getEnvTryZCopyForKVCacheTransfer()
         && destConfig.getParallelConfig().mPipelineParallelism == selfConfig.getParallelConfig().mPipelineParallelism)
@@ -268,7 +268,7 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
 
     if (connections.size() > 1)
     {
-        if (common::getEnvDisableReceiveKVCacheParallel())
+        if (!common::getEnvEnableReceiveKVCacheParallel())
         {
             TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
             for (size_t i = 0; i < connections.size(); i++)
@@ -330,7 +330,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     auto pickUpConnections = pickRecvConnections(connections, selfConfig, selfIdx, destConfig);
     // diff end
     constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange(*mCacheManager, llmRequest.mRequestId, beam);
+    auto blockRange = BlockRange::fromOldAllocatedBlockIds(*mCacheManager, llmRequest.mRequestId, beam);
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
@@ -390,11 +390,10 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         bool const onlyUseAsyncBuffer = recvBufferEleSize == 0;
         if (!onlyUseAsyncBuffer)
         {
-            std::string processString = llmRequest.getDataTransceiverState().getCommState()->toString();
-
-            if (common::getEnvRequestKVCacheSerial())
+            std::string processString = "default";
+            if (common::getEnvRequestKVCacheConcurrent())
             {
-                processString = "default";
+                processString = llmRequest.getDataTransceiverState().getCommState()->toString();
             }
 
             {
@@ -484,7 +483,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
 
         if (pickUpConnections.size() > 1)
         {
-            if (common::getEnvDisableReceiveKVCacheParallel())
+            if (!common::getEnvEnableReceiveKVCacheParallel())
             {
 
                 for (size_t i = 0; i < pickUpConnections.size(); i++)
@@ -590,18 +589,18 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
     {
         return false;
     }
-    if (selfConfig.getParallelConfig().mEnableAttenionDP
+    if (selfConfig.getParallelConfig().mEnableAttentionDP
         && (selfConfig.getParallelConfig().mTensorParallelism % selfConfig.getParallelConfig().mDPsize != 0))
     {
 
         return false;
     }
-    if (destConfig.getParallelConfig().mEnableAttenionDP
+    if (destConfig.getParallelConfig().mEnableAttentionDP
         && (destConfig.getParallelConfig().mTensorParallelism % destConfig.getParallelConfig().mDPsize != 0))
     {
         return false;
     }
-    if ((destConfig.getParallelConfig().mEnableAttenionDP)
+    if ((destConfig.getParallelConfig().mEnableAttentionDP)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
         return false;

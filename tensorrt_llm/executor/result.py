@@ -8,10 +8,11 @@ from weakref import WeakMethod
 
 import torch
 
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import AsyncQueue, nvtx_range
+from ..llmapi.utils import AsyncQueue
 from ..sampling_params import SamplingParams
 from .utils import ErrorResponse, has_event_loop
 
@@ -175,12 +176,8 @@ class GenerationResultBase:
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
-        # In PD, the first generation response will return 2 tokens
-        # Skip output the first generated token in generation response
-        # TODO: We should have a better way to handle this when enable
-        # beam search with PD.
-        if not self.sampling_params.use_beam_search and \
-            len(response_tensors.output_token_ids[src_idx]) == 2:
+        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
+        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
             output._last_token_ids_len = 1
 
         if response_tensors.cum_log_probs is not None:
@@ -223,7 +220,9 @@ class GenerationResultBase:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
 
-    @nvtx_range("handle_response", color="red", category="GenerationResultBase")
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="GenerationResultBase")
     def _handle_response(self, response: Union["PostprocWorker.Output",
                                                tllm.Response, ErrorResponse]):
 
@@ -303,9 +302,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    @nvtx_range("handle_response",
-                color="red",
-                category="DetokenizedGenerationResultBase")
+    @nvtx_range_debug("handle_response",
+                      color="red",
+                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 
@@ -352,10 +351,12 @@ class GenerationResult(GenerationResultBase):
         executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
     '''
 
-    def __init__(self,
-                 generation_request: "GenerationRequest",
-                 background_error_handler: Optional[Callable] = None,
-                 executor: Optional["GenerationExecutor"] = None) -> None:
+    def __init__(
+            self,
+            generation_request: "GenerationRequest",
+            background_error_handler: Optional[Callable] = None,
+            executor: Optional["GenerationExecutor"] = None,
+            disaggregated_params: Optional[DisaggregatedParams] = None) -> None:
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
@@ -364,6 +365,7 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
+        self.disaggregated_params = disaggregated_params
 
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[

@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Union
 
+from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..llmapi.tokenizer import TransformersTokenizer
-from ..llmapi.utils import nvtx_range
 # yapf: disable
 from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionLogProbsContent,
@@ -19,7 +19,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionResponseChoice,
                               CompletionResponseStreamChoice,
                               CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, StreamOptions, ToolCall, UsageInfo)
+                              FunctionCall, StreamOptions, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enale
 
@@ -69,7 +70,7 @@ def create_logprobs(token_ids: List[int],
     return chat_logprobs
 
 
-@nvtx_range("chat_stream_post_processor")
+@nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> List[str]:
 
     def yield_first_chat(num_tokens: int,
@@ -157,7 +158,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
     return res
 
 
-@nvtx_range("chat_response_post_processor")
+@nvtx_range_debug("chat_response_post_processor")
 def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> ChatCompletionResponse:
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
@@ -175,11 +176,13 @@ def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocAr
                 ])
         else:
             message = ChatMessage(role=role, content=output.text)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
             finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
+            disaggregated_params=disaggregated_params,
         )
 
         if args.return_logprobs:
@@ -226,7 +229,7 @@ class CompletionPostprocArgs(PostprocArgs):
         )
 
 
-@nvtx_range("completion_stream_post_processor")
+@nvtx_range_debug("completion_stream_post_processor")
 def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
     prompt_tokens = args.num_prompt_tokens
@@ -272,7 +275,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase, args:
     return res
 
 
-@nvtx_range("completion_response_post_processor")
+@nvtx_range_debug("completion_response_post_processor")
 def completion_response_post_processor(rsp: GenerationResult, args: CompletionPostprocArgs) -> CompletionResponse:
     prompt_tokens = args.num_prompt_tokens
     completion_tokens = 0
@@ -281,8 +284,7 @@ def completion_response_post_processor(rsp: GenerationResult, args: CompletionPo
         text = output.text
         if args.echo:
             text = args.prompt + text
-        disaggregated_params = CompletionResponseChoice.to_disaggregated_params(
-            output.disaggregated_params)
+        disaggregated_params = to_disaggregated_params(output.disaggregated_params)
         choice = CompletionResponseChoice(
             text=text,
             index=args.prompt_idx * args.num_choices + output.index,

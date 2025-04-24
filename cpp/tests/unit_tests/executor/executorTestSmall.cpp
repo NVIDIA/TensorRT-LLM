@@ -71,7 +71,7 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
     auto randomLogits = tensorrt_llm::testing::randomLogits<std::mt19937, TLogits>(params.vocabSize, &rng);
     auto const decoderParameters = tensorrt_llm::testing::utils::engines::ConstantTrivialDecoderParameters<TLogits>{
         tensorrt_llm::testing::utils::engines::TrivialDecoderParameters{params.vocabSize, params.maxBatchSize,
-            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth},
+            params.maxNumTokens, DecoderTestShared<TLogits>::kNumTokensPerBlock, params.maxBeamWidth, false},
         randomLogits};
     auto engineHostMemory
         = tensorrt_llm::testing::utils::engines::createConstantTrivialDecoder<TLogits>(decoderParameters, logger);
@@ -101,7 +101,7 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
         logger, modelConfig, worldConfig, engine, false, optionalParams);
     auto const executorConfig = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(),
         executor::KvCacheConfig{}, true, true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize,
-        params.maxNumTokens, std::nullopt, std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt,
+        params.maxNumTokens, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt,
         executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
         executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
     return std::make_unique<DecoderTestShared<TLogits>>(

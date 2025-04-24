@@ -40,12 +40,14 @@ def create_attention(
     qk_nope_head_dim: Optional[int] = None,
     v_head_dim: Optional[int] = None,
     predicted_tokens_per_seq: Optional[int] = 1,
+    skip_create_weights_in_init: bool = False,
 ):
 
     attn_cls = get_attention_backend(backend_name)
 
     if is_mla_enable:
-        assert attn_cls == TrtllmAttention
+        assert attn_cls.support_mla(
+        ), f"MLA is not supported for {backend_name} backend"
         assert (q_lora_rank > 0 and kv_lora_rank > 0 and qk_rope_head_dim > 0
                 and qk_nope_head_dim > 0 and v_head_dim > 0)
         mla_params = MLAParams(
@@ -68,4 +70,5 @@ def create_attention(
         q_scaling=q_scaling,
         pos_embd_params=pos_embd_params,
         mla_params=mla_params,
+        skip_create_weights_in_init=skip_create_weights_in_init,
     )

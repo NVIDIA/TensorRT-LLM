@@ -553,6 +553,14 @@ public:
         return mTokens.at(beam);
     }
 
+    /// @brief Get mutable reference to tokens for a specific beam
+    /// @param beam The beam index
+    /// @return Mutable reference to the tokens vector
+    [[nodiscard]] VecTokens& getTokensMutable(SizeType32 beam)
+    {
+        return mTokens.at(beam);
+    }
+
     /// @brief Get all tokens (input+output) for all beams
     /// @return A vector of vector of tokens.
     [[nodiscard]] BeamTokens const& getTokens() const
@@ -1772,6 +1780,9 @@ public:
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
 
+    // current position of the prompt tuning table (only used in chunked prefill mode)
+    SizeType32 mPtableCurrentPosition{0};
+
 protected:
     bool mIsStreaming;
 
@@ -2212,8 +2223,7 @@ public:
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false,
-        bool gatherContextOutputs = false);
+        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 

@@ -171,26 +171,27 @@ void initConfigBindings(pybind11::module_& m)
     auto parallelConfigGetstate = [](tle::ParallelConfig const& self)
     {
         return py::make_tuple(self.getCommunicationType(), self.getCommunicationMode(), self.getDeviceIds(),
-            self.getParticipantIds(), self.getOrchestratorConfig());
+            self.getParticipantIds(), self.getOrchestratorConfig(), self.getNumNodes());
     };
     auto parallelConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 5)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid state!");
         }
         return tle::ParallelConfig(state[0].cast<tle::CommunicationType>(), state[1].cast<tle::CommunicationMode>(),
             state[2].cast<std::optional<std::vector<SizeType32>>>(),
             state[3].cast<std::optional<std::vector<SizeType32>>>(),
-            state[4].cast<std::optional<tle::OrchestratorConfig>>());
+            state[4].cast<std::optional<tle::OrchestratorConfig>>(), state[5].cast<std::optional<SizeType32>>());
     };
     py::class_<tle::ParallelConfig>(m, "ParallelConfig")
         .def(py::init<tle::CommunicationType, tle::CommunicationMode, std::optional<std::vector<SizeType32>> const&,
-                 std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&>(),
+                 std::optional<std::vector<SizeType32>> const&, std::optional<tle::OrchestratorConfig> const&,
+                 std::optional<SizeType32> const&>(),
             py::arg_v("communication_type", tle::CommunicationType::kMPI, "CommunicationType.MPI"),
             py::arg_v("communication_mode", tle::CommunicationMode::kLEADER, "CommunicationMode.LEADER"),
             py::arg("device_ids") = py::none(), py::arg("participant_ids") = py::none(),
-            py::arg("orchestrator_config") = py::none())
+            py::arg("orchestrator_config") = py::none(), py::arg("num_nodes") = py::none())
         .def_property("communication_type", &tle::ParallelConfig::getCommunicationType,
             &tle::ParallelConfig::setCommunicationType)
         .def_property("communication_mode", &tle::ParallelConfig::getCommunicationMode,
@@ -200,6 +201,7 @@ void initConfigBindings(pybind11::module_& m)
             "participant_ids", &tle::ParallelConfig::getParticipantIds, &tle::ParallelConfig::setParticipantIds)
         .def_property("orchestrator_config", &tle::ParallelConfig::getOrchestratorConfig,
             &tle::ParallelConfig::setOrchestratorConfig)
+        .def_property("num_nodes", &tle::ParallelConfig::getNumNodes, &tle::ParallelConfig::setNumNodes)
         .def(py::pickle(parallelConfigGetstate, parallelConfigSetstate));
 
     auto peftCacheConfigSetstate = [](py::tuple const& state)
@@ -412,9 +414,11 @@ void initConfigBindings(pybind11::module_& m)
             c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
-            c.getGpuWeightsPercent(), c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(),
-            c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
-            c.getAdditionalOutputNames(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch());
+            c.getUseGpuDirectStorage(), c.getGpuWeightsPercent(), c.getMaxQueueSize(),
+            c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
+            c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
+            c.getAdditionalModelOutputs(), c.getGatherGenerationLogits(), c.getUseVariableBeamWidthSearch(),
+            c.getPromptTableOffloading());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -427,7 +431,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 25)
+        if (cpp_states.size() != 27)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -447,17 +451,19 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[11].cast<std::optional<tle::PeftCacheConfig>>(),           // PeftCacheConfig
             cpp_states[12].cast<std::optional<tle::LogitsPostProcessorConfig>>(), // LogitsPostProcessorConfig
             cpp_states[13].cast<std::optional<tle::DecodingConfig>>(),            // DecodingConfig
-            cpp_states[14].cast<float>(),                                         // GpuWeightsPercent
-            cpp_states[15].cast<std::optional<SizeType32>>(),                     // MaxQueueSize
-            cpp_states[16].cast<tle::ExtendedRuntimePerfKnobConfig>(),            // ExtendedRuntimePerfKnobConfig
-            cpp_states[17].cast<std::optional<tle::DebugConfig>>(),               // DebugConfig
-            cpp_states[18].cast<SizeType32>(),                                    // RecvPollPeriodMs
-            cpp_states[19].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
-            cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
-            cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
-            cpp_states[22].cast<std::optional<std::vector<std::string>>>(),       // AdditionalOutputNames
-            cpp_states[23].cast<bool>(),                                          // GatherGenerationLogits
-            cpp_states[24].cast<bool>()                                           // UseVariableBeamWidthSearch
+            cpp_states[14].cast<bool>(),                                          // UseGpuDirectStorage
+            cpp_states[15].cast<float>(),                                         // GpuWeightsPercent
+            cpp_states[16].cast<std::optional<SizeType32>>(),                     // MaxQueueSize
+            cpp_states[17].cast<tle::ExtendedRuntimePerfKnobConfig>(),            // ExtendedRuntimePerfKnobConfig
+            cpp_states[18].cast<std::optional<tle::DebugConfig>>(),               // DebugConfig
+            cpp_states[19].cast<SizeType32>(),                                    // RecvPollPeriodMs
+            cpp_states[20].cast<uint64_t>(),                                      // MaxSeqIdleMicroseconds
+            cpp_states[21].cast<std::optional<tle::SpeculativeDecodingConfig>>(), // SpecDecConfig
+            cpp_states[22].cast<std::optional<tle::GuidedDecodingConfig>>(),      // GuidedDecodingConfig
+            cpp_states[23].cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(), // AdditionalModelOutputs
+            cpp_states[24].cast<bool>(),                                                   // GatherGenerationLogits
+            cpp_states[25].cast<bool>(),                                                   // UseVariableBeamWidthSearch
+            cpp_states[26].cast<bool>()                                                    // PromptTableOffloading
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -466,32 +472,34 @@ void initConfigBindings(pybind11::module_& m)
     };
 
     py::class_<tle::ExecutorConfig>(m, "ExecutorConfig", pybind11::dynamic_attr())
-        .def(py::init<                                          //
-                 SizeType32,                                    // MaxBeamWidth
-                 tle::SchedulerConfig const&,                   // SchedulerConfig
-                 tle::KvCacheConfig const&,                     // KvCacheConfig
-                 bool,                                          // EnableChunkedContext
-                 bool,                                          // NormalizeLogProbs
-                 SizeType32,                                    // IterStatsMaxIterations
-                 SizeType32,                                    // RequestStatsMaxIterations
-                 tle::BatchingType,                             // BatchingType
-                 std::optional<SizeType32>,                     // MaxBatchSize
-                 std::optional<SizeType32>,                     // MaxNumTokens
-                 std::optional<tle::ParallelConfig>,            // ParallelConfig
-                 tle::PeftCacheConfig const&,                   // PeftCacheConfig
-                 std::optional<tle::LogitsPostProcessorConfig>, // LogitsPostProcessorConfig
-                 std::optional<tle::DecodingConfig>,            // DecodingConfig
-                 float,                                         // GpuWeightsPercent
-                 std::optional<SizeType32>,                     // MaxQueueSize
-                 tle::ExtendedRuntimePerfKnobConfig const&,     // ExtendedRuntimePerfKnobConfig
-                 std::optional<tle::DebugConfig>,               // DebugConfig
-                 SizeType32,                                    // RecvPollPeriodMs
-                 uint64_t,                                      // MaxSeqIdleMicroseconds
-                 std::optional<tle::SpeculativeDecodingConfig>, // SpecDecConfig
-                 std::optional<tle::GuidedDecodingConfig>,      // GuidedDecodingConfig
-                 std::optional<std::vector<std::string>>,       // AdditionalOutputNames
-                 bool,                                          // GatherGenerationLogits
-                 bool                                           // UseVariableBeamWidthSearch
+        .def(py::init<                                                   //
+                 SizeType32,                                             // MaxBeamWidth
+                 tle::SchedulerConfig const&,                            // SchedulerConfig
+                 tle::KvCacheConfig const&,                              // KvCacheConfig
+                 bool,                                                   // EnableChunkedContext
+                 bool,                                                   // NormalizeLogProbs
+                 SizeType32,                                             // IterStatsMaxIterations
+                 SizeType32,                                             // RequestStatsMaxIterations
+                 tle::BatchingType,                                      // BatchingType
+                 std::optional<SizeType32>,                              // MaxBatchSize
+                 std::optional<SizeType32>,                              // MaxNumTokens
+                 std::optional<tle::ParallelConfig>,                     // ParallelConfig
+                 tle::PeftCacheConfig const&,                            // PeftCacheConfig
+                 std::optional<tle::LogitsPostProcessorConfig>,          // LogitsPostProcessorConfig
+                 std::optional<tle::DecodingConfig>,                     // DecodingConfig
+                 bool,                                                   // UseGpuDirectStorage
+                 float,                                                  // GpuWeightsPercent
+                 std::optional<SizeType32>,                              // MaxQueueSize
+                 tle::ExtendedRuntimePerfKnobConfig const&,              // ExtendedRuntimePerfKnobConfig
+                 std::optional<tle::DebugConfig>,                        // DebugConfig
+                 SizeType32,                                             // RecvPollPeriodMs
+                 uint64_t,                                               // MaxSeqIdleMicroseconds
+                 std::optional<tle::SpeculativeDecodingConfig>,          // SpecDecConfig
+                 std::optional<tle::GuidedDecodingConfig>,               // GuidedDecodingConfig
+                 std::optional<std::vector<tle::AdditionalModelOutput>>, // AdditionalModelOutputs
+                 bool,                                                   // GatherGenerationLogits
+                 bool,                                                   // UseVariableBeamWidthSearch
+                 bool                                                    // PromptTableOffloading
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -503,14 +511,15 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("parallel_config") = py::none(),
             py::arg_v("peft_cache_config", tle::PeftCacheConfig(), "PeftCacheConfig()"),
             py::arg("logits_post_processor_config") = py::none(), py::arg("decoding_config") = py::none(),
-            py::arg("gpu_weights_percent") = 1.0, py::arg("max_queue_size") = py::none(),
+            py::arg("use_gpu_direct_storage") = false, py::arg("gpu_weights_percent") = 1.0,
+            py::arg("max_queue_size") = py::none(),
             py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
                 "ExtendedRuntimePerfKnobConfig()"),
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
-            py::arg("additional_output_names") = py::none(), py::arg("gather_generation_logits") = false,
-            py::arg("use_variable_beam_width_search") = false)
+            py::arg("additional_model_outputs") = py::none(), py::arg("gather_generation_logits") = false,
+            py::arg("use_variable_beam_width_search") = false, py::arg("mm_embedding_offloading") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -535,6 +544,8 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setLogitsPostProcessorConfig)
         .def_property(
             "decoding_config", &tle::ExecutorConfig::getDecodingConfig, &tle::ExecutorConfig::setDecodingConfig)
+        .def_property("use_gpu_direct_storage", &tle::ExecutorConfig::getUseGpuDirectStorage,
+            &tle::ExecutorConfig::setUseGpuDirectStorage)
         .def_property("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
         .def_property("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
@@ -548,12 +559,14 @@ void initConfigBindings(pybind11::module_& m)
         .def_property("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
         .def_property("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
             &tle::ExecutorConfig::setGuidedDecodingConfig)
-        .def_property("additional_output_names", &tle::ExecutorConfig::getAdditionalOutputNames,
-            &tle::ExecutorConfig::setAdditionalOutputNames)
+        .def_property("additional_model_outputs", &tle::ExecutorConfig::getAdditionalModelOutputs,
+            &tle::ExecutorConfig::setAdditionalModelOutputs)
         .def_property("gather_generation_logits", &tle::ExecutorConfig::getGatherGenerationLogits,
             &tle::ExecutorConfig::setGatherGenerationLogits)
-        .def_property("gather_generation_logits", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
+        .def_property("use_variable_beam_width_search", &tle::ExecutorConfig::getUseVariableBeamWidthSearch,
             &tle::ExecutorConfig::setUseVariableBeamWidthSearch)
+        .def_property("mm_embedding_offloading", &tle::ExecutorConfig::getPromptTableOffloading,
+            &tle::ExecutorConfig::setPromptTableOffloading)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 

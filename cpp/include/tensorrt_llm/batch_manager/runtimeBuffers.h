@@ -135,6 +135,10 @@ private:
 
 public:
     TensorPtr sequenceLengthsDevice;
+    bool promptTableOffloading;
+
+    //! Prompt-Tuning
+    std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
 
 private:
     //! Runtime
@@ -144,13 +148,9 @@ private:
     TensorPtr lastTokenIdsHost;
     TensorPtr lastTokenIdsDevice;
     TensorPtr logitsIdsHost;
-    TensorPtr logitsIdsDevice;
 
     //! Pipeline-Parallelism
     TensorPtr hiddenStates;
-
-    //! Prompt-Tuning
-    std::unique_ptr<PromptTuningBuffers> promptTuningBuffers;
 
     //! Mrope
     TensorPtr mropeRotaryCosSin;
@@ -260,7 +260,8 @@ public:
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, executor::DecodingConfig const& decodingConfig,
         bool gatherGenerationLogits, std::optional<SizeType32> maxNumTokens = std::nullopt,
-        std::optional<std::vector<std::string>> const& additionalOutputNames = std::nullopt);
+        std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs = std::nullopt,
+        bool promptTableOffloading = false);
 
     RuntimeBuffers(RuntimeBuffers const& other) = delete;
     RuntimeBuffers& operator=(RuntimeBuffers const& other) = delete;
@@ -290,7 +291,7 @@ private:
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLen, runtime::TllmRuntime const& runtime,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, bool gatherGenerationLogits,
-        std::optional<std::vector<std::string>> const& additionalOutputNames = std::nullopt);
+        std::optional<std::vector<executor::AdditionalModelOutput>> const& additionalModelOutputs = std::nullopt);
 
     void reshape(runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, bool gatherGenerationLogits);

@@ -5,66 +5,42 @@ import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
-                    TypedDict)
+from typing import AsyncGenerator, AsyncIterator, List, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from openai.types.chat import ChatCompletionMessageParam
+from transformers import AutoConfig, AutoProcessor
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.utils import nvtx_mark
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.chat_utils import (ConversationMessage,
+                                           apply_chat_template,
+                                           parse_chat_message_content)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
                                                 CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
-                                                ModelList, UsageInfo)
+                                                ModelList, UsageInfo,
+                                                to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
+from .._utils import nvtx_mark
+
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
-
-
-class ConversationMessage(TypedDict):
-    role: str
-    content: str
-
-
-def parse_chat_message_content(
-    message: ChatCompletionMessageParam, ) -> ConversationMessage:
-    role = message["role"]
-    content = message.get("content")
-
-    if content is None:
-        return []
-    if isinstance(content, str):
-        return [ConversationMessage(role=role, content=content)]
-
-    # for Iterable[ChatCompletionContentPartTextParam]
-    texts: List[str] = []
-    for part in content:
-        part_type = part["type"]
-        if part_type == "text":
-            text = part["text"]
-            texts.append(text)
-        else:
-            raise NotImplementedError(f"{part_type} is not supported")
-
-    text_prompt = "\n".join(texts)
-    return [ConversationMessage(role=role, content=text_prompt)]
 
 
 class OpenAIServer:
@@ -74,6 +50,14 @@ class OpenAIServer:
                  model: str):
         self.llm = llm
         self.tokenizer = llm.tokenizer
+        try:
+            hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
+            self.processor = AutoProcessor.from_pretrained(hf_tokenizer_path)
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+        except Exception:
+            logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
+            self.processor = None
+            self.model_config = None
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -124,6 +108,8 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        # TODO: workaround before ETCD support
+        self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -147,6 +133,16 @@ class OpenAIServer:
         async for stat in self.llm.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_kv_cache_events(self) -> JSONResponse:
+        events = []
+        try:
+            async for event in self.llm.get_kv_cache_events_async(2):
+                events.append(event)
+        except IndexError:
+            # queue is empty, no more events
+            pass
+        return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
@@ -179,12 +175,19 @@ class OpenAIServer:
 
         try:
             conversation: List[ConversationMessage] = []
-            for msg in request.messages:
-                conversation.extend(parse_chat_message_content(msg))
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            prompt: str = self.tokenizer.apply_chat_template(
+            sampling_params = request.to_sampling_params()
+            postproc_args = ChatPostprocArgs.from_request(request)
+
+            for msg in request.messages:
+                conv_messages, mm_data = parse_chat_message_content(msg, self.model_config)
+                conversation.extend(conv_messages)
+
+            prompt: str = apply_chat_template(
+                tokenizer=self.tokenizer,
+                processor=self.processor,
                 conversation=conversation,
                 tokenize=False,
                 add_generation_prompt=request.add_generation_prompt,
@@ -194,7 +197,18 @@ class OpenAIServer:
                 **(request.chat_template_kwargs or {}),
             )
             sampling_params = request.to_sampling_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             postproc_args = ChatPostprocArgs.from_request(request)
+            prompt = prompt_inputs(prompt)
+
+            if mm_data:
+                if "multi_modal_data" not in prompt:
+                    prompt["multi_modal_data"] = {}
+                for media_type, media_values in mm_data.items():
+                    if media_type not in prompt["multi_modal_data"]:
+                        prompt["multi_modal_data"][media_type] = []
+                    prompt["multi_modal_data"][media_type].extend(media_values)
+
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
@@ -209,6 +223,7 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -306,7 +321,7 @@ class OpenAIServer:
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
             sampling_params = request.to_sampling_params()
-            disaggregated_params = request.to_llm_disaggregated_params()
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx

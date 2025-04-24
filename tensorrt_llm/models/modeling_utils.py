@@ -1,11 +1,11 @@
 import argparse
 import copy
 import dataclasses
+import fnmatch
 import json
 import os
 import re
 from enum import IntFlag, auto
-from fnmatch import fnmatch
 from functools import cached_property
 from pathlib import Path
 from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
@@ -220,6 +220,21 @@ class QuantConfig:
         else:
             return None
 
+    def is_module_excluded_from_quantization(self, name: str) -> bool:
+        """Check if the module is excluded from quantization.
+
+        Args:
+            name (str): The name of the module.
+
+        Returns:
+            bool: True if the module is excluded from quantization, False otherwise.
+        """
+        if self.exclude_modules is not None:
+            for exclude_module in self.exclude_modules:
+                if fnmatch.fnmatchcase(name, exclude_module):
+                    return True
+        return False
+
     @classmethod
     def from_dict(cls, config: dict) -> 'QuantConfig':
         """Create a QuantConfig instance from a dict.
@@ -280,7 +295,7 @@ class LayerQuantConfig(QuantConfig):
     def layer_quant_mode(self, layer_name) -> QuantMode:
 
         for name, quant_mode in self.auto_quant_mode.items():
-            if fnmatch(layer_name, name):
+            if fnmatch.fnmatch(layer_name, name):
                 return quant_mode
 
         return QuantMode(0)
@@ -309,7 +324,7 @@ class LayerQuantConfig(QuantConfig):
         quant_res = QuantConfig()
 
         for name, quant_cfg in self.quantized_layers.items():
-            if fnmatch(module_name, name):
+            if fnmatch.fnmatch(module_name, name):
                 quant_res = quant_cfg
                 break
         return quant_res

@@ -14,16 +14,17 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from .._utils import KVCacheEventSerializer, global_mpi_rank, mpi_comm, mpi_rank
+from .._utils import (KVCacheEventSerializer, global_mpi_rank, mpi_comm,
+                      mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, nvtx_range,
-                            print_colored_debug, print_traceback_on_error)
-from ..lora_manager import LoraManager
+                            clear_sched_affinity, print_colored_debug,
+                            print_traceback_on_error)
+from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -55,6 +56,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        lora_config: Optional[LoraConfig] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -97,10 +99,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if not hasattr(executor_config, "backend"):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
-            elif executor_config.backend == "pytorch":
+            args = {
+                "executor_config": executor_config,
+                "checkpoint_dir": executor_config.hf_model_dir,
+                "engine_dir": executor_config.trt_engine_dir,
+            }
+            if executor_config.backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
+                args["lora_config"] = lora_config
             elif executor_config.backend == "autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -111,9 +119,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
             device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
-            return create_executor(executor_config=executor_config,
-                                   checkpoint_dir=executor_config.hf_model_dir,
-                                   engine_dir=executor_config.trt_engine_dir)
+            return create_executor(**args)
 
         self.engine = _create_engine()
 
@@ -132,6 +138,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self._lora_manager = LoraManager()
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
+
+        if getattr(executor_config, "backend",
+                   "") == "pytorch" and lora_config is not None:
+            self._lora_manager = LoraManager()
+            lora_model_config = self.engine.model_engine.lora_model_config
+            assert lora_model_config is not None
+            self._lora_model_config = lora_model_config
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -290,7 +303,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
             [lora_request.path],
-            model_config=self._runtime_model_config,
+            model_config=self._runtime_model_config if
+            self._runtime_model_config is not None else self._lora_model_config,
             runtime_mapping=None,
             uids=[str(lora_request.adapter_id)])
 
@@ -348,9 +362,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if is_overlap_enabled:
             is_disaggregated = self.engine.kv_cache_transceiver is not None
             if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY
-                    or request_type
-                    == tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
+                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
                 raise ValueError(
                     "Context only requests are not supported in pytorch backend when overlap is enabled."
                 )
@@ -419,7 +431,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
-            executor=self)
+            executor=self,
+            disaggregated_params=request.disaggregated_params)
 
         self._results[client_id] = result
 
@@ -489,18 +502,19 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
 @print_traceback_on_error
 def worker_main(
-        engine: Path | Engine,
-        worker_queues: WorkerCommIpcAddrs,
-        log_level: str,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
-        worker_cls: type = ExecutorBindingsWorker,
-        tracer_init_kwargs: Optional[dict] = None,
-        _torch_model_class_mapping: Optional[dict] = None,
-        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
-        ready_signal: Optional[str] = None,
-        is_llm_executor: Optional[
-            bool] = True,  # whether it's the main executor instance
+    engine: Path | Engine,
+    worker_queues: WorkerCommIpcAddrs,
+    log_level: str,
+    executor_config: Optional[tllm.ExecutorConfig] = None,
+    batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
+    worker_cls: type = ExecutorBindingsWorker,
+    tracer_init_kwargs: Optional[dict] = None,
+    _torch_model_class_mapping: Optional[dict] = None,
+    postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+    ready_signal: Optional[str] = None,
+    is_llm_executor: Optional[
+        bool] = True,  # whether it's the main executor instance
+    lora_config: Optional[LoraConfig] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -586,13 +600,14 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         print_colored_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: str = worker_queues.result_queue_addr
+        proxy_result_queue: tuple[
+            str, Optional[bytes]] = worker_queues.result_queue_addr
 
         assert result_queues is not None
         assert postproc_worker_config.postprocess_tokenizer_dir is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, str)
+        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
@@ -624,7 +639,8 @@ def worker_main(
             executor_config,
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
-            is_llm_executor=is_llm_executor)
+            is_llm_executor=is_llm_executor,
+            lora_config=lora_config)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
@@ -733,9 +749,9 @@ class AwaitResponseHelper:
                 lambda _: _,
                 [self.worker._engine_response_callback(r) for r in responses]))
 
-        with nvtx_range(f"await_response-{len(responses)}",
-                        color="red",
-                        category="Worker"):
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
             self.responses_handler(responses)
         return True
 
@@ -758,7 +774,7 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.result.is_final:
+            if response.has_error() or response.result.is_final:
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -771,9 +787,9 @@ class AwaitResponseHelper:
         in a FusedIpcQueue, and a background thread will batch them and invoke
         IPC periodically. '''
 
-        with nvtx_range(f"handle_for_ipc_periodically-{len(responses)}",
-                        color="red",
-                        category="Worker"):
+        with nvtx_range_debug(f"handle_for_ipc_periodically-{len(responses)}",
+                              color="red",
+                              category="Worker"):
 
             for response in responses:
 

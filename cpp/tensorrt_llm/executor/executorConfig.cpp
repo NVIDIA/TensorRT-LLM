@@ -28,12 +28,12 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
     std::optional<PeftCacheConfig> const& peftCacheConfig,
     std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
-    float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
+    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
     ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
     SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
-    std::optional<std::vector<std::string>> additionalOutputNames, bool gatherGenerationLogits,
-    bool useVariableBeamWidthSearch)
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs, bool gatherGenerationLogits,
+    bool useVariableBeamWidthSearch, bool promptTableOffloading)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -48,6 +48,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mPeftCacheConfig(peftCacheConfig)
     , mLogitsPostProcessorConfig(std::move(logitsPostProcessorConfig))
     , mDecodingConfig(std::move(decodingConfig))
+    , mUseGpuDirectStorage((useGpuDirectStorage))
     , mGpuWeightsPercent(gpuWeightPercent)
     , mMaxQueueSize(maxQueueSize)
     , mExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
@@ -56,9 +57,10 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mMaxSeqIdleMicroseconds(maxSeqIdleMicroseconds)
     , mSpeculativeDecodingConfig(specDecConfig)
     , mGuidedDecodingConfig(std::move(guidedDecodingConfig))
-    , mAdditionalOutputNames(std::move(additionalOutputNames))
+    , mAdditionalModelOutputs(std::move(additionalModelOutputs))
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mUseVariableBeamWidthSearch(useVariableBeamWidthSearch)
+    , mPromptTableOffloading(promptTableOffloading)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
@@ -146,6 +148,11 @@ std::optional<DecodingConfig> ExecutorConfig::getDecodingConfig() const
     return mDecodingConfig;
 }
 
+bool ExecutorConfig::getUseGpuDirectStorage() const
+{
+    return mUseGpuDirectStorage;
+}
+
 float ExecutorConfig::getGpuWeightsPercent() const
 {
     return mGpuWeightsPercent;
@@ -186,9 +193,9 @@ std::optional<GuidedDecodingConfig> ExecutorConfig::getGuidedDecodingConfig() co
     return mGuidedDecodingConfig;
 }
 
-std::optional<std::vector<std::string>> ExecutorConfig::getAdditionalOutputNames() const
+std::optional<std::vector<AdditionalModelOutput>> ExecutorConfig::getAdditionalModelOutputs() const
 {
-    return mAdditionalOutputNames;
+    return mAdditionalModelOutputs;
 }
 
 bool ExecutorConfig::getGatherGenerationLogits() const
@@ -199,6 +206,11 @@ bool ExecutorConfig::getGatherGenerationLogits() const
 bool ExecutorConfig::getUseVariableBeamWidthSearch() const
 {
     return mUseVariableBeamWidthSearch;
+}
+
+bool ExecutorConfig::getPromptTableOffloading() const
+{
+    return mPromptTableOffloading;
 }
 
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
@@ -276,6 +288,11 @@ void ExecutorConfig::setDecodingConfig(DecodingConfig const& decodingConfig)
     mDecodingConfig = decodingConfig;
 }
 
+void ExecutorConfig::setUseGpuDirectStorage(bool const& useGpuDirectStorage)
+{
+    mUseGpuDirectStorage = useGpuDirectStorage;
+}
+
 void ExecutorConfig::setGpuWeightsPercent(float const& gpuWeightsPercent)
 {
     mGpuWeightsPercent = gpuWeightsPercent;
@@ -318,9 +335,9 @@ void ExecutorConfig::setGuidedDecodingConfig(GuidedDecodingConfig const& guidedD
     mGuidedDecodingConfig = guidedDecodingConfig;
 }
 
-void ExecutorConfig::setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames)
+void ExecutorConfig::setAdditionalModelOutputs(std::vector<AdditionalModelOutput> const& additionalModelOutputs)
 {
-    mAdditionalOutputNames = additionalOutputNames;
+    mAdditionalModelOutputs = additionalModelOutputs;
 }
 
 void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
@@ -331,6 +348,11 @@ void ExecutorConfig::setGatherGenerationLogits(bool gatherGenerationLogits)
 void ExecutorConfig::setUseVariableBeamWidthSearch(bool useVariableBeamWidthSearch)
 {
     mUseVariableBeamWidthSearch = useVariableBeamWidthSearch;
+}
+
+void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
+{
+    mPromptTableOffloading = promptTableOffloading;
 }
 
 } // namespace tensorrt_llm::executor

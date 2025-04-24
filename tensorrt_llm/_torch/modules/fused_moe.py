@@ -5,12 +5,15 @@ from typing import Dict, List, NamedTuple, Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
 from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf)
-from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
+from .linear import TensorParallelMode, load_weight_shard
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -240,6 +243,7 @@ class FusedMoE(nn.Module):
         aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        apply_router_weight_on_input: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -261,24 +265,23 @@ class FusedMoE(nn.Module):
         # could be modified later
         self.quant_config = model_config.quant_config
 
+        self.cluster_rank = model_config.mapping.moe_cluster_rank
+        self.cluster_size = model_config.mapping.moe_cluster_size
+        self.smart_router = True if self.cluster_size > 1 else False
+
         self.tp_rank = model_config.mapping.moe_tp_rank
         self.tp_size = model_config.mapping.moe_tp_size
 
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
-
+        self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
 
         # All ranks participate in allreduce regardless of EP/TP combination
-        self.parallel_config = ParallelConfig(
-            tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size,
-            gpus_per_node=model_config.mapping.gpus_per_node,
-            pipeline_parallel_size=model_config.mapping.pp_size,
-            parallel_rank=model_config.mapping.rank)
-        self.parallel_size = self.parallel_config.tensor_parallel_size
+        self.mapping = model_config.mapping
+        self.parallel_size = self.mapping.tp_size
 
-        self.all_reduce = AllReduce(self.parallel_config)
+        self.all_reduce = AllReduce(self.mapping)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
@@ -304,8 +307,11 @@ class FusedMoE(nn.Module):
         self.has_been_profiled_min_latency = False
 
         self._weights_created = False
-        if not model_config.skip_create_weights:
+        if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
     def setup_quant_scales(self):
         self.quant_scales = None
@@ -323,7 +329,7 @@ class FusedMoE(nn.Module):
                 fc_weight_scales=self.w3_w1_weight_scaling_factor,
                 proj_weight_scales=self.w2_weight_scaling_factor,
             )
-        elif self.has_nv_fp4:
+        elif self.has_nvfp4:
             self.quant_scales = FusedMoEQuantScalesNVFP4(
                 fc1_act_global=self.fc31_input_scale,
                 fc1_weight_block=self.w3_w1_weight_scale,
@@ -332,6 +338,38 @@ class FusedMoE(nn.Module):
                 fc2_weight_block=self.w2_weight_scale,
                 fc2_global=self.fc2_alpha,
             )
+
+    def is_trtllm(self):
+        return self.moe_backend == "TRTLLM" and self.quant_config is not None
+
+    def is_cutlass(self):
+        return not self.is_trtllm()
+
+    def get_quant_scales(self, expert_start, expert_end):
+        assert self.smart_router
+
+        if self.has_fp8_block_scales:
+            return FusedMoEQuantScalesFP8BlockScales(
+                fc_weight_scales=self.w3_w1_weight_scaling_factor.narrow(
+                    0, expert_start, expert_end - expert_start),
+                proj_weight_scales=self.w2_weight_scaling_factor.narrow(
+                    0, expert_start, expert_end - expert_start),
+            )
+        elif self.has_nvfp4:
+            return FusedMoEQuantScalesNVFP4(
+                fc1_act_global=self.fc31_input_scale,
+                fc1_weight_block=self.w3_w1_weight_scale.narrow(
+                    0, expert_start, expert_end - expert_start),
+                fc1_global=self.fc31_alpha.narrow(0, expert_start,
+                                                  expert_end - expert_start),
+                fc2_act_global=self.fc2_input_scale,
+                fc2_weight_block=self.w2_weight_scale.narrow(
+                    0, expert_start, expert_end - expert_start),
+                fc2_global=self.fc2_alpha.narrow(0, expert_start,
+                                                 expert_end - expert_start),
+            )
+        else:
+            return self.quant_scales
 
     def create_weights(self):
         if self._weights_created:
@@ -351,7 +389,7 @@ class FusedMoE(nn.Module):
         self.has_any_quant = False
         self.has_fp8_qdq = False
         self.has_fp8_block_scales = False
-        self.has_nv_fp4 = False
+        self.has_nvfp4 = False
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             self.has_any_quant = True
             qc = self.quant_config
@@ -408,38 +446,51 @@ class FusedMoE(nn.Module):
                 self.register_parameter("w2_weight_scaling_factor",
                                         w2_weight_scaling_factor)
             elif qc.quant_mode.has_nvfp4():
-                self.has_nv_fp4 = True
-                weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
+                self.has_nvfp4 = True
+                if self.is_trtllm():
+                    weight_dtype = float4_sf_dtype
+                    weight_vec_size = torch.iinfo(weight_dtype).bits // 4
+                    block_scales_dtype = torch.float8_e4m3fn
+                    block_scales_vec_size = 1
+                else:
+                    weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
+                    weight_vec_size = torch.iinfo(weight_dtype).bits // 4
+                    block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+                    block_scales_vec_size = torch.iinfo(
+                        block_scales_dtype).bits // 8
+
                 self.scaling_vector_size = 16
                 # Divide by 16 because we use int64 to pack 16 fp4 values
                 w3_w1_weight_shape = (self.expert_size_per_partition,
                                       self.intermediate_size_per_partition * 2,
-                                      self.hidden_size // 16)
+                                      self.hidden_size // weight_vec_size)
                 w2_weight_shape = (self.expert_size_per_partition,
                                    self.hidden_size,
-                                   self.intermediate_size_per_partition // 16)
+                                   self.intermediate_size_per_partition //
+                                   weight_vec_size)
 
                 # Divide by 4 because we use int32 to pack 4 fp8 values
                 # column parallel
-                w3_w1_weight_scale = nn.Parameter(torch.ones(
-                    self.expert_size_per_partition,
-                    self.intermediate_size_per_partition * 2,
-                    self.hidden_size // self.scaling_vector_size // 4,
-                    dtype=FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE,
-                    device=device),
-                                                  requires_grad=False)
+                w3_w1_weight_scale = nn.Parameter(
+                    torch.ones(self.expert_size_per_partition,
+                               self.intermediate_size_per_partition * 2,
+                               self.hidden_size // self.scaling_vector_size //
+                               block_scales_vec_size,
+                               dtype=block_scales_dtype,
+                               device=device),
+                    requires_grad=False)
                 self.register_parameter("w3_w1_weight_scale",
                                         w3_w1_weight_scale)
 
                 # row parallel
-                w2_weight_scale = nn.Parameter(
-                    torch.ones(self.expert_size_per_partition,
-                               self.hidden_size,
-                               self.intermediate_size_per_partition //
-                               self.scaling_vector_size // 4,
-                               dtype=FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE,
-                               device=device),
-                    requires_grad=False)
+                w2_weight_scale = nn.Parameter(torch.ones(
+                    self.expert_size_per_partition,
+                    self.hidden_size,
+                    self.intermediate_size_per_partition //
+                    self.scaling_vector_size // block_scales_vec_size,
+                    dtype=block_scales_dtype,
+                    device=device),
+                                               requires_grad=False)
                 self.register_parameter("w2_weight_scale", w2_weight_scale)
 
                 fc31_input_scale = nn.Parameter(torch.tensor(
@@ -466,6 +517,15 @@ class FusedMoE(nn.Module):
                     device=device),
                                          requires_grad=False)
                 self.register_parameter("fc2_alpha", fc2_alpha)
+
+                if self.is_trtllm():
+                    fc31_scale_c = nn.Parameter(torch.ones(
+                        self.expert_size_per_partition,
+                        dtype=torch.float32,
+                        device=device),
+                                                requires_grad=False)
+                    self.register_parameter("fc31_scale_c", fc31_scale_c)
+
             else:
                 # TODO: support other quant mode
                 raise ValueError(
@@ -510,7 +570,7 @@ class FusedMoE(nn.Module):
 
         flatten_outputs = allgather(
             torch.cat(flatten_inputs),
-            self.parallel_config,
+            self.mapping,
             gather_dim=0,
         ).view(self.parallel_size, -1)
 
@@ -532,9 +592,7 @@ class FusedMoE(nn.Module):
         outputs = inputs
         if self.parallel_size > 1:
             if self.use_dp:
-                outputs = reducescatter(inputs,
-                                        self.parallel_config,
-                                        scatter_dim=0)
+                outputs = reducescatter(inputs, self.mapping, scatter_dim=0)
             elif self.reduce_results:
                 outputs = self.all_reduce(inputs)
         return outputs
@@ -565,12 +623,18 @@ class FusedMoE(nn.Module):
         assert token_final_scales.dtype == torch.float32
         assert token_selected_experts.dtype == torch.int32
 
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+            x = x * token_final_scales.to(x.dtype)
+            # TODO: remove this once we have correct fusedmoe kernel ready
+            token_final_scales = None
+
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq:
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_dequant)
-            elif self.has_nv_fp4:
+            elif self.has_nvfp4:
                 if not disable_fp4_allgather():
                     if isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = x.fp4_tensor, x.scaling_factor
@@ -595,7 +659,7 @@ class FusedMoE(nn.Module):
         ):
             x_sf, token_selected_experts, token_final_scales = self.all_gather(
                 [x_sf, token_selected_experts, token_final_scales])
-            x = allgather(x, self.parallel_config, gather_dim=0)
+            x = allgather(x, self.mapping, gather_dim=0)
             token_selected_experts = token_selected_experts.flatten(
                 0, 1).contiguous()
             token_final_scales = token_final_scales.flatten(0, 1).contiguous()
@@ -604,19 +668,43 @@ class FusedMoE(nn.Module):
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
 
+        if self.smart_router and not min_latency_mode:
+            ep_size = self.cluster_size
+            ep_rank = self.cluster_rank
+            expert_start = ep_rank * self.num_experts // ep_size
+            expert_end = min(self.num_experts,
+                             (ep_rank + 1) * self.num_experts // ep_size)
+            w3_w1_weight = self.w3_w1_weight.narrow(0, expert_start,
+                                                    expert_end - expert_start)
+            w2_weight = self.w2_weight.narrow(0, expert_start,
+                                              expert_end - expert_start)
+            cluster_size = self.ep_size
+            cluster_rank = self.ep_rank
+            quant_scales = self.get_quant_scales(expert_start, expert_end)
+        else:
+            ep_size = self.ep_size
+            ep_rank = self.ep_rank
+            w3_w1_weight = self.w3_w1_weight
+            w2_weight = self.w2_weight
+            cluster_size = self.cluster_size
+            cluster_rank = self.cluster_rank
+            quant_scales = self.quant_scales
+
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
             token_final_scales,
-            self.w3_w1_weight,
-            self.w2_weight,
+            w3_w1_weight,
+            w2_weight,
             output_dtype,
-            quant_scales=self.quant_scales,
+            quant_scales=quant_scales,
             input_sf=x_sf,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
             use_fp8_block_scaling=use_fp8_block_scaling,
             min_latency_mode=min_latency_mode,
         )
@@ -624,11 +712,16 @@ class FusedMoE(nn.Module):
         if min_latency_mode:
             assert not self.reduce_results
             return final_hidden_states
+        else:
+            # Custom op requires all inputs are in the same type.
+            # Only in min_latency_mode, the output is a list of tensors.
+            # Otherwise, the output should be unpacked as a single tensor.
+            final_hidden_states = final_hidden_states[0]
 
         if self.reduce_results and self.parallel_size > 1:
             return self.all_reduce(final_hidden_states)
         else:
-            return final_hidden_states[0]
+            return final_hidden_states
 
     def forward(
         self,
@@ -638,6 +731,26 @@ class FusedMoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        if self.is_cutlass():
+            return self.forward_cutlass(x, router_logits, min_latency_mode,
+                                        output_dtype, all_rank_num_tokens)
+        elif self.is_trtllm():
+            return self.forward_trtllmgen(x, router_logits)
+        else:
+            raise NotImplementedError(
+                f"FusedMoE only supports CUTLASS or TRTLLM backends, not {self.moe_backend}"
+            )
+
+    def forward_cutlass(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        min_latency_mode: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        assert self.is_cutlass()
+
         max_chunk_size = self.moe_max_num_tokens
         if self.use_dp:
             assert all_rank_num_tokens is not None
@@ -696,17 +809,94 @@ class FusedMoE(nn.Module):
             self.event_dict[EventType.MoeChunkingOverlap].wait()
             outputs = torch.cat(outputs_list)
         if self.use_dp:
-            rank = self.parallel_config.tensor_parallel_rank
+            rank = self.mapping.tp_rank
             outputs = outputs[:all_rank_num_tokens[rank]]
         return outputs
+
+    def forward_trtllmgen(self, x: torch.Tensor,
+                          router_logits: torch.Tensor) -> torch.Tensor:
+        assert self.is_trtllm()
+        assert x.dtype == torch.bfloat16
+
+        # TODO: since routing kernel is integrated into moe_runner for fp8,
+        #       here we just route the I/Os for moe_runner
+        routing_bias = self.routing_method.e_score_correction_bias
+        top_k = self.routing_method.routing_impl.top_k
+        n_group = self.routing_method.routing_impl.n_group
+        topk_group = self.routing_method.routing_impl.topk_group
+        routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
+
+        if self.quant_config and self.quant_config.quant_mode.has_fp8_block_scales(
+        ):
+            x_val, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x)
+
+            final_hidden_states = torch.ops.trtllm.fp8_block_scale_moe_runner(
+                router_logits,
+                routing_bias,
+                x_val,
+                x_scale,
+                self.w3_w1_weight,
+                self.w3_w1_weight_scaling_factor,
+                self.w2_weight,
+                self.w2_weight_scaling_factor,
+                self.num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                self.intermediate_size_per_partition,
+                self.
+                expert_start,  # local_expert_start;  use ep_rank if stride!=1
+                self.expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+            )
+        elif self.quant_config and self.quant_config.quant_mode.has_nvfp4():
+            scale_factor_use_ue8m0 = False
+            is_scale_factor_swizzled = False  # use linear layout here
+            hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
+                x, self.fc31_input_scale, 16, scale_factor_use_ue8m0,
+                is_scale_factor_swizzled)
+
+            final_hidden_states = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                router_logits,
+                routing_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
+                self.w3_w1_weight,
+                self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                self.w2_weight,
+                self.w2_weight_scale.view(torch.float8_e4m3fn),
+                self.fc31_scale_c.data,
+                self.fc31_alpha.data,
+                self.fc2_alpha.data,
+                self.num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                self.intermediate_size_per_partition,
+                self.
+                expert_start,  # local_expert_start;  use ep_rank if stride!=1
+                self.expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+            )
+        else:
+            raise NotImplementedError(
+                "The TRTLLM backend of FusedMoE only supports fp8_block_scaling and nvfp4 dtypes."
+            )
+
+        if self.reduce_results and self.parallel_size > 1:
+            final_hidden_states = self.all_reduce(final_hidden_states)
+
+        return final_hidden_states
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
-        def load_expert_w3_w1_weight(w1_weight, w3_weight,
-                                     dst_w3_w1_weight: torch.Tensor):
+        def load_expert_w3_w1_weight(w1_weight,
+                                     w3_weight,
+                                     dst_w3_w1_weight: torch.Tensor,
+                                     is_trtllm: bool = False):
             w1_weight_shard = load_weight_shard(w1_weight, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
@@ -714,20 +904,31 @@ class FusedMoE(nn.Module):
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
 
-            expert_w3_weight = dst_w3_w1_weight.narrow(
-                dim=0, start=0, length=self.intermediate_size_per_partition)
-            expert_w3_weight.copy_(w3_weight_shard.view(expert_w3_weight.dtype))
+            w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
+                                         dim=0)
 
-            expert_w1_weight = dst_w3_w1_weight.narrow(
-                dim=0,
-                start=self.intermediate_size_per_partition,
-                length=self.intermediate_size_per_partition)
-            expert_w1_weight.copy_(w1_weight_shard.view(expert_w1_weight.dtype))
+            if is_trtllm:
+                # FIXME: this depends on the kernel internals
+                epilogue_tile_m = 128
+                w31_weight_shard = reorder_rows_for_gated_act_gemm(
+                    w31_weight_shard)
+                w31_weight_shard = shuffle_matrix_a(w31_weight_shard,
+                                                    epilogue_tile_m)
 
-        def load_expert_w2_weight(w2_weight, dst_w2_weight: torch.Tensor):
+            dst_w3_w1_weight.copy_(w31_weight_shard.view(
+                dst_w3_w1_weight.dtype))
+
+        def load_expert_w2_weight(w2_weight,
+                                  dst_w2_weight: torch.Tensor,
+                                  is_trtllm: bool = False):
             w2_weight_shard = load_weight_shard(w2_weight, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.ROW)
+            if is_trtllm:
+                # FIXME: this depends on the kernel internals
+                epilogue_tile_m = 128
+                w2_weight_shard = shuffle_matrix_a(w2_weight_shard,
+                                                   epilogue_tile_m)
             dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype))
 
         for expert_id in range(self.expert_start, self.expert_end):
@@ -738,18 +939,27 @@ class FusedMoE(nn.Module):
                 w3_weight = weights[f"{expert_id}.w3.weight"]
                 w2_weight = weights[f"{expert_id}.w2.weight"]
             elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_idx].transpose(
+                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
                 w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_idx].transpose(0, 1)
+                w2_weight = weights["down_proj"][expert_id].transpose(0, 1)
             else:
                 raise NotImplementedError(
                     f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
                 )
 
-            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx])
+            # TODO: remove w1, w3 swap when kernel is ready
+            if self.is_trtllm() and self.quant_config.quant_mode.has_nvfp4():
+                is_trtllm_nvfp4 = True
+                w1_weight, w3_weight = w3_weight, w1_weight
+            else:
+                is_trtllm_nvfp4 = False
+
             load_expert_w3_w1_weight(w1_weight, w3_weight,
-                                     self.w3_w1_weight.data[expert_idx])
+                                     self.w3_w1_weight.data[expert_idx],
+                                     is_trtllm_nvfp4)
+            load_expert_w2_weight(w2_weight, self.w2_weight.data[expert_idx],
+                                  is_trtllm_nvfp4)
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             if self.quant_config.quant_mode.has_fp8_qdq():
@@ -812,9 +1022,18 @@ class FusedMoE(nn.Module):
                                            dtype=torch.float32)
         tmp_fc2_input_scale = torch.empty(self.num_experts, dtype=torch.float32)
         for expert_id in range(self.num_experts):
-            w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-            w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
-            w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
+                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_input_scale = weights[f"gate_up_proj_input_scale"]
+                w3_input_scale = weights[f"gate_up_proj_input_scale"]
+                w2_input_scale = weights[f"down_proj_input_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             load_expert_fc31_input_scale_fp8_qdq(
                 w1_input_scale, w3_input_scale, tmp_fc31_input_scale[expert_id])
@@ -878,9 +1097,18 @@ class FusedMoE(nn.Module):
             dst_w2_weight_scale.copy_(w2_weight_scale[...].reshape([]))
 
         for expert_id in range(self.expert_start, self.expert_end):
-            w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-            w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-            w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w1_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w3_weight_scale = weights[f"gate_up_proj_weight_scale"]
+                w2_weight_scale = weights[f"down_proj_weight_scale"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                )
 
             expert_idx = expert_id - self.expert_start
 
@@ -938,22 +1166,28 @@ class FusedMoE(nn.Module):
         # fc2_input_scale is the reciprocal of the maximum of all w2 input scales.
         self.fc2_input_scale.data.copy_(tmp_fc2_input_scale.max().reciprocal())
 
+        if self.is_trtllm():
+            block_scales_dtype = torch.float8_e4m3fn
+        else:
+            block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
+
         # Step2: Load weight block scales and alphas.
         def load_expert_w3_w1_weight_scale_nvfp4(
                 w1_weight_scale, w3_weight_scale,
-                dst_w3_w1_weight_scale: torch.Tensor):
+                dst_w3_w1_weight_scale: torch.Tensor, is_trtllm: bool):
             w1_weight_scale = load_weight_shard(w1_weight_scale, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
             w3_weight_scale = load_weight_shard(w3_weight_scale, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.COLUMN)
-
+            # w3
             dst_w3_weight_scale = dst_w3_w1_weight_scale.narrow(
                 dim=0, start=0, length=self.intermediate_size_per_partition)
             dst_w3_weight_scale.copy_(
                 w3_weight_scale.view(dst_w3_weight_scale.dtype))
 
+            # w1
             dst_w1_weight_scale = dst_w3_w1_weight_scale.narrow(
                 dim=0,
                 start=self.intermediate_size_per_partition,
@@ -962,14 +1196,25 @@ class FusedMoE(nn.Module):
                 w1_weight_scale.view(dst_w1_weight_scale.dtype))
 
             orig_shape = dst_w3_w1_weight_scale.shape
-            dst_w3_w1_weight_scale.copy_(
-                torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
-                    dst_w3_w1_weight_scale.cpu().view(float4_sf_dtype)).view(
-                        FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE).reshape(
-                            orig_shape))
 
-        def load_expert_w2_weight_scale_nvfp4(
-                w2_weight_scale, dst_w2_weight_scale: torch.Tensor):
+            if is_trtllm:
+                # FIXME
+                epilogue_tile_m = 128
+                dst_w3_w1_weight_scale.copy_(
+                    shuffle_matrix_sf_a(
+                        reorder_rows_for_gated_act_gemm(
+                            dst_w3_w1_weight_scale.view(float4_sf_dtype)),
+                        epilogue_tile_m,
+                        16).view(block_scales_dtype).reshape(orig_shape))
+            else:
+                dst_w3_w1_weight_scale.copy_(
+                    torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        dst_w3_w1_weight_scale.view(float4_sf_dtype)).view(
+                            block_scales_dtype).reshape(orig_shape))
+
+        def load_expert_w2_weight_scale_nvfp4(w2_weight_scale,
+                                              dst_w2_weight_scale: torch.Tensor,
+                                              is_trtllm: bool):
             w2_weight_scale = load_weight_shard(w2_weight_scale, self.tp_size,
                                                 self.tp_rank,
                                                 TensorParallelMode.ROW)
@@ -977,11 +1222,18 @@ class FusedMoE(nn.Module):
                 w2_weight_scale.view(dst_w2_weight_scale.dtype))
 
             orig_shape = dst_w2_weight_scale.shape
-            dst_w2_weight_scale.copy_(
-                torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
-                    dst_w2_weight_scale.cpu().view(float4_sf_dtype)).view(
-                        FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE).reshape(
-                            orig_shape))
+            if is_trtllm:
+                epilogue_tile_m = 128  # FIXME: read from kernel
+                dst_w2_weight_scale.copy_(
+                    shuffle_matrix_sf_a(
+                        dst_w2_weight_scale.view(float4_sf_dtype),
+                        epilogue_tile_m,
+                        16).view(block_scales_dtype).reshape(orig_shape))
+            else:
+                dst_w2_weight_scale.copy_(
+                    torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        dst_w2_weight_scale.view(float4_sf_dtype)).view(
+                            block_scales_dtype).reshape(orig_shape))
 
         def load_expert_fc31_alpha_nvfp4(w1_weight_scale_2, w3_weight_scale_2,
                                          final_fc31_input_scale: torch.Tensor,
@@ -1013,11 +1265,16 @@ class FusedMoE(nn.Module):
 
             expert_idx = expert_id - self.expert_start
 
+            # TODO: remove w1, w3 swap
+            if self.is_trtllm():
+                w1_weight_scale, w3_weight_scale = w3_weight_scale, w1_weight_scale
+
             load_expert_w3_w1_weight_scale_nvfp4(
                 w1_weight_scale, w3_weight_scale,
-                self.w3_w1_weight_scale.data[expert_idx])
+                self.w3_w1_weight_scale.data[expert_idx], self.is_trtllm())
             load_expert_w2_weight_scale_nvfp4(
-                w2_weight_scale, self.w2_weight_scale.data[expert_idx])
+                w2_weight_scale, self.w2_weight_scale.data[expert_idx],
+                self.is_trtllm())
 
             load_expert_fc31_alpha_nvfp4(w1_weight_scale_2, w3_weight_scale_2,
                                          self.fc31_input_scale.data,
@@ -1025,6 +1282,9 @@ class FusedMoE(nn.Module):
             load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
                                         self.fc2_input_scale.data,
                                         self.fc2_alpha.data[expert_idx])
+        if self.is_trtllm():
+            self.fc31_scale_c.data.copy_(self.fc2_input_scale.data *
+                                         self.fc31_alpha.data)
 
 
 class FusedMoEQuantScalesFP8(NamedTuple):

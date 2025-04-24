@@ -251,6 +251,7 @@ void initBindings(pybind11::module_& m)
             "guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
         .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+        .def_property_readonly("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
         .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
         .def_property_readonly(
@@ -403,16 +404,12 @@ void initBindings(pybind11::module_& m)
             py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
-            py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
+            py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
-
-    py::bind_vector<tb::RequestVector>(m, "RequestVector");
-    // Note: Making an opaque binding out of RequestList would impact any std::vector<unsigned> conversion
-    // PybindUtils::bindList<tb::RequestList>(m, "RequestList");
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),
@@ -438,6 +435,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots);
 
+    py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
+        .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
+        .def_readwrite("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
+        .def_property_readonly("new_output_tokens_host",
+            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
+        .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
+        .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
+        .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
+
     py::class_<tb::DecoderBuffers::DraftBuffers>(m, "DraftBuffers")
         .def(py::init())
         .def_readwrite("next_draft_tokens_device", &tb::DecoderBuffers::DraftBuffers::nextDraftTokensDevice)
@@ -457,29 +463,12 @@ void initBindings(pybind11::module_& m)
 
     py::classh<tb::DecoderBuffers>(m, "DecoderBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, runtime::SizeType32,
-                 runtime::SizeType32, runtime::BufferManager const&, runtime::ModelConfig const&,
-                 runtime::WorldConfig const&>(),
+                 runtime::BufferManager const&, runtime::ModelConfig const&, runtime::WorldConfig const&>(),
             py::arg("max_num_sequences"), py::arg("max_beam_width"), py::arg("max_attention_window"),
-            py::arg("max_seq_len"), py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"),
-            py::arg("world_config"))
+            py::arg("max_tokens_per_step"), py::arg("buffer_manager"), py::arg("model_config"), py::arg("world_config"))
         .def_readwrite("logits", &tb::DecoderBuffers::logits)
-        .def_readwrite("slot_output_ids", &tb::DecoderBuffers::slotOutputIds)
-        .def_readwrite("slot_output_ids_host", &tb::DecoderBuffers::slotOutputIdsHost)
         .def_readwrite("cache_indirection_input", &tb::DecoderBuffers::cacheIndirectionInput)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
-        .def_property_readonly(
-            "sequence_lengths", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.sequenceLengths); })
-        .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
-        .def_property_readonly(
-            "new_output_tokens", [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokens); })
-        .def_property_readonly("new_output_tokens_host",
-            [](tb::DecoderBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)
-        .def_readwrite("cum_log_probs_host", &tb::DecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::DecoderBuffers::logProbs)
-        .def_readwrite("log_probs_host", &tb::DecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderBuffers::finishReasonsHost)
         .def_readwrite("draft_buffers", &tb::DecoderBuffers::draftBuffers);
 
     py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")

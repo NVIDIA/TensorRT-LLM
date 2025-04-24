@@ -104,6 +104,11 @@ KV_CACHE_CFG = {
     },
 }
 
+KV_QUANT_CFG_CHOICES = {
+    "fp8": "FP8_KV_CFG",
+    "nvfp4": "NVFP4_KV_CFG",
+}
+
 
 def quant_cfg_choices():
     import modelopt.torch.quantization as mtq
@@ -379,20 +384,26 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
-            split="train")
+            split="train",
+            trust_remote_code=True)
         dataset = dataset["text"][:calib_size]
     elif "scienceqa" in dataset_name_or_dir.lower(
     ) or "science_qa" in dataset_name_or_dir.lower():
         if os.path.isdir(dataset_name_or_dir):
-            dataset = load_dataset(dataset_name_or_dir, split="train")
+            dataset = load_dataset(dataset_name_or_dir,
+                                   split="train",
+                                   trust_remote_code=True)
         else:
-            dataset = load_dataset("derek-thomas/ScienceQA", split="train")
+            dataset = load_dataset("derek-thomas/ScienceQA",
+                                   split="train",
+                                   trust_remote_code=True)
         dataset = dataset.select(range(calib_size))
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(
             dataset_name_or_dir,
             name="3.0.0",
             split="train",
+            trust_remote_code=True,
         )
         dataset = dataset["article"][:calib_size]
     elif os.path.isdir(dataset_name_or_dir):
@@ -400,7 +411,9 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
-        dataset = load_dataset(dataset_name_or_dir, split="train")
+        dataset = load_dataset(dataset_name_or_dir,
+                               split="train",
+                               trust_remote_code=True)
         dataset = dataset["text"][:calib_size]
     else:
         raise NotImplementedError(
@@ -670,6 +683,7 @@ def quantize_and_export(*,
         )
         raise e
 
+    import modelopt.torch.quantization as mtq
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
     from tensorrt_llm.models.convert_utils import infer_dtype
@@ -745,9 +759,11 @@ def quantize_and_export(*,
 
             if kv_cache_dtype is not None:
                 if kv_cache_dtype == "fp8":
-                    for value in KV_CACHE_CFG.values():
-                        value.update({"num_bits": (4, 3)})  # type: ignore
-                quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
+                    kv_cache_quant_cfg = getattr(
+                        mtq, KV_QUANT_CFG_CHOICES[kv_cache_dtype])["quant_cfg"]
+                    quant_cfg["quant_cfg"].update(kv_cache_quant_cfg)
+                else:
+                    quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
 
             # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
             if model_type == "gemma" and "int8_sq" in qformat:
@@ -985,22 +1001,29 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         dataset = load_dataset(
             "json",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
-            split="train")
+            split="train",
+            trust_remote_code=True)
         text_column = "text"
     elif "wikitext" in dataset_name_or_dir:
         dataset = load_dataset(dataset_name_or_dir,
                                "wikitext-103-v1",
-                               split="train")
+                               split="train",
+                               trust_remote_code=True)
         text_column = "text"
     elif "cnn_dailymail" in dataset_name_or_dir:
-        dataset = load_dataset(dataset_name_or_dir, name="3.0.0", split="train")
+        dataset = load_dataset(dataset_name_or_dir,
+                               name="3.0.0",
+                               split="train",
+                               trust_remote_code=True)
         text_column = "article"
     elif os.path.isdir(dataset_name_or_dir):
         logger.info(
             f"Recognized local dataset repo {dataset_name_or_dir} for calibration; "
             "assuming the calibration data are in the train split and text column."
         )
-        dataset = load_dataset(dataset_name_or_dir, split="train")
+        dataset = load_dataset(dataset_name_or_dir,
+                               split="train",
+                               trust_remote_code=True)
         text_column = "text"
     else:
         raise NotImplementedError(

@@ -9,16 +9,12 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-if(BUILD_BATCH_MANAGER)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-    add_subdirectory(batch_manager)
-  endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
+  add_subdirectory(batch_manager)
 endif()
 
-if(BUILD_EXECUTOR)
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-    add_subdirectory(executor)
-  endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
+  add_subdirectory(executor)
 endif()
 
 add_subdirectory(common)

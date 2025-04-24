@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -7,7 +7,7 @@ from torch import nn
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.decoder import TorchDecoder
+from ..pyexecutor.decoder import DecoderState, TorchDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -189,10 +189,9 @@ class MTPDecoder(TorchDecoder):
             request.state = LlmRequestState.GENERATION_COMPLETE
             request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
-    def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tensors_host: Dict[str, torch.Tensor],
-                        decoder_event: torch.cuda.Event):
-        decoder_event.synchronize()
+    def update_requests(self, decoder_state: DecoderState) -> None:
+        decoder_state.decoder_event.synchronize()
+        new_tensors_host = decoder_state.new_tensors_host
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
         new_tokens_lens_list = new_tensors_host["new_tokens_lens_host"].tolist()
         next_draft_tokens_list = new_tensors_host[
@@ -200,7 +199,7 @@ class MTPDecoder(TorchDecoder):
 
         idx = 0
         beam_idx = 0
-        for request in scheduled_requests.context_requests:
+        for request in decoder_state.scheduled_requests.context_requests:
             if request.get_context_remaining_length() != 0:
                 idx += 1
                 continue
@@ -218,7 +217,7 @@ class MTPDecoder(TorchDecoder):
                 request.py_decoding_iter += 1
             idx += 1
 
-        for request in scheduled_requests.generation_requests:
+        for request in decoder_state.scheduled_requests.generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_tokens = new_tokens_list[idx]
                 num_new_tokens = new_tokens_lens_list[idx]
@@ -240,15 +239,15 @@ class MTPDecoder(TorchDecoder):
             idx += 1
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs):
+                     model_outputs) -> DecoderState:
         # new_tokens_device: all of the accepted tokens, device tensor
         # new_tokens_lens_device: the accepted lengths, device tensor
         # next_draft_tokens_device: predicted draft tokens, device tensor
         # next_new_tokens_device: input tokens for the next iteration, device tensor
-        new_tokens_device = model_outputs[0]
-        new_tokens_lens_device = model_outputs[1]
-        next_draft_tokens_device = model_outputs[2]
-        next_new_tokens_device = model_outputs[3]
+        new_tokens_device = model_outputs['new_tokens']
+        new_tokens_lens_device = model_outputs['new_tokens_lens']
+        next_draft_tokens_device = model_outputs['next_draft_tokens']
+        next_new_tokens_device = model_outputs['next_new_tokens']
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
         new_tokens_lens_host = new_tokens_lens_device.to('cpu',
                                                          non_blocking=True)
@@ -271,7 +270,11 @@ class MTPDecoder(TorchDecoder):
         # with the max draft token length
         for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
-        return new_tensors_device, new_tensors_host, decoder_event
+        return DecoderState(scheduled_requests=scheduled_requests,
+                            logits=model_outputs['logits'],
+                            new_tensors_device=new_tensors_device,
+                            new_tensors_host=new_tensors_host,
+                            decoder_event=decoder_event)
 
 
 class MTPWorker(nn.Module):
@@ -296,6 +299,7 @@ class MTPWorker(nn.Module):
         batch_size = attn_metadata.num_seqs
 
         # Sample and verify draft tokens
+        raw_logits = logits
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, spec_metadata, attn_metadata)
 
@@ -334,8 +338,7 @@ class MTPWorker(nn.Module):
             attn_metadata = draft_inputs["attn_metadata"]
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
         if attn_metadata.is_cuda_graph and attn_metadata is not None:
-            self.restore_attn_metadata(num_accepted_tokens=num_accepted_tokens,
-                                       attn_metadata=attn_metadata)
+            self.restore_attn_metadata(attn_metadata=attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -344,7 +347,13 @@ class MTPWorker(nn.Module):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
 
     def update_mtp_hidden_states(
         self,
@@ -598,27 +607,28 @@ class MTPWorker(nn.Module):
             Draft model:
                 - input tokens: BCDE
                 - new generated draft tokens: FGH
-            Current sequence: ABCDE
+            Current sequence: ABCD E`FGH   -> Whitespace separates tokens produced by each phase
+                                           -> Backtick separates accepted and draft tokens
 
             Generation phase 1:
             Target model:
                 - input tokens: E + FGH
-                - sampling tokens: FGXY  -> Sample with E's logit and get 'F'; Sample with F's logit, ...
-                - accepted tokens: FGX   -> 'X' will be treat as the accepted token
+                - sampling tokens: FGXY    -> Sample with E's logit and get 'F'; Sample with F's logit, ...
+                - accepted tokens: FGX     -> 'X' will be treat as the accepted token
             Draft model:
                 - input tokens: FGX
-                - new generated draft tokens: NOP
-            Current sequence: ABCDEFGX
+                - new generated draft tokens: PQR
+            Current sequence: ABCD EFG X`PQR
 
             Generation phase 2:
             Target model:
-                - input tokens: X + NOP
-                - sampling tokens: NYQC
-                - accepted token: NY
+                - input tokens: X + PQR
+                - sampling tokens: PYST
+                - accepted token: PY
             Draft model:
-                - input tokens: NY
-                - new generated draft tokens: XYZ
-            Current sequence: ABCDEFGXNY
+                - input tokens: PY
+                - new generated draft tokens: UVW
+            Current sequence: ABCD EFG XP Y`UVW
         '''
 
         batch_size = attn_metadata.num_seqs
@@ -689,23 +699,12 @@ class MTPWorker(nn.Module):
                 attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
                     i] -= mtp_num_modules + 1 - num_accepted_tokens[i].item()
 
-    def restore_attn_metadata(self, num_accepted_tokens: torch.Tensor,
-                              attn_metadata: AttentionMetadata):
+    def restore_attn_metadata(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-
         num_contexts = attn_metadata.num_contexts
         attn_metadata._seq_lens[num_contexts:batch_size] += 1
         attn_metadata._seq_lens_cuda[num_contexts:batch_size] += 1
         attn_metadata.on_update()
-
-        if hasattr(attn_metadata, 'kv_lens_cuda'):
-            # Note that it's important to not free the seq_lens_cuda
-            # buffer once the graph has been captured also - this will invalidate
-            # the graph and force an expensive recapture.
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] += (
-                mtp_num_modules + 1 -
-                num_accepted_tokens[num_contexts:batch_size])
 
     def prepare_drafter_inputs(
         self,
@@ -927,9 +926,9 @@ class MTPEagleWorker(MTPWorker):
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
 
         # Sample and verify draft tokens
+        raw_logits = logits
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, spec_metadata, attn_metadata)
 
@@ -937,10 +936,6 @@ class MTPEagleWorker(MTPWorker):
         if attn_metadata.is_cuda_graph:
             seq_len = attn_metadata._seq_lens[:batch_size].clone()
             seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
-            spec_all_rank_num_tokens = spec_metadata.all_rank_num_tokens
-            req_types = attn_metadata.host_request_types[:batch_size].clone()
-            if hasattr(attn_metadata, 'kv_lens_cuda'):
-                kv_lens_cuda = attn_metadata.kv_lens_cuda[:batch_size].clone()
 
         # Prepare inputs for the 1st MTP layer
         position_ids = position_ids.squeeze(0)
@@ -1001,15 +996,9 @@ class MTPEagleWorker(MTPWorker):
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
-            attn_metadata.num_contexts = num_contexts
-            attn_metadata.num_generations = num_generations
             attn_metadata._seq_lens[:batch_size].copy_(seq_len)
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
-            attn_metadata.host_request_types[:batch_size].copy_(req_types)
-            spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-            if hasattr(attn_metadata, 'kv_lens_cuda'):
-                attn_metadata.kv_lens_cuda[:batch_size].copy_(kv_lens_cuda)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = accepted_tokens[
@@ -1018,7 +1007,13 @@ class MTPEagleWorker(MTPWorker):
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
                                        dim=1)
 
-        return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
+        return {
+            'logits': raw_logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
 
     def prepare_drafter_inputs(
         self,

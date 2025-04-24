@@ -319,7 +319,7 @@ def main(args):
     if is_enc_dec:
         logger.warning(
             "This path is an encoder-decoder model. Using different handling.")
-        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/enc_dec/run.py instead."
+        assert not args.use_py_session, "Encoder-decoder models don't have a unified python runtime, please use its own examples/models/core/enc_dec/run.py instead."
 
     model_name, model_version = read_model_name(
         args.engine_dir if not is_enc_dec else os.path.
@@ -440,7 +440,7 @@ def main(args):
 
         outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
                               pad_id, stop_words_list, bad_words_list,
-                              tokenizer.vocab_size)
+                              len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 

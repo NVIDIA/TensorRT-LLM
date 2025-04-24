@@ -138,7 +138,7 @@ def install_additional_requirements(python_exe, root_dir):
                     "pip",
                     "install",
                     "-r",
-                    "examples/recurrentgemma/requirements.txt",
+                    "examples/models/core/recurrentgemma/requirements.txt",
                 ],
                 cwd=root_dir,
                 env=_os.environ,
@@ -335,8 +335,8 @@ def test_unit_tests(build_google_tests, build_dir, lora_setup):
                          indirect=True)
 @pytest.mark.parametrize("model", [
     "bart", "chatglm", "eagle", "encoder", "enc_dec_language_adapter", "gpt",
-    "gpt_executor", "llama", "mamba", "medusa", "recurrentgemma", "redrafter",
-    "t5"
+    "gpt_executor", "gpt_session", "gpt_tests", "llama", "mamba", "medusa",
+    "recurrentgemma", "redrafter", "t5"
 ])
 @pytest.mark.parametrize("run_fp8", [False, True], ids=["", "fp8"])
 def test_model(build_google_tests, model, prepare_model, run_model_tests,

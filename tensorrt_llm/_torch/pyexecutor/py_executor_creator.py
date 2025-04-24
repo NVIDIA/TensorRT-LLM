@@ -4,21 +4,23 @@ import tensorrt_llm
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..distributed import MPIDist
 from ..speculative import Eagle3Config
 from ._util import (create_kv_cache_manager, create_py_executor_instance,
                     estimate_max_kv_cache_tokens, get_token_num_for_estimation,
                     is_mla)
 from .config import PyTorchConfig
-from .distributed import MPIDist
 from .model_engine import DRAFT_KV_CACHE_MANAGER_KEY, PyTorchModelEngine
 
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
-                       engine_dir: str = None):
+                       engine_dir: str = None,
+                       lora_config: LoraConfig = None):
     if executor_config.pytorch_backend_config is None:
         executor_config.pytorch_backend_config = PyTorchConfig()
 
@@ -75,10 +77,15 @@ def create_py_executor(executor_config: ExecutorConfig,
         dist=dist,
         spec_config=spec_config,
         guided_decoding_config=executor_config.guided_decoding_config,
+        lora_config=lora_config,
     )
 
-    draft_model_engine = None
     if has_draft_model_engine:
+        draft_spec_config = copy.copy(spec_config)
+        # The draft model won't have any draft tokens attached to
+        # generation requests when we invoke it autoregressively
+        draft_spec_config.max_draft_tokens = 0
+
         draft_model_engine = PyTorchModelEngine(
             spec_config.eagle_weights_path,
             pytorch_backend_config,
@@ -88,9 +95,12 @@ def create_py_executor(executor_config: ExecutorConfig,
             mapping=mapping,
             attn_runtime_features=attn_runtime_features,
             dist=dist,
-            spec_config=copy.copy(spec_config),
+            spec_config=draft_spec_config,
         )
         draft_model_engine.kv_cache_manager_key = DRAFT_KV_CACHE_MANAGER_KEY
+        draft_model_engine.load_weights_from_target_model(model_engine.model)
+    else:
+        draft_model_engine = None
 
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len
@@ -154,9 +164,9 @@ def create_py_executor(executor_config: ExecutorConfig,
                                               pytorch_backend_config,
                                               executor_config, ctx_chunk_config,
                                               model_engine, draft_model_engine,
-                                              False)
+                                              False, lora_config)
 
-    if executor_config.pytorch_backend_config.use_kv_cache:
+    if executor_config.pytorch_backend_config.use_kv_cache and 'cp_type' not in mapping.cp_config:
         kv_cache_max_tokens = estimate_max_kv_cache_tokens(
             py_executor, model_engine, origin_executor_config, mapping,
             origin_seq_len, ctx_chunk_config, draft_model_engine)
@@ -185,7 +195,7 @@ def create_py_executor(executor_config: ExecutorConfig,
             py_executor = create_py_executor_instance(
                 dist, kv_cache_manager, draft_kv_cache_manager, mapping,
                 pytorch_backend_config, executor_config, ctx_chunk_config,
-                model_engine, draft_model_engine, True)
+                model_engine, draft_model_engine, False, lora_config)
 
     py_executor.start_worker()
     return py_executor

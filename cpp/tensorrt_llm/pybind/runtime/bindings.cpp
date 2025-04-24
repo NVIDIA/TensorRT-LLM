@@ -16,8 +16,11 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
+#include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/delayStream.h"
+#include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -291,18 +294,18 @@ void initBindings(pybind11::module_& m)
     py::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "VectorRequest");
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>, std::vector<bool>>(), py::arg("logits"), py::arg("active"))
-        .def(py::init<std::vector<tr::ITensor::SharedPtr>>(), py::arg("logits"))
+        .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
+            py::arg("max_decoding_engine_tokens"))
+        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
-        .def_readwrite("active", &tr::decoder_batch::Input::active)
+        .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
         .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
         .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
         .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
-        .def_readwrite("cache_indirection", &tr::decoder::Output::cacheIndirection)
-        .def_readwrite("sequence_lengths", &tr::decoder::Output::sequenceLengths);
+        .def_readwrite("cache_indirection", &tr::decoder_batch::Output::cacheIndirection);
 
     py::class_<tr::decoder::Input>(m, "Input")
         .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
@@ -337,14 +340,8 @@ void initBindings(pybind11::module_& m)
     py::class_<tr::DecodingOutput>(m, "DecodingOutput");
 
     py::class_<tr::CudaEvent>(m, "CudaEvent")
-        .def(py::init(
-            [](CudaStreamPtr stream)
-            {
-                tr::CudaEvent eventStop{};
-                stream->record(eventStop);
-                return eventStop;
-            }))
-        .def("synchronize", [](tr::CudaEvent& self) { self.synchronize(); });
+        .def(py::init<unsigned int>(), py::arg("flags") = cudaEventDisableTiming)
+        .def("synchronize", &tr::CudaEvent::synchronize);
 
     py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
         .def(
@@ -364,10 +361,10 @@ void initBindings(pybind11::module_& m)
         .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
             py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
-        .def_property_readonly(
-            "joint_decoding_input", [](tr::decoder::DecoderState& self) { return self.getJointDecodingInput(); })
-        .def_property_readonly(
-            "joint_decoding_output", [](tr::decoder::DecoderState& self) { return self.getJointDecodingOutput(); })
+        .def_property_readonly("joint_decoding_input", &tr::decoder::DecoderState::getJointDecodingInput)
+        .def_property_readonly("joint_decoding_output", &tr::decoder::DecoderState::getJointDecodingOutput)
+        .def_property_readonly("sequence_lengths",
+            [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getSequenceLengths()); })
         .def_property_readonly(
             "all_new_tokens", [](tr::decoder::DecoderState& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
         .def_property_readonly(
@@ -411,6 +408,26 @@ void initBindings(pybind11::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+
+    py::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
+        .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
+        .value("RESIDUAL_RMS_NORM", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        .value("LAST_PROCESS_FOR_UB", tensorrt_llm::kernels::AllReduceFusionOp::LAST_PROCESS_FOR_UB)
+        .value("RESIDUAL_RMS_PREPOST_NORM", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+        .value("RESIDUAL_RMS_NORM_QUANT_FP8", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+        .value("RESIDUAL_RMS_NORM_QUANT_NVFP4", tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        .value("RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4",
+            tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        .value("RESIDUAL_RMS_NORM_OUT_QUANT_FP8",
+            tensorrt_llm::kernels::AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8);
+
+    py::enum_<tensorrt_llm::kernels::AllReduceStrategyType>(m, "AllReduceStrategy")
+        .value("NCCL", tensorrt_llm::kernels::AllReduceStrategyType::NCCL)
+        .value("MIN_LATENCY", tensorrt_llm::kernels::AllReduceStrategyType::MIN_LATENCY)
+        .value("AUTO", tensorrt_llm::kernels::AllReduceStrategyType::AUTO)
+        .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
+        .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
+        .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
 }
 
 } // namespace tensorrt_llm::pybind::runtime

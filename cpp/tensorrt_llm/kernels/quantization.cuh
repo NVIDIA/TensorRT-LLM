@@ -527,8 +527,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-    float outputScale
-        = SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+    float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValue) : 0.0f;
 
     if (SFout)
     {
@@ -557,6 +556,46 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 #endif
 }
 
+inline __device__ int64_t get_sf_out_offset_128x4(
+    std::optional<int> batchIdx, int mIdx, int kIdx, std::optional<int> numRows, int numCols)
+{
+    // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+    // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+    // batched tensor
+    // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+    // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+    int32_t innerKIdx = (kIdx % 4);
+    int64_t innerKStride = 1;
+
+    int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+    int64_t innerMStride = 4 * innerKStride; // 4
+
+    // M tile layout [32, 4] is column-major.
+    int32_t outerMIdx = (mIdx % 32);
+    int64_t outerMStride = 4 * innerMStride; // 16
+
+    int32_t kTileIdx = (kIdx / 4);
+    int64_t kTileStride = 32 * outerMStride; // 512
+
+    // SF vector size 16. We round the "numCols" up to a multiple of 64.
+    int factor = CVT_FP4_SF_VEC_SIZE * 4;
+    int32_t numKTiles = (numCols + factor - 1) / factor;
+    int32_t mTileIdx = mIdx / (32 * 4);
+    int64_t mTileStride = numKTiles * kTileStride;
+
+    // Each SF block has 128 rows so pad rows to the multiple of 128.
+    int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+    int64_t bTileStride = numMTiles * mTileStride;
+
+    // Compute the global offset.
+    int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride
+        + outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
+
+    return SFOffset;
+}
+
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
 __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx, int colIdx,
     std::optional<int> numRows, int numCols, SFType* SFout, FP4QuantizationSFLayout layout)
@@ -576,40 +615,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(std::optional<int> batchI
             int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
             int32_t mIdx = rowIdx;
 
-            // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-            // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
-            // batched tensor
-            // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-            // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
-            int32_t innerKIdx = (kIdx % 4);
-            int64_t innerKStride = 1;
-
-            int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-            int64_t innerMStride = 4 * innerKStride; // 4
-
-            // M tile layout [32, 4] is column-major.
-            int32_t outerMIdx = (mIdx % 32);
-            int64_t outerMStride = 4 * innerMStride; // 16
-
-            int32_t kTileIdx = (kIdx / 4);
-            int64_t kTileStride = 32 * outerMStride; // 512
-
-            // SF vector size 16. We round the "numCols" up to a multiple of 64.
-            int factor = CVT_FP4_SF_VEC_SIZE * 4;
-            int32_t numKTiles = (numCols + factor - 1) / factor;
-            int32_t mTileIdx = mIdx / (32 * 4);
-            int64_t mTileStride = numKTiles * kTileStride;
-
-            // Each SF block has 128 rows so pad rows to the multiple of 128.
-            int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
-            int64_t bTileStride = numMTiles * mTileStride;
-
-            // Compute the global offset.
-            int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride
-                + outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
-
+            auto SFOffset = get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numCols);
             return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
         }
         else if (layout == FP4QuantizationSFLayout::LINEAR)
@@ -819,5 +825,7 @@ cvt_fp8_to_fp4(
 #endif
 }
 
+__global__ void nvfp4_block_scale_interleave_kernel(
+    int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels
 } // namespace tensorrt_llm

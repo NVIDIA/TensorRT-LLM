@@ -9,12 +9,12 @@ from tensorrt_llm.scaffolding import (MajorityVoteController,
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
+    # .e.g. /home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B
     parser.add_argument(
-        '--generation_dir',
+        '--model_dir',
         type=str,
-        default=
-        "/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
-    )
+        required=True,
+        help="Path to the directory containing the generation model")
     # https://github.com/QwenLM/Qwen2.5-Math/blob/main/evaluation/data/aime24/test.jsonl
     parser.add_argument('--jsonl_file', type=str, default='./test.jsonl')
     parser.add_argument('--threshold', type=float, default=None)
@@ -36,7 +36,7 @@ def main():
     args = parse_arguments()
     workers = {}
 
-    llm_worker = TRTLLMWorker.init_with_new_llm(args.generation_dir,
+    llm_worker = TRTLLMWorker.init_with_new_llm(args.model_dir,
                                                 backend="pytorch",
                                                 max_batch_size=32,
                                                 max_num_tokens=4096,
