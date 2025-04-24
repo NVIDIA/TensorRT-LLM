@@ -372,6 +372,7 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = KV_CACHE_MANAGER_KEY
         self.lora_model_config: Optional[LoraModelConfig] = None
+        self.warmed_up = False
 
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
@@ -514,7 +515,7 @@ class PyTorchModelEngine(ModelEngine):
         if cp_type == 'star_attention':
             return
 
-        if self._torch_compile_enabled:
+        if self._torch_compile_enabled and self.warmed_up == False:
             # Disable cuda graph capture here so that we can properly capture it later
             with no_cuda_graph():
                 warmup_batch_size = [1, self.batch_size // 2]
@@ -543,7 +544,7 @@ class PyTorchModelEngine(ModelEngine):
                                     bs, num_tokens_per_request))
                             torch.cuda.synchronize()
 
-        if self.pytorch_backend_config.autotuner_enabled:
+        if self.pytorch_backend_config.autotuner_enabled and self.warmed_up == False:
             with no_cuda_graph(), autotune():
                 num_tokens_per_request = min(self.max_num_tokens,
                                              kv_cache_manager.max_seq_len - 1)
@@ -588,6 +589,7 @@ class PyTorchModelEngine(ModelEngine):
                              resource_manager=resource_manager,
                              extra_model_inputs=_create_extra_inputs(bs, 1))
                 torch.cuda.synchronize()
+        self.warmed_up = True
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         if kv_cache_manager is None:
