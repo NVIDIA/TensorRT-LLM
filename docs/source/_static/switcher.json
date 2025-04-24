@@ -1,0 +1,19 @@
+[
+    {
+        "preferred": true,
+        "version": "latest",
+        "url": "https://nvidia.github.io/TensorRT-LLM/latest"
+    },
+    {
+        "version": "0.20.0rc0",
+        "url": "https://nvidia.github.io/TensorRT-LLM/0.20.0rc0"
+    },
+    {
+        "version": "0.19.0rc0",
+        "url": "https://nvidia.github.io/TensorRT-LLM/0.19.0rc0"
+    },
+    {
+        "version": "0.18.2",
+        "url": "https://nvidia.github.io/TensorRT-LLM/0.18.2"
+    }
+]
