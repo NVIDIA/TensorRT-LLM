@@ -24,7 +24,6 @@ __all__ = [
     "DeepseekV3ForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
-    "MambaHybridForCausalLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
     "NemotronForCausalLM",
