@@ -143,8 +143,10 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
         TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
         auto const targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
 
-        auto [outputSplitCaches, bufferCoverTargetNum] = mCacheTransBufferManager->getOrAllocateSendBuffers(
+        auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
             cacheBufferId, targetNum, targetBufferSize, bufferManager);
+        auto& outputSplitCaches = std::get<0>(result);
+        auto& bufferCoverTargetNum = std::get<1>(result);
 
         tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
             inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);

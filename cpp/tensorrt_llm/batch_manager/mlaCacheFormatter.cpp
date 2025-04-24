@@ -155,10 +155,11 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
     size_t const pPDomainSize = targetInfo.mDomainPPSize;
     TLLM_CHECK((cacheBlockSize * blockNum) % pPDomainSize == 0);
     auto const targetBufferSize = (cacheBlockSize * blockNum) / pPDomainSize;
-    // diff end
-    auto [outputSplitCaches, bufferCoverTargetNum] = mCacheTransBufferManager->getOrAllocateSendBuffers(
+    auto result = mCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, pPDomainSize, targetBufferSize, bufferManager);
-    // return bufferCoverTargetNum ,  params : targetBufferSize, targetNum
+    auto& outputSplitCaches = std::get<0>(result);
+    auto& bufferCoverTargetNum = std::get<1>(result);
+    // diff end
 
     // The size of outputSplitCaches should be equal to pPDomainSize
 
@@ -324,8 +325,10 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         auto targetNum = pickUpConnections.size();
         TLLM_CHECK((cacheBlockSize * blockNum) % targetNum == 0);
         auto targetBufferSize = (cacheBlockSize * blockNum) / targetNum;
-        auto [recvSplitCaches, bufferCoverTargetNum] = mCacheTransBufferManager->getOrAllocateRecvBuffers(
+        auto result = mCacheTransBufferManager->getOrAllocateRecvBuffers(
             cacheBufferId, targetNum, targetBufferSize, bufferManager);
+        auto& recvSplitCaches = std::get<0>(result);
+        auto& bufferCoverTargetNum = std::get<1>(result);
         size_t remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
         bufferManager.getStream().synchronize();
