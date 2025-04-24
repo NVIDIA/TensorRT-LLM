@@ -4,6 +4,7 @@ import torch
 
 
 # Function to apply rotary positional embeddings (RoPE)
+# Used by torch.ops.attention.fused_mha
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -97,27 +98,15 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
 @torch.inference_mode()
 def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    RoPE implementation by DeepSeek:
+    Apply rotary positional embeddings by interleaving Q/K ,
+    indexing cos/sin tables with position_ids, and returning rotated q, k.
+    cos:  [seq_len, head_dim]
+    sin:  [seq_len, head_dim]
     """
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
@@ -139,12 +128,6 @@ def torch_apply_explicit_rope(
         [B, S, N, D] with unsqueeze_dim=2, default is [B, N, S, D]
     - Frequencies are provided as separate `cos` and `sin` tensors of shape [B, S, head_dim].
     """
-
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
     # in HF, cos/sin tensor are passed in as x.dtype, this is to double ensure
     cos = cos.type_as(q)
     sin = sin.type_as(q)
@@ -152,7 +135,6 @@ def torch_apply_explicit_rope(
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    print("q_embed", q_embed.dtype)
     return q_embed, k_embed
 
 
@@ -199,7 +181,7 @@ def torch_apply_rope_with_qk_interleaving(
     sin: torch.Tensor,  # [B, 1, seq_len, head_dim]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    DS-style RoPE: interleaves Q/K channels and returns rotated (q_embed, k_embed).
+    DeepSeek-style RoPE: interleaves Q/K channels and returns rotated (q_embed, k_embed).
     """
     b, h, s, d = q.shape
     q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)

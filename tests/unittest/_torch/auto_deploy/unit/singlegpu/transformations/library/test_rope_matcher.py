@@ -1,6 +1,11 @@
 import pytest
 import torch
 from _graph_test_helpers import run_test
+from _model_test_utils import (
+    apply_rotary_pos_emb_complex,
+    apply_rotary_pos_emb_explicit,
+    rotate_half,
+)
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.transformations.library.rope import (
@@ -13,23 +18,7 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 torch.manual_seed(0)
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _precompute_freqs_cis(seq_len: int, head_dim: int, rope_theta: float):
+def _precompute_freqs_cis_explicit(seq_len: int, head_dim: int, rope_theta: float):
     dtype = torch.float32
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     positions = torch.arange(seq_len, dtype=torch.float32)
@@ -40,21 +29,7 @@ def _precompute_freqs_cis(seq_len: int, head_dim: int, rope_theta: float):
     return cos, sin
 
 
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2) and complex dtype.
-):
-    # Reshape the inputs to pair the last dimension.
-    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
-    xq_out = torch.view_as_real(xq_complex * freqs_cis[:, :, None, :]).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis[:, :, None, :]).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def _precompute_freqs_cis_v2(seq_len: int, head_dim: int, rope_theta: float):
+def _precompute_freqs_cis_complex(seq_len: int, head_dim: int, rope_theta: float):
     """
     Compute the frequency tensor for the complex multiplication RoPE variant.
     Returns a complex tensor of shape (seq_len, head_dim//2).
@@ -109,12 +84,12 @@ class RoPEModel(torch.nn.Module):
             else:
                 unsq_dim = 2
 
-            cos, sin = _precompute_freqs_cis(s, self.head_dim, rope_theta=10000)
+            cos, sin = _precompute_freqs_cis_explicit(s, self.head_dim, rope_theta=10000)
             cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
             sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
             if self.mode == "match":
-                q_out, k_out = apply_rotary_pos_emb(q, k, cos, sin, unsq_dim)
+                q_out, k_out = apply_rotary_pos_emb_explicit(q, k, cos, sin, unsq_dim)
             else:  # optimize
                 q_out, k_out = torch.ops.rope.torch_apply_explicit_rope(q, k, cos, sin, unsq_dim)
 
@@ -129,11 +104,11 @@ class RoPEModel(torch.nn.Module):
         else:  # complex variant
             q = q.view(b, s, self.num_heads, self.head_dim)
             k = k.view(b, s, self.num_kv_heads, self.head_dim)
-            freqs = _precompute_freqs_cis_v2(s, self.head_dim, rope_theta=10000)
+            freqs = _precompute_freqs_cis_complex(s, self.head_dim, rope_theta=10000)
             freqs = freqs.to(x.device).unsqueeze(0).expand(b, -1, -1)
 
             if self.mode == "match":
-                q_out, k_out = apply_rotary_emb(q, k, freqs)
+                q_out, k_out = apply_rotary_pos_emb_complex(q, k, freqs)
             else:
                 q_out, k_out = torch.ops.rope.torch_apply_complex_rope(q, k, freqs)
 
