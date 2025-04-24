@@ -15,18 +15,16 @@
 
 import json
 import os
-import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-from defs.common import convert_weights
+from defs.common import convert_weights, venv_check_call
+from defs.conftest import llm_models_root, unittest_path
 from defs.trt_test_alternative import check_call
 
-from .common import convert_weights, venv_check_call
-from .conftest import llm_models_root, tests_path, unittest_path
-
-sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
+from tensorrt_llm.llmapi import LLM
+from tensorrt_llm.llmapi.llm_utils import BuildConfig
 
 
 def test_llmapi_quant_llama_70b(llm_root, engine_dir, llm_venv):
@@ -46,6 +44,9 @@ def test_llmapi_quant_llama_70b(llm_root, engine_dir, llm_venv):
         llm_root
     ) / "tests/integration/defs/examples/run_llm_fp8_quant_llama_70b.py"
     llm_venv.run_cmd([str(script_path)], env=env)
+
+
+run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 
 @pytest.mark.parametrize("model_name,model_path", [
@@ -94,8 +95,6 @@ def test_llmapi_load_engine_from_build_command_with_lora(
 ])
 def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
                                                model_name, model_path):
-    from tensorrt_llm.llmapi import LLM
-    from tensorrt_llm.llmapi.llm_utils import BuildConfig
     llama_example_root = os.path.join(llm_root, "examples", model_name)
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")

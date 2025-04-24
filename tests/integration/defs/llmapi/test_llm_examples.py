@@ -14,15 +14,11 @@
 # limitations under the License.
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
-
-from .common import venv_check_call
-from .conftest import llm_models_root, tests_path, unittest_path
-
-sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
+from defs.common import venv_check_call
+from defs.conftest import llm_models_root, unittest_path
 
 
 def test_llmapi_chat_example(llm_root, llm_venv):

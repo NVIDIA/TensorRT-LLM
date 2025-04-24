@@ -1053,9 +1053,6 @@ def test_mistral_large_hidden_vocab_size(llama_example_root, llm_venv,
     venv_check_call(llm_venv, run_cmd)
 
 
-run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
-
-
 def test_trtllm_serve_example(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
