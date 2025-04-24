@@ -493,7 +493,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=True,
             )
 
-            # TODO: Management of block ids should not be coupled with flash_mla so tightly.
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
 
@@ -516,6 +515,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 num_sm_parts = sm_count // num_heads_k // ceil_div(
                     num_heads_per_head_k, block_size_m)
 
+                # TODO: Management of block ids should not be coupled with flash_mla so tightly.
                 self.block_ids_per_seq = torch.empty(
                     [
                         self.kv_cache_manager.max_batch_size,
