@@ -524,6 +524,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
+                # TODO: kv_block_ids_per_seq is duplicated with block_ids_per_seq
                 self.kv_block_ids_per_seq = torch.empty(
                     [
                         self.kv_cache_manager.max_batch_size,
@@ -569,7 +570,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # set params that are used in wrapper.plan()
             self.kv_cache_block_offsets = None
             self.host_kv_cache_block_offsets = None
-            self.block_ids_per_seq = None  # TODO: this seems to be conflicting with block_ids_per_seq managed by flash_mla path
+            self.block_ids_per_seq = None
 
         prompt_lens = torch.tensor(
             self.prompt_lens,
@@ -616,8 +617,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
                 block_ids_per_seq, non_blocking=True)
             self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
-                block_ids_per_seq[self.num_contexts:], non_blocking=True
-            )  # TODO: block_ids_per_seq is duplicate with kv_block_ids_per_seq
+                block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
             torch.ops.trtllm.get_mla_metadata(
                 self.kv_lens_cuda[self.num_contexts:self.num_contexts +
