@@ -799,12 +799,8 @@ class PeftCacheManager(BaseResourceManager):
                     [1] + list(req.lora_config.shape))
             self.impl.add_request_peft(req, True)
 
-        from tensorrt_llm.bindings.internal.batch_manager import RequestVector
-        context_requests_vector = RequestVector(context_batch)
-        generation_requests_vector = RequestVector(generation_batch)
-
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
-            context_requests_vector, generation_requests_vector, False)
+            context_batch, generation_batch, False)
 
         for req in context_batch:
             req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
