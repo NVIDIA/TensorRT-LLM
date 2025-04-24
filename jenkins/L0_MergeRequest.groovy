@@ -592,10 +592,13 @@ def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
     }
     def pytorchOnlyList = [
         "tensorrt_llm/_torch/",
+        "tensorrt_llm/scaffolding/",
         "tests/unittest/_torch/",
+        "tests/unittest/scaffolding/",
         "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
         "tests/integration/defs/disaggregated/",
         "examples/pytorch/",
+        "examples/scaffolding/",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
