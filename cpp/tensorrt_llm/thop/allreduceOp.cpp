@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/lowlatTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
@@ -1045,10 +1046,24 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
     return {norm_out, residual_out};
 }
 
+at::Tensor lowlatTwoShotAllReduce(
+    at::Tensor& output, at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+    return tensorrt_llm::kernels::twoShotAllReduceDispatch(
+        mcast_mem, output, input, comm_buffer, buffer_flags, wait_for_results);
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "lowlat_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
+        "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
+    m.def(
+        "lowlat_twoshot_rmsnorm(Tensor prenorm_output, Tensor normed_output, Tensor input, Tensor gamma, "
+        "float epsilon, Tensor residual, Tensor buffer_flags) -> ()");
     m.def(
         "allreduce("
         "Tensor input,"
@@ -1078,6 +1093,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("lowlat_twoshot_allreduce", &torch_ext::lowlatTwoShotAllReduce);
+    m.impl("lowlat_twoshot_rmsnorm", &tensorrt_llm::kernels::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
 }
