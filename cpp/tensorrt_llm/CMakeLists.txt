@@ -211,7 +211,6 @@ set(TRTLLM_LINK_LIBS
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    fp8_blockscale_gemm_src
     ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src

@@ -19,7 +19,7 @@ This document explains how to build the [C4AI Command-R](https://huggingface.co/
 ## Overview
 
 The TensorRT-LLM Command-R implementation can be found in [`tensorrt_llm/models/commandr/model.py`](../../../../tensorrt_llm/models/commandr/model.py).
-The TensorRT-LLM Command-R example code is located in [`examples/commandr`](./). There is one main file:
+The TensorRT-LLM Command-R example code is located in [`examples/models/core/commandr`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert a checkpoint from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT-LLM format.
 

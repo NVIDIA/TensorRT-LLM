@@ -27,7 +27,7 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
 
 ## Overview
 
-The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/enc_dec`](./):
+The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc_dec/model.py](../../../../tensorrt_llm/models/enc_dec/model.py). The TensorRT-LLM Enc-Dec example code is located in [`examples/models/core/enc_dec`](./):
 
  * `trtllm-build` to build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run the Enc-Dec model,
  * [`run.py`](./run.py) to run the inference on an example input text.
@@ -35,7 +35,7 @@ The TensorRT-LLM Enc-Dec implementation can be found in [tensorrt_llm/models/enc
    * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert weights from HuggingFace or FairSeq format to TRT-LLM format, and split weights for multi-GPU inference,
 ## Usage
 
-The TensorRT-LLM Enc-Dec example code locates at [examples/enc_dec](./). It takes HuggingFace or FairSeq model name as input, and builds the corresponding TensorRT engines. On each GPU, there will be two TensorRT engines, one for Encoder and one for Decoder.
+The TensorRT-LLM Enc-Dec example code locates at [examples/models/core/enc_dec](./). It takes HuggingFace or FairSeq model name as input, and builds the corresponding TensorRT engines. On each GPU, there will be two TensorRT engines, one for Encoder and one for Decoder.
 
 ## Encoder-Decoder Model Support
 
@@ -225,7 +225,7 @@ For pure C++ runtime, there is no example given yet. Please check the [`Executor
 
 #### Run Python runtime
 
-For pure Python runtime, you can still use the encoder-decoder specific script under `examples/enc_dec/`.
+For pure Python runtime, you can still use the encoder-decoder specific script under `examples/models/core/enc_dec/`.
 
 ```bash
 # Inferencing w/ single GPU greedy search, compare results with HuggingFace FP32

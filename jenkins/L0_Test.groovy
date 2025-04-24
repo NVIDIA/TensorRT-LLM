@@ -115,6 +115,8 @@ def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
 def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
 @Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
 def DEBUG_MODE = "debug"
 @Field
 def testFilter = [
@@ -130,6 +132,7 @@ def testFilter = [
     (MULTI_GPU_FILE_CHANGED): false,
     (ONLY_PYTORCH_FILE_CHANGED): false,
     (DEBUG_MODE): false,
+    (AUTO_TRIGGER_TAG_LIST): [],
 ]
 
 String getShortenedJobName(String path)
@@ -614,6 +617,12 @@ def renderTestDB(testContext, llmSrc, stageName) {
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
+    if (stageName.contains("-DeepSeek-")) {
+        makoArgs += ["auto_trigger=deepseek"]
+    } else {
+        makoArgs += ["auto_trigger=others"]
+    }
+
     def makoOpts = getMakoOpts(scriptPath, makoArgs)
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -1178,8 +1187,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 {
     def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
     turtleConfigs = [
-        "DGX_H100-4_GPUs-PyTorch-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-TensorRT-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-TensorRT-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1458,6 +1467,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
         parallelJobsFiltered += multiGpuJobs
+    }
+
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+        echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
+        def autoTriggerTagStages = [:]
+        for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
+            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
+        }
+        parallelJobsFiltered += autoTriggerTagStages
+        if (autoTriggerTagStages.size() > 0) {
+            echo "Auto trigger will force run stages: ${autoTriggerTagStages.keySet().join(', ')}."
+        }
+        println parallelJobsFiltered.keySet()
     }
 
     // Check --post-merge, post-merge or TRT dependency testing pipelines.

@@ -205,39 +205,46 @@ void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
         EXPECT_EQ(outputShape.d[1], maxSeqLength);
 
         auto outputsIdsHost = manager.copyFrom(*outputsIds, MemoryType::kCPU);
-        auto output = bufferCast<TokenIdType>(*outputsIdsHost);
+        auto* output = bufferCast<TokenIdType>(*outputsIdsHost);
 
-        auto samplingConfig = samplingConfigs.at(b);
+        auto const& samplingConfig = samplingConfigs.at(b);
 
-        for (auto bw = 0; bw < samplingConfig.beamWidth; ++bw)
+        for (auto beamIndex = 0; beamIndex < samplingConfig.beamWidth; ++beamIndex)
         {
-            auto const result = (samplingConfig.beamWidth == 1) ? expectedTokenId : bw;
+            auto const result = (samplingConfig.beamWidth == 1) ? expectedTokenId : beamIndex;
 
-            auto* const outputPtr = output + tc::flat_index(outputShape.d, bw, 0);
+            auto* const outputPtr = output + tc::flat_index(outputShape.d, beamIndex, 0);
 
             auto const inputLength = inputLengths.at(b);
             auto* begin = outputPtr;
             auto* end = outputPtr + inputLength;
             ASSERT_LE(begin, end) << "bad input length " << inputLength;
-            ASSERT_THAT(std::vector(begin, end), ::testing::Each(inputTokenId)) << "input tokens: "
-                                                                                << "b:" << b << " bw: " << bw;
-            auto const seqLength = sequenceLengths.at(tc::flat_index2(b, bw, maxBeamWidth));
+
+            // Only the first beam contains the input token ID, the other beams point to it.
+            if (beamIndex == 0)
+            {
+                ASSERT_THAT(std::vector(begin, end), ::testing::Each(inputTokenId))
+                    << "input tokens: "
+                    << "b:" << b << " bw: " << beamIndex;
+            }
+
+            auto const seqLength = sequenceLengths.at(tc::flat_index2(b, beamIndex, maxBeamWidth));
             begin = end;
             end = outputPtr + seqLength;
             ASSERT_LE(begin, end) << "bad seq length " << seqLength;
             ASSERT_THAT(std::vector(begin, end), ::testing::Each(result)) << "new tokens: "
-                                                                          << "b:" << b << " bw: " << bw;
+                                                                          << "b:" << b << " bw: " << beamIndex;
             begin = end;
             end = outputPtr + maxSeqLength;
             ASSERT_LE(begin, end) << "bad max length " << maxSeqLength;
             ASSERT_THAT(std::vector(begin, end), ::testing::Each(endId)) << "padding: "
-                                                                         << "b:" << b << " bw: " << bw;
+                                                                         << "b:" << b << " bw: " << beamIndex;
         }
     }
 }
 
 void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs, SizeType32 maxBeamWidth,
-    bool computeLogProbs, bool normalizeLogProbs)
+    bool computeLogProbs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType32 constexpr tensorParallelism{1};
@@ -403,11 +410,11 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     std::iota(inputLengths.begin(), inputLengths.end(), 4);
 
     std::vector<SizeType32> tiledInputLengths;
-    for (int batchIdx = 0; batchIdx < inputLengths.size(); batchIdx++)
+    for (SizeType32 const inputLength : inputLengths)
     {
-        for (int beamId = 0; beamId < maxBeamWidth; beamId++)
+        for (SizeType32 beamId = 0; beamId < maxBeamWidth; beamId++)
         {
-            tiledInputLengths.push_back(inputLengths.at(batchIdx));
+            tiledInputLengths.push_back(inputLength);
         }
     }
 
@@ -436,14 +443,14 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         maxGeneratedTokensPerStep, dataType, modelConfig, worldConfig);
 
     // set up inputs and outputs
-    tb::DecoderInputBuffers inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
+    tb::DecoderInputBuffers const inputBuffers(batchSize, maxGeneratedTokensPerStep, manager);
 
     auto decoderInputs = createDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
         samplingConfigs, generatedTokensPerSteps, computeLogProbs, manager);
     auto outputs = createDecoderOutputs(batchSize, maxBeamWidth, maxSeqLength, tiledInputLengths,
         *decoder.getDecoderState().getJointDecodingOutput().lengths, manager);
 
-    std::vector<SizeType32> expectedSteps(batchSize, 0);
+    std::vector<SizeType32> const expectedSteps(batchSize, 0);
     auto expectedLengths = tiledInputLengths;
 
     auto const& finished = getFinished(*decoder.getDecoderState().getFinishedSum(), samplingConfigs, manager);
@@ -455,8 +462,8 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
-        TensorPtr newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
-        std::vector<SamplingConfig> singleConfig = {samplingConfigs[batchIdx]};
+        TensorPtr const newBatchSlot = ITensor::slice(inputBuffers.setupBatchSlots, batchIdx, 1);
+        std::vector<SamplingConfig> const singleConfig = {samplingConfigs[batchIdx]};
         newRequests(newBatchSlot, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
@@ -663,7 +670,7 @@ TEST_P(ParamTest, Test)
         samplingConfigs.emplace_back(beamWidth);
     }
 
-    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs, true);
+    testDecoder(dtype, samplingConfigs, beamConfig.maxBeamWidth, computeLogProbs);
 }
 
 INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamTest,

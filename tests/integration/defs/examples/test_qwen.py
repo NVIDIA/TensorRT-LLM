@@ -1000,14 +1000,14 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
     llm_venv.run_cmd(['-m', 'pip', 'install', 'jinja2==3.1.0'])
     # Run MMLU for Qwen 2.5 models.
     if '2.5' in llm_qwen_model_root:
-        summary_cmd = [
-            f"{qwen_example_root}/../../../mmlu_llmapi.py",
-            f"--hf_model_dir={llm_qwen_model_root}",
-            f"--engine_dir={engine_dir}",
-            f"--data_dir={llm_datasets_root}/mmlu",
-            "--check_accuracy",
-            f"--accuracy_threshold={mmlu_score}",
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llm_qwen_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={llm_datasets_root}/mmlu", "--check_accuracy",
+            f"--accuracy_threshold={mmlu_score}"
         ]
+        check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+
     else:
         summary_cmd = [
             f"{qwen_example_root}/../../../summarize.py",
@@ -1019,7 +1019,7 @@ def test_llm_hf_qwen_quantization_1gpu(dtype, llm_qwen_model_root, llm_venv,
             f"--dataset_dir={llm_datasets_root}",
             f"--rouge_dir={llm_rouge_root}",
         ]
-    venv_check_call(llm_venv, summary_cmd)
+        venv_check_call(llm_venv, summary_cmd)
 
 
 @skip_pre_ada

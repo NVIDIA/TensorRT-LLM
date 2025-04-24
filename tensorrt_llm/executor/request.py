@@ -25,7 +25,7 @@ class LoRARequest:
     lora_path: str = ""
 
     def __post_init__(self):
-        if not os.path.exists(self.lora_path):
+        if self.lora_path is not None and not os.path.exists(self.lora_path):
             raise ValueError(f"lora_path ({self.lora_path}) does not exist.")
 
     @property
