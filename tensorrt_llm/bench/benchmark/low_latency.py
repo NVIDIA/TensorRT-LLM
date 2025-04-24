@@ -22,7 +22,7 @@ from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, SUPPORTED_BACKENDS, PYTHON_SUPPORTED_BACKENDS
+from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
@@ -44,7 +44,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option("--backend",
-                 type=click.Choice(SUPPORTED_BACKENDS),
+                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
                  default="pytorch",
                  help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
@@ -218,7 +218,8 @@ def latency_command(
 
     # Engine configuration parsing for PyTorch backend
     kwargs = {}
-    if backend and backend.lower() in PYTHON_SUPPORTED_BACKENDS:
+    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
+    ) != "cpp":
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
