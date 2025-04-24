@@ -325,7 +325,7 @@ python3 scripts/launch_triton_server.py \
     --disable-spawn-processes
 ```
 
-+ All other operations is the same as `Simple deploy` part.
++ All other operations are the same as the `Simple deploy` part.
 
 ### Additional information
 
