@@ -1096,7 +1096,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 True,
             )
-            # get accepetd tokens and next draft tokens
+            # get accepted tokens and next draft tokens
             return self.mtp_worker(
                 input_ids=input_ids,
                 position_ids=position_ids,
