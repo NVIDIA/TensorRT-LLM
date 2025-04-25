@@ -1067,6 +1067,7 @@ void Serialization::serialize(ExecutorConfig const& executorConfig, std::ostream
     su::serialize(executorConfig.getSpecDecConfig(), os);
     su::serialize(executorConfig.getGuidedDecodingConfig(), os);
     su::serialize(executorConfig.getAdditionalModelOutputs(), os);
+    su::serialize(executorConfig.getCacheTransceiverConfig(), os);
     su::serialize(executorConfig.getGatherGenerationLogits(), os);
 }
 
