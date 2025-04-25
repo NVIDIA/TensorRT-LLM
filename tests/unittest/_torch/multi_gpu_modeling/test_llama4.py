@@ -2,6 +2,7 @@
 from difflib import SequenceMatcher
 
 import pytest
+import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import SamplingParams
@@ -19,12 +20,17 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 @pytest.mark.parametrize("use_cuda_graph", [True, False],
                          ids=["enable_graph", "disable_graph"])
 def test_llama4(model_name, backend, tp_size, use_cuda_graph):
-    prompts = [
-        "The president of the United States is",
-    ]
+    prompts = [{
+        "prompt": "The president of the United States is"
+    }, {
+        "prompt": "<|image|>This image is of color",
+        "multi_modal_data": {
+            "image": [torch.ones(3, 1024, 1024)]
+        }
+    }]
 
     expected_outputs = [
-        " the head of state and head of government of the",
+        " the head of state and head of government of the", " solid white"
     ]
 
     pytorch_config = PyTorchConfig(attn_backend=backend,
