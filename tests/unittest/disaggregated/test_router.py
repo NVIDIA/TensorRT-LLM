@@ -2,6 +2,7 @@ import copy
 
 import pytest
 
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
@@ -255,21 +256,27 @@ async def test_kv_cache_aware_router(servers):
 
 
 def test_create_router(servers):
-    round_robin_router = create_router("round_robin", servers)
+    default_router = create_router(None, servers)
+    assert isinstance(default_router, RoundRobinRouter)
+
+    round_robin_router = create_router(RouterConfig(type="round_robin"),
+                                       servers)
     assert isinstance(round_robin_router, RoundRobinRouter)
 
-    requests_load_balancing_router = create_router("requests_load_balancing",
-                                                   servers)
+    router_config = RouterConfig(type="load_balancing",
+                                 args={"use_tokens": False})
+    requests_load_balancing_router = create_router(router_config, servers)
     assert isinstance(requests_load_balancing_router, LoadBalancingRouter)
     assert not requests_load_balancing_router._use_tokens
 
-    tokens_load_balancing_router = create_router("tokens_load_balancing",
-                                                 servers)
+    router_config.args["use_tokens"] = True
+    tokens_load_balancing_router = create_router(router_config, servers)
     assert isinstance(tokens_load_balancing_router, LoadBalancingRouter)
     assert tokens_load_balancing_router._use_tokens
 
-    kv_cache_aware_router = create_router("kv_cache_aware", servers)
+    router_config.type = "kv_cache_aware"
+    kv_cache_aware_router = create_router(router_config, servers)
     assert isinstance(kv_cache_aware_router, KvCacheAwareRouter)
 
     with pytest.raises(ValueError):
-        create_router("unsupported_router", servers)
+        create_router(RouterConfig(type="unsupported_router"), servers)

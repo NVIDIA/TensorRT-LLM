@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
@@ -89,7 +89,6 @@ class KvCacheAwareServerState(ServerState):
                 self.add_blocks(block["block_hash"]
                                 for block in event["blocks"])
             elif event["type"] == "removed":
-                logger.info(f"removed blocks: {event['block_hashes']}")
                 self.remove_blocks(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
@@ -145,7 +144,7 @@ class Router(ABC):
 
 class RoundRobinRouter(Router):
 
-    def __init__(self, servers: list[str] = None):
+    def __init__(self, servers: list[str] = None, **kwargs):
         super().__init__(servers)
         self._server_idx = 0
 
@@ -160,7 +159,10 @@ class RoundRobinRouter(Router):
 
 class LoadBalancingRouter(Router):
 
-    def __init__(self, servers: list[str] = None, use_tokens: bool = False):
+    def __init__(self,
+                 servers: list[str] = None,
+                 use_tokens: bool = False,
+                 **kwargs):
         super().__init__(servers)
         self._lock = asyncio.Lock()
         # Load map between servers and their number of tokens processed
@@ -216,7 +218,8 @@ class KvCacheAwareRouter(Router):
                  servers: list[str] = None,
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
-                 tokens_per_block: int = 32):
+                 tokens_per_block: int = 32,
+                 **kwargs):
         super().__init__(servers)
         self._lock = asyncio.Lock()
 
@@ -300,15 +303,15 @@ class KvCacheAwareRouter(Router):
                                                         session=session)
 
 
-def create_router(router_type: str, servers: list[str]) -> Router:
+def create_router(router_config: Optional[RouterConfig],
+                  servers: list[str]) -> Router:
     """
     Factory function to create different types of router instances.
 
     Args:
         router_type (str): Type of router to create. Supported values:
-            - "round_robin": Creates a RoundRobinRouter
-            - "requests_load_balancing": Creates a LoadBalancingRouter, which balances requests across instances
-            - "tokens_load_balancing": Creates a LoadBalancingRouter, which balances tokens across instances
+            - "round_robin": Creates a RoundRobinRouter (default)
+            - "load_balancing": Creates a LoadBalancingRouter, which balances requests or tokens across instances
             - "kv_cache_aware": Creates a KvCacheAwareRouter, which balances requests across instances additionally based on KV cache hits
         servers: List of server URLs
 
@@ -318,21 +321,19 @@ def create_router(router_type: str, servers: list[str]) -> Router:
     Raises:
         ValueError: If an unsupported router type is provided
     """
+    if router_config is None:
+        return RoundRobinRouter(servers)
 
     router_map = {
         "round_robin": RoundRobinRouter,
-        "requests_load_balancing": LoadBalancingRouter,
-        "tokens_load_balancing": LoadBalancingRouter,
+        "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
     }
 
+    router_type = router_config.type
     router_class = router_map.get(router_type.lower())
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
 
-    if router_type.endswith("load_balancing"):
-        use_tokens = True if router_type.startswith("tokens") else False
-        return router_class(servers, use_tokens=use_tokens)
-    else:
-        return router_class(servers)
+    return router_class(servers, **router_config.args)

@@ -5,7 +5,9 @@ backend: "pytorch"
 free_gpu_memory_fraction: 0.15
 context_servers:
   num_instances: 2
-  router_type: tokens_load_balancing
+  router:
+    type: load_balancing
+    use_tokens: True
   max_batch_size: 1
   max_num_tokens: 3000
   max_seq_len: 4096
@@ -22,12 +24,14 @@ context_servers:
       - "localhost:8002"
 generation_servers:
   num_instances: 2
-  router_type: requests_load_balancing
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
+  router:
+    type: load_balancing
+    use_tokens: False
   max_batch_size: 256
   max_num_tokens: 4096
   max_seq_len: 4096
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
   kv_cache_config:
     free_gpu_memory_fraction: 0.15
     enable_partial_reuse: False

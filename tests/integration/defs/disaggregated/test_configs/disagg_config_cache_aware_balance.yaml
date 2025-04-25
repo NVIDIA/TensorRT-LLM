@@ -9,7 +9,8 @@ pytorch_backend_config:
   autotuner_enabled: False
 context_servers:
   num_instances: 2
-  router_type: kv_cache_aware
+  router:
+    type: kv_cache_aware
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
@@ -21,7 +22,8 @@ context_servers:
       - "localhost:8002"
 generation_servers:
   num_instances: 2
-  router_type: kv_cache_aware
+  router:
+    type: kv_cache_aware
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   kv_cache_config:
