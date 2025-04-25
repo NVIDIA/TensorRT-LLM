@@ -333,10 +333,15 @@ class ReportUtility:
         }
 
         if self.streaming:
+            avg_tpot = self.convert_to_ms(
+                self.statistics.per_user_time_per_output_token_ns)
+
             stats_dict["streaming_metrics"] = {
                 # Token output speed (1 / time-per-output-token)
                 # NOTE: Excludes TTFT by nature of using TPOT.
                 "token_output_speed_tok_s":
+                1000.0 / avg_tpot,
+                "token_genphase_tok_per_s":
                 self.per_user_generation_token_throughput_s,
                 # Average per request time-to-first-token (TTFT)
                 "avg_ttft_ms":
@@ -344,8 +349,7 @@ class ReportUtility:
                     self.statistics.per_user_time_to_first_token_ns),
                 # Average per request token time-per-output-token (TPOT)
                 "avg_tpot_ms":
-                self.convert_to_ms(
-                    self.statistics.per_user_time_per_output_token_ns),
+                avg_tpot,
                 # Average per request Time-per-output-token percentiles (TPOT)
                 "tpot_percentiles":
                 self.statistics.tpot_percentiles.model_dump(
@@ -483,6 +487,9 @@ class ReportUtility:
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
+            # Output Throughput includes context/first token.
+            f"Per User Output Throughput [w/ ctx] (tps/user):   {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tps/gpu):              {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
         )
 
         if streaming:
@@ -499,9 +506,10 @@ class ReportUtility:
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
             perf_stats += (
-                f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
                 f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
                 f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user) [1/avg(TPOT)]:   {streaming['token_output_speed_tok_s']:.4f}\n"
+                f"Per User Generation Throughput (tps/user):        {streaming['token_genphase_tok_per_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"
