@@ -14,6 +14,16 @@
 # limitations under the License.
 
 
+def _check_mpi_environment():
+    import os
+    has_mpirun = "OMPI_COMM_WORLD_RANK" in os.environ
+    has_pmix = "PMIX_RANK" in os.environ
+    if has_pmix and not has_mpirun:
+        raise RuntimeError(
+            "PMIx is detected, but OMPI_COMM_WORLD_RANK is not set. "
+            "Please use mpirun to launch the program.")
+
+
 def _add_trt_llm_dll_directory():
     import platform
     on_windows = platform.system() == "Windows"
@@ -25,6 +35,7 @@ def _add_trt_llm_dll_directory():
             Path(sysconfig.get_paths()['purelib']) / "tensorrt_llm" / "libs")
 
 
+_check_mpi_environment()
 _add_trt_llm_dll_directory()
 
 import sys
