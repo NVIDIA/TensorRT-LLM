@@ -749,7 +749,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     if (mIsMLAEnabled)
     {
         size_t flash_mla_workspace_size = 0;
-        if (mUseFlashMLA)
+        if (mUseGenFlashMLA)
         {
             int const FLASH_MLA_NUM_BUFFERS = 5;
             size_t flash_mla_workspaces[FLASH_MLA_NUM_BUFFERS];
@@ -1014,7 +1014,7 @@ int AttentionOp::mlaGeneration(
         mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);
     }
-    else if (mUseFlashMLA)
+    else if (mUseGenFlashMLA)
     {
         static constexpr int block_size_n = 64;
         static constexpr int fixed_overhead_num_blocks = 5;
@@ -2289,8 +2289,8 @@ int AttentionOp::initialize() noexcept
     if (mFP8GenerationMLA)
     {
         TLLM_CHECK_WITH_INFO(mIsMLAEnabled, "FP8 Generation MLA cannot be enabled because MLA is not supported.");
-        TLLM_CHECK_WITH_INFO(mSM == 90 || mSM == 100 || mSM == 120,
-            "FP8 Generation MLA is supported on Hopper or Blackwell architecture.");
+        TLLM_CHECK_WITH_INFO(mSM == 89 || mSM == 90 || mSM == 100 || mSM == 120,
+            "FP8 Generation MLA is supported on Ada, Hopper or Blackwell architecture.");
     }
 
     // Check requirements for FP4 output.
@@ -2518,9 +2518,12 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.tpRank = mTpRank;
                 mDecoderFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
 
-                // Only deepseek must using fmha.
-                TLLM_CHECK_WITH_INFO(
-                    mDecoderFMHARunner->isFmhaSupported(), "Deepseek should be supported by fmha in generation part.");
+                // Only deepseek must using fmha in the generation phase when flash mla is not enabled.
+                if (!mUseGenFlashMLA)
+                {
+                    TLLM_CHECK_WITH_INFO(mDecoderFMHARunner->isFmhaSupported(),
+                        "Deepseek should be supported by fmha in generation part.");
+                }
             }
 
             TLLM_CHECK_WITH_INFO(
@@ -2695,7 +2698,7 @@ std::string AttentionOp::toString() const
     ss << "mFMHAForceFP32Acc: " << std::boolalpha << mFMHAForceFP32Acc << std::endl;
     ss << "mSM: " << mSM << std::endl;
     ss << "mUseTllmGen: " << mUseTllmGen << std::endl;
-    ss << "mUseFlashMLA: " << mUseFlashMLA << std::endl;
+    ss << "mUseGenFlashMLA: " << mUseGenFlashMLA << std::endl;
     ss << "mMultiProcessorCount: " << mMultiProcessorCount << std::endl;
     ss << "mMaxSharedMemoryPerBlockOptin: " << mMaxSharedMemoryPerBlockOptin << std::endl;
     ss << "mMultiBlockMode: " << std::boolalpha << mMultiBlockMode << std::endl;
