@@ -330,7 +330,10 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
         prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
         prompt_tuning_config = None
+        multimodal_embedding = None
         mrope_config = None
+        if request.multimodal_embedding is not None:
+            multimodal_embedding = request.multimodal_embedding
         if request.prompt_adapter_request is not None:
             assert request.prompt_tuning_config is None, \
                 "cannot accept both prompt_adapter_request and prompt_tuning_config in one request"
@@ -393,6 +396,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 logits_post_processor_name=(
                     tllm.Request.BATCHED_POST_PROCESSOR_NAME

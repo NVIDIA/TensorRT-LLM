@@ -921,6 +921,12 @@ def test_prompt_tuning_config():
     assert (config.embedding_table == embedding_table).all()
 
 
+def test_multimodal_embedding():
+    embedding_table = torch.ones(100, 64)
+    config = trtllm.MultimodalEmbedding(embedding_table)
+    assert (config.embedding_table == embedding_table).all()
+
+
 def test_mrope_config():
     mrope_rotary_cos_sin = torch.ones(1, 4194304)
     mrope_position_deltas = torch.tensor([-50])
@@ -1021,6 +1027,7 @@ def test_request():
         "external_draft_tokens_config":
         trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
+        "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
         "logits_post_processor_name": "my_logits_pp",
         "client_id": 1234,

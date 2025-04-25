@@ -116,6 +116,7 @@ class GenerationExecutor(ABC):
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             streaming: bool = False,
             prompt_tuning_config: Optional[list] = None,
+            multimodal_embedding: Optional[list] = None,
             mrope_config: Optional[dict] = None,
             kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
             disaggregated_params: Optional[DisaggregatedParams] = None,
@@ -142,6 +143,7 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
                 prompt_tuning_config=prompt_tuning_config,
+                multimodal_embedding=multimodal_embedding,
                 mrope_config=mrope_config,
                 kv_cache_retention_config=kv_cache_retention_config,
                 disaggregated_params=disaggregated_params))
