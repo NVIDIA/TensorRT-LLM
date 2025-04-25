@@ -206,6 +206,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         req = create_dummy_context_requests(max_num_tokens, seq_len, vocab_size)
         req_ids = py_executor.enqueue_requests(req)
     req_ids = mpi_broadcast(req_ids, root=0)
+    py_executor.is_warmup = True
     py_executor.start_worker()
     py_executor.await_responses(req_ids)
     # TODO check why call mpi_barrier() here will hang-on, but call mpi_allgather(0) is fine.
@@ -251,6 +252,7 @@ def estimate_max_kv_cache_tokens(py_executor: PyExecutor,
         "kv_cache_manager").shutdown()
 
     if py_executor.dist.mapping.rank == 0:
+        py_executor.is_warmup = False
         py_executor.shutdown()
 
     return kv_cache_max_tokens
