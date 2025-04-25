@@ -42,6 +42,7 @@ class Llama4Attention(Attention):
         nope_layer: bool = False,
         attn_temperature_tuning: bool = True,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        attention_chunk_size: Optional[int] = None,
     ):
         config = model_config.pretrained_config
         self.aux_stream = aux_stream
@@ -89,6 +90,7 @@ class Llama4Attention(Attention):
         self.attn_temperature_tuning = attn_temperature_tuning and nope_layer
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
+        self.attention_chunk_size = attention_chunk_size
 
     def _attn_qkv(
             self,
@@ -99,19 +101,22 @@ class Llama4Attention(Attention):
             attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
             mrope_config: Optional[dict] = None,
-            all_reduce_params: Optional[AllReduceParams] = None):
+            all_reduce_params: Optional[AllReduceParams] = None,
+            attention_chunk_size: Optional[int] = None):
         out_scale = None
         if self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4 or self.o_proj.has_fp8_block_scales:
             out_scale = self.o_proj.inv_input_scale
 
         q, k, v = self.convert_qkv(q, k, v)
-        attn_output = self.attn.forward(q,
-                                        k,
-                                        v,
-                                        attn_metadata,
-                                        out_scale=out_scale,
-                                        attention_mask=attention_mask,
-                                        mrope_config=mrope_config)
+        attn_output = self.attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            out_scale=out_scale,
+            attention_mask=attention_mask,
+            mrope_config=mrope_config,
+            attention_chunk_size=attention_chunk_size)
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
@@ -163,8 +168,15 @@ class Llama4Attention(Attention):
             assert self.rotary_emb is not None and not self.enable_rope_fusion, "qk_norm requires attention rope fusion disabled"
             q, k = self.rotary_emb(position_ids, [q, k])
             q, k = self._qk_norm(q, k)
-            return self._attn_qkv(q, k, v, attn_metadata, attention_mask,
-                                  mrope_config, all_reduce_params)
+            return self._attn_qkv(
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                mrope_config,
+                all_reduce_params,
+                attention_chunk_size=self.attention_chunk_size)
         else:
             # When qk_norm is disabled, use the classic attention path that handles RoPE fusion
             return super().forward(position_ids, hidden_states, attn_metadata,
@@ -357,6 +369,7 @@ class Llama4DecoderLayer(DecoderLayer):
             nope_layer=config.no_rope_layers[layer_idx] == 0,
             attn_temperature_tuning=config.attn_temperature_tuning > 0,
             aux_stream=aux_stream,
+            attention_chunk_size=getattr(config, "attention_chunk_size", None),
         )
 
         is_mlp_layer = (layer_idx + 1) % config.interleave_moe_layer_step != 0

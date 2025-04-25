@@ -13,6 +13,17 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
                         RopeParams)
 
 
+def create_chunked_attention_mask(seq_len: int, attention_chunk_size: int,
+                                  device: torch.device) -> torch.Tensor:
+    block_pos = torch.abs(
+        (torch.arange(seq_len).unsqueeze(0) // attention_chunk_size) -
+        (torch.arange(seq_len).unsqueeze(1) // attention_chunk_size))
+    token_pos = torch.arange(seq_len).unsqueeze(0) - torch.arange(
+        seq_len).unsqueeze(1)
+    mask = (block_pos == 0) & (token_pos <= 0)
+    return mask.to(device)
+
+
 @dataclass(kw_only=True, init=False)
 class TrtllmAttentionWrapper:
     sequence_length: torch.Tensor
@@ -234,6 +245,7 @@ class TrtllmAttentionWrapper:
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        attention_chunk_size: Optional[int] = None,
     ):
         """
         Run the attention operation.
@@ -277,13 +289,56 @@ class TrtllmAttentionWrapper:
             assert self.context_lengths.shape[0] == batch_size
             assert self.host_context_lengths.shape[0] == batch_size
             assert self.host_request_types.shape[0] == batch_size
+            print("query shape", q.shape)
+            print("context length", self.context_lengths)
+            print("host context length", self.host_context_lengths)
+            print("batch size", batch_size)
+            print("host request types", self.host_request_types)
+            print("attention_chunk_size", attention_chunk_size)
+            if attention_chunk_size is not None:
+                mask_type = AttentionMaskType.custom_mask
+                ## context lengths of requests in context phase
+                num_contexts = (self.host_request_types == 0).sum().item()
+                print("num contexts", num_contexts)
+                all_attention_masks = []
+                if num_contexts > 0:
+                    seq_len_max = self.host_context_lengths[:num_contexts].max(
+                    ).item()
+                    full_attention_mask = create_chunked_attention_mask(
+                        seq_len_max, attention_chunk_size, q.device)  ## gpu
+                    print("full attention mask", full_attention_mask.shape)
+                    print("full attention mask device",
+                          full_attention_mask.device)
 
-            if attention_mask == PredefinedAttentionMask.CAUSAL:
+                    range_max_len = torch.arange(seq_len_max, device=q.device)
+                    for seq_len in self.host_context_lengths[:num_contexts]:
+                        padding_mask = (range_max_len < seq_len).unsqueeze(
+                            1) & (range_max_len < seq_len).unsqueeze(0)
+                        final_mask = full_attention_mask & padding_mask
+                        all_attention_masks.append(final_mask)
+                    all_attention_masks_tensor = torch.stack(
+                        all_attention_masks, dim=0)
+                    print("all attention masks tensor",
+                          all_attention_masks_tensor.shape)
+                    print("context lengths being passed to fmha",
+                          self.context_lengths[:num_contexts])
+                    print("calling pack_fmha_mask_by_input")
+                    attention_packed_mask = torch.ops.tensorrt_llm.pack_fmha_mask_by_input(
+                        all_attention_masks_tensor,
+                        self.context_lengths[:num_contexts],
+                        self.context_lengths[:num_contexts], 1.0)
+                    print("attention packed mask", attention_packed_mask.shape)
+                else:
+                    attention_packed_mask = None
+                    # mask_type=AttentionMaskType.causal
+            elif attention_mask == PredefinedAttentionMask.CAUSAL:
                 mask_type = AttentionMaskType.causal
             elif attention_mask == PredefinedAttentionMask.FULL:
                 mask_type = AttentionMaskType.padding
             else:
                 raise ValueError("Unexpected attention mask type")
+            # currently testing python masking hence not passing right now the correct mask type
+            mask_type = AttentionMaskType.causal
         else:
             assert is_fused_qkv
             if self.attention_input_type == AttentionInputType.context_only:
@@ -648,6 +703,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         q_pe: Optional[torch.Tensor] = None,
         mrope_config: Optional[dict] = None,
+        attention_chunk_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert isinstance(
@@ -717,7 +773,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                   and k is None,
                                   update_kv_cache=not metadata.is_cross
                                   or k is not None,
-                                  attention_mask=attention_mask)
+                                  attention_mask=attention_mask,
+                                  attention_chunk_size=attention_chunk_size)
         return output
 
     @classmethod

@@ -9,8 +9,8 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
 example_prompts = [
     "Hello, my name is",
     "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 
@@ -163,6 +163,11 @@ def setup_llm(args):
 def main():
     args = parse_arguments()
     prompts = args.prompt if args.prompt else example_prompts
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    for prompt in prompts:
+        print("prompt length tokenizer", len(tokenizer.encode(prompt)))
 
     llm, sampling_params = setup_llm(args)
     outputs = llm.generate(prompts, sampling_params)
